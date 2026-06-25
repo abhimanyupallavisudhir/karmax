@@ -1,0 +1,559 @@
+# karmax — Build Specification
+
+> A complete specification for an agent-orchestration platform centered on a todo list. Written to be handed to a coding agent as the source of truth for v1, with design rationale included where a decision is non-obvious. v2 material is isolated at the end.
+
+---
+
+## 0. Philosophy
+
+karmax is built on three convictions:
+
+1. **Everything is a todo list.** Just as the development environment of the past was a fancy text editor, the development environment of the AI era is a fancy todo list. Every unit of work — a coding change, a script run, a real-world action, even setting up the system itself — is a **task** on a list, assignable to a human or an agent. There is no second organizing abstraction competing with the task list.
+
+2. **Self-healing infrastructure.** Agents do not merely run inside karmax; they can *repair and extend* it. They edit workflows, add error-resolution cases, and save skills — all through the same reviewed, versioned mechanisms a human would use. The system is designed to get more reliable through use.
+
+3. **Whatever can be automated, should be.** Human attention is the scarcest resource. Errors are resolved automatically before a human is asked. Agents register accounts, log in, drive browsers, and pay for services within bounded budgets. A human is pulled in only at genuine decision points (review gates, irreversible actions, spending above a threshold) — never for mechanical work the system could do itself.
+
+### The architectural through-line
+
+One meta-principle makes the above buildable without collapsing into unmaintainable complexity: **keep the hard, slop-prone core small, and make every capability a pluggable layer that the core does not know about.** Concretely, three patterns recur throughout this spec, and almost every feature is one of them:
+
+- **The durable workflow** — a long-lived, crash-proof orchestration process per task. All control flow is this.
+- **The lease coordinator** — a singleton that hands out leases on a scarce resource (merge slots, agent-account capacity, spend budget). All contention is this.
+- **The declared contribution** — a typed, declared thing (an event type, a UI panel, an action, a world provider) that the host renders or routes without anticipating it. All extensibility is this.
+
+A fourth principle governs all three: **declare, don't guess.** Events, actions, UI, and capabilities are always declared with a typed contract that consumers bind to. Nothing reverse-engineers another component's shape.
+
+---
+
+## 1. Technology stack
+
+- **Durable execution engine: Temporal.** This is the spine and is non-negotiable for v1. It provides the durability, event delivery, timers, retries, child workflows, and state queries that the platform would otherwise reimplement badly. See §3.
+- **Language: TypeScript end-to-end** (Temporal TS SDK for workflows/activities, the gateway, and the web UI), for cohesion and shared types across the workflow contract and the UI. (Temporal also supports Python/Go/Java if a different choice is made later; the spec assumes TS.)
+- **Coding agents: Claude Agent SDK and Codex (app-server / SDK)**, behind a provider-adapter interface (§7).
+- **Secrets: a credential broker** backed by a vault (HashiCorp Vault, a cloud secret manager, or 1Password Unified Access). See §8.
+- **Worlds: a provider interface** with local and pluggable remote/sandboxed backends (§11).
+- **Remote access: Tailscale (default) or Cloudflare Tunnel + Access** (§12).
+- **Data home:** `~/.karmax/` holds workflow repos, agent config homes, prompt/skill content, and local state.
+
+---
+
+## 2. Domain model
+
+| Concept | Definition |
+|---|---|
+| **Project** | A namespace owning task lists, settings, active workflows, and configuration. The top-level container. |
+| **Task list** | An ordered list of tasks within a project. The primary surface a user interacts with. |
+| **Task** | A unit of intent. Has a workflow, parameters, a message history, a stage, and a view-model. In v1 a task runs exactly one execution. |
+| **Workflow** | A durable orchestration *definition* (code) describing how a task is carried out. Versioned, tested, agent-editable. See §4. |
+| **Agent profile** | A declarative spec parameterizing an agent (provider, model, effort, tools, prompt templates, capabilities, limits). See §7. |
+| **World** | The environment a task's work happens in: a git worktree, a container, or a remote sandbox. Accessed through a provider interface. See §11. |
+| **Resource coordinator** | A singleton workflow that leases a scarce resource (merge slot, agent account, budget). See §6. |
+| **Event** | A typed, namespaced, schema-declared message emitted by a workflow onto the event bus. See §5. |
+| **Capability** | A named permission (e.g. `create-task`, `merge-into:<repo>:<branch>`). Granted to principals (users, agent profiles) with scope. See §8. |
+| **Credential** | An external secret (login, API key, card) resolved at runtime from the broker via a handle, never stored in plaintext. See §8. |
+
+**Design note — why projects and task lists are fundamental, not workflows.** Workflows are how work is *done*; tasks are the work itself. A user thinks in tasks on a list, not in orchestration graphs. The list is the spine; workflows are an implementation detail of each task.
+
+---
+
+## 3. Core architecture: durable execution
+
+### 3.1 What a workflow execution is
+
+Each task runs as one **Temporal workflow execution**: a durable function whose state is reconstructed by deterministically replaying an append-only event history. It behaves as a single process that never crashes and can block for arbitrary durations (seconds to weeks) on external events, holding no thread or process while parked.
+
+**The determinism rule is mandatory and load-bearing.** Workflow code may only: call activities, start child workflows, start durable timers, wait on/handle signals, answer queries, and do pure computation. Every side effect — LLM calls, spawning agents, opening PRs, file/network I/O, clocks, randomness — **must** be wrapped in an **activity**, whose result is journaled once and replayed thereafter. This constraint is a feature: it forces a clean separation between *deciding what happens* (the workflow) and *doing it* (activities), which is exactly the separation a naive event-driven design lacks.
+
+### 3.2 The primitives and what each is used for
+
+- **Activity** — side-effecting work, with retries/timeouts. (Create world, run an agent turn, open a PR, run CI.)
+- **Signal** — async event delivered into a running workflow. (Follow-up message, hotfix, merge-slot granted, manager confirmation, dependency satisfied.) Durable; queued even if no worker is polling.
+- **Query** — read-only re-run returning current state without mutation. (The task's view-model: "what stage, what actions are allowed.")
+- **Update** — synchronous signal with a validator and a return value; can reject before admission. (Change target branch, but only if the PR is not yet open.)
+- **Child workflow** — a separately-tracked execution a parent starts and awaits. (Sub-tasks.)
+- **Task queue** — routes work to workers; a queue served by a single worker with one slot serializes work. (Merge serialization.)
+- **continue-as-new** — restarts an execution with fresh, empty history carrying input forward. (Long-lived coordinators; recurring tasks.)
+- **signal-with-start** — create-or-signal atomically. (Enqueue into a coordinator without caring whether it already exists.)
+- **Versioning / patching** — branch behavior by version so in-flight executions keep their original code path while new ones take the new one.
+
+### 3.3 The event bus / dispatcher
+
+External happenings (GitHub webhooks, token-window refills, cross-task dependencies) are routed to the right workflow as signals by a thin **dispatcher**. This is the only legitimately "event-driven services" layer in the system, and it sits *underneath* control flow as a router — it never *is* the control flow. Workflows emit typed events (§5); the dispatcher delivers them as signals to subscribers.
+
+**Design note — why not model workflows themselves as reactive event rules.** A swarm of "on event X in state Y do Z" rules makes a task's state implicit, scattered, and unanswerable. Durable imperative code keeps the state explicit and the control flow readable even with waits, parallelism, and sub-tasks. Reactive routing belongs only in the transport layer.
+
+### 3.4 The gateway and the platform MCP server
+
+- **Gateway** — a thin, stateless HTTP service that translates requests into Temporal `signal`/`query`/`update` calls and enforces authz. It holds no business logic. The web UI and phone talk only to the gateway.
+- **Platform MCP server** — the single API that agents use to act on the system: create/edit tasks, create review info, spawn sub-tasks, save skills, edit workflows (via the reviewed path), reorder coordinators, etc. One MCP server given to every agent; integration is written once because both Claude and Codex speak MCP. Every call carries a scoped credential and is permission-checked (§8).
+
+---
+
+## 4. Workflows
+
+### 4.1 What a workflow is
+
+A workflow is **a package of ordinary durable-execution code**, not a configuration file and not a graph the system interprets. The control flow is written as readable imperative TypeScript: stages are plain sequencing, waits are `await`s on conditions, sub-tasks are awaited child workflows, contention is a lease. This is deliberate — full programming-language power and debuggability, with no interpreter to build or maintain.
+
+**Two distinct nouns share the word "workflow":**
+
+- The **definition** — the editable, versioned, tested code artifact. This is the product concept users and agents work with.
+- The **execution** — a running Temporal instance of that definition for one task.
+
+Keeping these separate resolves most apparent contradictions about editing "a workflow."
+
+### 4.2 Repo layout
+
+Each workflow lives in its own git repo under `~/.karmax/workflows/<name>/`:
+
+```
+~/.karmax/workflows/software-dev/
+  manifest.ts          # name, version, requires, event schemas, capabilities,
+                       # onActivate hook, UI slot contributions, command registrations
+  workflow.ts          # the durable orchestration spine (deterministic)
+  activities.ts        # side-effecting work: createWorld, runAgentTurn, openPr, ...
+  prompts/             # role prompt templates referenced by agent profiles
+    merge.md  resolve.md
+  resolve/cases.ts     # auto-resolve case list (matcher -> vetted action)
+  ui/                  # slot contributions (task panel, project-settings section, ...)
+  api/actions.ts       # action -> signal/update/query mapping for the gateway
+  tests/workflow.test.ts
+```
+
+### 4.3 The manifest
+
+`manifest.ts` is what the host reads to wire a workflow in. It declares:
+
+- `name`, `version` (semver; the git SHA is the precise pin).
+- `requires: [...]` — other workflows this one depends on (e.g. software-dev `requires: ['merge-queue']`). Activating a workflow activates the transitive closure.
+- `events: {...}` — the typed event types this workflow emits, each with a schema (§5).
+- `capabilities: [...]` — capabilities this workflow's agents may need (the ceiling; §8).
+- `onActivate` — an optional hook run when the workflow is added to a project (§4.6).
+- `ui: [...]` — slot contributions (§10).
+- `commands: [...]` — command/keybinding registrations (§10).
+
+### 4.4 The update model (this is the crux of "agent-editable")
+
+There are **two different artifacts with two different update models**:
+
+**Workflow code** is deterministic and replay-bound, so it is **version-pinned per execution**. A task records the workflow version at creation and runs that version to completion; new tasks pick up the newest version; running tasks are never hot-swapped. Editing is **a pull request, literally**:
+
+1. An agent (or human) edits the workflow repo on a branch.
+2. The workflow's own test suite runs, plus a replay-compatibility check.
+3. A human (or trusted-policy gate) reviews and approves.
+4. Merge publishes a new version.
+
+This PR gate is **the single most important safety boundary in the system**: agents can *propose* changes to live orchestration but never *silently publish* them. The review itself is run by the **merge-only workflow** (§5 of workflows list) pointed at the workflow repo — the gate is dogfooded, not separate machinery.
+
+**Prompts, skills, and memory** are content, not deterministic code, so they get the opposite model: **freely editable, snapshotted at the point of use.** When prompt assembly composes what goes to an agent, the concrete text is recorded as the (journaled) input to that turn. Editing a skill therefore never rewrites a past task and simply applies to future uses. No versioning ceremony is needed for content.
+
+> **Rule of thumb: content the agent reads is free to edit; code that auto-runs is gated.**
+
+### 4.5 Versioning and in-flight changes
+
+Finite task workflows rarely need in-flight migration — let running tasks drain on their pinned version. Long-lived coordinators (§6) are the exception: their durable state outlives any code version, so coordinator edits require tested state migrations and Temporal patching for in-flight executions. See §9 for why safe mode does not rescue them.
+
+### 4.6 Registration hooks and dependencies
+
+Two manifest mechanisms, kept deliberately minimal:
+
+- `requires` — declared workflow dependencies, resolved transitively on activation.
+- `onActivate` — when a workflow is added to a project, it may spawn a **task** (run by an agent) to prepare the project. For software-dev this spawns a "make this project karmax-ready" task: ensure git is initialized in each repo; for brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees, and fix them.
+
+**Design note.** The bootstrap is *itself a karmax task*, which is the philosophy applied to the system's own setup. Do not generalize this into a large lifecycle-event framework; `requires` plus `onActivate` (and optionally `onDeactivate` later) is sufficient.
+
+### 4.7 Standard workflows shipped in v1
+
+- **software-dev** — branch/world → do → review → PR (optional) → merge → end, with resolve and sub-tasks. Detailed in §5.
+- **just-do** — a single straightforward agent call, no merge machinery.
+- **script-exec** — run a script/command as a task.
+- **goal** — like software-dev, but instead of pausing at the review gate it auto-sends a "keep going" message to the agent until the agent emits a structured completion signal.
+- **merge-only** — the review-and-merge half of software-dev (no Do stage). Starts at the review gate, then optional PR, then merge. Used to review agents' PRs, including edits to workflow repos.
+- **merge-queue** (coordinator) — leases the single merge slot per target branch (§6).
+- **token/account coordinator** — tracks per-account limits and leases agent-account capacity (§6, §7).
+
+---
+
+## 5. The software-development workflow (detailed)
+
+### 5.1 Stages and flow
+
+```
+Setup → Do ⇄ Review → PR → Merge → End
+                │
+                └── (Review can be a human or an AI/parent task)
+
+Resolve is cross-cutting: any stage on error → auto-resolve → Resolve agent → resume or escalate.
+Sub-tasks: during Do, spawn child workflows and await them.
+Merge is the point of no return.
+```
+
+> The **Review** stage is the gate formerly called "Confirm"; it resolves either by **confirming** (advance) or by **sending a follow-up** (return to Do). Name is adjustable.
+
+### 5.2 Stage details
+
+**Setup.** An activity creates the world (a git worktree off the base branch, or a container/remote world per project config; §11), copies the gitignored files the project config names, and allocates non-conflicting resources (ports). Records the world handle in workflow state.
+
+**Do.** Runs the assigned coding agent profile **one turn per activity** (`runAgentTurn`). Between turns only a session ID is stored; the agent process does not exist while the task waits (§7). During a turn the agent may, via the platform MCP: create review info, spawn sub-tasks, save skills, and **signal completion via a structured tool call** (not a parsed "promise" string — structured is unambiguous and unspoofable). On completion/idle/needs-input → Review.
+
+**Review.** The workflow's view-model exposes the allowed actions `[confirm]` and `[send follow-up]` plus review info. The **confirmer** is a human by default, or an AI; for a **sub-task the confirmer is the parent task's workflow**, which receives the child's review info and either confirms or sends a follow-up — the ordinary parent/child signal pattern. Confirm → PR. Follow-up → append to agent input, return to Do.
+
+**PR.** Opening a GitHub PR is **optional** — a project setting gated by GitHub authorization. The Review stage *is* the conceptual PR; a GitHub PR is just an optional integration output. Off → the merge agent merges branches locally under the queue. On → open a real PR.
+
+**Merge.** Enqueue in the merge-queue coordinator for the target branch; on grant, run the **merge agent** in the world; release the lease; → End. The merge commit is the **point of no return**: before it, the task may be cancelled; after it, not.
+
+**Resolve (cross-cutting).** On an unhandled error at any stage, route first to **auto-resolve** (scripted handlers keyed on error signature — retries, known fix scripts). On miss/novelty, spawn the **Resolve agent** with a context bundle. On fix → resume the originating stage; on failure → escalate to the human via the task UI. Fixes the Resolve agent discovers are saved as skills.
+
+### 5.3 Transition rules
+
+| From | To | Condition |
+|---|---|---|
+| Setup | Do | world ready |
+| Do | Review | structured completion signal (or idle/needs-input surfaced) |
+| Do | Do | sub-tasks spawned → awaited → resumed |
+| Review | Do | follow-up message |
+| Review | PR | confirm |
+| PR | Merge | PR opened (if enabled) **and** merge-queue slot granted |
+| Merge | End | merge success |
+| any | Resolve | unhandled error |
+| Resolve | (origin) | fix succeeded |
+| Resolve | human escalation | fix failed |
+
+### 5.4 Prompt templates (shapes)
+
+Assembled per role by an activity that fills the **role template** (owned by the agent profile) with **task bindings** (owned by the workflow) plus global/project instructions, then snapshots the result as the journaled turn input.
+
+- **Do agent:** global + project instructions; a "you are running inside karmax; here are your tools" preamble listing the platform MCP tools (create-sub-task, create-review-info, signal-completion, save-skill); the world handle; the task prompt.
+- **Merge agent (`prompts/merge.md`):** "You are merging task `{{task}}`. Its work is on branch `{{branch}}` in the worktree at `{{path}}`. Merge `{{targetBranch}}` into this branch, resolve conflicts, ensure the build and tests pass, then merge into `{{targetBranch}}`. Review context: `{{reviewInfo}}`. Signal completion when done."
+- **Resolve agent (`prompts/resolve.md`):** "The `{{stage}}` step failed for task `{{task}}`. Error: `{{error}}`. Worktree: `{{path}}`. Recent transcript: `[[transcript]]`. Candidate resolution skills: `[[skills]]`. Diagnose and fix so `{{stage}}` can resume; if you cannot, explain why."
+
+`{{...}}` are bindings filled at assembly; `[[...]]` are links resolved from the content store at assembly time and snapshotted.
+
+### 5.5 Per-stage task UI
+
+The task UI is the view-model the workflow projects (§10). Always present: title, message history, stage indicator, and two **cheap check-in** affordances:
+
+- **Open a terminal in the world** — a PTY spawned on demand against the on-disk worktree / via the world provider's PTY. Ephemeral; nothing persistent.
+- **Open the conversation** — renders the *stored session transcript*. It does **not** resume the agent (the agent only runs during a turn). This is what keeps check-in cheap.
+
+Stage-gated actions:
+
+- **Pre-send:** editable initial prompt + parameter forms (target branch, agent profiles).
+- **During Do:** live output stream (from the event log), a queue-a-follow-up box, a cancel button (live only before the point of no return).
+- **At Review:** confirm / follow-up actions, plus the review panel (links to a running server, diffs, polished output the agent created).
+- **In the merge queue:** position in queue, reorder / cancel-if-allowed.
+- **Post-merge:** read-only links to the PR and commit.
+
+### 5.6 Reference workflow code (illustrative)
+
+```ts
+export const followUp = defineSignal<[Msg]>('followUp');
+export const confirm   = defineSignal('confirm');
+export const setTarget = defineUpdate<boolean, [string]>('setTarget'); // validated
+export const view      = defineQuery<TaskView>('view');
+
+export async function softwareDev(task: TaskInput) {
+  let stage = 'setup', target = task.target, confirmed = false;
+  const msgs = [...task.msgs];
+
+  setHandler(view, () => projectView(stage, msgs, target, allowed(stage)));
+  setHandler(followUp, (m) => msgs.push(m));
+  setHandler(confirm, () => { confirmed = true; });
+  setHandler(setTarget, (b) =>
+    (stage === 'do' || stage === 'review') ? (target = b, true) : false);
+
+  await withResolve(() => stage, async () => {        // try/catch -> auto-resolve -> Resolve agent
+    const world = await act.createWorld(task.base, project.copyGlobs);
+    let session;
+    for (stage = 'do' ;; ) {
+      const turn = await act.runAgentTurn(profiles.do, world, msgs, session);
+      session = turn.session;
+      if (turn.subTasks)
+        await Promise.all(turn.subTasks.map((s) => executeChild(softwareDev, { args: [s] })));
+      if (turn.completed) {
+        stage = 'review';
+        await condition(() => confirmed || msgs.length > turn.seen);
+        if (confirmed) break;                          // -> PR; else loop back to Do
+      }
+    }
+    stage = 'pr';    if (project.openGithubPr) await act.openPr(world, target);
+    stage = 'merge'; await mergeQueue.acquire(target);
+                     await act.runAgentTurn(profiles.merge, world, null, session);
+                     await mergeQueue.release(target);
+    stage = 'done';
+  });
+}
+```
+
+---
+
+## 6. Resource coordinators (the lease pattern)
+
+A scarce shared resource is owned by a **singleton coordinator workflow** with a well-known ID (Temporal enforces one running execution per ID, so the ID *is* the singleton). The coordinator holds the queue/capacity as explicit state and hands out **leases**.
+
+### 6.1 Merge queue
+
+- ID per serialization domain, almost always per target branch: `merge-queue:<repo>:<branch>`.
+- A task wanting to merge does **signal-with-start** to enqueue, then `await(() => granted)`.
+- The coordinator, when the slot is free, pops the head and signals it `granted`; the task runs its merge and signals `release`; the coordinator pops the next.
+- Because the queue is explicit state: **reorder** = a `prioritize(taskId)` signal; **position** = a query; **N parallel slots** = the same code with the slot count raised (a counting semaphore).
+- **Crash safety:** after granting, the coordinator awaits `release` *or* a lease-timeout; on timeout it checks the grantee's status and reclaims if it died.
+- **continue-as-new:** the coordinator is long-lived and accumulates history (every enqueue/grant/release), so it must periodically continue-as-new, carrying the queue state forward.
+
+### 6.2 Token / account coordinator
+
+Same pattern, leasing **agent-account capacity** instead of merge slots:
+
+- Tracks each account's 5-hour and weekly windows and refresh times.
+- Per agent turn, leases a config home (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`, §7) for an account with headroom.
+- When the whole pool is exhausted, parks turns until a refresh timer fires.
+- Resolve/auto-resolve consult it to decide when *not* to spawn agents and when to retry turns that failed on rate limits.
+
+**Design note — the unification.** Merge slots, agent-account capacity, and (in v2) spend budgets are all the same coordinator-with-leases pattern at different scopes. External-resource brokering is not new machinery; it is this one primitive pointed at different pools.
+
+---
+
+## 7. Agents
+
+### 7.1 Agent profile model
+
+A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capabilities, resourceLimits, auth }`. A **provider adapter** translates the profile into the concrete invocation:
+
+- **Claude** → Claude Agent SDK (same harness as Claude Code; session resume/fork; hooks; MCP).
+- **Codex** → Codex app-server / SDK (structured items/turns/threads; approvals pause a turn; resumable threads).
+
+`auth` references an **auth source**: either a subscription **config home** (a `CODEX_HOME`/`CLAUDE_CONFIG_DIR` directory) or an API-key **credential handle** (§8). Never a raw key inline.
+
+### 7.2 The per-turn execution model
+
+**The workflow is the long-lived (but cheap) thing; the agent runs one turn at a time inside an activity (expensive, but ephemeral).** `runAgentTurn`:
+
+1. Spins up / resumes the agent session (via session/thread ID stored in workflow state).
+2. Lets the agent work until a turn boundary (completion / idle / needs-input).
+3. Captures output, events, and the new session ID; exits — the process dies, RAM is reclaimed.
+
+Between turns — where all waits live — the agent is only a stored session ID. **RAM is consumed strictly during turns, never during waits**, regardless of whether a wait is five seconds or five hours. This is the fix for the naive "long-lived agent process" design that exhausts system resources.
+
+**Yield only at turn boundaries.** Anything long the agent triggers (a 20-minute test suite, a build) becomes its own activity or child workflow so the agent's turn can end; a fresh turn resumes with the result. The agent never sits idle holding context.
+
+### 7.3 Config homes under `~/.karmax`
+
+karmax mints **one config home per (account × profile)** under `~/.karmax`, and injects the right `CODEX_HOME` / `CLAUDE_CONFIG_DIR` at process spawn. This is the official isolation mechanism for both tools and isolates auth, settings, sessions, MCP servers, and skills. Because these are environment variables read at process startup, they apply identically to the CLI, the app-server, and the SDK subprocess. The config home also carries the browser MCP config (§7.5) and the platform MCP config.
+
+**Gotcha:** spawn each agent with a **scrubbed, fully isolated environment** — unset any inherited `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` (they otherwise leak across profiles), and do not share the real home directory (some global state lives outside the config dir). Clean env per spawn.
+
+### 7.4 Agent communication
+
+- **Point-to-point** (supervisor follow-up to a sub-task at the review gate; a hotfix to one task) = **a signal to that task's workflow**, appended to the agent's next turn. No new machinery; it falls out of signals + the per-turn loop.
+- **Fan-out** (a hotfix broadcast to all active tasks touching a file) = **a small workflow** that enumerates targets and signals each. Only orchestrated multi-target comms deserve to be a workflow.
+
+### 7.5 Browser automation
+
+Browser control is via MCP, so it works identically across CLI/app-server/SDK:
+
+- **chrome-devtools-mcp** for inspection/debugging; **Playwright MCP** for full headless automation.
+- Run **headless + isolated**, per task, torn down with the turn; cap concurrency.
+- For logged-in sessions, use a dedicated `--user-data-dir` per account (Chrome blocks remote debugging on the default profile).
+- Run the browser in a container with network policy for anything touching real credentials.
+
+### 7.6 Autonomy (browser, accounts, payments)
+
+The philosophy is maximal autonomy within bounded, auditable controls:
+
+- **Registering / logging in:** never a plaintext password file. Use the credential broker (§8): the agent requests a scoped credential through the platform MCP, the broker injects it just-in-time at spawn, and newly-created accounts are written back to the vault. TOTP-capable brokers let agents complete MFA without a human; un-automatable bank step-up is surfaced as a human gate at the review stage.
+- **Payments (v1):** a **virtual card per agent profile (or per task)** with a hard cap and merchant-lock (e.g. Stripe Issuing for programmatic/business use). Enforcement is at card-authorization level, so over-budget transactions are declined automatically. Spending above a configured threshold requires approval at the review gate. Model the budget as a lease (§6) so the rail can be swapped later. (Payment-protocol rails are v2; §13.)
+
+---
+
+## 8. Permissions and security
+
+### 8.1 Capability model
+
+A flat set of named capabilities (`create-task`, `edit-task`, `create-review-info`, `signal-task`, `reorder-queue`, `merge-into:<repo>:<branch>`, `edit-workflow`, ...). Principals are **humans** and **agent profiles**, each with a granted capability set scoped global/project/task.
+
+### 8.2 Attenuation
+
+An agent acts on behalf of the user/task that spawned it. Its **effective capabilities = intersection(profile-declared ceiling, granting principal's capabilities)**. A profile declares the most it may ever attempt; the spawning context grants a subset; the agent can never exceed its grantor. (Least privilege / capability attenuation.)
+
+### 8.3 Enforcement
+
+- **The workflow mints the agent's credential** — it alone knows the task, the profile, and the granting user — issuing a scoped token when it spawns the agent.
+- **The platform MCP server checks** each call's action against the token's effective capability set before executing.
+- **The merge capability** (`merge-into:...`) is granted only to merge-agent profiles and authorized humans. Do agents get write to their own world/branch only, so every merge into a protected target (including workflow repos) is forced through the merge agent under the queue.
+- **The most dangerous action — publishing workflow/infra changes — is gated not by a runtime check but by the PR-test-approve flow (§4.4).** That gate covers the real blast radius; a minimal capability check covers the rest.
+
+### 8.4 Credential broker
+
+Agents never see raw secrets in prompt/context. A vault-backed broker provides:
+
+- **Just-in-time injection** at spawn into the isolated environment.
+- **Scoping** to exactly what the task needs (not the user's full set).
+- **Rotation** and short-lived credentials.
+- **Full audit** of which agent requested what, when, why.
+
+Agent profiles and workflow repos store **credential handles** (pointers), never raw keys — a key committed into an agent-editable, git-versioned workflow repo is a guaranteed leak.
+
+### 8.5 v1 scope
+
+Build the **token + capability-check skeleton** and the **PR gate** — do not skip them; retrofitting auth onto a system where agents edit infrastructure is dangerous. Defer the policy engine, fine-grained per-field permissions, delegation chains, and deep audit tooling to v2.
+
+---
+
+## 9. Resilience: safe mode and defaults
+
+**Defaults ship immutable and read-only with each release; customizations are versioned overlays that shadow them.** Resolution order is **project override → user override → bundled default**. Nothing is ever destroyed; "restore" is choosing which layer to resolve from, not a copy operation.
+
+- **Global safe mode** boots fully vanilla (resolve with all overlays off) — the floor for "I can't even open the app." Because it is the normal resolver with overlays disabled, it is robust against its own bugs.
+- **Per-workflow disable/fallback** drops a single misbehaving custom workflow to its default (or off) while the rest of the customization keeps working — the common case, analogous to disabling one extension rather than rebooting.
+- **Roll back the overlay** to the last green generation (its git history) for surgical recovery.
+
+**Safe mode must be a repair environment, not just a read-only fallback:** it must give you enough working system to fix the broken customization in place (run vanilla software-dev plus an agent to repair the custom workflow, or revert the overlay).
+
+**Boundary (be precise about the guarantee):** safe mode reverts **code/behavior, not state**. Tasks, worlds, event histories, and config survive booting vanilla, but vanilla code cannot un-break an *in-flight* task of a broken custom workflow (it doesn't understand that instance's durable state shape) — let those drain or cancel. The guarantee is "the system stays operable and fixable," not "every running custom task is recovered."
+
+**The one case safe mode does not cover: coordinators.** Their durable state outlives any code version, and safe mode swaps code, not state. A coordinator edit that corrupts its own continue-as-new payload cannot be fixed by booting vanilla code over corrupt state. Coordinators therefore still require tested state migrations and Temporal patching on the way in (§4.5). Rule: finite workflows edit freely (the floor catches mistakes); stateful coordinators demand care on the way in.
+
+---
+
+## 10. UI and the contribution system
+
+### 10.1 The contribution system
+
+The host implements a **protocol**, not a catalog of anticipated workflows — like a browser rendering any conforming page. A workflow package contributes typed, declared things into named **slots/extension points** on the host: task-detail panel, task-list item, task-list column, project-settings section, global-nav, merge-queue panel, review area, dashboard widget. Mounting is simple; the design work is keeping the **slot set small, stable, and versioned**, because contributions bind to it.
+
+A **command/keymap registry** is the substrate for keyboard navigation: core and contributions register commands; every declared action is a command; keybindings are a view over the registry. The "extensive keyboard navigation system" is this registry, not a separate mechanism.
+
+### 10.2 The rendering tiers (with a guaranteed floor)
+
+Every workflow, however custom, exposes **typed structured state and typed declared actions**, so there is always a renderable floor. Tiers, from safest/most-consistent to most-expressive:
+
+1. **Generic auto-render (floor)** — the view-model shown as structured display; each declared action auto-rendered as a form/button from its argument types. Works for *any* conforming workflow.
+2. **Declarative composition** — compose host widgets (list, gauge, thread, diff, table).
+3. **Mounted component** — a first-party / reviewed component in a slot.
+4. **Sandboxed iframe** — untrusted/agent-authored UI (e.g. a rich review panel), in an iframe with a postMessage bridge to a capability-scoped client.
+
+Trust determines the mounting mechanism (reviewed → mounted; untrusted/agent → sandboxed), not expressiveness. A custom component is only a prettier renderer over the same `query`/`signal`/`update` contract — it cannot invent new backend operations.
+
+**Structured state is mandatory even when a custom renderer exists** — it is what keeps search, audit, automation, and the generic-fallback rendering working for every workflow. A workflow that shipped only a bespoke iframe and no structured state is forbidden by the protocol.
+
+### 10.3 Core UI modules
+
+The host shell and core modules are **first-party**, built on the same contribution system so extensions can **augment** them (add a task-list column, a settings section, a dashboard widget). v1 core modules:
+
+- **Task list** — the primary surface (per project / task list).
+- **Merge queue UI** — ordered queue, reorder, position, cancel.
+- **Settings** — project and global settings, including each active workflow's project-level UI (e.g. for software-dev: repo directories with folder pickers, default agent profiles per role, default merge-to branch, gitignored-files-to-copy, GitHub PR toggle).
+- **User page & notifications.**
+- **Dashboard** — agent runs, token/limit status across accounts, resources used.
+- **The final composed app UI** with the keyboard-navigation registry.
+
+---
+
+## 11. Worlds
+
+### 11.1 The world provider interface
+
+A world is accessed through a small interface so the backend is swappable without touching workflows:
+
+```
+create()        # provision the environment
+exec(cmd)       # run a command
+fs              # read/write files
+pty()           # interactive terminal (powers cheap check-in)
+snapshot()      # checkpoint (powers resume-while-parked)
+destroy()
+events          # lifecycle webhooks -> signals (ready, died, ...)
+```
+
+`createWorld` dispatches to the configured provider. The workflow talks only to this interface, so local-worktree → container → remote sandbox changes nothing upstream.
+
+### 11.2 Backends
+
+- **Local (default):** git worktree; or a local container / devcontainer for isolation on the host.
+- **Sandboxed/remote (pluggable):**
+  - microVM, strong isolation for untrusted code: **E2B** (Firecracker, agent-native, SSH/PTY, lifecycle webhooks, snapshots), **Northflank** (Kata/Firecracker/gVisor, bring-your-own-cloud).
+  - container, faster/persistent "agent lives inside it": **Daytona**, **Cloudflare Sandboxes** (PTY, snapshots, egress-proxy credential injection).
+  - GPU-heavy: **Modal**.
+- **Remote dev env / your own infra:** the container provider pointed at a remote Docker host, or self-hosted Coder/Gitpod.
+
+### 11.3 Ties to the rest of the spec
+
+- The provider **PTY** powers the "open a terminal in the world" check-in against remote worlds.
+- The provider **snapshot** powers the resume-while-parked model: when a workflow parks, snapshot the world and let it sleep to zero; restore on the next turn. This is the cloud equivalent of tearing the agent down between turns and keeps remote worlds cheap while idle.
+- Provider **lifecycle events** become signals into the workflow.
+- A provider's secure credential injection feeds scoped secrets (§8) into a world without putting them in the agent's context.
+
+**v1 scope:** ship local-worktree + one container provider, with the interface designed so a managed sandbox is a drop-in.
+
+---
+
+## 12. Remote access (phone / off-laptop)
+
+karmax serves its web UI on localhost; a mesh or tunnel makes it reachable. This is purely an access layer, orthogonal to the core.
+
+- **Default (private, just you):** **Tailscale** — phone joins the tailnet and reaches the laptop directly; use **Tailscale Serve** for a private `https://*.ts.net` URL (HTTPS is required for some phone-browser features). Nothing is exposed publicly.
+- **Public URL with auth (business / multiple people):** **Cloudflare Tunnel** (outbound-only `cloudflared`, no open ports, no public IP) **with Cloudflare Access** (SSO/OTP) and WAF in front.
+- **Quick one-off:** ngrok (random URL; demos only).
+
+**Non-negotiable:** never put a naked public tunnel in front of karmax — it can move money and drive agents. Keep it private behind Tailscale, or public only behind Cloudflare Access, **and** give karmax its own auth regardless (defense in depth).
+
+---
+
+## 13. v2 and deferred
+
+Explicitly **out of v1**. Build the v1 seams so these arrive as additions, not rewrites.
+
+### 13.1 Substitutes (alternate attempts for a task)
+
+A **task** is the intent; it may own a set of **substitutes** — mutually exclusive alternate executions, of which at most one survives. Use cases: assigning several alternates up front; or, at any point before a winner passes the point of no return, adding another alternate (e.g. "I don't like this one; try again with a tweaked prompt or parameters" — same intent).
+
+Mechanism (reuses existing primitives, no new machinery):
+
+- A substitute is a software-dev execution, spawned fresh or **forked** from a sibling's starting point (fork the prepared session/world and change the binding).
+- The task is a thin coordinator holding a **winner-lease of size 1** — the right to pass the point of no return — the same singleton-lease pattern as the merge queue, scoped to the task.
+- To merge, a substitute acquires the task winner-lease, then a global merge slot.
+- When the winner merges, the task signals every sibling to cancel; cancelling a child cancels its sub-tree, clearing speculative sub-tasks and dependents automatically.
+- Cancelled substitutes are **kept as historical record** (superseded), not deleted.
+
+Invariants: dependents bind to the **task**, never to a specific substitute (so they fire when the task settles); the winner-lease is monotonic (once merged, no new substitutes are accepted). This is fork + child workflows + the lease pattern at a third scope.
+
+### 13.2 Other deferred items
+
+- Permission **policy engine**, fine-grained per-field permissions, delegation chains, deep audit tooling.
+- A workflow **distribution/marketplace**.
+- **Broadcast agent comms** beyond simple fan-out; **mid-turn interruption** (turn cancellation).
+- **Agentic payment protocols** (e.g. mandate-based / tokenized agent payment rails) layered behind the v1 budget-lease abstraction.
+- Additional world providers and richer dashboard analytics.
+
+---
+
+## 14. v1 build checklist
+
+- [ ] Temporal cluster + worker scaffold; deterministic workflow / activity split.
+- [ ] Gateway (HTTP → signal/query/update) + the platform MCP server with scoped-token checks.
+- [ ] Projects, task lists, tasks; the task view-model contract.
+- [ ] Workflow package format (manifest, repo layout, `requires`, `onActivate`); version-pinning per execution.
+- [ ] Workflows: software-dev, just-do, script-exec, goal, merge-only; merge-queue and token/account coordinators (lease pattern + continue-as-new + crash-safe leases).
+- [ ] Per-turn agent loop with session resume; provider adapters for Claude and Codex; per-(account×profile) config homes with scrubbed env.
+- [ ] Capability model + attenuation + workflow-minted scoped tokens; PR-test-approve gate via merge-only.
+- [ ] Credential broker (vault-backed, JIT, scoped, audited); credential handles only.
+- [ ] Contribution system: slots, declared event schemas, command/keymap registry; the generic auto-render floor + declarative tier + sandboxed-iframe escape hatch.
+- [ ] Core UI: task list, merge-queue UI, settings (incl. per-workflow project UI), user/notifications, dashboard, keyboard navigation.
+- [ ] World provider interface + local-worktree + one container provider; cheap PTY check-in + transcript view.
+- [ ] Immutable defaults + overlay resolution + global safe mode + per-workflow fallback.
+- [ ] Remote access via Tailscale (default) / Cloudflare Tunnel + Access; karmax's own auth.
+- [ ] Virtual-card budget per profile/task with hard cap + review-gate threshold.
+
+---
+
+## 15. Glossary
+
+- **World** — the environment a task's work happens in (worktree/container/sandbox).
+- **Review stage** — the gate where a confirmer (human, or AI/parent) confirms or sends a follow-up. (Formerly "Confirm.")
+- **Point of no return** — the merge commit; cancellation is impossible after it.
+- **Lease** — a grant of a scarce resource handed out by a coordinator (merge slot, account capacity, budget).
+- **View-model** — the structured, typed projection of a task's (or coordinator's) state and allowed actions that the UI renders.
+- **Config home** — a `CODEX_HOME` / `CLAUDE_CONFIG_DIR` directory isolating one agent account's auth/settings/sessions/MCP.
+- **Credential handle** — a pointer into the credential broker; resolved to a live secret only at spawn.
+- **Substitute** (v2) — one of several mutually-exclusive alternate executions of the same task.
