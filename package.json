@@ -1,0 +1,38 @@
+{
+  "name": "karmax",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "An agent-orchestration platform centered on a todo list, on a durable-execution substrate (Temporal).",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "dev": "tsx watch --clear-screen=false src/main.ts",
+    "worker": "tsx src/temporal/run-worker.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "reset": "tsx src/scripts/reset.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.191",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@temporalio/activity": "^1.11.7",
+    "@temporalio/client": "^1.11.7",
+    "@temporalio/common": "^1.11.7",
+    "@temporalio/worker": "^1.11.7",
+    "@temporalio/workflow": "^1.11.7",
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

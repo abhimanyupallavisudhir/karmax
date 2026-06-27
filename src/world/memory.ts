@@ -1,0 +1,79 @@
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult } from './types.js';
+
+const pexec = promisify(execFile);
+
+/**
+ * A lightweight world backed by a real temp directory but with no git wiring.
+ * Used for fast, hermetic tests of the agent loop where merge machinery is not
+ * exercised. Real worlds use {@link WorktreeProvider}.
+ */
+export class MemoryWorldProvider implements WorldProvider {
+  readonly kind = 'memory' as const;
+  readonly parkable = true;
+  private roots = new Map<string, string>();
+
+  async create(spec: WorldSpec): Promise<World> {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-mem-${spec.taskId}-`));
+    this.roots.set(spec.taskId, root);
+    const handle: WorldHandle = {
+      kind: 'memory',
+      id: spec.taskId,
+      root,
+      branch: `karmax/${spec.taskId}`,
+      base: spec.base,
+      target: spec.target,
+    };
+    return new MemoryWorld(handle);
+  }
+
+  async open(handle: WorldHandle): Promise<World> {
+    return new MemoryWorld(handle);
+  }
+}
+
+class MemoryWorld implements World {
+  constructor(public handle: WorldHandle) {}
+
+  async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
+    try {
+      const { stdout, stderr } = await pexec(cmd, args, {
+        cwd: opts.cwd ?? this.handle.root,
+        timeout: opts.timeoutMs ?? 60_000,
+        maxBuffer: 32 * 1024 * 1024,
+        env: opts.env ? { ...process.env, ...opts.env } : process.env,
+      });
+      return { stdout, stderr, code: 0 };
+    } catch (e: any) {
+      return { stdout: e.stdout ?? '', stderr: e.stderr ?? String(e?.message ?? e), code: e.code ?? 1 };
+    }
+  }
+
+  async readFile(relPath: string): Promise<string> {
+    return fs.promises.readFile(path.join(this.handle.root, relPath), 'utf8');
+  }
+  async writeFile(relPath: string, content: string): Promise<void> {
+    const abs = path.join(this.handle.root, relPath);
+    await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+    await fs.promises.writeFile(abs, content);
+  }
+  async listFiles(): Promise<string[]> {
+    const out: string[] = [];
+    const walk = (dir: string, prefix: string) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const rel = prefix ? `${prefix}/${e.name}` : e.name;
+        if (e.isDirectory()) walk(path.join(dir, e.name), rel);
+        else out.push(rel);
+      }
+    };
+    if (fs.existsSync(this.handle.root)) walk(this.handle.root, '');
+    return out;
+  }
+  async destroy(): Promise<void> {
+    if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
+  }
+}

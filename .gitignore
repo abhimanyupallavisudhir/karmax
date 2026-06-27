@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# karmax runtime data (workflow repos, worlds, config homes, vault, temporal db, state)
+.karmax/
+.karmax-data/
+
+# logs / coverage / caches
+*.log
+coverage/
+.vitest/
+.cache/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
