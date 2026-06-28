@@ -11,7 +11,9 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest, MANIFESTS } from '../contrib/manifests.js';
-import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig } from '../platform/params.js';
+import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams } from '../platform/params.js';
+import { defaultProvider } from '../agent/adapters.js';
+import { defaultModel } from '../agent/profiles.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePort } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
@@ -260,6 +262,16 @@ export class Gateway {
         const since = Number(url.searchParams.get('since') ?? '0');
         return this.json(res, 200, store.eventsSince(eventsMatch[1]!, since));
       }
+      const sessMatch = p.match(/^\/api\/tasks\/([^/]+)\/sessions$/);
+      if (sessMatch && method === 'GET') {
+        const id = sessMatch[1]!;
+        const out: Record<string, string> = {};
+        for (const role of ['do', 'merge', 'resolve', 'confirm']) {
+          const s = store.kvGet(`session:${id}:${role}`);
+          if (s) out[role] = s;
+        }
+        return this.json(res, 200, out);
+      }
 
       // merge queue
       if (p === '/api/queue' && method === 'GET') {
@@ -287,6 +299,25 @@ export class Gateway {
           200,
           MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params })),
         );
+      }
+
+      // resolved/inherited defaults per scope — drives form placeholders (SPEC §10.4)
+      const defs = p.match(/^\/api\/defaults\/([^/]+)\/([^/]+)$/);
+      if (defs && method === 'GET') {
+        const projectId = defs[1]!;
+        const wf = defs[2]!;
+        const m = manifest(wf);
+        if (!m) return this.json(res, 404, { error: 'no workflow' });
+        const gs = (s: string, w: string) => store.getSettings(s, w);
+        const project = store.getProject(projectId);
+        const globalVals = globalSettingsFor(gs, wf);
+        const projectVals = project ? projectSettingsFor(gs, project, wf) : {};
+        const enrich = (vals: Record<string, unknown>) => this.enrichAgentDefaults(m, vals);
+        return this.json(res, 200, {
+          task: { own: {}, inherited: enrich(resolveParams(m, { project: projectVals, global: globalVals })) },
+          project: { own: projectVals, inherited: enrich(resolveParams(m, { global: globalVals })) },
+          global: { own: globalVals, inherited: enrich(resolveParams(m, {})) },
+        });
       }
 
       // settings (global + per-project, per workflow)
@@ -368,6 +399,22 @@ export class Gateway {
       spawned.push(task.id);
     }
     return { activated: workflow, requires: m?.requires ?? [], spawnedTasks: spawned };
+  }
+
+  /** For each agent field, resolve the concrete provider/model the server would
+   *  actually run (setting → seeded profile → code default), so the form can show
+   *  it as the inherited default. */
+  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>) {
+    const out = { ...vals };
+    for (const f of m.params) {
+      if (f.type !== 'agent' || !f.role) continue;
+      const spec = (out[f.name] as any) || {};
+      const prof = this.deps.store.getProfile(`${f.role}-default`);
+      const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
+      const model = spec.model ?? prof?.model ?? defaultModel(provider);
+      out[f.name] = { provider, ...(model ? { model } : {}), ...(spec.effort ? { effort: spec.effort } : {}) };
+    }
+    return out;
   }
 
   private async dashboard() {

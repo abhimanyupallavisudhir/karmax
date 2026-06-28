@@ -87,7 +87,10 @@ export class ClaudeAdapter implements AgentAdapter {
       if (completed) break;
     }
 
-    return { session: input.session ?? `claude-${input.world.handle.id}`, output: finalText };
+    // The Messages API is stateless — there is no provider conversation id to
+    // resume by, so we don't fabricate one (SPEC §10.5). Use the Agent SDK path
+    // (ambient Claude Code login) for resumable sessions.
+    return { session: input.session, output: finalText };
   }
 
   // ─── Claude Agent SDK (ambient Claude Code login) ───────────────────────────

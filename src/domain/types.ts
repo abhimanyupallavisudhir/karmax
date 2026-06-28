@@ -142,8 +142,9 @@ export interface AgentSpec {
   provider: Provider;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  /** Continue a prior agent session (by task or raw session/conversation id). */
-  resumeFrom?: { taskId?: string; sessionId?: string };
+  /** Continue a prior agent session: a source task (+ which role's agent) or a
+   *  raw provider conversation/session id. */
+  resumeFrom?: { taskId?: string; role?: string; sessionId?: string };
 }
 
 /** A declared action the workflow exposes; auto-rendered as a button/form (§10.2 tier 1). */

@@ -54,46 +54,57 @@ function schemaFor(workflow) {
 }
 
 // ── generic field renderer (SPEC §10.4 / §10.5) ──────────────────────────────
-function renderField(f, value) {
-  const v = value ?? f.default ?? '';
+// value = own (explicitly set at this scope); inherited = what it falls back to.
+function ghost(inherited) {
+  return inherited === undefined || inherited === null || inherited === '' ? '' : `inherit: ${Array.isArray(inherited) ? inherited.join(', ') : inherited}`;
+}
+function renderField(f, value, inherited) {
+  const v = value ?? '';
+  const ph = ghost(inherited) || f.placeholder || '';
   const label = `<label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : ''}`;
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}"`;
-  if (f.type === 'agent') return `<div class="form-row">${label}${renderAgentField(f, value)}</div>`;
+  if (f.type === 'agent') return `<div class="form-row">${label}${renderAgentField(f, value, inherited)}</div>`;
   if (f.type === 'text')
-    return `<div class="form-row">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
-  if (f.type === 'boolean')
-    return `<div class="form-row switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label></div>`;
-  if (f.type === 'select')
-    return `<div class="form-row">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+    return `<div class="form-row">${label}<textarea ${attrs} rows="4" placeholder="${esc(ph)}">${esc(v)}</textarea></div>`;
+  if (f.type === 'boolean') {
+    const checked = value !== undefined ? value : inherited;
+    return `<div class="form-row switch"><input type="checkbox" ${attrs} ${checked ? 'checked' : ''} /><label>${esc(f.label)} <span style="color:var(--ink-3);font-size:11px">(default: ${inherited ? 'on' : 'off'})</span></label></div>`;
+  }
+  if (f.type === 'select') {
+    const inhOpt = `<option value="">${esc(ghost(inherited) || 'inherit')}</option>`;
+    return `<div class="form-row">${label}<select ${attrs}>${inhOpt}${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+  }
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
-    return `<div class="form-row">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
+    return `<div class="form-row">${label}<textarea ${attrs} rows="2" placeholder="${esc(ph || 'one per line')}">${esc(text)}</textarea></div>`;
   }
   // string / number / branch / repoPath
-  return `<div class="form-row">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
+  return `<div class="form-row">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(ph)}" /></div>`;
 }
 
-function renderAgentField(f, spec) {
-  const s = spec || {};
-  const provider = s.provider || 'claude';
+function renderAgentField(f, spec, inherited) {
+  const overriding = !!spec;
+  const inh = inherited || {};
+  const eff = spec || inh; // what to show in the controls
+  const provider = eff.provider || 'claude';
   const models = MODELS[provider] || MODELS.claude;
-  const taskOpts = S.tasks
-    .filter((t) => t.lastView)
-    .map((t) => `<option value="${t.id}" ${s.resumeFrom?.taskId === t.id ? 'selected' : ''}>${esc(t.title)}</option>`)
-    .join('');
-  return `<div class="agent-field" data-agent="${esc(f.role || f.name)}">
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
-      <input class="af-model" list="models-${esc(f.role || f.name)}" placeholder="model (default)" value="${esc(s.model || '')}" style="flex:1;min-width:140px" />
-      <datalist id="models-${esc(f.role || f.name)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
-      <select class="af-effort">${EFFORTS.map((e) => `<option value="${e}" ${e === (s.effort || '') ? 'selected' : ''}>${e || 'effort'}</option>`).join('')}</select>
+  const role = f.role || f.name;
+  const dis = overriding ? '' : 'disabled';
+  return `<div class="agent-field" data-agent="${esc(role)}">
+    <label class="switch" style="font-weight:500"><input type="checkbox" class="af-override" ${overriding ? 'checked' : ''} />
+      Override agent <span style="color:var(--ink-3);font-size:11px">(default: ${esc(inh.provider || 'claude')}${inh.model ? ' · ' + esc(inh.model) : ''}${inh.effort ? ' · ' + esc(inh.effort) : ''})</span></label>
+    <div class="af-controls" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+      <select class="af-provider" ${dis}>${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+      <input class="af-model" list="models-${esc(role)}" placeholder="${esc(inh.model ? 'inherit: ' + inh.model : 'model')}" value="${esc(spec?.model || '')}" ${dis} style="flex:1;min-width:140px" />
+      <datalist id="models-${esc(role)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
+      <select class="af-effort" ${dis}>${EFFORTS.map((e) => `<option value="${e}" ${e === (spec?.effort || '') ? 'selected' : ''}>${e || (inh.effort ? 'inherit: ' + inh.effort : 'effort')}</option>`).join('')}</select>
     </div>
-    <details style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
-      <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
-        <select class="af-resume-task" style="flex:1;min-width:160px"><option value="">— pick a task —</option>${taskOpts}</select>
-        <input class="af-resume-session" placeholder="…or conversation/session id" value="${esc(s.resumeFrom?.sessionId || '')}" style="flex:1;min-width:160px" />
-      </div>
-    </details>
+    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
+      <input class="af-resume-search" placeholder="Search tasks to resume from…" ${dis} style="width:100%;margin-top:6px;padding:7px 10px" />
+      <div class="af-resume-results" style="max-height:140px;overflow:auto"></div>
+      <div class="af-resume-chosen" style="font-size:12px;color:var(--accent);margin-top:4px">${spec?.resumeFrom ? esc(JSON.stringify(spec.resumeFrom)) : ''}</div>
+      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id" value="${esc(spec?.resumeFrom?.sessionId || '')}" ${dis} style="width:100%;margin-top:6px;padding:7px 10px" />
+    </div></details>
   </div>`;
 }
 
@@ -103,18 +114,20 @@ function collectForm(root, fields) {
   for (const f of fields) {
     if (f.type === 'agent') {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
-      if (!box) continue;
+      if (!box || !box.querySelector('.af-override').checked) continue; // not overriding → inherit
       const provider = box.querySelector('.af-provider').value;
       const model = box.querySelector('.af-model').value.trim();
       const effort = box.querySelector('.af-effort').value;
-      const taskId = box.querySelector('.af-resume-task').value;
       const sessionId = box.querySelector('.af-resume-session').value.trim();
+      const chosen = box.querySelector('.af-resume-chosen').textContent.trim();
       const spec = { provider };
       if (model) spec.model = model;
       if (effort) spec.effort = effort;
-      if (taskId || sessionId) spec.resumeFrom = { ...(taskId ? { taskId } : {}), ...(sessionId ? { sessionId } : {}) };
-      // only include if the user actually set something beyond default provider
-      if (model || effort || spec.resumeFrom || provider !== 'claude') out[f.name] = spec;
+      let resumeFrom;
+      if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
+      if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+      if (resumeFrom) spec.resumeFrom = resumeFrom;
+      out[f.name] = spec;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -125,6 +138,49 @@ function collectForm(root, fields) {
     else if (el.value !== '') out[f.name] = el.value;
   }
   return out;
+}
+
+// Wire agent-field controls: override toggle, provider→model datalist, resume search.
+function wireAgentFields(root) {
+  root.querySelectorAll('.agent-field').forEach((box) => {
+    const ov = box.querySelector('.af-override');
+    const ctrls = () => box.querySelectorAll('.af-provider,.af-model,.af-effort,.af-resume-search,.af-resume-session');
+    ov?.addEventListener('change', () => ctrls().forEach((c) => (c.disabled = !ov.checked)));
+    box.querySelector('.af-provider')?.addEventListener('change', (e) => {
+      box.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
+      box.querySelector('.af-model').value = '';
+    });
+    const search = box.querySelector('.af-resume-search');
+    const results = box.querySelector('.af-resume-results');
+    search?.addEventListener('input', () => resumeSearch(box, search.value, results));
+  });
+}
+
+// Resume search: find tasks by title, then list their per-role agent sessions.
+async function resumeSearch(box, q, results) {
+  const ql = q.toLowerCase().trim();
+  if (!ql) { results.innerHTML = ''; return; }
+  const matches = S.tasks.filter((t) => !t.params?.draft && t.title.toLowerCase().includes(ql)).slice(0, 6);
+  const rows = await Promise.all(
+    matches.map(async (t) => {
+      let sessions = {};
+      try { sessions = await api(`/api/tasks/${t.id}/sessions`); } catch {}
+      const roles = Object.keys(sessions);
+      if (!roles.length) return '';
+      return roles
+        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role])}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
+        .join('');
+    }),
+  );
+  const html = rows.filter(Boolean).join('') || '<div style="padding:7px 10px;color:var(--ink-3);font-size:12px">No resumable agent sessions in matching tasks.</div>';
+  results.innerHTML = html;
+  results.querySelectorAll('[data-tid]').forEach((r) =>
+    r.addEventListener('click', () => {
+      box.querySelector('.af-resume-chosen').textContent = JSON.stringify({ taskId: r.dataset.tid, role: r.dataset.role });
+      box.querySelector('.af-resume-search').value = `${r.textContent}`;
+      results.innerHTML = '';
+    }),
+  );
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
@@ -425,10 +481,12 @@ async function deleteDraft(id) {
 }
 
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
-function openTaskForm(workflow, draft) {
+async function openTaskForm(workflow, draft) {
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   const values = draft ? { ...draft.params } : {};
+  let inherited = {};
+  try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
   const root = $('#overlay-root');
   root.innerHTML = `
     <div class="palette-scrim" id="tf-scrim">
@@ -438,27 +496,17 @@ function openTaskForm(workflow, draft) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name])).join('')}</div>
+        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}</div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
           <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${draft ? 'Queue' : 'Add task'}</button>
         </div>
       </div>
     </div>`;
-  const rerender = () => openTaskForm($('#tf-wf').value); // workflow switch re-renders fields
-  $('#tf-wf')?.addEventListener('change', rerender);
+  $('#tf-wf')?.addEventListener('change', () => openTaskForm($('#tf-wf').value)); // workflow switch re-renders fields
   $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') root.innerHTML = ''; });
   $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
-  // re-render agent provider→model datalist on provider change
-  $('#tf-body').querySelectorAll('.af-provider').forEach((sel) =>
-    sel.addEventListener('change', () => {
-      const box = sel.closest('.agent-field');
-      const ml = box.querySelector('.af-model');
-      const dl = box.querySelector('datalist');
-      dl.innerHTML = (MODELS[sel.value] || []).map((m) => `<option value="${m}">`).join('');
-      ml.value = '';
-    }),
-  );
+  wireAgentFields($('#tf-body'));
   const submit = async (draftMode) => {
     const body = collectForm($('#tf-body'), fields);
     const payload = { workflow: wf, params: body, draft: draftMode };
@@ -759,25 +807,20 @@ function settingsForms(scope, projectId) {
 }
 
 async function hydrateSettingsForms(scope, projectId) {
-  // load saved values per workflow and re-fill the inputs
+  // load saved (own) values + inherited defaults per workflow and fill the inputs
   for (const sec of $('#main').querySelectorAll('[data-wf]')) {
     const wf = sec.dataset.wf;
-    const url = scope === 'global' ? `/api/settings/global/${wf}` : `/api/settings/project/${projectId}/${wf}`;
-    let values = {};
-    try { values = await api(url); } catch {}
+    let own = {};
+    let inherited = {};
+    try {
+      const d = await api(`/api/defaults/${projectId || 'global'}/${wf}`);
+      own = d[scope].own;
+      inherited = d[scope].inherited;
+    } catch {}
     const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
-    sec.querySelector('.wf-form').innerHTML = fields.map((f) => renderField(f, values[f.name])).join('');
-    wireAgentProviderSwitches(sec);
+    sec.querySelector('.wf-form').innerHTML = fields.map((f) => renderField(f, own[f.name], inherited[f.name])).join('');
+    wireAgentFields(sec);
   }
-}
-function wireAgentProviderSwitches(root) {
-  root.querySelectorAll('.af-provider').forEach((sel) =>
-    sel.addEventListener('change', () => {
-      const box = sel.closest('.agent-field');
-      box.querySelector('datalist').innerHTML = (MODELS[sel.value] || []).map((m) => `<option value="${m}">`).join('');
-      box.querySelector('.af-model').value = '';
-    }),
-  );
 }
 
 function settingsView(proj) {

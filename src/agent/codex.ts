@@ -2,10 +2,10 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './typ
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 
 /**
- * Codex/OpenAI provider adapter (SPEC §7.1). Uses the OpenAI chat-completions
- * API with function-calling to drive an agentic tool loop in the world. Auth is
- * the OPENAI_API_KEY (resolved JIT; never journaled). Completion is the
- * structured signal_completion tool call.
+ * Codex/OpenAI provider adapter (SPEC §7.1). Uses the OpenAI **Responses API**
+ * with function-calling so the session id we store and resume is the provider's
+ * own conversation handle (`response.id` → `previous_response_id`), not a
+ * karmax-fabricated id (SPEC §10.5). Auth is OPENAI_API_KEY (resolved JIT).
  */
 export class CodexAdapter implements AgentAdapter {
   readonly provider = 'codex' as const;
@@ -18,64 +18,64 @@ export class CodexAdapter implements AgentAdapter {
     const apiKey = input.resolvedAuth?.apiKey ?? process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error('CodexAdapter: OPENAI_API_KEY not set');
     const baseUrl = process.env.KARMAX_OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
-    const model = input.profile.model ?? 'gpt-5.1';
+    const model = input.profile.model ?? 'gpt-4.1';
     const handlers = platformToolHandlers(input.world, ctx);
-    const tools = TOOL_SCHEMAS.map((t) => ({
-      type: 'function',
-      function: { name: t.name, description: t.description, parameters: t.parameters },
-    }));
+    // Responses API function tools are flat ({type:'function', name, ...}).
+    const tools = TOOL_SCHEMAS.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }));
 
-    const messages: any[] = [
-      { role: 'system', content: input.systemPrompt },
-      ...input.messages
-        .filter((m) => m.role !== 'system')
-        .map((m) => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text })),
-    ];
-    if (!input.messages.some((m) => m.role === 'user')) {
-      messages.push({ role: 'user', content: 'Begin the task described above. Call signal_completion when done.' });
-    }
+    // Send only the latest human message; history is carried by previous_response_id.
+    const recent = input.messages.filter((m) => m.role !== 'agent');
+    const firstText = recent.length ? recent[recent.length - 1]!.text : 'Begin the task described in the instructions. Call signal_completion when done.';
+    let nextInput: any[] = [{ role: 'user', content: firstText }];
 
+    let respId: string | undefined = input.session; // resume from a prior response id
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? 24;
     let finalText = '';
 
     for (let i = 0; i < maxIters; i++) {
-      const res = await fetch(`${baseUrl}/chat/completions`, {
+      const body: any = { model, tools, tool_choice: 'auto', store: true, input: nextInput };
+      if (respId) body.previous_response_id = respId;
+      else body.instructions = input.systemPrompt;
+
+      const res = await fetch(`${baseUrl}/responses`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages, tools, tool_choice: 'auto', parallel_tool_calls: false }),
+        body: JSON.stringify(body),
       });
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`OpenAI API ${res.status}: ${body.slice(0, 500)}`);
-      }
+      if (!res.ok) throw new Error(`OpenAI Responses API ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const data = (await res.json()) as any;
-      const msg = data.choices?.[0]?.message;
-      if (!msg) throw new Error('OpenAI: empty response');
-      messages.push(msg);
-      if (msg.content) {
-        finalText = msg.content;
-        ctx.emit(msg.content);
-      }
-      const calls = msg.tool_calls ?? [];
-      if (calls.length === 0) break; // model yielded with no tool call → turn boundary
+      respId = data.id ?? respId;
 
+      const outputs: any[] = data.output ?? [];
+      const calls = outputs.filter((o) => o.type === 'function_call');
+      const text = outputs
+        .filter((o) => o.type === 'message')
+        .flatMap((m: any) => (m.content ?? []).filter((c: any) => c.type === 'output_text').map((c: any) => c.text))
+        .join('\n');
+      if (text) {
+        finalText = text;
+        ctx.emit(text);
+      }
+      if (calls.length === 0) break;
+
+      const toolOutputs: any[] = [];
       let completed = false;
       for (const call of calls) {
-        const name = call.function?.name;
         let args: any = {};
         try {
-          args = call.function?.arguments ? JSON.parse(call.function.arguments) : {};
+          args = call.arguments ? JSON.parse(call.arguments) : {};
         } catch {
-          /* leave args empty */
+          /* leave empty */
         }
-        const handler = handlers[name];
-        const result = handler ? await handler(args) : `unknown tool ${name}`;
-        messages.push({ role: 'tool', tool_call_id: call.id, content: result });
-        if (name === 'signal_completion') completed = true;
+        const handler = handlers[call.name];
+        const result = handler ? await handler(args) : `unknown tool ${call.name}`;
+        toolOutputs.push({ type: 'function_call_output', call_id: call.call_id, output: result });
+        if (call.name === 'signal_completion') completed = true;
       }
+      nextInput = toolOutputs;
       if (completed) break;
     }
 
-    return { session: input.session ?? `codex-${input.world.handle.id}`, output: finalText };
+    return { session: respId, output: finalText };
   }
 }

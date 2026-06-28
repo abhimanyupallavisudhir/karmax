@@ -104,9 +104,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // id, or the stored session of a referenced task for this role.
       let session = args.session;
       if (!session && spec?.resumeFrom) {
+        const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source role
         session = spec.resumeFrom.sessionId
-          ?? (spec.resumeFrom.taskId ? store.kvGet(`session:${spec.resumeFrom.taskId}:${args.role}`) : undefined);
-        if (session) record(args.taskId, 'session.resumed', { from: spec.resumeFrom });
+          ?? (spec.resumeFrom.taskId ? store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) : undefined);
+        if (session) record(args.taskId, 'session.resumed', { from: spec.resumeFrom, session });
       }
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
