@@ -20,12 +20,20 @@ function ensureQuietRuntime() {
 export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}): Promise<WorkerHandle> {
   ensureQuietRuntime();
   const connection = await NativeConnection.connect({ address: conn.address });
+  // Resource caps. The Worker's reusable-VM cache and task-execution pools
+  // default to sizes that scale with CPU cores; on a multi-core box several of
+  // these (one per test file, plus the dev server) can exhaust RAM. These caps
+  // keep one worker small without affecting correctness. Tune via env for prod.
+  const num = (v: string | undefined, d: number) => (v ? Number(v) : d);
   const worker = await Worker.create({
     connection,
     namespace: conn.namespace,
     taskQueue: TASK_QUEUE,
     workflowsPath: fileURLToPath(new URL('../workflows/index.ts', import.meta.url)),
     activities: buildActivities(deps),
+    maxCachedWorkflows: num(process.env.KARMAX_MAX_CACHED_WORKFLOWS, 20),
+    maxConcurrentWorkflowTaskExecutions: num(process.env.KARMAX_MAX_WFT, 8),
+    maxConcurrentActivityTaskExecutions: num(process.env.KARMAX_MAX_ACT, 8),
   });
 
   let runPromise: Promise<void> | undefined;

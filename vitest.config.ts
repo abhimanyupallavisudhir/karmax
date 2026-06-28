@@ -5,8 +5,15 @@ export default defineConfig({
     include: ['tests/**/*.test.ts', 'src/**/*.test.ts'],
     testTimeout: 30_000,
     hookTimeout: 60_000,
+    // Each integration test file boots a real Temporal dev server + Worker.
+    // Run them ONE AT A TIME in a SINGLE process so we never have several heavy
+    // servers/workers alive at once (which can exhaust RAM). See TESTING.md.
     pool: 'forks',
-    // Temporal-backed integration tests must not run concurrently with each other.
+    poolOptions: { forks: { singleFork: true } },
     fileParallelism: false,
+    maxConcurrency: 1,
+    // Make sure a hung integration test is killed rather than left holding a
+    // Temporal server forever.
+    teardownTimeout: 20_000,
   },
 });

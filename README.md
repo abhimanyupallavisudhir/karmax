@@ -74,9 +74,15 @@ merged into your target branch.
 ## Testing
 
 ```bash
-npm test          # 50 tests: real Temporal, real git, mock agent (hermetic)
+npm test          # 55 tests: real Temporal, real git, mock agent (hermetic)
 npm run typecheck
 ```
+
+Integration tests boot a real Temporal dev server + Worker, so the suite runs
+**sequentially, one server at a time**, and the Worker is resource-capped — don't
+re-enable parallelism on a memory-constrained machine. See **[TESTING.md](./TESTING.md)**
+for how to run a subset cheaply, the live-agent/Docker tests, and clearing stray
+Temporal processes.
 
 The live-agent test runs only when an API key is present:
 

@@ -100,10 +100,11 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
       await new Promise<void>((resolve) => {
         child.once('exit', () => resolve());
         child.kill('SIGTERM');
-        // hard kill if it lingers
+        // Hard-kill quickly so a stopping server doesn't overlap the next test
+        // file's fresh one (the dev DB is throwaway — nothing to flush).
         setTimeout(() => {
           if (child.exitCode === null) child.kill('SIGKILL');
-        }, 3000).unref();
+        }, 1200).unref();
       });
     },
   };
