@@ -448,6 +448,35 @@ The host shell and core modules are **first-party**, built on the same contribut
 - **Dashboard** — agent runs, token/limit status across accounts, resources used.
 - **The final composed app UI** with the keyboard-navigation registry.
 
+### 10.4 Parameter forms — the third declared contribution
+
+Just as a workflow declares its events (§5), capabilities (§8), and UI slots (§10.1), it declares its **parameters**: a typed `params` schema in the manifest. This single declaration drives three surfaces, so there is exactly one source of truth and no per-surface guessing (the "declare, don't guess" rule, §0):
+
+1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, world provider, copy-globs, PR toggle).
+2. **The project-settings form** — per-enabled-workflow defaults at the project scope.
+3. **The global-settings form** — the same per-workflow form at the user scope.
+
+**Field model.** Each parameter is a `FieldSpec`: `{ name, type, label, help?, required?, options?, default?, scopes, bind, role? }`.
+
+- `type` ∈ `text | string | number | boolean | select | list | repoPath | branch | agent`. The `agent` type is a composite control (§10.5).
+- `scopes` ⊆ `{ task, project, global }` — which surfaces the field appears on. A prompt is `task`-only; `repos` is `project`-only; base/target/profiles appear on all three.
+- `bind` tells the host where a resolved value lands in the workflow input (`prompt | top | project | profile`), so the same generic assembler maps any workflow's fields into its `TaskInput` with no per-workflow code.
+
+This generalizes the §10.2 declared-action argument descriptor — the same renderer draws action forms and parameter forms.
+
+**Defaults resolution is the overlay model (§9).** A field's effective value is `task override → project setting → global setting → field default`. Settings forms write to the project and global (user) overlays; the task form reads the resolved defaults and lets the user override per-task. Safe mode resolves field defaults only.
+
+**Drafts.** The expanded task form can **save as draft** instead of queueing. A draft is a stored task record with its parameters but no started workflow; it can be edited and later **queued** (which starts the workflow with the stored params) or deleted. This makes the task form a first-class composition surface, not a fire-and-forget dialog.
+
+### 10.5 The agent field (selecting and configuring an agent)
+
+The `agent` field type is the reusable control for choosing the agent that runs a role — used both in the task form (per-role override) and in the project/global settings (per-role defaults). It collects an **AgentSpec**: `{ provider, model, effort?, resumeFrom? }`.
+
+- **provider** ∈ `claude | codex` (and `mock` for tests). **model** is a provider-scoped list with a free-text escape (Claude: `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`, …; Codex: `gpt-4.1`, …). **effort** ∈ `low | medium | high | xhigh | max` where the provider/model supports it.
+- **resumeFrom** continues a prior agent session: either a **task search** picker (find a previous task; resume its stored session for that role) or a directly-entered **conversation/session id**. The chosen session is passed to `runAgentTurn` as the initial session (§7.2), so the agent continues with its prior context (forking, not mutating, the source).
+
+The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.
+
 ---
 
 ## 11. Worlds
