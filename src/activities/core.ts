@@ -87,8 +87,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async runAgentTurn(args: RunAgentTurnArgs) {
-      const profile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId);
+      const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId);
+      // Apply the per-role agent override from the task form (SPEC §10.5).
+      const spec = args.task.agents?.[args.role];
+      const profile = spec
+        ? {
+            ...baseProfile,
+            provider: spec.provider ?? baseProfile.provider,
+            ...(spec.model ? { model: spec.model } : {}),
+            ...(spec.effort ? { effort: spec.effort } : {}),
+          }
+        : baseProfile;
       const world = await worlds.open(args.worldHandle);
+
+      // Resume a prior agent session if requested (SPEC §10.5): explicit session
+      // id, or the stored session of a referenced task for this role.
+      let session = args.session;
+      if (!session && spec?.resumeFrom) {
+        session = spec.resumeFrom.sessionId
+          ?? (spec.resumeFrom.taskId ? store.kvGet(`session:${spec.resumeFrom.taskId}:${args.role}`) : undefined);
+        if (session) record(args.taskId, 'session.resumed', { from: spec.resumeFrom });
+      }
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
       // capabilities = intersection(profile ceiling, granting principal).
@@ -137,7 +156,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           profile,
           world,
           messages: args.messages,
-          session: args.session,
+          session,
           systemPrompt,
           role: args.role,
           maxTurns: profile.maxTurns,
@@ -146,6 +165,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         { adapters: deps.adapters, onEmit: (t) => record(args.taskId, 'agent.output', { text: t }) },
       );
       if (token) deps.tokens?.revoke(token);
+      // Persist the session id so other tasks can resume from this one (§10.5).
+      if (result.session) store.kvSet(`session:${args.taskId}:${args.role}`, result.session);
 
       if (result.skills?.length) {
         for (const s of result.skills) record(args.taskId, 'skill.saved', { name: s.name });

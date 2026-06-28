@@ -20,6 +20,7 @@ const S = {
   drawerSeq: 0,
   activity: [],
   search: '',
+  schema: [],
   ws: null,
 };
 
@@ -39,6 +40,92 @@ const NODES = [
   { key: 'done', label: 'End' },
 ];
 const STAGE_INDEX = { setup: 0, do: 1, resolve: 1, review: 2, pr: 3, merge: 4, escalated: 4, done: 5, cancelled: 5, failed: 5 };
+
+// Provider → model choices for the agent field (free-text also allowed).
+const MODELS = {
+  claude: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-7', 'claude-fable-5'],
+  codex: ['gpt-4.1', 'gpt-4o', 'gpt-4.1-mini'],
+  mock: ['mock'],
+};
+const EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+function schemaFor(workflow) {
+  return (S.schema.find((s) => s.name === workflow)?.params) || [];
+}
+
+// ── generic field renderer (SPEC §10.4 / §10.5) ──────────────────────────────
+function renderField(f, value) {
+  const v = value ?? f.default ?? '';
+  const label = `<label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : ''}`;
+  const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}"`;
+  if (f.type === 'agent') return `<div class="form-row">${label}${renderAgentField(f, value)}</div>`;
+  if (f.type === 'text')
+    return `<div class="form-row">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
+  if (f.type === 'boolean')
+    return `<div class="form-row switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label></div>`;
+  if (f.type === 'select')
+    return `<div class="form-row">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+  if (f.type === 'list') {
+    const text = Array.isArray(v) ? v.join('\n') : v;
+    return `<div class="form-row">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
+  }
+  // string / number / branch / repoPath
+  return `<div class="form-row">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
+}
+
+function renderAgentField(f, spec) {
+  const s = spec || {};
+  const provider = s.provider || 'claude';
+  const models = MODELS[provider] || MODELS.claude;
+  const taskOpts = S.tasks
+    .filter((t) => t.lastView)
+    .map((t) => `<option value="${t.id}" ${s.resumeFrom?.taskId === t.id ? 'selected' : ''}>${esc(t.title)}</option>`)
+    .join('');
+  return `<div class="agent-field" data-agent="${esc(f.role || f.name)}">
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+      <input class="af-model" list="models-${esc(f.role || f.name)}" placeholder="model (default)" value="${esc(s.model || '')}" style="flex:1;min-width:140px" />
+      <datalist id="models-${esc(f.role || f.name)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
+      <select class="af-effort">${EFFORTS.map((e) => `<option value="${e}" ${e === (s.effort || '') ? 'selected' : ''}>${e || 'effort'}</option>`).join('')}</select>
+    </div>
+    <details style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
+      <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+        <select class="af-resume-task" style="flex:1;min-width:160px"><option value="">— pick a task —</option>${taskOpts}</select>
+        <input class="af-resume-session" placeholder="…or conversation/session id" value="${esc(s.resumeFrom?.sessionId || '')}" style="flex:1;min-width:160px" />
+      </div>
+    </details>
+  </div>`;
+}
+
+// Read a form's values back out, keyed by field name (inverse of renderField).
+function collectForm(root, fields) {
+  const out = {};
+  for (const f of fields) {
+    if (f.type === 'agent') {
+      const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      const provider = box.querySelector('.af-provider').value;
+      const model = box.querySelector('.af-model').value.trim();
+      const effort = box.querySelector('.af-effort').value;
+      const taskId = box.querySelector('.af-resume-task').value;
+      const sessionId = box.querySelector('.af-resume-session').value.trim();
+      const spec = { provider };
+      if (model) spec.model = model;
+      if (effort) spec.effort = effort;
+      if (taskId || sessionId) spec.resumeFrom = { ...(taskId ? { taskId } : {}), ...(sessionId ? { sessionId } : {}) };
+      // only include if the user actually set something beyond default provider
+      if (model || effort || spec.resumeFrom || provider !== 'claude') out[f.name] = spec;
+      continue;
+    }
+    const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
+    if (!el) continue;
+    if (f.type === 'boolean') out[f.name] = el.checked;
+    else if (f.type === 'list') out[f.name] = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    else if (f.type === 'number') out[f.name] = el.value === '' ? undefined : Number(el.value);
+    else if (el.value !== '') out[f.name] = el.value;
+  }
+  return out;
+}
 
 // ── api ──────────────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
@@ -73,6 +160,7 @@ async function boot() {
   S.meta = await api('/api/meta');
   try {
     S.contributions = await api('/api/contributions');
+    S.schema = await api('/api/schema');
   } catch {}
   await loadProjects();
   connectWs();
@@ -159,8 +247,9 @@ function renderRail() {
       .join('')}
     <div class="proj add" id="new-project"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
-    <div class="nav-item ${S.tab === 'settings' ? 'active' : ''}" data-tab="settings">⚙ Settings</div>
-    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard">▦ Dashboard</div>`;
+    <div class="label">Global</div>
+    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard">▦ Dashboard</div>
+    <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global">⚙ Global settings</div>`;
   rail.querySelectorAll('.proj[data-id]').forEach((e) =>
     e.addEventListener('click', () => { S.projectId = e.dataset.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); }),
   );
@@ -181,11 +270,14 @@ function renderMain() {
   const main = $('#main');
   if (!main) return;
   const proj = S.projects.find((p) => p.id === S.projectId);
-  const tabs = ['tasks', 'queue', 'activity', 'dashboard', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Merge queue', activity: 'Activity', dashboard: 'Dashboard', settings: 'Settings' };
-  const tabbar = `<div class="tabs">${tabs
-    .map((t) => `<div class="tab ${S.tab === t ? 'active' : ''}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</div>`)
-    .join('')}</div>`;
+  const tabs = ['tasks', 'queue', 'activity', 'settings'];
+  const labels = { tasks: 'Tasks', queue: 'Merge queue', activity: 'Activity', settings: 'Project settings' };
+  const projectScoped = ['tasks', 'queue', 'activity', 'settings'].includes(S.tab);
+  const tabbar = projectScoped
+    ? `<div class="tabs">${tabs
+        .map((t) => `<div class="tab ${S.tab === t ? 'active' : ''}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</div>`)
+        .join('')}</div>`
+    : '';
 
   let content = '';
   if (S.tab === 'tasks') content = tasksView();
@@ -193,19 +285,21 @@ function renderMain() {
   else if (S.tab === 'activity') content = activityView();
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
   else if (S.tab === 'settings') content = settingsView(proj);
+  else if (S.tab === 'global') content = globalSettingsView();
 
   main.innerHTML = tabbar + content;
   main.querySelectorAll('.tab[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
   if (S.tab === 'tasks') wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'settings') wireSettingsView(proj);
+  if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
   updateBell();
 }
 
 // ── tasks ────────────────────────────────────────────────────────────────────
 function tasksView() {
-  const filtered = S.tasks.filter((t) => !S.search || t.title.toLowerCase().includes(S.search.toLowerCase()));
+  const filtered = S.tasks.filter((t) => !t.params?.deleted && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())));
   const rows = filtered
     .slice()
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
@@ -215,12 +309,28 @@ function tasksView() {
     <div class="composer">
       <input class="title-in" id="new-task" placeholder="Describe a task and press Enter…  ( n )" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
+      <button class="btn" id="expand-task" title="Full task form">⋯ More</button>
       <button class="btn primary" id="add-task">Add</button>
     </div>
-    ${rows || `<div class="empty"><div class="big">No tasks yet</div>Describe a task above — an agent will pick it up.</div>`}`;
+    ${rows || `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`}`;
 }
 
 function taskRow(t) {
+  const isDraft = t.params?.draft;
+  if (isDraft) {
+    return `
+    <div class="task-row" data-draft="${t.id}">
+      <span class="status-dot cancelled" title="draft"></span>
+      <div class="task-main">
+        <div class="task-title">${esc(t.title)}</div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span></div>
+      </div>
+      <div class="task-right">
+        <button class="btn sm" data-queue="${t.id}">Queue</button>
+        <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
+      </div>
+    </div>`;
+  }
   const v = t.lastView || {};
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
@@ -273,7 +383,16 @@ function pipelineLarge(v) {
 }
 
 function wireTasksView() {
-  $('#main').querySelectorAll('.task-row').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.id)));
+  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.id)));
+  $('#main').querySelectorAll('[data-draft]').forEach((e) =>
+    e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
+  );
+  $('#main').querySelectorAll('[data-queue]').forEach((b) =>
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+  );
+  $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); /* drafts have no workflow; just drop the row by deleting the task record via cancel-equivalent */ toast('Draft removed'); await deleteDraft(b.dataset.deldraft); }),
+  );
   const add = async () => {
     const input = $('#new-task');
     const title = input.value.trim();
@@ -293,8 +412,72 @@ function wireTasksView() {
   };
   $('#add-task')?.addEventListener('click', add);
   $('#new-task')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+  $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
+
+async function deleteDraft(id) {
+  // No workflow exists for a draft; mark it removed by clearing it from the list.
+  // (Drafts live only as task records; a dedicated delete endpoint can replace this.)
+  try { await api(`/api/tasks/${id}/params`, { method: 'PATCH', body: JSON.stringify({ params: { draft: false, deleted: true } }) }); } catch {}
+  S.tasks = S.tasks.filter((t) => t.id !== id);
+  renderMain();
+}
+
+// ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
+function openTaskForm(workflow, draft) {
+  const wf = workflow || draft?.workflow || 'software-dev';
+  const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
+  const values = draft ? { ...draft.params } : {};
+  const root = $('#overlay-root');
+  root.innerHTML = `
+    <div class="palette-scrim" id="tf-scrim">
+      <div class="palette" style="width:min(640px,94vw);max-height:84vh;overflow:auto">
+        <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px">
+          <b>${draft ? 'Edit draft' : 'New task'}</b>
+          <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
+          <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
+        </div>
+        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name])).join('')}</div>
+        <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
+          <button class="btn" id="tf-draft">Save draft</button>
+          <button class="btn primary" id="tf-queue">${draft ? 'Queue' : 'Add task'}</button>
+        </div>
+      </div>
+    </div>`;
+  const rerender = () => openTaskForm($('#tf-wf').value); // workflow switch re-renders fields
+  $('#tf-wf')?.addEventListener('change', rerender);
+  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') root.innerHTML = ''; });
+  $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
+  // re-render agent provider→model datalist on provider change
+  $('#tf-body').querySelectorAll('.af-provider').forEach((sel) =>
+    sel.addEventListener('change', () => {
+      const box = sel.closest('.agent-field');
+      const ml = box.querySelector('.af-model');
+      const dl = box.querySelector('datalist');
+      dl.innerHTML = (MODELS[sel.value] || []).map((m) => `<option value="${m}">`).join('');
+      ml.value = '';
+    }),
+  );
+  const submit = async (draftMode) => {
+    const body = collectForm($('#tf-body'), fields);
+    const payload = { workflow: wf, params: body, draft: draftMode };
+    try {
+      if (draft) {
+        // edit existing draft, then optionally queue
+        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body }) });
+        if (!draftMode) await api(`/api/tasks/${draft.id}/queue`, { method: 'POST', body: '{}' });
+      } else {
+        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
+      }
+      root.innerHTML = '';
+      toast(draftMode ? 'Draft saved' : 'Task created');
+      refreshTasks();
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#tf-draft').addEventListener('click', () => submit(true));
+  $('#tf-queue').addEventListener('click', () => submit(false));
+}
 
 // ── drawer ───────────────────────────────────────────────────────────────────
 async function openDrawer(taskId) {
@@ -558,48 +741,68 @@ async function renderDashboard() {
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 
-// ── settings ─────────────────────────────────────────────────────────────────
+// ── settings (schema-driven, SPEC §10.4) ─────────────────────────────────────
+// One renderer for both scopes; `scope` decides which fields show + where they save.
+function settingsForms(scope, projectId) {
+  const wfs = S.schema.filter((s) => WORKFLOWS.some((w) => w.id === s.name));
+  return wfs
+    .map((s) => {
+      const fields = s.params.filter((f) => f.scopes.includes(scope));
+      if (!fields.length) return '';
+      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
+        <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— defaults</span></summary>
+        <div class="wf-form" style="margin-top:10px">${fields.map((f) => renderField(f, undefined)).join('')}</div>
+        <button class="btn primary sm" data-save="${esc(s.name)}">Save ${esc(s.name)} defaults</button>
+      </details>`;
+    })
+    .join('');
+}
+
+async function hydrateSettingsForms(scope, projectId) {
+  // load saved values per workflow and re-fill the inputs
+  for (const sec of $('#main').querySelectorAll('[data-wf]')) {
+    const wf = sec.dataset.wf;
+    const url = scope === 'global' ? `/api/settings/global/${wf}` : `/api/settings/project/${projectId}/${wf}`;
+    let values = {};
+    try { values = await api(url); } catch {}
+    const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
+    sec.querySelector('.wf-form').innerHTML = fields.map((f) => renderField(f, values[f.name])).join('');
+    wireAgentProviderSwitches(sec);
+  }
+}
+function wireAgentProviderSwitches(root) {
+  root.querySelectorAll('.af-provider').forEach((sel) =>
+    sel.addEventListener('change', () => {
+      const box = sel.closest('.agent-field');
+      box.querySelector('datalist').innerHTML = (MODELS[sel.value] || []).map((m) => `<option value="${m}">`).join('');
+      box.querySelector('.af-model').value = '';
+    }),
+  );
+}
+
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
-  const c = proj.config || {};
   return `
     <div class="page-title">Project settings — ${esc(proj.name)}</div>
-    <div class="card">
-      <div class="section-h">Software dev</div>
-      <div class="form-row"><label>Repository directory</label><input id="set-repo" value="${esc((c.repos || [])[0] || '')}" placeholder="/path/to/your/repo" /></div>
-      <div class="form-row"><label>Base branch</label><input id="set-base" value="${esc(c.defaultBase || 'main')}" /></div>
-      <div class="form-row"><label>Merge-to (target) branch</label><input id="set-target" value="${esc(c.defaultTarget || 'main')}" /></div>
-      <div class="form-row"><label>Gitignored files to copy into each world (comma-separated)</label><input id="set-copy" value="${esc((c.copyGlobs || []).join(', '))}" placeholder=".env, .env.local" /></div>
-      <div class="form-row"><label>World provider</label><select id="set-world"><option value="worktree" ${c.worldProvider !== 'container' ? 'selected' : ''}>Local git worktree</option><option value="container" ${c.worldProvider === 'container' ? 'selected' : ''}>Container (Docker)</option></select></div>
-      <div class="form-row switch"><input type="checkbox" id="set-pr" ${c.openGithubPr ? 'checked' : ''} /><label for="set-pr">Open a real GitHub PR on confirm (requires gh auth)</label></div>
-      <button class="btn primary" id="save-settings">Save settings</button>
-    </div>
+    <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
+    ${settingsForms('project', proj.id)}
     <div class="card">
       <div class="section-h">Workflow activation</div>
-      <p style="color:var(--ink-2);margin-top:0">Activating a workflow resolves its dependencies and may spawn an onActivate preparation task (e.g. "make this project karmax-ready").</p>
+      <p style="color:var(--ink-2);margin-top:0">Activating a workflow resolves its dependencies and may spawn an onActivate preparation task.</p>
       <button class="btn" id="activate-sd">Activate software-dev (runs prep task)</button>
-    </div>
-    <div class="card">
-      <div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
     </div>`;
 }
 function wireSettingsView(proj) {
-  $('#save-settings')?.addEventListener('click', async () => {
-    const config = {
-      repos: $('#set-repo').value.trim() ? [$('#set-repo').value.trim()] : [],
-      defaultBase: $('#set-base').value.trim() || 'main',
-      defaultTarget: $('#set-target').value.trim() || 'main',
-      copyGlobs: $('#set-copy').value.split(',').map((s) => s.trim()).filter(Boolean),
-      worldProvider: $('#set-world').value,
-      openGithubPr: $('#set-pr').checked,
-    };
-    try {
-      await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ config }) });
-      await loadProjects();
-      toast('Settings saved');
-    } catch (e) { toast(e.message, true); }
-  });
+  hydrateSettingsForms('project', proj.id);
+  $('#main').querySelectorAll('[data-save]').forEach((b) =>
+    b.addEventListener('click', async () => {
+      const wf = b.dataset.save;
+      const sec = b.closest('[data-wf]');
+      const fields = schemaFor(wf).filter((f) => f.scopes.includes('project'));
+      const values = collectForm(sec.querySelector('.wf-form'), fields);
+      try { await api(`/api/settings/project/${proj.id}/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) }); await loadProjects(); toast(`${wf} defaults saved`); } catch (e) { toast(e.message, true); }
+    }),
+  );
   $('#activate-sd')?.addEventListener('click', async () => {
     try {
       const r = await api(`/api/projects/${proj.id}/activate-workflow`, { method: 'POST', body: JSON.stringify({ workflow: 'software-dev' }) });
@@ -607,6 +810,35 @@ function wireSettingsView(proj) {
       refreshTasks();
     } catch (e) { toast(e.message, true); }
   });
+}
+
+// ── global settings (user scope) ─────────────────────────────────────────────
+function globalSettingsView() {
+  return `
+    <div class="page-title">Global settings</div>
+    <p style="color:var(--ink-2);margin-top:-8px">Your defaults across all projects. Projects can override these; tasks override both.</p>
+    ${settingsForms('global')}
+    <div class="card">
+      <div class="section-h">Appearance</div>
+      <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
+    </div>
+    <div class="card">
+      <div class="section-h">Resilience</div>
+      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
+    </div>`;
+}
+function wireGlobalSettings() {
+  hydrateSettingsForms('global');
+  $('#main').querySelectorAll('[data-save]').forEach((b) =>
+    b.addEventListener('click', async () => {
+      const wf = b.dataset.save;
+      const sec = b.closest('[data-wf]');
+      const fields = schemaFor(wf).filter((f) => f.scopes.includes('global'));
+      const values = collectForm(sec.querySelector('.wf-form'), fields);
+      try { await api(`/api/settings/global/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) }); toast(`${wf} global defaults saved`); } catch (e) { toast(e.message, true); }
+    }),
+  );
+  $('#gs-theme')?.addEventListener('click', toggleTheme);
   $('#safe-mode')?.addEventListener('change', async (e) => {
     try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
   });

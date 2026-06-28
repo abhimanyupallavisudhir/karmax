@@ -114,6 +114,38 @@ export interface ActionArg {
   default?: unknown;
 }
 
+// ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
+
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent';
+/** Which surfaces a field appears on. */
+export type FieldScope = 'task' | 'project' | 'global';
+/** Where a resolved value lands in TaskInput (the generic assembler reads this). */
+export type FieldBind = 'prompt' | 'top' | 'project' | 'profile';
+
+export interface FieldSpec {
+  name: string;
+  type: FieldType;
+  label: string;
+  help?: string;
+  required?: boolean;
+  options?: string[];
+  default?: unknown;
+  placeholder?: string;
+  scopes: FieldScope[];
+  bind: FieldBind;
+  /** For agent fields / bind:'profile' — the role this configures (do/merge/resolve). */
+  role?: string;
+}
+
+/** A per-use agent override collected by the `agent` field (SPEC §10.5). */
+export interface AgentSpec {
+  provider: Provider;
+  model?: string;
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  /** Continue a prior agent session (by task or raw session/conversation id). */
+  resumeFrom?: { taskId?: string; sessionId?: string };
+}
+
 /** A declared action the workflow exposes; auto-rendered as a button/form (§10.2 tier 1). */
 export interface DeclaredAction {
   name: string;
@@ -166,7 +198,7 @@ export interface AgentProfile {
   name: string;
   provider: Provider;
   model?: string;
-  effort?: 'low' | 'medium' | 'high';
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   role: AgentRole;
   /** Prompt template path under the content store, or inline text. */
   promptTemplate?: string;
@@ -191,6 +223,8 @@ export interface TaskInput {
   parentTaskId?: string;
   /** Resolved profile ids per role. */
   profiles?: Record<string, string>;
+  /** Per-role agent overrides (provider/model/effort/resume) from the task form (§10.5). */
+  agents?: Record<string, AgentSpec>;
   /** A snapshot of project config, captured at creation. */
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */

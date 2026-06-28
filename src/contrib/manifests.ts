@@ -1,9 +1,23 @@
+import { FieldSpec } from '../domain/types.js';
+
 /**
  * Workflow manifests (SPEC §4.3). Data-only declarations the host reads to wire
  * a workflow in: name/version, `requires` (transitive deps), emitted event
- * schemas, capability ceiling, UI slot contributions, command registrations, and
- * an optional onActivate hook. These are pure data so any layer can import them.
+ * schemas, capability ceiling, UI slot contributions, command registrations,
+ * the typed parameter schema (§10.4), and an optional onActivate hook. Pure data
+ * so any layer can import them.
  */
+
+// ── reusable field builders ──
+const ALL: FieldSpec['scopes'] = ['task', 'project', 'global'];
+const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Prompt', required: true, scopes: ['task'], bind: 'prompt', placeholder: 'Describe the task…' });
+const agentField = (role: string, label: string): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ALL, bind: 'profile', role });
+const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
+const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top' });
+const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directory', help: 'Absolute path, or one starting with ~', scopes: ['project'], bind: 'project' });
+const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
+const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', options: ['worktree', 'container'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
+const prToggleField = (): FieldSpec => ({ name: 'openGithubPr', type: 'boolean', label: 'Open a GitHub PR on confirm', default: false, scopes: ['project', 'global'], bind: 'project' });
 
 export interface EventSchemaDecl {
   type: string;
@@ -50,6 +64,8 @@ export interface WorkflowManifest {
   capabilities: string[];
   ui: UiContribution[];
   commands: CommandDecl[];
+  /** Typed parameter schema (SPEC §10.4) — drives task forms + settings + defaults. */
+  params: FieldSpec[];
   onActivate?: OnActivateDecl;
   /** Coordinators are long-lived singletons (SPEC §6), not task workflows. */
   kind?: 'task' | 'coordinator';
@@ -76,6 +92,18 @@ export const MANIFESTS: WorkflowManifest[] = [
       { id: 'task.followUp', title: 'Send follow-up', keybinding: 'f' },
       { id: 'task.cancel', title: 'Cancel task', keybinding: 'x' },
     ],
+    params: [
+      promptField(),
+      agentField('do', 'Do agent'),
+      baseField(),
+      targetField(),
+      reposField(),
+      copyGlobsField(),
+      worldProviderField(),
+      prToggleField(),
+      agentField('merge', 'Merge agent'),
+      agentField('resolve', 'Resolve agent'),
+    ],
     onActivate: {
       spawnTask: {
         workflow: 'just-do',
@@ -94,6 +122,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'just-do.done', description: 'Single agent call finished.', fields: {} }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), worldProviderField()],
   },
   {
     name: 'script-exec',
@@ -104,6 +133,10 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'script-exec.done', description: 'Command finished.', fields: { code: 'number' } }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
+    params: [
+      { name: 'command', type: 'text', label: 'Command', required: true, scopes: ['task'], bind: 'top', placeholder: 'npm test' },
+      reposField(),
+    ],
   },
   {
     name: 'goal',
@@ -114,6 +147,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), prToggleField()],
   },
   {
     name: 'merge-only',
@@ -124,6 +158,12 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'merge-only.merged', description: 'Reviewed branch merged.', fields: { sha: 'string' } }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
+    params: [
+      { name: 'branch', type: 'branch', label: 'Branch to merge', required: true, scopes: ['task'], bind: 'top' },
+      targetField(),
+      reposField(),
+      agentField('merge', 'Merge agent'),
+    ],
   },
   {
     name: 'merge-queue',
@@ -134,6 +174,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [],
     ui: [{ slot: 'merge-queue-panel', tier: 2, component: 'merge-queue', title: 'Merge queue' }],
     commands: [],
+    params: [],
     kind: 'coordinator',
   },
   {
@@ -145,6 +186,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [],
     ui: [{ slot: 'dashboard-widget', tier: 2, component: 'accounts', title: 'Accounts' }],
     commands: [],
+    params: [],
     kind: 'coordinator',
   },
 ];

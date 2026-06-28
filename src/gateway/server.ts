@@ -10,7 +10,8 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
-import { manifest } from '../contrib/manifests.js';
+import { manifest, MANIFESTS } from '../contrib/manifests.js';
+import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig } from '../platform/params.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePort } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
@@ -232,6 +233,17 @@ export class Gateway {
       if (viewMatch && method === 'GET') {
         return this.json(res, 200, (await api.getTaskView(token, viewMatch[1]!)) ?? null);
       }
+      const queueMatch = p.match(/^\/api\/tasks\/([^/]+)\/queue$/);
+      if (queueMatch && method === 'POST') {
+        return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
+      }
+      const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
+      if (editMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        const t = store.getTask(editMatch[1]!);
+        if (t) store.updateTaskParams(editMatch[1]!, { ...t.params, ...b.params });
+        return this.json(res, 200, store.getTask(editMatch[1]!) ?? null);
+      }
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
@@ -266,6 +278,46 @@ export class Gateway {
         const b = await this.body(req);
         store.upsertProfile(b);
         return this.json(res, 200, { ok: true });
+      }
+
+      // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms
+      if (p === '/api/schema' && method === 'GET') {
+        return this.json(
+          res,
+          200,
+          MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params })),
+        );
+      }
+
+      // settings (global + per-project, per workflow)
+      const gset = p.match(/^\/api\/settings\/global\/([^/]+)$/);
+      if (gset) {
+        const wf = gset[1]!;
+        if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          store.setSettings('global', wf, b.values ?? {});
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const pset = p.match(/^\/api\/settings\/project\/([^/]+)\/([^/]+)$/);
+      if (pset) {
+        const projectId = pset[1]!;
+        const wf = pset[2]!;
+        if (method === 'GET') {
+          const project = store.getProject(projectId);
+          if (!project) return this.json(res, 404, { error: 'no project' });
+          return this.json(res, 200, projectSettingsFor((s, w) => store.getSettings(s, w), project, wf));
+        }
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const values = b.values ?? {};
+          store.setSettings(projectId, wf, values);
+          // Mirror bound-project fields into ProjectConfig for back-compat.
+          const m = manifest(wf);
+          if (m) store.updateProjectConfig(projectId, settingsToProjectConfig(m, values));
+          return this.json(res, 200, { ok: true });
+        }
       }
 
       // contributions (slots / commands / event schemas)

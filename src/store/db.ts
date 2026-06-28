@@ -58,6 +58,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS kv (
         k TEXT PRIMARY KEY, v TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS settings (
+        scopeKey TEXT NOT NULL, workflow TEXT NOT NULL, json TEXT NOT NULL,
+        PRIMARY KEY (scopeKey, workflow)
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
     `);
@@ -199,6 +203,17 @@ export class Store {
     this.db.prepare('UPDATE tasks SET ord = ? WHERE id = ?').run(ord, taskId);
   }
 
+  updateTaskParams(taskId: string, params: TaskParams) {
+    this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId);
+  }
+
+  /** Mark a draft task as queued (clear its draft flag). */
+  clearDraft(taskId: string) {
+    const t = this.getTask(taskId);
+    if (!t) return;
+    this.updateTaskParams(taskId, { ...t.params, draft: false });
+  }
+
   // ─── Profiles ──────────────────────────────────────────────────────────────
 
   upsertProfile(p: AgentProfile) {
@@ -237,6 +252,20 @@ export class Store {
     return (this.db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq').all(seq) as any[]).map(
       (r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }),
     );
+  }
+
+  // ─── Settings (per-scope × workflow parameter values; SPEC §10.4) ────────────
+
+  /** scopeKey = 'global' or a projectId. Returns the stored field-value map (or undefined). */
+  getSettings(scopeKey: string, workflow: string): Record<string, unknown> | undefined {
+    const r = this.db.prepare('SELECT json FROM settings WHERE scopeKey = ? AND workflow = ?').get(scopeKey, workflow) as any;
+    return r ? (JSON.parse(r.json) as Record<string, unknown>) : undefined;
+  }
+
+  setSettings(scopeKey: string, workflow: string, values: Record<string, unknown>) {
+    this.db
+      .prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, workflow) DO UPDATE SET json = excluded.json')
+      .run(scopeKey, workflow, JSON.stringify(values));
   }
 
   // ─── KV (misc small state) ───────────────────────────────────────────────────

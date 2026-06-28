@@ -4,7 +4,9 @@ import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG } from '../workflows/names.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskInput, TaskRecord, TaskView, Message } from '../domain/types.js';
+import { TaskRecord, TaskView, Message } from '../domain/types.js';
+import { manifest as manifestFor } from '../contrib/manifests.js';
+import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
@@ -12,6 +14,8 @@ import { paths } from '../config/paths.js';
 export class CapabilityError extends Error {
   code = 'capability_denied';
 }
+
+const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
 
 export interface KarmaxApiDeps {
   store: Store;
@@ -39,40 +43,84 @@ export class KarmaxApi {
 
   async createTask(
     token: string,
-    args: { projectId: string; title: string; prompt: string; workflow?: string; base?: string; target?: string; command?: string; profiles?: Record<string, string> },
+    args: {
+      projectId: string;
+      title?: string;
+      prompt?: string;
+      workflow?: string;
+      base?: string;
+      target?: string;
+      command?: string;
+      branch?: string;
+      profiles?: Record<string, string>;
+      /** Full task-form field values (SPEC §10.4); takes precedence over the flat fields. */
+      params?: ValueMap;
+      /** Save without starting the workflow (SPEC §10.4 drafts). */
+      draft?: boolean;
+    },
   ): Promise<TaskRecord> {
     this.require(token, 'create_task');
     const workflow = args.workflow ?? 'software-dev';
     const type = WORKFLOW_TYPE[workflow];
-    if (!type) throw new Error(`unknown workflow "${workflow}"`);
+    const manifest = manifestFor(workflow);
+    if (!type || !manifest) throw new Error(`unknown workflow "${workflow}"`);
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
 
-    const task = this.deps.store.createTask({
-      projectId: args.projectId,
-      title: args.title,
-      workflow,
-      workflowVersion: '1.0.0',
-      params: { prompt: args.prompt, base: args.base, target: args.target, command: args.command, profiles: args.profiles },
+    // Task-scope overrides: the form's `params` plus the legacy flat fields.
+    const taskOverrides: ValueMap = { ...(args.params ?? {}) };
+    for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
+      if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
+    }
+    const getSettings = (s: string, w: string) => this.deps.store.getSettings(s, w);
+    const resolved = resolveParams(manifest, {
+      task: taskOverrides,
+      project: projectSettingsFor(getSettings, project, workflow),
+      global: globalSettingsFor(getSettings, workflow),
     });
 
-    const input: TaskInput = {
+    const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
+    const task = this.deps.store.createTask({
+      projectId: args.projectId,
+      title,
+      workflow,
+      workflowVersion: manifest.version,
+      params: { ...resolved, prompt: String(resolved.prompt ?? ''), profiles: args.profiles, draft: !!args.draft },
+    });
+    if (args.draft) return task; // stored but not queued
+
+    const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: args.projectId,
-      title: args.title,
-      prompt: args.prompt,
-      base: args.base ?? project.config.defaultBase,
-      target: args.target ?? project.config.defaultTarget,
-      command: args.command,
-      profiles: args.profiles,
+      title,
       project: project.config,
-    };
-    await this.deps.client.workflow.start(type, {
-      taskQueue: this.deps.taskQueue,
-      workflowId: task.id,
-      args: [input],
     });
+    if (args.profiles) input.profiles = args.profiles;
+
+    await this.deps.client.workflow.start(type, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
     return task;
+  }
+
+  /** Start a previously-saved draft (SPEC §10.4). */
+  async queueTask(token: string, taskId: string): Promise<TaskRecord> {
+    this.require(token, 'create_task');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    const project = this.deps.store.getProject(task.projectId);
+    const manifest = manifestFor(task.workflow);
+    const type = WORKFLOW_TYPE[task.workflow];
+    if (!project || !manifest || !type) throw new Error(`cannot queue task ${taskId}`);
+    const resolved: ValueMap = { ...task.params };
+    const input = assembleTaskInput(manifest, resolved, {
+      taskId: task.id,
+      projectId: task.projectId,
+      title: task.title,
+      project: project.config,
+    });
+    if (task.params.profiles) input.profiles = task.params.profiles as Record<string, string>;
+    this.deps.store.clearDraft(taskId);
+    await this.deps.client.workflow.start(type, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
+    return this.deps.store.getTask(taskId)!;
   }
 
   async getTaskView(token: string, taskId: string): Promise<TaskView | undefined> {
