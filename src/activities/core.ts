@@ -181,6 +181,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return result;
     },
 
+    /** Auto-derive review info from git so Review always shows what changed (§5.5). */
+    async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; diff: string; changedFiles: string[] }> {
+      const world = await worlds.open(handle);
+      const root = handle.root;
+      const { git } = await import('../world/git.js');
+      const tracked = await git(root, ['diff', '--name-only', base]);
+      const untracked = await git(root, ['ls-files', '--others', '--exclude-standard']);
+      const changedFiles = [
+        ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean),
+        ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((f) => `${f} (new)`),
+      ];
+      // intent-to-add so new files appear in the diff, then diff vs base (non-destructive).
+      await git(root, ['add', '-AN']);
+      const diffR = await git(root, ['diff', base]);
+      const diff = diffR.stdout.slice(0, 20000);
+      void world;
+      const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.` : 'No file changes detected.';
+      record(handle.id, 'review.built', { files: changedFiles.length });
+      return { summary, diff, changedFiles };
+    },
+
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {
       const world = await worlds.open(handle);
       const result = await finalizeMerge(world, target);

@@ -255,6 +255,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       }),
     );
     session = turn.session ?? session;
+    if (turn.output?.trim()) msgs.push({ id: `a${msgs.length}`, role: 'agent', text: turn.output, ts: msgs.length });
     seen = msgs.length;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
 
@@ -298,6 +299,18 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         });
         stage = 'do';
         continue;
+      }
+      // Always attach a git-derived review (diff + changed files); the agent's own
+      // review info (summary/links/html) takes precedence where present (§5.5).
+      const auto = await core.buildReview(world as any, base).catch(() => undefined);
+      if (auto) {
+        reviewInfo = {
+          summary: reviewInfo?.summary ?? auto.summary,
+          diff: reviewInfo?.diff ?? auto.diff,
+          changedFiles: auto.changedFiles,
+          ...(reviewInfo?.links ? { links: reviewInfo.links } : {}),
+          ...(reviewInfo?.html ? { html: reviewInfo.html } : {}),
+        };
       }
       stage = 'review';
       status = 'waiting';

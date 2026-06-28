@@ -40,6 +40,15 @@ export async function currentBranch(dir: string): Promise<string> {
   return gitOrThrow(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
 }
 
+/** The repo's actual default branch (origin/HEAD, else the checked-out branch). */
+export async function defaultBranch(repo: string): Promise<string | undefined> {
+  const origin = await git(repo, ['symbolic-ref', '--short', '-q', 'refs/remotes/origin/HEAD']);
+  if (origin.code === 0 && origin.stdout.trim()) return origin.stdout.trim().replace(/^origin\//, '');
+  const cur = await git(repo, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const b = cur.stdout.trim();
+  return cur.code === 0 && b && b !== 'HEAD' ? b : undefined;
+}
+
 export async function headSha(dir: string): Promise<string> {
   return gitOrThrow(dir, ['rev-parse', 'HEAD']);
 }

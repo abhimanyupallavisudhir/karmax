@@ -70,6 +70,11 @@ async function main() {
   const workerRun = worker.run();
   console.log('  • Worker started');
 
+  // Reconcile the task index against live workflows (settle anything lost on restart).
+  const { reconcileTasks } = await import('./platform/reconcile.js');
+  const recon = await reconcileTasks(store, client).catch(() => ({ checked: 0, settled: 0 }));
+  if (recon.settled) console.log(`  • Reconciled ${recon.settled} task(s) lost/finished while offline`);
+
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content });
   const contributions = new ContributionRegistry();
   const overlays = new Overlays();

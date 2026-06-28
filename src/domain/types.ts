@@ -99,6 +99,8 @@ export interface ReviewInfo {
   summary?: string;
   links?: { label: string; url: string }[];
   diff?: string;
+  /** Files changed vs base (auto-derived from git so Review always shows them). */
+  changedFiles?: string[];
   /** Agent-authored rich HTML, rendered in a sandboxed iframe (§10.2 tier 4). */
   html?: string;
 }

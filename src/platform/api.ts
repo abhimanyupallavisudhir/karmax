@@ -7,6 +7,8 @@ import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinat
 import { TaskRecord, TaskView, Message } from '../domain/types.js';
 import { manifest as manifestFor } from '../contrib/manifests.js';
 import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
+import { defaultBranch } from '../world/git.js';
+import { expandPath } from '../util/expand.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
@@ -73,11 +75,22 @@ export class KarmaxApi {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
     const getSettings = (s: string, w: string) => this.deps.store.getSettings(s, w);
-    const resolved = resolveParams(manifest, {
-      task: taskOverrides,
-      project: projectSettingsFor(getSettings, project, workflow),
-      global: globalSettingsFor(getSettings, workflow),
-    });
+    const projectVals = projectSettingsFor(getSettings, project, workflow);
+    const globalVals = globalSettingsFor(getSettings, workflow);
+    const resolved = resolveParams(manifest, { task: taskOverrides, project: projectVals, global: globalVals });
+
+    // Auto-detect the repo's default branch when base/target weren't set anywhere,
+    // instead of guessing "main" (which would create a phantom target branch).
+    const explicitBase = taskOverrides.base ?? projectVals.base ?? globalVals.base;
+    const explicitTarget = taskOverrides.target ?? projectVals.target ?? globalVals.target;
+    const repo0 = project.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
+    if (repo0 && (!explicitBase || !explicitTarget)) {
+      const db = await defaultBranch(repo0).catch(() => undefined);
+      if (db) {
+        if (!explicitBase) resolved.base = db;
+        if (!explicitTarget) resolved.target = db;
+      }
+    }
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
     const task = this.deps.store.createTask({

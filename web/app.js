@@ -17,6 +17,7 @@ const S = {
   selected: null, // taskId
   view: null, // selected task view
   drawerEvents: [],
+  liveOutput: '',
   drawerSeq: 0,
   activity: [],
   search: '',
@@ -248,8 +249,14 @@ function connectWs() {
     if (S.tab === 'activity') renderMain();
     if (S.selected && ev.taskId === S.selected) {
       S.drawerEvents.push(ev);
-      if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result') refreshDrawer();
-      else renderDrawerEvents();
+      if (ev.type === 'agent.output' && ev.payload?.text) {
+        S.liveOutput += (S.liveOutput ? '\n' : '') + ev.payload.text;
+        updateLiveBubble();
+      }
+      if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
+        S.liveOutput = '';
+        refreshDrawer();
+      } else renderDrawerEvents();
     }
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => { if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks(); }, 350);
@@ -619,6 +626,7 @@ function drawerBody(v) {
     ? `<div class="section-h">Review</div>
        <div class="review">
          ${v.reviewInfo.summary ? `<div class="summary">${esc(v.reviewInfo.summary)}</div>` : ''}
+         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin-bottom:8px">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo.diff ? `<div class="diff">${renderDiff(v.reviewInfo.diff)}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
@@ -635,7 +643,9 @@ function drawerBody(v) {
     ${review}
     ${subtasks}
     <div class="section-h">Conversation</div>
-    <div class="thread">${msgs || '<div class="msg system">No messages yet</div>'}</div>
+    <div class="thread">${msgs || '<div class="msg system">No messages yet</div>'}
+      <div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>
+    </div>
     <details class="advanced">
       <summary>Advanced — terminal, live event log, structured state</summary>
       <div class="section-h">Terminal — open a shell in the world (ephemeral)</div>
@@ -707,6 +717,14 @@ function wireActions(v) {
     }),
   );
   $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.open)));
+}
+
+function updateLiveBubble() {
+  const b = document.getElementById('live-bubble');
+  if (!b) return;
+  b.classList.remove('hidden');
+  b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
+  b.scrollIntoView({ block: 'nearest' });
 }
 
 function renderDrawerEvents() {

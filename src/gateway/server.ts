@@ -14,6 +14,7 @@ import { manifest, MANIFESTS } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel } from '../agent/profiles.js';
+import { defaultBranch } from '../world/git.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePort } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
@@ -312,11 +313,21 @@ export class Gateway {
         const project = store.getProject(projectId);
         const globalVals = globalSettingsFor(gs, wf);
         const projectVals = project ? projectSettingsFor(gs, project, wf) : {};
-        const enrich = (vals: Record<string, unknown>) => this.enrichAgentDefaults(m, vals);
+        // Detect the repo's real default branch so placeholders show it (not "main").
+        const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
+        const db = repo0 ? await defaultBranch(repo0).catch(() => undefined) : undefined;
+        const enrich = (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
+          const out = this.enrichAgentDefaults(m, vals);
+          if (db) {
+            if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = db;
+            if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = db;
+          }
+          return out;
+        };
         return this.json(res, 200, {
-          task: { own: {}, inherited: enrich(resolveParams(m, { project: projectVals, global: globalVals })) },
-          project: { own: projectVals, inherited: enrich(resolveParams(m, { global: globalVals })) },
-          global: { own: globalVals, inherited: enrich(resolveParams(m, {})) },
+          task: { own: {}, inherited: enrich(resolveParams(m, { project: projectVals, global: globalVals }), {}) },
+          project: { own: projectVals, inherited: enrich(resolveParams(m, { global: globalVals }), projectVals) },
+          global: { own: globalVals, inherited: enrich(resolveParams(m, {}), { ...projectVals, ...globalVals }) },
         });
       }
 
