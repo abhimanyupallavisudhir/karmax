@@ -86,6 +86,31 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('hi there');
   });
 
+  it('escalates with a clear error when the project repo is misconfigured (no silent scratch)', async () => {
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          taskId,
+          projectId: 'p1',
+          title: 'bad repo',
+          prompt: '@write x.txt :: hi',
+          base: 'main',
+          target: 'main',
+          project: { repos: ['/no/such/repo/path'], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+        },
+      ],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 25_000 }).toBe('escalated');
+    const v = await view(handle);
+    expect(v.error).toMatch(/not a git repository/i);
+    await handle.signal('cancel');
+    const result = await handle.result();
+    expect(result.stage).toBe('cancelled');
+  });
+
   it('routes an unhandled error through Resolve to human escalation', async () => {
     const repo = await h.makeRepo('app-fail');
     const taskId = newId('task');

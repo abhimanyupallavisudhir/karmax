@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult } from './types.js';
 import { git, gitOrThrow, isGitRepo, ensureIdentity } from './git.js';
 import { paths } from '../config/paths.js';
+import { expandPath } from '../util/expand.js';
 
 const pexec = promisify(execFile);
 
@@ -26,10 +27,20 @@ export class WorktreeProvider implements WorldProvider {
     const branch = spec.branch ?? `karmax/${spec.taskId}`;
     const root = path.join(this.home, spec.taskId);
 
-    let repo = spec.repo;
-    if (repo && (await isGitRepo(repo))) {
+    let repo = spec.repo ? expandPath(spec.repo) : undefined;
+    if (repo) {
+      // A repo was configured. It MUST be a valid git repo — never silently fall
+      // back to a throwaway scratch repo (that produces invisible "merges").
+      if (!(await isGitRepo(repo))) {
+        throw new Error(
+          `Configured repository "${spec.repo}" is not a git repository (resolved to "${repo}"). ` +
+            `Fix the repository path in project Settings (an absolute path, or one starting with ~), ` +
+            `or run \`git init\` there.`,
+        );
+      }
       repo = await gitOrThrow(repo, ['rev-parse', '--show-toplevel']);
     } else {
+      // No repo configured at all — a scratch sandbox (the world is the deliverable).
       repo = await this.makeScratchRepo(spec.taskId, spec.base);
     }
 

@@ -188,6 +188,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
   // ── Resolve wrapper (SPEC §5.2) ──
   async function withResolve<T>(stageName: string, fn: () => Promise<T>): Promise<T> {
+    let lastError = '';
     for (;;) {
       let attempt = 0;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
@@ -195,7 +196,8 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           return await fn();
         } catch (err) {
           if (cancelled) throw err;
-          error = String(err);
+          lastError = describeError(err);
+          error = lastError;
           const prevStage = stage;
           stage = 'resolve';
           await publish();
@@ -213,18 +215,20 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
             log.info('resolve agent ran', { completed: r.completed });
           }
           stage = prevStage as Stage;
-          error = undefined;
+          error = undefined; // clear for the retry display
           await publish();
         }
       }
-      // Attempts exhausted → escalate to a human.
+      // Attempts exhausted → escalate to a human, preserving the failure cause.
       stage = 'escalated';
       status = 'blocked';
+      error = lastError;
       retryRequested = false;
       await publish();
       await condition(() => retryRequested || cancelled);
       if (cancelled) throw new Cancelled();
       status = 'active';
+      error = undefined;
     }
   }
 
@@ -383,7 +387,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
   stage = 'done';
   status = 'done';
-  reviewInfo = { ...reviewInfo, summary: `Merged into ${target} as ${sha?.slice(0, 8)}.` };
+  reviewInfo = { ...reviewInfo, summary: `Merged into ${target} at ${world!.repo ?? '(scratch repo)'} as ${sha?.slice(0, 8)}.` };
   await publish();
   await core.destroyWorld(world as any);
   return { stage, sha };
@@ -404,4 +408,15 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
 function lastOutputs(msgs: Message[]): string {
   return msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n');
+}
+
+/** Extract a meaningful message, following Temporal's wrapped `.cause` chain. */
+function describeError(err: any): string {
+  const parts: string[] = [];
+  let e: any = err;
+  for (let depth = 0; e && depth < 6; depth++) {
+    if (e.message && !parts.includes(e.message)) parts.push(e.message);
+    e = e.cause;
+  }
+  return parts.join(' → ') || String(err);
 }

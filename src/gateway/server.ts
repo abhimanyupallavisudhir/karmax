@@ -13,7 +13,8 @@ import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePort } from '../util/ports.js';
-import { Provider } from '../domain/types.js';
+import { expandPath } from '../util/expand.js';
+import { Provider, ProjectConfig } from '../domain/types.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -184,7 +185,7 @@ export class Gateway {
       if (p === '/api/projects' && method === 'GET') return this.json(res, 200, store.listProjects());
       if (p === '/api/projects' && method === 'POST') {
         const b = await this.body(req);
-        return this.json(res, 200, store.createProject(b.name ?? 'New project', b.config ?? {}));
+        return this.json(res, 200, store.createProject(b.name ?? 'New project', normalizeConfig(b.config)));
       }
       const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
       if (projMatch) {
@@ -192,7 +193,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.getProject(id) ?? null);
         if (method === 'PATCH') {
           const b = await this.body(req);
-          return this.json(res, 200, store.updateProjectConfig(id, b.config ?? {}));
+          return this.json(res, 200, store.updateProjectConfig(id, normalizeConfig(b.config)));
         }
         if (method === 'DELETE') {
           store.deleteProject(id);
@@ -378,4 +379,12 @@ export class Gateway {
       /* ignore */
     }
   }
+}
+
+/** Expand ~ / $HOME in repo paths so a configured repo resolves to a real dir. */
+function normalizeConfig(config: ProjectConfig = {}): ProjectConfig {
+  if (Array.isArray(config.repos)) {
+    return { ...config, repos: config.repos.filter(Boolean).map(expandPath) };
+  }
+  return config;
 }
