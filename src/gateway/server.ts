@@ -240,6 +240,15 @@ export class Gateway {
       if (viewMatch && method === 'GET') {
         return this.json(res, 200, (await api.getTaskView(token, viewMatch[1]!)) ?? null);
       }
+      if (viewMatch && method === 'DELETE') {
+        // Hard-delete is for drafts only (they never started a workflow). Running
+        // tasks must be cancelled, not deleted out from under their workflow.
+        const t = store.getTask(viewMatch[1]!);
+        if (!t) return this.json(res, 404, { error: 'no such task' });
+        if (!t.params?.draft) return this.json(res, 400, { error: 'only drafts can be deleted; cancel a running task instead' });
+        store.deleteTask(viewMatch[1]!);
+        return this.json(res, 200, { ok: true });
+      }
       const queueMatch = p.match(/^\/api\/tasks\/([^/]+)\/queue$/);
       if (queueMatch && method === 'POST') {
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));

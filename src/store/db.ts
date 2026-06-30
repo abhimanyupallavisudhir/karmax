@@ -219,6 +219,12 @@ export class Store {
     this.updateTaskParams(taskId, { ...t.params, draft: false });
   }
 
+  /** Hard-delete a task row + its events (used for drafts, which never ran). */
+  deleteTask(taskId: string) {
+    this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId);
+    this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+  }
+
   // ─── Profiles ──────────────────────────────────────────────────────────────
 
   upsertProfile(p: AgentProfile) {

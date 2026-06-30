@@ -76,6 +76,29 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(onMain.stdout).toContain('from a draft');
   });
 
+  it('hard-deletes a draft (it stays gone on reload) but refuses to delete a running task', async () => {
+    const draft = await post(`/api/projects/${projectId}/tasks`, {
+      title: 'Disposable draft',
+      workflow: 'software-dev',
+      draft: true,
+      params: { prompt: 'never queued' },
+    });
+    const del = await fetch(`${base}/api/tasks/${draft.id}`, { method: 'DELETE', headers: auth() });
+    expect(del.status).toBe(200);
+    // gone from the listing — not a soft flag that reappears
+    const tasks = await get(`/api/projects/${projectId}/tasks`);
+    expect(tasks.find((t: any) => t.id === draft.id)).toBeUndefined();
+
+    // a queued (running/terminal) task cannot be hard-deleted via this route
+    const live = await post(`/api/projects/${projectId}/tasks`, {
+      title: 'Live one',
+      workflow: 'software-dev',
+      params: { prompt: '@write x.txt :: y\n@review ok' },
+    });
+    const bad = await fetch(`${base}/api/tasks/${live.id}`, { method: 'DELETE', headers: auth() });
+    expect(bad.status).toBe(400);
+  });
+
   it('resumes a prior agent session via the agent field', async () => {
     // task A runs and stores its session
     const a = await post(`/api/projects/${projectId}/tasks`, {

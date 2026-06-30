@@ -454,7 +454,7 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); /* drafts have no workflow; just drop the row by deleting the task record via cancel-equivalent */ toast('Draft removed'); await deleteDraft(b.dataset.deldraft); }),
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
   );
   const add = async () => {
     const input = $('#new-task');
@@ -480,9 +480,8 @@ function wireTasksView() {
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
 
 async function deleteDraft(id) {
-  // No workflow exists for a draft; mark it removed by clearing it from the list.
-  // (Drafts live only as task records; a dedicated delete endpoint can replace this.)
-  try { await api(`/api/tasks/${id}/params`, { method: 'PATCH', body: JSON.stringify({ params: { draft: false, deleted: true } }) }); } catch {}
+  // Drafts never started a workflow, so the record is hard-deleted server-side.
+  try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch (e) { return toast(e.message, true); }
   S.tasks = S.tasks.filter((t) => t.id !== id);
   renderMain();
 }
