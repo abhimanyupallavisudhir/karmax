@@ -52,6 +52,9 @@ export interface RunAgentTurnArgs {
   task: TaskInput;
   bindings?: Record<string, string>;
   explicitProfileId?: string;
+  /** Config home leased by the account coordinator for this turn (SPEC §6.2);
+   * overrides the profile's own auth home so turns rotate across logins. */
+  accountConfigHome?: string;
 }
 
 export interface PrepareChildArgs {
@@ -154,6 +157,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         if (home) resolvedAuth = { configHome: home };
       }
+      // A coordinator-leased account home wins over the profile default so turns
+      // rotate across connected logins (SPEC §6.2 token/account leasing).
+      if (args.accountConfigHome) resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome };
 
       const systemPrompt = assemblePrompt({
         profile,

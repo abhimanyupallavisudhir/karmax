@@ -12,6 +12,7 @@ import {
   SIG_LEASE_ACCOUNT,
   SIG_RETURN_ACCOUNT,
   SIG_ACCOUNT_GRANTED,
+  SIG_REGISTER_ACCOUNTS,
   QRY_ACCOUNTS,
 } from './names.js';
 
@@ -48,6 +49,15 @@ export interface AccountsView {
 export const leaseAccountSignal = defineSignal<[{ taskId: string; turnId: string }]>(SIG_LEASE_ACCOUNT);
 export const returnAccountSignal = defineSignal<[{ accountId: string }]>(SIG_RETURN_ACCOUNT);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
+/** Upsert accounts into the pool — lets connected logins register after start. */
+export const registerAccountsSignal = defineSignal<[{ accounts: RegisteredAccount[] }]>(SIG_REGISTER_ACCOUNTS);
+
+export interface RegisteredAccount {
+  id: string;
+  configHome: string;
+  maxConcurrent?: number;
+  fiveHourLimit?: number;
+}
 
 const FIVE_HOURS = 5 * 60 * 60 * 1000;
 const CONTINUE_AFTER = 1000;
@@ -62,6 +72,26 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     return a.inUse < a.maxConcurrent && windowOk;
   }
 
+  setHandler(registerAccountsSignal, ({ accounts: incoming }) => {
+    for (const a of incoming) {
+      const existing = accounts.find((x) => x.id === a.id);
+      if (existing) {
+        existing.configHome = a.configHome;
+        existing.maxConcurrent = a.maxConcurrent ?? existing.maxConcurrent;
+        existing.fiveHourLimit = a.fiveHourLimit ?? existing.fiveHourLimit;
+      } else {
+        accounts.push({
+          id: a.id,
+          configHome: a.configHome,
+          maxConcurrent: a.maxConcurrent ?? 1,
+          inUse: 0,
+          fiveHourLimit: a.fiveHourLimit ?? 1_000_000,
+          fiveHourUsed: 0,
+          windowResetAt: 0,
+        });
+      }
+    }
+  });
   setHandler(leaseAccountSignal, (req) => {
     if (!queue.find((q) => q.taskId === req.taskId && q.turnId === req.turnId)) queue.push(req);
   });

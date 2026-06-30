@@ -11,7 +11,7 @@ import {
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
-import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
+import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
 import {
   TaskInput,
   TaskView,
@@ -39,6 +39,7 @@ export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
+export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome: string }]>(SIG_ACCOUNT_GRANTED);
 export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
 export const viewQuery = defineQuery<TaskView>('view');
 
@@ -83,6 +84,10 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let pointOfNoReturnPassed = false;
   let mergeGranted = false;
   let seen = 0; // messages the Do agent has already processed
+  // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
+  const accountGrants = new Map<string, { accountId: string; configHome: string }>();
+  let turnSeq = 0;
+  let accountPool = 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
 
   const kind = input.project.worldProvider === 'container' ? 'container' : 'worktree';
 
@@ -178,6 +183,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   setHandler(mergeGrantedSignal, () => {
     mergeGranted = true;
   });
+  setHandler(accountGrantedSignal, (g) => {
+    accountGrants.set(g.turnId, { accountId: g.accountId, configHome: g.configHome });
+  });
   setHandler(setTargetUpdate, (b) => {
     if (stage === 'do' || stage === 'review') {
       target = b;
@@ -204,14 +212,17 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           const auto = await core.autoResolve({ taskId, stage: stageName, error });
           if (!auto.resolved && world) {
             // Escalate to the Resolve agent with a context bundle.
-            const r = await long.runAgentTurn({
-              taskId,
-              role: 'resolve',
-              worldHandle: world as any,
-              messages: [{ id: `r${attempt}`, role: 'user', text: `Fix the ${stageName} failure.`, ts: 0 }],
-              task: input,
-              bindings: { stage: stageName, error, transcript: lastOutputs(msgs), skills: '' },
-            });
+            const r = await leasedTurn((accountConfigHome) =>
+              long.runAgentTurn({
+                taskId,
+                role: 'resolve',
+                worldHandle: world as any,
+                messages: [{ id: `r${attempt}`, role: 'user', text: `Fix the ${stageName} failure.`, ts: 0 }],
+                task: input,
+                bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
+                accountConfigHome,
+              }),
+            );
             log.info('resolve agent ran', { completed: r.completed });
           }
           stage = prevStage as Stage;
@@ -232,12 +243,34 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     }
   }
 
+  /**
+   * Lease a connected login for one turn (SPEC §6.2), then return it. Activates
+   * only when the account pool is non-empty — otherwise the turn runs exactly as
+   * before with the profile's own home. Never hangs: if no grant arrives within
+   * the park window, it falls back to the profile default.
+   */
+  async function leasedTurn<T>(fn: (accountConfigHome?: string) => Promise<T>): Promise<T> {
+    if (accountPool <= 0) return await fn(undefined);
+    const turnId = `${taskId}#${turnSeq++}`;
+    await coord.leaseAccount(taskId, turnId);
+    await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
+    const grant = accountGrants.get(turnId);
+    accountGrants.delete(turnId);
+    try {
+      return await fn(grant?.configHome);
+    } finally {
+      if (grant) await coord.returnAccount(grant.accountId).catch(() => undefined);
+    }
+  }
+
   try {
   // ── Setup ──
   await publish();
   world = (await withResolve('setup', () =>
     core.createWorld({ taskId, repo: input.project.repos?.[0], base, target, copyGlobs: input.project.copyGlobs, kind }),
   )) as WorldHandleLike;
+  // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
+  accountPool = await coord.accountPoolSize().catch(() => 0);
 
   // ── Do ⇄ Review ──
   for (stage = 'do', status = 'active'; ; ) {
@@ -245,14 +278,17 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     if (cancelled) return await abort();
 
     const turn = await withResolve('do', () =>
-      long.runAgentTurn({
-        taskId,
-        role: 'do',
-        worldHandle: world as any,
-        messages: msgs,
-        session,
-        task: input,
-      }),
+      leasedTurn((accountConfigHome) =>
+        long.runAgentTurn({
+          taskId,
+          role: 'do',
+          worldHandle: world as any,
+          messages: msgs,
+          session,
+          task: input,
+          accountConfigHome,
+        }),
+      ),
     );
     session = turn.session ?? session;
     if (turn.output?.trim()) msgs.push({ id: `a${msgs.length}`, role: 'agent', text: turn.output, ts: msgs.length });
@@ -363,8 +399,8 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     let result;
     try {
       // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
-      await long
-        .runAgentTurn({
+      await leasedTurn((accountConfigHome) =>
+        long.runAgentTurn({
           taskId,
           role: 'merge',
           worldHandle: world as any,
@@ -372,8 +408,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           session,
           task: input,
           bindings: { reviewInfo: reviewInfo?.summary ?? '' },
-        })
-        .catch((e) => log.warn('merge agent turn failed; proceeding to authoritative merge', { e: String(e) }));
+          accountConfigHome,
+        }),
+      ).catch((e) => log.warn('merge agent turn failed; proceeding to authoritative merge', { e: String(e) }));
       // …then the authoritative, deterministic merge that guarantees work lands.
       result = await long.finalizeMergeActivity(world as any, target);
     } catch (err) {

@@ -18,6 +18,7 @@ export const QRY_QUEUE = 'queue';
 export const SIG_LEASE_ACCOUNT = 'leaseAccount';
 export const SIG_RETURN_ACCOUNT = 'returnAccount';
 export const SIG_ACCOUNT_GRANTED = 'accountGranted';
+export const SIG_REGISTER_ACCOUNTS = 'registerAccounts';
 export const QRY_ACCOUNTS = 'accounts';
 
 export const SIG_REQUEST_SPEND = 'requestSpend';

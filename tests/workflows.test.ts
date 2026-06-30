@@ -126,4 +126,31 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await ping.result();
     await coord.terminate('test done');
   });
+
+  it('leases an account per turn when a pool is registered, then returns it', async () => {
+    const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
+    const coordClient = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    // Register a pool (creates the singleton coordinator via the new signal path).
+    await coordClient.registerAccounts([{ id: 'claude:work', configHome: '/tmp/karmax-ch-work', maxConcurrent: 2, fiveHourLimit: 100 }]);
+    const coord = h.client.workflow.getHandle(accountCoordinatorId());
+    await expect.poll(async () => ((await coord.query('accounts')) as any).accounts.length, { timeout: 10_000 }).toBe(1);
+
+    const repo = await h.makeRepo('leased');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'Leased', prompt: 'Do it.\n@write a.txt :: hi\n@review done' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+
+    // The do-turn leased the account (fiveHourUsed incremented) and returned it.
+    const acct = ((await coord.query('accounts')) as any).accounts[0];
+    expect(acct.fiveHourUsed).toBeGreaterThanOrEqual(1);
+    await expect.poll(async () => ((await coord.query('accounts')) as any).accounts[0].inUse, { timeout: 10_000 }).toBe(0);
+    await coord.terminate('test done');
+  });
 });

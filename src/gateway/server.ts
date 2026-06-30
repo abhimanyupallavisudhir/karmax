@@ -355,6 +355,14 @@ export class Gateway {
             platform: b.platformMcp ? { command: String(b.platformMcp.command), args: Array.isArray(b.platformMcp.args) ? b.platformMcp.args : [] } : undefined,
           });
         }
+        // Re-register the pool so any now-logged-in account joins coordinator leasing.
+        if (this.deps.configHomes && this.deps.client) {
+          const pool = this.deps.configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path }));
+          if (pool.length) {
+            const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
+            await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);
+          }
+        }
         // strip the absolute configHome path from the response
         const { configHome, ...safe } = result;
         return this.json(res, 200, safe);

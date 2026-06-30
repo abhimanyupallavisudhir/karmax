@@ -102,7 +102,16 @@ input — one model, not two.
 **Phase F — deeper spec features (later)**
 21. Dynamically-loaded, version-pinned workflow repos + replay-compat (real
     self-healing). This is the substrate the others below lean on for editability.
-22. Token/account coordinator wired into the turn loop.
+22. ✅ Token/account coordinator wired into the turn loop. The built coordinator
+    (lease/park/window-refresh, SPEC §6.2) now drives real per-turn leasing:
+    `registerAccounts` upserts connected logins into the pool; software-dev probes
+    the pool size once after setup and, when non-empty, leases a login per agent
+    turn (`leasedTurn`), passes its `configHome` into `runAgentTurn` (overriding the
+    profile default so turns rotate), and returns it after. Empty pool ⇒ leasing
+    stays off (zero behavior change). Never hangs: a 6h grant timeout falls back to
+    the profile home. Boot + connect register logged-in homes. End-to-end test
+    proves a task leases + returns. *Open:* per-account real token metering (the
+    dev model approximates windows) and rotation policy tuning.
 23. Real GitHub PR lifecycle + webhook dispatcher.
 24. Archive/delete + world/branch pruning; pagination; observability.
 25. **(a) ✅ Profile + account management UI** — edit role profiles
@@ -166,11 +175,10 @@ input — one model, not two.
     - **Runtime resolution**: a profile with `auth.kind:'configHome'` resolves its
       account ref → the minted home via `ConfigHomeManager` (activity dep), so the
       Claude Agent-SDK path runs under that account's `CLAUDE_CONFIG_DIR`.
-    - *Remaining sub-items:* Codex-*subscription* via the Codex app-server/CLI
-      (reads `CODEX_HOME`) instead of the raw Responses API; and wiring the account
-      coordinator (§6.2, item 22) into the turn loop (lease a home with token
-      headroom per turn, rotate/park on rate limits). Logins + switching now exist;
-      automatic rotation is the open piece.
+    - Account-coordinator-into-turn-loop ✅ done (item 22): connected logins are
+      leased per turn and rotate/park automatically.
+    - *Remaining sub-item:* Codex-*subscription* via the Codex app-server/CLI
+      (reads `CODEX_HOME`) instead of the raw Responses API.
 29. **(e) ✅ Per-profile MCP baseline in config homes** (SPEC §7.5, §7.3). karmax
     writes a standard `mcpServers` set into a minted home — the karmax platform
     MCP **and** a browser MCP (chrome-devtools / Playwright) — so every agent on

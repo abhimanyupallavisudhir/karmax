@@ -1,12 +1,18 @@
 import type { Client } from '@temporalio/client';
 import {
   MERGE_QUEUE_WORKFLOW,
+  ACCOUNT_COORDINATOR_WORKFLOW,
   SIG_ENQUEUE,
   SIG_RELEASE,
   SIG_PRIORITIZE,
   SIG_CANCEL_MERGE,
+  SIG_LEASE_ACCOUNT,
+  SIG_RETURN_ACCOUNT,
+  SIG_REGISTER_ACCOUNTS,
   QRY_QUEUE,
+  QRY_ACCOUNTS,
   mergeQueueId,
+  accountCoordinatorId,
 } from '../coordinators/names.js';
 
 export interface CoordinatorActivityDeps {
@@ -83,6 +89,44 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         return desc.status.name === 'RUNNING';
       } catch {
         return false;
+      }
+    },
+
+    // ── account/token coordinator (SPEC §6.2) ──
+    /** Upsert connected logins into the account pool, creating the coordinator. */
+    async registerAccounts(accounts: { id: string; configHome: string; maxConcurrent?: number; fiveHourLimit?: number }[]): Promise<void> {
+      await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
+        workflowId: accountCoordinatorId(),
+        taskQueue,
+        args: [{}],
+        signal: SIG_REGISTER_ACCOUNTS,
+        signalArgs: [{ accounts }],
+      });
+    },
+    /** Request an account lease for a turn (the coordinator signals the task back). */
+    async leaseAccount(taskId: string, turnId: string): Promise<void> {
+      await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
+        workflowId: accountCoordinatorId(),
+        taskQueue,
+        args: [{}],
+        signal: SIG_LEASE_ACCOUNT,
+        signalArgs: [{ taskId, turnId }],
+      });
+    },
+    async returnAccount(accountId: string): Promise<void> {
+      try {
+        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_RETURN_ACCOUNT, { accountId });
+      } catch {
+        /* coordinator gone — nothing to return */
+      }
+    },
+    /** How many accounts are in the pool (0 if the coordinator isn't running). */
+    async accountPoolSize(): Promise<number> {
+      try {
+        const view = (await client.workflow.getHandle(accountCoordinatorId()).query(QRY_ACCOUNTS)) as { accounts: unknown[] };
+        return view.accounts.length;
+      } catch {
+        return 0;
       }
     },
   };
