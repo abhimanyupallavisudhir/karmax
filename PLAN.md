@@ -91,10 +91,30 @@ input — one model, not two.
 
 **Phase F — deeper spec features (later)**
 21. Dynamically-loaded, version-pinned workflow repos + replay-compat (real
-    self-healing).
+    self-healing). This is the substrate the others below lean on for editability.
 22. Token/account coordinator wired into the turn loop.
 23. Real GitHub PR lifecycle + webhook dispatcher.
 24. Archive/delete + world/branch pruning; pagination; observability.
+25. **(a) Profile + account management UI** — edit role profiles
+    (provider/model/effort/capabilities/maxTurns/auth) and connect accounts /
+    register API keys from Global settings. Backend (ProfileStore, broker,
+    /api/profiles) mostly exists; this is forms + a couple endpoints + an
+    `edit_profile`/`register_account` platform-MCP tool so agents can self-edit.
+26. **(b) Contribution UI tiers 2–3** — a host widget library (list/gauge/thread/
+    diff/table) + a renderer that draws whatever a workflow declares into a slot,
+    so extension UIs work without bespoke code (today only tier-1 auto-render and
+    tier-4 iframe are wired; the core modules are hardcoded, not declarative).
+27. **(c) Payments + agent account registration** — a pluggable PaymentProvider
+    interface (mock / Stripe-Issuing / future AP2) behind the existing budget-lease
+    coordinator; a `request_spend` MCP tool + activity that gates on the lease and
+    surfaces over-threshold spend at the review gate; agent account registration +
+    MFA via the broker + browser MCP. The rail implementation lives in an editable
+    layer (workflow-repo/skill) so agents can PR changes when a provider's API
+    shifts — depends on (21) for runtime self-healing.
+
+These were in the original gap assessment; they were triaged below the three
+explicit demands + the trust pass (Phase E), not cut. (a)/(b)/(c) above restore
+them as concrete line items.
 
 Phases A–D deliver the user's three demands; E is the "make it trustworthy"
 pass; F is the long tail. Each phase is independently shippable and tested.

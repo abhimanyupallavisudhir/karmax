@@ -55,98 +55,98 @@ function schemaFor(workflow) {
 }
 
 // ── generic field renderer (SPEC §10.4 / §10.5) ──────────────────────────────
-// value = own (explicitly set at this scope); inherited = what it falls back to.
-function ghost(inherited) {
-  return inherited === undefined || inherited === null || inherited === '' ? '' : `inherit: ${Array.isArray(inherited) ? inherited.join(', ') : inherited}`;
-}
-function renderField(f, value, inherited) {
-  const v = value ?? '';
-  const ph = ghost(inherited) || f.placeholder || '';
+// Controls are PREFILLED with the effective value (own ?? inherited). On submit
+// we only store fields the user CHANGED from the inherited value — so untouched
+// fields keep inheriting (no checkbox, no "Inherit:" options). The inherited
+// value is stashed on the control via data-inherit for that diff.
+const eff = (own, inherited) => (own !== undefined && own !== null && own !== '' ? own : inherited);
+const inhAttr = (val) => `data-inherit='${esc(JSON.stringify(val ?? null))}'`;
+
+function renderField(f, own, inherited) {
+  const v = eff(own, inherited) ?? '';
   const label = `<label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : ''}`;
-  const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}"`;
-  if (f.type === 'agent') return `<div class="form-row">${label}${renderAgentField(f, value, inherited)}</div>`;
+  const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
+  if (f.type === 'agent') return `<div class="form-row">${label}${renderAgentField(f, own, inherited)}</div>`;
   if (f.type === 'text')
-    return `<div class="form-row">${label}<textarea ${attrs} rows="4" placeholder="${esc(ph)}">${esc(v)}</textarea></div>`;
-  if (f.type === 'boolean') {
-    const checked = value !== undefined ? value : inherited;
-    return `<div class="form-row switch"><input type="checkbox" ${attrs} ${checked ? 'checked' : ''} /><label>${esc(f.label)} <span style="color:var(--ink-3);font-size:11px">(default: ${inherited ? 'on' : 'off'})</span></label></div>`;
-  }
-  if (f.type === 'select') {
-    const inhOpt = `<option value="">${esc(ghost(inherited) || 'inherit')}</option>`;
-    return `<div class="form-row">${label}<select ${attrs}>${inhOpt}${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
-  }
+    return `<div class="form-row">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
+  if (f.type === 'boolean')
+    return `<div class="form-row switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label></div>`;
+  if (f.type === 'select')
+    return `<div class="form-row">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
-    return `<div class="form-row">${label}<textarea ${attrs} rows="2" placeholder="${esc(ph || 'one per line')}">${esc(text)}</textarea></div>`;
+    return `<div class="form-row">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
   }
   // string / number / branch / repoPath
-  return `<div class="form-row">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(ph)}" /></div>`;
+  return `<div class="form-row">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
 function renderAgentField(f, spec, inherited) {
-  const overriding = !!spec;
   const inh = inherited || {};
-  const eff = spec || inh; // what to show in the controls
-  const provider = eff.provider || 'claude';
+  const e = spec || inh; // prefill with the effective spec
+  const provider = e.provider || 'claude';
   const models = MODELS[provider] || MODELS.claude;
   const role = f.role || f.name;
-  const dis = overriding ? '' : 'disabled';
-  return `<div class="agent-field" data-agent="${esc(role)}">
-    <label class="switch" style="font-weight:500"><input type="checkbox" class="af-override" ${overriding ? 'checked' : ''} />
-      Override agent <span style="color:var(--ink-3);font-size:11px">(default: ${esc(inh.provider || 'claude')}${inh.model ? ' · ' + esc(inh.model) : ''}${inh.effort ? ' · ' + esc(inh.effort) : ''})</span></label>
-    <div class="af-controls" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
-      <select class="af-provider" ${dis}>${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
-      <input class="af-model" list="models-${esc(role)}" placeholder="${esc(inh.model ? 'inherit: ' + inh.model : 'model')}" value="${esc(spec?.model || '')}" ${dis} style="flex:1;min-width:140px" />
+  return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+      <input class="af-model" list="models-${esc(role)}" placeholder="model" value="${esc(e.model || '')}" style="flex:1;min-width:140px" />
       <datalist id="models-${esc(role)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
-      <select class="af-effort" ${dis}>${EFFORTS.map((e) => `<option value="${e}" ${e === (spec?.effort || '') ? 'selected' : ''}>${e || (inh.effort ? 'inherit: ' + inh.effort : 'effort')}</option>`).join('')}</select>
+      <select class="af-effort">${EFFORTS.map((eo) => `<option value="${eo}" ${eo === (e.effort || '') ? 'selected' : ''}>${eo || 'effort'}</option>`).join('')}</select>
     </div>
     <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
-      <input class="af-resume-search" placeholder="Search tasks to resume from…" ${dis} style="width:100%;margin-top:6px;padding:7px 10px" />
+      <input class="af-resume-search" placeholder="Search tasks to resume from…" style="width:100%;margin-top:6px;padding:7px 10px" />
       <div class="af-resume-results" style="max-height:140px;overflow:auto"></div>
       <div class="af-resume-chosen" style="font-size:12px;color:var(--accent);margin-top:4px">${spec?.resumeFrom ? esc(JSON.stringify(spec.resumeFrom)) : ''}</div>
-      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id" value="${esc(spec?.resumeFrom?.sessionId || '')}" ${dis} style="width:100%;margin-top:6px;padding:7px 10px" />
-    </div></details>
+      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
+    </details>
   </div>`;
 }
 
-// Read a form's values back out, keyed by field name (inverse of renderField).
+const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
+
+// Read a form's values back out; only return fields CHANGED from inherited.
 function collectForm(root, fields) {
   const out = {};
   for (const f of fields) {
     if (f.type === 'agent') {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
-      if (!box || !box.querySelector('.af-override').checked) continue; // not overriding → inherit
-      const provider = box.querySelector('.af-provider').value;
+      if (!box) continue;
+      const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+      const spec = { provider: box.querySelector('.af-provider').value };
       const model = box.querySelector('.af-model').value.trim();
       const effort = box.querySelector('.af-effort').value;
-      const sessionId = box.querySelector('.af-resume-session').value.trim();
-      const chosen = box.querySelector('.af-resume-chosen').textContent.trim();
-      const spec = { provider };
       if (model) spec.model = model;
       if (effort) spec.effort = effort;
+      const sessionId = box.querySelector('.af-resume-session').value.trim();
+      const chosen = box.querySelector('.af-resume-chosen').textContent.trim();
       let resumeFrom;
       if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
       if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
       if (resumeFrom) spec.resumeFrom = resumeFrom;
-      out[f.name] = spec;
+      // include only if the agent differs from inherited OR a resume was chosen
+      if (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))) out[f.name] = spec;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
     if (!el) continue;
-    if (f.type === 'boolean') out[f.name] = el.checked;
-    else if (f.type === 'list') out[f.name] = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
-    else if (f.type === 'number') out[f.name] = el.value === '' ? undefined : Number(el.value);
-    else if (el.value !== '') out[f.name] = el.value;
+    const inh = JSON.parse(el.getAttribute('data-inherit') || 'null');
+    let val;
+    if (f.type === 'boolean') val = el.checked;
+    else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
+    else val = el.value === '' ? undefined : el.value;
+    if (val === undefined) continue;
+    // store only when changed from the inherited default (required fields always)
+    if (f.required || !sameJson(val, inh)) out[f.name] = val;
   }
   return out;
 }
 
-// Wire agent-field controls: override toggle, provider→model datalist, resume search.
+// Wire agent-field controls: provider→model datalist + resume search (no toggle).
 function wireAgentFields(root) {
   root.querySelectorAll('.agent-field').forEach((box) => {
-    const ov = box.querySelector('.af-override');
-    const ctrls = () => box.querySelectorAll('.af-provider,.af-model,.af-effort,.af-resume-search,.af-resume-session');
-    ov?.addEventListener('change', () => ctrls().forEach((c) => (c.disabled = !ov.checked)));
     box.querySelector('.af-provider')?.addEventListener('change', (e) => {
       box.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
       box.querySelector('.af-model').value = '';
