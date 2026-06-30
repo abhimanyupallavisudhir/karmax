@@ -602,7 +602,7 @@ function renderDrawer() {
           <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
-          <span>${esc(v.workflow)}</span>
+          <span>${esc(v.workflow)}${(() => { const rec = S.tasks.find((t) => t.id === v.taskId); return rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''; })()}</span>
           ${v.branch ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}

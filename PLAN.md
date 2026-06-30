@@ -59,12 +59,16 @@ input — one model, not two.
 
 ## Build order
 
-> **Status:** Phases A–E ✅ done; Phase F items **(a)** profile/account UI,
-> **(c)-1** payments lease, **(d)** connect-accounts/multi-login, and **(e)**
-> per-profile MCP baseline ✅ done (91 tests; verified live incl. real Claude +
-> Codex agents). Form fields **prefill the effective value and store only what the
-> user changed** (no inherit-checkbox / "Inherit:" entries). Remaining: two small
-> leftovers + the rest of Phase F (b, c-2/3, 21–24, coordinator-into-turn).
+> **Status:** Phases A–E ✅. Phase F done: **(a)** profile/account UI, **(b)**
+> declarative widget tier, **(c)-1** payments lease, **(d)** connect-accounts/
+> multi-login, **(e)** per-profile MCP baseline, **22** account-coordinator-into-
+> turn-loop, **24** task archiving + pagination + draft hard-delete (100 tests;
+> verified live incl. real Claude + Codex agents). Version-pinning per execution
+> is recorded + surfaced in the UI. Remaining Phase F is the long tail that needs
+> external resources or is a large bet: **21** dynamic version-pinned repo loading
+> (self-healing substrate), **23** GitHub PR webhooks (needs a public endpoint),
+> **(c)-2** real Stripe rail, **(c)-3** agent registration + MFA (browser),
+> instant mid-turn cancel, richer observability.
 >
 > Small leftovers (not yet done): instant mid-turn cancel (cancel currently lands
 > between turns); a real draft `DELETE` endpoint (today drafts soft-delete in the UI).
