@@ -146,9 +146,35 @@ input — one model, not two.
       Cards/budget UI, 12 tests); (c)-2 = real card rail (Stripe Issuing, external);
       (c)-3 = agent account registration + MFA via broker + browser MCP (large).
 
-These were in the original gap assessment; they were triaged below the three
-explicit demands + the trust pass (Phase E), not cut. (a)/(b)/(c) above restore
-them as concrete line items.
+28. **(d) Connect accounts + multiple logins + switching** (SPEC §7.3, §6.2). Both
+    tools support per-home logins: Claude via `CLAUDE_CONFIG_DIR`, Codex via
+    `CODEX_HOME`. Build:
+    - A **LoginManager**: mint a config home per (provider × account), spawn the
+      provider's own login (`claude setup-token` / `codex login`) with that home's
+      env, capture the device/OAuth URL, return it. The user completes OAuth;
+      karmax never types credentials. `status()` checks the home for a credentials
+      file.
+    - **"Connect account" UI** + endpoints (`POST /api/accounts/connect`,
+      `GET /api/accounts` lists config-home accounts + login status). Profiles'
+      account picker offers config-home accounts, not just key handles.
+    - The Claude Agent-SDK path already runs against a profile's `configHome`;
+      Codex-*subscription* needs routing through the Codex app-server/CLI (reads
+      `CODEX_HOME`) instead of the raw API — larger, sub-item.
+    - **Wire the account coordinator (§6.2, item 22) into the turn loop**: lease a
+      config home with token headroom per turn, rotate/park on rate limits.
+29. **(e) Per-profile MCP baseline in config homes** (SPEC §7.5, §7.3). karmax
+    writes a standard `mcpServers` set into each minted home — the karmax platform
+    MCP **and** a browser MCP (chrome-devtools / Playwright) — so every agent on
+    that profile gets browser automation + the platform API, editable per profile.
+    The Claude SDK picks these up via `CLAUDE_CONFIG_DIR`; Codex via
+    `config.toml [mcp_servers]`. This is the clean place to *enforce* a tool
+    baseline and unblocks §7.5 (and the (c)-3 agent-registration flow, which needs
+    a browser). Note: actually executing a browser MCP needs the npx server +
+    a browser at runtime — a deployment concern, not karmax code.
+
+These were in the original gap assessment / the accounts+MCP discussion; they were
+triaged below the three explicit demands + the trust pass (Phase E), not cut.
+(a)/(b)/(c)/(d)/(e) above are the concrete line items.
 
 ## Next up (current implementation target)
 
