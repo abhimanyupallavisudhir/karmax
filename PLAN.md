@@ -59,31 +59,39 @@ input — one model, not two.
 
 ## Build order
 
-**Phase A — the parameter foundation (unblocks 1, 2, 3 + several gaps)**
+> **Status:** Phases A–E are ✅ done (69 tests; verified live incl. real Claude +
+> Codex agents). Form fields now **prefill the effective value and store only
+> what the user changed** (no inherit-checkbox / "Inherit:" entries). Remaining:
+> two small leftovers + Phase F.
+>
+> Small leftovers (not yet done): instant mid-turn cancel (cancel currently lands
+> between turns); a real draft `DELETE` endpoint (today drafts soft-delete in the UI).
+
+**Phase A ✅ — the parameter foundation (unblocks 1, 2, 3 + several gaps)**
 1. `FieldSpec` type; generalize `ActionArg`. Manifest `params` for each workflow.
 2. `settings` store table + migration of `ProjectConfig`.
 3. `resolveParams` + `assembleTaskInput` (overlay resolution + binding).
 4. Refactor `KarmaxApi.createTask` to resolve+assemble (no behavior change yet).
 5. Tests: resolution precedence, binding, back-compat with existing tasks.
 
-**Phase B — agent field + resume**
+**Phase B ✅ — agent field + resume**
 6. `AgentSpec` type; `agent` FieldSpec on the do/merge/resolve roles.
 7. `input.agents` → `runAgentTurn` effective-profile build + resume session.
 8. Persist per-(task,role) session id to the store; task-search resume endpoint.
 9. Tests: agent override changes provider/model; resume passes session.
 
-**Phase C — drafts**
+**Phase C ✅ — drafts**
 10. Task `status: draft`; createTask `draft` option; `queueTask`; edit params.
 11. Tests: draft not started; queue starts with stored params.
 
-**Phase D — UI**
+**Phase D ✅ — UI**
 12. Generic form renderer from FieldSpec (task / project / global).
 13. Expanded task composer + draft controls.
 14. Global settings surface; project settings as a tab; nav split.
 15. Agent-field UI (provider/model/effort + resume picker).
 16. Verify in browser (or curl + Artifact snapshot if automation blocked).
 
-**Phase E — the trust/correctness gaps (from my assessment)**
+**Phase E ✅ — the trust/correctness gaps**
 17. Auto-detect the repo's default branch; validate at task creation.
 18. Auto-generated git-diff review (changed files + test result) at Review.
 19. Live agent-output streaming into the thread + cancel-a-running-turn.
@@ -104,17 +112,51 @@ input — one model, not two.
     diff/table) + a renderer that draws whatever a workflow declares into a slot,
     so extension UIs work without bespoke code (today only tier-1 auto-render and
     tier-4 iframe are wired; the core modules are hardcoded, not declarative).
-27. **(c) Payments + agent account registration** — a pluggable PaymentProvider
-    interface (mock / Stripe-Issuing / future AP2) behind the existing budget-lease
-    coordinator; a `request_spend` MCP tool + activity that gates on the lease and
-    surfaces over-threshold spend at the review gate; agent account registration +
-    MFA via the broker + browser MCP. The rail implementation lives in an editable
-    layer (workflow-repo/skill) so agents can PR changes when a provider's API
-    shifts — depends on (21) for runtime self-healing.
+27. **(c) Payments + agent account registration.** Design (converged):
+    - **Cards are resources** added at project/global scope (like repos). An agent
+      never "owns a wallet"; money is a shared funding source + policy limits.
+    - **Two concerns on the two existing layers:** *which* cards an agent may use →
+      the capability system (`use-card:<id>` / `use-card:*`, attenuated, default =
+      all project cards); *how much* it may spend → the budget-lease (§6), a number
+      keyed by the grant — never a number crammed into a capability string.
+    - **Three limits + funding (orthogonal):** (1) the agent's **allowance** (grant)
+      — soft, exceeding → `needs_approval` (human raises/approves); (2) a **review
+      threshold** — big spend within allowance still asks; (3) the **hard cap**
+      (card/Stripe limit + optional absolute ceiling) — `denied`, can't proceed.
+      Funding availability is separate → `needs_funding`.
+    - **`request_spend({amount, merchant, why})`** (platform-MCP tool + activity)
+      returns one of `granted` | `needs_approval` | `needs_funding` | `denied`.
+      `granted` proceeds with no human; the middle two **park the task** (Temporal
+      durable wait) and raise a **review packet** with the amount, the reason, and a
+      one-tap action — "Approve / raise allowance" (A) or "Top up $X" + link (B).
+      `denied` returns to the agent as a normal tool result so it adapts (cheaper
+      option / skip / report blocked) — never hangs, never silently fails. Money
+      only moves on `granted` (a point-of-no-return, like the merge commit).
+    - **Refine the budget coordinator** (currently flat cap/threshold decline) to
+      emit those four outcomes.
+    - **Pluggable `PaymentProvider`** (`provision` / `authorize` / `fund` / `revoke`)
+      selected by a registry like world providers: `MockPaymentProvider` first
+      (no external account, fully testable), then `StripeIssuingProvider`
+      (Issuing handles card provisioning, spend limits, merchant locks,
+      auth-time decline) or Privacy.com for individuals. The rail implementation
+      lives in an editable layer (workflow-repo/skill) so agents can PR changes
+      when a provider's API shifts — runtime self-healing depends on (21).
+    - **Layering for build:** (c)-1 = request_spend + four-outcome lease + review-
+      packet funding + MockPaymentProvider (medium, no external deps, testable);
+      (c)-2 = real card rail (external); (c)-3 = agent account registration + MFA
+      via broker + browser MCP (large).
 
 These were in the original gap assessment; they were triaged below the three
 explicit demands + the trust pass (Phase E), not cut. (a)/(b)/(c) above restore
 them as concrete line items.
+
+## Next up (current implementation target)
+
+Per the conversation: **(a)** profile/account management UI, then **(c)-1** — the
+`request_spend` four-outcome budget lease + review-packet funding + a
+MockPaymentProvider (no external accounts, end-to-end testable). Then (b) the
+declarative widget renderer; real Stripe rail, agent registration, and dynamic
+version-pinned workflow repos (21) are the larger Phase-F push.
 
 Phases A–D deliver the user's three demands; E is the "make it trustworthy"
 pass; F is the long tail. Each phase is independently shippable and tested.
