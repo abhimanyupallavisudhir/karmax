@@ -31,6 +31,7 @@ export interface GatewayDeps {
   taskQueue: string;
   staticDir: string;
   agentInfo: { provider: Provider; reason: string };
+  broker?: import('../autonomy/broker.js').CredentialBroker;
   password?: string;
   version?: string;
 }
@@ -285,12 +286,26 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
-      // profiles
+      // profiles (agent role profiles: provider/model/effort/capabilities/auth)
       if (p === '/api/profiles' && method === 'GET') return this.json(res, 200, store.listProfiles());
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
-        store.upsertProfile(b);
-        return this.json(res, 200, { ok: true });
+        if (!b.id || !b.role) return this.json(res, 400, { error: 'profile needs id + role' });
+        store.upsertProfile({ provider: 'claude', capabilities: [], ...b });
+        return this.json(res, 200, store.getProfile(b.id) ?? null);
+      }
+
+      // accounts (credential handles in the broker; secrets are write-only)
+      if (p === '/api/accounts' && method === 'GET') {
+        return this.json(res, 200, { handles: this.deps.broker?.listHandles() ?? [] });
+      }
+      if (p === '/api/accounts' && method === 'POST') {
+        const b = await this.body(req);
+        if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+        if (!b.provider || !b.account || !b.apiKey) return this.json(res, 400, { error: 'provider, account, apiKey required' });
+        const handle = `${b.provider}:${b.account}`;
+        this.deps.broker.registerHandle(handle, String(b.apiKey));
+        return this.json(res, 200, { handle }); // never echoes the secret
       }
 
       // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms

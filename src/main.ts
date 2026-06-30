@@ -96,6 +96,7 @@ async function main() {
     taskQueue: TASK_QUEUE,
     staticDir,
     agentInfo: { provider, reason },
+    broker,
     password: process.env.KARMAX_PASSWORD,
     version: VERSION,
   });

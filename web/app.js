@@ -879,6 +879,24 @@ function globalSettingsView() {
     <div class="page-title">Global settings</div>
     <p style="color:var(--ink-2);margin-top:-8px">Your defaults across all projects. Projects can override these; tasks override both.</p>
     ${settingsForms('global')}
+    <div class="card" id="profiles-card">
+      <div class="section-h">Agent profiles</div>
+      <p style="color:var(--ink-2);margin-top:0">Role defaults used when a task doesn't override the agent. Edit provider, model, effort, capabilities, and which stored key to use.</p>
+      <div id="profiles-list">Loading…</div>
+    </div>
+    <div class="card" id="accounts-card">
+      <div class="section-h">Accounts (API keys)</div>
+      <div id="accounts-list" style="margin-bottom:10px"></div>
+      <div class="form-row"><label>Register a key</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <select id="acct-provider"><option>claude</option><option>codex</option></select>
+          <input id="acct-name" placeholder="account name (e.g. work)" style="flex:1;min-width:120px" />
+          <input id="acct-key" type="password" placeholder="API key" style="flex:1;min-width:160px" />
+          <button class="btn" id="acct-add">Register</button>
+        </div>
+        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Stored encrypted in the vault; the key is never shown again. (You enter it — karmax never sees it elsewhere.)</div>
+      </div>
+    </div>
     <div class="card">
       <div class="section-h">Appearance</div>
       <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
@@ -888,8 +906,73 @@ function globalSettingsView() {
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
     </div>`;
 }
+function profileRow(p, handles) {
+  const models = MODELS[p.provider] || MODELS.claude;
+  const authHandle = p.auth?.kind === 'apiKeyHandle' ? p.auth.handle : '';
+  return `<div class="card" data-profile="${esc(p.id)}" style="background:var(--surface-2)">
+    <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
+      <input class="pf-model" list="pm-${esc(p.id)}" placeholder="model" value="${esc(p.model || '')}" style="flex:1;min-width:140px" />
+      <datalist id="pm-${esc(p.id)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
+      <select class="pf-effort">${EFFORTS.map((e) => `<option value="${e}" ${e === (p.effort || '') ? 'selected' : ''}>${e || 'effort'}</option>`).join('')}</select>
+      <input class="pf-maxturns" type="number" placeholder="max turns" value="${p.maxTurns ?? ''}" style="width:90px" />
+    </div>
+    <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
+    <div class="form-row"><label>Account key (handle)</label><select class="pf-auth"><option value="">— ambient login / env —</option>${handles.map((h) => `<option value="${esc(h)}" ${h === authHandle ? 'selected' : ''}>${esc(h)}</option>`).join('')}</select></div>
+    <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save profile</button>
+  </div>`;
+}
+
+async function hydrateProfilesAndAccounts() {
+  let handles = [];
+  try { handles = (await api('/api/accounts')).handles || []; } catch {}
+  const accBox = $('#accounts-list');
+  if (accBox) accBox.innerHTML = handles.length ? handles.map((h) => `<span class="chip">${esc(h)}</span>`).join(' ') : '<span style="color:var(--ink-3)">No keys registered.</span>';
+  let profiles = [];
+  try { profiles = await api('/api/profiles'); } catch {}
+  const list = $('#profiles-list');
+  if (list) {
+    list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
+    list.querySelectorAll('.pf-provider').forEach((sel) => sel.addEventListener('change', (e) => {
+      const card = sel.closest('[data-profile]');
+      card.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
+    }));
+    list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
+      const card = b.closest('[data-profile]');
+      const id = b.dataset.saveprofile;
+      const orig = profiles.find((p) => p.id === id);
+      const authHandle = card.querySelector('.pf-auth').value;
+      const profile = {
+        ...orig,
+        provider: card.querySelector('.pf-provider').value,
+        model: card.querySelector('.pf-model').value.trim() || undefined,
+        effort: card.querySelector('.pf-effort').value || undefined,
+        maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
+        capabilities: card.querySelector('.pf-caps').value.split(',').map((s) => s.trim()).filter(Boolean),
+        auth: authHandle ? { kind: 'apiKeyHandle', handle: authHandle } : undefined,
+      };
+      try { await api('/api/profiles', { method: 'PUT', body: JSON.stringify(profile) }); toast('Profile saved'); } catch (e) { toast(e.message, true); }
+    }));
+  }
+}
+
 function wireGlobalSettings() {
   hydrateSettingsForms('global');
+  hydrateProfilesAndAccounts();
+  $('#acct-add')?.addEventListener('click', async () => {
+    const provider = $('#acct-provider').value;
+    const account = $('#acct-name').value.trim();
+    const apiKey = $('#acct-key').value.trim();
+    if (!account || !apiKey) return toast('account name + key required', true);
+    try {
+      await api('/api/accounts', { method: 'POST', body: JSON.stringify({ provider, account, apiKey }) });
+      $('#acct-key').value = '';
+      $('#acct-name').value = '';
+      toast('Key registered');
+      hydrateProfilesAndAccounts();
+    } catch (e) { toast(e.message, true); }
+  });
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
       const wf = b.dataset.save;

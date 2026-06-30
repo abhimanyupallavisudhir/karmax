@@ -18,6 +18,8 @@ import { KarmaxApi } from '../../src/platform/api.js';
 import { ContributionRegistry } from '../../src/contrib/registry.js';
 import { Overlays } from '../../src/store/overlays.js';
 import { Gateway } from '../../src/gateway/server.js';
+import { CredentialBroker } from '../../src/autonomy/broker.js';
+import { Vault } from '../../src/autonomy/vault.js';
 
 export interface Harness {
   server: DevServer;
@@ -88,6 +90,7 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
         taskQueue: TASK_QUEUE,
         staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-static-')),
         agentInfo: { provider: 'mock', reason: 'test' },
+        broker: new CredentialBroker(new Vault(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-')))),
         password: opts?.password,
       });
       const started = await gw.listen();
