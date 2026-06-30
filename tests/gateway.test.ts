@@ -72,6 +72,16 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     }
     expect(stage).toBe('review');
 
+    // tier-2 declarative widgets resolve against the live view-model (SPEC §10.2)
+    const widgets: any = await (await fetch(`${base}/api/tasks/${task.id}/widgets`, { headers: auth() })).json();
+    expect(widgets.length).toBeGreaterThan(0);
+    const progress = widgets.find((g: any) => g.title === 'Progress');
+    expect(progress).toBeTruthy();
+    const byType = Object.fromEntries(progress.widgets.map((w: any) => [w.type, w]));
+    expect(byType.badge.data).toBe('review'); // bound to view.stage
+    expect(byType.thread.data.length).toBeGreaterThan(0); // bound to view.messages
+    expect(Array.isArray(byType.list.data)).toBe(true); // bound to changedFiles
+
     // events endpoint returns a live log
     const events: any = await (await fetch(`${base}/api/tasks/${task.id}/events?since=0`, { headers: auth() })).json();
     expect(events.length).toBeGreaterThan(0);

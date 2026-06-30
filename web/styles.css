@@ -300,6 +300,11 @@ a { color: var(--accent); text-decoration: none; }
 .diff { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; white-space: pre; }
 .diff .add { color: var(--merged); }
 .diff .del { color: var(--danger); }
+/* tier-2 declarative widgets (host widget library) */
+.wk-table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 4px 0; display: block; overflow-x: auto; }
+.wk-table th, .wk-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.wk-table th { color: var(--ink-3); font-weight: 600; }
+.wk-gauge { margin: 4px 0; }
 
 /* action forms (the generic auto-render floor) */
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }

@@ -541,12 +541,16 @@ async function openDrawer(taskId) {
   try {
     S.view = await api(`/api/tasks/${taskId}`);
     S.drawerEvents = await api(`/api/tasks/${taskId}/events?since=0`);
+    S.widgets = await api(`/api/tasks/${taskId}/widgets`).catch(() => []);
   } catch (e) { toast(e.message, true); }
   renderDrawer();
 }
 async function refreshDrawer() {
   if (!S.selected) return;
-  try { S.view = await api(`/api/tasks/${S.selected}`); } catch {}
+  try {
+    S.view = await api(`/api/tasks/${S.selected}`);
+    S.widgets = await api(`/api/tasks/${S.selected}/widgets`).catch(() => S.widgets);
+  } catch {}
   renderDrawer();
 }
 function closeDrawer() {
@@ -640,6 +644,7 @@ function drawerBody(v) {
     ${pipelineLarge(v)}
     ${error}
     ${review}
+    ${renderWidgetGroups(S.widgets)}
     ${subtasks}
     <div class="section-h">Conversation</div>
     <div class="thread">${msgs || '<div class="msg system">No messages yet</div>'}
@@ -663,6 +668,55 @@ function renderDiff(d) {
     .split('\n')
     .map((l) => (l.startsWith('+') ? `<span class="add">${l}</span>` : l.startsWith('-') ? `<span class="del">${l}</span>` : l))
     .join('\n');
+}
+
+// ── the host widget library (SPEC §10.2 tier 2): draw server-resolved widget
+// descriptors. The host owns NO resolve logic — it just renders what's declared,
+// so any conforming workflow gets a richer-than-floor UI with no bespoke code.
+function renderWidgetGroups(groups) {
+  if (!Array.isArray(groups) || !groups.length) return '';
+  return groups
+    .map((g) => `<div class="section-h">${esc(g.title || g.workflow)}</div>${(g.widgets || []).map(renderWidget).join('')}`)
+    .join('');
+}
+function renderWidget(w) {
+  const empty = (s) => `<div class="task-sub" style="color:var(--ink-3)">${esc(s || '—')}</div>`;
+  const head = w.title ? `<div class="wk-title" style="font-size:11px;color:var(--ink-3);margin:6px 0 2px">${esc(w.title)}</div>` : '';
+  const d = w.data;
+  switch (w.type) {
+    case 'text':
+      return head + (d ? `<div class="wk-text">${esc(d)}</div>` : empty(w.empty));
+    case 'badge':
+      return head + (d ? `<span class="chip">${esc(d)}</span>` : empty(w.empty));
+    case 'keyValue':
+      return head + (Array.isArray(d) && d.length
+        ? `<div class="wk-kv">${d.map((r) => `<div class="task-sub"><b>${esc(r.label)}</b>: ${esc(r.value)}</div>`).join('')}</div>`
+        : empty(w.empty));
+    case 'list':
+      return head + (Array.isArray(d) && d.length
+        ? `<div class="task-sub" style="flex-wrap:wrap">${d.map((x) => `<span class="branch">${esc(x)}</span>`).join('')}</div>`
+        : empty(w.empty));
+    case 'table':
+      return head + (d && d.rows && d.rows.length
+        ? `<table class="wk-table"><thead><tr>${d.columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>`
+          + `<tbody>${d.rows.map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+        : empty(w.empty));
+    case 'thread':
+      return head + (Array.isArray(d) && d.length
+        ? `<div class="thread">${d.map((m) => `<div class="msg ${esc(m.role)}"><div class="role">${esc(m.role)}</div>${esc(m.text)}</div>`).join('')}</div>`
+        : empty(w.empty));
+    case 'diff':
+      return head + (d ? `<div class="diff">${renderDiff(d)}</div>` : empty(w.empty));
+    case 'gauge': {
+      const g = d || { value: 0, max: 0, pct: 0 };
+      return head + `<div class="wk-gauge" title="${g.value} / ${g.max}">
+        <div class="wk-gauge-bar" style="background:var(--surface-2);border-radius:6px;height:10px;overflow:hidden">
+          <div style="width:${g.pct}%;height:100%;background:var(--accent,#5b8cff)"></div></div>
+        <div class="task-sub" style="color:var(--ink-3)">${g.max ? `${g.value} / ${g.max}` : 'n/a'}</div></div>`;
+    }
+    default:
+      return '';
+  }
 }
 
 // the generic auto-render floor (SPEC §10.2 tier 1): render declared actions

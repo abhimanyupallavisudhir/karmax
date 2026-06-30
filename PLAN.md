@@ -119,10 +119,18 @@ input — one model, not two.
     register API keys from Global settings. Backend (ProfileStore, broker,
     /api/profiles) mostly exists; this is forms + a couple endpoints + an
     `edit_profile`/`register_account` platform-MCP tool so agents can self-edit.
-26. **(b) Contribution UI tiers 2–3** — a host widget library (list/gauge/thread/
-    diff/table) + a renderer that draws whatever a workflow declares into a slot,
-    so extension UIs work without bespoke code (today only tier-1 auto-render and
-    tier-4 iframe are wired; the core modules are hardcoded, not declarative).
+26. **(b) ✅ Contribution UI tiers 2–3** — declarative composition is now wired.
+    `src/contrib/widgets.ts` defines `WidgetSpec` (text/badge/keyValue/list/table/
+    thread/diff/gauge) + a pure, tested `resolveWidgets` that binds each widget's
+    path into the workflow view-model. A contribution declares `widgets` inline;
+    the server resolves them against the live view (`GET /api/tasks/:id/widgets`)
+    so the UI is a pure **host widget library** (web/app.js `renderWidgetGroups`)
+    that draws descriptors and owns no resolve logic — any conforming workflow gets
+    a richer-than-floor UI with no bespoke code. software-dev ships a tier-2
+    "Progress" panel (stage badge, merge-queue gauge, changed-files list,
+    conversation thread) as the worked example. Tier 3 (mounted component) remains
+    the existing named-`component` path (merge-queue, accounts, settings); tier 1
+    (floor) and tier 4 (iframe) unchanged.
 27. **(c) Payments + agent account registration.** Design (converged):
     - **Cards are resources** added at project/global scope (like repos). An agent
       never "owns a wallet"; money is a shared funding source + policy limits.

@@ -38,8 +38,10 @@ export interface UiContribution {
     | 'global-nav';
   /** Rendering tier (SPEC §10.2): 1 generic floor, 2 declarative, 3 mounted, 4 sandboxed iframe. */
   tier: 1 | 2 | 3 | 4;
-  /** Component/renderer id the UI resolves (for tiers 2–4). */
+  /** Component/renderer id the UI resolves (for tier-3 mounted components). */
   component?: string;
+  /** Declarative widget composition (tier 2) — host draws these, no bespoke code. */
+  widgets?: import('./widgets.js').WidgetSpec[];
   title?: string;
 }
 
@@ -84,6 +86,19 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     ui: [
       { slot: 'task-detail', tier: 1, title: 'Task' },
+      // Tier-2 declarative composition (SPEC §10.2): host widgets bound to the
+      // view-model — drawn generically, no software-dev-specific UI code.
+      {
+        slot: 'task-detail',
+        tier: 2,
+        title: 'Progress',
+        widgets: [
+          { type: 'badge', bind: 'stage', title: 'Stage' },
+          { type: 'gauge', bind: 'mergeQueue', title: 'Merge queue', valueKey: 'position', maxKey: 'total' },
+          { type: 'list', bind: 'reviewInfo.changedFiles', title: 'Changed files', empty: 'No changes yet.' },
+          { type: 'thread', bind: 'messages', title: 'Conversation' },
+        ],
+      },
       { slot: 'review-area', tier: 4, component: 'review-iframe', title: 'Review' },
       { slot: 'project-settings', tier: 2, component: 'software-dev-settings', title: 'Software dev' },
     ],

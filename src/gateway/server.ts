@@ -286,6 +286,23 @@ export class Gateway {
         }
         return this.json(res, 200, out);
       }
+      // Tier-2 declarative widgets (SPEC §10.2): resolve each contribution's
+      // declared widget tree against the live view-model, server-side, so the UI
+      // is a pure host widget library (draws descriptors, owns no resolve logic).
+      const widgetsMatch = p.match(/^\/api\/tasks\/([^/]+)\/widgets$/);
+      if (widgetsMatch && method === 'GET') {
+        const id = widgetsMatch[1]!;
+        const t = store.getTask(id);
+        const view = (await api.getTaskView(token, id).catch(() => undefined)) ?? t?.lastView;
+        if (!t || !view) return this.json(res, 200, []);
+        const { resolveWidgets } = await import('../contrib/widgets.js');
+        const slot = (url.searchParams.get('slot') ?? 'task-detail') as any;
+        const groups = this.deps.contributions
+          .slots(slot)
+          .filter((s) => s.workflow === t.workflow && s.contribution.tier === 2 && s.contribution.widgets?.length)
+          .map((s) => ({ workflow: s.workflow, title: s.contribution.title, widgets: resolveWidgets(s.contribution.widgets, view) }));
+        return this.json(res, 200, groups);
+      }
 
       // merge queue
       if (p === '/api/queue' && method === 'GET') {
