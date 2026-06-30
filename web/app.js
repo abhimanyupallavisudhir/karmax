@@ -888,7 +888,26 @@ function globalSettingsView() {
     </div>
     ${paymentsCard('global')}
     <div class="card" id="accounts-card">
-      <div class="section-h">Accounts (API keys)</div>
+      <div class="section-h">Accounts</div>
+
+      <div style="font-weight:600;margin-bottom:4px">Logins (subscriptions)</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude or Codex account to use its subscription. Each gets an isolated config home you can switch between (dodges token limits). karmax opens the provider's own login — you complete it; karmax never types your credentials.</p>
+      <div id="logins-list" style="margin-bottom:10px"></div>
+      <div class="form-row"><label>Connect a login</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <select id="login-provider"><option>claude</option><option>codex</option></select>
+          <input id="login-name" placeholder="account name (e.g. personal)" style="flex:1;min-width:120px" />
+          <select id="login-browser" title="Browser MCP baseline for this profile">
+            <option value="none">no browser MCP</option>
+            <option value="chrome-devtools">+ chrome-devtools MCP</option>
+            <option value="playwright">+ playwright MCP</option>
+          </select>
+          <button class="btn primary" id="login-connect">Connect</button>
+        </div>
+        <div id="login-result" style="font-size:12px;margin-top:6px"></div>
+      </div>
+
+      <div style="font-weight:600;margin:14px 0 4px">API keys</div>
       <div id="accounts-list" style="margin-bottom:10px"></div>
       <div class="form-row"><label>Register a key</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -972,9 +991,17 @@ async function wirePaymentsCard(scope, projectId) {
   });
 }
 
-function profileRow(p, handles) {
+// Auth options for a profile: API-key handles + connected logins (config homes).
+function authOptions(p, handles, logins) {
+  const cur = p.auth?.kind === 'apiKeyHandle' ? `key:${p.auth.handle}` : p.auth?.kind === 'configHome' ? `login:${p.auth.account}` : '';
+  const opt = (val, label) => `<option value="${esc(val)}" ${val === cur ? 'selected' : ''}>${esc(label)}</option>`;
+  const keyOpts = handles.map((h) => opt(`key:${h}`, `key · ${h}`)).join('');
+  const loginOpts = logins.map((l) => opt(`login:${l.provider}:${l.account}`, `login · ${l.provider}:${l.account}${l.loggedIn ? '' : ' (not signed in)'}`)).join('');
+  return `<option value="">— ambient login / env —</option>${loginOpts}${keyOpts}`;
+}
+
+function profileRow(p, handles, logins) {
   const models = MODELS[p.provider] || MODELS.claude;
-  const authHandle = p.auth?.kind === 'apiKeyHandle' ? p.auth.handle : '';
   return `<div class="card" data-profile="${esc(p.id)}" style="background:var(--surface-2)">
     <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -985,21 +1012,25 @@ function profileRow(p, handles) {
       <input class="pf-maxturns" type="number" placeholder="max turns" value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
     <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
-    <div class="form-row"><label>Account key (handle)</label><select class="pf-auth"><option value="">— ambient login / env —</option>${handles.map((h) => `<option value="${esc(h)}" ${h === authHandle ? 'selected' : ''}>${esc(h)}</option>`).join('')}</select></div>
+    <div class="form-row"><label>Account (login or API key)</label><select class="pf-auth">${authOptions(p, handles, logins)}</select></div>
     <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save profile</button>
   </div>`;
 }
 
 async function hydrateProfilesAndAccounts() {
-  let handles = [];
-  try { handles = (await api('/api/accounts')).handles || []; } catch {}
+  let handles = [], logins = [];
+  try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
   const accBox = $('#accounts-list');
   if (accBox) accBox.innerHTML = handles.length ? handles.map((h) => `<span class="chip">${esc(h)}</span>`).join(' ') : '<span style="color:var(--ink-3)">No keys registered.</span>';
+  const loginBox = $('#logins-list');
+  if (loginBox) loginBox.innerHTML = logins.length
+    ? logins.map((l) => `<span class="chip" title="${l.loggedIn ? 'signed in' : 'connect pending — finish OAuth in your browser'}">${l.loggedIn ? '🟢' : '🟡'} ${esc(l.provider)}:${esc(l.account)}</span>`).join(' ')
+    : '<span style="color:var(--ink-3)">No logins connected.</span>';
   let profiles = [];
   try { profiles = await api('/api/profiles'); } catch {}
   const list = $('#profiles-list');
   if (list) {
-    list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
+    list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles, logins)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
     list.querySelectorAll('.pf-provider').forEach((sel) => sel.addEventListener('change', (e) => {
       const card = sel.closest('[data-profile]');
       card.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
@@ -1008,7 +1039,10 @@ async function hydrateProfilesAndAccounts() {
       const card = b.closest('[data-profile]');
       const id = b.dataset.saveprofile;
       const orig = profiles.find((p) => p.id === id);
-      const authHandle = card.querySelector('.pf-auth').value;
+      const authVal = card.querySelector('.pf-auth').value;
+      let auth;
+      if (authVal.startsWith('key:')) auth = { kind: 'apiKeyHandle', handle: authVal.slice(4) };
+      else if (authVal.startsWith('login:')) auth = { kind: 'configHome', account: authVal.slice(6) };
       const profile = {
         ...orig,
         provider: card.querySelector('.pf-provider').value,
@@ -1016,7 +1050,7 @@ async function hydrateProfilesAndAccounts() {
         effort: card.querySelector('.pf-effort').value || undefined,
         maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
         capabilities: card.querySelector('.pf-caps').value.split(',').map((s) => s.trim()).filter(Boolean),
-        auth: authHandle ? { kind: 'apiKeyHandle', handle: authHandle } : undefined,
+        auth,
       };
       try { await api('/api/profiles', { method: 'PUT', body: JSON.stringify(profile) }); toast('Profile saved'); } catch (e) { toast(e.message, true); }
     }));
@@ -1039,6 +1073,27 @@ function wireGlobalSettings() {
       toast('Key registered');
       hydrateProfilesAndAccounts();
     } catch (e) { toast(e.message, true); }
+  });
+  $('#login-connect')?.addEventListener('click', async () => {
+    const provider = $('#login-provider').value;
+    const account = $('#login-name').value.trim();
+    const browserMcp = $('#login-browser').value;
+    const out = $('#login-result');
+    if (!account) return toast('account name required', true);
+    out.textContent = 'Launching provider login…';
+    out.style.color = 'var(--ink-2)';
+    try {
+      const btn = $('#login-connect'); btn.disabled = true;
+      const r = await api('/api/accounts/connect', { method: 'POST', body: JSON.stringify({ provider, account, browserMcp }) });
+      btn.disabled = false;
+      if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
+      else if (r.status === 'awaiting_oauth' && r.loginUrl) {
+        out.innerHTML = `Open this URL to finish signing in (karmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>`;
+        out.style.color = 'var(--ink-1)';
+      } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
+      $('#login-name').value = '';
+      hydrateProfilesAndAccounts();
+    } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
   });
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {

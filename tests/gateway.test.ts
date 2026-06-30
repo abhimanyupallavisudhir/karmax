@@ -95,4 +95,23 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(dash.projects).toBeGreaterThanOrEqual(1);
     expect(dash.tasks).toBeGreaterThanOrEqual(1);
   });
+
+  it('connects an account login and lists it without leaking the config-home path', async () => {
+    const r: any = await (
+      await fetch(`${base}/api/accounts/connect`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ provider: 'claude', account: 'work', browserMcp: 'chrome-devtools' }),
+      })
+    ).json();
+    expect(r.status).toBe('awaiting_oauth');
+    expect(r.loginUrl).toBe('https://example.com/dev?code=TEST');
+    expect(r.configHome).toBeUndefined(); // absolute path never crosses the wire
+
+    const accounts: any = await (await fetch(`${base}/api/accounts`, { headers: auth() })).json();
+    const login = accounts.logins.find((l: any) => l.provider === 'claude' && l.account === 'work');
+    expect(login).toBeTruthy();
+    expect(login.path).toBeUndefined(); // listing also hides the path
+    expect(typeof login.loggedIn).toBe('boolean');
+  });
 });

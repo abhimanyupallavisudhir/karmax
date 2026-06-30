@@ -21,6 +21,8 @@ import { Gateway } from '../../src/gateway/server.js';
 import { CredentialBroker } from '../../src/autonomy/broker.js';
 import { Vault } from '../../src/autonomy/vault.js';
 import { MockPaymentProvider } from '../../src/autonomy/payments.js';
+import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
+import { LoginManager } from '../../src/autonomy/login.js';
 
 export interface Harness {
   server: DevServer;
@@ -82,6 +84,13 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
     tokens,
     api,
     async startGateway(opts) {
+      const configHomes = new ConfigHomeManager(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-homes-')));
+      // fake login command (no real CLI / OAuth): print a device URL then exit
+      const login = new LoginManager(configHomes, () => ({
+        cmd: 'bash',
+        args: ['-c', 'echo "open https://example.com/dev?code=TEST"; exit 0'],
+        env: {} as Record<string, string>,
+      }));
       const gw = new Gateway({
         api,
         store,
@@ -95,6 +104,8 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
         agentInfo: { provider: 'mock', reason: 'test' },
         broker: new CredentialBroker(new Vault(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-')))),
         payments,
+        configHomes,
+        login,
         password: opts?.password,
       });
       const started = await gw.listen();

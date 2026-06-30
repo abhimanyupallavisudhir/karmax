@@ -59,10 +59,12 @@ input — one model, not two.
 
 ## Build order
 
-> **Status:** Phases A–E are ✅ done (69 tests; verified live incl. real Claude +
-> Codex agents). Form fields now **prefill the effective value and store only
-> what the user changed** (no inherit-checkbox / "Inherit:" entries). Remaining:
-> two small leftovers + Phase F.
+> **Status:** Phases A–E ✅ done; Phase F items **(a)** profile/account UI,
+> **(c)-1** payments lease, **(d)** connect-accounts/multi-login, and **(e)**
+> per-profile MCP baseline ✅ done (91 tests; verified live incl. real Claude +
+> Codex agents). Form fields **prefill the effective value and store only what the
+> user changed** (no inherit-checkbox / "Inherit:" entries). Remaining: two small
+> leftovers + the rest of Phase F (b, c-2/3, 21–24, coordinator-into-turn).
 >
 > Small leftovers (not yet done): instant mid-turn cancel (cancel currently lands
 > between turns); a real draft `DELETE` endpoint (today drafts soft-delete in the UI).
@@ -146,31 +148,41 @@ input — one model, not two.
       Cards/budget UI, 12 tests); (c)-2 = real card rail (Stripe Issuing, external);
       (c)-3 = agent account registration + MFA via broker + browser MCP (large).
 
-28. **(d) Connect accounts + multiple logins + switching** (SPEC §7.3, §6.2). Both
-    tools support per-home logins: Claude via `CLAUDE_CONFIG_DIR`, Codex via
-    `CODEX_HOME`. Build:
-    - A **LoginManager**: mint a config home per (provider × account), spawn the
-      provider's own login (`claude setup-token` / `codex login`) with that home's
-      env, capture the device/OAuth URL, return it. The user completes OAuth;
-      karmax never types credentials. `status()` checks the home for a credentials
-      file.
-    - **"Connect account" UI** + endpoints (`POST /api/accounts/connect`,
-      `GET /api/accounts` lists config-home accounts + login status). Profiles'
-      account picker offers config-home accounts, not just key handles.
-    - The Claude Agent-SDK path already runs against a profile's `configHome`;
-      Codex-*subscription* needs routing through the Codex app-server/CLI (reads
-      `CODEX_HOME`) instead of the raw API — larger, sub-item.
-    - **Wire the account coordinator (§6.2, item 22) into the turn loop**: lease a
-      config home with token headroom per turn, rotate/park on rate limits.
-29. **(e) Per-profile MCP baseline in config homes** (SPEC §7.5, §7.3). karmax
-    writes a standard `mcpServers` set into each minted home — the karmax platform
+28. **(d) ✅ Connect accounts + multiple logins + switching** (SPEC §7.3, §6.2).
+    Both tools support per-home logins: Claude via `CLAUDE_CONFIG_DIR`, Codex via
+    `CODEX_HOME`. Built:
+    - **LoginManager** (`src/autonomy/login.ts`): mints a config home per
+      (provider × account), spawns the provider's own login (`claude setup-token` /
+      `codex login`, both overridable via env) with that home's scrubbed env,
+      captures the device/OAuth URL from stdout/stderr, returns it. The user
+      completes OAuth; karmax never types credentials. Short-circuits to
+      `logged_in` when a creds file already exists. `status()` checks the home.
+      Login command is injectable so tests use a fake CLI (no real OAuth).
+    - **"Connect a login" UI** in Global settings + endpoints (`POST
+      /api/accounts/connect` returns the device URL + status, never the home path;
+      `GET /api/accounts` now lists `logins` with `loggedIn` flags). Profiles'
+      account picker offers connected logins **and** key handles (one dropdown;
+      `login:` → `auth.kind:'configHome'`, `key:` → `apiKeyHandle`).
+    - **Runtime resolution**: a profile with `auth.kind:'configHome'` resolves its
+      account ref → the minted home via `ConfigHomeManager` (activity dep), so the
+      Claude Agent-SDK path runs under that account's `CLAUDE_CONFIG_DIR`.
+    - *Remaining sub-items:* Codex-*subscription* via the Codex app-server/CLI
+      (reads `CODEX_HOME`) instead of the raw Responses API; and wiring the account
+      coordinator (§6.2, item 22) into the turn loop (lease a home with token
+      headroom per turn, rotate/park on rate limits). Logins + switching now exist;
+      automatic rotation is the open piece.
+29. **(e) ✅ Per-profile MCP baseline in config homes** (SPEC §7.5, §7.3). karmax
+    writes a standard `mcpServers` set into a minted home — the karmax platform
     MCP **and** a browser MCP (chrome-devtools / Playwright) — so every agent on
     that profile gets browser automation + the platform API, editable per profile.
-    The Claude SDK picks these up via `CLAUDE_CONFIG_DIR`; Codex via
-    `config.toml [mcp_servers]`. This is the clean place to *enforce* a tool
-    baseline and unblocks §7.5 (and the (c)-3 agent-registration flow, which needs
-    a browser). Note: actually executing a browser MCP needs the npx server +
-    a browser at runtime — a deployment concern, not karmax code.
+    `ConfigHomeManager.writeMcpConfig` writes Claude's `.claude.json` (merging,
+    not clobbering) / Codex's `config.toml [mcp_servers]`; `mcpServerMap` resolves
+    the baseline to concrete `npx` stdio commands. Wired into the connect flow
+    (browser-MCP picker on the Connect form). The Claude SDK picks these up via
+    `CLAUDE_CONFIG_DIR`; Codex via `CODEX_HOME`. This is the clean place to
+    *enforce* a tool baseline and unblocks §7.5 (and the (c)-3 agent-registration
+    flow, which needs a browser). Note: actually executing a browser MCP needs the
+    npx server + a browser at runtime — a deployment concern, not karmax code.
 
 These were in the original gap assessment / the accounts+MCP discussion; they were
 triaged below the three explicit demands + the trust pass (Phase E), not cut.

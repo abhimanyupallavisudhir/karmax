@@ -30,6 +30,7 @@ export interface CoreActivityDeps {
   tokens?: TokenAuthority;
   broker?: CredentialBroker;
   payments?: PaymentProvider;
+  configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
 }
 
 export interface CreateWorldArgs {
@@ -139,8 +140,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           caps: effective,
         });
         resolvedAuth = { apiKey };
-      } else if (profile.auth?.kind === 'configHome' && profile.auth.configHome) {
-        resolvedAuth = { configHome: profile.auth.configHome };
+      } else if (profile.auth?.kind === 'configHome') {
+        // Either an explicit path, or an account ref resolved to its minted home.
+        // `account` may be "<provider>:<name>" (from the login picker) or just "<name>".
+        let home = profile.auth.configHome;
+        if (!home && profile.auth.account && deps.configHomes) {
+          const ref = profile.auth.account;
+          const [maybeProv, ...rest] = ref.split(':');
+          const isProv = rest.length > 0 && (maybeProv === 'claude' || maybeProv === 'codex' || maybeProv === 'mock');
+          const prov = (isProv ? maybeProv : profile.provider) as Provider;
+          const name = isProv ? rest.join(':') : ref;
+          home = deps.configHomes.ensure(prov, name);
+        }
+        if (home) resolvedAuth = { configHome: home };
       }
 
       const systemPrompt = assemblePrompt({

@@ -57,6 +57,10 @@ async function main() {
   const broker = new CredentialBroker(new Vault(p.vault));
   const { MockPaymentProvider } = await import('./autonomy/payments.js');
   const payments = new MockPaymentProvider(store);
+  const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
+  const { LoginManager } = await import('./autonomy/login.js');
+  const configHomes = new ConfigHomeManager();
+  const login = new LoginManager(configHomes);
 
   const worker = await makeWorker(conn, {
     store,
@@ -68,6 +72,7 @@ async function main() {
     tokens,
     broker,
     payments,
+    configHomes,
     taskQueue: TASK_QUEUE,
   });
   const workerRun = worker.run();
@@ -101,6 +106,8 @@ async function main() {
     agentInfo: { provider, reason },
     broker,
     payments,
+    login,
+    configHomes,
     password: process.env.KARMAX_PASSWORD,
     version: VERSION,
   });

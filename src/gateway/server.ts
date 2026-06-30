@@ -33,6 +33,8 @@ export interface GatewayDeps {
   agentInfo: { provider: Provider; reason: string };
   broker?: import('../autonomy/broker.js').CredentialBroker;
   payments?: import('../autonomy/payments.js').PaymentProvider;
+  login?: import('../autonomy/login.js').LoginManager;
+  configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   password?: string;
   version?: string;
 }
@@ -321,9 +323,14 @@ export class Gateway {
         return this.json(res, 200, store.getCard(fundMatch[1]!) ?? null);
       }
 
-      // accounts (credential handles in the broker; secrets are write-only)
+      // accounts: API-key handles (broker; secrets write-only) + config-home
+      // logins (SPEC §7.3 — switchable per-account subscriptions).
       if (p === '/api/accounts' && method === 'GET') {
-        return this.json(res, 200, { handles: this.deps.broker?.listHandles() ?? [] });
+        return this.json(res, 200, {
+          handles: this.deps.broker?.listHandles() ?? [],
+          // never expose the home's absolute path to the browser
+          logins: (this.deps.configHomes?.list() ?? []).map((a) => ({ provider: a.provider, account: a.account, loggedIn: a.loggedIn })),
+        });
       }
       if (p === '/api/accounts' && method === 'POST') {
         const b = await this.body(req);
@@ -332,6 +339,25 @@ export class Gateway {
         const handle = `${b.provider}:${b.account}`;
         this.deps.broker.registerHandle(handle, String(b.apiKey));
         return this.json(res, 200, { handle }); // never echoes the secret
+      }
+      // connect an account login: mint a config home + launch the provider's own
+      // OAuth, return the device URL for the user to complete (we never type creds).
+      if (p === '/api/accounts/connect' && method === 'POST') {
+        if (!this.deps.login) return this.json(res, 400, { error: 'no login manager configured' });
+        const b = await this.body(req);
+        const provider = b.provider === 'codex' ? 'codex' : 'claude';
+        if (!b.account) return this.json(res, 400, { error: 'account required' });
+        const result = await this.deps.login.connect(provider, String(b.account));
+        // optionally seed a browser/platform MCP baseline into the new home (§7.5)
+        if (this.deps.configHomes && (b.browserMcp || b.platformMcp)) {
+          this.deps.configHomes.writeMcpConfig(result.configHome, provider, {
+            browser: b.browserMcp === 'chrome-devtools' || b.browserMcp === 'playwright' ? b.browserMcp : 'none',
+            platform: b.platformMcp ? { command: String(b.platformMcp.command), args: Array.isArray(b.platformMcp.args) ? b.platformMcp.args : [] } : undefined,
+          });
+        }
+        // strip the absolute configHome path from the response
+        const { configHome, ...safe } = result;
+        return this.json(res, 200, safe);
       }
 
       // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms

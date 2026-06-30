@@ -6,7 +6,8 @@ import WebSocket from 'ws';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
-import { ConfigHomeManager, scrubbedEnv } from '../src/autonomy/config-homes.js';
+import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn } from '../src/autonomy/config-homes.js';
+import { LoginManager } from '../src/autonomy/login.js';
 import { remoteAccessPlan } from '../src/remote/access.js';
 
 describe('config homes + scrubbed env (SPEC §7.3)', () => {
@@ -22,6 +23,83 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(env.ANTHROPIC_API_KEY).toBeUndefined(); // never leaks across profiles
     expect(env.CLAUDE_CONFIG_DIR).toBe(home);
     delete process.env.ANTHROPIC_API_KEY;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('resolves a browser + platform MCP baseline (SPEC §7.5)', () => {
+    const servers = mcpServerMap({ browser: 'chrome-devtools', platform: { command: 'node', args: ['mcp.js'] } });
+    expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] });
+    expect(servers['karmax']).toEqual({ command: 'node', args: ['mcp.js'] });
+    expect(mcpServerMap({ browser: 'none' })).toEqual({});
+  });
+
+  it('writes the MCP baseline into a Claude home (.claude.json) and merges', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mcp-'));
+    const mgr = new ConfigHomeManager(dir);
+    const home = mgr.ensure('claude', 'work');
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ existing: true, mcpServers: { keep: { command: 'x', args: [] } } }));
+    mgr.writeMcpConfig(home, 'claude', { browser: 'playwright' });
+    const cfg = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
+    expect(cfg.existing).toBe(true); // preserved
+    expect(cfg.mcpServers.keep).toBeTruthy(); // merged, not clobbered
+    expect(cfg.mcpServers.playwright.command).toBe('npx');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('writes the MCP baseline into a Codex home (config.toml)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mcpc-'));
+    const mgr = new ConfigHomeManager(dir);
+    const home = mgr.ensure('codex', 'work');
+    mgr.writeMcpConfig(home, 'codex', { browser: 'chrome-devtools' });
+    const toml = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
+    expect(toml).toContain('[mcp_servers.chrome-devtools]');
+    expect(toml).toContain('command = "npx"');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('account login (SPEC §7.3 / §6.2)', () => {
+  it('mints a home and captures the device URL from the provider login', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-'));
+    const homes = new ConfigHomeManager(dir);
+    // fake login command: prints a URL then exits (real CLIs print then wait)
+    const login = new LoginManager(homes, (_provider, home) => ({
+      cmd: 'bash',
+      args: ['-c', 'echo "Visit https://example.com/device?code=ABC123 to finish"; exit 0'],
+      env: { ...process.env, KARMAX_HOME_PROBE: home } as Record<string, string>,
+    }));
+    const r = await login.connect('claude', 'work', { urlTimeoutMs: 4000 });
+    expect(r.status).toBe('awaiting_oauth');
+    expect(r.loginUrl).toBe('https://example.com/device?code=ABC123');
+    expect(fs.existsSync(r.configHome)).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reports logged_in when a credentials file already exists (no relaunch)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login2-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('claude', 'work');
+    fs.writeFileSync(path.join(home, '.credentials.json'), '{}');
+    expect(isLoggedIn('claude', home)).toBe(true);
+    let launched = false;
+    const login = new LoginManager(homes, () => {
+      launched = true;
+      return { cmd: 'false', args: [], env: {} };
+    });
+    const r = await login.connect('claude', 'work');
+    expect(r.status).toBe('logged_in');
+    expect(launched).toBe(false); // short-circuits, never spawns
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('status() reflects the credentials file', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login3-'));
+    const homes = new ConfigHomeManager(dir);
+    const login = new LoginManager(homes);
+    expect(login.status('codex', 'acme').loggedIn).toBe(false);
+    const home = homes.ensure('codex', 'acme');
+    fs.writeFileSync(path.join(home, 'auth.json'), '{}');
+    expect(login.status('codex', 'acme').loggedIn).toBe(true);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
