@@ -17,6 +17,14 @@ export interface PlatformToolContext {
   createSubTask(t: { title: string; prompt: string }): void;
   /** Persist a reusable skill (content, freely editable; SPEC §4.4). */
   saveSkill(s: { name: string; content: string }): void;
+  /** Request a payment against the budget lease (SPEC §7.6). Returns the outcome:
+   *  granted (charged) | needs_approval | needs_funding | denied. */
+  requestSpend(args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
+    status: 'granted' | 'needs_approval' | 'needs_funding' | 'denied';
+    reason?: string;
+    transactionId?: string;
+    shortfall?: number;
+  }>;
   /** Stream incremental output to the task's live event log. */
   emit(text: string): void;
 }

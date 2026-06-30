@@ -62,6 +62,11 @@ export class Store {
         scopeKey TEXT NOT NULL, workflow TEXT NOT NULL, json TEXT NOT NULL,
         PRIMARY KEY (scopeKey, workflow)
       );
+      CREATE TABLE IF NOT EXISTS cards (
+        id TEXT PRIMARY KEY, provider TEXT NOT NULL, scope TEXT NOT NULL,
+        scopeId TEXT, label TEXT NOT NULL, cap INTEGER NOT NULL,
+        available INTEGER NOT NULL, merchantLock TEXT, createdAt INTEGER NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
     `);
@@ -268,6 +273,30 @@ export class Store {
       .run(scopeKey, workflow, JSON.stringify(values));
   }
 
+  // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────
+
+  createCard(c: { id: string; provider: string; scope: 'project' | 'global'; scopeId?: string; label: string; cap: number; available: number; merchantLock?: string[]; createdAt: number }) {
+    this.db
+      .prepare('INSERT INTO cards (id, provider, scope, scopeId, label, cap, available, merchantLock, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(c.id, c.provider, c.scope, c.scopeId ?? null, c.label, c.cap, c.available, c.merchantLock ? JSON.stringify(c.merchantLock) : null, c.createdAt);
+  }
+  getCard(id: string): any {
+    const r = this.db.prepare('SELECT * FROM cards WHERE id = ?').get(id) as any;
+    return r ? cardRow(r) : undefined;
+  }
+  /** Cards visible to a project: its own project-scope cards plus all global cards. */
+  listCards(projectId?: string): any[] {
+    const rows = projectId
+      ? (this.db.prepare("SELECT * FROM cards WHERE scope='global' OR (scope='project' AND scopeId=?) ORDER BY createdAt").all(projectId) as any[])
+      : (this.db.prepare('SELECT * FROM cards ORDER BY createdAt').all() as any[]);
+    return rows.map(cardRow);
+  }
+  updateCard(id: string, patch: { available?: number; cap?: number }) {
+    const c = this.getCard(id);
+    if (!c) return;
+    this.db.prepare('UPDATE cards SET available = ?, cap = ? WHERE id = ?').run(patch.available ?? c.available, patch.cap ?? c.cap, id);
+  }
+
   // ─── KV (misc small state) ───────────────────────────────────────────────────
 
   kvGet(k: string): string | undefined {
@@ -284,6 +313,20 @@ export class Store {
   close() {
     this.db.close();
   }
+}
+
+function cardRow(r: any) {
+  return {
+    id: r.id,
+    provider: r.provider,
+    scope: r.scope,
+    scopeId: r.scopeId ?? undefined,
+    label: r.label,
+    cap: r.cap,
+    available: r.available,
+    merchantLock: r.merchantLock ? JSON.parse(r.merchantLock) : undefined,
+    createdAt: r.createdAt,
+  };
 }
 
 function rowToProject(r: any): Project {

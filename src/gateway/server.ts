@@ -32,6 +32,7 @@ export interface GatewayDeps {
   staticDir: string;
   agentInfo: { provider: Provider; reason: string };
   broker?: import('../autonomy/broker.js').CredentialBroker;
+  payments?: import('../autonomy/payments.js').PaymentProvider;
   password?: string;
   version?: string;
 }
@@ -293,6 +294,31 @@ export class Gateway {
         if (!b.id || !b.role) return this.json(res, 400, { error: 'profile needs id + role' });
         store.upsertProfile({ provider: 'claude', capabilities: [], ...b });
         return this.json(res, 200, store.getProfile(b.id) ?? null);
+      }
+
+      // cards (payment resources; SPEC §7.6). Provision/list/fund.
+      if (p === '/api/cards' && method === 'GET') {
+        const pid = url.searchParams.get('projectId') ?? undefined;
+        return this.json(res, 200, store.listCards(pid));
+      }
+      if (p === '/api/cards' && method === 'POST') {
+        if (!this.deps.payments) return this.json(res, 400, { error: 'no payment provider configured' });
+        const b = await this.body(req);
+        const card = await this.deps.payments.provisionCard({
+          scope: b.scope === 'global' ? 'global' : 'project',
+          scopeId: b.scope === 'global' ? undefined : b.projectId,
+          label: b.label ?? 'Card',
+          cap: Number(b.cap ?? 0),
+          merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
+        });
+        return this.json(res, 200, card);
+      }
+      const fundMatch = p.match(/^\/api\/cards\/([^/]+)\/fund$/);
+      if (fundMatch && method === 'POST') {
+        if (!this.deps.payments) return this.json(res, 400, { error: 'no payment provider configured' });
+        const b = await this.body(req);
+        await this.deps.payments.fund(fundMatch[1]!, Number(b.amount ?? 0));
+        return this.json(res, 200, store.getCard(fundMatch[1]!) ?? null);
       }
 
       // accounts (credential handles in the broker; secrets are write-only)

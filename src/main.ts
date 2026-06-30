@@ -55,6 +55,8 @@ async function main() {
   const bus = new KarmaxBus();
   const tokens = new TokenAuthority();
   const broker = new CredentialBroker(new Vault(p.vault));
+  const { MockPaymentProvider } = await import('./autonomy/payments.js');
+  const payments = new MockPaymentProvider(store);
 
   const worker = await makeWorker(conn, {
     store,
@@ -65,6 +67,7 @@ async function main() {
     client,
     tokens,
     broker,
+    payments,
     taskQueue: TASK_QUEUE,
   });
   const workerRun = worker.run();
@@ -97,6 +100,7 @@ async function main() {
     staticDir,
     agentInfo: { provider, reason },
     broker,
+    payments,
     password: process.env.KARMAX_PASSWORD,
     version: VERSION,
   });

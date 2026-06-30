@@ -847,6 +847,7 @@ function settingsView(proj) {
     <div class="page-title">Project settings — ${esc(proj.name)}</div>
     <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
     ${settingsForms('project', proj.id)}
+    ${paymentsCard('project')}
     <div class="card">
       <div class="section-h">Workflow activation</div>
       <p style="color:var(--ink-2);margin-top:0">Activating a workflow resolves its dependencies and may spawn an onActivate preparation task.</p>
@@ -864,6 +865,7 @@ function wireSettingsView(proj) {
       try { await api(`/api/settings/project/${proj.id}/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) }); await loadProjects(); toast(`${wf} defaults saved`); } catch (e) { toast(e.message, true); }
     }),
   );
+  wirePaymentsCard('project', proj.id);
   $('#activate-sd')?.addEventListener('click', async () => {
     try {
       const r = await api(`/api/projects/${proj.id}/activate-workflow`, { method: 'POST', body: JSON.stringify({ workflow: 'software-dev' }) });
@@ -884,6 +886,7 @@ function globalSettingsView() {
       <p style="color:var(--ink-2);margin-top:0">Role defaults used when a task doesn't override the agent. Edit provider, model, effort, capabilities, and which stored key to use.</p>
       <div id="profiles-list">Loading…</div>
     </div>
+    ${paymentsCard('global')}
     <div class="card" id="accounts-card">
       <div class="section-h">Accounts (API keys)</div>
       <div id="accounts-list" style="margin-bottom:10px"></div>
@@ -906,6 +909,69 @@ function globalSettingsView() {
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
     </div>`;
 }
+// ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
+function paymentsCard(scope) {
+  return `<div class="card" data-payments="${scope}">
+    <div class="section-h">Payments — budget & cards</div>
+    <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
+    <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
+    <button class="btn sm primary" data-savepolicy="${scope}">Save budget policy</button>
+    <div class="section-h" style="margin-top:14px">Cards</div>
+    <div class="cards-list" style="margin-bottom:8px"></div>
+    <div class="form-row"><label>Add a ${scope} card</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input class="card-label" placeholder="label (e.g. Ops)" />
+        <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
+        <button class="btn" data-addcard="${scope}">Add card</button>
+      </div></div>
+  </div>`;
+}
+const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
+async function wirePaymentsCard(scope, projectId) {
+  const box = $(`[data-payments="${scope}"]`);
+  if (!box) return;
+  const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
+  let policy = {};
+  try { policy = await api(sUrl); } catch {}
+  if (policy.allowance != null) box.querySelector('.pay-allow').value = (policy.allowance / 100).toFixed(2);
+  if (policy.threshold != null) box.querySelector('.pay-thresh').value = (policy.threshold / 100).toFixed(2);
+  box.querySelector(`[data-savepolicy]`).addEventListener('click', async () => {
+    const a = box.querySelector('.pay-allow').value;
+    const t = box.querySelector('.pay-thresh').value;
+    const values = { ...policy };
+    values.allowance = a === '' ? undefined : Math.round(Number(a) * 100);
+    values.threshold = t === '' ? undefined : Math.round(Number(t) * 100);
+    try { await api(sUrl, { method: 'PUT', body: JSON.stringify({ values }) }); toast('Budget policy saved'); } catch (e) { toast(e.message, true); }
+  });
+  const renderCards = async () => {
+    let cards = [];
+    try { cards = await api(`/api/cards${projectId ? `?projectId=${projectId}` : ''}`); } catch {}
+    if (scope === 'global') cards = cards.filter((c) => c.scope === 'global');
+    const list = box.querySelector('.cards-list');
+    list.innerHTML = cards.length
+      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope}</span><div class="task-sub">available ${usd(c.available)} / cap ${usd(c.cap)}</div></div>
+        <input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button></div>`).join('')
+      : '<span style="color:var(--ink-3)">No cards.</span>';
+    list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
+      const amt = b.closest('.queue-item').querySelector('.fund-amt').value;
+      if (!amt) return;
+      try { await api(`/api/cards/${b.dataset.fund}/fund`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+    }));
+  };
+  await renderCards();
+  box.querySelector(`[data-addcard]`).addEventListener('click', async () => {
+    const label = box.querySelector('.card-label').value.trim() || 'Card';
+    const cap = box.querySelector('.card-cap').value;
+    try {
+      await api('/api/cards', { method: 'POST', body: JSON.stringify({ scope, projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
+      box.querySelector('.card-label').value = '';
+      box.querySelector('.card-cap').value = '';
+      toast('Card added');
+      renderCards();
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
 function profileRow(p, handles) {
   const models = MODELS[p.provider] || MODELS.claude;
   const authHandle = p.auth?.kind === 'apiKeyHandle' ? p.auth.handle : '';
@@ -960,6 +1026,7 @@ async function hydrateProfilesAndAccounts() {
 function wireGlobalSettings() {
   hydrateSettingsForms('global');
   hydrateProfilesAndAccounts();
+  wirePaymentsCard('global');
   $('#acct-add')?.addEventListener('click', async () => {
     const provider = $('#acct-provider').value;
     const account = $('#acct-name').value.trim();

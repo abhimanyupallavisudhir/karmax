@@ -80,6 +80,20 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'request_spend',
+    description:
+      'Request to pay for something with the project card. Amount in cents. Returns granted (charged), needs_approval, needs_funding, or denied. If not granted, stop and report — the human will fund/approve, then you can retry.',
+    parameters: {
+      type: 'object',
+      properties: {
+        amount: { type: 'number', description: 'Amount in cents.' },
+        merchant: { type: 'string' },
+        why: { type: 'string', description: 'Why this purchase is needed (shown to the human).' },
+      },
+      required: ['amount', 'why'],
+    },
+  },
+  {
     name: 'signal_completion',
     description: 'Signal that your turn is complete. Call this exactly when finished — do not write a "done" message instead.',
     parameters: {
@@ -130,6 +144,14 @@ export function platformToolHandlers(
     async save_skill(args) {
       ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
       return 'skill saved';
+    },
+    async request_spend(args) {
+      const r = await ctx.requestSpend({
+        amount: Number(args?.amount ?? 0),
+        merchant: args?.merchant ? String(args.merchant) : undefined,
+        why: args?.why ? String(args.why) : undefined,
+      });
+      return JSON.stringify(r);
     },
     async signal_completion(args) {
       ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);

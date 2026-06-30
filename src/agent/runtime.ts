@@ -1,10 +1,23 @@
 import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import { Provider, ReviewInfo } from '../domain/types.js';
 
+const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
+
 export interface RunTurnDeps {
   adapters: Map<Provider, AgentAdapter>;
   /** Stream incremental output to the task's live event log. */
   onEmit?: (text: string) => void;
+  /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
+  budget?: {
+    request(ctx: { projectId: string; taskId: string }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
+      status: 'granted' | 'needs_approval' | 'needs_funding' | 'denied';
+      reason?: string;
+      transactionId?: string;
+      shortfall?: number;
+    }>;
+  };
+  spendCtx?: { projectId: string; taskId: string };
+  onSpend?: (req: any, outcome: any) => void;
 }
 
 /**
@@ -34,6 +47,22 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     },
     saveSkill(s) {
       skills.push(s);
+    },
+    async requestSpend(args) {
+      if (!deps.budget || !deps.spendCtx) return { status: 'denied', reason: 'payments not configured' };
+      const outcome = await deps.budget.request(deps.spendCtx, args);
+      deps.onSpend?.(args, outcome);
+      // surface a pending spend at the Review gate so the human can fund/approve
+      if (outcome.status !== 'granted') {
+        const note =
+          outcome.status === 'needs_funding'
+            ? `Funding needed: add ${fmt(outcome.shortfall ?? args.amount)} to the card to pay ${fmt(args.amount)}${args.merchant ? ' at ' + args.merchant : ''}. ${args.why ?? ''}`
+            : outcome.status === 'needs_approval'
+              ? `Approval needed to spend ${fmt(args.amount)}${args.merchant ? ' at ' + args.merchant : ''} (${outcome.reason}). ${args.why ?? ''}`
+              : `Spend denied: ${outcome.reason}.`;
+        reviewInfo = { ...reviewInfo, summary: note };
+      }
+      return outcome;
     },
     emit(text) {
       deps.onEmit?.(text);

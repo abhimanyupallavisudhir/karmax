@@ -12,6 +12,7 @@ import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
+import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole } from '../domain/types.js';
 import { newId } from '../util/id.js';
@@ -28,6 +29,7 @@ export interface CoreActivityDeps {
   globalInstructions?: string;
   tokens?: TokenAuthority;
   broker?: CredentialBroker;
+  payments?: PaymentProvider;
 }
 
 export interface CreateWorldArgs {
@@ -163,7 +165,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
         },
-        { adapters: deps.adapters, onEmit: (t) => record(args.taskId, 'agent.output', { text: t }) },
+        {
+          adapters: deps.adapters,
+          onEmit: (t) => record(args.taskId, 'agent.output', { text: t }),
+          ...(deps.payments
+            ? {
+                budget: new BudgetService(store, deps.payments),
+                spendCtx: { projectId: args.task.projectId, taskId: args.taskId },
+                onSpend: (req: any, outcome: any) => record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }),
+              }
+            : {}),
+        },
       );
       if (token) deps.tokens?.revoke(token);
       // Persist the session id so other tasks can resume from this one (§10.5).

@@ -20,6 +20,7 @@ import { Overlays } from '../../src/store/overlays.js';
 import { Gateway } from '../../src/gateway/server.js';
 import { CredentialBroker } from '../../src/autonomy/broker.js';
 import { Vault } from '../../src/autonomy/vault.js';
+import { MockPaymentProvider } from '../../src/autonomy/payments.js';
 
 export interface Harness {
   server: DevServer;
@@ -53,6 +54,7 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
   const bus = new KarmaxBus();
 
   const tokens = new TokenAuthority();
+  const payments = new MockPaymentProvider(store);
   const worker: WorkerHandle = await makeWorker(conn, {
     store,
     worlds,
@@ -61,6 +63,7 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
     bus,
     client,
     tokens,
+    payments,
     taskQueue: TASK_QUEUE,
   });
   const runPromise = worker.run();
@@ -91,6 +94,7 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
         staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-static-')),
         agentInfo: { provider: 'mock', reason: 'test' },
         broker: new CredentialBroker(new Vault(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-')))),
+        payments,
         password: opts?.password,
       });
       const started = await gw.listen();

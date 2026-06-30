@@ -62,6 +62,14 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`skill: ${name.trim()}`);
           break;
         }
+        case 'spend': {
+          // @spend <amount-cents> :: <why>
+          const [amt, why = ''] = splitOn(rest, '::');
+          const r = await ctx.requestSpend({ amount: Number(amt.trim()), why: why.trim() });
+          ctx.emit(`spend(${amt.trim()}) → ${r.status}`);
+          outputs.push(`spend ${amt.trim()}: ${r.status}`);
+          break;
+        }
         case 'fail':
           throw new Error(rest || 'mock failure');
         case 'incomplete':
