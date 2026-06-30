@@ -99,6 +99,44 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(bad.status).toBe(400);
   });
 
+  it('archives terminal tasks (hidden by default, shown on demand) and refuses to archive a running one', async () => {
+    const task = await post(`/api/projects/${projectId}/tasks`, {
+      title: 'Archive me',
+      workflow: 'software-dev',
+      params: { prompt: '@write arch.txt :: x\n@review ready' },
+    });
+    const atReview = await poll(task.id, 'review'); // awaiting review → status waiting
+    expect(atReview.status).toBe('waiting');
+    // refuse to archive while live (running or awaiting review)
+    const refused = await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });
+    expect(refused.status).toBe(400);
+
+    // finish it, then archive
+    await post(`/api/tasks/${task.id}/signal`, { signal: 'confirm' });
+    await poll(task.id, 'done');
+    const ok = await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });
+    expect(ok.status).toBe(200);
+
+    // excluded from the default list, present with includeArchived=1
+    const def = await get(`/api/projects/${projectId}/tasks`);
+    expect(def.find((t: any) => t.id === task.id)).toBeUndefined();
+    const withArch = await get(`/api/projects/${projectId}/tasks?includeArchived=1`);
+    expect(withArch.find((t: any) => t.id === task.id)?.params.archived).toBe(true);
+
+    // unarchive brings it back
+    await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: false }) });
+    const back = await get(`/api/projects/${projectId}/tasks`);
+    expect(back.find((t: any) => t.id === task.id)).toBeTruthy();
+  });
+
+  it('paginates the task list with limit/offset', async () => {
+    const page = await get(`/api/projects/${projectId}/tasks?limit=2&offset=0`);
+    expect(Array.isArray(page.tasks)).toBe(true);
+    expect(page.tasks.length).toBeLessThanOrEqual(2);
+    expect(typeof page.total).toBe('number');
+    expect(page.total).toBeGreaterThanOrEqual(page.tasks.length);
+  });
+
   it('resumes a prior agent session via the agent field', async () => {
     // task A runs and stores its session
     const a = await post(`/api/projects/${projectId}/tasks`, {

@@ -192,6 +192,7 @@ a { color: var(--accent); text-decoration: none; }
 }
 .task-row:hover { border-color: var(--line-strong); }
 .task-row:active { transform: translateY(1px); }
+.task-row.archived { opacity: 0.55; }
 .task-row.sel { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
 .status-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
 .status-dot.active { background: var(--accent); box-shadow: 0 0 0 4px var(--accent-weak); }

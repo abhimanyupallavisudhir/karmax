@@ -113,7 +113,15 @@ input — one model, not two.
     proves a task leases + returns. *Open:* per-account real token metering (the
     dev model approximates windows) and rotation policy tuning.
 23. Real GitHub PR lifecycle + webhook dispatcher.
-24. Archive/delete + world/branch pruning; pagination; observability.
+24. ◑ Archive/delete + world/branch pruning; pagination; observability.
+    - Task **archiving** ✅ — `POST /api/tasks/:id/archive` (refused while a task is
+      live: running or awaiting review); archived tasks are hidden from the default
+      list, shown via `?includeArchived=1`; UI archive/unarchive controls + a "Show
+      archived" toggle; archived tasks drop out of the attention bell.
+    - Draft hard-**delete** ✅ (done earlier).
+    - **Pagination** ✅ — `?limit=&offset=` returns `{tasks, total, offset}`.
+    - World pruning is already handled (worktrees `destroyWorld` at end/abort;
+      branches kept by design). *Open:* richer observability/metrics.
 25. **(a) ✅ Profile + account management UI** — edit role profiles
     (provider/model/effort/capabilities/maxTurns/auth) and connect accounts /
     register API keys from Global settings. Backend (ProfileStore, broker,

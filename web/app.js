@@ -232,7 +232,7 @@ async function loadProjects() {
 
 async function loadTasks() {
   if (!S.projectId) return;
-  S.tasks = await api(`/api/projects/${S.projectId}/tasks`);
+  S.tasks = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
 }
 
 // ── websocket live stream ──────────────────────────────────────────────────
@@ -362,18 +362,23 @@ function renderMain() {
 
 // ── tasks ────────────────────────────────────────────────────────────────────
 function tasksView() {
-  const filtered = S.tasks.filter((t) => !t.params?.deleted && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())));
+  const filtered = S.tasks.filter((t) => (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())));
   const rows = filtered
     .slice()
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
     .map(taskRow)
     .join('');
+  const archivedCount = S.tasks.filter((t) => t.params?.archived).length;
   return `
     <div class="composer">
       <input class="title-in" id="new-task" placeholder="Describe a task and press Enter…  ( n )" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
       <button class="btn" id="expand-task" title="Full task form">⋯ More</button>
       <button class="btn primary" id="add-task">Add</button>
+    </div>
+    <div class="switch" style="justify-content:flex-end;margin:4px 0">
+      <input type="checkbox" id="show-archived" ${S.showArchived ? 'checked' : ''} />
+      <label for="show-archived" style="font-size:12px;color:var(--ink-3)">Show archived${S.showArchived && archivedCount ? ` (${archivedCount})` : ''}</label>
     </div>
     ${rows || `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`}`;
 }
@@ -397,18 +402,26 @@ function taskRow(t) {
   const v = t.lastView || {};
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
+  const archived = t.params?.archived;
+  // archivable when not progressing on its own / not awaiting review
+  const terminal = !['active', 'waiting'].includes(status);
+  const archiveBtn = archived
+    ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive">⊕</button>`
+    : terminal
+      ? `<button class="icon-btn" data-archive="${t.id}" title="Archive">⊟</button>`
+      : '';
   return `
-    <div class="task-row" data-id="${t.id}">
+    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)}</div>
+        <div class="task-title">${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
           <span class="wf">${esc(t.workflow)}</span>
           ${v.branch ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stage)}</span>
         </div>
       </div>
-      <div class="task-right">${pipeline(v)}</div>
+      <div class="task-right">${pipeline(v)}${archiveBtn}</div>
     </div>`;
 }
 
@@ -456,6 +469,17 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
   );
+  const setArchived = async (id, archived) => {
+    try { await api(`/api/tasks/${id}/archive`, { method: 'POST', body: JSON.stringify({ archived }) }); toast(archived ? 'Archived' : 'Unarchived'); refreshTasks(); }
+    catch (e) { toast(e.message, true); }
+  };
+  $('#main').querySelectorAll('[data-archive]').forEach((b) =>
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.archive, true); }),
+  );
+  $('#main').querySelectorAll('[data-unarchive]').forEach((b) =>
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.unarchive, false); }),
+  );
+  $('#show-archived')?.addEventListener('change', (e) => { S.showArchived = e.target.checked; refreshTasks(); });
   const add = async () => {
     const input = $('#new-task');
     const title = input.value.trim();
@@ -1165,7 +1189,7 @@ function wireGlobalSettings() {
 
 // ── notifications ────────────────────────────────────────────────────────────
 function needsAttention() {
-  return S.tasks.filter((t) => ['review', 'escalated'].includes(t.lastView?.stage) && t.lastView?.status !== 'done' && !t.parentTaskId);
+  return S.tasks.filter((t) => ['review', 'escalated'].includes(t.lastView?.stage) && t.lastView?.status !== 'done' && !t.parentTaskId && !t.params?.archived);
 }
 function updateBell() {
   const badge = $('#bell-badge');

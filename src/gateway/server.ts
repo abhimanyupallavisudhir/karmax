@@ -212,14 +212,22 @@ export class Gateway {
       if (tasksMatch) {
         const projectId = tasksMatch[1]!;
         if (method === 'GET') {
-          const tasks = await api.listTasks(token, projectId);
+          const all = await api.listTasks(token, projectId);
+          // Archived tasks are hidden from the default list (SPEC §11 housekeeping).
+          const includeArchived = url.searchParams.get('includeArchived') === '1';
+          const filtered = includeArchived ? all : all.filter((t) => !t.params?.archived);
+          // Optional pagination (?limit=&offset=); returns the page + total count.
+          const limit = Number(url.searchParams.get('limit') ?? '0');
+          const offset = Number(url.searchParams.get('offset') ?? '0');
+          const page = limit > 0 ? filtered.slice(offset, offset + limit) : filtered;
           // enrich with the freshest live view where possible
           const enriched = await Promise.all(
-            tasks.map(async (t) => {
+            page.map(async (t) => {
               const view = await api.getTaskView(token, t.id).catch(() => t.lastView);
               return { ...t, lastView: view ?? t.lastView };
             }),
           );
+          if (limit > 0) return this.json(res, 200, { tasks: enriched, total: filtered.length, offset });
           return this.json(res, 200, enriched);
         }
         if (method === 'POST') {
@@ -259,6 +267,20 @@ export class Gateway {
         const t = store.getTask(editMatch[1]!);
         if (t) store.updateTaskParams(editMatch[1]!, { ...t.params, ...b.params });
         return this.json(res, 200, store.getTask(editMatch[1]!) ?? null);
+      }
+      const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
+      if (archiveMatch && method === 'POST') {
+        const b = await this.body(req);
+        const t = store.getTask(archiveMatch[1]!);
+        if (!t) return this.json(res, 404, { error: 'no such task' });
+        const archived = b.archived !== false; // default: archive
+        // Archiving only hides; refuse to hide a task that's still progressing on
+        // its own (running) or awaiting review — it would vanish mid-flight. A
+        // stuck/terminal task (done/cancelled/blocked/failed) can be archived.
+        const live = t.lastView?.status === 'active' || t.lastView?.status === 'waiting';
+        if (archived && live) return this.json(res, 400, { error: 'cannot archive a running task; cancel or finish it first' });
+        store.updateTaskParams(archiveMatch[1]!, { ...t.params, archived });
+        return this.json(res, 200, { ok: true, archived });
       }
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {

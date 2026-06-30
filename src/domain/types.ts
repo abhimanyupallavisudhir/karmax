@@ -69,6 +69,9 @@ export interface TaskParams {
   profiles?: Record<string, string>;
   /** script-exec command. */
   command?: string;
+  /** UI lifecycle: stored-not-queued (draft) / hidden from the default list (archived). */
+  draft?: boolean;
+  archived?: boolean;
   [k: string]: unknown;
 }
 
