@@ -103,7 +103,7 @@ input — one model, not two.
 22. Token/account coordinator wired into the turn loop.
 23. Real GitHub PR lifecycle + webhook dispatcher.
 24. Archive/delete + world/branch pruning; pagination; observability.
-25. **(a) Profile + account management UI** — edit role profiles
+25. **(a) ✅ Profile + account management UI** — edit role profiles
     (provider/model/effort/capabilities/maxTurns/auth) and connect accounts /
     register API keys from Global settings. Backend (ProfileStore, broker,
     /api/profiles) mostly exists; this is forms + a couple endpoints + an
@@ -141,10 +141,10 @@ input — one model, not two.
       auth-time decline) or Privacy.com for individuals. The rail implementation
       lives in an editable layer (workflow-repo/skill) so agents can PR changes
       when a provider's API shifts — runtime self-healing depends on (21).
-    - **Layering for build:** (c)-1 = request_spend + four-outcome lease + review-
-      packet funding + MockPaymentProvider (medium, no external deps, testable);
-      (c)-2 = real card rail (external); (c)-3 = agent account registration + MFA
-      via broker + browser MCP (large).
+    - **Layering for build:** (c)-1 ✅ = request_spend + four-outcome lease + review-
+      packet funding + MockPaymentProvider (done; cards-as-resources, BudgetService,
+      Cards/budget UI, 12 tests); (c)-2 = real card rail (Stripe Issuing, external);
+      (c)-3 = agent account registration + MFA via broker + browser MCP (large).
 
 These were in the original gap assessment; they were triaged below the three
 explicit demands + the trust pass (Phase E), not cut. (a)/(b)/(c) above restore
