@@ -48,7 +48,42 @@ const MODELS = {
   codex: ['gpt-4.1', 'gpt-4o', 'gpt-4.1-mini'],
   mock: ['mock'],
 };
-const EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'];
+// Which reasoning-effort levels a given model actually accepts (mirrors the
+// server's src/agent/effort.ts gating). Empty = the model has no effort control.
+const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
+function effortLevelsFor(provider, model) {
+  const m = (model || '').toLowerCase();
+  if (provider === 'claude') {
+    if (!/opus-4-(5|6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
+    const ok = new Set(['low', 'medium', 'high']);
+    if (/opus-4-(7|8)|sonnet-5|fable-5|mythos-5/.test(m)) ok.add('xhigh');
+    if (/opus-4-(6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) ok.add('max');
+    return EFFORT_ORDER.filter((l) => ok.has(l));
+  }
+  if (provider === 'codex') {
+    if (!/^(o1|o3|o4|gpt-5|codex)/.test(m) && !m.includes('reasoning')) return [];
+    return ['low', 'medium', 'high']; // OpenAI Responses reasoning.effort tops out at high
+  }
+  return [];
+}
+// A <select> listing only the levels this model supports; disabled (greyed) when none.
+function effortSelectHtml(cls, provider, model, current) {
+  const levels = effortLevelsFor(provider, model);
+  if (!levels.length) {
+    return `<select class="${esc(cls)}" disabled title="This model has no reasoning-effort control"><option value="">no effort control</option></select>`;
+  }
+  const cur = levels.includes(current) ? current : '';
+  const opts = ['', ...levels].map((e) => `<option value="${e}" ${e === cur ? 'selected' : ''}>${e || 'provider default'}</option>`).join('');
+  return `<select class="${esc(cls)}">${opts}</select>`;
+}
+// Re-render an effort <select> in place after its provider/model changes.
+function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
+  const el = box.querySelector('.' + effortCls);
+  if (!el) return;
+  const provider = box.querySelector('.' + providerCls)?.value;
+  const model = box.querySelector('.' + modelCls)?.value.trim();
+  el.outerHTML = effortSelectHtml(effortCls, provider, model, el.value || '');
+}
 
 function schemaFor(workflow) {
   return (S.schema.find((s) => s.name === workflow)?.params) || [];
@@ -92,7 +127,7 @@ function renderAgentField(f, spec, inherited) {
       <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <input class="af-model" list="models-${esc(role)}" placeholder="model" value="${esc(e.model || '')}" style="flex:1;min-width:140px" />
       <datalist id="models-${esc(role)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
-      <select class="af-effort">${EFFORTS.map((eo) => `<option value="${eo}" ${eo === (e.effort || '') ? 'selected' : ''}>${eo || 'provider default'}</option>`).join('')}</select>
+      ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
     <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
       <input class="af-resume-search" placeholder="Search tasks to resume from…" style="width:100%;margin-top:6px;padding:7px 10px" />
@@ -150,7 +185,9 @@ function wireAgentFields(root) {
     box.querySelector('.af-provider')?.addEventListener('change', (e) => {
       box.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
       box.querySelector('.af-model').value = '';
+      refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
     });
+    box.querySelector('.af-model')?.addEventListener('input', () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
     const search = box.querySelector('.af-resume-search');
     const results = box.querySelector('.af-resume-results');
     search?.addEventListener('input', () => resumeSearch(box, search.value, results));
@@ -1117,7 +1154,7 @@ function profileRow(p, handles, logins, scope) {
       <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <input class="pf-model" list="pm-${esc(p.id)}" placeholder="model" value="${esc(p.model || '')}" style="flex:1;min-width:140px" />
       <datalist id="pm-${esc(p.id)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
-      <select class="pf-effort">${EFFORTS.map((e) => `<option value="${e}" ${e === (p.effort || '') ? 'selected' : ''}>${e || 'provider default'}</option>`).join('')}</select>
+      ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
     <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
@@ -1139,8 +1176,14 @@ async function hydrateProfiles(scope, projectId) {
   if (!list) return;
   list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles, logins, scope)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
   list.querySelectorAll('.pf-provider').forEach((sel) => sel.addEventListener('change', (e) => {
-    sel.closest('[data-profile]').querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
+    const card = sel.closest('[data-profile]');
+    card.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
+    card.querySelector('.pf-model').value = '';
+    refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
   }));
+  list.querySelectorAll('.pf-model').forEach((inp) => inp.addEventListener('input', () =>
+    refreshEffortSelect(inp.closest('[data-profile]'), 'pf-provider', 'pf-model', 'pf-effort'),
+  ));
   const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
   list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
     const card = b.closest('[data-profile]');
