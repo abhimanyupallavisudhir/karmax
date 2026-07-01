@@ -55,8 +55,11 @@ async function main() {
   const bus = new KarmaxBus();
   const tokens = new TokenAuthority();
   const broker = new CredentialBroker(new Vault(p.vault));
-  const { MockPaymentProvider } = await import('./autonomy/payments.js');
+  const { MockPaymentProvider, StripeIssuingProvider, PaymentRegistry } = await import('./autonomy/payments.js');
   const payments = new MockPaymentProvider(store);
+  const paymentRegistry = new PaymentRegistry();
+  paymentRegistry.register(payments);
+  paymentRegistry.register(new StripeIssuingProvider());
   const { ConfigHomeManager } = await import('./autonomy/config-homes.js');
   const { LoginManager } = await import('./autonomy/login.js');
   const configHomes = new ConfigHomeManager();
@@ -116,6 +119,7 @@ async function main() {
     agentInfo: { provider, reason },
     broker,
     payments,
+    paymentRegistry,
     login,
     configHomes,
     password: process.env.KARMAX_PASSWORD,

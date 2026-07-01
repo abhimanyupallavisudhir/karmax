@@ -82,6 +82,15 @@ describe('profile + account management (Global settings backend)', () => {
     expect(view.find((p: any) => p.role === 'do').scope).toBe('inherited');
   });
 
+  it('exposes payment providers + a connect flow (1g)', async () => {
+    const r = await fetch(`${base}/api/payments/providers`, { headers: auth() }).then(J);
+    expect(r.active).toBe('mock');
+    expect(r.providers.some((p: any) => p.name === 'mock' && p.connected)).toBe(true);
+    expect(r.providers.some((p: any) => p.name === 'stripe' && p.kind === 'oauth')).toBe(true);
+    const c = await fetch(`${base}/api/payments/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'mock' }) }).then(J);
+    expect(c.status).toBe('connected');
+  });
+
   it('deletes and renames a connected login via the API (1b)', async () => {
     // connect (fake login in the harness) then rename + delete
     await fetch(`${base}/api/accounts/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'claude', account: 'temp' }) });

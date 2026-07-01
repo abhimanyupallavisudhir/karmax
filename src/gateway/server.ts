@@ -33,6 +33,7 @@ export interface GatewayDeps {
   agentInfo: { provider: Provider; reason: string };
   broker?: import('../autonomy/broker.js').CredentialBroker;
   payments?: import('../autonomy/payments.js').PaymentProvider;
+  paymentRegistry?: import('../autonomy/payments.js').PaymentRegistry;
   login?: import('../autonomy/login.js').LoginManager;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   password?: string;
@@ -374,6 +375,19 @@ export class Gateway {
       if (profDelMatch && method === 'DELETE') {
         store.deleteProfile(decodeURIComponent(profDelMatch[1]!));
         return this.json(res, 200, { ok: true });
+      }
+
+      // payment providers (SPEC §7.6): how a user connects funding. Local (mock)
+      // needs nothing; Stripe Issuing connects via OAuth (karmax never sees card data).
+      if (p === '/api/payments/providers' && method === 'GET') {
+        const list = this.deps.paymentRegistry?.list() ?? (this.deps.payments ? [this.deps.payments.describe()] : []);
+        return this.json(res, 200, { providers: list, active: this.deps.payments?.name ?? null });
+      }
+      if (p === '/api/payments/connect' && method === 'POST') {
+        const b = await this.body(req);
+        const prov = this.deps.paymentRegistry?.get(b.provider) ?? this.deps.payments;
+        if (!prov) return this.json(res, 400, { error: 'no payment provider configured' });
+        return this.json(res, 200, await prov.connect());
       }
 
       // cards (payment resources; SPEC §7.6). Provision/list/fund.

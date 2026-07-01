@@ -29,6 +29,22 @@ export interface AuthorizeResult {
   transactionId?: string;
 }
 
+/** How a user connects funding to a provider (SPEC §7.6). */
+export interface ProviderInfo {
+  name: string;
+  label: string;
+  /** 'local' = no external account (mock); 'oauth' = connect a provider account. */
+  kind: 'local' | 'oauth';
+  connected: boolean;
+  help?: string;
+}
+export interface ConnectResult {
+  status: 'connected' | 'awaiting_oauth' | 'unavailable';
+  /** OAuth URL for the user to complete (kind 'oauth'). karmax never sees card data. */
+  url?: string;
+  detail?: string;
+}
+
 export interface PaymentProvider {
   readonly name: string;
   provisionCard(spec: { scope: 'project' | 'global'; scopeId?: string; label: string; cap: number; merchantLock?: string[] }): Promise<Card>;
@@ -36,6 +52,10 @@ export interface PaymentProvider {
   fund(cardId: string, amount: number): Promise<void>;
   /** Attempt a charge; the rail enforces the hard cap + merchant lock + funds. */
   authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult>;
+  /** Provider metadata for the connect surface. */
+  describe(): ProviderInfo;
+  /** Start (or report) connecting funding to this provider. */
+  connect(): Promise<ConnectResult>;
 }
 
 /** Mock rail: card state lives in the karmax store. Real rails (Stripe) keep it provider-side. */
@@ -74,6 +94,52 @@ export class MockPaymentProvider implements PaymentProvider {
     this.store.updateCard(cardId, { available: c.available - amount });
     return { ok: true, transactionId: newId('txn') };
   }
+  describe(): ProviderInfo {
+    return { name: this.name, label: 'Local (no external account)', kind: 'local', connected: true, help: 'Cards are local test funds — fully usable, no real money. Great for trying karmax.' };
+  }
+  async connect(): Promise<ConnectResult> {
+    return { status: 'connected', detail: 'Local provider needs no connection — add and fund cards below.' };
+  }
+}
+
+/**
+ * Stripe Issuing rail (SPEC §7.6, layer c-2). You connect your Stripe account via
+ * OAuth — Stripe holds the card data / PCI; karmax stores only the account handle
+ * and references the Stripe-issued virtual card ids. Card provisioning + auth-time
+ * decline are enforced by Stripe. The rail itself (API calls) is the c-2 work; this
+ * implements the *connect* surface so the model is real and pluggable now.
+ */
+export class StripeIssuingProvider implements PaymentProvider {
+  readonly name = 'stripe';
+  private notConfigured(): never {
+    throw new Error('Stripe Issuing is not configured yet — set STRIPE_SECRET_KEY and connect your account first.');
+  }
+  describe(): ProviderInfo {
+    const connected = !!process.env.STRIPE_SECRET_KEY;
+    return {
+      name: this.name,
+      label: 'Stripe Issuing',
+      kind: 'oauth',
+      connected,
+      help: connected
+        ? 'Connected. Cards are issued by Stripe; karmax never sees the card number.'
+        : 'Connect your Stripe account (OAuth). Stripe holds the card data; karmax stores only the account handle. Requires STRIPE_CLIENT_ID (+ STRIPE_SECRET_KEY on the server).',
+    };
+  }
+  async connect(): Promise<ConnectResult> {
+    const clientId = process.env.STRIPE_CLIENT_ID;
+    if (!clientId) {
+      return { status: 'unavailable', detail: 'Set STRIPE_CLIENT_ID (and STRIPE_SECRET_KEY) on the karmax server to enable Stripe Issuing, then connect.' };
+    }
+    // Standard Stripe Connect OAuth — the user authorizes; karmax never types creds.
+    const url = `https://connect.stripe.com/oauth/authorize?response_type=code&scope=read_write&client_id=${encodeURIComponent(clientId)}`;
+    return { status: 'awaiting_oauth', url, detail: 'Authorize karmax in Stripe; you complete it — karmax never sees your Stripe password or card numbers.' };
+  }
+  // Card operations require the live rail (c-2).
+  async provisionCard(): Promise<Card> { this.notConfigured(); }
+  async getCard(): Promise<Card | undefined> { return undefined; }
+  async fund(): Promise<void> { this.notConfigured(); }
+  async authorize(): Promise<AuthorizeResult> { return { ok: false, reason: 'Stripe rail not configured' }; }
 }
 
 export class PaymentRegistry {
@@ -85,6 +151,9 @@ export class PaymentRegistry {
     const p = this.providers.get(name);
     if (!p) throw new Error(`no payment provider "${name}"`);
     return p;
+  }
+  list(): ProviderInfo[] {
+    return [...this.providers.values()].map((p) => p.describe());
   }
 }
 

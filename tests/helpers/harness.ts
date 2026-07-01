@@ -20,7 +20,7 @@ import { Overlays } from '../../src/store/overlays.js';
 import { Gateway } from '../../src/gateway/server.js';
 import { CredentialBroker } from '../../src/autonomy/broker.js';
 import { Vault } from '../../src/autonomy/vault.js';
-import { MockPaymentProvider } from '../../src/autonomy/payments.js';
+import { MockPaymentProvider, StripeIssuingProvider, PaymentRegistry } from '../../src/autonomy/payments.js';
 import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
 import { LoginManager } from '../../src/autonomy/login.js';
 
@@ -57,6 +57,9 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
 
   const tokens = new TokenAuthority();
   const payments = new MockPaymentProvider(store);
+  const paymentRegistry = new PaymentRegistry();
+  paymentRegistry.register(payments);
+  paymentRegistry.register(new StripeIssuingProvider());
   const worker: WorkerHandle = await makeWorker(conn, {
     store,
     worlds,
@@ -104,6 +107,7 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
         agentInfo: { provider: 'mock', reason: 'test' },
         broker: new CredentialBroker(new Vault(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-')))),
         payments,
+        paymentRegistry,
         configHomes,
         login,
         password: opts?.password,

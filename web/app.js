@@ -1007,6 +1007,11 @@ function globalSettingsView() {
 function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
     <div class="section-h">Payments — budget & cards</div>
+    ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
+      <div style="font-weight:600;margin-bottom:4px">Funding source</div>
+      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How karmax pays. Cards are shared project/global resources; agents spend against them within your budget policy. karmax never stores card numbers.</p>
+      <div class="pay-providers-list">Loading…</div>
+    </div>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
     <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
     <button class="btn sm primary" data-savepolicy="${scope}">Save budget policy</button>
@@ -1021,9 +1026,32 @@ function paymentsCard(scope) {
   </div>`;
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
+async function wirePaymentProviders(box) {
+  const list = box.querySelector('.pay-providers-list');
+  if (!list) return;
+  let data = { providers: [], active: null };
+  try { data = await api('/api/payments/providers'); } catch {}
+  list.innerHTML = data.providers.length
+    ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
+        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : ''}
+          <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
+        ${p.kind === 'oauth' && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}</div>`).join('')
+    : '<span style="color:var(--ink-3)">No payment providers.</span>';
+  list.querySelectorAll('[data-connectpay]').forEach((b) => b.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/payments/connect', { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
+      const row = b.closest('[data-prov]');
+      if (r.status === 'awaiting_oauth' && r.url) {
+        row.insertAdjacentHTML('beforeend', `<div style="font-size:12px;margin-top:6px;flex-basis:100%">Open to authorize (karmax never sees your card data):<br><a href="${esc(r.url)}" target="_blank" rel="noopener" class="mono">${esc(r.url)}</a></div>`);
+      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box); }
+      else { toast(r.detail || 'Not available', true); }
+    } catch (e) { toast(e.message, true); }
+  }));
+}
 async function wirePaymentsCard(scope, projectId) {
   const box = $(`[data-payments="${scope}"]`);
   if (!box) return;
+  if (scope === 'global') await wirePaymentProviders(box);
   const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
   try { policy = await api(sUrl); } catch {}

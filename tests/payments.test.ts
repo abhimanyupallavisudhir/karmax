@@ -1,6 +1,30 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { evaluateSpend, MockPaymentProvider, BudgetService } from '../src/autonomy/payments.js';
+import { evaluateSpend, MockPaymentProvider, StripeIssuingProvider, PaymentRegistry, BudgetService } from '../src/autonomy/payments.js';
 import { Store } from '../src/store/db.js';
+
+describe('payment providers — the connect surface (SPEC §7.6, task 1g)', () => {
+  it('lists local (connected) + Stripe (oauth, needs connecting)', () => {
+    const reg = new PaymentRegistry();
+    reg.register(new MockPaymentProvider(new Store(':memory:')));
+    reg.register(new StripeIssuingProvider());
+    const list = reg.list();
+    const mock = list.find((p) => p.name === 'mock')!;
+    const stripe = list.find((p) => p.name === 'stripe')!;
+    expect(mock).toMatchObject({ kind: 'local', connected: true });
+    expect(stripe).toMatchObject({ kind: 'oauth' });
+  });
+  it('mock connects trivially; Stripe reports unavailable until configured', async () => {
+    const prevId = process.env.STRIPE_CLIENT_ID;
+    delete process.env.STRIPE_CLIENT_ID;
+    expect((await new MockPaymentProvider(new Store(':memory:')).connect()).status).toBe('connected');
+    expect((await new StripeIssuingProvider().connect()).status).toBe('unavailable');
+    process.env.STRIPE_CLIENT_ID = 'ca_test123';
+    const r = await new StripeIssuingProvider().connect();
+    expect(r.status).toBe('awaiting_oauth');
+    expect(r.url).toContain('connect.stripe.com');
+    if (prevId === undefined) delete process.env.STRIPE_CLIENT_ID; else process.env.STRIPE_CLIENT_ID = prevId;
+  });
+});
 
 describe('evaluateSpend (four outcomes; SPEC §7.6)', () => {
   const base = { amount: 100, spent: 0, available: 1000, hardCap: 100000 };
