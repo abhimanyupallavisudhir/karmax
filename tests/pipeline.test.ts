@@ -111,6 +111,26 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('cancelled');
   });
 
+  it('cancels mid-turn: a long-running Do turn aborts on cancel without finishing (SPEC §5.6)', async () => {
+    const repo = await h.makeRepo('app-cancel');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // the Do turn sleeps ~30s; a naive cancel would wait it out
+      args: [input({ taskId, repo, title: 'Slow', prompt: '@sleep 30000\n@review done' })],
+    });
+    // wait until the turn is actually running
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await new Promise((r) => setTimeout(r, 500)); // ensure we're inside the sleeping turn
+    const t0 = Date.now();
+    await handle.signal('cancel');
+    const result = await handle.result();
+    expect(result.stage).toBe('cancelled');
+    // it aborted mid-turn — did NOT wait out the ~30s sleep
+    expect(Date.now() - t0).toBeLessThan(15_000);
+  });
+
   it('routes an unhandled error through Resolve to human escalation', async () => {
     const repo = await h.makeRepo('app-fail');
     const taskId = newId('task');

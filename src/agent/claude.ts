@@ -55,6 +55,8 @@ export class ClaudeAdapter implements AgentAdapter {
     let finalText = '';
 
     for (let i = 0; i < maxIters; i++) {
+      if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
+      ctx.heartbeat?.(); // let Temporal deliver a pending cancellation
       const res = await fetch(`${baseUrl}/v1/messages`, {
         method: 'POST',
         headers: {
@@ -63,6 +65,7 @@ export class ClaudeAdapter implements AgentAdapter {
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({ model, max_tokens: 4096, system: input.systemPrompt, messages, tools }),
+        signal: ctx.signal,
       });
       if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const data = (await res.json()) as any;

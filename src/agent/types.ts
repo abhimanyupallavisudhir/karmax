@@ -27,6 +27,11 @@ export interface PlatformToolContext {
   }>;
   /** Stream incremental output to the task's live event log. */
   emit(text: string): void;
+  /** Aborts when the task is cancelled mid-turn (SPEC §5.6): adapters pass this to
+   *  fetch and check it between tool iterations so cancel takes effect at once. */
+  signal?: AbortSignal;
+  /** Called between tool iterations so Temporal delivers a pending cancellation. */
+  heartbeat?: () => void;
 }
 
 export interface TurnInput {

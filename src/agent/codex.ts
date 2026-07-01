@@ -35,6 +35,8 @@ export class CodexAdapter implements AgentAdapter {
     let finalText = '';
 
     for (let i = 0; i < maxIters; i++) {
+      if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
+      ctx.heartbeat?.(); // let Temporal deliver a pending cancellation
       const body: any = { model, tools, tool_choice: 'auto', store: true, input: nextInput };
       if (respId) body.previous_response_id = respId;
       else body.instructions = input.systemPrompt;
@@ -43,6 +45,7 @@ export class CodexAdapter implements AgentAdapter {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(body),
+        signal: ctx.signal,
       });
       if (!res.ok) throw new Error(`OpenAI Responses API ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const data = (await res.json()) as any;

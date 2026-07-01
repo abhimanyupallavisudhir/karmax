@@ -14,6 +14,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './typ
  *   @skill <name> :: <content>      save a skill
  *   @fail <message>                 throw (exercises Resolve)
  *   @incomplete                     do NOT signal completion this turn
+ *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
  */
 export class MockAdapter implements AgentAdapter {
   readonly provider = 'mock' as const;
@@ -68,6 +69,18 @@ export class MockAdapter implements AgentAdapter {
           const r = await ctx.requestSpend({ amount: Number(amt.trim()), why: why.trim() });
           ctx.emit(`spend(${amt.trim()}) → ${r.status}`);
           outputs.push(`spend ${amt.trim()}: ${r.status}`);
+          break;
+        }
+        case 'sleep': {
+          // Simulate a long turn that honors mid-turn cancellation (SPEC §5.6).
+          ctx.heartbeat?.();
+          const ms = Number(rest.trim()) || 1000;
+          await new Promise<void>((resolve, reject) => {
+            if (ctx.signal?.aborted) return reject(new Error('aborted'));
+            const t = setTimeout(resolve, ms);
+            ctx.signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')); }, { once: true });
+          });
+          outputs.push(`slept ${ms}ms`);
           break;
         }
         case 'fail':

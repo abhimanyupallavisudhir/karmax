@@ -7,6 +7,8 @@ import {
   condition,
   executeChild,
   workflowInfo,
+  CancellationScope,
+  isCancellation,
   log,
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
@@ -88,6 +90,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   const accountGrants = new Map<string, { accountId: string; configHome: string }>();
   let turnSeq = 0;
   let accountPool = 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
+  // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
+  // signal aborts the in-flight agent turn instead of waiting for it to finish.
+  let activeTurn: CancellationScope | undefined;
 
   const kind = input.project.worldProvider === 'container' ? 'container' : 'worktree';
 
@@ -175,7 +180,10 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     confirmed = true;
   });
   setHandler(cancelSignal, () => {
-    if (!pointOfNoReturnPassed) cancelled = true;
+    if (!pointOfNoReturnPassed) {
+      cancelled = true;
+      activeTurn?.cancel(); // abort an in-flight agent turn immediately (SPEC §5.6)
+    }
   });
   setHandler(retrySignal, () => {
     retryRequested = true;
@@ -203,7 +211,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         try {
           return await fn();
         } catch (err) {
-          if (cancelled) throw err;
+          if (cancelled || isCancellation(err)) throw err; // mid-turn cancel: don't resolve/retry
           lastError = describeError(err);
           error = lastError;
           const prevStage = stage;
@@ -250,16 +258,28 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
    * the park window, it falls back to the profile default.
    */
   async function leasedTurn<T>(fn: (accountConfigHome?: string) => Promise<T>): Promise<T> {
-    if (accountPool <= 0) return await fn(undefined);
+    if (accountPool <= 0) return await runCancellable(() => fn(undefined));
     const turnId = `${taskId}#${turnSeq++}`;
     await coord.leaseAccount(taskId, turnId);
     await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
     const grant = accountGrants.get(turnId);
     accountGrants.delete(turnId);
     try {
-      return await fn(grant?.configHome);
+      return await runCancellable(() => fn(grant?.configHome));
     } finally {
+      // returnAccount runs in the parent (uncancelled) scope so the lease is freed.
       if (grant) await coord.returnAccount(grant.accountId).catch(() => undefined);
+    }
+  }
+
+  // Run one agent turn in a cancellable scope; a cancel signal aborts it at once.
+  async function runCancellable<T>(fn: () => Promise<T>): Promise<T> {
+    const scope = new CancellationScope({ cancellable: true });
+    activeTurn = scope;
+    try {
+      return await scope.run(fn);
+    } finally {
+      activeTurn = undefined;
     }
   }
 
@@ -410,7 +430,10 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           bindings: { reviewInfo: reviewInfo?.summary ?? '' },
           accountConfigHome,
         }),
-      ).catch((e) => log.warn('merge agent turn failed; proceeding to authoritative merge', { e: String(e) }));
+      ).catch((e) => {
+        if (isCancellation(e)) throw e; // pre-merge cancel → abort, don't merge
+        log.warn('merge agent turn failed; proceeding to authoritative merge', { e: String(e) });
+      });
       // …then the authoritative, deterministic merge that guarantees work lands.
       result = await long.finalizeMergeActivity(world as any, target);
     } catch (err) {
@@ -442,7 +465,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   await core.destroyWorld(world as any);
   return { stage, sha };
   } catch (e) {
-    if (e instanceof Cancelled) return await abort();
+    if (e instanceof Cancelled || (isCancellation(e) && cancelled)) return await abort();
     throw e;
   }
 

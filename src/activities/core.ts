@@ -1,4 +1,5 @@
 import type { Client } from '@temporalio/client';
+import { Context as activityContext } from '@temporalio/activity';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
 import { WorldHandle, WorldKind } from '../world/types.js';
@@ -191,6 +192,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Snapshot the journaled turn input (SPEC §5.4).
       record(args.taskId, 'turn.prompt', { role: args.role, profile: profile.id, provider: profile.provider });
 
+      // Temporal cancellation → abort the in-flight turn mid-flight (SPEC §5.6).
+      let signal: AbortSignal | undefined;
+      let heartbeat: (() => void) | undefined;
+      try {
+        const actx = activityContext.current();
+        signal = actx.cancellationSignal;
+        heartbeat = () => actx.heartbeat();
+      } catch {
+        /* not running inside a Temporal activity (e.g. a direct unit test) */
+      }
+
       const result = await runTurn(
         {
           profile,
@@ -204,6 +216,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         },
         {
           adapters: deps.adapters,
+          signal,
+          heartbeat,
           onEmit: (t) => record(args.taskId, 'agent.output', { text: t }),
           ...(deps.payments
             ? {

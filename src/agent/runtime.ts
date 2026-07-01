@@ -18,6 +18,9 @@ export interface RunTurnDeps {
   };
   spendCtx?: { projectId: string; taskId: string };
   onSpend?: (req: any, outcome: any) => void;
+  /** Cancellation propagated from the workflow (SPEC §5.6 mid-turn cancel). */
+  signal?: AbortSignal;
+  heartbeat?: () => void;
 }
 
 /**
@@ -67,6 +70,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     emit(text) {
       deps.onEmit?.(text);
     },
+    signal: deps.signal,
+    heartbeat: deps.heartbeat,
   };
 
   const turn = await adapter.runTurn(input, ctx);
