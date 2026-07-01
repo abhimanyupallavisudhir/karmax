@@ -2,7 +2,7 @@ import type { Client } from '@temporalio/client';
 import { Store } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
-import { WORKFLOW_TYPE, SIG } from '../workflows/names.js';
+import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
 import { TaskRecord, TaskView, Message } from '../domain/types.js';
 import { manifest as manifestFor } from '../contrib/manifests.js';
@@ -115,7 +115,9 @@ export class KarmaxApi {
     input.workflow = workflow;
     if (args.profiles) input.profiles = args.profiles;
 
-    await this.deps.client.workflow.start(type, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
+    // Pin the execution to the manifest version stamped on the task (§21b), so a
+    // later version upgrade only affects new tasks, never this running one.
+    await this.deps.client.workflow.start(pinnedType(type, manifest.version), { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
     return task;
   }
 
@@ -138,7 +140,9 @@ export class KarmaxApi {
     input.workflow = task.workflow;
     if (task.params.profiles) input.profiles = task.params.profiles as Record<string, string>;
     this.deps.store.clearDraft(taskId);
-    await this.deps.client.workflow.start(type, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
+    // Pin to the version stamped when the draft was created, not whatever is
+    // current now — queueing a draft after an upgrade must not silently swap code.
+    await this.deps.client.workflow.start(pinnedType(type, task.workflowVersion), { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
     return this.deps.store.getTask(taskId)!;
   }
 
@@ -228,7 +232,7 @@ export class KarmaxApi {
       workflowVersion: '1.0.0',
       params: { prompt: args.title, branch: args.branch, target: args.target },
     });
-    await this.deps.client.workflow.start(WORKFLOW_TYPE['merge-only']!, {
+    await this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, '1.0.0'), {
       taskQueue: this.deps.taskQueue,
       workflowId: task.id,
       args: [

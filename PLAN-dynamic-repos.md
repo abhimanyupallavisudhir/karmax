@@ -204,9 +204,16 @@ Then the loading machinery (these package declarations are its payload):
   `resolve(name, version?)` with latest-by-numeric-version, `list`, `versions`).
   `PackageStore.withBundled()` seeds from `MANIFESTS`; malformed packages are
   rejected. No execution change yet — nothing consumes it; 21b wires it in.
-- **21b — Version-qualified registration + start**: register `type@version`; pin
-  per execution; two versions of a trivial workflow coexist; an old execution
-  replays its version while a new one runs the new version (the determinism test).
+- **21b — Version-qualified registration + start** ✅ The worker registers each
+  task workflow under a `type@version` export (`workflows/index.ts`, via ES
+  arbitrary-string export names — verified to bundle + register on Temporal
+  1.11). `qualifiedType`/`pinnedType` (`workflows/names.ts`) map a workflow +
+  version to its Temporal type, falling back to the bare type if that version
+  isn't registered (unpinned, never a failed start). `createTask` pins to the
+  manifest version, `queueTask` to the version stamped on the draft, so a later
+  upgrade never swaps a running/queued execution's code. Determinism proven in
+  `tests/versioning.test.ts`: two versions of a probe workflow coexist in one
+  worker and each execution returns its own pinned version while the other runs.
 - **21c — External package load**: load a workflow package from a git ref (not the
   bundle); run it end-to-end (mock agent).
 - **21d — Pin/upgrade UI + self-healing loop**: version settings, upgrade surface,
