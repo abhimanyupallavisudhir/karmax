@@ -99,4 +99,24 @@ describe('install a workflow from git and run a task on it (real dev server)', (
   it('refuses to install over a built-in workflow name', async () => {
     await expect(api.installWorkflow(token, { url: repo, name: 'software-dev' })).rejects.toThrow(/built-in/);
   });
+
+  it('persists an install and reloads it after a restart (from the on-disk snapshot)', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-persist-'));
+    try {
+      // Install with persistence on (cacheHome set).
+      const m1 = new WorkflowManager(mgr, new WorkflowRepoLoader(home), PackageStore.withBundled(), home);
+      await m1.install({ url: repo });
+
+      // Simulate a restart: a brand-new manager with a fresh in-memory store,
+      // same cacheHome. It knows nothing until it restores from disk.
+      const m2 = new WorkflowManager(mgr, new WorkflowRepoLoader(home), PackageStore.withBundled(), home);
+      expect(m2.list().some((w) => w.name === 'note')).toBe(false);
+      const restored = await m2.restore();
+      expect(restored).toBe(1);
+      expect(m2.list().some((w) => w.name === 'note' && w.source === 'external')).toBe(true);
+      expect(m2.resolveStart('note')).toBeTruthy();
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
 });

@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { WorkerManager } from '../temporal/worker-pool.js';
 import { WorkflowRepoLoader } from './repo.js';
 import { PackageStore } from './store.js';
@@ -5,6 +7,13 @@ import { ExternalWorkflowRef } from './bundle.js';
 import { WORKFLOW_TYPE, qualifiedType } from '../workflows/names.js';
 import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import { bundledStart, StartResolution } from '../platform/resolve-start.js';
+
+/** One installed package, persisted so it can be reloaded at boot from disk. */
+interface InstalledRecord {
+  name: string;
+  version: string;
+  dir: string; // immutable snapshot dir (holds manifest + workflow code)
+}
 
 export interface WorkflowSummary {
   name: string;
@@ -31,7 +40,31 @@ export class WorkflowManager {
     private worker: WorkerManager,
     private loader: WorkflowRepoLoader,
     private store: PackageStore = PackageStore.withBundled(),
+    /** Directory for the persisted install registry; omit to disable persistence (tests). */
+    private cacheHome?: string,
   ) {}
+
+  private get registryFile(): string | undefined {
+    return this.cacheHome ? path.join(this.cacheHome, 'installed.json') : undefined;
+  }
+
+  private readRegistry(): InstalledRecord[] {
+    const f = this.registryFile;
+    if (!f || !fs.existsSync(f)) return [];
+    try {
+      const data = JSON.parse(fs.readFileSync(f, 'utf8'));
+      return Array.isArray(data) ? data : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private writeRegistry(records: InstalledRecord[]): void {
+    const f = this.registryFile;
+    if (!f) return;
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, JSON.stringify(records, null, 2));
+  }
 
   /** The package store, for callers that resolve manifests directly. */
   get packages(): PackageStore {
@@ -65,7 +98,52 @@ export class WorkflowManager {
     const type = qualifiedType(pkg.manifest.name, pkg.manifest.version);
     this.external.set(type, { type, entryFile: pkg.workflowEntry, exportName: manifestExport(pkg.manifest) });
     await this.worker.refresh([...this.external.values()]);
+    this.persist(pkg.manifest.name, pkg.manifest.version, pkg.dir);
     return { name: pkg.manifest.name, version: pkg.manifest.version };
+  }
+
+  /**
+   * Reload previously-installed packages from disk and roll the worker once so
+   * they're served again after a restart (SPEC §4.2). Loads from the cached
+   * snapshot — no network — so an unreachable origin doesn't break boot. A
+   * snapshot that has gone missing is skipped (reported to `onWarn`).
+   */
+  async restore(onWarn: (msg: string) => void = () => {}): Promise<number> {
+    const records = this.readRegistry();
+    let loaded = 0;
+    for (const r of records) {
+      try {
+        if (!fs.existsSync(r.dir)) throw new Error('snapshot missing');
+        const { manifest, workflowEntry } = await this.loader.inspect(r.dir);
+        if (!workflowEntry) throw new Error('no workflow module');
+        this.store.register(manifest);
+        const type = qualifiedType(manifest.name, manifest.version);
+        this.external.set(type, { type, entryFile: workflowEntry, exportName: manifestExport(manifest) });
+        loaded++;
+      } catch (e) {
+        onWarn(`could not restore workflow ${r.name}@${r.version}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (this.external.size) await this.worker.refresh([...this.external.values()]);
+    return loaded;
+  }
+
+  private persist(name: string, version: string, dir: string): void {
+    const records = this.readRegistry().filter((r) => !(r.name === name && r.version === version));
+    records.push({ name, version, dir });
+    this.writeRegistry(records);
+  }
+
+  /**
+   * Task-form parameter schemas for every selectable workflow — built-in and
+   * installed (§10.4/§21d) — so an installed workflow is pickable in the New Task
+   * form, not just via the API. Coordinators are excluded (not user-startable).
+   */
+  schemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
+    return [...new Set(this.store.list().map((p) => p.name))]
+      .map((name) => this.store.resolve(name)!)
+      .filter((m) => m.kind !== 'coordinator')
+      .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
   }
 
   /** Resolve how to start `workflow` (built-in or installed) at an optional version. */

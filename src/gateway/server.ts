@@ -10,7 +10,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
-import { manifest, MANIFESTS } from '../contrib/manifests.js';
+import { manifest } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort } from '../agent/profiles.js';
@@ -494,11 +494,8 @@ export class Gateway {
 
       // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms
       if (p === '/api/schema' && method === 'GET') {
-        return this.json(
-          res,
-          200,
-          MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages })),
-        );
+        // Built-in + installed workflows, so the New Task form offers both (§21d).
+        return this.json(res, 200, api.workflowSchemas());
       }
 
       // resolved/inherited defaults per scope — drives form placeholders (SPEC §10.4)

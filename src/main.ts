@@ -100,7 +100,11 @@ async function main() {
     console.log(`  • Registered ${pool.length} login(s) into the account pool`);
   }
 
-  const workflows = new WorkflowManager(workerManager, new WorkflowRepoLoader(p.workflows));
+  const workflows = new WorkflowManager(workerManager, new WorkflowRepoLoader(p.workflows), undefined, p.workflows);
+  // Reload workflows installed in previous sessions (SPEC §4.2) and roll the
+  // worker once so their tasks — new and in-flight — can run after a restart.
+  const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
+  if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows });
   const contributions = new ContributionRegistry();
   const overlays = new Overlays();

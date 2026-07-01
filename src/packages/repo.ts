@@ -78,17 +78,29 @@ export class WorkflowRepoLoader {
       fs.rmSync(tarball, { force: true });
     }
 
-    const manifest = await readManifest(dir);
+    const { manifest, workflowEntry } = await inspectDir(dir);
     // The manifest's own name is authoritative for registration/resolution. Only
     // when a caller pinned an explicit name do we treat a disagreement as an
     // error — otherwise the URL-derived name is just a cache-dir guess.
     if (spec.name && manifest.name !== spec.name) {
       throw new Error(`package at ${spec.url} declares name "${manifest.name}" but was loaded as "${spec.name}"`);
     }
-    const workflowEntry = firstExisting(dir, WORKFLOW_NAMES);
     if (store) store.register(manifest);
     return { manifest, sha, ref, dir, workflowEntry };
   }
+
+  /**
+   * Read + validate a package from an already-cached snapshot dir, without git.
+   * Used to reload installed packages at boot from `~/.karmax/workflows/...`
+   * even if the origin is unreachable (SPEC §4.2 — the repos live on disk).
+   */
+  async inspect(dir: string): Promise<{ manifest: WorkflowManifest; workflowEntry?: string }> {
+    return inspectDir(dir);
+  }
+}
+
+async function inspectDir(dir: string): Promise<{ manifest: WorkflowManifest; workflowEntry?: string }> {
+  return { manifest: await readManifest(dir), workflowEntry: firstExisting(dir, WORKFLOW_NAMES) };
 }
 
 function deriveName(url: string): string {

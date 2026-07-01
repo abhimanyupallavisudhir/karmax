@@ -4,6 +4,7 @@ import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
+import { MANIFESTS } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
 import { TaskRecord, TaskView, Message } from '../domain/types.js';
@@ -267,6 +268,17 @@ export class KarmaxApi {
   listWorkflows(token: string): WorkflowSummary[] {
     this.require(token, 'list_workflows');
     return this.deps.workflows?.list() ?? [];
+  }
+
+  /**
+   * Task-form parameter schemas for selectable workflows (§10.4). Includes
+   * installed workflows when a manager is configured, else the built-ins — so
+   * the New Task form can offer any registered workflow. Read-only, session-gated
+   * by the gateway, so it takes no capability (matches the prior inline handler).
+   */
+  workflowSchemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
+    if (this.deps.workflows) return this.deps.workflows.schemas();
+    return MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
   }
 
   /**
