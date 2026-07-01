@@ -79,8 +79,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(progress).toBeTruthy();
     const byType = Object.fromEntries(progress.widgets.map((w: any) => [w.type, w]));
     expect(byType.badge.data).toBe('review'); // bound to view.stage
-    expect(byType.thread.data.length).toBeGreaterThan(0); // bound to view.messages
+    expect(byType.gauge.data).toBeTruthy(); // merge-queue gauge
     expect(Array.isArray(byType.list.data)).toBe(true); // bound to changedFiles
+    // the conversation thread is intentionally NOT duplicated here — the drawer's
+    // (collapsible) conversation floor already shows it (task 1b).
+    expect(byType.thread).toBeUndefined();
 
     // events endpoint returns a live log
     const events: any = await (await fetch(`${base}/api/tasks/${task.id}/events?since=0`, { headers: auth() })).json();

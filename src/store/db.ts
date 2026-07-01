@@ -31,6 +31,22 @@ export class Store {
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.migrate();
+    this.migrateData();
+  }
+
+  /** One-time data migrations (idempotent; run every boot). */
+  private migrateData() {
+    // Turn caps are now optional (unlimited by default). Strip the legacy caps
+    // that older builds seeded onto the role-default profiles so existing installs
+    // match the new "no limit unless you set one" behavior.
+    const rows = this.db.prepare("SELECT id, json FROM profiles WHERE id LIKE '%-default'").all() as any[];
+    for (const r of rows) {
+      const p = JSON.parse(r.json);
+      if (p.maxTurns !== undefined) {
+        delete p.maxTurns;
+        this.db.prepare('UPDATE profiles SET json = ? WHERE id = ?').run(JSON.stringify(p), r.id);
+      }
+    }
   }
 
   private migrate() {

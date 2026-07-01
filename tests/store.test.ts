@@ -1,10 +1,27 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs';
 import { Store } from '../src/store/db.js';
 
 describe('Store', () => {
   let store: Store;
   beforeEach(() => {
     store = new Store(':memory:');
+  });
+
+  it('migrates away legacy turn caps on role-default profiles (task 1a)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    // an older build persisted a role default with maxTurns
+    const s1 = new Store(dbPath);
+    s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude', capabilities: [], maxTurns: 24 } as any);
+    s1.upsertProfile({ id: 'custom-big', name: 'Big', role: 'do', provider: 'claude', capabilities: [], maxTurns: 99 } as any);
+    // reopening runs migrateData
+    const s2 = new Store(dbPath);
+    expect(s2.getProfile('do-default')!.maxTurns).toBeUndefined(); // legacy cap stripped
+    expect(s2.getProfile('custom-big')!.maxTurns).toBe(99); // non-default profiles untouched
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('creates a project with a default task list', () => {

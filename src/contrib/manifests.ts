@@ -11,7 +11,10 @@ import { FieldSpec } from '../domain/types.js';
 // ── reusable field builders ──
 const ALL: FieldSpec['scopes'] = ['task', 'project', 'global'];
 const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Prompt', required: true, scopes: ['task'], bind: 'prompt', placeholder: 'Describe the task…' });
-const agentField = (role: string, label: string): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ALL, bind: 'profile', role });
+// Task-scope only: per-role agent DEFAULTS live in the Agent-profiles editor
+// (with a per-project override), so this is just the one-off per-task override —
+// no duplication with the workflow-defaults settings forms (SPEC §7.1/§10.5).
+const agentField = (role: string, label: string): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directory', help: 'Absolute path, or one starting with ~', scopes: ['project'], bind: 'project' });
@@ -96,7 +99,6 @@ export const MANIFESTS: WorkflowManifest[] = [
           { type: 'badge', bind: 'stage', title: 'Stage' },
           { type: 'gauge', bind: 'mergeQueue', title: 'Merge queue', valueKey: 'position', maxKey: 'total' },
           { type: 'list', bind: 'reviewInfo.changedFiles', title: 'Changed files', empty: 'No changes yet.' },
-          { type: 'thread', bind: 'messages', title: 'Conversation' },
         ],
       },
       { slot: 'review-area', tier: 4, component: 'review-iframe', title: 'Review' },

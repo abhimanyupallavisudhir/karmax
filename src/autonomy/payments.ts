@@ -122,14 +122,17 @@ export class StripeIssuingProvider implements PaymentProvider {
       kind: 'oauth',
       connected,
       help: connected
-        ? 'Connected. Cards are issued by Stripe; karmax never sees the card number.'
-        : 'Connect your Stripe account (OAuth). Stripe holds the card data; karmax stores only the account handle. Requires STRIPE_CLIENT_ID (+ STRIPE_SECRET_KEY on the server).',
+        ? 'Connected. You authorize karmax to your Stripe account; Stripe issues the cards and holds the card data — karmax never sees the card number.'
+        : 'Connect your Stripe account with one click (OAuth) — you authorize, karmax stores only the account handle. Enabled by the karmax operator; you never enter keys or card numbers.',
     };
   }
   async connect(): Promise<ConnectResult> {
+    // STRIPE_CLIENT_ID is the *platform operator's* Stripe Connect app id — set once
+    // for the whole deployment, NOT per user. Each user just authorizes via OAuth and
+    // their connected-account id is stored per-account (multi-tenant safe).
     const clientId = process.env.STRIPE_CLIENT_ID;
     if (!clientId) {
-      return { status: 'unavailable', detail: 'Set STRIPE_CLIENT_ID (and STRIPE_SECRET_KEY) on the karmax server to enable Stripe Issuing, then connect.' };
+      return { status: 'unavailable', detail: 'Stripe Issuing is not enabled on this karmax deployment yet — the operator configures the platform Stripe Connect app once. Until then, use Local funds.' };
     }
     // Standard Stripe Connect OAuth — the user authorizes; karmax never types creds.
     const url = `https://connect.stripe.com/oauth/authorize?response_type=code&scope=read_write&client_id=${encodeURIComponent(clientId)}`;

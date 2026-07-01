@@ -278,7 +278,7 @@ function renderShell() {
       <div class="brand"><span class="mark">◇</span> karmax</div>
       <div class="search"><span>⌕</span><input id="search" placeholder="Search tasks…  ( / )" /></div>
       <div class="spacer"></div>
-      <div class="agent-chip ${isMock ? 'mock' : ''}" title="${esc(agent.reason || '')}">
+      <div class="agent-chip ${isMock ? 'mock' : ''}" id="agent-chip" role="button" tabindex="0" style="cursor:pointer" title="${esc(agent.reason || '')} — manage agents & accounts">
         <span class="dot"></span> ${esc(agent.provider || 'agent')}
       </div>
       <button class="icon-btn has-badge" id="bell" title="Needs attention">🔔<span class="badge hidden" id="bell-badge">0</span></button>
@@ -291,6 +291,7 @@ function renderShell() {
   $('#search').addEventListener('input', (e) => { S.search = e.target.value; if (S.tab === 'tasks') renderMain(); });
   $('#theme').addEventListener('click', toggleTheme);
   $('#bell').addEventListener('click', toggleNotifications);
+  $('#agent-chip')?.addEventListener('click', () => switchTab('global'));
   renderRail();
   renderMain();
   refreshTasks();
@@ -670,10 +671,12 @@ function drawerBody(v) {
     ${review}
     ${renderWidgetGroups(S.widgets)}
     ${subtasks}
-    <div class="section-h">Conversation</div>
-    <div class="thread">${msgs || '<div class="msg system">No messages yet</div>'}
-      <div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>
-    </div>
+    <details class="conversation" ${['active', 'waiting'].includes(v.status) ? 'open' : ''}>
+      <summary class="section-h" style="cursor:pointer">Conversation${(v.messages || []).length ? ` (${(v.messages || []).length})` : ''}</summary>
+      <div class="thread">${msgs || '<div class="msg system">No messages yet</div>'}
+        <div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>
+      </div>
+    </details>
     <details class="advanced">
       <summary>Advanced — terminal, live event log, structured state</summary>
       <div class="section-h">Terminal — open a shell in the world (ephemeral)</div>
