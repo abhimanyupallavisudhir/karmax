@@ -337,13 +337,33 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
-      // profiles (agent role profiles: provider/model/effort/capabilities/auth)
-      if (p === '/api/profiles' && method === 'GET') return this.json(res, 200, store.listProfiles());
+      // profiles (agent role profiles). Global scope by default; a project overlay
+      // (id `<projectId>::<role>-default`) overrides global per project (SPEC §7/§9).
+      if (p === '/api/profiles' && method === 'GET') {
+        const pid = url.searchParams.get('projectId') ?? undefined;
+        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::')));
+        // effective per-role view: the project override if present, else global (inherited)
+        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::'));
+        const view = globals.map((g) => {
+          const proj = store.getProfile(`${pid}::${g.role}-default`);
+          return { ...(proj ?? g), id: `${pid}::${g.role}-default`, role: g.role, scope: proj ? 'project' : 'inherited', inherited: g };
+        });
+        return this.json(res, 200, view);
+      }
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
-        if (!b.id || !b.role) return this.json(res, 400, { error: 'profile needs id + role' });
-        store.upsertProfile({ provider: 'claude', capabilities: [], ...b });
-        return this.json(res, 200, store.getProfile(b.id) ?? null);
+        if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
+        const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
+        if (!id) return this.json(res, 400, { error: 'profile needs id or projectId' });
+        const { projectId: _pid, scope: _s, inherited: _i, ...rest } = b;
+        store.upsertProfile({ provider: 'claude', capabilities: [], ...rest, id });
+        return this.json(res, 200, store.getProfile(id) ?? null);
+      }
+      // reset a project profile override back to the global default
+      const profDelMatch = p.match(/^\/api\/profiles\/(.+)$/);
+      if (profDelMatch && method === 'DELETE') {
+        store.deleteProfile(decodeURIComponent(profDelMatch[1]!));
+        return this.json(res, 200, { ok: true });
       }
 
       // cards (payment resources; SPEC §7.6). Provision/list/fund.
@@ -403,17 +423,26 @@ export class Gateway {
             platform: b.platformMcp ? { command: String(b.platformMcp.command), args: Array.isArray(b.platformMcp.args) ? b.platformMcp.args : [] } : undefined,
           });
         }
-        // Re-register the pool so any now-logged-in account joins coordinator leasing.
-        if (this.deps.configHomes && this.deps.client) {
-          const pool = this.deps.configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path }));
-          if (pool.length) {
-            const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
-            await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);
-          }
-        }
+        await this.refreshLoginPool();
         // strip the absolute configHome path from the response
         const { configHome, ...safe } = result;
         return this.json(res, 200, safe);
+      }
+      // edit (rename) / delete a connected login
+      const loginMatch = p.match(/^\/api\/accounts\/logins\/([^/]+)\/(.+)$/);
+      if (loginMatch && (method === 'DELETE' || method === 'PATCH')) {
+        if (!this.deps.configHomes) return this.json(res, 400, { error: 'no config homes configured' });
+        const provider = (loginMatch[1] === 'codex' ? 'codex' : 'claude') as Provider;
+        const account = decodeURIComponent(loginMatch[2]!);
+        if (method === 'DELETE') {
+          this.deps.configHomes.remove(provider, account);
+        } else {
+          const b = await this.body(req);
+          if (!b.account) return this.json(res, 400, { error: 'new account name required' });
+          this.deps.configHomes.rename(provider, account, String(b.account));
+        }
+        await this.refreshLoginPool();
+        return this.json(res, 200, { ok: true });
       }
 
       // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms
@@ -538,6 +567,16 @@ export class Gateway {
   /** For each agent field, resolve the concrete provider/model the server would
    *  actually run (setting → seeded profile → code default), so the form can show
    *  it as the inherited default. */
+  /** Re-register the connected-login pool with the account coordinator so lease
+   *  rotation reflects the current set (called after connect/rename/delete). */
+  private async refreshLoginPool(): Promise<void> {
+    if (!this.deps.configHomes || !this.deps.client) return;
+    const pool = this.deps.configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path }));
+    if (!pool.length) return;
+    const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
+    await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);
+  }
+
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>) {
     const out = { ...vals };
     for (const f of m.params) {

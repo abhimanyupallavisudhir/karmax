@@ -6,7 +6,7 @@ import WebSocket from 'ws';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
-import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn } from '../src/autonomy/config-homes.js';
+import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, capturedToken } from '../src/autonomy/config-homes.js';
 import { LoginManager } from '../src/autonomy/login.js';
 import { remoteAccessPlan } from '../src/remote/access.js';
 
@@ -100,6 +100,37 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     const home = homes.ensure('codex', 'acme');
     fs.writeFileSync(path.join(home, 'auth.json'), '{}');
     expect(login.status('codex', 'acme').loggedIn).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('captures a printed setup-token so the account reads as signed-in (1c)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-tok-'));
+    const homes = new ConfigHomeManager(dir);
+    // fake login: prints a device URL, then (as if OAuth finished) a token, then exits
+    const login = new LoginManager(homes, () => ({
+      cmd: 'bash',
+      args: ['-c', 'echo "Visit https://example.com/dev?code=X"; echo "Your token: sk-ant-oat01-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"; sleep 0.05'],
+      env: {} as Record<string, string>,
+    }));
+    const r = await login.connect('claude', 'work', { urlTimeoutMs: 2000 });
+    expect(r.loginUrl).toContain('example.com');
+    // give the background reader a moment to persist the token
+    await new Promise((res) => setTimeout(res, 200));
+    expect(isLoggedIn('claude', r.configHome)).toBe(true);
+    expect(capturedToken(r.configHome)).toMatch(/^sk-ant-oat01-/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('deletes and renames a login config home (1b)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mgmt-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('claude', 'old');
+    fs.writeFileSync(path.join(home, '.credentials.json'), '{}');
+    const moved = homes.rename('claude', 'old', 'new');
+    expect(fs.existsSync(path.join(moved, '.credentials.json'))).toBe(true); // creds carried over
+    expect(homes.list().map((h) => h.account)).toContain('new');
+    homes.remove('claude', 'new');
+    expect(homes.list().map((h) => h.account)).not.toContain('new');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });

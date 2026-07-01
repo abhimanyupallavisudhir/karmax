@@ -54,11 +54,16 @@ export class ProfileResolver {
     private fallbackProvider: Provider,
   ) {}
 
-  resolve(role: AgentRole, taskProfiles?: Record<string, string>, explicitId?: string): AgentProfile {
+  resolve(role: AgentRole, taskProfiles?: Record<string, string>, explicitId?: string, projectId?: string): AgentProfile {
     const id = explicitId ?? taskProfiles?.[role];
     if (id) {
       const p = this.store.getProfile(id);
       if (p) return p;
+    }
+    // Project overlay (SPEC §9): a project-scoped role default overrides the global one.
+    if (projectId) {
+      const proj = this.store.getProfile(`${projectId}::${role}-default`);
+      if (proj) return proj;
     }
     const def = this.store.getProfile(`${role}-default`);
     if (def) return def;
@@ -71,7 +76,6 @@ export class ProfileResolver {
       ...(model ? { model } : {}),
       role,
       capabilities: ['signal-completion'],
-      maxTurns: 24,
     };
   }
 }

@@ -130,7 +130,12 @@ export class ClaudeAdapter implements AgentAdapter {
 
     // Scrubbed, config-home-isolated env (SPEC §7.3).
     const { scrubbedEnv } = await import('../autonomy/config-homes.js');
-    const env = scrubbedEnv({ provider: 'claude', configHome: input.resolvedAuth?.configHome });
+    const env = scrubbedEnv({
+      provider: 'claude',
+      configHome: input.resolvedAuth?.configHome,
+      // A captured setup-token login: re-supply it (scrubbedEnv strips it by default).
+      ...(input.resolvedAuth?.oauthToken ? { extra: { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } } : {}),
+    });
 
     let finalText = '';
     let session = input.session;

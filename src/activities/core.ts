@@ -13,11 +13,32 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
+import { capturedToken } from '../autonomy/config-homes.js';
 import { attenuate } from '../platform/capabilities.js';
-import { Provider, Message, TaskInput, TaskView, AgentRole } from '../domain/types.js';
+import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
 
 const DEFAULT_GRANT = ['*'];
+
+/** Split an account ref that may be "<provider>:<name>" or just "<name>". */
+function splitAccountRef(ref: string, fallback: Provider): { provider: Provider; name: string } {
+  const [maybeProv, ...rest] = ref.split(':');
+  const isProv = rest.length > 0 && (maybeProv === 'claude' || maybeProv === 'codex' || maybeProv === 'mock');
+  return { provider: (isProv ? maybeProv : fallback) as Provider, name: isProv ? rest.join(':') : ref };
+}
+
+/** Derive a single AuthSource from the first usable entry of allowedAccounts
+ *  (`login:<provider>:<account>` → configHome; `key:<handle>` → apiKeyHandle). */
+function firstAllowedToAuth(allowed: string[] | undefined, provider: Provider): AuthSource | undefined {
+  if (!allowed?.length) return undefined;
+  // Prefer a login for the profile's provider; else the first login; else a key.
+  const logins = allowed.filter((a) => a.startsWith('login:'));
+  const preferred = logins.find((a) => a.slice('login:'.length).startsWith(`${provider}:`)) ?? logins[0];
+  if (preferred) return { kind: 'configHome', account: preferred.slice('login:'.length) };
+  const key = allowed.find((a) => a.startsWith('key:'));
+  if (key) return { kind: 'apiKeyHandle', handle: key.slice('key:'.length) };
+  return undefined;
+}
 
 export interface CoreActivityDeps {
   store: Store;
@@ -93,7 +114,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async runAgentTurn(args: RunAgentTurnArgs) {
-      const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId);
+      const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId, args.task.projectId);
       // Apply the per-role agent override from the task form (SPEC §10.5).
       const spec = args.task.agents?.[args.role];
       const profile = spec
@@ -134,32 +155,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         record(args.taskId, 'token.minted', { profile: profile.id, caps: effective });
       }
 
-      // JIT-resolve credentials via the broker (never journaled).
-      let resolvedAuth: { apiKey?: string; configHome?: string } | undefined;
-      if (profile.auth?.kind === 'apiKeyHandle' && profile.auth.handle && deps.broker) {
-        const apiKey = deps.broker.resolve(profile.auth.handle, {
-          taskId: args.taskId,
-          profileId: profile.id,
-          caps: effective,
-        });
+      // JIT-resolve credentials via the broker (never journaled). The account to
+      // use comes from the profile's allowedAccounts set (SPEC §7.3/§6.2) — first
+      // matching entry — falling back to the legacy single `auth` field.
+      let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
+      const effAuth = profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider);
+      if (effAuth?.kind === 'apiKeyHandle' && effAuth.handle && deps.broker) {
+        const apiKey = deps.broker.resolve(effAuth.handle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
-      } else if (profile.auth?.kind === 'configHome') {
+      } else if (effAuth?.kind === 'configHome') {
         // Either an explicit path, or an account ref resolved to its minted home.
         // `account` may be "<provider>:<name>" (from the login picker) or just "<name>".
-        let home = profile.auth.configHome;
-        if (!home && profile.auth.account && deps.configHomes) {
-          const ref = profile.auth.account;
-          const [maybeProv, ...rest] = ref.split(':');
-          const isProv = rest.length > 0 && (maybeProv === 'claude' || maybeProv === 'codex' || maybeProv === 'mock');
-          const prov = (isProv ? maybeProv : profile.provider) as Provider;
-          const name = isProv ? rest.join(':') : ref;
+        let home = effAuth.configHome;
+        if (!home && effAuth.account && deps.configHomes) {
+          const { provider: prov, name } = splitAccountRef(effAuth.account, profile.provider);
           home = deps.configHomes.ensure(prov, name);
         }
-        if (home) resolvedAuth = { configHome: home };
+        if (home) resolvedAuth = { configHome: home, ...(capturedToken(home) ? { oauthToken: capturedToken(home) } : {}) };
       }
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
-      if (args.accountConfigHome) resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome };
+      if (args.accountConfigHome) {
+        const tok = capturedToken(args.accountConfigHome);
+        resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome, ...(tok ? { oauthToken: tok } : {}) };
+      }
 
       const systemPrompt = assemblePrompt({
         profile,

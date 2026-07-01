@@ -924,6 +924,7 @@ function settingsView(proj) {
     <div class="page-title">Project settings — ${esc(proj.name)}</div>
     <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
     ${settingsForms('project', proj.id)}
+    ${profilesCard('project')}
     ${paymentsCard('project')}
     <div class="card">
       <div class="section-h">Workflow activation</div>
@@ -933,6 +934,7 @@ function settingsView(proj) {
 }
 function wireSettingsView(proj) {
   hydrateSettingsForms('project', proj.id);
+  hydrateProfiles('project', proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
       const wf = b.dataset.save;
@@ -958,11 +960,7 @@ function globalSettingsView() {
     <div class="page-title">Global settings</div>
     <p style="color:var(--ink-2);margin-top:-8px">Your defaults across all projects. Projects can override these; tasks override both.</p>
     ${settingsForms('global')}
-    <div class="card" id="profiles-card">
-      <div class="section-h">Agent profiles</div>
-      <p style="color:var(--ink-2);margin-top:0">Role defaults used when a task doesn't override the agent. Edit provider, model, effort, capabilities, and which stored key to use.</p>
-      <div id="profiles-list">Loading…</div>
-    </div>
+    ${profilesCard('global')}
     ${paymentsCard('global')}
     <div class="card" id="accounts-card">
       <div class="section-h">Accounts</div>
@@ -1068,19 +1066,28 @@ async function wirePaymentsCard(scope, projectId) {
   });
 }
 
-// Auth options for a profile: API-key handles + connected logins (config homes).
-function authOptions(p, handles, logins) {
-  const cur = p.auth?.kind === 'apiKeyHandle' ? `key:${p.auth.handle}` : p.auth?.kind === 'configHome' ? `login:${p.auth.account}` : '';
-  const opt = (val, label) => `<option value="${esc(val)}" ${val === cur ? 'selected' : ''}>${esc(label)}</option>`;
-  const keyOpts = handles.map((h) => opt(`key:${h}`, `key · ${h}`)).join('');
-  const loginOpts = logins.map((l) => opt(`login:${l.provider}:${l.account}`, `login · ${l.provider}:${l.account}${l.loggedIn ? '' : ' (not signed in)'}`)).join('');
-  return `<option value="">— ambient login / env —</option>${loginOpts}${keyOpts}`;
+// Which accounts an agent may use (SPEC §7.3/§6.2) — a checkbox pool, all checked
+// by default. The checked set becomes the agent's credential + lease-rotation pool.
+function accountChecks(p, handles, logins) {
+  const refs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
+  if (!refs.length) return `<span style="color:var(--ink-3);font-size:12px">No accounts connected — the agent uses the ambient login.</span>`;
+  const all = !p.allowedAccounts || !p.allowedAccounts.length; // unset ⇒ all allowed
+  const on = (ref) => all || p.allowedAccounts.includes(ref);
+  const box = (ref, label, warn) =>
+    `<label style="display:inline-flex;gap:5px;align-items:center;font-size:12px;margin:2px 10px 2px 0">
+      <input type="checkbox" class="pf-acct" value="${esc(ref)}" ${on(ref) ? 'checked' : ''} /> ${esc(label)}${warn ? ' <span style="color:var(--warn,#e0b15a)">(not signed in)</span>' : ''}</label>`;
+  return (
+    logins.map((l) => box(`login:${l.provider}:${l.account}`, `${l.provider}:${l.account}`, !l.loggedIn)).join('') +
+    handles.map((h) => box(`key:${h}`, `key · ${h}`, false)).join('')
+  );
 }
 
-function profileRow(p, handles, logins) {
+function profileRow(p, handles, logins, scope) {
   const models = MODELS[p.provider] || MODELS.claude;
-  return `<div class="card" data-profile="${esc(p.id)}" style="background:var(--surface-2)">
-    <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span></div>
+  const inherited = scope === 'project' && p.scope === 'inherited';
+  return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
+    <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span>
+      ${inherited ? '<span class="chip" title="Using the global default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <input class="pf-model" list="pm-${esc(p.id)}" placeholder="model" value="${esc(p.model || '')}" style="flex:1;min-width:140px" />
@@ -1089,54 +1096,86 @@ function profileRow(p, handles, logins) {
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
     <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
-    <div class="form-row"><label>Account (login or API key)</label><select class="pf-auth">${authOptions(p, handles, logins)}</select></div>
-    <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save profile</button>
+    <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins)}</div></div>
+    <div style="display:flex;gap:8px">
+      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save profile</button>
+      ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to global</button>` : ''}
+    </div>
   </div>`;
 }
 
-async function hydrateProfilesAndAccounts() {
+// Render + wire the agent-profiles editor for a scope (global or a project).
+async function hydrateProfiles(scope, projectId) {
+  let handles = [], logins = [];
+  try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
+  let profiles = [];
+  try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
+  const list = $(`#profiles-list-${scope}`);
+  if (!list) return;
+  list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles, logins, scope)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
+  list.querySelectorAll('.pf-provider').forEach((sel) => sel.addEventListener('change', (e) => {
+    sel.closest('[data-profile]').querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
+  }));
+  const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
+  list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
+    const card = b.closest('[data-profile]');
+    const orig = profiles.find((p) => p.id === b.dataset.saveprofile) || {};
+    const checked = [...card.querySelectorAll('.pf-acct:checked')].map((c) => c.value);
+    // all checked ⇒ store nothing (means "all", stays correct as accounts are added)
+    const allowedAccounts = allRefs.length && checked.length < allRefs.length ? checked : undefined;
+    const profile = {
+      role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined, projectId: scope === 'project' ? projectId : undefined,
+      provider: card.querySelector('.pf-provider').value,
+      model: card.querySelector('.pf-model').value.trim() || undefined,
+      effort: card.querySelector('.pf-effort').value || undefined,
+      maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
+      capabilities: card.querySelector('.pf-caps').value.split(',').map((s) => s.trim()).filter(Boolean),
+      allowedAccounts,
+    };
+    try { await api('/api/profiles', { method: 'PUT', body: JSON.stringify(profile) }); toast('Profile saved'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
+  }));
+  list.querySelectorAll('[data-resetprofile]').forEach((b) => b.addEventListener('click', async () => {
+    try { await api(`/api/profiles/${encodeURIComponent(b.dataset.resetprofile)}`, { method: 'DELETE' }); toast('Reset to global'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
+  }));
+}
+
+// The accounts card (logins + API keys) — a global concept; projects choose which
+// via the per-profile checkboxes above.
+async function hydrateAccounts() {
   let handles = [], logins = [];
   try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
   const accBox = $('#accounts-list');
   if (accBox) accBox.innerHTML = handles.length ? handles.map((h) => `<span class="chip">${esc(h)}</span>`).join(' ') : '<span style="color:var(--ink-3)">No keys registered.</span>';
   const loginBox = $('#logins-list');
   if (loginBox) loginBox.innerHTML = logins.length
-    ? logins.map((l) => `<span class="chip" title="${l.loggedIn ? 'signed in' : 'connect pending — finish OAuth in your browser'}">${l.loggedIn ? '🟢' : '🟡'} ${esc(l.provider)}:${esc(l.account)}</span>`).join(' ')
+    ? logins.map((l) => `<span class="chip" data-login="${esc(l.provider)}:${esc(l.account)}" title="${l.loggedIn ? 'signed in' : 'connect pending — finish OAuth in your browser'}">
+        ${l.loggedIn ? '🟢' : '🟡'} ${esc(l.provider)}:${esc(l.account)}
+        <span class="login-rename" data-p="${esc(l.provider)}" data-a="${esc(l.account)}" title="Rename" style="cursor:pointer;margin-left:6px">✎</span>
+        <span class="login-del" data-p="${esc(l.provider)}" data-a="${esc(l.account)}" title="Delete" style="cursor:pointer;margin-left:4px">✕</span></span>`).join(' ')
     : '<span style="color:var(--ink-3)">No logins connected.</span>';
-  let profiles = [];
-  try { profiles = await api('/api/profiles'); } catch {}
-  const list = $('#profiles-list');
-  if (list) {
-    list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles, logins)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
-    list.querySelectorAll('.pf-provider').forEach((sel) => sel.addEventListener('change', (e) => {
-      const card = sel.closest('[data-profile]');
-      card.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
-    }));
-    list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
-      const card = b.closest('[data-profile]');
-      const id = b.dataset.saveprofile;
-      const orig = profiles.find((p) => p.id === id);
-      const authVal = card.querySelector('.pf-auth').value;
-      let auth;
-      if (authVal.startsWith('key:')) auth = { kind: 'apiKeyHandle', handle: authVal.slice(4) };
-      else if (authVal.startsWith('login:')) auth = { kind: 'configHome', account: authVal.slice(6) };
-      const profile = {
-        ...orig,
-        provider: card.querySelector('.pf-provider').value,
-        model: card.querySelector('.pf-model').value.trim() || undefined,
-        effort: card.querySelector('.pf-effort').value || undefined,
-        maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
-        capabilities: card.querySelector('.pf-caps').value.split(',').map((s) => s.trim()).filter(Boolean),
-        auth,
-      };
-      try { await api('/api/profiles', { method: 'PUT', body: JSON.stringify(profile) }); toast('Profile saved'); } catch (e) { toast(e.message, true); }
-    }));
-  }
+  loginBox?.querySelectorAll('.login-del').forEach((x) => x.addEventListener('click', async () => {
+    if (!confirm(`Delete login ${x.dataset.p}:${x.dataset.a}? Its stored credentials are removed.`)) return;
+    try { await api(`/api/accounts/logins/${x.dataset.p}/${encodeURIComponent(x.dataset.a)}`, { method: 'DELETE' }); toast('Login deleted'); hydrateAccounts(); } catch (e) { toast(e.message, true); }
+  }));
+  loginBox?.querySelectorAll('.login-rename').forEach((x) => x.addEventListener('click', async () => {
+    const to = prompt(`Rename login ${x.dataset.p}:${x.dataset.a} to:`, x.dataset.a);
+    if (!to || to === x.dataset.a) return;
+    try { await api(`/api/accounts/logins/${x.dataset.p}/${encodeURIComponent(x.dataset.a)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); hydrateAccounts(); } catch (e) { toast(e.message, true); }
+  }));
+}
+
+function profilesCard(scope) {
+  return `<div class="card" id="profiles-card-${scope}">
+    <div class="section-h">Agent profiles</div>
+    <p style="color:var(--ink-2);margin-top:0">Per-role defaults: provider, model, effort, capabilities, turn cap, and which accounts each agent may use.${scope === 'project' ? ' These override your global defaults for this project.' : ''}</p>
+    <div id="profiles-list-${scope}">Loading…</div>
+  </div>`;
 }
 
 function wireGlobalSettings() {
   hydrateSettingsForms('global');
-  hydrateProfilesAndAccounts();
+  hydrateProfiles('global');
+  hydrateAccounts();
   wirePaymentsCard('global');
   $('#acct-add')?.addEventListener('click', async () => {
     const provider = $('#acct-provider').value;
@@ -1148,7 +1187,7 @@ function wireGlobalSettings() {
       $('#acct-key').value = '';
       $('#acct-name').value = '';
       toast('Key registered');
-      hydrateProfilesAndAccounts();
+      hydrateAccounts();
     } catch (e) { toast(e.message, true); }
   });
   $('#login-connect')?.addEventListener('click', async () => {
@@ -1169,7 +1208,8 @@ function wireGlobalSettings() {
         out.style.color = 'var(--ink-1)';
       } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
       $('#login-name').value = '';
-      hydrateProfilesAndAccounts();
+      hydrateAccounts();
+      hydrateProfiles('global');
     } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
   });
   $('#main').querySelectorAll('[data-save]').forEach((b) =>

@@ -42,7 +42,7 @@ export interface TurnInput {
   /** Max tool/agent iterations for this turn. */
   maxTurns?: number;
   /** Credentials resolved JIT by the broker (never journaled); preferred over env. */
-  resolvedAuth?: { apiKey?: string; configHome?: string };
+  resolvedAuth?: { apiKey?: string; configHome?: string; oauthToken?: string };
 }
 
 /** When no turn cap is set, agents run "unlimited" — this is only a runaway

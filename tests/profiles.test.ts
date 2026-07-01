@@ -40,8 +40,59 @@ describe('profile + account management (Global settings backend)', () => {
     expect(JSON.stringify(accounts)).not.toContain('sk-super-secret'); // secret never returned
   });
 
-  it('rejects a profile without id/role', async () => {
+  it('rejects a profile without a role', async () => {
     const res = await fetch(`${base}/api/profiles`, { method: 'PUT', headers: auth(), body: JSON.stringify({ provider: 'claude' }) });
     expect(res.status).toBe(400);
+  });
+
+  it('stores per-agent allowedAccounts (the checkbox pool; 1d)', async () => {
+    const saved = await fetch(`${base}/api/profiles`, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({ id: 'merge-default', role: 'merge', name: 'Merge agent', provider: 'claude', capabilities: [], allowedAccounts: ['login:claude:work'] }),
+    }).then(J);
+    expect(saved.allowedAccounts).toEqual(['login:claude:work']);
+  });
+
+  it('supports project-scoped profile overrides that fall back to global (1e)', async () => {
+    const project = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(), body: JSON.stringify({ name: 'P' }) }).then(J);
+    // by default the project view inherits global
+    let view = await fetch(`${base}/api/profiles?projectId=${project.id}`, { headers: auth() }).then(J);
+    const doRow = view.find((p: any) => p.role === 'do');
+    expect(doRow.scope).toBe('inherited');
+    expect(doRow.id).toBe(`${project.id}::do-default`);
+
+    // create a project override
+    await fetch(`${base}/api/profiles`, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({ projectId: project.id, role: 'do', name: 'Do agent', provider: 'codex', capabilities: [], effort: 'low' }),
+    });
+    view = await fetch(`${base}/api/profiles?projectId=${project.id}`, { headers: auth() }).then(J);
+    const overridden = view.find((p: any) => p.role === 'do');
+    expect(overridden.scope).toBe('project');
+    expect(overridden.effort).toBe('low');
+    // global stays untouched
+    const globals = await fetch(`${base}/api/profiles`, { headers: auth() }).then(J);
+    expect(globals.every((p: any) => !p.id.includes('::'))).toBe(true);
+
+    // reset the override → back to inherited
+    await fetch(`${base}/api/profiles/${encodeURIComponent(`${project.id}::do-default`)}`, { method: 'DELETE', headers: auth() });
+    view = await fetch(`${base}/api/profiles?projectId=${project.id}`, { headers: auth() }).then(J);
+    expect(view.find((p: any) => p.role === 'do').scope).toBe('inherited');
+  });
+
+  it('deletes and renames a connected login via the API (1b)', async () => {
+    // connect (fake login in the harness) then rename + delete
+    await fetch(`${base}/api/accounts/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'claude', account: 'temp' }) });
+    let accts = await fetch(`${base}/api/accounts`, { headers: auth() }).then(J);
+    expect(accts.logins.some((l: any) => l.account === 'temp')).toBe(true);
+    await fetch(`${base}/api/accounts/logins/claude/temp`, { method: 'PATCH', headers: auth(), body: JSON.stringify({ account: 'renamed' }) });
+    accts = await fetch(`${base}/api/accounts`, { headers: auth() }).then(J);
+    expect(accts.logins.some((l: any) => l.account === 'renamed')).toBe(true);
+    const del = await fetch(`${base}/api/accounts/logins/claude/renamed`, { method: 'DELETE', headers: auth() });
+    expect(del.status).toBe(200);
+    accts = await fetch(`${base}/api/accounts`, { headers: auth() }).then(J);
+    expect(accts.logins.some((l: any) => l.account === 'renamed')).toBe(false);
   });
 });

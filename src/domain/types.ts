@@ -212,6 +212,14 @@ export interface AgentProfile {
   capabilities: string[];
   maxTurns?: number;
   auth?: AuthSource;
+  /**
+   * Which accounts this agent may use (SPEC §7.3/§6.2). Each ref is
+   * `login:<provider>:<account>` (a connected config-home login) or
+   * `key:<handle>` (a stored API key). Empty/undefined = all connected accounts.
+   * This set is the agent's credential/lease pool — the coordinator rotates
+   * across exactly these logins.
+   */
+  allowedAccounts?: string[];
 }
 
 // ─── Workflow input ──────────────────────────────────────────────────────────

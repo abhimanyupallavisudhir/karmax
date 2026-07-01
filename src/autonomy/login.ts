@@ -1,5 +1,7 @@
 import { spawn, ChildProcess } from 'node:child_process';
-import { ConfigHomeManager, scrubbedEnv, isLoggedIn } from './config-homes.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { ConfigHomeManager, scrubbedEnv, isLoggedIn, KARMAX_TOKEN_FILE } from './config-homes.js';
 import { Provider } from '../domain/types.js';
 
 /**
@@ -54,6 +56,11 @@ export class LoginManager {
     } catch (e) {
       return { provider, account, configHome, status: 'failed', detail: `could not launch ${spec.cmd}: ${String((e as Error).message ?? e)}` };
     }
+    // Keep reading the child after the URL: when the user finishes OAuth in the
+    // browser, `claude setup-token` prints a long-lived token — persist it so the
+    // account reads as signed-in (fixes "still not signed in") and the Agent SDK
+    // can use it. `codex login` writes auth.json itself, so this is a no-op there.
+    persistTokenWhenPrinted(child, configHome);
     const url = await captureUrl(child, opts.urlTimeoutMs ?? 8000);
     child.unref(); // let it keep running while the user completes OAuth
     if (url) return { provider, account, configHome, loginUrl: url, status: 'awaiting_oauth' };
@@ -65,6 +72,30 @@ export class LoginManager {
     const configHome = this.homes.ensure(provider, account);
     return { provider, account, configHome, loggedIn: isLoggedIn(provider, configHome) };
   }
+}
+
+/** A provider-issued long-lived token (e.g. Claude setup-token output). */
+const TOKEN_RE = /\b(sk-ant-[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{40,}\.[A-Za-z0-9_-]{20,})\b/;
+
+/** Watch the login process output for a printed token and persist it to the home. */
+function persistTokenWhenPrinted(child: ChildProcess, home: string): void {
+  let buf = '';
+  let written = false;
+  const onData = (b: Buffer) => {
+    if (written) return;
+    buf += b.toString();
+    const m = buf.match(TOKEN_RE);
+    if (m) {
+      written = true;
+      try {
+        fs.writeFileSync(path.join(home, KARMAX_TOKEN_FILE), JSON.stringify({ token: m[1] }));
+      } catch {
+        /* home vanished — ignore */
+      }
+    }
+  };
+  child.stdout?.on('data', onData);
+  child.stderr?.on('data', onData);
 }
 
 /** Read child stdout/stderr until a URL appears or the timeout elapses. */

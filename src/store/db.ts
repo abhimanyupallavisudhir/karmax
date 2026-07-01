@@ -242,6 +242,10 @@ export class Store {
     return (this.db.prepare('SELECT json FROM profiles').all() as any[]).map((r) => JSON.parse(r.json));
   }
 
+  deleteProfile(id: string) {
+    this.db.prepare('DELETE FROM profiles WHERE id = ?').run(id);
+  }
+
   // ─── Event log (live stream) ─────────────────────────────────────────────────
 
   appendEvent(ev: KarmaxEvent): number {

@@ -21,6 +21,21 @@ export class ConfigHomeManager {
     return dir;
   }
 
+  /** Delete a login's config home (removes its credentials + settings). */
+  remove(provider: Provider, account: string): void {
+    const dir = path.join(this.root, `${provider}-${sanitize(account)}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  /** Rename a login (move its config home so credentials carry over). */
+  rename(provider: Provider, from: string, to: string): string {
+    const src = path.join(this.root, `${provider}-${sanitize(from)}`);
+    const dst = path.join(this.root, `${provider}-${sanitize(to)}`);
+    if (fs.existsSync(src) && !fs.existsSync(dst)) fs.renameSync(src, dst);
+    else fs.mkdirSync(dst, { recursive: true });
+    return dst;
+  }
+
   list(): { provider: string; account: string; path: string; loggedIn: boolean }[] {
     if (!fs.existsSync(this.root)) return [];
     return fs.readdirSync(this.root).map((name) => {
@@ -79,10 +94,26 @@ function readJson(file: string): any {
   }
 }
 
-/** Is a config home logged in (has a provider credentials file)? */
+/** Is a config home logged in? Checks the provider's own credential file and the
+ *  karmax token file we write when a `setup-token` flow prints a token. */
 export function isLoggedIn(provider: string, home: string): boolean {
-  const candidates = provider === 'codex' ? ['auth.json'] : ['.credentials.json'];
+  const candidates =
+    provider === 'codex'
+      ? ['auth.json', KARMAX_TOKEN_FILE]
+      : ['.credentials.json', '.claude/.credentials.json', KARMAX_TOKEN_FILE];
   return candidates.some((f) => fs.existsSync(path.join(home, f)));
+}
+
+/** Where we persist a captured OAuth/setup token for a home. */
+export const KARMAX_TOKEN_FILE = 'karmax-oauth.json';
+
+/** Read a captured token for a home (used to inject into the agent env). */
+export function capturedToken(home: string): string | undefined {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(home, KARMAX_TOKEN_FILE), 'utf8')).token;
+  } catch {
+    return undefined;
+  }
 }
 
 const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_.-]/g, '-');
