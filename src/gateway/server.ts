@@ -352,13 +352,17 @@ export class Gateway {
       // profiles (agent role profiles). Global scope by default; a project overlay
       // (id `<projectId>::<role>-default`) overrides global per project (SPEC §7/§9).
       if (p === '/api/profiles' && method === 'GET') {
+        // Annotate each profile with the workflow(s) that declare its role, so the
+        // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
+        const { roleDef } = await import('../contrib/manifests.js');
+        const withRole = (pr: any) => ({ ...pr, roleWorkflows: roleDef(pr.role)?.workflows ?? [] });
         const pid = url.searchParams.get('projectId') ?? undefined;
-        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::')));
+        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::')).map(withRole));
         // effective per-role view: the project override if present, else global (inherited)
         const globals = store.listProfiles().filter((pr) => !pr.id.includes('::'));
         const view = globals.map((g) => {
           const proj = store.getProfile(`${pid}::${g.role}-default`);
-          return { ...(proj ?? g), id: `${pid}::${g.role}-default`, role: g.role, scope: proj ? 'project' : 'inherited', inherited: g };
+          return withRole({ ...(proj ?? g), id: `${pid}::${g.role}-default`, role: g.role, scope: proj ? 'project' : 'inherited', inherited: g });
         });
         return this.json(res, 200, view);
       }

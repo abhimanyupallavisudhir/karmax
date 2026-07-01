@@ -37,6 +37,29 @@ Everything else in karmax is "just code." This one fights **Temporal determinism
   re-exports the workflow fns; `makeWorker` (`src/temporal/worker.ts`) bundles
   them. This is what we generalize.
 
+## 2b. Workflow-ownership gaps (do these FIRST — they are the package payload)
+
+Loading a workflow from a repo is pointless if the platform still hardcodes how
+that workflow's agents are orchestrated. Today the **declared-data** half of the
+contribution protocol works (events, params, actions, UI widgets, capabilities-
+as-open-strings, commands), but the **agent-orchestration** half is baked into the
+binary. A dynamically-loaded package must be able to bring all of the following;
+each is a self-contained, testable step that also stands on its own before item 21:
+
+| Gap | Hardcoded in | Becomes |
+|---|---|---|
+| **Roles** — prompt template, capability ceiling, default agent spec | `DEFAULT_ROLE_TEMPLATES` (`agent/prompt.ts`) + `seedProfiles` (`agent/profiles.ts`), keyed by role string | `roles[]` on the manifest; prompt assembly, seeding, and the profiles UI derive from it. **Phase 0 below.** |
+| **Agent tools** — what tools/MCP an agent may wield | fixed `TOOL_SCHEMAS` (`agent/tools.ts`); no manifest hook | `agentTools[]` (+ `mcp[]`) declarable per workflow/role, merged onto the platform baseline |
+| **Stages + pipeline UI** — the lifecycle | fixed `Stage` enum + one hardcoded `NODES` pipeline in `web/app.js` rendered for every task | `stages[]` on the manifest; the client renders the workflow's own pipeline from the declaration (falls back to the generic floor) |
+| **Auto-resolve** — retry/resolve heuristics | fixed `CASES` (`resolve/cases.ts`) | `resolveRules[]` declarable; platform cases become the default set |
+| **Prompt preamble** | `TOOLS_PREAMBLE` + `GLOBAL_INSTRUCTIONS` inlined | optional per-workflow preamble override |
+
+Resolution stays **by role name** (shared vocabulary — configure "merge agent"
+once, reused wherever a `merge` role appears), matching how profiles already
+resolve. A registry dedupes declared roles by name; a future need for a
+same-named role with a *different* template per workflow would add `(workflow,
+role)` keying — noted, not built.
+
 ## 3. Target model
 
 A **workflow package** is a git repo (or a subdir) at a pinned ref:
@@ -151,6 +174,27 @@ drain+rebuild if multi-node.
 - The manifest's `capabilities` are the ceiling shown to the approver at pin time.
 
 ## 8. Rollout phases
+
+Workflow-ownership first (§2b) — each makes the platform derive behavior from the
+manifest instead of hardcoding it, so a loaded package can actually bring its own.
+These are independently shippable *before* any loading machinery:
+
+- **Phase 0 — `roles[]`** ⟵ *building now.* Manifest `roles[]` (name, label,
+  promptTemplate, capabilities, default agent spec). Move the bundled do/merge/
+  resolve templates + seeded defaults out of `prompt.ts`/`profiles.ts` into
+  declarations; prompt assembly, `seedProfiles`, and the profiles UI derive from a
+  role registry (by name, deduped). Prove a novel role (`reviewer`) runs end-to-end
+  with the mock agent and gets its own prompt + configurable profile.
+- **Phase 0b — `agentTools[]` / `mcp[]`** — a workflow declares tools/servers its
+  agents get on top of the platform baseline; `runAgentTurn` merges them.
+- **Phase 0c — declarative `stages[]` + pipeline** — the client renders each
+  workflow's own lifecycle from the manifest (generic floor when undeclared),
+  instead of the hardcoded software-dev `NODES`.
+- **Phase 0d — `resolveRules[]`** — declarable retry/resolve heuristics; the
+  platform `CASES` become the default set.
+- **Phase 0e — prompt-preamble override** (optional, per workflow).
+
+Then the loading machinery (these package declarations are its payload):
 
 - **21a — Package store + manifest schema + loader** (no execution change yet):
   load bundled workflows *through* the store; prove `name@version` resolution and

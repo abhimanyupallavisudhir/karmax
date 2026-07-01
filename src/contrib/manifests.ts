@@ -60,6 +60,67 @@ export interface OnActivateDecl {
   spawnTask?: { workflow: string; title: string; prompt: string };
 }
 
+/**
+ * An agent role a workflow owns (SPEC §7.1). The workflow declares its roles here
+ * — each with the system-prompt template, capability ceiling, and default agent
+ * knobs — so prompt assembly, profile seeding, and the profiles UI derive from the
+ * package instead of the platform hardcoding do/merge/resolve. Provider/model are
+ * resolved at seed time from the platform default, so they aren't declared here.
+ */
+export interface WorkflowRole {
+  name: string;
+  label: string;
+  /** System-prompt template; `{{bindings}}` are filled at turn time (agent/prompt.ts). */
+  promptTemplate: string;
+  /** Capability ceiling seeded onto this role's default profile. */
+  capabilities?: string[];
+  defaults?: { effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; maxTurns?: number };
+}
+
+// The bundled roles, defined once and referenced by the workflows that use them
+// (do/merge/resolve are shared vocabulary — see PLAN-dynamic-repos.md §2b).
+// `{{toolsPreamble}}` and the other `{{...}}` are filled by assemblePrompt.
+const DO_ROLE: WorkflowRole = {
+  name: 'do',
+  label: 'Do agent',
+  capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
+  promptTemplate: `{{toolsPreamble}}
+
+# Task
+{{title}}
+
+{{prompt}}
+
+# World
+Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
+
+{{instructions}}`,
+};
+const MERGE_ROLE: WorkflowRole = {
+  name: 'merge',
+  label: 'Merge agent',
+  capabilities: ['merge-into:*', 'signal-completion'],
+  promptTemplate: `{{toolsPreamble}}
+
+You are merging task "{{title}}". Its work is on branch {{branch}} in the worktree at {{worldPath}}.
+Merge {{target}} into this branch, resolve any conflicts, ensure the build and tests pass, then the work will be merged into {{target}}.
+Review context: {{reviewInfo}}
+Call signal_completion when the branch is ready to merge.`,
+};
+const RESOLVE_ROLE: WorkflowRole = {
+  name: 'resolve',
+  label: 'Resolve agent',
+  capabilities: ['signal-completion', 'save-skill'],
+  promptTemplate: `{{toolsPreamble}}
+
+The "{{stage}}" step failed for task "{{title}}".
+Error: {{error}}
+Worktree: {{worldPath}}
+Recent transcript: {{transcript}}
+Candidate resolution skills: {{skills}}
+Diagnose and fix so {{stage}} can resume. If you cannot, explain why, then call signal_completion.`,
+};
+
 export interface WorkflowManifest {
   name: string;
   version: string;
@@ -69,6 +130,8 @@ export interface WorkflowManifest {
   capabilities: string[];
   ui: UiContribution[];
   commands: CommandDecl[];
+  /** Agent roles this workflow owns (SPEC §7.1). */
+  roles?: WorkflowRole[];
   /** Typed parameter schema (SPEC §10.4) — drives task forms + settings + defaults. */
   params: FieldSpec[];
   onActivate?: OnActivateDecl;
@@ -109,6 +172,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { id: 'task.followUp', title: 'Send follow-up', keybinding: 'f' },
       { id: 'task.cancel', title: 'Cancel task', keybinding: 'x' },
     ],
+    roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE],
     params: [
       promptField(),
       agentField('do', 'Do agent'),
@@ -139,6 +203,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'just-do.done', description: 'Single agent call finished.', fields: {} }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
+    roles: [DO_ROLE],
     params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), worldProviderField()],
   },
   {
@@ -164,6 +229,8 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
+    // goal delegates to softwareDev, so it runs merge/resolve too.
+    roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE],
     params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), prToggleField()],
   },
   {
@@ -175,6 +242,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'merge-only.merged', description: 'Reviewed branch merged.', fields: { sha: 'string' } }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
+    roles: [MERGE_ROLE],
     params: [
       { name: 'branch', type: 'branch', label: 'Branch to merge', required: true, scopes: ['task'], bind: 'top' },
       targetField(),
@@ -210,6 +278,34 @@ export const MANIFESTS: WorkflowManifest[] = [
 
 export function manifest(name: string): WorkflowManifest | undefined {
   return MANIFESTS.find((m) => m.name === name);
+}
+
+/** A declared role plus which workflow(s) declare it (for the profiles UI). */
+export interface RoleWithSource extends WorkflowRole {
+  workflows: string[];
+}
+
+/** Every role declared across the given manifests, deduped by name (first wins),
+ *  tracking which workflows use each. Resolution is by role name — shared
+ *  vocabulary — matching how profiles resolve (SPEC §7.1). */
+export function allRoles(manifests: WorkflowManifest[] = MANIFESTS): RoleWithSource[] {
+  const byName = new Map<string, RoleWithSource>();
+  for (const m of manifests) {
+    for (const r of m.roles ?? []) {
+      const cur = byName.get(r.name);
+      if (cur) {
+        if (!cur.workflows.includes(m.name)) cur.workflows.push(m.name);
+      } else {
+        byName.set(r.name, { ...r, workflows: [m.name] });
+      }
+    }
+  }
+  return [...byName.values()];
+}
+
+/** The declared role by name (or undefined if no active workflow declares it). */
+export function roleDef(name: string, manifests: WorkflowManifest[] = MANIFESTS): RoleWithSource | undefined {
+  return allRoles(manifests).find((r) => r.name === name);
 }
 
 /** Resolve the transitive closure of `requires` for a set of workflows (SPEC §4.6). */

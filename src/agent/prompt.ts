@@ -1,5 +1,6 @@
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle } from '../world/types.js';
+import { roleDef } from '../contrib/manifests.js';
 
 /**
  * Prompt assembly (SPEC §5.4). Fills the role template (owned by the profile)
@@ -17,8 +18,8 @@ const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration pl
 - signal_completion(summary?): structured signal that your turn's work is complete. Call this exactly when you are done — do not write a "done" sentence instead.
 Do real work directly in the working directory (create/edit files, run commands). When finished, call signal_completion.`;
 
-export const DEFAULT_ROLE_TEMPLATES: Record<string, string> = {
-  do: `{{toolsPreamble}}
+// Minimal fallback if a role is undeclared and there's no `do` role registered.
+const FALLBACK_TEMPLATE = `{{toolsPreamble}}
 
 # Task
 {{title}}
@@ -28,22 +29,7 @@ export const DEFAULT_ROLE_TEMPLATES: Record<string, string> = {
 # World
 Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
 
-{{instructions}}`,
-  merge: `{{toolsPreamble}}
-
-You are merging task "{{title}}". Its work is on branch {{branch}} in the worktree at {{worldPath}}.
-Merge {{target}} into this branch, resolve any conflicts, ensure the build and tests pass, then the work will be merged into {{target}}.
-Review context: {{reviewInfo}}
-Call signal_completion when the branch is ready to merge.`,
-  resolve: `{{toolsPreamble}}
-
-The "{{stage}}" step failed for task "{{title}}".
-Error: {{error}}
-Worktree: {{worldPath}}
-Recent transcript: {{transcript}}
-Candidate resolution skills: {{skills}}
-Diagnose and fix so {{stage}} can resume. If you cannot, explain why, then call signal_completion.`,
-};
+{{instructions}}`;
 
 export interface AssembleArgs {
   profile: AgentProfile;
@@ -57,8 +43,10 @@ export interface AssembleArgs {
 }
 
 export function assemblePrompt(args: AssembleArgs): string {
+  // Prompt template precedence (SPEC §5.4/§7.1): an explicit profile template wins;
+  // else the workflow-declared role template; else the `do` role; else a floor.
   const tpl =
-    args.profile.promptTemplate ?? DEFAULT_ROLE_TEMPLATES[args.role] ?? DEFAULT_ROLE_TEMPLATES.do!;
+    args.profile.promptTemplate ?? roleDef(args.role)?.promptTemplate ?? roleDef('do')?.promptTemplate ?? FALLBACK_TEMPLATE;
   const instructions = [args.globalInstructions, args.projectInstructions].filter(Boolean).join('\n\n');
   const values: Record<string, string> = {
     toolsPreamble: TOOLS_PREAMBLE,

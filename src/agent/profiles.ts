@@ -1,36 +1,25 @@
 import { AgentProfile, AgentRole, Provider } from '../domain/types.js';
 import { Store } from '../store/db.js';
+import { allRoles } from '../contrib/manifests.js';
 
-/** The standard per-role profiles shipped with v1. */
+/**
+ * The default per-role profiles, derived from the roles the active workflows
+ * declare (SPEC §7.1) — not a hardcoded do/merge/resolve list. A workflow that
+ * declares a new role automatically gets a seeded default + a profiles-UI entry.
+ */
 export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
   const model = defaultModel(provider);
-  return [
-    {
-      id: 'do-default',
-      name: 'Do agent',
-      provider,
-      ...(model ? { model } : {}),
-      role: 'do',
-      capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
-      // no maxTurns ⇒ unlimited (runaway backstop only); set one to cap explicitly
-    },
-    {
-      id: 'merge-default',
-      name: 'Merge agent',
-      provider,
-      ...(model ? { model } : {}),
-      role: 'merge',
-      capabilities: ['merge-into:*', 'signal-completion'],
-    },
-    {
-      id: 'resolve-default',
-      name: 'Resolve agent',
-      provider,
-      ...(model ? { model } : {}),
-      role: 'resolve',
-      capabilities: ['signal-completion', 'save-skill'],
-    },
-  ];
+  return allRoles().map((r) => ({
+    id: `${r.name}-default`,
+    name: r.label,
+    provider,
+    ...(model ? { model } : {}),
+    role: r.name,
+    capabilities: r.capabilities ?? [],
+    ...(r.defaults?.effort ? { effort: r.defaults.effort } : {}),
+    ...(r.defaults?.maxTurns ? { maxTurns: r.defaults.maxTurns } : {}),
+    // no maxTurns unless declared ⇒ unlimited (runaway backstop only)
+  }));
 }
 
 export function defaultModel(provider: Provider): string | undefined {

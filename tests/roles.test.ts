@@ -1,0 +1,66 @@
+import { describe, it, expect } from 'vitest';
+import { allRoles, roleDef, WorkflowManifest } from '../src/contrib/manifests.js';
+import { makeDefaultProfiles } from '../src/agent/profiles.js';
+import { assemblePrompt } from '../src/agent/prompt.js';
+
+const world = { id: 'w', root: '/tmp/w', branch: 'karmax/t', base: 'main', target: 'main' } as any;
+const task = { taskId: 't', projectId: 'p', title: 'Add factorial', prompt: 'implement it' } as any;
+const profile = (over: any = {}) => ({ id: 'do', name: 'Do', provider: 'claude', role: 'do', capabilities: [], ...over } as any);
+
+describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', () => {
+  it('aggregates declared roles across the bundled workflows, tracking who uses each', () => {
+    const roles = Object.fromEntries(allRoles().map((r) => [r.name, r]));
+    expect(Object.keys(roles).sort()).toEqual(['do', 'merge', 'resolve']);
+    expect(roles.do.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal']));
+    expect(roles.merge.workflows).toEqual(expect.arrayContaining(['software-dev', 'merge-only', 'goal']));
+    expect(roles.resolve.workflows).toEqual(expect.arrayContaining(['software-dev', 'goal']));
+  });
+
+  it('exposes each role its declared prompt template + capability ceiling', () => {
+    expect(roleDef('do')!.promptTemplate).toContain('# Task');
+    expect(roleDef('merge')!.promptTemplate).toContain('You are merging');
+    expect(roleDef('merge')!.capabilities).toContain('merge-into:*');
+    expect(roleDef('nonexistent')).toBeUndefined();
+  });
+
+  it('registers a NOVEL role a workflow declares (dedupe + source tracking)', () => {
+    const custom: WorkflowManifest[] = [
+      {
+        name: 'research', version: '1.0.0', description: '', requires: [], events: [], capabilities: [], ui: [], commands: [], params: [],
+        roles: [{ name: 'reviewer', label: 'Reviewer', promptTemplate: 'Review {{title}}: {{prompt}}', capabilities: ['create-review-info'] }],
+      },
+    ];
+    const r = roleDef('reviewer', custom)!;
+    expect(r).toBeTruthy();
+    expect(r.label).toBe('Reviewer');
+    expect(r.workflows).toEqual(['research']);
+    expect(r.promptTemplate).toContain('Review');
+  });
+
+  it('seeds one default profile per declared role, carrying the role capabilities', () => {
+    const profiles = makeDefaultProfiles('claude');
+    expect(profiles.map((p) => p.id).sort()).toEqual(['do-default', 'merge-default', 'resolve-default']);
+    const merge = profiles.find((p) => p.id === 'merge-default')!;
+    expect(merge.role).toBe('merge');
+    expect(merge.capabilities).toContain('merge-into:*');
+    expect(merge.model).toBeTruthy(); // provider/model resolved at seed time
+  });
+});
+
+describe('prompt assembly derives from the declared role (not a hardcoded map)', () => {
+  it('uses the role-declared template for the role', () => {
+    const out = assemblePrompt({ profile: profile({ role: 'merge' }), role: 'merge', task, world });
+    expect(out).toContain('You are merging'); // merge template, not the do template
+    expect(out).toContain('Add factorial'); // {{title}} bound
+  });
+
+  it('a profile promptTemplate overrides the role template', () => {
+    const out = assemblePrompt({ profile: profile({ promptTemplate: 'CUSTOM {{title}}' }), role: 'do', task, world });
+    expect(out).toBe('CUSTOM Add factorial');
+  });
+
+  it('an undeclared role falls back to the do template rather than breaking', () => {
+    const out = assemblePrompt({ profile: profile({ role: 'reviewer' }), role: 'reviewer', task, world });
+    expect(out).toContain('# Task'); // do template floor
+  });
+});
