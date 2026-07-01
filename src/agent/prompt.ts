@@ -1,6 +1,6 @@
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle } from '../world/types.js';
-import { roleDef } from '../contrib/manifests.js';
+import { roleDef, manifest } from '../contrib/manifests.js';
 
 /**
  * Prompt assembly (SPEC §5.4). Fills the role template (owned by the profile)
@@ -48,8 +48,10 @@ export function assemblePrompt(args: AssembleArgs): string {
   const tpl =
     args.profile.promptTemplate ?? roleDef(args.role)?.promptTemplate ?? roleDef('do')?.promptTemplate ?? FALLBACK_TEMPLATE;
   const instructions = [args.globalInstructions, args.projectInstructions].filter(Boolean).join('\n\n');
+  // A workflow may override the platform tools-preamble for its agents (SPEC §5.4).
+  const preamble = (args.task.workflow && manifest(args.task.workflow)?.promptPreamble) || TOOLS_PREAMBLE;
   const values: Record<string, string> = {
-    toolsPreamble: TOOLS_PREAMBLE,
+    toolsPreamble: preamble,
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: args.world.root,

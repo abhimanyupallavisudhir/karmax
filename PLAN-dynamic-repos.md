@@ -177,22 +177,24 @@ drain+rebuild if multi-node.
 
 Workflow-ownership first (§2b) — each makes the platform derive behavior from the
 manifest instead of hardcoding it, so a loaded package can actually bring its own.
-These are independently shippable *before* any loading machinery:
+These are independently shippable *before* any loading machinery. **All ✅ done:**
 
-- **Phase 0 — `roles[]`** ⟵ *building now.* Manifest `roles[]` (name, label,
-  promptTemplate, capabilities, default agent spec). Move the bundled do/merge/
-  resolve templates + seeded defaults out of `prompt.ts`/`profiles.ts` into
-  declarations; prompt assembly, `seedProfiles`, and the profiles UI derive from a
-  role registry (by name, deduped). Prove a novel role (`reviewer`) runs end-to-end
-  with the mock agent and gets its own prompt + configurable profile.
-- **Phase 0b — `agentTools[]` / `mcp[]`** — a workflow declares tools/servers its
-  agents get on top of the platform baseline; `runAgentTurn` merges them.
-- **Phase 0c — declarative `stages[]` + pipeline** — the client renders each
-  workflow's own lifecycle from the manifest (generic floor when undeclared),
-  instead of the hardcoded software-dev `NODES`.
-- **Phase 0d — `resolveRules[]`** — declarable retry/resolve heuristics; the
-  platform `CASES` become the default set.
-- **Phase 0e — prompt-preamble override** (optional, per workflow).
+- **Phase 0 — `roles[]`** ✅ Manifest `roles[]` (name, label, promptTemplate,
+  capabilities, default agent spec); do/merge/resolve templates + seeded defaults
+  moved out of `prompt.ts`/`profiles.ts` into declarations; prompt assembly,
+  `seedProfiles`, and the profiles UI derive from a role registry (by name,
+  deduped). A novel role registers, seeds, and gets its own prompt (tested).
+- **Phase 0b — `agentMcp[]`** ✅ A workflow declares MCP servers its agents get on
+  top of the platform baseline; `TaskInput.workflow` threaded through so
+  `runAgentTurn` reads the manifest and the Agent SDK path merges them into
+  `mcpServers`. (Custom function tools with karmax-side handlers still need the
+  loadable-package work — item 21.)
+- **Phase 0c — declarative `stages[]` + pipeline** ✅ The client renders each
+  workflow's own lifecycle from the manifest (software-dev default when
+  undeclared), instead of the hardcoded `NODES`.
+- **Phase 0d — `resolveRules[]`** ✅ Declarable retry/resolve heuristics (regex
+  data), checked before the platform `CASES`.
+- **Phase 0e — `promptPreamble` override** ✅ Per-workflow tools-preamble override.
 
 Then the loading machinery (these package declarations are its payload):
 

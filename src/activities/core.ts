@@ -376,7 +376,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async autoResolve(args: { taskId: string; stage: string; error: string }): Promise<{ resolved: boolean; note?: string; action?: string }> {
-      const r = runAutoResolve(args.stage, args.error);
+      // Workflow-declared resolve rules (SPEC §5.2) take precedence over the defaults.
+      const wf = store.getTask(args.taskId)?.workflow;
+      const rules = wf ? manifest(wf)?.resolveRules : undefined;
+      const r = runAutoResolve(args.stage, args.error, rules);
       record(args.taskId, 'resolve.auto', { stage: args.stage, resolved: r.resolved, action: r.action });
       return r;
     },

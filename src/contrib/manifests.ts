@@ -1,4 +1,5 @@
 import { FieldSpec } from '../domain/types.js';
+import { ResolveRuleDecl } from '../resolve/cases.js';
 
 /**
  * Workflow manifests (SPEC §4.3). Data-only declarations the host reads to wire
@@ -177,6 +178,10 @@ export interface WorkflowManifest {
   roles?: WorkflowRole[];
   /** MCP servers this workflow's agents get, beyond the platform baseline (SPEC §7.5). */
   agentMcp?: AgentMcpServer[];
+  /** Declared auto-resolve rules, checked before the platform defaults (SPEC §5.2). */
+  resolveRules?: ResolveRuleDecl[];
+  /** Override the platform tools-preamble in this workflow's agent prompts (SPEC §5.4). */
+  promptPreamble?: string;
   /** The workflow's lifecycle stages (SPEC §5) — drives the pipeline UI. */
   stages?: StageDef[];
   /** Typed parameter schema (SPEC §10.4) — drives task forms + settings + defaults. */

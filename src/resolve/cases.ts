@@ -9,6 +9,19 @@ export interface ResolveOutcome {
   note?: string;
 }
 
+/**
+ * A workflow-declared resolve rule (SPEC §5.2). Data-only (a regex source, not a
+ * function) so it rides in the manifest. Its `match` is tested against the error;
+ * declared rules are checked before the platform defaults.
+ */
+export interface ResolveRuleDecl {
+  name: string;
+  match: string;
+  flags?: string;
+  action?: 'retry';
+  note?: string;
+}
+
 interface ResolveCase {
   name: string;
   match: (stage: string, error: string) => boolean;
@@ -28,7 +41,15 @@ const CASES: ResolveCase[] = [
   },
 ];
 
-export function autoResolve(stage: string, error: string): ResolveOutcome {
+export function autoResolve(stage: string, error: string, rules?: ResolveRuleDecl[]): ResolveOutcome {
+  // Workflow-declared rules first (more specific), then the platform defaults.
+  for (const r of rules ?? []) {
+    try {
+      if (new RegExp(r.match, r.flags ?? 'i').test(error)) return { resolved: true, action: r.action, note: r.note ?? r.name };
+    } catch {
+      /* a bad regex in a declared rule shouldn't wedge resolve */
+    }
+  }
   for (const c of CASES) {
     if (c.match(stage, error)) return c.outcome;
   }

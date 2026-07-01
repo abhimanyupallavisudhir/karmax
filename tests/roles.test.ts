@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { allRoles, roleDef, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
 import { makeDefaultProfiles } from '../src/agent/profiles.js';
 import { assemblePrompt } from '../src/agent/prompt.js';
+import { autoResolve } from '../src/resolve/cases.js';
 
 const world = { id: 'w', root: '/tmp/w', branch: 'karmax/t', base: 'main', target: 'main' } as any;
 const task = { taskId: 't', projectId: 'p', title: 'Add factorial', prompt: 'implement it' } as any;
@@ -98,5 +99,28 @@ describe('workflow-owned agent MCP servers (SPEC §7.5)', () => {
     expect(agentMcpToConfig(custom.agentMcp)['chrome-devtools']!.command).toBe('npx');
     // bundled workflows declare none → agents get only the platform baseline
     expect(manifest('software-dev')!.agentMcp).toBeUndefined();
+  });
+});
+
+describe('workflow-declared resolve rules (SPEC §5.2)', () => {
+  it('a declared rule matches the error and wins over the platform defaults', () => {
+    const r = autoResolve('do', 'FooWidget exploded during build', [{ name: 'widget', match: 'FooWidget exploded', action: 'retry', note: 'retrying widget' }]);
+    expect(r).toEqual({ resolved: true, action: 'retry', note: 'retrying widget' });
+  });
+  it('falls through to the platform defaults, then to unresolved', () => {
+    expect(autoResolve('do', 'HTTP 429 rate limit').resolved).toBe(true); // platform rate-limit case
+    expect(autoResolve('do', 'a totally novel error').resolved).toBe(false);
+  });
+  it('a bad regex in a declared rule never wedges resolve', () => {
+    expect(() => autoResolve('do', 'x', [{ name: 'bad', match: '(' }])).not.toThrow();
+    expect(autoResolve('do', 'x', [{ name: 'bad', match: '(' }]).resolved).toBe(false);
+  });
+});
+
+describe('prompt preamble (SPEC §5.4)', () => {
+  it('uses the platform preamble when the workflow declares no override', () => {
+    const out = assemblePrompt({ profile: profile(), role: 'do', task: { ...task, workflow: 'software-dev' } as any, world });
+    expect(out).toContain('running inside karmax'); // platform TOOLS_PREAMBLE
+    expect(manifest('software-dev')!.promptPreamble).toBeUndefined();
   });
 });
