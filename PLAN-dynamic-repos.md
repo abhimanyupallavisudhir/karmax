@@ -198,9 +198,12 @@ These are independently shippable *before* any loading machinery. **All ✅ done
 
 Then the loading machinery (these package declarations are its payload):
 
-- **21a — Package store + manifest schema + loader** (no execution change yet):
-  load bundled workflows *through* the store; prove `name@version` resolution and
-  manifest validation. Fully testable offline.
+- **21a — Package store + manifest schema + loader** ✅ `src/packages/schema.ts`
+  (zod validation of a manifest — strict required fields, `.passthrough()` for
+  forward-compat) + `src/packages/store.ts` (`PackageStore`: register/validate,
+  `resolve(name, version?)` with latest-by-numeric-version, `list`, `versions`).
+  `PackageStore.withBundled()` seeds from `MANIFESTS`; malformed packages are
+  rejected. No execution change yet — nothing consumes it; 21b wires it in.
 - **21b — Version-qualified registration + start**: register `type@version`; pin
   per execution; two versions of a trivial workflow coexist; an old execution
   replays its version while a new one runs the new version (the determinism test).
