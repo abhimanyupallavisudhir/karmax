@@ -106,6 +106,10 @@ input — one model, not two.
 **Phase F — deeper spec features (later)**
 21. Dynamically-loaded, version-pinned workflow repos + replay-compat (real
     self-healing). This is the substrate the others below lean on for editability.
+    **Implementation plan written: see `PLAN-dynamic-repos.md`** (Option B —
+    version-qualified workflow types in one worker, pinned per execution; the
+    determinism constraint is workflow-code-only; most surrounding machinery
+    already exists). Ready to build in phases 21a–21e.
 22. ✅ Token/account coordinator wired into the turn loop. The built coordinator
     (lease/park/window-refresh, SPEC §6.2) now drives real per-turn leasing:
     `registerAccounts` upserts connected logins into the pool; software-dev probes
