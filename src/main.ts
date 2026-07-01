@@ -3,8 +3,10 @@ import { fileURLToPath } from 'node:url';
 import { ensurePaths, paths } from './config/paths.js';
 import { startDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
-import { makeWorker } from './temporal/worker.js';
+import { WorkerManager } from './temporal/worker-pool.js';
 import { TASK_QUEUE } from './temporal/config.js';
+import { WorkflowManager } from './packages/manager.js';
+import { WorkflowRepoLoader } from './packages/repo.js';
 import { Store } from './store/db.js';
 import { WorldRegistry } from './world/registry.js';
 import { WorktreeProvider } from './world/worktree.js';
@@ -65,7 +67,9 @@ async function main() {
   const configHomes = new ConfigHomeManager();
   const login = new LoginManager(configHomes);
 
-  const worker = await makeWorker(conn, {
+  // A managed worker so newly-installed workflow packages can be picked up by
+  // rolling the worker without a restart (§21d/§21e).
+  const workerManager = new WorkerManager(conn, {
     store,
     worlds,
     adapters,
@@ -78,7 +82,7 @@ async function main() {
     configHomes,
     taskQueue: TASK_QUEUE,
   });
-  const workerRun = worker.run();
+  await workerManager.start();
   console.log('  • Worker started');
 
   // Reconcile the task index against live workflows (settle anything lost on restart).
@@ -96,7 +100,8 @@ async function main() {
     console.log(`  • Registered ${pool.length} login(s) into the account pool`);
   }
 
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content });
+  const workflows = new WorkflowManager(workerManager, new WorkflowRepoLoader(p.workflows));
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows });
   const contributions = new ContributionRegistry();
   const overlays = new Overlays();
 
@@ -140,8 +145,7 @@ async function main() {
   const shutdown = async () => {
     console.log('\n  shutting down…');
     await closeGateway().catch(() => {});
-    worker.shutdown();
-    await workerRun.catch(() => {});
+    await workerManager.stop().catch(() => {});
     await closeClient().catch(() => {});
     await server.stop().catch(() => {});
     process.exit(0);

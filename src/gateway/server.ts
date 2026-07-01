@@ -349,6 +349,20 @@ export class Gateway {
         return this.json(res, 200, await api.proposeWorkflowEdit(token, { projectId: proposeMatch[1]!, title: b.title, repo: b.repo, branch: b.branch, target: b.target }));
       }
 
+      // Installed + built-in workflows, and installing a new one from a git repo (§21d).
+      if (p === '/api/workflows' && method === 'GET') return this.json(res, 200, api.listWorkflows(token));
+      if (p === '/api/workflows/install' && method === 'POST') {
+        const b = await this.body(req);
+        if (!b.url) return this.json(res, 400, { error: 'url required' });
+        try {
+          return this.json(res, 200, await api.installWorkflow(token, { url: String(b.url), ref: b.ref ? String(b.ref) : undefined, name: b.name ? String(b.name) : undefined }));
+        } catch (e) {
+          if (e instanceof CapabilityError) throw e;
+          // fetch/validation/collision failures are user-facing input errors
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
       // profiles (agent role profiles). Global scope by default; a project overlay
       // (id `<projectId>::<role>-default`) overrides global per project (SPEC §7/§9).
       if (p === '/api/profiles' && method === 'GET') {

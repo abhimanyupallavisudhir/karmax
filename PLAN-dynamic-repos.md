@@ -226,9 +226,23 @@ Then the loading machinery (these package declarations are its payload):
     driving a platform activity, while the built-ins still work in the same worker.
   - `packages/store.ts` `retire()` + `livePinnedRefs()` — refuse to drop a
     version any live execution is still pinned to (the §21b determinism rule).
-- **21d — Pin/upgrade UI + self-healing loop**: version settings, upgrade surface,
-  `propose_workflow_edit` → publish → pin.
-- **21e — Worker refresh** (drain+rebuild) for multi-node.
+- **21d — Install/list UI + reachable from the product** ✅ `WorkflowManager`
+  (`packages/manager.ts`) ties loader + store + worker refresh together:
+  `install({url, ref})` loads a package, registers it, rolls the worker (§21e),
+  and refuses to shadow a built-in name; `list()` reports built-in + installed
+  workflows with versions; `resolveStart()` (shared with the API via
+  `platform/resolve-start.ts`) resolves built-in *or* installed workflows to a
+  version-pinned start type. `KarmaxApi` gained an optional `workflows` dep +
+  `installWorkflow`/`listWorkflows`; `createTask`/`queueTask` now start any
+  registered workflow. Gateway: `GET /api/workflows`, `POST
+  /api/workflows/install`. UI: a Workflows card in Global settings (list +
+  install-from-git). `main.ts` runs a `WorkerManager` and wires the manager at
+  `~/.karmax/workflows`. `tests/install-workflow.test.ts`: install from a git
+  repo → list as external → create+run a task on it end-to-end.
+  (Deferred: per-project version pinning UI + the full auto self-healing loop —
+  the manual `proposeWorkflowEdit` PR gate already exists.)
+- **21e — Worker refresh** ✅ (see the §21e commit — `WorkerManager` rolls the
+  live worker with a superset bundle; in-flight executions survive).
 
 ## 9. Testing strategy
 

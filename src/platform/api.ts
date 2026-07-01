@@ -3,9 +3,10 @@ import { Store } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
+import { bundledStart, StartResolution } from './resolve-start.js';
+import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
 import { TaskRecord, TaskView, Message } from '../domain/types.js';
-import { manifest as manifestFor } from '../contrib/manifests.js';
 import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
@@ -29,6 +30,12 @@ export interface KarmaxApiDeps {
   taskQueue: string;
   tokens: TokenAuthority;
   contentDir?: string;
+  /**
+   * Optional workflow-package manager (§21d). When present, tasks can run
+   * installed (git-loaded) workflows and `installWorkflow`/`listWorkflows` work;
+   * when absent the API serves only the built-in workflows (unchanged behavior).
+   */
+  workflows?: WorkflowManager;
 }
 
 /**
@@ -67,9 +74,9 @@ export class KarmaxApi {
   ): Promise<TaskRecord> {
     this.require(token, 'create_task');
     const workflow = args.workflow ?? 'software-dev';
-    const type = WORKFLOW_TYPE[workflow];
-    const manifest = manifestFor(workflow);
-    if (!type || !manifest) throw new Error(`unknown workflow "${workflow}"`);
+    const start = this.resolveStart(workflow);
+    if (!start) throw new Error(`unknown workflow "${workflow}"`);
+    const { manifest, startType } = start;
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
 
@@ -117,8 +124,13 @@ export class KarmaxApi {
 
     // Pin the execution to the manifest version stamped on the task (§21b), so a
     // later version upgrade only affects new tasks, never this running one.
-    await this.deps.client.workflow.start(pinnedType(type, manifest.version), { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
+    await this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
     return task;
+  }
+
+  /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
+  private resolveStart(workflow: string, version?: string): StartResolution | undefined {
+    return this.deps.workflows?.resolveStart(workflow, version) ?? bundledStart(workflow, version);
   }
 
   /** Start a previously-saved draft (SPEC §10.4). */
@@ -127,9 +139,11 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
     const project = this.deps.store.getProject(task.projectId);
-    const manifest = manifestFor(task.workflow);
-    const type = WORKFLOW_TYPE[task.workflow];
-    if (!project || !manifest || !type) throw new Error(`cannot queue task ${taskId}`);
+    // Pin to the version stamped when the draft was created, not whatever is
+    // current now — queueing a draft after an upgrade must not silently swap code.
+    const start = this.resolveStart(task.workflow, task.workflowVersion);
+    if (!project || !start) throw new Error(`cannot queue task ${taskId}`);
+    const { manifest, startType } = start;
     const resolved: ValueMap = { ...task.params };
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
@@ -140,9 +154,7 @@ export class KarmaxApi {
     input.workflow = task.workflow;
     if (task.params.profiles) input.profiles = task.params.profiles as Record<string, string>;
     this.deps.store.clearDraft(taskId);
-    // Pin to the version stamped when the draft was created, not whatever is
-    // current now — queueing a draft after an upgrade must not silently swap code.
-    await this.deps.client.workflow.start(pinnedType(type, task.workflowVersion), { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
+    await this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
     return this.deps.store.getTask(taskId)!;
   }
 
@@ -249,5 +261,21 @@ export class KarmaxApi {
       ],
     });
     return task;
+  }
+
+  /** Installed + built-in workflows, with versions (§21d). */
+  listWorkflows(token: string): WorkflowSummary[] {
+    this.require(token, 'list_workflows');
+    return this.deps.workflows?.list() ?? [];
+  }
+
+  /**
+   * Install a workflow from a git repo and roll the worker to serve it (§21d/§21e).
+   * Requires a configured workflow manager; refuses to shadow a built-in name.
+   */
+  async installWorkflow(token: string, args: { url: string; ref?: string; name?: string }): Promise<{ name: string; version: string }> {
+    this.require(token, 'install_workflow');
+    if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
+    return this.deps.workflows.install(args);
   }
 }

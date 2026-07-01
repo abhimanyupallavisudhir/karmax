@@ -58,5 +58,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   reorder_queue: 'reorder-queue',
   get_task: 'read-task',
   list_tasks: 'read-task',
+  list_workflows: 'read-task',
   edit_workflow: 'edit-workflow',
+  install_workflow: 'edit-workflow',
 };

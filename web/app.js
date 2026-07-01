@@ -1043,6 +1043,20 @@ function globalSettingsView() {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Stored encrypted in the vault; the key is never shown again. (You enter it — karmax never sees it elsewhere.)</div>
       </div>
     </div>
+    <div class="card" id="workflows-card">
+      <div class="section-h">Workflows</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
+      <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
+      <div class="form-row"><label>Install from a git repo</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input id="wf-url" placeholder="git URL or path (e.g. https://github.com/you/my-workflow.git)" style="flex:1;min-width:220px" />
+          <input id="wf-ref" placeholder="ref (tag/branch/sha, optional)" style="width:180px" />
+          <button class="btn primary" id="wf-install">Install</button>
+        </div>
+        <div id="wf-install-result" style="font-size:12px;margin-top:6px"></div>
+        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
+      </div>
+    </div>
     <div class="card">
       <div class="section-h">Appearance</div>
       <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
@@ -1051,6 +1065,21 @@ function globalSettingsView() {
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
     </div>`;
+}
+
+async function hydrateWorkflows() {
+  const box = $('#workflows-list');
+  if (!box) return;
+  let list = [];
+  try { list = await api('/api/workflows'); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>'; return; }
+  if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
+  box.innerHTML = list.map((w) => `<div class="queue-item">
+      <div style="flex:1"><b>${esc(w.name)}</b>
+        <span class="chip">${w.source === 'bundled' ? 'built-in' : 'installed'}</span>
+        <span class="chip">v${esc(w.latest)}</span>
+        ${w.versions.length > 1 ? `<span class="task-sub" style="color:var(--ink-3)">versions: ${w.versions.map(esc).join(', ')}</span>` : ''}
+        <div class="task-sub" style="color:var(--ink-3)">${esc(w.description || '')}</div>
+      </div></div>`).join('');
 }
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
@@ -1260,7 +1289,27 @@ function wireGlobalSettings() {
   hydrateSettingsForms('global');
   hydrateProfiles('global');
   hydrateAccounts();
+  hydrateWorkflows();
   wirePaymentsCard('global');
+  $('#wf-install')?.addEventListener('click', async () => {
+    const url = $('#wf-url').value.trim();
+    const ref = $('#wf-ref').value.trim();
+    const out = $('#wf-install-result');
+    if (!url) return toast('git URL or path required', true);
+    const btn = $('#wf-install'); btn.disabled = true;
+    out.textContent = 'Fetching, validating, and loading the workflow…';
+    out.style.color = 'var(--ink-2)';
+    try {
+      const r = await api('/api/workflows/install', { method: 'POST', body: JSON.stringify({ url, ref: ref || undefined }) });
+      out.innerHTML = `🟢 Installed <b>${esc(r.name)}</b> v${esc(r.version)} — the worker was rolled to serve it, no restart needed.`;
+      out.style.color = 'var(--ok, green)';
+      $('#wf-url').value = ''; $('#wf-ref').value = '';
+      hydrateWorkflows();
+    } catch (e) {
+      out.textContent = e.message;
+      out.style.color = 'var(--bad, crimson)';
+    } finally { btn.disabled = false; }
+  });
   $('#acct-add')?.addEventListener('click', async () => {
     const provider = $('#acct-provider').value;
     const account = $('#acct-name').value.trim();
