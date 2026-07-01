@@ -1,5 +1,6 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { codexReasoningEffort } from './effort.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Uses the OpenAI **Responses API**
@@ -40,6 +41,9 @@ export class CodexAdapter implements AgentAdapter {
       const body: any = { model, tools, tool_choice: 'auto', store: true, input: nextInput };
       if (respId) body.previous_response_id = respId;
       else body.instructions = input.systemPrompt;
+      // Reasoning effort (SPEC §10.5) — only reasoning models accept it (not gpt-4.1).
+      const reasoningEffort = codexReasoningEffort(model, input.profile.effort);
+      if (reasoningEffort) body.reasoning = { effort: reasoningEffort };
 
       const res = await fetch(`${baseUrl}/responses`, {
         method: 'POST',

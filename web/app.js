@@ -271,16 +271,11 @@ async function refreshTasks() {
 // ── shell ────────────────────────────────────────────────────────────────────
 function renderShell() {
   const app = $('#app');
-  const agent = S.meta?.agent || {};
-  const isMock = agent.provider === 'mock';
   app.innerHTML = `
     <div class="topbar">
       <div class="brand"><span class="mark">◇</span> karmax</div>
       <div class="search"><span>⌕</span><input id="search" placeholder="Search tasks…  ( / )" /></div>
       <div class="spacer"></div>
-      <div class="agent-chip ${isMock ? 'mock' : ''}" id="agent-chip" role="button" tabindex="0" style="cursor:pointer" title="${esc(agent.reason || '')} — manage agents & accounts">
-        <span class="dot"></span> ${esc(agent.provider || 'agent')}
-      </div>
       <button class="icon-btn has-badge" id="bell" title="Needs attention">🔔<span class="badge hidden" id="bell-badge">0</span></button>
       <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
     </div>
@@ -291,7 +286,6 @@ function renderShell() {
   $('#search').addEventListener('input', (e) => { S.search = e.target.value; if (S.tab === 'tasks') renderMain(); });
   $('#theme').addEventListener('click', toggleTheme);
   $('#bell').addEventListener('click', toggleNotifications);
-  $('#agent-chip')?.addEventListener('click', () => switchTab('global'));
   renderRail();
   renderMain();
   refreshTasks();

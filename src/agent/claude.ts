@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { claudeMessagesEffort } from './effort.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -64,7 +65,15 @@ export class ClaudeAdapter implements AgentAdapter {
           'x-api-key': apiKey,
           'anthropic-version': '2023-06-01',
         },
-        body: JSON.stringify({ model, max_tokens: 4096, system: input.systemPrompt, messages, tools }),
+        body: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          system: input.systemPrompt,
+          messages,
+          tools,
+          // Reasoning effort (SPEC §10.5) — sent only on models that accept it.
+          ...(claudeMessagesEffort(model, input.profile.effort) ? { output_config: { effort: claudeMessagesEffort(model, input.profile.effort) } } : {}),
+        }),
         signal: ctx.signal,
       });
       if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${(await res.text()).slice(0, 500)}`);
@@ -150,6 +159,9 @@ export class ClaudeAdapter implements AgentAdapter {
         permissionMode: 'acceptEdits',
         systemPrompt: input.systemPrompt,
         ...(input.profile.model ? { model: input.profile.model } : {}),
+        // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models
+        // that don't support the level, so no gating is needed here.
+        ...(input.profile.effort ? { effort: input.profile.effort } : {}),
         ...(session ? { resume: session } : {}),
         mcpServers: { karmax: platform },
         env,
