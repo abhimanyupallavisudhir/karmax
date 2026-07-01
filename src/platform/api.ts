@@ -75,7 +75,9 @@ export class KarmaxApi {
   ): Promise<TaskRecord> {
     this.require(token, 'create_task');
     const workflow = args.workflow ?? 'software-dev';
-    const start = this.resolveStart(workflow);
+    // Honor a per-project version pin (§21d) so a project can hold on a specific
+    // version while others take the latest; unpinned → latest.
+    const start = this.resolveStart(workflow, this.workflowPinFor(args.projectId, workflow));
     if (!start) throw new Error(`unknown workflow "${workflow}"`);
     const { manifest, startType } = start;
     const project = this.deps.store.getProject(args.projectId);
@@ -132,6 +134,32 @@ export class KarmaxApi {
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
   private resolveStart(workflow: string, version?: string): StartResolution | undefined {
     return this.deps.workflows?.resolveStart(workflow, version) ?? bundledStart(workflow, version);
+  }
+
+  private pinKey(projectId: string, workflow: string): string {
+    return `wfpin:${projectId}:${workflow}`;
+  }
+
+  /** The version a project pins `workflow` to, or undefined for latest. */
+  private workflowPinFor(projectId: string, workflow: string): string | undefined {
+    const v = this.deps.store.kvGet(this.pinKey(projectId, workflow));
+    return v || undefined;
+  }
+
+  /** Pin a project to a version of a workflow for new tasks (§21d); empty clears to latest. */
+  pinWorkflow(token: string, args: { projectId: string; workflow: string; version?: string }): { workflow: string; version: string } {
+    this.require(token, 'edit_workflow');
+    const v = args.version && args.version !== 'latest' ? args.version : '';
+    this.deps.store.kvSet(this.pinKey(args.projectId, args.workflow), v);
+    return { workflow: args.workflow, version: v || 'latest' };
+  }
+
+  /** The version each installed/built-in workflow is pinned to for a project (else 'latest'). */
+  workflowPins(token: string, projectId: string): Record<string, string> {
+    this.require(token, 'list_workflows');
+    const out: Record<string, string> = {};
+    for (const w of this.deps.workflows?.list() ?? []) out[w.name] = this.workflowPinFor(projectId, w.name) ?? 'latest';
+    return out;
   }
 
   /** Start a previously-saved draft (SPEC §10.4). */
@@ -243,7 +271,9 @@ export class KarmaxApi {
       title: args.title,
       workflow: 'merge-only',
       workflowVersion: '1.0.0',
-      params: { prompt: args.title, branch: args.branch, target: args.target },
+      // Record the edit target so the self-healing loop can reload the workflow
+      // from `repo@target` once this merge completes (§4.4).
+      params: { prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true },
     });
     await this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, '1.0.0'), {
       taskQueue: this.deps.taskQueue,

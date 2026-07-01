@@ -5,7 +5,7 @@ import { startDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager } from './temporal/worker-pool.js';
 import { TASK_QUEUE } from './temporal/config.js';
-import { WorkflowManager } from './packages/manager.js';
+import { WorkflowManager, reloadSpecForWorkflowEdit } from './packages/manager.js';
 import { WorkflowRepoLoader } from './packages/repo.js';
 import { Store } from './store/db.js';
 import { WorldRegistry } from './world/registry.js';
@@ -106,6 +106,23 @@ async function main() {
   const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows });
+
+  // Self-healing loop (SPEC §4.4): when a workflow-edit PR merges (its merge-only
+  // task reaches done), reload the edited workflow from its repo so new tasks pick
+  // up the published version. Runs in this process (not inside a workflow), so
+  // rolling the worker is safe; deduped per task. A merge that forgot to bump the
+  // version fails the reload loudly (version-bump guard) rather than swapping code.
+  const healed = new Set<string>();
+  bus.onAny((ev) => {
+    if (ev.type !== 'view.updated' || (ev.payload as { status?: string })?.status !== 'done' || healed.has(ev.taskId)) return;
+    const spec = reloadSpecForWorkflowEdit(store.getTask(ev.taskId) ?? {}, 'done');
+    if (!spec) return;
+    healed.add(ev.taskId);
+    workflows
+      .install(spec)
+      .then((r) => console.log(`  • Self-healed: reloaded ${r.name}@${r.version} after a workflow edit`))
+      .catch((e) => console.warn(`  • Workflow reload after edit failed: ${e instanceof Error ? e.message : e}`));
+  });
   const contributions = new ContributionRegistry();
   const overlays = new Overlays();
 

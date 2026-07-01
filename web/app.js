@@ -975,15 +975,45 @@ function settingsView(proj) {
     ${settingsForms('project', proj.id)}
     ${profilesCard('project')}
     ${paymentsCard('project')}
+    <div class="card" id="wf-pins-card">
+      <div class="section-h">Workflow versions</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Pin this project to a specific version of a workflow, or track the latest. A pin only affects <b>new</b> tasks — running ones keep the version they started on.</p>
+      <div id="wf-pins-list">Loading…</div>
+    </div>
     <div class="card">
       <div class="section-h">Workflow activation</div>
       <p style="color:var(--ink-2);margin-top:0">Activating a workflow resolves its dependencies and may spawn an onActivate preparation task.</p>
       <button class="btn" id="activate-sd">Activate software-dev (runs prep task)</button>
     </div>`;
 }
+async function hydrateWorkflowPins(projectId) {
+  const box = $('#wf-pins-list');
+  if (!box) return;
+  let list = [];
+  let pins = {};
+  try { [list, pins] = await Promise.all([api('/api/workflows'), api(`/api/projects/${projectId}/workflow-pins`)]); }
+  catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>'; return; }
+  box.innerHTML = list.map((w) => {
+    const pinned = pins[w.name] ?? 'latest';
+    const opts = [`<option value="latest" ${pinned === 'latest' ? 'selected' : ''}>latest (v${esc(w.latest)})</option>`]
+      .concat(w.versions.slice().reverse().map((v) => `<option value="${esc(v)}" ${pinned === v ? 'selected' : ''}>v${esc(v)}</option>`))
+      .join('');
+    return `<div class="queue-item">
+      <div style="flex:1"><b>${esc(w.name)}</b> <span class="chip">${w.source === 'bundled' ? 'built-in' : 'installed'}</span></div>
+      <select class="wf-pin" data-wf="${esc(w.name)}" ${w.versions.length <= 1 ? 'disabled title="only one version"' : ''}>${opts}</select>
+    </div>`;
+  }).join('');
+  box.querySelectorAll('.wf-pin').forEach((sel) => sel.addEventListener('change', async () => {
+    try {
+      await api(`/api/projects/${projectId}/workflow-pins`, { method: 'POST', body: JSON.stringify({ workflow: sel.dataset.wf, version: sel.value }) });
+      toast(`${sel.dataset.wf} pinned to ${sel.value}`);
+    } catch (e) { toast(e.message, true); }
+  }));
+}
 function wireSettingsView(proj) {
   hydrateSettingsForms('project', proj.id);
   hydrateProfiles('project', proj.id);
+  hydrateWorkflowPins(proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
       const wf = b.dataset.save;

@@ -100,6 +100,42 @@ describe('install a workflow from git and run a task on it (real dev server)', (
     await expect(api.installWorkflow(token, { url: repo, name: 'software-dev' })).rejects.toThrow(/built-in/);
   });
 
+  it('refuses a same-version re-publish, accepts a bump, and honors a per-project pin', async () => {
+    // note@1.0.0 was installed by the first test. Change the repo WITHOUT bumping
+    // the version → a new commit at the same version → refused (would swap code).
+    fs.writeFileSync(path.join(repo, 'workflow.mjs'), `export default async function note(){ return { v:'sneaky' }; }\n`);
+    await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'edit without bump']);
+    await expect(api.installWorkflow(token, { url: repo, ref: 'main' })).rejects.toThrow(/bump the version/);
+
+    // Bump to 1.1.0 → accepted; latest becomes 1.1.0. Its code returns a version marker.
+    fs.writeFileSync(
+      path.join(repo, 'manifest.json'),
+      JSON.stringify({ name: 'note', version: '1.1.0', description: 'note v1.1', requires: [], events: [], capabilities: [], ui: [], commands: [], params: [{ name: 'prompt', type: 'text', bind: 'prompt', scopes: ['task'] }] }),
+    );
+    fs.writeFileSync(
+      path.join(repo, 'workflow.mjs'),
+      `import { proxyActivities } from '@temporalio/workflow';\nconst act = proxyActivities({ startToCloseTimeout: '10s' });\nexport default async function note(input) { const echoed = await act.echo(input?.prompt ?? ''); return { ran: 'external', echoed, v: '1.1.0' }; }\n`,
+    );
+    await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'v1.1.0']);
+    expect(await api.installWorkflow(token, { url: repo, ref: 'main' })).toEqual({ name: 'note', version: '1.1.0' });
+    expect(api.listWorkflows(token).find((w) => w.name === 'note')!.latest).toBe('1.1.0');
+
+    // No pin → a new task runs the latest (1.1.0).
+    const latest = await api.createTask(token, { projectId, workflow: 'note', prompt: 'hi' });
+    expect((await client.workflow.getHandle(latest.id).result()).v).toBe('1.1.0');
+
+    // Pin the project to 1.0.0 → a new task runs the OLD version's code (still bundled).
+    expect(api.pinWorkflow(token, { projectId, workflow: 'note', version: '1.0.0' })).toEqual({ workflow: 'note', version: '1.0.0' });
+    expect(api.workflowPins(token, projectId).note).toBe('1.0.0');
+    const pinned = await api.createTask(token, { projectId, workflow: 'note', prompt: 'hi' });
+    expect(pinned.workflowVersion).toBe('1.0.0');
+    const r = await client.workflow.getHandle(pinned.id).result();
+    expect(r.ran).toBe('external');
+    expect(r.v).toBeUndefined(); // 1.0.0's code has no version marker
+  });
+
   it('persists an install and reloads it after a restart (from the on-disk snapshot)', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-persist-'));
     try {

@@ -239,8 +239,21 @@ Then the loading machinery (these package declarations are its payload):
   install-from-git). `main.ts` runs a `WorkerManager` and wires the manager at
   `~/.karmax/workflows`. `tests/install-workflow.test.ts`: install from a git
   repo → list as external → create+run a task on it end-to-end.
-  (Deferred: per-project version pinning UI + the full auto self-healing loop —
-  the manual `proposeWorkflowEdit` PR gate already exists.)
+- **21d+ — version pinning + self-healing loop** ✅
+  - **Version-bump guard**: `install` refuses to re-publish `name@version` from a
+    different commit (would swap code under in-flight tasks); an edit must bump
+    the version, re-installing the same commit is a no-op. SHA tracked per type.
+  - **Per-project version pin**: `pinWorkflow`/`workflowPins` + `createTask`
+    honors the pin (`resolveStart(workflow, pinnedVersion)`); a project can hold
+    on an older installed version while others take latest. Gateway endpoints +
+    a "Workflow versions" card in project settings.
+  - **Self-healing loop** (SPEC §4.4): `proposeWorkflowEdit` records the edit
+    target; a bus listener in `main.ts` reloads the edited workflow from
+    `repo@target` when its merge-only task completes (`reloadSpecForWorkflowEdit`,
+    unit-tested; deduped; runs in the gateway process so rolling the worker is
+    safe; a forgotten version bump fails the reload loudly, never swaps code).
+  - `tests/self-heal.test.ts` + version-bump/upgrade/pin in
+    `tests/install-workflow.test.ts`. 167 hermetic tests pass.
 - **21e — Worker refresh** ✅ (see the §21e commit — `WorkerManager` rolls the
   live worker with a superset bundle; in-flight executions survive).
 

@@ -16,7 +16,7 @@ import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort } from '../agent/profiles.js';
 import { defaultBranch } from '../world/git.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
-import { findFreePort } from '../util/ports.js';
+import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
@@ -40,6 +40,10 @@ export interface GatewayDeps {
   password?: string;
   version?: string;
 }
+
+/** Conventional gateway port. If it's taken we walk upward (findFreePortFrom),
+ *  so the UI URL stays stable across restarts. Override with KARMAX_PORT. */
+export const DEFAULT_GATEWAY_PORT = 4505;
 
 const USER_CAPS = ['*'];
 const MIME: Record<string, string> = {
@@ -71,8 +75,8 @@ export class Gateway {
     return { sid, session };
   }
 
-  async listen(preferredPort?: number): Promise<{ url: string; port: number; close: () => Promise<void> }> {
-    const port = preferredPort ?? (await findFreePort());
+  async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; port: number; close: () => Promise<void> }> {
+    const port = await findFreePortFrom(preferredPort);
     const server = http.createServer((req, res) => this.handle(req, res).catch((e) => this.fail(res, e)));
     this.server = server;
 
@@ -361,6 +365,14 @@ export class Gateway {
           // fetch/validation/collision failures are user-facing input errors
           return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
         }
+      }
+      // Per-project version pins (§21d): hold a project on a specific version.
+      const pinsMatch = p.match(/^\/api\/projects\/([^/]+)\/workflow-pins$/);
+      if (pinsMatch && method === 'GET') return this.json(res, 200, api.workflowPins(token, pinsMatch[1]!));
+      if (pinsMatch && method === 'POST') {
+        const b = await this.body(req);
+        if (!b.workflow) return this.json(res, 400, { error: 'workflow required' });
+        return this.json(res, 200, api.pinWorkflow(token, { projectId: pinsMatch[1]!, workflow: String(b.workflow), version: b.version ? String(b.version) : undefined }));
       }
 
       // profiles (agent role profiles). Global scope by default; a project overlay
