@@ -18,6 +18,7 @@ import { defaultBranch } from '../world/git.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePort } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
+import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
 
 export interface GatewayDeps {
@@ -622,9 +623,9 @@ export class Gateway {
   private async dashboard() {
     let accounts: unknown = { accounts: [], waiting: 0 };
     try {
-      accounts = await this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts');
+      accounts = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts'), 3000);
     } catch {
-      /* coordinator not running */
+      /* coordinator not running or wedged — show empty rather than hang */
     }
     const projects = this.deps.store.listProjects();
     const allTasks = projects.flatMap((pr) => this.deps.store.listTasks(pr.id));

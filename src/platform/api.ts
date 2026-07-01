@@ -9,6 +9,7 @@ import { manifest as manifestFor } from '../contrib/manifests.js';
 import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
+import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
@@ -18,6 +19,9 @@ export class CapabilityError extends Error {
 }
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
+
+/** How long to wait on a live workflow query before falling back to the snapshot. */
+const QUERY_TIMEOUT_MS = 3000;
 
 export interface KarmaxApiDeps {
   store: Store;
@@ -138,11 +142,17 @@ export class KarmaxApi {
 
   async getTaskView(token: string, taskId: string): Promise<TaskView | undefined> {
     this.require(token, 'get_task');
-    // Prefer the live workflow view; fall back to the persisted snapshot.
+    const snapshot = () => this.deps.store.getTask(taskId)?.lastView;
+    // Prefer the live workflow view, but bound it: a wedged workflow (e.g. stuck
+    // in a workflow-task-failure loop) makes a query hang without rejecting, which
+    // would otherwise freeze the whole task list / dashboard. Fall back fast.
     try {
-      return (await this.deps.client.workflow.getHandle(taskId).query('view')) as TaskView;
+      const q = this.deps.client.workflow.getHandle(taskId).query('view') as Promise<TaskView>;
+      q.catch(() => undefined); // swallow the late rejection if we time out first
+      const view = await withTimeout(q, QUERY_TIMEOUT_MS);
+      return (view as TaskView) ?? snapshot();
     } catch {
-      return this.deps.store.getTask(taskId)?.lastView;
+      return snapshot();
     }
   }
 
