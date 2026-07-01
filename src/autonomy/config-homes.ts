@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { paths } from '../config/paths.js';
 import { Provider } from '../domain/types.js';
 
@@ -59,11 +60,14 @@ export class ConfigHomeManager {
       cur.mcpServers = { ...(cur.mcpServers ?? {}), ...servers };
       fs.writeFileSync(file, JSON.stringify(cur, null, 2));
     } else if (provider === 'codex') {
-      // Minimal TOML for [mcp_servers.<name>] (command + args).
+      // Minimal TOML for [mcp_servers.<name>] (command + args + env).
       const file = path.join(home, 'config.toml');
       const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
       const toml = Object.entries(servers)
-        .map(([name, s]) => `\n[mcp_servers.${name}]\ncommand = ${JSON.stringify(s.command)}\nargs = ${JSON.stringify(s.args)}\n`)
+        .map(([name, s]) => {
+          const envLines = s.env ? Object.entries(s.env).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join('\n') : '';
+          return `\n[mcp_servers.${name}]\ncommand = ${JSON.stringify(s.command)}\nargs = ${JSON.stringify(s.args)}\n${s.env ? `\n[mcp_servers.${name}.env]\n${envLines}\n` : ''}`;
+        })
         .join('');
       fs.writeFileSync(file, existing + toml);
     }
@@ -71,19 +75,35 @@ export class ConfigHomeManager {
 }
 
 export type BrowserMcp = 'chrome-devtools' | 'playwright' | 'none';
+export interface McpServerSpec {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+}
 export interface McpBaseline {
   browser?: BrowserMcp;
-  /** karmax platform MCP as a stdio bridge: { command, args } (optional). */
-  platform?: { command: string; args: string[] };
+  /** karmax platform MCP (SPEC §3.4) — a stdio bridge to the gateway. */
+  platform?: McpServerSpec;
 }
 
 /** Resolve a baseline spec to concrete stdio MCP server commands. */
-export function mcpServerMap(spec: McpBaseline): Record<string, { command: string; args: string[] }> {
-  const out: Record<string, { command: string; args: string[] }> = {};
+export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
+  const out: Record<string, McpServerSpec> = {};
   if (spec.browser === 'chrome-devtools') out['chrome-devtools'] = { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] };
   else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', '@playwright/mcp@latest'] };
   if (spec.platform) out['karmax'] = spec.platform;
   return out;
+}
+
+/**
+ * The karmax platform MCP server entry for a config home (SPEC §3.4). Points at
+ * the stdio entrypoint and carries the gateway URL; the per-turn scoped token is
+ * injected into the agent's spawn env (never baked into the static config), and
+ * the MCP subprocess inherits it as KARMAX_TOKEN.
+ */
+export function platformMcpSpec(gatewayUrl: string): McpServerSpec {
+  const entry = fileURLToPath(new URL('../mcp/stdio.ts', import.meta.url));
+  return { command: 'npx', args: ['tsx', entry], env: { KARMAX_GATEWAY_URL: gatewayUrl } };
 }
 
 function readJson(file: string): any {

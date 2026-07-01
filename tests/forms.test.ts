@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
+import { httpOps } from '../src/platform/mcp.js';
 
 describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
   let h: Harness;
@@ -127,6 +128,18 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: false }) });
     const back = await get(`/api/projects/${projectId}/tasks`);
     expect(back.find((t: any) => t.id === task.id)).toBeTruthy();
+  });
+
+  it('the platform MCP (httpOps) drives the gateway with a scoped token (SPEC §3.4, task #4)', async () => {
+    // This is exactly what the stdio MCP subprocess does for a CLI agent.
+    const ops = httpOps(base, token);
+    const created = await ops.createTask({ projectId, title: 'via MCP', prompt: 'noop', workflow: 'software-dev' });
+    expect(created.id).toMatch(/^task_/);
+    const list = await ops.listTasks(projectId);
+    expect(list.some((t) => t.id === created.id)).toBe(true);
+    const view: any = await ops.getTask(created.id);
+    expect(view?.taskId ?? view?.workflow).toBeTruthy();
+    await ops.signalTask(created.id, 'cancel'); // clean up the started workflow
   });
 
   it('paginates the task list with limit/offset', async () => {

@@ -336,6 +336,16 @@ export class Gateway {
         await api.reorderQueue(token, b.domain, b.taskId);
         return this.json(res, 200, { ok: true });
       }
+      // platform API surface used by the MCP server (save skill / propose edit)
+      if (p === '/api/skills' && method === 'POST') {
+        const b = await this.body(req);
+        return this.json(res, 200, await api.saveSkill(token, { name: String(b.name), content: String(b.content ?? '') }));
+      }
+      const proposeMatch = p.match(/^\/api\/projects\/([^/]+)\/propose-workflow-edit$/);
+      if (proposeMatch && method === 'POST') {
+        const b = await this.body(req);
+        return this.json(res, 200, await api.proposeWorkflowEdit(token, { projectId: proposeMatch[1]!, title: b.title, repo: b.repo, branch: b.branch, target: b.target }));
+      }
 
       // profiles (agent role profiles). Global scope by default; a project overlay
       // (id `<projectId>::<role>-default`) overrides global per project (SPEC §7/§9).
@@ -416,11 +426,15 @@ export class Gateway {
         const provider = b.provider === 'codex' ? 'codex' : 'claude';
         if (!b.account) return this.json(res, 400, { error: 'account required' });
         const result = await this.deps.login.connect(provider, String(b.account));
-        // optionally seed a browser/platform MCP baseline into the new home (§7.5)
-        if (this.deps.configHomes && (b.browserMcp || b.platformMcp)) {
+        // Seed the config home's MCP baseline (SPEC §7.5/§3.4): the karmax platform
+        // MCP (always) + an optional browser MCP. The scoped token is injected at
+        // spawn; here we bake in the gateway URL only.
+        if (this.deps.configHomes) {
+          const { platformMcpSpec } = await import('../autonomy/config-homes.js');
+          const gatewayUrl = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
           this.deps.configHomes.writeMcpConfig(result.configHome, provider, {
             browser: b.browserMcp === 'chrome-devtools' || b.browserMcp === 'playwright' ? b.browserMcp : 'none',
-            platform: b.platformMcp ? { command: String(b.platformMcp.command), args: Array.isArray(b.platformMcp.args) ? b.platformMcp.args : [] } : undefined,
+            platform: platformMcpSpec(gatewayUrl),
           });
         }
         await this.refreshLoginPool();

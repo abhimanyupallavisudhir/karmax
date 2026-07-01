@@ -46,6 +46,22 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('writes the karmax platform MCP into a config home with the gateway URL (task #4)', async () => {
+    const { platformMcpSpec } = await import('../src/autonomy/config-homes.js');
+    const spec = platformMcpSpec('http://127.0.0.1:4505');
+    expect(spec.command).toBe('npx');
+    expect(spec.args.some((a) => a.includes('stdio'))).toBe(true);
+    expect(spec.env?.KARMAX_GATEWAY_URL).toBe('http://127.0.0.1:4505');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-plat-'));
+    const mgr = new ConfigHomeManager(dir);
+    const home = mgr.ensure('claude', 'work');
+    mgr.writeMcpConfig(home, 'claude', { platform: spec });
+    const cfg = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
+    expect(cfg.mcpServers.karmax.command).toBe('npx');
+    expect(cfg.mcpServers.karmax.env.KARMAX_GATEWAY_URL).toContain('4505');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('writes the MCP baseline into a Codex home (config.toml)', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mcpc-'));
     const mgr = new ConfigHomeManager(dir);

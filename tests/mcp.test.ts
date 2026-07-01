@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { KarmaxApi } from '../src/platform/api.js';
-import { createPlatformMcpServer } from '../src/platform/mcp.js';
+import { createPlatformMcpServer, apiOps, httpOps } from '../src/platform/mcp.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 
@@ -22,7 +22,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     tokens = new TokenAuthority();
     contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
     api = new KarmaxApi({ store, client: {} as any, taskQueue: 'karmax', tokens, contentDir });
-    const server = createPlatformMcpServer(api, () => currentToken);
+    const server = createPlatformMcpServer(apiOps(api, () => currentToken));
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
     await server.connect(serverT);
     client = new Client({ name: 'test', version: '1.0.0' });
