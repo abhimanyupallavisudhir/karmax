@@ -214,8 +214,18 @@ Then the loading machinery (these package declarations are its payload):
   upgrade never swaps a running/queued execution's code. Determinism proven in
   `tests/versioning.test.ts`: two versions of a probe workflow coexist in one
   worker and each execution returns its own pinned version while the other runs.
-- **21c — External package load**: load a workflow package from a git ref (not the
-  bundle); run it end-to-end (mock agent).
+- **21c — External package load** ✅ Three pieces, all tested hermetically:
+  - `packages/repo.ts` `WorkflowRepoLoader` — fetch a workflow repo, pin to the
+    exact commit (§4.3), snapshot it .git-free, validate + register the manifest.
+  - `packages/bundle.ts` `buildVersionedBundle` — compile external package *code*
+    into the Temporal deterministic sandbox under its `type@version`, alongside
+    the built-ins (`export *` carries the bundled qualified types through; a
+    webpack resolve hook points at the project node_modules). `worker.ts` gained
+    an optional `workflowBundle` so a worker can run the augmented bundle.
+    `tests/external-workflow.test.ts`: a git-loaded workflow runs end-to-end,
+    driving a platform activity, while the built-ins still work in the same worker.
+  - `packages/store.ts` `retire()` + `livePinnedRefs()` — refuse to drop a
+    version any live execution is still pinned to (the §21b determinism rule).
 - **21d — Pin/upgrade UI + self-healing loop**: version settings, upgrade surface,
   `propose_workflow_edit` → publish → pin.
 - **21e — Worker refresh** (drain+rebuild) for multi-node.

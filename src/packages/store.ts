@@ -1,9 +1,28 @@
 import { WorkflowManifest, MANIFESTS } from '../contrib/manifests.js';
+import { TaskRecord } from '../domain/types.js';
 import { parseManifest, safeParseManifest } from './schema.js';
 
 export interface PackageRef {
   name: string;
   version: string;
+}
+
+const TERMINAL_STATUS = new Set(['done', 'failed', 'cancelled']);
+
+/**
+ * The `name@version` refs a live (non-terminal) execution is still pinned to.
+ * A version's code must stay registered while any such execution exists, or the
+ * execution can't replay (§21b). This is the input to `PackageStore.retire`.
+ */
+export function livePinnedRefs(tasks: TaskRecord[]): Set<string> {
+  const refs = new Set<string>();
+  for (const t of tasks) {
+    // Status lives on the (opportunistic) view snapshot; a task with no snapshot
+    // yet is treated as live so its code is never pulled out from under it.
+    const status = t.lastView?.status;
+    if (!status || !TERMINAL_STATUS.has(status)) refs.add(`${t.workflow}@${t.workflowVersion}`);
+  }
+  return refs;
 }
 
 /**
@@ -57,6 +76,23 @@ export class PackageStore {
   /** Registered versions of a package, ascending. */
   versions(name: string): string[] {
     return [...(this.pkgs.get(name)?.keys() ?? [])].sort(cmpVersion);
+  }
+
+  /**
+   * Retire a version so new tasks stop resolving it. Refuses when a live
+   * execution is still pinned to it — dropping that code would wedge the
+   * execution on its next replay (§21b). `inUse` is the live-ref set from
+   * `livePinnedRefs`. Returns false if the version wasn't registered.
+   */
+  retire(name: string, version: string, inUse: Set<string> = new Set()): boolean {
+    if (inUse.has(`${name}@${version}`)) {
+      throw new Error(`refusing to retire ${name}@${version}: a live execution is still pinned to it`);
+    }
+    const versions = this.pkgs.get(name);
+    if (!versions?.has(version)) return false;
+    versions.delete(version);
+    if (versions.size === 0) this.pkgs.delete(name);
+    return true;
   }
 }
 

@@ -1,7 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { PackageStore } from '../src/packages/store.js';
+import { PackageStore, livePinnedRefs } from '../src/packages/store.js';
 import { safeParseManifest, parseManifest } from '../src/packages/schema.js';
 import { manifest as bundled } from '../src/contrib/manifests.js';
+import { TaskRecord, TaskStatus } from '../src/domain/types.js';
+
+const task = (over: { workflow?: string; workflowVersion?: string; status?: TaskStatus }): TaskRecord =>
+  ({
+    id: 't', projectId: 'p', listId: 'l', title: 't',
+    workflow: over.workflow ?? 'software-dev', workflowVersion: over.workflowVersion ?? '1.0.0',
+    params: {}, createdAt: 0, order: 0,
+    lastView: over.status ? ({ status: over.status } as TaskRecord['lastView']) : undefined,
+  } as TaskRecord);
 
 const valid = () => ({
   name: 'demo', version: '1.0.0', description: 'x', requires: [], events: [], capabilities: [], ui: [], commands: [], params: [],
@@ -54,5 +63,40 @@ describe('PackageStore (name@version resolution)', () => {
     const r = store.tryRegister({ name: 'broken' }); // missing required fields
     expect(r.ok).toBe(false);
     expect(store.list().length).toBe(before);
+  });
+});
+
+describe('version retirement (§21c — never drop code a live execution replays)', () => {
+  it('livePinnedRefs tracks only non-terminal executions', () => {
+    const refs = livePinnedRefs([
+      task({ status: 'active', workflowVersion: '1.0.0' }),
+      task({ status: 'waiting', workflow: 'goal', workflowVersion: '2.0.0' }),
+      task({ status: 'done', workflowVersion: '0.9.0' }), // terminal → not pinned
+      task({ status: 'cancelled', workflowVersion: '0.8.0' }),
+    ]);
+    expect(refs).toEqual(new Set(['software-dev@1.0.0', 'goal@2.0.0']));
+  });
+
+  it('refuses to retire a version a live execution is pinned to, but allows it once drained', () => {
+    const store = PackageStore.withBundled();
+    store.register({ ...bundled('goal'), version: '2.0.0' });
+
+    const live = livePinnedRefs([task({ workflow: 'goal', workflowVersion: '1.0.0', status: 'active' })]);
+    expect(() => store.retire('goal', '1.0.0', live)).toThrow(/live execution/);
+    expect(store.versions('goal')).toContain('1.0.0'); // still registered
+
+    // a newer version with no live executions retires freely
+    expect(store.retire('goal', '2.0.0', live)).toBe(true);
+    expect(store.versions('goal')).toEqual(['1.0.0']);
+
+    // once the execution drains (done), the old version can be retired too
+    const drained = livePinnedRefs([task({ workflow: 'goal', workflowVersion: '1.0.0', status: 'done' })]);
+    expect(store.retire('goal', '1.0.0', drained)).toBe(true);
+    expect(store.resolve('goal')).toBeUndefined();
+  });
+
+  it('retire returns false for an unknown version', () => {
+    const store = PackageStore.withBundled();
+    expect(store.retire('software-dev', '9.9.9')).toBe(false);
   });
 });
