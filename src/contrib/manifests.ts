@@ -145,6 +145,25 @@ export interface StageDef {
   aliases?: string[];
 }
 
+/**
+ * An MCP server a workflow gives its agents, on top of the platform baseline
+ * (SPEC §7.5). A stdio server launched per turn — e.g. a browser MCP or a
+ * domain tool. Auth-bearing servers should read their creds from env, not here.
+ */
+export interface AgentMcpServer {
+  name: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+/** Map declared agent MCP servers to the Claude Agent SDK `mcpServers` shape. */
+export function agentMcpToConfig(servers: AgentMcpServer[] | undefined): Record<string, { command: string; args: string[]; env?: Record<string, string> }> {
+  const out: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {};
+  for (const s of servers ?? []) out[s.name] = { command: s.command, args: s.args ?? [], ...(s.env ? { env: s.env } : {}) };
+  return out;
+}
+
 export interface WorkflowManifest {
   name: string;
   version: string;
@@ -156,6 +175,8 @@ export interface WorkflowManifest {
   commands: CommandDecl[];
   /** Agent roles this workflow owns (SPEC §7.1). */
   roles?: WorkflowRole[];
+  /** MCP servers this workflow's agents get, beyond the platform baseline (SPEC §7.5). */
+  agentMcp?: AgentMcpServer[];
   /** The workflow's lifecycle stages (SPEC §5) — drives the pipeline UI. */
   stages?: StageDef[];
   /** Typed parameter schema (SPEC §10.4) — drives task forms + settings + defaults. */

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
+import { agentMcpToConfig } from '../contrib/manifests.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -163,7 +164,8 @@ export class ClaudeAdapter implements AgentAdapter {
         // that don't support the level, so no gating is needed here.
         ...(input.profile.effort ? { effort: input.profile.effort } : {}),
         ...(session ? { resume: session } : {}),
-        mcpServers: { karmax: platform },
+        // The platform MCP (in-process) + any MCP servers the workflow declares (§7.5).
+        mcpServers: { karmax: platform, ...agentMcpToConfig(input.agentMcp) },
         env,
       },
     });

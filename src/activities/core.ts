@@ -15,6 +15,7 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { capturedToken } from '../autonomy/config-homes.js';
+import { manifest } from '../contrib/manifests.js';
 import { attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
@@ -213,6 +214,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
+          // MCP servers the workflow gives its agents (SPEC §7.5).
+          ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
         },
         {
           adapters: deps.adapters,

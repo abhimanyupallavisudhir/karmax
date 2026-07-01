@@ -227,6 +227,8 @@ export interface AgentProfile {
 export interface TaskInput {
   taskId: string;
   projectId: string;
+  /** The workflow this task runs (so activities can read its manifest — roles, agentMcp). */
+  workflow?: string;
   title: string;
   prompt: string;
   base?: string;

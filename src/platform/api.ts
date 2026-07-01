@@ -112,6 +112,7 @@ export class KarmaxApi {
       title,
       project: project.config,
     });
+    input.workflow = workflow;
     if (args.profiles) input.profiles = args.profiles;
 
     await this.deps.client.workflow.start(type, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
@@ -134,6 +135,7 @@ export class KarmaxApi {
       title: task.title,
       project: project.config,
     });
+    input.workflow = task.workflow;
     if (task.params.profiles) input.profiles = task.params.profiles as Record<string, string>;
     this.deps.store.clearDraft(taskId);
     await this.deps.client.workflow.start(type, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { allRoles, roleDef, manifest, WorkflowManifest } from '../src/contrib/manifests.js';
+import { allRoles, roleDef, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
 import { makeDefaultProfiles } from '../src/agent/profiles.js';
 import { assemblePrompt } from '../src/agent/prompt.js';
 
@@ -77,5 +77,26 @@ describe('workflow-owned lifecycle stages (SPEC §5 — the pipeline the UI rend
     expect(keys('just-do')).toEqual(['setup', 'do', 'review', 'done']); // no pr/merge
     expect(manifest('script-exec')!.stages!.find((s) => s.key === 'do')!.label).toBe('Run');
     expect(keys('merge-only')).toEqual(['setup', 'review', 'merge', 'done']); // no do
+  });
+});
+
+describe('workflow-owned agent MCP servers (SPEC §7.5)', () => {
+  it('maps declared servers to the Agent SDK mcpServers shape', () => {
+    const cfg = agentMcpToConfig([
+      { name: 'chrome', command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'], env: { K: 'v' } },
+      { name: 'bare', command: 'node' },
+    ]);
+    expect(cfg.chrome).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'], env: { K: 'v' } });
+    expect(cfg.bare).toEqual({ command: 'node', args: [] });
+    expect(agentMcpToConfig(undefined)).toEqual({});
+  });
+  it('a workflow can declare agent MCP servers in its manifest', () => {
+    const custom: WorkflowManifest = {
+      name: 'browsing', version: '1.0.0', description: '', requires: [], events: [], capabilities: [], ui: [], commands: [], params: [],
+      agentMcp: [{ name: 'chrome-devtools', command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] }],
+    };
+    expect(agentMcpToConfig(custom.agentMcp)['chrome-devtools']!.command).toBe('npx');
+    // bundled workflows declare none → agents get only the platform baseline
+    expect(manifest('software-dev')!.agentMcp).toBeUndefined();
   });
 });

@@ -48,6 +48,8 @@ export interface TurnInput {
   maxTurns?: number;
   /** Credentials resolved JIT by the broker (never journaled); preferred over env. */
   resolvedAuth?: { apiKey?: string; configHome?: string; oauthToken?: string };
+  /** MCP servers the workflow gives its agents, beyond the platform baseline (SPEC §7.5). */
+  agentMcp?: import('../contrib/manifests.js').AgentMcpServer[];
 }
 
 /** When no turn cap is set, agents run "unlimited" — this is only a runaway
