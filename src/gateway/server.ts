@@ -483,7 +483,7 @@ export class Gateway {
         return this.json(
           res,
           200,
-          MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params })),
+          MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages })),
         );
       }
 

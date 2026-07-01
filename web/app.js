@@ -40,7 +40,6 @@ const NODES = [
   { key: 'merge', label: 'Merge', ponr: true },
   { key: 'done', label: 'End' },
 ];
-const STAGE_INDEX = { setup: 0, do: 1, resolve: 1, review: 2, pr: 3, merge: 4, escalated: 4, done: 5, cancelled: 5, failed: 5 };
 
 // Provider → model choices for the agent field (free-text also allowed).
 const MODELS = {
@@ -457,17 +456,32 @@ function taskRow(t) {
     </div>`;
 }
 
+// The workflow's declared stages (SPEC §5), or the software-dev default.
+function stagesFor(workflow) {
+  const s = (S.schema || []).find((x) => x.name === workflow);
+  return s && s.stages && s.stages.length ? s.stages : NODES;
+}
+function stageIndexOf(stages, stage) {
+  for (let i = 0; i < stages.length; i++) {
+    if (stages[i].key === stage || (stages[i].aliases || []).includes(stage)) return i;
+  }
+  if (['done', 'cancelled', 'failed'].includes(stage)) return stages.length - 1; // terminal
+  return 0;
+}
+
 function pipeline(v) {
-  const idx = STAGE_INDEX[v.stage] ?? 0;
+  const stages = stagesFor(v.workflow);
+  const idx = stageIndexOf(stages, v.stage);
   const done = v.stage === 'done';
   const merged = v.pointOfNoReturnPassed || done;
+  const ponrIdx = stages.findIndex((n) => n.ponr);
   let segs = '';
-  for (let i = 0; i < NODES.length - 1; i++) {
-    const n = NODES[i];
+  for (let i = 0; i < stages.length - 1; i++) {
+    const n = stages[i];
     let cls = 'seg';
     if (i < idx) cls += ' done';
     if (i === idx && !done) cls += ' current ' + (v.status === 'active' ? 'working' : v.status || '');
-    if (merged && i >= 4) cls += ' merged';
+    if (merged && ponrIdx >= 0 && i >= ponrIdx) cls += ' merged';
     if (n.ponr) {
       segs += `<span class="ponr ${merged ? 'passed' : i === idx ? 'current' : ''}" title="point of no return"></span>`;
     }
@@ -477,16 +491,17 @@ function pipeline(v) {
 }
 
 function pipelineLarge(v) {
-  const idx = STAGE_INDEX[v.stage] ?? 0;
+  const stages = stagesFor(v.workflow);
+  const idx = stageIndexOf(stages, v.stage);
   const done = v.stage === 'done';
   const merged = v.pointOfNoReturnPassed || done;
-  return `<div class="pipeline-lg">${NODES.map((n, i) => {
+  return `<div class="pipeline-lg">${stages.map((n, i) => {
     let cls = 'node';
     if (i < idx || (done && i <= idx)) cls += ' done';
     if (i === idx && !done) cls += ' current';
-    if (merged && n.key === 'merge') cls += ' merged';
-    if (done && n.key === 'done') cls += ' merged';
-    return `<div class="${cls}"><div class="bar"></div><div class="name">${n.ponr ? '◆ ' : ''}${n.label}</div></div>`;
+    if (merged && n.ponr) cls += ' merged';
+    if (done && i === stages.length - 1) cls += ' merged';
+    return `<div class="${cls}"><div class="bar"></div><div class="name">${n.ponr ? '◆ ' : ''}${esc(n.label)}</div></div>`;
   }).join('')}</div>`;
 }
 

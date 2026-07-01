@@ -121,6 +121,30 @@ Candidate resolution skills: {{skills}}
 Diagnose and fix so {{stage}} can resume. If you cannot, explain why, then call signal_completion.`,
 };
 
+// Lifecycle stages per bundled workflow (the pipeline the UI renders).
+const SOFTWARE_DEV_STAGES: StageDef[] = [
+  { key: 'setup', label: 'Setup' },
+  { key: 'do', label: 'Do', aliases: ['resolve'] },
+  { key: 'review', label: 'Review' },
+  { key: 'pr', label: 'PR' },
+  { key: 'merge', label: 'Merge', ponr: true, aliases: ['escalated'] },
+  { key: 'done', label: 'End' },
+];
+
+/**
+ * A stage in a workflow's lifecycle (SPEC §5). The workflow declares its own
+ * pipeline so the UI renders *its* lifecycle, not software-dev's. `key` must match
+ * the value the workflow sets on `view.stage`; `aliases` fold transient/meta
+ * stages onto a node (e.g. `resolve` → the `do` node); `ponr` marks the point of
+ * no return. Terminal stages (done/cancelled/failed) are handled generically.
+ */
+export interface StageDef {
+  key: string;
+  label: string;
+  ponr?: boolean;
+  aliases?: string[];
+}
+
 export interface WorkflowManifest {
   name: string;
   version: string;
@@ -132,6 +156,8 @@ export interface WorkflowManifest {
   commands: CommandDecl[];
   /** Agent roles this workflow owns (SPEC §7.1). */
   roles?: WorkflowRole[];
+  /** The workflow's lifecycle stages (SPEC §5) — drives the pipeline UI. */
+  stages?: StageDef[];
   /** Typed parameter schema (SPEC §10.4) — drives task forms + settings + defaults. */
   params: FieldSpec[];
   onActivate?: OnActivateDecl;
@@ -173,6 +199,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { id: 'task.cancel', title: 'Cancel task', keybinding: 'x' },
     ],
     roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE],
+    stages: SOFTWARE_DEV_STAGES,
     params: [
       promptField(),
       agentField('do', 'Do agent'),
@@ -204,6 +231,13 @@ export const MANIFESTS: WorkflowManifest[] = [
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
     roles: [DO_ROLE],
+    // No merge machinery: do → review → done.
+    stages: [
+      { key: 'setup', label: 'Setup' },
+      { key: 'do', label: 'Do', aliases: ['resolve'] },
+      { key: 'review', label: 'Review' },
+      { key: 'done', label: 'End' },
+    ],
     params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), worldProviderField()],
   },
   {
@@ -215,6 +249,13 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'script-exec.done', description: 'Command finished.', fields: { code: 'number' } }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
+    // No agent: run the command, then show its output.
+    stages: [
+      { key: 'setup', label: 'Setup' },
+      { key: 'do', label: 'Run' },
+      { key: 'review', label: 'Output' },
+      { key: 'done', label: 'End' },
+    ],
     params: [
       { name: 'command', type: 'text', label: 'Command', required: true, scopes: ['task'], bind: 'top', placeholder: 'npm test' },
       reposField(),
@@ -231,6 +272,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     commands: [],
     // goal delegates to softwareDev, so it runs merge/resolve too.
     roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE],
+    stages: SOFTWARE_DEV_STAGES,
     params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), prToggleField()],
   },
   {
@@ -243,6 +285,13 @@ export const MANIFESTS: WorkflowManifest[] = [
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
     roles: [MERGE_ROLE],
+    // Review an existing branch, then merge it (no Do).
+    stages: [
+      { key: 'setup', label: 'Setup' },
+      { key: 'review', label: 'Review' },
+      { key: 'merge', label: 'Merge', ponr: true, aliases: ['escalated'] },
+      { key: 'done', label: 'End' },
+    ],
     params: [
       { name: 'branch', type: 'branch', label: 'Branch to merge', required: true, scopes: ['task'], bind: 'top' },
       targetField(),

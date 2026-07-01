@@ -43,6 +43,9 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     const fieldNames = sd.params.map((f: any) => f.name);
     expect(fieldNames).toEqual(expect.arrayContaining(['prompt', 'agent:do', 'base', 'target', 'repos', 'openGithubPr']));
     expect(sd.params.find((f: any) => f.name === 'agent:do').type).toBe('agent');
+    // each workflow serves its own lifecycle stages (drives the pipeline UI)
+    expect(sd.stages.map((s: any) => s.key)).toEqual(['setup', 'do', 'review', 'pr', 'merge', 'done']);
+    expect(schema.find((s: any) => s.name === 'just-do').stages.map((s: any) => s.key)).toEqual(['setup', 'do', 'review', 'done']);
   });
 
   it('round-trips global and project settings', async () => {

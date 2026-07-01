@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { allRoles, roleDef, WorkflowManifest } from '../src/contrib/manifests.js';
+import { allRoles, roleDef, manifest, WorkflowManifest } from '../src/contrib/manifests.js';
 import { makeDefaultProfiles } from '../src/agent/profiles.js';
 import { assemblePrompt } from '../src/agent/prompt.js';
 
@@ -11,9 +11,9 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
   it('aggregates declared roles across the bundled workflows, tracking who uses each', () => {
     const roles = Object.fromEntries(allRoles().map((r) => [r.name, r]));
     expect(Object.keys(roles).sort()).toEqual(['do', 'merge', 'resolve']);
-    expect(roles.do.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal']));
-    expect(roles.merge.workflows).toEqual(expect.arrayContaining(['software-dev', 'merge-only', 'goal']));
-    expect(roles.resolve.workflows).toEqual(expect.arrayContaining(['software-dev', 'goal']));
+    expect(roles.do!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal']));
+    expect(roles.merge!.workflows).toEqual(expect.arrayContaining(['software-dev', 'merge-only', 'goal']));
+    expect(roles.resolve!.workflows).toEqual(expect.arrayContaining(['software-dev', 'goal']));
   });
 
   it('exposes each role its declared prompt template + capability ceiling', () => {
@@ -62,5 +62,20 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
   it('an undeclared role falls back to the do template rather than breaking', () => {
     const out = assemblePrompt({ profile: profile({ role: 'reviewer' }), role: 'reviewer', task, world });
     expect(out).toContain('# Task'); // do template floor
+  });
+});
+
+describe('workflow-owned lifecycle stages (SPEC §5 — the pipeline the UI renders)', () => {
+  const keys = (wf: string) => (manifest(wf)!.stages ?? []).map((s) => s.key);
+  it('software-dev declares the full merge lifecycle with a point of no return', () => {
+    expect(keys('software-dev')).toEqual(['setup', 'do', 'review', 'pr', 'merge', 'done']);
+    expect(manifest('software-dev')!.stages!.find((s) => s.key === 'merge')!.ponr).toBe(true);
+    // resolve/escalated fold onto do/merge nodes rather than adding phantom stages
+    expect(manifest('software-dev')!.stages!.find((s) => s.key === 'do')!.aliases).toContain('resolve');
+  });
+  it('just-do has no merge machinery; script-exec runs (no Do agent label); merge-only has no Do', () => {
+    expect(keys('just-do')).toEqual(['setup', 'do', 'review', 'done']); // no pr/merge
+    expect(manifest('script-exec')!.stages!.find((s) => s.key === 'do')!.label).toBe('Run');
+    expect(keys('merge-only')).toEqual(['setup', 'review', 'merge', 'done']); // no do
   });
 });
