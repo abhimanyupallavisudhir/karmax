@@ -13,7 +13,7 @@ import { Overlays } from '../store/overlays.js';
 import { manifest, MANIFESTS } from '../contrib/manifests.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
-import { defaultModel } from '../agent/profiles.js';
+import { defaultModel, defaultEffort } from '../agent/profiles.js';
 import { defaultBranch } from '../world/git.js';
 import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePort } from '../util/ports.js';
@@ -546,7 +546,8 @@ export class Gateway {
       const prof = this.deps.store.getProfile(`${f.role}-default`);
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
-      out[f.name] = { provider, ...(model ? { model } : {}), ...(spec.effort ? { effort: spec.effort } : {}) };
+      const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
+      out[f.name] = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
     }
     return out;
   }

@@ -45,6 +45,10 @@ export interface TurnInput {
   resolvedAuth?: { apiKey?: string; configHome?: string };
 }
 
+/** When no turn cap is set, agents run "unlimited" — this is only a runaway
+ *  backstop so an infinite tool-loop can't burn unbounded spend. */
+export const RUNAWAY_BACKSTOP = 1000;
+
 export interface AdapterTurn {
   session?: string;
   output: string;

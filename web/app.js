@@ -92,7 +92,7 @@ function renderAgentField(f, spec, inherited) {
       <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <input class="af-model" list="models-${esc(role)}" placeholder="model" value="${esc(e.model || '')}" style="flex:1;min-width:140px" />
       <datalist id="models-${esc(role)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
-      <select class="af-effort">${EFFORTS.map((eo) => `<option value="${eo}" ${eo === (e.effort || '') ? 'selected' : ''}>${eo || 'effort'}</option>`).join('')}</select>
+      <select class="af-effort">${EFFORTS.map((eo) => `<option value="${eo}" ${eo === (e.effort || '') ? 'selected' : ''}>${eo || 'provider default'}</option>`).join('')}</select>
     </div>
     <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
       <input class="af-resume-search" placeholder="Search tasks to resume from…" style="width:100%;margin-top:6px;padding:7px 10px" />
@@ -1085,8 +1085,8 @@ function profileRow(p, handles, logins) {
       <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <input class="pf-model" list="pm-${esc(p.id)}" placeholder="model" value="${esc(p.model || '')}" style="flex:1;min-width:140px" />
       <datalist id="pm-${esc(p.id)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
-      <select class="pf-effort">${EFFORTS.map((e) => `<option value="${e}" ${e === (p.effort || '') ? 'selected' : ''}>${e || 'effort'}</option>`).join('')}</select>
-      <input class="pf-maxturns" type="number" placeholder="max turns" value="${p.maxTurns ?? ''}" style="width:90px" />
+      <select class="pf-effort">${EFFORTS.map((e) => `<option value="${e}" ${e === (p.effort || '') ? 'selected' : ''}>${e || 'provider default'}</option>`).join('')}</select>
+      <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
     <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
     <div class="form-row"><label>Account (login or API key)</label><select class="pf-auth">${authOptions(p, handles, logins)}</select></div>

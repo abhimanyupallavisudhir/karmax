@@ -1,4 +1,4 @@
-import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
+import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 
 /**
@@ -29,7 +29,9 @@ export class CodexAdapter implements AgentAdapter {
     let nextInput: any[] = [{ role: 'user', content: firstText }];
 
     let respId: string | undefined = input.session; // resume from a prior response id
-    const maxIters = input.maxTurns ?? input.profile.maxTurns ?? 24;
+    // Turn cap is optional: unset ⇒ effectively unlimited (a high runaway backstop
+    // only, so a pathological infinite tool-loop can't burn unbounded spend).
+    const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
 
     for (let i = 0; i < maxIters; i++) {

@@ -12,7 +12,7 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
       ...(model ? { model } : {}),
       role: 'do',
       capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
-      maxTurns: 24,
+      // no maxTurns ⇒ unlimited (runaway backstop only); set one to cap explicitly
     },
     {
       id: 'merge-default',
@@ -21,7 +21,6 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
       ...(model ? { model } : {}),
       role: 'merge',
       capabilities: ['merge-into:*', 'signal-completion'],
-      maxTurns: 24,
     },
     {
       id: 'resolve-default',
@@ -30,7 +29,6 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
       ...(model ? { model } : {}),
       role: 'resolve',
       capabilities: ['signal-completion', 'save-skill'],
-      maxTurns: 16,
     },
   ];
 }
@@ -38,6 +36,14 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
 export function defaultModel(provider: Provider): string | undefined {
   if (provider === 'codex') return process.env.KARMAX_OPENAI_MODEL ?? 'gpt-4.1';
   if (provider === 'claude') return process.env.KARMAX_CLAUDE_MODEL ?? 'claude-sonnet-4-5';
+  return undefined;
+}
+
+/** The provider's default reasoning effort — shown as the inferred default in
+ *  forms so the field reads a real value, not a bare "effort" placeholder. It is
+ *  display-only: leaving a profile's effort unset still lets the provider pick. */
+export function defaultEffort(provider: Provider): string | undefined {
+  if (provider === 'codex' || provider === 'claude') return 'medium';
   return undefined;
 }
 

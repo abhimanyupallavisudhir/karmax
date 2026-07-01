@@ -1,7 +1,7 @@
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
+import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 
 /**
@@ -51,7 +51,7 @@ export class ClaudeAdapter implements AgentAdapter {
       messages.push({ role: 'user', content: 'Begin the task. Call signal_completion when done.' });
     }
 
-    const maxIters = input.maxTurns ?? input.profile.maxTurns ?? 24;
+    const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
 
     for (let i = 0; i < maxIters; i++) {
