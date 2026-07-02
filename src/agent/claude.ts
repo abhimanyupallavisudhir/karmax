@@ -157,7 +157,11 @@ export class ClaudeAdapter implements AgentAdapter {
       options: {
         cwd: input.world.handle.root,
         additionalDirectories: [input.world.handle.root],
-        permissionMode: 'acceptEdits',
+        // The world is already an isolated git worktree (the sandbox boundary),
+        // and the agent runs headless — there is no human to approve command
+        // execution. `acceptEdits` auto-approves file edits but still GATES Bash,
+        // so a headless agent can't run tests/tooling. Bypass inside the sandbox.
+        permissionMode: 'bypassPermissions',
         systemPrompt: input.systemPrompt,
         ...(input.profile.model ? { model: input.profile.model } : {}),
         // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models

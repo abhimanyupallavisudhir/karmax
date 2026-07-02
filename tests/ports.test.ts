@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import net from 'node:net';
-import { findFreePort, findFreePorts, isPortFree, waitForPort } from '../src/util/ports.js';
+import { findFreePort, findFreePortFrom, findFreePorts, isPortFree, waitForPort } from '../src/util/ports.js';
 
 describe('dynamic port allocation', () => {
   it('finds a free port in the valid range', async () => {
@@ -26,6 +26,24 @@ describe('dynamic port allocation', () => {
     await new Promise<void>((r) => srv.listen(port, '127.0.0.1', () => r()));
     try {
       expect(await isPortFree(port)).toBe(false);
+    } finally {
+      await new Promise<void>((r) => srv.close(() => r()));
+    }
+  });
+
+  it('findFreePortFrom returns the preferred port when it is free', async () => {
+    const preferred = await findFreePort(); // free right now
+    expect(await findFreePortFrom(preferred)).toBe(preferred);
+  });
+
+  it('findFreePortFrom walks upward when the preferred port is taken', async () => {
+    const preferred = await findFreePort();
+    const srv = net.createServer();
+    await new Promise<void>((r) => srv.listen(preferred, '127.0.0.1', () => r()));
+    try {
+      const port = await findFreePortFrom(preferred);
+      expect(port).toBeGreaterThan(preferred);
+      expect(await isPortFree(port)).toBe(true);
     } finally {
       await new Promise<void>((r) => srv.close(() => r()));
     }

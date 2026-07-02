@@ -24,6 +24,21 @@ export function findFreePort(host = '127.0.0.1'): Promise<number> {
 }
 
 /**
+ * Find a free port at or above `preferred`, walking upward one port at a time.
+ * Unlike `findFreePort` (which asks the OS for an arbitrary free port), this
+ * prefers a conventional port so a service's URL stays stable across restarts
+ * (SPEC: the gateway tries 4505, stepping up only if it's taken). Falls back to
+ * an OS-assigned port if the whole window is occupied.
+ */
+export async function findFreePortFrom(preferred: number, host = '127.0.0.1', maxTries = 100): Promise<number> {
+  const start = Math.max(1, Math.min(65535, Math.floor(preferred)));
+  for (let port = start; port < start + maxTries && port <= 65535; port++) {
+    if (await isPortFree(port, host)) return port;
+  }
+  return findFreePort(host);
+}
+
+/**
  * Find `n` distinct free ports. We hold each socket open until all are found
  * so the OS does not hand us the same port twice, then release them.
  */
@@ -51,18 +66,6 @@ export async function findFreePorts(n: number, host = '127.0.0.1'): Promise<numb
   } finally {
     await Promise.all(servers.map((s) => new Promise<void>((r) => s.close(() => r()))));
   }
-}
-
-/**
- * Find a free port, preferring `preferred` and walking upward if it's taken, so
- * a service (e.g. the gateway) keeps a stable URL across restarts when possible.
- * Falls back to an OS-assigned port after `span` attempts.
- */
-export async function findFreePortFrom(preferred: number, host = '127.0.0.1', span = 100): Promise<number> {
-  for (let port = preferred; port < preferred + span && port <= 65535; port++) {
-    if (await isPortFree(port, host)) return port;
-  }
-  return findFreePort(host);
 }
 
 /** True if `port` is currently bindable on `host`. */

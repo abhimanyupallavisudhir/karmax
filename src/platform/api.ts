@@ -55,6 +55,27 @@ export class KarmaxApi {
     return r.record!;
   }
 
+  /**
+   * A repo-oriented workflow — one whose manifest declares a `repos` param — run
+   * against a project with no repository configured would silently get a
+   * throwaway scratch repo from the world provider (worktree.ts): the agent ends
+   * up in an empty README-only sandbox instead of the user's code, with no signal
+   * (the empty-repo footgun). Refuse the *run* early, with an actionable message,
+   * rather than let a whole attempt burn against the wrong world.
+   */
+  private assertRepoConfigured(manifest: WorkflowManifest, project: Project) {
+    const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
+    if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
+    const configured = (project.config.repos ?? []).some((r) => !!r && r.trim().length > 0);
+    if (!configured) {
+      throw new Error(
+        `Workflow "${manifest.name}" works on a repository, but project "${project.name}" has no repository ` +
+          `configured — it would run against an empty throwaway sandbox, not your code. Set the repository ` +
+          `directory in the project's Settings (an absolute path, or one starting with ~) before running this task.`,
+      );
+    }
+  }
+
   async createTask(
     token: string,
     args: {
@@ -82,6 +103,9 @@ export class KarmaxApi {
     const { manifest, startType } = start;
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
+    // Refuse to *run* a repo-oriented workflow with no repository configured
+    // (drafts may still be saved without one, then checked again at queueTask).
+    if (!args.draft) this.assertRepoConfigured(manifest, project);
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
@@ -189,6 +213,7 @@ export class KarmaxApi {
     const start = this.resolveStart(task.workflow, task.workflowVersion);
     if (!project || !start) throw new Error(`cannot queue task ${taskId}`);
     const { manifest, startType } = start;
+    this.assertRepoConfigured(manifest, project); // same guard as createTask, before we clear the draft
     // Re-resolve against the CURRENT project/global defaults. The task stored only
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived) aren't overrides.
