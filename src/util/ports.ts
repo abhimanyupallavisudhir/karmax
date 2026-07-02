@@ -53,6 +53,18 @@ export async function findFreePorts(n: number, host = '127.0.0.1'): Promise<numb
   }
 }
 
+/**
+ * Find a free port, preferring `preferred` and walking upward if it's taken, so
+ * a service (e.g. the gateway) keeps a stable URL across restarts when possible.
+ * Falls back to an OS-assigned port after `span` attempts.
+ */
+export async function findFreePortFrom(preferred: number, host = '127.0.0.1', span = 100): Promise<number> {
+  for (let port = preferred; port < preferred + span && port <= 65535; port++) {
+    if (await isPortFree(port, host)) return port;
+  }
+  return findFreePort(host);
+}
+
 /** True if `port` is currently bindable on `host`. */
 export function isPortFree(port: number, host = '127.0.0.1'): Promise<boolean> {
   return new Promise((resolve) => {
