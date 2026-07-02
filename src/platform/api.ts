@@ -25,6 +25,15 @@ const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'T
 /** How long to wait on a live workflow query before falling back to the snapshot. */
 const QUERY_TIMEOUT_MS = 3000;
 
+/**
+ * How long to wait for the durable engine to *accept* a new workflow before we
+ * give up. A healthy server accepts in well under a second; this only trips when
+ * Temporal is wedged/unreachable — in which case we surface a real error and undo
+ * the task row instead of hanging the request and stranding an orphan task (the
+ * "clicked queue, nothing happened, pile of tasks stuck at setup" failure mode).
+ */
+const START_TIMEOUT_MS = 12_000;
+
 export interface KarmaxApiDeps {
   store: Store;
   client: Client;
@@ -140,7 +149,21 @@ export class KarmaxApi {
 
     // Pin the execution to the manifest version stamped on the task (§21b), so a
     // later version upgrade only affects new tasks, never this running one.
-    await this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
+    // Bounded + compensated: if the engine won't accept it (wedged/unreachable),
+    // delete the row we just wrote so it can't linger as an orphan stuck at
+    // "setup", and surface a real error instead of hanging.
+    try {
+      await withTimeout(
+        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
+        START_TIMEOUT_MS,
+      );
+    } catch (e) {
+      this.deps.store.deleteTask(task.id);
+      throw new Error(
+        `Could not start "${title}": the durable engine didn't accept the task (${e instanceof Error ? e.message : String(e)}). ` +
+          `Nothing was queued — check that Temporal is healthy and try again.`,
+      );
+    }
     return task;
   }
 
@@ -228,7 +251,21 @@ export class KarmaxApi {
     input.workflow = task.workflow;
     if (profiles) input.profiles = profiles as Record<string, string>;
     this.deps.store.clearDraft(taskId);
-    await this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
+    // Bounded + compensated: on a wedged engine, restore the draft flag so a
+    // failed queue attempt leaves the task saved (not stranded, non-draft, with
+    // no workflow) and report a real error rather than hanging.
+    try {
+      await withTimeout(
+        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
+        START_TIMEOUT_MS,
+      );
+    } catch (e) {
+      this.deps.store.updateTaskParams(taskId, { ...task.params, draft: true });
+      throw new Error(
+        `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
+          `It's still saved as a draft — check that Temporal is healthy and try again.`,
+      );
+    }
     return this.deps.store.getTask(taskId)!;
   }
 
@@ -320,22 +357,33 @@ export class KarmaxApi {
       // from `repo@target` once this merge completes (§4.4).
       params: { prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true },
     });
-    await this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, '1.0.0'), {
-      taskQueue: this.deps.taskQueue,
-      workflowId: task.id,
-      args: [
-        {
-          taskId: task.id,
-          projectId: args.projectId,
-          title: args.title,
-          prompt: args.title,
-          branch: args.branch,
-          target: args.target,
-          project: { ...project.config, repos: [args.repo] },
-          workflowEdit: true,
-        },
-      ],
-    });
+    try {
+      await withTimeout(
+        this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, '1.0.0'), {
+          taskQueue: this.deps.taskQueue,
+          workflowId: task.id,
+          args: [
+            {
+              taskId: task.id,
+              projectId: args.projectId,
+              title: args.title,
+              prompt: args.title,
+              branch: args.branch,
+              target: args.target,
+              project: { ...project.config, repos: [args.repo] },
+              workflowEdit: true,
+            },
+          ],
+        }),
+        START_TIMEOUT_MS,
+      );
+    } catch (e) {
+      this.deps.store.deleteTask(task.id);
+      throw new Error(
+        `Could not start the workflow-edit task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
+          `Nothing was queued — check that Temporal is healthy and try again.`,
+      );
+    }
     return task;
   }
 

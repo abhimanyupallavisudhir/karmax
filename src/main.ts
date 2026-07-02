@@ -21,6 +21,7 @@ import { ContributionRegistry } from './contrib/registry.js';
 import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
 import { remoteAccessPlan } from './remote/access.js';
+import { withTimeout } from './util/timeout.js';
 
 const VERSION = '1.0.0';
 
@@ -37,12 +38,16 @@ async function main() {
   }
 
   // ── Temporal dev server (SQLite-backed, dynamic ports) ──
-  console.log('  • Starting Temporal…');
+  // One long-lived server, reused across restarts/reloads (see dev-server.ts):
+  // spawning a fresh one per reload against the same SQLite file is what wedges
+  // Temporal. A wedged/dead server is auto-replaced here.
+  console.log('  • Connecting to Temporal…');
   const server = await startDevServer({
     dbFilename: path.join(p.temporal, 'temporal.db'),
     logLevel: 'error',
   });
   const conn = { address: server.address, namespace: server.namespace };
+  console.log(`  • Temporal ${server.reused ? 'reused (already running)' : 'started'} at ${server.address}`);
   if (server.uiUrl) console.log(`    Temporal UI: ${server.uiUrl}`);
 
   const { client, close: closeClient } = await makeClient(conn);
@@ -163,12 +168,20 @@ async function main() {
     /* ignore */
   }
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('\n  shutting down…');
-    await closeGateway().catch(() => {});
-    await workerManager.stop().catch(() => {});
-    await closeClient().catch(() => {});
-    await server.stop().catch(() => {});
+    // Backstop: never let a hung dependency (e.g. a slow worker drain) block exit.
+    setTimeout(() => process.exit(0), 8000).unref();
+    // Bound every step so one wedged call can't strand the whole shutdown.
+    const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 5000).catch(() => {});
+    await step(closeGateway());
+    await step(workerManager.stop());
+    await step(closeClient());
+    await step(server.stop()); // no-op for the shared server — it persists for a fast restart
+    console.log('  (Temporal left running for a fast restart — `npm run reset` stops it)');
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
