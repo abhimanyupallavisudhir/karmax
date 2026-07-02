@@ -271,7 +271,16 @@ export class Gateway {
       if (editMatch && method === 'PATCH') {
         const b = await this.body(req);
         const t = store.getTask(editMatch[1]!);
-        if (t) store.updateTaskParams(editMatch[1]!, { ...t.params, ...b.params });
+        if (t) {
+          // Replace the workflow-field overrides wholesale (b.params is the form's
+          // full set of own overrides) so a field reset to its default is actually
+          // removed — a merge would leave the stale override behind. Lifecycle meta
+          // (draft/archived/profiles) is preserved across the edit.
+          const { draft, archived, profiles } = t.params;
+          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}) };
+          const replace = b.replace === true;
+          store.updateTaskParams(editMatch[1]!, replace ? { ...meta, ...b.params } : { ...t.params, ...b.params });
+        }
         return this.json(res, 200, store.getTask(editMatch[1]!) ?? null);
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
@@ -525,7 +534,7 @@ export class Gateway {
         const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
         const db = repo0 ? await defaultBranch(repo0).catch(() => undefined) : undefined;
         const enrich = (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
-          const out = this.enrichAgentDefaults(m, vals);
+          const out = this.enrichAgentDefaults(m, vals, projectId);
           if (db) {
             if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = db;
             if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = db;
@@ -633,12 +642,16 @@ export class Gateway {
     await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);
   }
 
-  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>) {
+  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
       if (f.type !== 'agent' || !f.role) continue;
       const spec = (out[f.name] as any) || {};
-      const prof = this.deps.store.getProfile(`${f.role}-default`);
+      // The project's role-default overlay overrides the global one (SPEC §9), so a
+      // per-project model/provider default flows through to new tasks' inherited value.
+      const prof =
+        (projectId ? this.deps.store.getProfile(`${projectId}::${f.role}-default`) : undefined) ??
+        this.deps.store.getProfile(`${f.role}-default`);
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);

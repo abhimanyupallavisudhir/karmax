@@ -96,23 +96,30 @@ function schemaFor(workflow) {
 const eff = (own, inherited) => (own !== undefined && own !== null && own !== '' ? own : inherited);
 const inhAttr = (val) => `data-inherit='${esc(JSON.stringify(val ?? null))}'`;
 
+// "Reset to default" button — cleared/hidden until the field holds an override,
+// then clicking it drops the override so the field inherits again (SPEC §10.5).
+const resetBtn = (name) => `<button type="button" class="field-reset" data-reset="${esc(name)}" hidden title="Drop this override and inherit the default">↺ Reset to default</button>`;
+const fieldLabel = (f) =>
+  `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtn(f.name)}</div>` +
+  (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
+
 function renderField(f, own, inherited) {
   const v = eff(own, inherited) ?? '';
-  const label = `<label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : ''}`;
+  const label = fieldLabel(f);
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
-  if (f.type === 'agent') return `<div class="form-row">${label}${renderAgentField(f, own, inherited)}</div>`;
+  if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
   if (f.type === 'text')
-    return `<div class="form-row">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
   if (f.type === 'boolean')
-    return `<div class="form-row switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${resetBtn(f.name)}</div></div>`;
   if (f.type === 'select')
-    return `<div class="form-row">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
-    return `<div class="form-row">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
   }
   // string / number / branch / repoPath
-  return `<div class="form-row">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
+  return `<div class="form-row" data-row="${esc(f.name)}">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
 function renderAgentField(f, spec, inherited) {
@@ -124,8 +131,11 @@ function renderAgentField(f, spec, inherited) {
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
-      <input class="af-model" list="models-${esc(role)}" placeholder="model" value="${esc(e.model || '')}" style="flex:1;min-width:140px" />
-      <datalist id="models-${esc(role)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
+      <div class="combo af-model-combo" style="flex:1;min-width:140px">
+        <input class="af-model" placeholder="model" value="${esc(e.model || '')}" autocomplete="off" />
+        <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
+        <div class="combo-menu" hidden></div>
+      </div>
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
     <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
@@ -178,19 +188,128 @@ function collectForm(root, fields) {
   return out;
 }
 
-// Wire agent-field controls: provider→model datalist + resume search (no toggle).
+// A lightweight combobox: a real dropdown that opens on focus and on the caret,
+// filters as you type, and still accepts free text. Replaces <datalist>, whose
+// popup is unreliable (won't open on the caret, flaky while typing).
+function wireCombo(combo, getOptions, onChange) {
+  const input = combo.querySelector('input');
+  const menu = combo.querySelector('.combo-menu');
+  const caret = combo.querySelector('.combo-caret');
+  if (!input || !menu || !caret) return;
+  let open = false;
+  const draw = () => {
+    const q = input.value.trim().toLowerCase();
+    const opts = (getOptions() || []).filter((o) => !q || o.toLowerCase().includes(q));
+    menu.innerHTML = opts.length
+      ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o)}">${esc(o)}</div>`).join('')
+      : `<div class="combo-empty">No matching presets — free text is allowed</div>`;
+  };
+  const show = () => { draw(); menu.hidden = false; open = true; };
+  const hide = () => { menu.hidden = true; open = false; };
+  input.addEventListener('focus', show);
+  input.addEventListener('input', () => { show(); onChange && onChange(); });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') { hide(); input.blur(); } });
+  input.addEventListener('blur', () => setTimeout(hide, 150)); // let a menu click land first
+  // mousedown (not click) so it fires before the input's blur closes the menu
+  caret.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    if (open) hide();
+    else { input.focus(); show(); }
+  });
+  menu.addEventListener('mousedown', (e) => {
+    const opt = e.target.closest('.combo-opt');
+    if (!opt) return;
+    e.preventDefault();
+    input.value = opt.dataset.v;
+    hide();
+    onChange && onChange();
+  });
+}
+
+// Wire agent-field controls: provider→model combobox + resume search (no toggle).
 function wireAgentFields(root) {
   root.querySelectorAll('.agent-field').forEach((box) => {
-    box.querySelector('.af-provider')?.addEventListener('change', (e) => {
-      box.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
-      box.querySelector('.af-model').value = '';
+    const combo = box.querySelector('.af-model-combo');
+    const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
+    if (combo) wireCombo(combo, () => MODELS[providerOf()] || MODELS.claude, () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
+    box.querySelector('.af-provider')?.addEventListener('change', () => {
+      box.querySelector('.af-model').value = ''; // model choices are provider-specific
       refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
     });
-    box.querySelector('.af-model')?.addEventListener('input', () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
     const search = box.querySelector('.af-resume-search');
     const results = box.querySelector('.af-resume-results');
     search?.addEventListener('input', () => resumeSearch(box, search.value, results));
   });
+}
+
+// Wire per-field "Reset to default" buttons: show the button whenever the field
+// diverges from its inherited default, and on click restore the inherited value
+// so the field goes back to inheriting (collectForm then stores no override).
+function wireFieldResets(root, fields) {
+  for (const f of fields) {
+    if (f.required) continue; // a required field always stores a value; nothing to inherit
+    const btn = root.querySelector(`.field-reset[data-reset="${CSS.escape(f.name)}"]`);
+    if (!btn) continue;
+    const sync = () => { btn.hidden = !fieldOverridden(root, f); };
+    if (f.type === 'agent') {
+      const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      box.addEventListener('input', sync);
+      box.addEventListener('change', sync);
+      btn.addEventListener('click', () => { resetAgentField(box); sync(); });
+    } else {
+      const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
+      if (!el) continue;
+      el.addEventListener('input', sync);
+      el.addEventListener('change', sync);
+      btn.addEventListener('click', () => { resetPlainField(el, f); sync(); });
+    }
+    sync();
+  }
+}
+
+// Does the field currently hold a value that differs from the inherited default?
+function fieldOverridden(root, f) {
+  if (f.type === 'agent') {
+    const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+    if (!box) return false;
+    const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+    const spec = { provider: box.querySelector('.af-provider').value };
+    const model = box.querySelector('.af-model').value.trim();
+    const effort = box.querySelector('.af-effort').value;
+    if (model) spec.model = model;
+    if (effort) spec.effort = effort;
+    return !sameJson(normSpec(spec), normSpec(inh));
+  }
+  const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
+  if (!el) return false;
+  const inh = JSON.parse(el.getAttribute('data-inherit') || 'null');
+  let val;
+  if (f.type === 'boolean') val = el.checked;
+  else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
+  else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
+  else val = el.value === '' ? undefined : el.value;
+  if (val === undefined) return false; // empty ⇒ inheriting
+  if (f.type === 'list' && Array.isArray(val) && !val.length) return false;
+  return !sameJson(val, inh);
+}
+
+function resetPlainField(el, f) {
+  const inh = JSON.parse(el.getAttribute('data-inherit') || 'null');
+  if (f.type === 'boolean') el.checked = !!inh;
+  else if (f.type === 'list') el.value = Array.isArray(inh) ? inh.join('\n') : (inh || '');
+  else el.value = inh === undefined || inh === null ? '' : inh;
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function resetAgentField(box) {
+  const inh = JSON.parse(box.getAttribute('data-inherit') || 'null') || {};
+  const prov = box.querySelector('.af-provider');
+  prov.value = inh.provider || 'claude';
+  box.querySelector('.af-model').value = inh.model || '';
+  refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+  const eff = box.querySelector('.af-effort');
+  if (eff && inh.effort) eff.value = inh.effort;
 }
 
 // Resume search: find tasks by title, then list their per-role agent sessions.
@@ -584,13 +703,14 @@ async function openTaskForm(workflow, draft) {
   $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') root.innerHTML = ''; });
   $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
   wireAgentFields($('#tf-body'));
+  wireFieldResets($('#tf-body'), fields);
   const submit = async (draftMode) => {
     const body = collectForm($('#tf-body'), fields);
     const payload = { workflow: wf, params: body, draft: draftMode };
     try {
       if (draft) {
         // edit existing draft, then optionally queue
-        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body }) });
+        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true }) });
         if (!draftMode) await api(`/api/tasks/${draft.id}/queue`, { method: 'POST', body: '{}' });
       } else {
         await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
@@ -964,6 +1084,7 @@ async function hydrateSettingsForms(scope, projectId) {
     const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
     sec.querySelector('.wf-form').innerHTML = fields.map((f) => renderField(f, own[f.name], inherited[f.name])).join('');
     wireAgentFields(sec);
+    wireFieldResets(sec, fields);
   }
 }
 
@@ -1219,7 +1340,6 @@ function accountChecks(p, handles, logins) {
 }
 
 function profileRow(p, handles, logins, scope) {
-  const models = MODELS[p.provider] || MODELS.claude;
   const inherited = scope === 'project' && p.scope === 'inherited';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
@@ -1227,8 +1347,11 @@ function profileRow(p, handles, logins, scope) {
       ${inherited ? '<span class="chip" title="Using the global default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
-      <input class="pf-model" list="pm-${esc(p.id)}" placeholder="model" value="${esc(p.model || '')}" style="flex:1;min-width:140px" />
-      <datalist id="pm-${esc(p.id)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
+      <div class="combo pf-model-combo" style="flex:1;min-width:140px">
+        <input class="pf-model" placeholder="model" value="${esc(p.model || '')}" autocomplete="off" />
+        <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
+        <div class="combo-menu" hidden></div>
+      </div>
       ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
@@ -1250,15 +1373,15 @@ async function hydrateProfiles(scope, projectId) {
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
   list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles, logins, scope)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
-  list.querySelectorAll('.pf-provider').forEach((sel) => sel.addEventListener('change', (e) => {
-    const card = sel.closest('[data-profile]');
-    card.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
-    card.querySelector('.pf-model').value = '';
-    refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
-  }));
-  list.querySelectorAll('.pf-model').forEach((inp) => inp.addEventListener('input', () =>
-    refreshEffortSelect(inp.closest('[data-profile]'), 'pf-provider', 'pf-model', 'pf-effort'),
-  ));
+  list.querySelectorAll('[data-profile]').forEach((card) => {
+    const combo = card.querySelector('.pf-model-combo');
+    const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
+    if (combo) wireCombo(combo, () => MODELS[providerOf()] || MODELS.claude, () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
+    card.querySelector('.pf-provider')?.addEventListener('change', () => {
+      card.querySelector('.pf-model').value = ''; // model choices are provider-specific
+      refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
+    });
+  });
   const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
   list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
     const card = b.closest('[data-profile]');

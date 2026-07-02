@@ -109,6 +109,55 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(dash.tasks).toBeGreaterThanOrEqual(1);
   });
 
+  it('inherits defaults live: drafts store only overrides and re-resolve when queued', async () => {
+    const project: any = await (
+      await fetch(`${base}/api/projects`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ name: 'Inherit', config: {} }),
+      })
+    ).json();
+
+    // A draft with only a prompt must persist ONLY its own overrides — never a
+    // baked snapshot of the resolved defaults (which would freeze inheritance).
+    const draft: any = await (
+      await fetch(`${base}/api/projects/${project.id}/tasks`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ prompt: 'inherit me', workflow: 'software-dev', draft: true }),
+      })
+    ).json();
+    const stored = h.store.getTask(draft.id)!;
+    expect(stored.params.prompt).toBe('inherit me');
+    expect(stored.params.draft).toBe(true);
+    // none of the inheritable defaults should be baked onto the task
+    expect(stored.params.worldProvider).toBeUndefined();
+    expect(stored.params.openGithubPr).toBeUndefined();
+    expect(stored.params.base).toBeUndefined();
+
+    // Changing a project default now flows into the (still unqueued) task's
+    // resolved defaults — the /api/defaults task scope reflects it immediately.
+    await fetch(`${base}/api/settings/project/${project.id}/software-dev`, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({ values: { worldProvider: 'container', base: 'develop' } }),
+    });
+    const defs: any = await (await fetch(`${base}/api/defaults/${project.id}/software-dev`, { headers: auth() })).json();
+    expect(defs.task.inherited.worldProvider).toBe('container');
+    expect(defs.task.inherited.base).toBe('develop');
+
+    // A project override, in turn, still inherits from a global default it does
+    // not set (here: copyGlobs), proving the full task→project→global chain.
+    await fetch(`${base}/api/settings/global/software-dev`, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({ values: { copyGlobs: ['.env'] } }),
+    });
+    const defs2: any = await (await fetch(`${base}/api/defaults/${project.id}/software-dev`, { headers: auth() })).json();
+    expect(defs2.task.inherited.copyGlobs).toEqual(['.env']); // global reaches the task through the project
+    expect(defs2.task.inherited.worldProvider).toBe('container'); // project override still wins
+  });
+
   it('connects an account login and lists it without leaking the config-home path', async () => {
     const r: any = await (
       await fetch(`${base}/api/accounts/connect`, {

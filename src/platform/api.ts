@@ -112,31 +112,20 @@ export class KarmaxApi {
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
-    const getSettings = (s: string, w: string) => this.deps.store.getSettings(s, w);
-    const projectVals = projectSettingsFor(getSettings, project, workflow);
-    const globalVals = globalSettingsFor(getSettings, workflow);
-    const resolved = resolveParams(manifest, { task: taskOverrides, project: projectVals, global: globalVals });
-
-    // Auto-detect the repo's default branch when base/target weren't set anywhere,
-    // instead of guessing "main" (which would create a phantom target branch).
-    const explicitBase = taskOverrides.base ?? projectVals.base ?? globalVals.base;
-    const explicitTarget = taskOverrides.target ?? projectVals.target ?? globalVals.target;
-    const repo0 = project.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
-    if (repo0 && (!explicitBase || !explicitTarget)) {
-      const db = await defaultBranch(repo0).catch(() => undefined);
-      if (db) {
-        if (!explicitBase) resolved.base = db;
-        if (!explicitTarget) resolved.target = db;
-      }
-    }
+    const resolved = await this.resolveTaskParams(manifest, project, taskOverrides);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
+    // Persist only the task's OWN overrides (sparse), not the resolved snapshot.
+    // A baked snapshot would freeze inherited values, so later changes to the
+    // project/global defaults could never reach an unqueued task. Keeping the
+    // task sparse means it re-resolves against the live defaults when it's
+    // finally queued (createTask below for immediate start, queueTask for drafts).
     const task = this.deps.store.createTask({
       projectId: args.projectId,
       title,
       workflow,
       workflowVersion: manifest.version,
-      params: { ...resolved, prompt: String(resolved.prompt ?? ''), profiles: args.profiles, draft: !!args.draft },
+      params: { ...taskOverrides, prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''), profiles: args.profiles, draft: !!args.draft },
     });
     if (args.draft) return task; // stored but not queued
 
@@ -153,6 +142,33 @@ export class KarmaxApi {
     // later version upgrade only affects new tasks, never this running one.
     await this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
     return task;
+  }
+
+  /**
+   * Resolve a task's effective field values from its own overrides layered over
+   * the CURRENT project + global defaults (SPEC §10.4 overlay). Shared by task
+   * creation and draft queueing so both pick up the live defaults, and so an
+   * unqueued task inherits any default change made after it was saved.
+   */
+  private async resolveTaskParams(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap): Promise<ValueMap> {
+    const getSettings = (s: string, w: string) => this.deps.store.getSettings(s, w);
+    const projectVals = projectSettingsFor(getSettings, project, manifest.name);
+    const globalVals = globalSettingsFor(getSettings, manifest.name);
+    const resolved = resolveParams(manifest, { task: taskOverrides, project: projectVals, global: globalVals });
+
+    // Auto-detect the repo's default branch when base/target weren't set anywhere,
+    // instead of guessing "main" (which would create a phantom target branch).
+    const explicitBase = taskOverrides.base ?? projectVals.base ?? globalVals.base;
+    const explicitTarget = taskOverrides.target ?? projectVals.target ?? globalVals.target;
+    const repo0 = project.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
+    if (repo0 && (!explicitBase || !explicitTarget)) {
+      const db = await defaultBranch(repo0).catch(() => undefined);
+      if (db) {
+        if (!explicitBase) resolved.base = db;
+        if (!explicitTarget) resolved.target = db;
+      }
+    }
+    return resolved;
   }
 
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
@@ -198,7 +214,11 @@ export class KarmaxApi {
     if (!project || !start) throw new Error(`cannot queue task ${taskId}`);
     const { manifest, startType } = start;
     this.assertRepoConfigured(manifest, project); // same guard as createTask, before we clear the draft
-    const resolved: ValueMap = { ...task.params };
+    // Re-resolve against the CURRENT project/global defaults. The task stored only
+    // its own overrides, so a draft queued after a default change picks up the new
+    // default (SPEC §10.4). Meta fields (profiles/draft/archived) aren't overrides.
+    const { profiles, draft: _d, archived: _a, ...overrides } = task.params as Record<string, unknown>;
+    const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,
@@ -206,7 +226,7 @@ export class KarmaxApi {
       project: project.config,
     });
     input.workflow = task.workflow;
-    if (task.params.profiles) input.profiles = task.params.profiles as Record<string, string>;
+    if (profiles) input.profiles = profiles as Record<string, string>;
     this.deps.store.clearDraft(taskId);
     await this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] });
     return this.deps.store.getTask(taskId)!;
