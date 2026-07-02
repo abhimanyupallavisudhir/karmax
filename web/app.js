@@ -1557,7 +1557,11 @@ async function newProject() {
   const name = prompt('Project name');
   if (!name) return;
   try {
-    const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: { defaultBase: 'main', defaultTarget: 'main' } }) });
+    // Create with an EMPTY config so branches (and every other field) inherit
+    // from global settings. Hardcoding defaultBase/defaultTarget here would bake
+    // a project-scope override that shadows the global default (e.g. "master"),
+    // which is exactly the inheritance bug this avoids.
+    const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: {} }) });
     await loadProjects();
     S.projectId = p.id;
     renderRail();
