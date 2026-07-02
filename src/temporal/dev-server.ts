@@ -2,9 +2,17 @@ import { spawn, ChildProcess } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { findFreePorts, waitForPort } from '../util/ports.js';
+import { findFreePortFrom, waitForPort } from '../util/ports.js';
 
 const TEMPORAL_BIN = process.env.TEMPORAL_CLI ?? path.join(os.homedir(), '.temporalio', 'bin', 'temporal');
+
+// Conventional Temporal ports. Each is claimed by walking upward from its
+// default (findFreePortFrom) so they stay stable across restarts. Temporal's
+// own internal services (history/matching/worker) take arbitrary high ports we
+// never touch, so these three don't collide with them.
+const DEFAULT_GRPC_PORT = 7233;
+const DEFAULT_UI_PORT = 8233;
+const DEFAULT_METRICS_PORT = 9233;
 
 export interface DevServer {
   address: string; // host:grpcPort
@@ -33,10 +41,9 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
     );
   }
   const namespace = opts.namespace ?? 'default';
-  const ports = await findFreePorts(3);
-  const grpcPort = ports[0]!;
-  const uiPort = ports[1]!;
-  const metricsPort = ports[2]!;
+  const grpcPort = await findFreePortFrom(DEFAULT_GRPC_PORT);
+  const uiPort = await findFreePortFrom(DEFAULT_UI_PORT, { avoid: [grpcPort] });
+  const metricsPort = await findFreePortFrom(DEFAULT_METRICS_PORT, { avoid: [grpcPort, uiPort] });
 
   const args = [
     'server',

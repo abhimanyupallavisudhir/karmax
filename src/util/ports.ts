@@ -1,9 +1,33 @@
 import net from 'node:net';
 
 /**
- * Dynamic port allocation. karmax never hardcodes localhost ports: every
- * service (Temporal gRPC/UI, the gateway) asks for a free port at boot.
+ * Port allocation policy. Each karmax service has a conventional *default*
+ * port and, at boot, claims the lowest free port at or above it (see
+ * findFreePortFrom). So a service's URL is stable run-to-run — restarting
+ * karmax (e.g. after editing its own code) reclaims the same port instead of
+ * jumping to a fresh OS-assigned one — while a leftover or second instance
+ * still starts cleanly on the next port up.
+ *
+ * findFreePort/findFreePorts (:0, arbitrary OS-chosen ports) remain for tests
+ * that just need *some* free port and don't care which.
  */
+
+/**
+ * Find the lowest free TCP port at or above `start`, skipping any in `avoid`.
+ * This is the default allocation strategy for karmax's long-lived services.
+ */
+export async function findFreePortFrom(
+  start: number,
+  { host = '127.0.0.1', maxTries = 512, avoid }: { host?: string; maxTries?: number; avoid?: Iterable<number> } = {},
+): Promise<number> {
+  const taken = new Set(avoid ?? []);
+  const limit = Math.min(start + maxTries, 65536);
+  for (let port = start; port < limit; port++) {
+    if (taken.has(port)) continue;
+    if (await isPortFree(port, host)) return port;
+  }
+  throw new Error(`no free port found at or above ${start} (tried up to ${limit - 1})`);
+}
 
 /** Ask the OS for a free TCP port by binding to :0 and reading it back. */
 export function findFreePort(host = '127.0.0.1'): Promise<number> {
