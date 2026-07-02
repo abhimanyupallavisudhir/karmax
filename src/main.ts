@@ -131,9 +131,12 @@ async function main() {
   const contributions = new ContributionRegistry();
   const overlays = new Overlays();
 
-  // Ensure a default project exists for first-run UX.
+  // Ensure a default project exists for first-run UX. Seed it with an EMPTY
+  // config so branches inherit from global settings (or the repo's real default
+  // branch) instead of baking a project-scope "main" override that would shadow
+  // a global default like "master".
   if (store.listProjects().length === 0) {
-    store.createProject('My project', { defaultBase: 'main', defaultTarget: 'main' });
+    store.createProject('My project', {});
   }
 
   const staticDir = fileURLToPath(new URL('../web', import.meta.url));

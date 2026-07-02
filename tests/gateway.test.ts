@@ -158,6 +158,46 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(defs2.task.inherited.worldProvider).toBe('container'); // project override still wins
   });
 
+  it('a newly created project inherits the global branch default (no baked "main" override)', async () => {
+    // Set a global branch default that differs from the field default ("main").
+    await fetch(`${base}/api/settings/global/software-dev`, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({ values: { base: 'master', target: 'master' } }),
+    });
+    // Create a project exactly the way the New Project UI now does: empty config.
+    const project: any = await (
+      await fetch(`${base}/api/projects`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ name: 'FreshProject', config: {} }),
+      })
+    ).json();
+    // The project must NOT have baked a defaultBase/defaultTarget of its own.
+    expect(project.config.defaultBase).toBeUndefined();
+    expect(project.config.defaultTarget).toBeUndefined();
+
+    // Resolved defaults at the task scope must reflect the GLOBAL value, not "main".
+    const defs: any = await (await fetch(`${base}/api/defaults/${project.id}/software-dev`, { headers: auth() })).json();
+    expect(defs.task.inherited.base).toBe('master');
+    expect(defs.task.inherited.target).toBe('master');
+    // And the project scope owns nothing for base/target (it purely inherits).
+    expect(defs.project.own.base).toBeUndefined();
+    expect(defs.project.own.target).toBeUndefined();
+
+    // A task created in this project resolves its branches to the global default too.
+    const task: any = await (
+      await fetch(`${base}/api/projects/${project.id}/tasks`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ prompt: 'inherit branch', workflow: 'software-dev', draft: true }),
+      })
+    ).json();
+    // Stored sparsely — no baked branch override.
+    expect(h.store.getTask(task.id)!.params.base).toBeUndefined();
+    expect(h.store.getTask(task.id)!.params.target).toBeUndefined();
+  });
+
   it('connects an account login and lists it without leaking the config-home path', async () => {
     const r: any = await (
       await fetch(`${base}/api/accounts/connect`, {
