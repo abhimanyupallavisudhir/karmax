@@ -4,10 +4,10 @@ import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
-import { MANIFESTS } from '../contrib/manifests.js';
+import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project } from '../domain/types.js';
 import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
@@ -55,6 +55,27 @@ export class KarmaxApi {
     return r.record!;
   }
 
+  /**
+   * A repo-oriented workflow — one whose manifest declares a `repos` param — run
+   * against a project with no repository configured would silently get a
+   * throwaway scratch repo from the world provider (worktree.ts): the agent ends
+   * up in an empty README-only sandbox instead of the user's code, with no signal
+   * (the empty-repo footgun). Refuse the *run* early, with an actionable message,
+   * rather than let a whole attempt burn against the wrong world.
+   */
+  private assertRepoConfigured(manifest: WorkflowManifest, project: Project) {
+    const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
+    if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
+    const configured = (project.config.repos ?? []).some((r) => !!r && r.trim().length > 0);
+    if (!configured) {
+      throw new Error(
+        `Workflow "${manifest.name}" works on a repository, but project "${project.name}" has no repository ` +
+          `configured — it would run against an empty throwaway sandbox, not your code. Set the repository ` +
+          `directory in the project's Settings (an absolute path, or one starting with ~) before running this task.`,
+      );
+    }
+  }
+
   async createTask(
     token: string,
     args: {
@@ -82,6 +103,9 @@ export class KarmaxApi {
     const { manifest, startType } = start;
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
+    // Refuse to *run* a repo-oriented workflow with no repository configured
+    // (drafts may still be saved without one, then checked again at queueTask).
+    if (!args.draft) this.assertRepoConfigured(manifest, project);
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
@@ -173,6 +197,7 @@ export class KarmaxApi {
     const start = this.resolveStart(task.workflow, task.workflowVersion);
     if (!project || !start) throw new Error(`cannot queue task ${taskId}`);
     const { manifest, startType } = start;
+    this.assertRepoConfigured(manifest, project); // same guard as createTask, before we clear the draft
     const resolved: ValueMap = { ...task.params };
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
