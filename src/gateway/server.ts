@@ -270,8 +270,12 @@ export class Gateway {
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
       if (editMatch && method === 'PATCH') {
         const b = await this.body(req);
-        const t = store.getTask(editMatch[1]!);
-        if (t) {
+        const id = editMatch[1]!;
+        const t = store.getTask(id);
+        if (!t) return this.json(res, 404, { error: 'no such task' });
+        // A draft has no running workflow — edit its stored params in place; they
+        // re-resolve at queue time (SPEC §10.4).
+        if (t.params?.draft) {
           // Replace the workflow-field overrides wholesale (b.params is the form's
           // full set of own overrides) so a field reset to its default is actually
           // removed — a merge would leave the stale override behind. Lifecycle meta
@@ -279,9 +283,19 @@ export class Gateway {
           const { draft, archived, profiles } = t.params;
           const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}) };
           const replace = b.replace === true;
-          store.updateTaskParams(editMatch[1]!, replace ? { ...meta, ...b.params } : { ...t.params, ...b.params });
+          store.updateTaskParams(id, replace ? { ...meta, ...b.params } : { ...t.params, ...b.params });
+          return this.json(res, 200, store.getTask(id) ?? null);
         }
-        return this.json(res, 200, store.getTask(editMatch[1]!) ?? null);
+        // Once queued, params are frozen except the ones the workflow declares
+        // in-flight-editable (SPEC §4.5/§5.5). Forward to its validated update and
+        // let the validator reject anything frozen — a clear 409, never a silent
+        // no-op on the stored record (which the running workflow would ignore).
+        try {
+          const applied = await api.updateParams(token, id, b.params ?? {});
+          return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id) });
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {

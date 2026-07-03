@@ -9,11 +9,13 @@ import {
   workflowInfo,
   CancellationScope,
   isCancellation,
+  ApplicationFailure,
   log,
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
+import { editableInFlight } from '../platform/mutability.js';
 import {
   TaskInput,
   TaskView,
@@ -43,6 +45,13 @@ export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome: string }]>(SIG_ACCOUNT_GRANTED);
 export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
+/**
+ * Generic in-flight param edit (SPEC §4.5/§5.5). Validated: the validator rejects
+ * (before admission, SPEC §2) any field not currently editable per its declared
+ * `mutable` window; the handler applies the accepted fields to live state and
+ * returns what it applied. `setTarget` above is the back-compat shim for `target`.
+ */
+export const updateParamsUpdate = defineUpdate<{ applied: string[] }, [Record<string, unknown>]>('updateParams');
 export const viewQuery = defineQuery<TaskView>('view');
 
 export interface SoftwareDevInput extends TaskInput {
@@ -84,6 +93,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let mergeQueuePos: { position: number; total: number } | undefined;
   const subTaskIds: string[] = [];
   let pointOfNoReturnPassed = false;
+  // Flips true when `target` becomes load-bearing — a PR opened against it, or the
+  // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
+  let targetLocked = false;
   let mergeGranted = false;
   let seen = 0; // messages the Do agent has already processed
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
@@ -95,6 +107,50 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let activeTurn: CancellationScope | undefined;
 
   const kind = input.project.worldProvider === 'container' ? 'container' : 'worktree';
+
+  // ── in-flight param edits (SPEC §4.5/§5.5) ──
+  // A working copy of the per-role agent overrides that later turns re-read, so a
+  // merge/resolve agent swapped mid-flight actually takes effect. The Do agent runs
+  // from the first turn holding a live session, so it stays frozen (use a follow-up).
+  const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
+  // Params the workflow has already consumed (value now load-bearing). `target` is
+  // consumed once locked (PR open / merge enqueue); merge/resolve agents when their
+  // turn runs.
+  const consumed = new Set<string>();
+  const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
+  const paramEditable = (name: string): boolean =>
+    !cancelled && editableInFlight(input.paramWindows?.[name], { consumed: isConsumed(name), pointOfNoReturnPassed });
+  const editableParamsNow = (): string[] => Object.keys(input.paramWindows ?? {}).filter(paramEditable);
+  /** Update validator: reject (before admission, SPEC §2) any field not editable now. */
+  function validateParamPatch(patch: Record<string, unknown>): void {
+    const names = Object.keys(patch);
+    if (!names.length) throw ApplicationFailure.nonRetryable('no params to edit', 'ParamEditEmpty');
+    for (const name of names)
+      if (!paramEditable(name))
+        throw ApplicationFailure.nonRetryable(
+          `"${name}" can't be edited now — it's frozen after queue, already in use, or past the point of no return`,
+          'ParamLocked',
+          name,
+        );
+  }
+  /** Apply an already-validated patch to live state. `target` is re-read at PR/merge;
+   *  `agent:<role>` overrides are re-read when that role's turn runs. */
+  function applyParamPatch(patch: Record<string, unknown>): { applied: string[] } {
+    const applied: string[] = [];
+    if (typeof patch.target === 'string' && patch.target) {
+      target = patch.target;
+      applied.push('target');
+    }
+    for (const role of ['merge', 'resolve']) {
+      const key = `agent:${role}`;
+      const spec = patch[key];
+      if (spec && typeof spec === 'object' && (spec as { provider?: string }).provider) {
+        liveInput.agents = { ...(liveInput.agents ?? {}), [role]: spec as NonNullable<SoftwareDevInput['agents']>[string] };
+        applied.push(key);
+      }
+    }
+    return { applied };
+  }
 
   // ── view-model ──
   function allowed(): DeclaredAction[] {
@@ -111,7 +167,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       name: 'setTarget',
       kind: 'update',
       label: 'Change target branch',
-      enabled: stage === 'do' || stage === 'review',
+      enabled: paramEditable('target'),
       args: [{ name: 'branch', type: 'string', label: 'Target branch', default: target }],
     };
     const retry: DeclaredAction = { name: 'retry', kind: 'signal', label: 'Retry', enabled: true };
@@ -151,6 +207,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         turnsSeen: seen,
         worldReady: !!world,
         mergeGranted,
+        targetLocked,
         mergeDomain: world ? `${world.repo ?? input.projectId}:${target}` : undefined,
       },
       branch: world?.branch,
@@ -163,6 +220,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       parentTaskId: input.parentTaskId,
       error,
       pointOfNoReturnPassed,
+      // The task-scope params the UI may edit right now (SPEC §5.5): declared
+      // `untilUsed` fields not yet consumed. `queue` fields never appear here.
+      editableParams: editableParamsNow(),
       updatedAt: workflowInfo().historyLength,
     };
   }
@@ -195,12 +255,13 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     accountGrants.set(g.turnId, { accountId: g.accountId, configHome: g.configHome });
   });
   setHandler(setTargetUpdate, (b) => {
-    if (stage === 'do' || stage === 'review') {
-      target = b;
-      return true;
-    }
-    return false;
+    // Back-compat shim over the same window as updateParams({ target }), but
+    // keeps the legacy boolean contract (returns false rather than rejecting).
+    if (!paramEditable('target')) return false;
+    target = b;
+    return true;
   });
+  setHandler(updateParamsUpdate, (patch) => applyParamPatch(patch), { validator: validateParamPatch });
 
   // ── Resolve wrapper (SPEC §5.2) ──
   async function withResolve<T>(stageName: string, fn: () => Promise<T>): Promise<T> {
@@ -219,6 +280,8 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           await publish();
           const auto = await core.autoResolve({ taskId, stage: stageName, error });
           if (!auto.resolved && world) {
+            // The resolve agent is about to run — freeze `agent:resolve` (SPEC §5.5).
+            consumed.add('agent:resolve');
             // Escalate to the Resolve agent with a context bundle.
             const r = await leasedTurn((accountConfigHome) =>
               long.runAgentTurn({
@@ -226,7 +289,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
                 role: 'resolve',
                 worldHandle: world as any,
                 messages: [{ id: `r${attempt}`, role: 'user', text: `Fix the ${stageName} failure.`, ts: 0 }],
-                task: input,
+                task: liveInput,
                 bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
                 accountConfigHome,
               }),
@@ -305,7 +368,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           worldHandle: world as any,
           messages: msgs,
           session,
-          task: input,
+          task: liveInput,
           accountConfigHome,
         }),
       ),
@@ -388,12 +451,18 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   await publish();
   if (cancelled) return await abort();
   if (input.project.openGithubPr) {
+    // Opening a PR binds it to `target`; close the edit window before we do (SPEC §2).
+    targetLocked = true;
+    await publish();
     const opened = await withResolve('pr', () => core.openPr(world as any, target));
     if (opened) pr = opened;
   }
 
   // ── Merge (point of no return) ──
-  const domain = `${world!.repo ?? input.projectId}:${target}`;
+  // Lock the target before committing it to a merge-queue domain: the queue is
+  // keyed by target, so from here it's load-bearing and no longer editable (SPEC §5.5).
+  // Set before any await so no queued edit can slip in and desync the domain.
+  targetLocked = true;
   let sha: string | undefined;
   for (;;) {
     stage = 'merge';
@@ -402,6 +471,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     await publish();
     if (cancelled) return await abort();
 
+    const domain = `${world!.repo ?? input.projectId}:${target}`;
     await coord.enqueueMerge(domain, taskId);
     // Wait for the grant; allow cancel only before it.
     while (!mergeGranted && !cancelled) {
@@ -416,6 +486,8 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     mergeQueuePos = { position: 0, total: mergeQueuePos?.total ?? 1 };
     await publish();
 
+    // The merge agent is about to run — freeze `agent:merge` (SPEC §5.5).
+    consumed.add('agent:merge');
     let result;
     try {
       // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
@@ -426,7 +498,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           worldHandle: world as any,
           messages: [{ id: 'merge', role: 'user', text: `Prepare branch for merge into ${target}.`, ts: 0 }],
           session,
-          task: input,
+          task: liveInput,
           bindings: { reviewInfo: reviewInfo?.summary ?? '' },
           accountConfigHome,
         }),

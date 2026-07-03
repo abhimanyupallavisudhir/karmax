@@ -15,9 +15,16 @@ const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Pr
 // Task-scope only: per-role agent DEFAULTS live in the Agent-profiles editor
 // (with a per-project override), so this is just the one-off per-task override —
 // no duplication with the workflow-defaults settings forms (SPEC §7.1/§10.5).
-const agentField = (role: string, label: string): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role });
+// `mutable`: an agent role whose turn runs LATER (merge, resolve) can be swapped
+// in-flight until that turn runs (SPEC §5.5). The Do agent is left frozen — it
+// runs from the first turn and holds a live resumable session, so the follow-up
+// box is its live-redirect channel, not a mid-session provider swap.
+const agentField = (role: string, label: string, mutable?: FieldSpec['mutable']): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role, ...(mutable ? { mutable } : {}) });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
-const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top' });
+// `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
+// opened against it or the merge enqueue). software-dev re-reads `target` at
+// PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
+const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directory', help: 'Absolute path, or one starting with ~', scopes: ['project'], bind: 'project' });
 const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
 const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', options: ['worktree', 'container'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
@@ -235,8 +242,8 @@ export const MANIFESTS: WorkflowManifest[] = [
       copyGlobsField(),
       worldProviderField(),
       prToggleField(),
-      agentField('merge', 'Merge agent'),
-      agentField('resolve', 'Resolve agent'),
+      agentField('merge', 'Merge agent', 'untilUsed'),
+      agentField('resolve', 'Resolve agent', 'untilUsed'),
     ],
     onActivate: {
       spawnTask: {

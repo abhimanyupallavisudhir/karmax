@@ -1,4 +1,4 @@
-import { FieldSpec, TaskInput, AgentSpec, ProjectConfig, Project } from '../domain/types.js';
+import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ProjectConfig, Project } from '../domain/types.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { expandPath } from '../util/expand.js';
 
@@ -67,6 +67,12 @@ export function assembleTaskInput(
   // Mirror base/target into project defaults so the workflow's fallbacks are coherent.
   if (input.base) input.project.defaultBase = input.base;
   if (input.target) input.project.defaultTarget = input.target;
+  // Carry the in-flight editability windows into the workflow so its update
+  // validator can enforce them without importing the manifest into the Temporal
+  // sandbox (SPEC §4.5/§5.5). Sparse: only non-`queue` fields.
+  const windows: Record<string, FieldMutable> = {};
+  for (const f of manifest.params) if (f.mutable && f.mutable !== 'queue') windows[f.name] = f.mutable;
+  if (Object.keys(windows).length) input.paramWindows = windows;
   return input;
 }
 

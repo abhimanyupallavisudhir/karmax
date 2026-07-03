@@ -1,15 +1,18 @@
 import {
   proxyActivities,
   defineSignal,
+  defineUpdate,
   defineQuery,
   setHandler,
   condition,
   workflowInfo,
+  ApplicationFailure,
   log,
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
+import { editableInFlight } from '../platform/mutability.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike } from './contract.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -20,6 +23,9 @@ export const confirmSignal = defineSignal('confirm');
 export const followUpSignal = defineSignal<[Message]>('followUp');
 export const cancelSignal = defineSignal('cancel');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
+/** In-flight param edit (SPEC §4.5/§5.5). merge-only exposes only `target` as
+ *  editable — until it's committed to the merge queue. */
+export const updateParamsUpdate = defineUpdate<{ applied: string[] }, [Record<string, unknown>]>('updateParams');
 export const viewQuery = defineQuery<TaskView>('view');
 
 export interface MergeOnlyInput extends TaskInput {
@@ -40,7 +46,7 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = input.prompt ? [{ id: 'm0', role: 'user', text: input.prompt, ts: 0 }] : [];
   const base = input.base ?? input.project.defaultBase ?? 'main';
-  const target = input.target ?? input.project.defaultTarget ?? base;
+  let target = input.target ?? input.project.defaultTarget ?? base;
   let confirmed = false;
   let cancelled = false;
   let world: WorldHandleLike | undefined;
@@ -48,6 +54,26 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   let mergeGranted = false;
   let checks: { passed: boolean; detail?: string } | undefined;
   let pointOfNoReturnPassed = false;
+  // `target` is editable in-flight until committed to the merge queue / a PR opens.
+  let targetLocked = false;
+  const paramEditable = (name: string): boolean =>
+    !cancelled && editableInFlight(input.paramWindows?.[name], { consumed: name === 'target' ? targetLocked : false, pointOfNoReturnPassed });
+  const editableParamsNow = (): string[] => Object.keys(input.paramWindows ?? {}).filter(paramEditable);
+  function validateParamPatch(patch: Record<string, unknown>): void {
+    const names = Object.keys(patch);
+    if (!names.length) throw ApplicationFailure.nonRetryable('no params to edit', 'ParamEditEmpty');
+    for (const name of names)
+      if (!paramEditable(name))
+        throw ApplicationFailure.nonRetryable(`"${name}" can't be edited now — frozen after queue, in use, or past the point of no return`, 'ParamLocked', name);
+  }
+  function applyParamPatch(patch: Record<string, unknown>): { applied: string[] } {
+    const applied: string[] = [];
+    if (typeof patch.target === 'string' && patch.target) {
+      target = patch.target;
+      applied.push('target');
+    }
+    return { applied };
+  }
 
   function actions(): DeclaredAction[] {
     const cancel: DeclaredAction = { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: !pointOfNoReturnPassed, danger: true };
@@ -58,8 +84,9 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'merge-only', stage, status, messages: msgs, reviewInfo,
-      actions: actions(), state: { checks, mergeGranted }, branch: world?.branch, base, targetBranch: target,
+      actions: actions(), state: { checks, mergeGranted, targetLocked }, branch: world?.branch, base, targetBranch: target,
       worldPath: world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
+      editableParams: editableParamsNow(),
       updatedAt: workflowInfo().historyLength,
     };
   }
@@ -78,6 +105,7 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   setHandler(mergeGrantedSignal, () => {
     mergeGranted = true;
   });
+  setHandler(updateParamsUpdate, (patch) => applyParamPatch(patch), { validator: validateParamPatch });
 
   await publish();
   // Open a world on the EXISTING branch under review.
@@ -107,12 +135,16 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   }
 
   if (input.project.openGithubPr) {
+    targetLocked = true; // opening a PR binds it to `target` (SPEC §2)
     const opened = await core.openPr(world as any, target);
     if (opened) reviewInfo = { ...reviewInfo, links: [...(reviewInfo?.links ?? []), { label: 'PR', url: opened.url }] };
   }
 
   stage = 'merge';
   await publish();
+  // Commit `target` to the merge-queue domain — no await between locking and
+  // reading it, so a queued edit can't desync the domain (SPEC §5.5).
+  targetLocked = true;
   const domain = `${world!.repo ?? input.projectId}:${target}`;
   await coord.enqueueMerge(domain, taskId);
   while (!mergeGranted && !cancelled) {

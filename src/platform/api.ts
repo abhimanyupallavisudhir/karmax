@@ -22,6 +22,18 @@ export class CapabilityError extends Error {
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
 
+/** Deepest cause message — unwraps Temporal's WorkflowUpdateFailedError → the
+ *  validator's ApplicationFailure so the user sees the real "why". */
+function unwrapCause(e: unknown): string {
+  let cur: any = e;
+  let msg = e instanceof Error ? e.message : String(e);
+  for (let i = 0; cur && i < 8; i++) {
+    if (typeof cur.message === 'string' && cur.message) msg = cur.message;
+    cur = cur.cause;
+  }
+  return msg;
+}
+
 /** How long to wait on a live workflow query before falling back to the snapshot. */
 const QUERY_TIMEOUT_MS = 3000;
 
@@ -307,6 +319,22 @@ export class KarmaxApi {
       return (await this.deps.client.workflow.getHandle(taskId).executeUpdate('setTarget', { args: [branch] })) as boolean;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Apply an in-flight param edit (SPEC §4.5/§5.5) via the workflow's validated
+   * `updateParams` update. Throws with the validator's reason if any field isn't
+   * editable now (frozen after queue, or past the point of no return) — the
+   * workflow validator is the single source of truth, so the gateway needn't
+   * re-derive the window.
+   */
+  async updateParams(token: string, taskId: string, patch: Record<string, unknown>): Promise<{ applied: string[] }> {
+    this.require(token, 'edit_task');
+    try {
+      return (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
+    } catch (e) {
+      throw new Error(unwrapCause(e));
     }
   }
 

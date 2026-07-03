@@ -22,6 +22,7 @@ const S = {
   activity: [],
   search: '',
   schema: [],
+  paramDefaults: {},
   ws: null,
 };
 
@@ -733,6 +734,7 @@ async function openDrawer(taskId) {
     S.view = await api(`/api/tasks/${taskId}`);
     S.drawerEvents = await api(`/api/tasks/${taskId}/events?since=0`);
     S.widgets = await api(`/api/tasks/${taskId}/widgets`).catch(() => []);
+    S.paramDefaults = await loadParamDefaults(taskId);
   } catch (e) { toast(e.message, true); }
   renderDrawer();
 }
@@ -741,6 +743,7 @@ async function refreshDrawer() {
   try {
     S.view = await api(`/api/tasks/${S.selected}`);
     S.widgets = await api(`/api/tasks/${S.selected}/widgets`).catch(() => S.widgets);
+    S.paramDefaults = await loadParamDefaults(S.selected);
   } catch {}
   renderDrawer();
 }
@@ -781,6 +784,7 @@ function renderDrawer() {
   $('#scrim').addEventListener('click', closeDrawer);
   $('#drawer-close').addEventListener('click', closeDrawer);
   wireActions(v);
+  wireParams(v);
   wireTerminal(v.taskId);
   renderDrawerEvents();
 }
@@ -834,6 +838,7 @@ function drawerBody(v) {
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
     ${error}
+    ${drawerParams(v)}
     ${review}
     ${renderWidgetGroups(S.widgets)}
     ${subtasks}
@@ -912,21 +917,150 @@ function renderWidget(w) {
   }
 }
 
+// ── in-flight parameters form (SPEC §5.5 / §10.4) ────────────────────────────
+// The task's declared params, editable or frozen per the workflow's lifecycle.
+// Editable fields (view.editableParams) get a live control + Save; everything
+// else — prompt, base, agents — is shown read-only, because those are baked into
+// the task at queue and only a follow-up can redirect the agent afterwards.
+const TERMINAL_STAGES = ['done', 'cancelled', 'failed'];
+// The resolved inherited defaults for the open task's workflow (task scope),
+// same source the New-task / settings forms use, so frozen fields show the real
+// effective value (e.g. the actual Do-agent provider·model) not "(default)".
+async function loadParamDefaults(taskId) {
+  const wf = S.view?.workflow;
+  const pid = S.tasks.find((t) => t.id === taskId)?.projectId || S.projectId;
+  if (!wf || !pid) return {};
+  return api(`/api/defaults/${pid}/${wf}`).then((d) => d?.task?.inherited || {}).catch(() => ({}));
+}
+function drawerParams(v) {
+  const rec = S.tasks.find((t) => t.id === v.taskId);
+  // Drafts are composed in the full task form (all fields editable pre-queue).
+  if (rec?.params?.draft) {
+    return `<div class="section-h">Parameters</div>
+      <button class="btn sm" id="edit-draft-params">Edit parameters…</button>`;
+  }
+  if (TERMINAL_STAGES.includes(v.stage)) return '';
+  const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task'));
+  if (!fields.length) return '';
+  const editable = new Set(v.editableParams || []);
+  const inheritedAll = S.paramDefaults || {};
+  const lock = `<span title="Frozen — this parameter has already been used (send a follow-up to change direction)" style="color:var(--ink-3)">🔒</span>`;
+  const rows = fields
+    .map((f) => {
+      const own = paramCurrentValue(f, v, rec);
+      const inherited = inheritedAll[f.name];
+      const isEditable = editable.has(f.name);
+      // Agent fields show the full control (provider · model · effort · resume),
+      // exactly like the task form — interactive when editable, disabled when frozen.
+      if (f.type === 'agent') {
+        const control = renderField(f, own, inherited); // full control incl. its own label
+        if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${control}</div>`;
+        // frozen: same control, disabled (read-only), with a lock in the corner
+        return `<div class="form-row" data-row="${esc(f.name)}" style="position:relative">
+          <span style="position:absolute;right:0;top:0" title="Frozen — this agent has already run (send a follow-up to change direction)">🔒</span>
+          <fieldset disabled style="border:none;padding:0;margin:0;min-inline-size:auto;opacity:.65">${control}</fieldset></div>`;
+      }
+      if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
+      // frozen non-agent: read-only effective value (own override, else inherited default)
+      return `<div class="form-row"><div class="label-row"><label>${esc(f.label)}</label>${lock}</div>
+        <div class="pf-ro" style="padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink-2);white-space:pre-wrap;overflow-wrap:anywhere">${esc(displayParam(f, eff(own, inherited)))}</div></div>`;
+    })
+    .join('');
+  const footer = editable.size
+    ? `<button class="btn sm primary" id="params-save">Save changes</button>`
+    : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
+  return `<div class="section-h">Parameters</div><div id="drawer-params">${rows}${footer}</div>`;
+}
+
+// Best-known current value of a param for a running task (the view carries a few;
+// the task record holds the rest of the user's own overrides).
+function paramCurrentValue(f, v, rec) {
+  const own = (rec && rec.params) || {};
+  if (f.bind === 'prompt') return own.prompt ?? (v.messages || []).find((m) => m.role === 'user')?.text ?? '';
+  if (f.name === 'target') return v.targetBranch ?? own.target ?? '';
+  if (f.name === 'base') return v.base ?? own.base ?? '';
+  return own[f.name];
+}
+function displayParam(f, val) {
+  if (val === undefined || val === null || val === '') return '(default)';
+  if (f.type === 'agent') return [val.provider, val.model].filter(Boolean).join(' · ') || '(default)';
+  if (Array.isArray(val)) return val.join(', ') || '(none)';
+  if (typeof val === 'boolean') return val ? 'on' : 'off';
+  return String(val);
+}
+// Read back the editable param controls as a patch (no inherit-diffing — these
+// are concrete live values, not overlay overrides).
+function collectParamEdits(root, fields) {
+  const out = {};
+  for (const f of fields) {
+    if (f.type === 'agent') {
+      // Reconstruct the AgentSpec from the composite control (same shape the task
+      // form's collectForm produces). Editable agent fields always send a spec.
+      const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      const spec = { provider: box.querySelector('.af-provider').value };
+      const model = box.querySelector('.af-model').value.trim();
+      const effort = box.querySelector('.af-effort')?.value;
+      if (model) spec.model = model;
+      if (effort) spec.effort = effort;
+      const sessionId = box.querySelector('.af-resume-session')?.value.trim();
+      const chosen = box.querySelector('.af-resume-chosen')?.textContent.trim();
+      let resumeFrom;
+      if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
+      if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+      if (resumeFrom) spec.resumeFrom = resumeFrom;
+      out[f.name] = spec;
+      continue;
+    }
+    const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
+    if (!el) continue;
+    let val;
+    if (f.type === 'boolean') val = el.checked;
+    else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
+    else val = el.value.trim() === '' ? undefined : el.value.trim();
+    if (val !== undefined) out[f.name] = val;
+  }
+  return out;
+}
+function wireParams(v) {
+  const editBtn = document.getElementById('edit-draft-params');
+  if (editBtn) {
+    const rec = S.tasks.find((t) => t.id === v.taskId);
+    editBtn.addEventListener('click', () => openTaskForm(v.workflow, rec));
+    return;
+  }
+  const root = document.getElementById('drawer-params');
+  if (root) wireAgentFields(root); // make editable agent controls (model combo, effort, resume) work
+  const saveBtn = document.getElementById('params-save');
+  if (!saveBtn) return;
+  saveBtn.addEventListener('click', async () => {
+    const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task') && (v.editableParams || []).includes(f.name));
+    const patch = collectParamEdits(root, fields);
+    if (!Object.keys(patch).length) return toast('No changes');
+    try {
+      await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
+      toast('Parameters updated');
+      setTimeout(refreshDrawer, 250);
+      setTimeout(refreshTasks, 400);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+}
+
 // the generic auto-render floor (SPEC §10.2 tier 1): render declared actions
 function drawerActions(v) {
   const acts = v.actions || [];
   const followUp = acts.find((a) => a.name === 'followUp');
-  const setTarget = acts.find((a) => a.name === 'setTarget');
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
   for (const a of simple) {
     const cls = a.name === 'confirm' ? 'primary' : a.danger ? 'danger' : '';
     html += `<button class="btn ${cls}" data-act="${a.name}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}</button>`;
   }
-  if (setTarget) {
-    html += `<input id="target-in" class="title-in" style="max-width:160px;padding:8px 10px" placeholder="branch" value="${esc(v.targetBranch || '')}" ${setTarget.enabled ? '' : 'disabled'} />
-             <button class="btn sm" data-act="setTarget" ${setTarget.enabled ? '' : 'disabled'}>Set target</button>`;
-  }
+  // Target-branch editing now lives in the Parameters form (drawerParams), which
+  // renders it editable/frozen per the workflow's window — no separate input here.
   html += `</div>`;
   if (followUp) {
     html += `<div class="followup-box">
@@ -949,10 +1083,6 @@ function wireActions(v) {
           await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', text }) });
           $('#followup').value = '';
           toast('Follow-up sent');
-        } else if (act === 'setTarget') {
-          const branch = $('#target-in').value.trim();
-          await api(`/api/tasks/${v.taskId}/target`, { method: 'POST', body: JSON.stringify({ branch }) });
-          toast('Target updated');
         } else {
           await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
           toast(`${act} sent`);
