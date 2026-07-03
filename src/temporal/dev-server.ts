@@ -3,10 +3,20 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { Connection } from '@temporalio/client';
-import { findFreePorts, waitForPort } from '../util/ports.js';
+import { findFreePortFrom, findFreePorts, waitForPort } from '../util/ports.js';
 import { withTimeout } from '../util/timeout.js';
 
 const TEMPORAL_BIN = process.env.TEMPORAL_CLI ?? path.join(os.homedir(), '.temporalio', 'bin', 'temporal');
+
+// Conventional Temporal ports. The persistent server claims each by walking
+// upward from its default (findFreePortFrom) so its address — and the UI URL —
+// stay stable across restarts. Ephemeral (test) servers keep OS-random ports
+// so parallel test workers don't race for the same base. Temporal's own
+// internal services (history/matching/worker) take arbitrary high ports we
+// never touch, so these three don't collide with them.
+const DEFAULT_GRPC_PORT = 7233;
+const DEFAULT_UI_PORT = 8233;
+const DEFAULT_METRICS_PORT = 9233;
 
 export interface DevServer {
   address: string; // host:grpcPort
@@ -195,8 +205,10 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
 }
 
 async function spawnPersistent(opts: DevServerOptions, namespace: string, rec: string): Promise<DevServer> {
-  const [grpcPort, uiPort, metricsPort] = await findFreePorts(3);
-  const args = buildArgs({ grpcPort: grpcPort!, uiPort: uiPort!, metricsPort: metricsPort! }, namespace, opts);
+  const grpcPort = await findFreePortFrom(DEFAULT_GRPC_PORT);
+  const uiPort = await findFreePortFrom(DEFAULT_UI_PORT);
+  const metricsPort = await findFreePortFrom(DEFAULT_METRICS_PORT);
+  const args = buildArgs({ grpcPort, uiPort, metricsPort }, namespace, opts);
   const logPath = logFilePath(opts.dbFilename!);
   const out = fs.openSync(logPath, 'a');
   // detached + unref: the server must outlive this (reload-prone) process so the
@@ -204,7 +216,7 @@ async function spawnPersistent(opts: DevServerOptions, namespace: string, rec: s
   // our lifetime, and so Temporal's logs survive for later diagnosis.
   const child = spawn(TEMPORAL_BIN, args, { stdio: ['ignore', out, out], detached: true });
   try {
-    await awaitStartup(child, grpcPort!, () => `log:\n${tail(logPath)}`);
+    await awaitStartup(child, grpcPort, () => `log:\n${tail(logPath)}`);
   } finally {
     try {
       fs.closeSync(out);
