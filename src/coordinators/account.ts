@@ -38,13 +38,21 @@ import {
  * that PRODUCES a reset instant lives in the reporting activity (SPEC §3.1).
  */
 export type AccountProvider = 'claude' | 'codex' | 'mock';
-export type AccountStatus = 'available' | 'exhausted' | 'manual-off';
+/** available → leasable; exhausted → auto-refreshes at resetAt; manual-off → user
+ *  turned it off; needs-attention → a HARD failure (billing/auth) that needs a human. */
+export type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';
 export type LimitWindow = '5h' | 'weekly' | 'model';
 
+export type CredKind = 'login' | 'ambient' | 'key';
+
 export interface AccountState {
-  id: string;
+  id: string; // the credential key: login:<p>:<a> | ambient:<p> | key:<p> | key:handle:<h>
   configHome: string;
   provider: AccountProvider;
+  /** Credential kind (login/ambient/key) — drives default concurrency + UI. */
+  kind?: CredKind;
+  /** For a key credential: the broker handle to resolve JIT (else the env key). */
+  apiKeyHandle?: string;
   /** Max concurrent turns on this account. */
   maxConcurrent: number;
   inUse: number;
@@ -61,13 +69,15 @@ export interface AccountState {
 
 export interface AccountCoordinatorState {
   accounts: AccountState[];
-  queue: { taskId: string; turnId: string; provider: AccountProvider }[];
+  /** `allowed` = the credential policy's ordered, enabled keys for the turn (SPEC §7/§9). */
+  queue: { taskId: string; turnId: string; provider?: AccountProvider; allowed?: string[] }[];
   processed: number;
 }
 
 export interface AccountView {
   id: string;
   provider: AccountProvider;
+  kind?: CredKind;
   status: AccountStatus;
   inUse: number;
   maxConcurrent: number;
@@ -86,10 +96,12 @@ export interface RegisteredAccount {
   id: string;
   configHome: string;
   provider?: AccountProvider;
+  kind?: CredKind;
+  apiKeyHandle?: string;
   maxConcurrent?: number;
 }
 
-export const leaseAccountSignal = defineSignal<[{ taskId: string; turnId: string; provider?: AccountProvider }]>(SIG_LEASE_ACCOUNT);
+export const leaseAccountSignal = defineSignal<[{ taskId: string; turnId: string; provider?: AccountProvider; allowed?: string[] }]>(SIG_LEASE_ACCOUNT);
 export const returnAccountSignal = defineSignal<[{ accountId: string }]>(SIG_RETURN_ACCOUNT);
 export const registerAccountsSignal = defineSignal<[{ accounts: RegisteredAccount[] }]>(SIG_REGISTER_ACCOUNTS);
 /** Ground-truth exhaustion feed (from the reportAccountExhausted activity). */
@@ -121,27 +133,62 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     }
   }
 
-  const providerHas = (p: AccountProvider) => accounts.some((a) => a.provider === p);
-  const freeFor = (p: AccountProvider) =>
-    accounts.find((a) => a.provider === p && a.status === 'available' && a.inUse < a.maxConcurrent);
-  // A request is serveable now if a compatible login is free, OR no login of that
-  // provider exists at all (→ passthrough grant: the turn runs on its profile's
-  // own home rather than parking forever).
-  const serveable = (p: AccountProvider) => !!freeFor(p) || !providerHas(p);
+  type Req = { provider?: AccountProvider; allowed?: string[] };
+  const available = (a: AccountState) => a.status === 'available' && a.inUse < a.maxConcurrent;
+  // The first AVAILABLE credential to grant a request. Two modes:
+  //  - allow-list (real turns): the credential policy's ordered enabled keys — grant
+  //    the first available one, in precedence order.
+  //  - provider fallback (no allow-list — mock/legacy): first available of the provider.
+  const pickFor = (req: Req): AccountState | undefined => {
+    if (req.allowed !== undefined) {
+      for (const key of req.allowed) {
+        const a = accounts.find((x) => x.id === key);
+        if (a && available(a)) return a;
+      }
+      return undefined;
+    }
+    return req.provider ? accounts.find((a) => a.provider === req.provider && available(a)) : undefined;
+  };
+  // Serveable now if a credential is free, OR there's nothing to wait for (an empty
+  // allow-list, or no account of that provider) → passthrough grant. Each request
+  // carries its own list, so this never head-of-line-blocks across requests.
+  const serveable = (req: Req): boolean => {
+    if (req.allowed !== undefined) return !!pickFor(req) || req.allowed.length === 0;
+    if (!req.provider) return true;
+    return !!pickFor(req) || !accounts.some((a) => a.provider === req.provider);
+  };
+  // A request that can NEVER be served — an allow-list whose every credential needs
+  // human action (needs-attention / manual-off / missing), with none available or
+  // auto-refreshing (exhausted). Such a request is DENIED so the task escalates to a
+  // human instead of parking forever (SPEC §5.2, #5).
+  const deniable = (req: Req): boolean =>
+    req.allowed !== undefined &&
+    req.allowed.length > 0 &&
+    !req.allowed.some((key) => {
+      const a = accounts.find((x) => x.id === key);
+      return a && (a.status === 'available' || a.status === 'exhausted');
+    });
 
   setHandler(registerAccountsSignal, ({ accounts: incoming }) => {
     for (const a of incoming) {
       const existing = accounts.find((x) => x.id === a.id);
+      // Logins are concurrency-limited (the whole point of leasing); ambient logins
+      // and API keys are effectively high-concurrency.
+      const defMax = a.maxConcurrent ?? (a.kind === 'login' ? 1 : 100);
       if (existing) {
         existing.configHome = a.configHome;
         if (a.provider) existing.provider = a.provider;
+        if (a.kind) existing.kind = a.kind;
+        if (a.apiKeyHandle !== undefined) existing.apiKeyHandle = a.apiKeyHandle || undefined;
         if (a.maxConcurrent) existing.maxConcurrent = a.maxConcurrent;
       } else {
         accounts.push({
           id: a.id,
           configHome: a.configHome,
           provider: a.provider ?? 'claude',
-          maxConcurrent: a.maxConcurrent ?? 1,
+          ...(a.kind ? { kind: a.kind } : {}),
+          ...(a.apiKeyHandle ? { apiKeyHandle: a.apiKeyHandle } : {}),
+          maxConcurrent: defMax,
           inUse: 0,
           status: 'available',
         });
@@ -149,9 +196,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     }
   });
   setHandler(leaseAccountSignal, (req) => {
-    const provider = req.provider ?? 'claude';
     if (!queue.find((q) => q.taskId === req.taskId && q.turnId === req.turnId)) {
-      queue.push({ taskId: req.taskId, turnId: req.turnId, provider });
+      queue.push({ taskId: req.taskId, turnId: req.turnId, provider: req.provider, allowed: req.allowed });
     }
   });
   setHandler(returnAccountSignal, ({ accountId }) => {
@@ -187,6 +233,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     accounts: accounts.map((a) => ({
       id: a.id,
       provider: a.provider,
+      kind: a.kind,
       status: a.status,
       inUse: a.inUse,
       maxConcurrent: a.maxConcurrent,
@@ -209,11 +256,23 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
 
     while (queue.length > 0) {
       refreshDue();
-      // Serve the first request whose provider has capacity (avoids head-of-line
-      // blocking: a claude request with no free claude login must not stall a
-      // codex request behind it).
-      const idx = queue.findIndex((q) => serveable(q.provider));
+      // Serve the first request whose credential allow-list has capacity (avoids
+      // head-of-line blocking: each request carries its own ordered list).
+      const idx = queue.findIndex((q) => serveable(q));
       if (idx < 0) {
+        // Deny any request that can never be served (all its credentials need human
+        // action) so the task escalates instead of parking forever.
+        const denyIdx = queue.findIndex((q) => deniable(q));
+        if (denyIdx >= 0) {
+          const req = queue.splice(denyIdx, 1)[0]!;
+          processed++;
+          try {
+            await getExternalWorkflowHandle(req.taskId).signal(SIG_ACCOUNT_GRANTED, { turnId: req.turnId, accountId: '(denied)' });
+          } catch (e) {
+            log.warn(`account deny signal to ${req.taskId} failed`, { e: String(e) });
+          }
+          continue;
+        }
         // Nothing serveable now — park (this is "waiting for quota refresh"). Wake
         // on any state change (a return, a refresh, a new account) or the soonest
         // reset instant among cooling-down accounts.
@@ -223,23 +282,23 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
           .map((a) => a.resetAt!);
         const sleepMs = resets.length ? Math.max(0, Math.min(...resets) - now) : BACKSTOP_PARK_MS;
         await Promise.race([
-          condition(() => queue.some((q) => serveable(q.provider))),
+          condition(() => queue.some((q) => serveable(q))),
           sleep(sleepMs),
         ]);
         continue;
       }
       const req = queue.splice(idx, 1)[0]!;
-      const free = freeFor(req.provider);
-      // Passthrough grant when no login of this provider exists: run on the
-      // profile's own home rather than wedging the request.
-      const configHome = free?.configHome;
+      // First available credential from the request's ordered allow-list; passthrough
+      // (profile default) when the list is empty.
+      const free = pickFor(req);
       if (free) free.inUse++;
       processed++;
       try {
         await getExternalWorkflowHandle(req.taskId).signal(SIG_ACCOUNT_GRANTED, {
           turnId: req.turnId,
           accountId: free?.id ?? '(passthrough)',
-          configHome,
+          configHome: free?.configHome,
+          ...(free?.apiKeyHandle ? { apiKeyHandle: free.apiKeyHandle } : {}),
         });
       } catch (e) {
         log.warn(`account grant signal to ${req.taskId} failed; freeing`, { e: String(e) });

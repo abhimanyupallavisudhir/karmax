@@ -45,8 +45,8 @@ const NODES = [
 
 // Provider → model choices for the agent field (free-text also allowed).
 const MODELS = {
-  claude: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-7', 'claude-fable-5'],
-  codex: ['gpt-4.1', 'gpt-4o', 'gpt-4.1-mini'],
+  claude: ['claude-sonnet-5', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-fable-5'],
+  codex: ['gpt-5.5', 'gpt-5.4-mini'],
   mock: ['mock'],
 };
 // Which reasoning-effort levels a given model actually accepts (mirrors the
@@ -62,8 +62,10 @@ function effortLevelsFor(provider, model) {
     return EFFORT_ORDER.filter((l) => ok.has(l));
   }
   if (provider === 'codex') {
-    if (!/^(o1|o3|o4|gpt-5|codex)/.test(m) && !m.includes('reasoning')) return [];
-    return ['low', 'medium', 'high']; // OpenAI Responses reasoning.effort tops out at high
+    // gpt-5.x (5.5, 5.4-mini) accept up to xhigh; older reasoning models top out at high.
+    if (/^gpt-5/.test(m)) return ['low', 'medium', 'high', 'xhigh'];
+    if (/^(o1|o3|o4|codex)/.test(m) || m.includes('reasoning')) return ['low', 'medium', 'high'];
+    return [];
   }
   return [];
 }
@@ -326,7 +328,7 @@ async function resumeSearch(box, q, results) {
       const roles = Object.keys(sessions);
       if (!roles.length) return '';
       return roles
-        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role])}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
+        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
         .join('');
     }),
   );
@@ -834,6 +836,7 @@ function renderDrawer() {
   wireNotes(v);
   wireTerminal(v.taskId);
   wireCopyButtons();
+  renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId, taskId: v.taskId });
   renderDrawerEvents();
 }
 
@@ -882,8 +885,10 @@ function drawerBody(v) {
       const live = t.role === liveRole
         ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
         : '';
-      const sid = S.sessions && S.sessions[t.role];
-      const resumeCmd = sid && v.worldPath ? `cd ${v.worldPath} && claude --resume ${sid}` : '';
+      // Only subscription/CLI-resumable sessions carry a config home; API-key /
+      // stateless sessions can't be resumed from a terminal, so no command is shown.
+      const sess = S.sessions && S.sessions[t.role];
+      const resumeCmd = sess?.id && sess?.home && v.worldPath ? resumeCommandFor(sess, v.worldPath) : '';
       const copy = resumeCmd
         ? `<button class="btn sm copy-cmd" data-cmd="${esc(resumeCmd)}" title="Copy a CLI command to resume this agent in your terminal">⧉ resume cmd</button>`
         : '';
@@ -933,6 +938,8 @@ function drawerBody(v) {
       <input id="term-in" class="title-in hidden" style="width:100%;margin-top:6px;padding:8px 10px" placeholder="command + Enter" />
       <div class="section-h">Live events</div>
       <div class="events" id="drawer-events"></div>
+      <div class="section-h">Credentials for this task (override precedence / enable-disable)</div>
+      <div id="cred-editor-task">Loading…</div>
       <div class="section-h">Structured state (the view-model floor)</div>
       <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>
     </details>`;
@@ -955,6 +962,72 @@ function waitingLabel(w) {
     case 'subtask': return 'a sub-task';
     default: return w.detail || w.kind;
   }
+}
+
+// Build a copy-pasteable CLI command to resume an agent session in its own config
+// home (provider sessions are home-bound). Run from the task's world directory.
+function resumeCommandFor(sess, worldPath) {
+  if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex exec resume ${sess.id}`;
+  return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id}`;
+}
+
+// Credential-policy editor (SPEC §7/§9): order credentials by precedence and
+// enable/disable each, at a given scope (global/project/task). Lower scopes override
+// higher ones; API keys are off by default when a subscription exists.
+async function renderCredentialEditor(el, scope, opts = {}) {
+  if (!el) return;
+  const q = new URLSearchParams();
+  if (opts.projectId) q.set('projectId', opts.projectId);
+  if (opts.taskId) q.set('taskId', opts.taskId);
+  let data;
+  try { data = await api(`/api/credentials?${q.toString()}`); }
+  catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
+  const sd = data[scope] || { own: {}, enabled: [] };
+  const own = sd.own || {};
+  const enabled = new Set(sd.enabled || []);
+  const byKey = Object.fromEntries((data.credentials || []).map((c) => [c.key, c]));
+  const ordered = [...(sd.enabled || []).filter((k) => byKey[k]), ...(data.credentials || []).map((c) => c.key).filter((k) => !enabled.has(k))];
+  if (!ordered.length) { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">No credentials yet — connect a login or add an API key.</div>'; return; }
+  el.innerHTML = ordered
+    .map((key, i) => {
+      const c = byKey[key];
+      return `<div class="cred-row" data-key="${esc(key)}" style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--line)">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;min-width:0">
+          <input type="checkbox" class="cred-on" ${enabled.has(key) ? 'checked' : ''} />
+          <span class="mono" style="overflow:hidden;text-overflow:ellipsis">${esc(c.label)}</span>
+          <span class="chip">${esc(c.kind)}</span>
+        </label>
+        <span style="display:flex;gap:4px;flex:none">
+          <button class="icon-btn cred-up" ${i === 0 ? 'disabled' : ''} title="Higher precedence">↑</button>
+          <button class="icon-btn cred-down" ${i === ordered.length - 1 ? 'disabled' : ''} title="Lower precedence">↓</button>
+        </span>
+      </div>`;
+    })
+    .join('');
+  const save = async (policy) => {
+    try { await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
+    catch (e) { toast(e.message, true); }
+    renderCredentialEditor(el, scope, opts);
+  };
+  el.querySelectorAll('.cred-row').forEach((row) => {
+    const key = row.dataset.key;
+    row.querySelector('.cred-on').addEventListener('change', (e) => {
+      const on = new Set(own.on || []);
+      const off = new Set(own.off || []);
+      if (e.target.checked) { on.add(key); off.delete(key); } else { off.add(key); on.delete(key); }
+      save({ ...own, on: [...on], off: [...off] });
+    });
+    const move = (dir) => {
+      const a = [...ordered];
+      const i = a.indexOf(key);
+      const j = i + dir;
+      if (j < 0 || j >= a.length) return;
+      [a[i], a[j]] = [a[j], a[i]];
+      save({ ...own, order: a });
+    };
+    row.querySelector('.cred-up').addEventListener('click', () => move(-1));
+    row.querySelector('.cred-down').addEventListener('click', () => move(1));
+  });
 }
 
 // Which agent role "owns" a given stage — drives which transcript opens by default.
@@ -1326,8 +1399,13 @@ async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
   try {
-    const d = await api('/api/dashboard');
+    const [d, u] = await Promise.all([
+      api('/api/dashboard'),
+      api('/api/accounts/usage').catch(() => ({ usage: {}, pollable: [] })),
+    ]);
     const accounts = d.accounts?.accounts || [];
+    const usage = u.usage || {};
+    const pollable = new Set(u.pollable || []);
     box.innerHTML = `
       <div class="page-title">Overview</div>
       <div class="stat-grid">
@@ -1335,7 +1413,10 @@ async function renderDashboard() {
         <div class="stat"><div class="n">${d.tasks}</div><div class="l">Tasks</div></div>
         ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(s)}</div></div>`).join('')}
       </div>
-      <div class="section-h">Agent accounts (login availability &amp; quota)</div>
+      <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
+        <span>Agent accounts (login availability &amp; quota)</span>
+        ${pollable.size ? `<button class="btn sm usage-recheck-all">↻ Re-check usage</button>` : ''}
+      </div>
       ${accounts.length
         ? accounts.map((a) => {
             const status = a.status || 'available';
@@ -1352,15 +1433,25 @@ async function renderDashboard() {
                 <span>${badge}</span>${weekly}
                 <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent}</span>
               </div>
+              ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
               <div class="task-sub" style="gap:6px;margin-top:6px">
                 ${status === 'available'
                   ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
                   : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available now</button>`}
                 <button class="btn sm acct-reset" data-id="${esc(a.id)}">Set reset time…</button>
+                ${pollable.has(a.id) ? `<button class="btn sm usage-recheck" data-id="${esc(a.id)}">↻ Re-check usage</button>` : ''}
               </div>
             </div>`;
           }).join('') + (d.accounts.waiting ? `<div class="task-sub" style="color:var(--ink-3);margin-top:6px">${d.accounts.waiting} turn(s) waiting for a login</div>` : '')
         : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`;
+    const recheck = async (btn, body) => {
+      const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
+      try { await api('/api/accounts/usage/recheck', { method: 'POST', body: JSON.stringify(body) }); }
+      catch (e) { toast(e.message, true); }
+      btn.textContent = label; renderDashboard();
+    };
+    box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
+    box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
     box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
       await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
       renderDashboard();
@@ -1375,6 +1466,67 @@ async function renderDashboard() {
       renderDashboard();
     }));
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+// Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,
+// an "unavailable" record, or undefined (never probed). Non-pollable logins (Codex /
+// API keys / setup-token) render nothing here — their reactive status is shown above.
+function usageBlock(id, snap, isPollable) {
+  if (!snap) {
+    return isPollable
+      ? `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">Usage not checked yet — click “↻ Re-check usage”.</div>`
+      : '';
+  }
+  if (!snap.ok) {
+    const why = snap.reason === 'setup-token'
+      ? 'Usage % needs a full login (this one uses a setup-token) — tracked reactively.'
+      : snap.reason === 'logged-out' ? 'Not logged in.'
+      : snap.reason === 'not-subscription' ? 'No subscription usage to report.'
+      : `Usage unavailable (${esc(snap.reason || '')}).`;
+    return `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">${esc(why)}</div>`;
+  }
+  const rows = [];
+  if (snap.session) rows.push(usageRow('Session', snap.session));
+  if (snap.week) rows.push(usageRow('Week', snap.week));
+  for (const m of snap.models || []) rows.push(usageRow(m.name || 'model', m));
+  return `<div style="margin-top:6px">${rows.join('')}
+    <div class="task-sub" style="color:var(--ink-3);font-size:11px">checked ${esc(fmtAgo(snap.at))}</div></div>`;
+}
+
+function usageRow(label, win) {
+  const pct = Math.max(0, Math.min(100, win.pct || 0));
+  const hue = pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
+  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px">
+    <span style="width:64px;color:var(--ink-2)">${esc(label)}</span>
+    <span style="flex:1;height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:180px">
+      <span style="display:block;height:100%;width:${pct}%;background:${hue}"></span>
+    </span>
+    <span class="mono" style="width:38px;text-align:right">${pct}%</span>
+    <span style="color:var(--ink-3)">resets ${esc(fmtUsageReset(win))}</span>
+  </div>`;
+}
+
+function fmtUsageReset(win) {
+  const cd = win.resetAt ? ` · ${fmtCountdown(win.resetAt)}` : '';
+  return `${win.resetLabel || ''}${win.tz ? ` (${win.tz})` : ''}${cd}`;
+}
+
+function fmtCountdown(epoch) {
+  const ms = epoch - Date.now();
+  if (ms <= 0) return 'now';
+  const mins = Math.floor(ms / 60_000);
+  const d = Math.floor(mins / 1440), h = Math.floor((mins % 1440) / 60), m = mins % 60;
+  if (d) return `in ${d}d ${h}h`;
+  if (h) return `in ${h}h ${m}m`;
+  return `in ${m}m`;
+}
+
+function fmtAgo(epoch) {
+  if (!epoch) return 'just now';
+  const ms = Date.now() - epoch;
+  if (ms < 60_000) return 'just now';
+  const m = Math.floor(ms / 60_000);
+  return m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
 }
 
 // Format an absolute reset instant as a local time + relative countdown.
@@ -1428,6 +1580,11 @@ function settingsView(proj) {
     <div class="page-title">Project settings — ${esc(proj.name)}</div>
     <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
     ${settingsForms('project', proj.id)}
+    <div class="card">
+      <div class="section-h">Credentials &amp; precedence</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Override the global credential order/enablement for this project (e.g. enable an API key here that's off globally).</p>
+      <div id="cred-editor-project">Loading…</div>
+    </div>
     ${profilesCard('project')}
     ${paymentsCard('project')}
     <div class="card" id="wf-pins-card">
@@ -1472,6 +1629,7 @@ async function hydrateWorkflowPins(projectId) {
 }
 function wireSettingsView(proj) {
   hydrateSettingsForms('project', proj.id);
+  renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
   hydrateWorkflowPins(proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
@@ -1513,6 +1671,11 @@ function globalSettingsView() {
     <p style="color:var(--ink-2);margin-top:-8px">Your defaults across all projects. Projects can override these; tasks override both.</p>
     ${settingsForms('global')}
     ${profilesCard('global')}
+    <div class="card">
+      <div class="section-h">Credentials &amp; precedence</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Order which logins/keys agents try (top = highest precedence) and enable/disable each. API keys are off by default when a subscription exists. Projects and tasks can override this.</p>
+      <div id="cred-editor-global">Loading…</div>
+    </div>
     ${paymentsCard('global')}
     <div class="card" id="accounts-card">
       <div class="section-h">Accounts</div>
@@ -1792,6 +1955,7 @@ function profilesCard(scope) {
 
 function wireGlobalSettings() {
   hydrateSettingsForms('global');
+  renderCredentialEditor($('#cred-editor-global'), 'global');
   hydrateProfiles('global');
   hydrateAccounts();
   hydrateWorkflows();

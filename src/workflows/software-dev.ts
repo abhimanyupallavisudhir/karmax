@@ -44,7 +44,7 @@ export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
-export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome: string }]>(SIG_ACCOUNT_GRANTED);
+export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
 export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
 /**
  * Generic in-flight param edit (SPEC §4.5/§5.5). Validated: the validator rejects
@@ -70,6 +70,10 @@ const MAX_RESOLVE_ATTEMPTS = 2;
  * do that. Cancellation is caught and routed to a graceful `abort()`.
  */
 class Cancelled extends Error {}
+
+/** No usable credential for a turn — every allowed login/key needs human action
+ *  (funding, re-auth, or re-enable). Escalates straight to a human (SPEC §5.2, #5). */
+class CredentialDenied extends Error {}
 
 /**
  * The software-development workflow (SPEC §5): Setup → Do ⇄ Review → PR → Merge
@@ -111,7 +115,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   const mergeMsgs: Message[] = [];
   const resolveMsgs: Message[] = [];
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
-  const accountGrants = new Map<string, { accountId: string; configHome: string }>();
+  const accountGrants = new Map<string, { accountId: string; configHome?: string; apiKeyHandle?: string }>();
   let turnSeq = 0;
   let accountPool = 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
@@ -274,7 +278,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     mergeGranted = true;
   });
   setHandler(accountGrantedSignal, (g) => {
-    accountGrants.set(g.turnId, { accountId: g.accountId, configHome: g.configHome });
+    accountGrants.set(g.turnId, { accountId: g.accountId, configHome: g.configHome, apiKeyHandle: g.apiKeyHandle });
   });
   setHandler(setTargetUpdate, (b) => {
     // Back-compat shim over the same window as updateParams({ target }), but
@@ -295,6 +299,13 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           return await fn();
         } catch (err) {
           if (cancelled || isCancellation(err)) throw err; // mid-turn cancel: don't resolve/retry
+          // A credential wall (all logins/keys need a human) won't fix on retry —
+          // escalate straight to a human (#5).
+          if (err instanceof CredentialDenied) {
+            lastError = describeError(err);
+            error = lastError;
+            break;
+          }
           lastError = describeError(err);
           error = lastError;
           const prevStage = stage;
@@ -313,7 +324,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
               ts: resolveMsgs.length,
             };
             resolveMsgs.push(rin);
-            const r = await leasedTurn('resolve', (accountConfigHome) =>
+            const r = await leasedTurn('resolve', (accountConfigHome, accountApiKeyHandle) =>
               long.runAgentTurn({
                 taskId,
                 role: 'resolve',
@@ -322,6 +333,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
                 task: liveInput,
                 bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
                 accountConfigHome,
+                accountApiKeyHandle,
               }),
             );
             if (r.output?.trim()) resolveMsgs.push({ id: `r-out-${resolveMsgs.length}`, role: 'agent', text: r.output, ts: resolveMsgs.length });
@@ -384,14 +396,20 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
    * and arms a refresh timer, then the error is rethrown so withResolve re-leases a
    * different available login — or parks until one refreshes.
    */
-  async function leasedTurn<T>(role: string, fn: (accountConfigHome?: string) => Promise<T>): Promise<T> {
+  async function leasedTurn<T>(role: string, fn: (accountConfigHome?: string, accountApiKeyHandle?: string) => Promise<T>): Promise<T> {
     // No pool ⇒ no leasing at all (zero behavior change, no extra activity).
-    if (accountPool <= 0) return await runCancellable(() => fn(undefined));
+    if (accountPool <= 0) return await runCancellable(() => fn(undefined, undefined));
     const prov = await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
     const provider = prov === 'claude' || prov === 'codex' || prov === 'mock' ? prov : undefined;
-    if (!provider) return await runCancellable(() => fn(undefined));
+    if (!provider) return await runCancellable(() => fn(undefined, undefined));
+    // Credential-policy allow-list for real providers (precedence + enable/disable,
+    // resolved global→project→task); mock uses the coordinator's provider fallback.
+    const allowed =
+      provider === 'claude' || provider === 'codex'
+        ? await core.resolveCredentialOrder({ taskId, projectId: input.projectId, provider }).catch(() => undefined)
+        : undefined;
     const turnId = `${taskId}#${turnSeq++}`;
-    await coord.leaseAccount(taskId, turnId, provider);
+    await coord.leaseAccount(taskId, turnId, provider, allowed);
     const priorStatus = status;
     status = 'waiting';
     waitingFor = { kind: 'account', provider };
@@ -401,15 +419,26 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
     const grant = accountGrants.get(turnId);
     accountGrants.delete(turnId);
-    const leasedHome = grant?.accountId === '(passthrough)' ? undefined : grant?.configHome;
+    // The coordinator denies a turn whose every allowed credential needs human action
+    // (#5): escalate rather than run/park.
+    if (grant?.accountId === '(denied)') {
+      if (cancelled) throw new Cancelled();
+      throw new CredentialDenied(`No usable ${provider} credential — every allowed login/key needs attention (funding, re-auth, or re-enable it in credential settings).`);
+    }
+    const passthrough = !grant || grant.accountId === '(passthrough)';
+    const leasedHome = passthrough ? undefined : grant?.configHome;
+    const leasedKey = passthrough ? undefined : grant?.apiKeyHandle;
     try {
-      return await runCancellable(() => fn(leasedHome));
+      return await runCancellable(() => fn(leasedHome, leasedKey));
     } catch (err) {
-      // Usage/session-limit failure → tell the coordinator this login is exhausted
-      // (it arms a refresh timer), then rethrow so withResolve re-leases another.
-      if (grant && grant.accountId !== '(passthrough)' && !cancelled && !isCancellation(err)) {
+      // Limit failure → update the coordinator so it re-leases the next allowed
+      // credential: a transient window arms a refresh timer; a HARD billing/auth
+      // failure is flagged needs-attention (won't self-refresh → a human must act).
+      if (grant && !passthrough && !cancelled && !isCancellation(err)) {
         const cls = classifyLimitError(describeError(err));
-        if (cls.limited) {
+        if (cls.hard) {
+          await coord.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
+        } else if (cls.limited) {
           await coord
             .reportAccountExhausted({ accountId: grant.accountId, window: cls.window ?? '5h', resetHint: cls.resetHint, note: cls.note })
             .catch(() => undefined);
@@ -418,7 +447,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       throw err;
     } finally {
       // returnAccount runs in the parent (uncancelled) scope so the lease is freed.
-      if (grant && grant.accountId !== '(passthrough)') await coord.returnAccount(grant.accountId).catch(() => undefined);
+      if (grant && !passthrough) await coord.returnAccount(grant.accountId).catch(() => undefined);
     }
   }
 
@@ -449,7 +478,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
     let doHome: string | undefined;
     const turn = await withResolve('do', () =>
-      leasedTurn('do', (accountConfigHome) => {
+      leasedTurn('do', (accountConfigHome, accountApiKeyHandle) => {
         doHome = accountConfigHome ?? '(profile)';
         return long.runAgentTurn({
           taskId,
@@ -461,6 +490,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           session: sessionMatchesHome(accountConfigHome) ? session : undefined,
           task: liveInput,
           accountConfigHome,
+          accountApiKeyHandle,
         });
       }),
     );
@@ -586,7 +616,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     let result;
     try {
       // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
-      const mt = await leasedTurn('merge', (accountConfigHome) =>
+      const mt = await leasedTurn('merge', (accountConfigHome, accountApiKeyHandle) =>
         long.runAgentTurn({
           taskId,
           role: 'merge',
@@ -596,6 +626,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           task: liveInput,
           bindings: { reviewInfo: reviewInfo?.summary ?? '' },
           accountConfigHome,
+          accountApiKeyHandle,
         }),
       ).catch((e) => {
         if (isCancellation(e)) throw e; // pre-merge cancel → abort, don't merge

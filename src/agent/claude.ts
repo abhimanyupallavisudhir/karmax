@@ -30,7 +30,15 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    if (input.resolvedAuth?.apiKey || ClaudeAdapter.hasApiKey()) return this.runMessagesApi(input, ctx);
+    const auth = input.resolvedAuth;
+    // Route on the PROFILE's resolved auth first, so each profile picks its rail:
+    // an API key → the Messages API (metered); a config home → the subscription
+    // login (Agent SDK). Only with NO explicit profile auth do we fall back to the
+    // ambient environment — so a stray ANTHROPIC_API_KEY can no longer silently
+    // force a subscription profile onto the metered path.
+    if (auth?.apiKey) return this.runMessagesApi(input, ctx);
+    if (auth?.configHome) return this.runAgentSdk(input, ctx);
+    if (ClaudeAdapter.hasApiKey()) return this.runMessagesApi(input, ctx);
     if (ClaudeAdapter.hasAmbientLogin()) return this.runAgentSdk(input, ctx);
     throw new Error('ClaudeAdapter: no ANTHROPIC_API_KEY and no Claude Code login found');
   }

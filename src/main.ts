@@ -99,10 +99,15 @@ async function main() {
   // Empty pool ⇒ per-turn leasing stays off (zero behavior change).
   const { makeCoordinatorActivities } = await import('./activities/coordinator.js');
   const coordClient = makeCoordinatorActivities({ client, taskQueue: TASK_QUEUE });
-  const pool = configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path, provider: (a.provider === 'codex' ? 'codex' : 'claude') as 'claude' | 'codex' }));
+  // Register EVERY credential (logins, ambient, API keys) under its stable policy key
+  // so the coordinator can lease/track any of them (SPEC §6.2/§7).
+  const { gatherCredentialSources } = await import('./platform/credential-sources.js');
+  const { enumerateCredentials } = await import('./platform/credentials.js');
+  const creds = enumerateCredentials(gatherCredentialSources({ configHomes, broker }));
+  const pool = creds.map((c) => ({ id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}) }));
   if (pool.length) {
-    await coordClient.registerAccounts(pool).catch((e) => console.warn('  • account pool register failed', String(e)));
-    console.log(`  • Registered ${pool.length} login(s) into the account pool`);
+    await coordClient.registerAccounts(pool).catch((e) => console.warn('  • credential pool register failed', String(e)));
+    console.log(`  • Registered ${pool.length} credential(s) into the account pool`);
   }
 
   const workflows = new WorkflowManager(workerManager, new WorkflowRepoLoader(p.workflows), undefined, p.workflows);

@@ -136,6 +136,23 @@ export function capturedToken(home: string): string | undefined {
   }
 }
 
+/** Is the home authenticated with a FULL native credential — `.credentials.json`
+ *  from `claude auth login` (claude) / `auth.json` from `codex login` (codex)?
+ *  A setup-token-only home (just `karmax-oauth.json`) is NOT fully authed, so
+ *  `connect` re-runs login to upgrade it to a full, usage-pollable credential (#6). */
+export function isFullyAuthed(provider: string, home: string): boolean {
+  const native = provider === 'codex' ? ['auth.json'] : ['.credentials.json', '.claude/.credentials.json'];
+  return native.some((f) => fs.existsSync(path.join(home, f)));
+}
+
+/** The captured setup-token to inject as CLAUDE_CODE_OAUTH_TOKEN — UNLESS the home
+ *  already holds a full native `.credentials.json`. The setup-token is restricted
+ *  (can't read usage, RESOLVE-PLAN #6) and would shadow the full login, so prefer
+ *  the native credential (the Agent SDK reads it directly). */
+export function tokenToInject(home: string): string | undefined {
+  return fs.existsSync(path.join(home, '.credentials.json')) ? undefined : capturedToken(home);
+}
+
 const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_.-]/g, '-');
 
 /** Build a clean, isolated environment for an agent spawn (SPEC §7.3 gotcha). */

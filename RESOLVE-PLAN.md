@@ -248,6 +248,50 @@ and edit whatever params that unfreezes (param-edit UI + `editableParams` gating
 - **Phase 3B — stage-machine executor (gotoStage/parkUntil rewind) — NOT STARTED.** Risky: refactors the core workflow control flow into a stage dispatcher. Flag before executing.
 - **Phase 4 — self-healing PR loop + human rewind UI + MCP expansion — NOT STARTED.**
 
+### Credential coordinator (#1 + #5) — DONE (tested + live-verified in UI)
+
+Unified all auth sources into a policy-driven credential coordinator:
+- `credentials.ts` (pure): every auth source is a `Credential` (`login:*` / `ambient:*` / `key:*`); policy resolves global→project→task (`order`/`on`/`off`), default = subscriptions ON + preferred, API keys OFF *when a subscription exists* (on when a key is the only option). Unit-tested.
+- Coordinator leases by the policy's **ordered allow-list** (first available, skipping exhausted), with a provider fallback for mock/legacy; grants a config-home OR a broker API-key handle. `runAgentTurn` resolves the leased key.
+- All credentials registered under stable keys (main.ts + gateway).
+- **#5**: `classifyLimitError` splits transient rate-limit (park+refresh) vs **hard billing/auth** (`needs-attention`, no auto-refresh); the coordinator **denies** a request whose every allowed credential needs attention → the task **escalates to a human** (`CredentialDenied`) instead of parking forever.
+- Gateway: `GET /api/credentials` (list + effective per scope) + `POST /api/credentials/policy`. UI: a credential editor (reorder + enable/disable) in global settings, project settings, and the task drawer.
+- Tests: credential resolution (enumeration/defaults/cross-scope/precedence), coordinator allow-list precedence + exhaustion-skip + deny, hard-vs-transient classification.
+- **Live UI verification (2026-07-04):** boot registers 5 credentials into the pool; the global-settings credential editor renders all 5 with the correct default policy (`claude:manyu`/`claude:mats`/`ambient:claude`/`ambient:codex` enabled; `OPENAI_API_KEY` = `key:codex` disabled-by-default because a codex subscription exists); toggle→`POST /api/credentials/policy` (200)→re-render round-trip persists; ↑↓ precedence controls present; state restored to pristine (`global.own = {}`) after the test.
+
+### Proactive quota via `claude /usage` (#6) — DONE (parser tested; live-verified in UI)
+
+**Corrected feasibility (verified live 2026-07-04, Claude Code 2.1.201):** `claude -p '/usage'` prints a parseable panel (session %, weekly %, per-model %, reset instant + IANA tz) **only for a login with a full interactive-login `.credentials.json`**. karmax's `claude setup-token` logins get a *restricted* OAuth token (`sk-ant-oat*`) that authenticates inference but whose usage query returns nothing (header only) — even with a fully-materialized `.credentials.json`. Codex has **no** usage command at all. So proactive polling covers full-login creds (the ambient `~/.claude` today); setup-token/Codex/API-key creds degrade to the reactive engine (#1/#2). `CLAUDE_CONFIG_DIR` polling *does* work — but only once the home holds a full-login credential (see the login-flow unlock below).
+
+Built:
+- `src/agent/usage.ts` — `parseUsagePanel(text, now)` (pure; session/week/per-model + best-effort DST-correct `resetAt` via Intl offset), `probeClaudeUsage({configHome})` (isolates in a throwaway dir holding only a COPY of the login's `.credentials.json`, so it never races/mutates a leased home; injectable runner for tests), `isUsagePollable(cred)`. **10 hermetic tests** (`tests/usage.test.ts`).
+- Gateway: `GET /api/accounts/usage` (cached snapshots from kv + `pollable` list + a `setup-token` hint for non-pollable Claude logins) and `POST /api/accounts/usage/recheck` (`{accountId?}` → probe one/all → cache in kv `usage:<credKey>` → return). Usage lives in **kv, not the coordinator workflow** — it's display state, not leasing state → zero Temporal non-determinism risk.
+- Dashboard (`web/app.js` `renderDashboard` + `usageBlock`/`usageRow`): per-login usage bars (session/week/per-model), reset label + tz + live countdown, "checked Xm ago" freshness, per-account **↻ Re-check usage** + a section-level "Re-check usage". Non-pollable Claude logins show the setup-token hint; Codex/keys render nothing (reactive status only).
+- **Live UI verified:** ambient login shows Session/Week/Fable %, reset labels, countdowns; re-check round-trips (button → "checking…" → probe → fresh %, "checked just now"); manyu/mats show the setup-token hint; codex/keys blank.
+
+**Login-flow unlock — DONE (implemented + tested; user re-login activates it).** The user chose "flip default to full login". Changes:
+- `login.ts`: Claude login default `setup-token` → **`auth login --claudeai`** (writes a full-scope native `.credentials.json`). `setup-token` still available via `KARMAX_CLAUDE_LOGIN_ARGS`.
+- `config-homes.ts`: new `isFullyAuthed(provider, home)` (native `.credentials.json`/`auth.json`, NOT a setup-token-only home) — `connect` now skips only when fully authed, so **re-adding a setup-token login upgrades it in place** (no delete needed). New `tokenToInject(home)` returns the captured setup-token ONLY when there's no native `.credentials.json` → a full login is never shadowed by the restricted setup-token.
+- `core.ts`: both auth-resolution sites use `tokenToInject` (prefer native creds). The adapter already routed `configHome` (no `oauthToken`) through the Agent SDK, which reads `.credentials.json` natively — so full-login homes need no adapter change.
+- Fully backward-compatible: existing setup-token homes keep running (adapter injects their token when no native cred). Tests: `autonomy.test.ts` +2 (setup-token vs full-login distinction; connect re-runs to upgrade). 16/16 green.
+
+**To activate per managed login:** re-add it in the UI (Connect a login → same name) — it now runs the full OAuth login and writes `.credentials.json`, making it usage-pollable AND simplifying its auth. Codex stays reactive (no usage command).
+
+**Activated + live-validated (2026-07-05):** user re-added `manyu` + `mats` → both now hold a native `.credentials.json`. Verified end-to-end: `pollable` now lists both; dashboard shows real usage (manyu Session 6%/Week 2%; mats Week 23%/Fable 20% — mats has no active session window, so the parser correctly omits the Session row); and a real inference turn runs on each via the native cred with `CLAUDE_CODE_OAUTH_TOKEN` scrubbed (`KARMAX-LOGIN-OK` / `KARMAX-MATS-OK`). The full-login flip is confirmed working for both usage polling and agent runs.
+
+### Side-workstream: provider auth parity (both providers × both rails) — mostly DONE (tested; live smoke test pending)
+
+Decision: both Claude and Codex must support **subscription** AND **API-key** logins.
+- ✅ **Dispatch on the profile's resolved auth** (both adapters): `apiKey` → API path; `configHome` → subscription path; ambient env only as a no-profile fallback. Kills the "stray `ANTHROPIC_API_KEY` silently forces Claude to metered" footgun.
+- ✅ **Codex subscription path** (`codex.ts` `runCodexExec`): drives `codex exec --json` with `CODEX_HOME` = the leased config home (subscription `auth.json`), `-s workspace-write -a never`, `-o` for the final message, resume via `codex exec resume <id>`. Parses JSONL for thread id + `UsageLimitReachedError` (`resets_in_seconds`, machine-readable). Injectable via `KARMAX_CODEX_EXEC_CMD` (hermetically tested with a stub).
+- ✅ **`limits.ts`** now parses relative reset hints (`"in 3600s"` / minutes / hours) so the Codex machine-readable reset flows precisely into the coordinator.
+- **Live + hermetic tests added** (gated by credentials + `KARMAX_SKIP_LIVE`):
+  - `tests/quota-coordinator.test.ts` — HERMETIC (zero quota): provider-scoped leasing, re-lease-on-exhaustion, **park→refresh→grant** (real refresh timer), manual availability override. **4/4 green.**
+  - `tests/codex-exec.test.ts` — HERMETIC: the `codex exec` subscription path via an injectable stub (routing, output capture, thread id, usage-limit throw). Green.
+  - `tests/live-providers.test.ts` — LIVE, per-rail gated: Claude API-key, Claude subscription, Codex API-key, **Codex subscription (`codex exec`)**, and **Claude resume-under-switched-login** (fresh session + msgs replay preserves context). Skips rails whose credential is absent.
+- ⚠️ **Seeding** — karmax's Codex config-homes are empty (only the API key has been used). To actually use a Codex subscription in the app, connect a Codex login in the UI (runs `codex login` → writes `auth.json`).
+- ⚠️ **v1 tool parity** — exec-path agents do real work in the worktree and complete naturally (`turn.completed`); in-turn platform tools (`create_review_info`/`resolve_decision`) aren't wired to the exec path yet (a follow-up; the API-key path has them).
+
 ## 5. Phasing (delivery order)
 
 1. **Phase 1 — Visibility & UI wins (Part C.1).** All-role transcripts; copy-command buttons; remove
