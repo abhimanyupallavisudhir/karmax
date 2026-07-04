@@ -57,6 +57,12 @@ export interface TaskRecord {
   createdAt: number;
   order: number;
   parentTaskId?: string;
+  /**
+   * Free-form human notes about the task (SPEC §10). Purely cosmetic — shown only
+   * in the UI and never assembled into any agent prompt. The human jots whatever
+   * they want here; it has no effect on workflow execution.
+   */
+  notes?: string;
   /** Last view snapshot, refreshed opportunistically so terminal/parked tasks list cheaply. */
   lastView?: TaskView;
 }
@@ -185,6 +191,12 @@ export interface TaskView {
   workflow: string;
   stage: Stage;
   status: TaskStatus;
+  /**
+   * Free-form human notes (cosmetic, UI-only — never sent to any agent). Mirrored
+   * onto the view from the task record so the UI can show/edit them at any stage,
+   * even for a task not currently in the loaded list. Not produced by the workflow.
+   */
+  notes?: string;
   messages: Message[];
   /**
    * Per-role conversation transcripts (Do / Merge / Resolve). `messages` above is

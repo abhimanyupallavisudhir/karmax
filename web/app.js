@@ -831,6 +831,7 @@ function renderDrawer() {
   $('#drawer-close').addEventListener('click', closeDrawer);
   wireActions(v);
   wireParams(v);
+  wireNotes(v);
   wireTerminal(v.taskId);
   wireCopyButtons();
   renderDrawerEvents();
@@ -915,6 +916,7 @@ function drawerBody(v) {
     ${pipelineLarge(v)}
     ${error}
     ${waiting}
+    ${drawerNotes(v)}
     ${drawerParams(v)}
     ${review}
     ${renderWidgetGroups(S.widgets)}
@@ -1051,6 +1053,44 @@ async function loadParamDefaults(taskId) {
   if (!wf || !pid) return {};
   return api(`/api/defaults/${pid}/${wf}`).then((d) => d?.task?.inherited || {}).catch(() => ({}));
 }
+// Free-form human notes (cosmetic, UI-only — never sent to any agent). Editable
+// at ANY stage (active, done, cancelled, failed, archived) — the endpoint has no
+// stage guard. The current value comes from the freshly-fetched view (`v.notes`),
+// so it's correct even for a task not in the loaded list.
+function drawerNotes(v) {
+  const notes = v.notes || '';
+  return `<div class="section-h">Notes</div>
+    <div id="drawer-notes">
+      <textarea id="task-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(notes)}</textarea>
+      <div class="task-sub" style="margin-top:4px;justify-content:space-between">
+        <span style="color:var(--ink-3)">Only you see this — never sent to the agent.</span>
+        <button class="btn sm" id="notes-save">Save notes</button>
+      </div>
+    </div>`;
+}
+
+function wireNotes(v) {
+  const ta = document.getElementById('task-notes');
+  const btn = document.getElementById('notes-save');
+  if (!ta || !btn) return;
+  const save = async () => {
+    const notes = ta.value;
+    if ((v.notes || '') === notes) return; // no change
+    try {
+      await api(`/api/tasks/${v.taskId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
+      v.notes = notes || undefined; // keep the in-memory view in sync
+      const rec = S.tasks.find((t) => t.id === v.taskId);
+      if (rec) rec.notes = notes || undefined;
+      toast('Notes saved');
+    } catch (e) {
+      toast(e.message, true);
+    }
+  };
+  btn.addEventListener('click', save);
+  // Save on blur too, so notes aren't lost when the drawer closes.
+  ta.addEventListener('blur', save);
+}
+
 function drawerParams(v) {
   const rec = S.tasks.find((t) => t.id === v.taskId);
   // Drafts are composed in the full task form (all fields editable pre-queue).

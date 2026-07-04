@@ -311,6 +311,16 @@ export class Gateway {
         store.updateTaskParams(archiveMatch[1]!, { ...t.params, archived });
         return this.json(res, 200, { ok: true, archived });
       }
+      const notesMatch = p.match(/^\/api\/tasks\/([^/]+)\/notes$/);
+      if (notesMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        const t = store.getTask(notesMatch[1]!);
+        if (!t) return this.json(res, 404, { error: 'no such task' });
+        // Purely cosmetic human notes — stored on the record, never sent to any agent.
+        const notes = typeof b.notes === 'string' ? b.notes : '';
+        store.setTaskNotes(notesMatch[1]!, notes);
+        return this.json(res, 200, { ok: true, notes });
+      }
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
