@@ -111,6 +111,8 @@ export class KarmaxApi {
       profiles?: Record<string, string>;
       /** Full task-form field values (SPEC §10.4); takes precedence over the flat fields. */
       params?: ValueMap;
+      /** Free-form human notes (cosmetic, UI-only — stored off `params` so they never reach the agent). */
+      notes?: string;
       /** Save without starting the workflow (SPEC §10.4 drafts). */
       draft?: boolean;
     },
@@ -148,6 +150,13 @@ export class KarmaxApi {
       workflowVersion: manifest.version,
       params: { ...taskOverrides, prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''), profiles: args.profiles, draft: !!args.draft },
     });
+    // Cosmetic human notes live in a dedicated column, never in `params`, so they
+    // are structurally incapable of reaching the agent (SPEC §10). Persist them the
+    // same way whether the task is queued now or saved as a draft.
+    if (typeof args.notes === 'string') {
+      this.deps.store.setTaskNotes(task.id, args.notes);
+      task.notes = args.notes || undefined;
+    }
     if (args.draft) return task; // stored but not queued
 
     const input = assembleTaskInput(manifest, resolved, {

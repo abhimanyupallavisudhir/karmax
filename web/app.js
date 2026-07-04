@@ -731,7 +731,13 @@ async function openTaskForm(workflow, draft, seedText) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}</div>
+        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
+          <div class="form-row" data-row="__notes">
+            <div class="label-row"><label>Notes</label></div>
+            <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
+            <span style="color:var(--ink-3);font-size:12px">Only you see this — never sent to the agent.</span>
+          </div>
+        </div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
           <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${draft ? 'Queue' : 'Add task'}</button>
@@ -751,11 +757,15 @@ async function openTaskForm(workflow, draft, seedText) {
   wireFieldResets($('#tf-body'), fields);
   const submit = async (draftMode) => {
     const body = collectForm($('#tf-body'), fields);
-    const payload = { workflow: wf, params: body, draft: draftMode };
+    // Cosmetic human notes — kept separate from `params` so they never reach the
+    // agent, and editable at any stage (here, pre-queue, in the full form).
+    const notes = $('#tf-notes')?.value ?? '';
+    const payload = { workflow: wf, params: body, notes, draft: draftMode };
     try {
       if (draft) {
         // edit existing draft, then optionally queue
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true }) });
+        if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
         if (!draftMode) await api(`/api/tasks/${draft.id}/queue`, { method: 'POST', body: '{}' });
       } else {
         await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
