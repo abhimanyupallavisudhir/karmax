@@ -685,9 +685,22 @@ function wireTasksView() {
   };
   $('#add-task')?.addEventListener('click', add);
   $('#new-task')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
-  $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value));
+  // Opening the full form via "More" carries over whatever was typed in the
+  // quick-add box into the field that consumes it (Prompt, Command, …).
+  $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
+
+// The task-scope field that consumes the quick-add "Describe a task" text: the
+// workflow's prompt field, else its primary required text/string input (e.g.
+// script-exec's Command). Mirrors how add() maps that text to prompt/command.
+function consumingField(fields) {
+  return (
+    fields.find((f) => f.bind === 'prompt') ||
+    fields.find((f) => (f.type === 'text' || f.type === 'string') && f.required) ||
+    null
+  );
+}
 
 async function deleteDraft(id) {
   // Drafts never started a workflow, so the record is hard-deleted server-side.
@@ -697,10 +710,16 @@ async function deleteDraft(id) {
 }
 
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
-async function openTaskForm(workflow, draft) {
+async function openTaskForm(workflow, draft, seedText) {
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   const values = draft ? { ...draft.params } : {};
+  // Carry over the quick-add text (or whatever was typed before switching
+  // workflows) into the field that consumes it, without clobbering a real value.
+  if (seedText) {
+    const cf = consumingField(fields);
+    if (cf && !values[cf.name]) values[cf.name] = seedText;
+  }
   let inherited = {};
   try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
   const root = $('#overlay-root');
@@ -719,7 +738,13 @@ async function openTaskForm(workflow, draft) {
         </div>
       </div>
     </div>`;
-  $('#tf-wf')?.addEventListener('change', () => openTaskForm($('#tf-wf').value)); // workflow switch re-renders fields
+  $('#tf-wf')?.addEventListener('change', () => {
+    // Re-render for the new workflow, preserving text typed into the current
+    // consuming field so it moves to the new workflow's consuming field.
+    const cf = consumingField(fields);
+    const carried = cf ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`)?.value : '';
+    openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
+  });
   $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') root.innerHTML = ''; });
   $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
   wireAgentFields($('#tf-body'));
