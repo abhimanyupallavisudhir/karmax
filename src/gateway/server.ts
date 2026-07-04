@@ -527,6 +527,23 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
+      // Manual availability override for an agent login (SPEC §6.2): force a login
+      // on/off or edit its reset time (e.g. after upgrading a plan) without waiting
+      // for the old refresh. Signals the account coordinator directly.
+      if (p === '/api/accounts/availability' && method === 'POST') {
+        if (!this.deps.client) return this.json(res, 400, { error: 'no temporal client' });
+        const b = await this.body(req);
+        if (!b.accountId || !b.status) return this.json(res, 400, { error: 'accountId and status required' });
+        const status = b.status === 'available' ? 'available' : b.status === 'manual-off' ? 'manual-off' : 'exhausted';
+        const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
+        await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).setAccountAvailability({
+          accountId: String(b.accountId),
+          status,
+          ...(b.resetAt != null ? { resetAt: Number(b.resetAt) } : {}),
+        });
+        return this.json(res, 200, { ok: true });
+      }
+
       // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms
       if (p === '/api/schema' && method === 'GET') {
         // Built-in + installed workflows, so the New Task form offers both (§21d).
@@ -650,7 +667,7 @@ export class Gateway {
    *  rotation reflects the current set (called after connect/rename/delete). */
   private async refreshLoginPool(): Promise<void> {
     if (!this.deps.configHomes || !this.deps.client) return;
-    const pool = this.deps.configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path }));
+    const pool = this.deps.configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path, provider: (a.provider === 'codex' ? 'codex' : 'claude') as 'claude' | 'codex' }));
     if (!pool.length) return;
     const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
     await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);

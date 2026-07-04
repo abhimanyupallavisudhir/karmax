@@ -23,6 +23,7 @@ const S = {
   search: '',
   schema: [],
   paramDefaults: {},
+  sessions: {}, // role -> provider session id, for the "resume in CLI" copy command
   ws: null,
 };
 
@@ -357,12 +358,23 @@ async function api(path, opts = {}) {
   return body;
 }
 
-function toast(msg, err = false) {
+function toast(msg, err = false, action) {
   const t = document.createElement('div');
   t.className = 'toast' + (err ? ' err' : '');
-  t.textContent = msg;
+  const span = document.createElement('span');
+  span.textContent = msg;
+  t.appendChild(span);
+  // An optional action (e.g. Undo) — gives the toast a clickable button and more
+  // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
+  if (action) {
+    const btn = document.createElement('button');
+    btn.className = 'toast-action';
+    btn.textContent = action.label;
+    btn.addEventListener('click', () => { t.remove(); action.fn(); });
+    t.appendChild(btn);
+  }
   $('#toasts').appendChild(t);
-  setTimeout(() => t.remove(), 3200);
+  setTimeout(() => t.remove(), action ? 6500 : 3200);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -557,9 +569,9 @@ function taskRow(t) {
   // archivable when not progressing on its own / not awaiting review
   const terminal = !['active', 'waiting'].includes(status);
   const archiveBtn = archived
-    ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive">⊕</button>`
+    ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
     : terminal
-      ? `<button class="icon-btn" data-archive="${t.id}" title="Archive">⊟</button>`
+      ? `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`
       : '';
   return `
     <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}">
@@ -637,8 +649,15 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
   );
   const setArchived = async (id, archived) => {
-    try { await api(`/api/tasks/${id}/archive`, { method: 'POST', body: JSON.stringify({ archived }) }); toast(archived ? 'Archived' : 'Unarchived'); refreshTasks(); }
-    catch (e) { toast(e.message, true); }
+    const title = S.tasks.find((t) => t.id === id)?.title || 'task';
+    try {
+      await api(`/api/tasks/${id}/archive`, { method: 'POST', body: JSON.stringify({ archived }) });
+      // Archiving only hides — offer an immediate one-click Undo so an accidental
+      // click is trivially reversible (it isn't destructive, just filtered out).
+      if (archived) toast(`Archived “${title.slice(0, 40)}”`, false, { label: 'Undo', fn: () => setArchived(id, false) });
+      else toast('Unarchived');
+      refreshTasks();
+    } catch (e) { toast(e.message, true); }
   };
   $('#main').querySelectorAll('[data-archive]').forEach((b) =>
     b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.archive, true); }),
@@ -734,6 +753,7 @@ async function openDrawer(taskId) {
     S.view = await api(`/api/tasks/${taskId}`);
     S.drawerEvents = await api(`/api/tasks/${taskId}/events?since=0`);
     S.widgets = await api(`/api/tasks/${taskId}/widgets`).catch(() => []);
+    S.sessions = await api(`/api/tasks/${taskId}/sessions`).catch(() => ({}));
     S.paramDefaults = await loadParamDefaults(taskId);
   } catch (e) { toast(e.message, true); }
   renderDrawer();
@@ -743,6 +763,7 @@ async function refreshDrawer() {
   try {
     S.view = await api(`/api/tasks/${S.selected}`);
     S.widgets = await api(`/api/tasks/${S.selected}/widgets`).catch(() => S.widgets);
+    S.sessions = await api(`/api/tasks/${S.selected}/sessions`).catch(() => S.sessions);
     S.paramDefaults = await loadParamDefaults(S.selected);
   } catch {}
   renderDrawer();
@@ -786,6 +807,7 @@ function renderDrawer() {
   wireActions(v);
   wireParams(v);
   wireTerminal(v.taskId);
+  wireCopyButtons();
   renderDrawerEvents();
 }
 
@@ -817,8 +839,35 @@ function wireTerminal(taskId) {
 }
 
 function drawerBody(v) {
-  const msgs = (v.messages || [])
-    .map((m) => `<div class="msg ${m.role}"><div class="role">${m.role}</div>${esc(m.text)}</div>`)
+  // Show every agent's conversation (Do / Merge / Resolve), collapsed except the
+  // one owning the active stage (SPEC §5.5). Falls back to `messages` (Do) for
+  // tasks whose workflow predates per-role transcripts.
+  const activeRole = roleForStage(v.stage);
+  const transcripts = (v.transcripts && v.transcripts.length)
+    ? v.transcripts
+    : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
+  const liveRole = transcripts.some((t) => t.role === activeRole) ? activeRole : (transcripts[0] && transcripts[0].role);
+  const conversations = transcripts
+    .map((t) => {
+      const body = (t.messages || [])
+        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}</div>`)
+        .join('') || '<div class="msg system">No messages yet</div>';
+      // Only the active role gets the #live-bubble (one per drawer, updated by the WS stream).
+      const live = t.role === liveRole
+        ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
+        : '';
+      const sid = S.sessions && S.sessions[t.role];
+      const resumeCmd = sid && v.worldPath ? `cd ${v.worldPath} && claude --resume ${sid}` : '';
+      const copy = resumeCmd
+        ? `<button class="btn sm copy-cmd" data-cmd="${esc(resumeCmd)}" title="Copy a CLI command to resume this agent in your terminal">⧉ resume cmd</button>`
+        : '';
+      return `<details class="conversation" ${t.role === liveRole ? 'open' : ''}>
+        <summary class="section-h" style="cursor:pointer;display:flex;align-items:center;gap:8px">
+          <span>${esc(t.label || t.role)} (${(t.messages || []).length})</span>${copy}
+        </summary>
+        <div class="thread">${body}${live}</div>
+      </details>`;
+    })
     .join('');
   const review = v.reviewInfo
     ? `<div class="section-h">Review</div>
@@ -826,11 +875,13 @@ function drawerBody(v) {
          ${v.reviewInfo.summary ? `<div class="summary">${esc(v.reviewInfo.summary)}</div>` : ''}
          ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin-bottom:8px">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
-         ${v.reviewInfo.diff ? `<div class="diff">${renderDiff(v.reviewInfo.diff)}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
        </div>`
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
+  const waiting = v.waitingFor
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
+    : '';
   const subtasks = v.subTasks?.length
     ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(id)}</span></div>`).join('')}`
     : '';
@@ -838,20 +889,19 @@ function drawerBody(v) {
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
     ${error}
+    ${waiting}
     ${drawerParams(v)}
     ${review}
     ${renderWidgetGroups(S.widgets)}
     ${subtasks}
-    <details class="conversation" ${['active', 'waiting'].includes(v.status) ? 'open' : ''}>
-      <summary class="section-h" style="cursor:pointer">Conversation${(v.messages || []).length ? ` (${(v.messages || []).length})` : ''}</summary>
-      <div class="thread">${msgs || '<div class="msg system">No messages yet</div>'}
-        <div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>
-      </div>
-    </details>
+    ${conversations}
     <details class="advanced">
       <summary>Advanced — terminal, live event log, structured state</summary>
       <div class="section-h">Terminal — open a shell in the world (ephemeral)</div>
-      <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+      <div class="task-sub" style="gap:6px;flex-wrap:wrap">
+        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      </div>
       <pre class="raw hidden" id="term-out" style="height:200px"></pre>
       <input id="term-in" class="title-in hidden" style="width:100%;margin-top:6px;padding:8px 10px" placeholder="command + Enter" />
       <div class="section-h">Live events</div>
@@ -866,6 +916,50 @@ function renderDiff(d) {
     .split('\n')
     .map((l) => (l.startsWith('+') ? `<span class="add">${l}</span>` : l.startsWith('-') ? `<span class="del">${l}</span>` : l))
     .join('\n');
+}
+
+// Human label for a "waiting for" indicator (SPEC §6.2).
+function waitingLabel(w) {
+  if (!w) return '';
+  switch (w.kind) {
+    case 'account': return `a ${w.provider || 'compatible'} login (quota refresh)`;
+    case 'mergeSlot': return 'a merge slot';
+    case 'human': return 'human input';
+    case 'subtask': return 'a sub-task';
+    default: return w.detail || w.kind;
+  }
+}
+
+// Which agent role "owns" a given stage — drives which transcript opens by default.
+function roleForStage(s) {
+  if (s === 'resolve') return 'resolve';
+  if (s === 'pr' || s === 'merge') return 'merge';
+  return 'do';
+}
+
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+  return Promise.resolve();
+}
+
+// Copy-command buttons (⧉): copy a shell command to the clipboard without toggling
+// any enclosing <details>/<summary>.
+function wireCopyButtons() {
+  document.querySelectorAll('.copy-cmd').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      copyToClipboard(btn.dataset.cmd || '').then(() => {
+        const prev = btn.textContent;
+        btn.textContent = '✓ copied';
+        setTimeout(() => { btn.textContent = prev; }, 1200);
+      });
+    });
+  });
 }
 
 // ── the host widget library (SPEC §10.2 tier 2): draw server-resolved widget
@@ -1176,11 +1270,56 @@ async function renderDashboard() {
         <div class="stat"><div class="n">${d.tasks}</div><div class="l">Tasks</div></div>
         ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(s)}</div></div>`).join('')}
       </div>
-      <div class="section-h">Agent accounts (token / limit status)</div>
+      <div class="section-h">Agent accounts (login availability &amp; quota)</div>
       ${accounts.length
-        ? accounts.map((a) => `<div class="card"><b class="mono">${esc(a.id)}</b> — in use ${a.inUse}/${a.maxConcurrent}, window ${a.fiveHourUsed}/${a.fiveHourLimit}${d.accounts.waiting ? ` · ${d.accounts.waiting} waiting` : ''}</div>`).join('')
+        ? accounts.map((a) => {
+            const status = a.status || 'available';
+            const badge = status === 'available'
+              ? '🟢 available'
+              : status === 'manual-off'
+                ? '⏸ off (manual)'
+                : `🔴 ${esc(a.window || 'exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`;
+            const weekly = a.weeklyResetAt ? `<span style="color:var(--ink-3)"> · weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
+            return `<div class="card">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <b class="mono">${esc(a.id)}</b>
+                <span class="chip">${esc(a.provider || '')}</span>
+                <span>${badge}</span>${weekly}
+                <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent}</span>
+              </div>
+              <div class="task-sub" style="gap:6px;margin-top:6px">
+                ${status === 'available'
+                  ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
+                  : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available now</button>`}
+                <button class="btn sm acct-reset" data-id="${esc(a.id)}">Set reset time…</button>
+              </div>
+            </div>`;
+          }).join('') + (d.accounts.waiting ? `<div class="task-sub" style="color:var(--ink-3);margin-top:6px">${d.accounts.waiting} turn(s) waiting for a login</div>` : '')
         : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`;
+    box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
+      await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
+      renderDashboard();
+    }));
+    box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
+      const ans = prompt('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
+      if (!ans) return;
+      const mins = Number(ans);
+      const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
+      if (!resetAt || isNaN(resetAt)) { toast('Could not parse a time', true); return; }
+      await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
+      renderDashboard();
+    }));
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+// Format an absolute reset instant as a local time + relative countdown.
+function fmtReset(epoch) {
+  const ms = epoch - Date.now();
+  const when = new Date(epoch).toLocaleString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' });
+  if (ms <= 0) return `${when} (now)`;
+  const h = Math.floor(ms / 3600_000);
+  const m = Math.floor((ms % 3600_000) / 60_000);
+  return `${when} (in ${h ? `${h}h ` : ''}${m}m)`;
 }
 
 // ── settings (schema-driven, SPEC §10.4) ─────────────────────────────────────

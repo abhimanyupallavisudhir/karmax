@@ -118,15 +118,32 @@ Call signal_completion when the branch is ready to merge.`,
 const RESOLVE_ROLE: WorkflowRole = {
   name: 'resolve',
   label: 'Resolve agent',
-  capabilities: ['signal-completion', 'save-skill'],
+  capabilities: ['signal-completion', 'save-skill', 'resolve-decision'],
   promptTemplate: `{{toolsPreamble}}
 
-The "{{stage}}" step failed for task "{{title}}".
-Error: {{error}}
+You are the RESOLVE agent for task "{{title}}". The "{{stage}}" step failed.
+
+Error:
+{{error}}
+
 Worktree: {{worldPath}}
-Recent transcript: {{transcript}}
-Candidate resolution skills: {{skills}}
-Diagnose and fix so {{stage}} can resume. If you cannot, explain why, then call signal_completion.`,
+Recent transcript:
+{{transcript}}
+
+Candidate resolution skills (read any that look relevant before acting):
+{{skills}}
+
+## Read carefully — your job is narrow
+(a) You are NOT here to finish the task. Your ONLY job is to diagnose THIS error and decide how to get the task back on track, then report that decision with the resolve_decision tool. Do not implement the task's feature.
+
+(b) Our strong preference is that errors are caught by the auto-resolve SCRIPT, never by an agent. This one reached you because no auto-resolve case matched it. So, in order:
+  1. Diagnose the cause. If you can fix it in the worktree (a bad file, a missing dependency, a stale artifact), do so, then call resolve_decision({action:"resume"}) to continue the interrupted agent, or {action:"retryStage"} to re-run the step fresh.
+  2. If this class of error is MECHANICALLY recognizable (a stable error signature → a scripted fix), capture that so it auto-resolves next time WITHOUT an agent: save_skill a skill named "resolve/<slug>" whose content states (i) a regex/signature that matches this error, (ii) the exact fix or retry that resolves it, and (iii) whether it's safe to auto-retry. These skills are the source material for new auto-resolve cases (added later through the reviewed PR gate — the merge-only workflow — so they are tested before they ever run automatically).
+  3. If you cannot fix it, call resolve_decision({action:"escalate", reason:"<what a human needs to do>"}). Do not loop or keep trying.
+
+(c) The candidate skills above are your index of prior resolutions — prefer reusing a known fix over rediscovering one.
+
+Always finish by calling resolve_decision exactly once.`,
 };
 
 // Lifecycle stages per bundled workflow (the pipeline the UI renders).

@@ -16,6 +16,7 @@ import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
+import { classifyLimitError } from '../agent/limits.js';
 import {
   TaskInput,
   TaskView,
@@ -87,6 +88,12 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let retryRequested = false;
   let world: WorldHandleLike | undefined;
   let session: string | undefined;
+  // The config home that minted `session`. Provider sessions are login-bound, so a
+  // later turn leased a DIFFERENT home must NOT resume this session — we drop it and
+  // let the turn start fresh (karmax's own `msgs` carries the conversation). §2.5.
+  let sessionHome: string | undefined;
+  // What a parked turn is waiting on (surfaced in the view; SPEC §6.2).
+  let waitingFor: TaskView['waitingFor'];
   let reviewInfo: ReviewInfo | undefined;
   let error: string | undefined;
   let pr: { url: string; number: number } | undefined;
@@ -98,6 +105,11 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let targetLocked = false;
   let mergeGranted = false;
   let seen = 0; // messages the Do agent has already processed
+  // Per-role transcripts surfaced in the view-model (SPEC §5.5): the Do agent's
+  // conversation is `msgs`; the merge/resolve agents run on their own message
+  // arrays whose input+output we accumulate here so all three are inspectable.
+  const mergeMsgs: Message[] = [];
+  const resolveMsgs: Message[] = [];
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, { accountId: string; configHome: string }>();
   let turnSeq = 0;
@@ -191,6 +203,14 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     }
   }
 
+  /** All per-role transcripts, omitting roles that haven't run a turn yet. */
+  function buildTranscripts(): { role: string; label: string; messages: Message[] }[] {
+    const t = [{ role: 'do', label: 'Do agent', messages: msgs }];
+    if (mergeMsgs.length) t.push({ role: 'merge', label: 'Merge agent', messages: mergeMsgs });
+    if (resolveMsgs.length) t.push({ role: 'resolve', label: 'Resolve agent', messages: resolveMsgs });
+    return t;
+  }
+
   function buildView(): TaskView {
     return {
       taskId,
@@ -199,6 +219,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       stage,
       status,
       messages: msgs,
+      transcripts: buildTranscripts(),
       reviewInfo,
       actions: allowed(),
       state: {
@@ -219,6 +240,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       subTasks: subTaskIds.length ? subTaskIds : undefined,
       parentTaskId: input.parentTaskId,
       error,
+      waitingFor,
       pointOfNoReturnPassed,
       // The task-scope params the UI may edit right now (SPEC §5.5): declared
       // `untilUsed` fields not yet consumed. `queue` fields never appear here.
@@ -282,19 +304,50 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           if (!auto.resolved && world) {
             // The resolve agent is about to run — freeze `agent:resolve` (SPEC §5.5).
             consumed.add('agent:resolve');
-            // Escalate to the Resolve agent with a context bundle.
-            const r = await leasedTurn((accountConfigHome) =>
+            // Escalate to the Resolve agent with a context bundle, accumulating its
+            // conversation into resolveMsgs so it's inspectable in the UI (SPEC §5.5).
+            const rin: Message = {
+              id: `r-in-${resolveMsgs.length}`,
+              role: 'user',
+              text: `Fix the ${stageName} failure. Error: ${error ?? ''}`,
+              ts: resolveMsgs.length,
+            };
+            resolveMsgs.push(rin);
+            const r = await leasedTurn('resolve', (accountConfigHome) =>
               long.runAgentTurn({
                 taskId,
                 role: 'resolve',
                 worldHandle: world as any,
-                messages: [{ id: `r${attempt}`, role: 'user', text: `Fix the ${stageName} failure.`, ts: 0 }],
+                messages: [rin],
                 task: liveInput,
                 bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
                 accountConfigHome,
               }),
             );
-            log.info('resolve agent ran', { completed: r.completed });
+            if (r.output?.trim()) resolveMsgs.push({ id: `r-out-${resolveMsgs.length}`, role: 'agent', text: r.output, ts: resolveMsgs.length });
+            // Consume the agent's structured verdict (SPEC §5.2, RESOLVE-PLAN §3.2)
+            // instead of blindly retrying. This is the fix for "the resolve agent's
+            // decision is ignored".
+            const decision = r.resolution;
+            if (decision) {
+              const detail =
+                decision.do === 'escalate' ? ` — ${decision.reason}` : decision.do === 'gotoStage' ? ` → ${decision.stage}` : '';
+              resolveMsgs.push({ id: `r-dec-${resolveMsgs.length}`, role: 'system', text: `Resolve decision: ${decision.do}${detail}`, ts: resolveMsgs.length });
+              log.info('resolve decision', { decision: decision.do });
+              if (decision.do === 'escalate') {
+                lastError = decision.reason || lastError;
+                break; // agent gives up → escalate to a human now (don't burn retries)
+              }
+              if (decision.do !== 'resume' && decision.do !== 'retryStage') {
+                // gotoStage / parkUntil need the stage-machine executor (a later phase);
+                // until then escalate to a human rather than silently ignore the request.
+                lastError = `Resolve agent requested "${decision.do}"${decision.do === 'gotoStage' ? ` → ${decision.stage}` : ''}, which isn't auto-applied yet — escalating to a human.`;
+                break;
+              }
+              // resume / retryStage → fall through and re-run the originating stage.
+            } else {
+              log.info('resolve agent ran (no explicit decision)', { completed: r.completed });
+            }
           }
           stage = prevStage as Stage;
           error = undefined; // clear for the retry display
@@ -314,24 +367,58 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     }
   }
 
+  /** May `session` (minted under `sessionHome`) be resumed under `home` now? Only
+   *  if the homes match — provider sessions are login-bound (§2.5). Passthrough
+   *  (no leased home) is tracked as '(profile)'. */
+  const sessionMatchesHome = (home: string | undefined): boolean =>
+    sessionHome === undefined || sessionHome === (home ?? '(profile)');
+
   /**
-   * Lease a connected login for one turn (SPEC §6.2), then return it. Activates
-   * only when the account pool is non-empty — otherwise the turn runs exactly as
-   * before with the profile's own home. Never hangs: if no grant arrives within
-   * the park window, it falls back to the profile default.
+   * Lease a connected login for one turn (SPEC §6.2), then return it. Leases only
+   * an account of the turn's provider (claude logins for claude agents, codex for
+   * codex). Activates only when the account pool is non-empty — otherwise the turn
+   * runs with the profile's own home (zero behavior change). While parked for a
+   * grant the task shows "waiting for a login" (that IS "waiting for quota refresh"
+   * when the pool is exhausted). If the leased turn fails on a usage/session limit,
+   * the leased account is reported exhausted so the coordinator marks it unavailable
+   * and arms a refresh timer, then the error is rethrown so withResolve re-leases a
+   * different available login — or parks until one refreshes.
    */
-  async function leasedTurn<T>(fn: (accountConfigHome?: string) => Promise<T>): Promise<T> {
+  async function leasedTurn<T>(role: string, fn: (accountConfigHome?: string) => Promise<T>): Promise<T> {
+    // No pool ⇒ no leasing at all (zero behavior change, no extra activity).
     if (accountPool <= 0) return await runCancellable(() => fn(undefined));
+    const prov = await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
+    const provider = prov === 'claude' || prov === 'codex' || prov === 'mock' ? prov : undefined;
+    if (!provider) return await runCancellable(() => fn(undefined));
     const turnId = `${taskId}#${turnSeq++}`;
-    await coord.leaseAccount(taskId, turnId);
+    await coord.leaseAccount(taskId, turnId, provider);
+    const priorStatus = status;
+    status = 'waiting';
+    waitingFor = { kind: 'account', provider };
+    await publish();
     await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
+    waitingFor = undefined;
+    if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
     const grant = accountGrants.get(turnId);
     accountGrants.delete(turnId);
+    const leasedHome = grant?.accountId === '(passthrough)' ? undefined : grant?.configHome;
     try {
-      return await runCancellable(() => fn(grant?.configHome));
+      return await runCancellable(() => fn(leasedHome));
+    } catch (err) {
+      // Usage/session-limit failure → tell the coordinator this login is exhausted
+      // (it arms a refresh timer), then rethrow so withResolve re-leases another.
+      if (grant && grant.accountId !== '(passthrough)' && !cancelled && !isCancellation(err)) {
+        const cls = classifyLimitError(describeError(err));
+        if (cls.limited) {
+          await coord
+            .reportAccountExhausted({ accountId: grant.accountId, window: cls.window ?? '5h', resetHint: cls.resetHint, note: cls.note })
+            .catch(() => undefined);
+        }
+      }
+      throw err;
     } finally {
       // returnAccount runs in the parent (uncancelled) scope so the lease is freed.
-      if (grant) await coord.returnAccount(grant.accountId).catch(() => undefined);
+      if (grant && grant.accountId !== '(passthrough)') await coord.returnAccount(grant.accountId).catch(() => undefined);
     }
   }
 
@@ -360,20 +447,25 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     await publish();
     if (cancelled) return await abort();
 
+    let doHome: string | undefined;
     const turn = await withResolve('do', () =>
-      leasedTurn((accountConfigHome) =>
-        long.runAgentTurn({
+      leasedTurn('do', (accountConfigHome) => {
+        doHome = accountConfigHome ?? '(profile)';
+        return long.runAgentTurn({
           taskId,
           role: 'do',
           worldHandle: world as any,
           messages: msgs,
-          session,
+          // Resume the stored session only if this turn's login minted it (§2.5);
+          // otherwise start fresh under the new login (msgs replays the context).
+          session: sessionMatchesHome(accountConfigHome) ? session : undefined,
           task: liveInput,
           accountConfigHome,
-        }),
-      ),
+        });
+      }),
     );
     session = turn.session ?? session;
+    sessionHome = doHome ?? sessionHome;
     if (turn.output?.trim()) msgs.push({ id: `a${msgs.length}`, role: 'agent', text: turn.output, ts: msgs.length });
     seen = msgs.length;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
@@ -419,13 +511,14 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         stage = 'do';
         continue;
       }
-      // Always attach a git-derived review (diff + changed files); the agent's own
-      // review info (summary/links/html) takes precedence where present (§5.5).
+      // Attach a git-derived changed-files summary; the agent's own review info
+      // (summary/links/html) takes precedence where present (§5.5). Diffs are
+      // intentionally omitted from the review packet — reviewers use the
+      // changed-files list plus the in-world terminal / conversation transcripts.
       const auto = await core.buildReview(world as any, base).catch(() => undefined);
       if (auto) {
         reviewInfo = {
           summary: reviewInfo?.summary ?? auto.summary,
-          diff: reviewInfo?.diff ?? auto.diff,
           changedFiles: auto.changedFiles,
           ...(reviewInfo?.links ? { links: reviewInfo.links } : {}),
           ...(reviewInfo?.html ? { html: reviewInfo.html } : {}),
@@ -488,16 +581,18 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
     // The merge agent is about to run — freeze `agent:merge` (SPEC §5.5).
     consumed.add('agent:merge');
+    const mergeIn: Message = { id: `m-in-${mergeMsgs.length}`, role: 'user', text: `Prepare branch for merge into ${target}.`, ts: mergeMsgs.length };
+    mergeMsgs.push(mergeIn);
     let result;
     try {
       // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
-      await leasedTurn((accountConfigHome) =>
+      const mt = await leasedTurn('merge', (accountConfigHome) =>
         long.runAgentTurn({
           taskId,
           role: 'merge',
           worldHandle: world as any,
-          messages: [{ id: 'merge', role: 'user', text: `Prepare branch for merge into ${target}.`, ts: 0 }],
-          session,
+          messages: [mergeIn],
+          session: sessionMatchesHome(accountConfigHome) ? session : undefined,
           task: liveInput,
           bindings: { reviewInfo: reviewInfo?.summary ?? '' },
           accountConfigHome,
@@ -505,7 +600,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       ).catch((e) => {
         if (isCancellation(e)) throw e; // pre-merge cancel → abort, don't merge
         log.warn('merge agent turn failed; proceeding to authoritative merge', { e: String(e) });
+        return undefined;
       });
+      if (mt?.output?.trim()) mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: mergeMsgs.length });
       // …then the authoritative, deterministic merge that guarantees work lands.
       result = await long.finalizeMergeActivity(world as any, target);
     } catch (err) {

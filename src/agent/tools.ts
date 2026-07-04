@@ -1,4 +1,5 @@
 import { PlatformToolContext } from './types.js';
+import { parseTransition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
 /** Provider-neutral tool descriptor (mapped to OpenAI / MCP shapes per adapter). */
@@ -101,6 +102,21 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: { summary: { type: 'string' } },
     },
   },
+  {
+    name: 'resolve_decision',
+    description:
+      'Resolve agents ONLY. Report how to get the task back on track — do NOT finish the task yourself. action: "resume" (you fixed the cause; continue the interrupted agent), "retryStage" (re-run the failed step fresh), "gotoStage" (rewind to an earlier stage, optionally editing params), "parkUntil" (wait for an event then act), or "escalate" (you cannot fix it; hand to a human with a reason). Calling this ends your turn.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['resume', 'retryStage', 'gotoStage', 'parkUntil', 'escalate'] },
+        stage: { type: 'string', description: 'For gotoStage: earlier stage to return to (setup/do/review/pr/merge).' },
+        reason: { type: 'string', description: 'For escalate: why a human is needed.' },
+        params: { type: 'object', description: 'For gotoStage: param edits to apply on rewind, e.g. {"target":"release"}.' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 /** Returns name → executor for the platform tools, bound to a world + context. */
@@ -156,6 +172,12 @@ export function platformToolHandlers(
     async signal_completion(args) {
       ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);
       return 'completion recorded';
+    },
+    async resolve_decision(args) {
+      const t = parseTransition(args);
+      if (!t) return 'invalid resolve decision — use action: resume | retryStage | gotoStage | parkUntil | escalate';
+      ctx.resolveDecision(t);
+      return `resolution recorded: ${t.do}`;
     },
   };
 }

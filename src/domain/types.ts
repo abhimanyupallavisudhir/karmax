@@ -186,6 +186,13 @@ export interface TaskView {
   stage: Stage;
   status: TaskStatus;
   messages: Message[];
+  /**
+   * Per-role conversation transcripts (Do / Merge / Resolve). `messages` above is
+   * kept as the Do transcript for back-compat + the live bubble; this carries all
+   * roles so the UI can show each — collapsed except the one owning the active
+   * stage (SPEC §5.5). Roles with no turns yet are omitted.
+   */
+  transcripts?: { role: string; label: string; messages: Message[] }[];
   reviewInfo?: ReviewInfo;
   actions: DeclaredAction[];
   /** Mandatory structured state — keeps search/audit/auto-render working (§10.2). */
@@ -199,6 +206,12 @@ export interface TaskView {
   subTasks?: string[];
   parentTaskId?: string;
   error?: string;
+  /**
+   * What the task is currently parked on, if anything (SPEC §6.2). Surfaced so the
+   * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
+   * agent login to free up or refresh. Cleared once unparked.
+   */
+  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask'; provider?: string; earliestResetAt?: number; detail?: string };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right
