@@ -1374,6 +1374,11 @@ function settingsView(proj) {
       <div class="section-h">Workflow activation</div>
       <p style="color:var(--ink-2);margin-top:0">Activating a workflow resolves its dependencies and may spawn an onActivate preparation task.</p>
       <button class="btn" id="activate-sd">Activate software-dev (runs prep task)</button>
+    </div>
+    <div class="card" style="border-color:var(--danger-weak)">
+      <div class="section-h" style="color:var(--danger)">Danger zone</div>
+      <p style="color:var(--ink-2);margin-top:0">Deleting a project permanently removes it and all of its tasks. This cannot be undone.</p>
+      <button class="btn danger" id="delete-project">Delete project</button>
     </div>`;
 }
 async function hydrateWorkflowPins(projectId) {
@@ -1419,6 +1424,19 @@ function wireSettingsView(proj) {
       const r = await api(`/api/projects/${proj.id}/activate-workflow`, { method: 'POST', body: JSON.stringify({ workflow: 'software-dev' }) });
       toast(`Activated (deps: ${r.requires.join(', ') || 'none'}${r.spawnedTasks.length ? '; prep task spawned' : ''})`);
       refreshTasks();
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#delete-project')?.addEventListener('click', async () => {
+    if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
+    try {
+      await api(`/api/projects/${proj.id}`, { method: 'DELETE' });
+      toast(`Deleted project "${proj.name}"`);
+      if (S.projectId === proj.id) S.projectId = null;
+      await loadProjects();
+      S.tab = S.projectId ? 'tasks' : 'dashboard';
+      if (S.projectId) await loadTasks();
+      renderRail();
+      renderMain();
     } catch (e) { toast(e.message, true); }
   });
 }
