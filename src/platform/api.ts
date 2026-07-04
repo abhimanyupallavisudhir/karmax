@@ -284,6 +284,10 @@ export class KarmaxApi {
   async getTaskView(token: string, taskId: string): Promise<TaskView | undefined> {
     this.require(token, 'get_task');
     const snapshot = () => this.deps.store.getTask(taskId)?.lastView;
+    // Cosmetic human notes live on the record (never on the workflow), so mirror
+    // them onto whichever view we return — the UI shows/edits them at any stage.
+    const withNotes = (view: TaskView | undefined): TaskView | undefined =>
+      view ? { ...view, notes: this.deps.store.getTask(taskId)?.notes } : view;
     // Prefer the live workflow view, but bound it: a wedged workflow (e.g. stuck
     // in a workflow-task-failure loop) makes a query hang without rejecting, which
     // would otherwise freeze the whole task list / dashboard. Fall back fast.
@@ -291,9 +295,9 @@ export class KarmaxApi {
       const q = this.deps.client.workflow.getHandle(taskId).query('view') as Promise<TaskView>;
       q.catch(() => undefined); // swallow the late rejection if we time out first
       const view = await withTimeout(q, QUERY_TIMEOUT_MS);
-      return (view as TaskView) ?? snapshot();
+      return withNotes((view as TaskView) ?? snapshot());
     } catch {
-      return snapshot();
+      return withNotes(snapshot());
     }
   }
 

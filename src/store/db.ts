@@ -86,6 +86,12 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
     `);
+    // Free-form human notes, added after the initial schema. Guarded so existing
+    // installs pick it up without a re-create.
+    const cols = this.db.prepare('PRAGMA table_info(tasks)').all() as any[];
+    if (!cols.some((c) => c.name === 'notes')) {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN notes TEXT');
+    }
   }
 
   // ─── Projects ──────────────────────────────────────────────────────────────
@@ -178,8 +184,8 @@ export class Store {
     };
     this.db
       .prepare(
-        `INSERT INTO tasks (id, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
@@ -192,6 +198,7 @@ export class Store {
         t.createdAt,
         t.order,
         t.parentTaskId ?? null,
+        null,
         null,
       );
     return t;
@@ -226,6 +233,11 @@ export class Store {
 
   updateTaskParams(taskId: string, params: TaskParams) {
     this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId);
+  }
+
+  /** Set the human notes on a task (cosmetic, UI-only; empty string clears them). */
+  setTaskNotes(taskId: string, notes: string) {
+    this.db.prepare('UPDATE tasks SET notes = ? WHERE id = ?').run(notes === '' ? null : notes, taskId);
   }
 
   /** Mark a draft task as queued (clear its draft flag). */
@@ -373,6 +385,7 @@ function rowToTask(r: any): TaskRecord {
     createdAt: r.createdAt,
     order: r.ord,
     parentTaskId: r.parentTaskId ?? undefined,
+    notes: r.notes ?? undefined,
     lastView: r.lastView ? JSON.parse(r.lastView) : undefined,
   };
 }

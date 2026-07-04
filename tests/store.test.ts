@@ -54,6 +54,45 @@ describe('Store', () => {
     expect(tasks[0]!.params.prompt).toBe('do a thing');
   });
 
+  it('stores and clears cosmetic human notes on a task', () => {
+    const p = store.createProject('Acme');
+    const t = store.createTask({
+      projectId: p.id,
+      title: 'X',
+      workflow: 'software-dev',
+      workflowVersion: '1.0.0',
+      params: { prompt: 'x' },
+    });
+    expect(store.getTask(t.id)!.notes).toBeUndefined(); // none by default
+    // notes live off params (never assembled into any prompt)
+    expect(store.getTask(t.id)!.params.notes).toBeUndefined();
+    store.setTaskNotes(t.id, 'remember to check the flaky test');
+    expect(store.getTask(t.id)!.notes).toBe('remember to check the flaky test');
+    expect(store.getTask(t.id)!.params.prompt).toBe('x'); // params untouched
+    store.setTaskNotes(t.id, '');
+    expect(store.getTask(t.id)!.notes).toBeUndefined(); // empty clears
+  });
+
+  it('adds the notes column to a pre-existing database on reopen', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-notes-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const s1 = new Store(dbPath);
+    const p = s1.createProject('Acme');
+    const t = s1.createTask({
+      projectId: p.id,
+      title: 'X',
+      workflow: 'software-dev',
+      workflowVersion: '1.0.0',
+      params: { prompt: 'x' },
+    });
+    // simulate an install that predates the column, then reopen (runs migrate)
+    s1.db.exec('ALTER TABLE tasks DROP COLUMN notes');
+    const s2 = new Store(dbPath);
+    s2.setTaskNotes(t.id, 'jotted after upgrade');
+    expect(s2.getTask(t.id)!.notes).toBe('jotted after upgrade');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('tracks parent/child relationships', () => {
     const p = store.createProject('Acme');
     const parent = store.createTask({
