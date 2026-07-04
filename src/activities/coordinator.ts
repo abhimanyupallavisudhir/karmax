@@ -18,8 +18,9 @@ import {
 } from '../coordinators/names.js';
 
 type AccountProvider = 'claude' | 'codex' | 'mock';
+type CredKind = 'login' | 'ambient' | 'key';
 type LimitWindow = '5h' | 'weekly' | 'model';
-type AccountStatus = 'available' | 'exhausted' | 'manual-off';
+type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';
 
 export interface CoordinatorActivityDeps {
   client: Client;
@@ -99,8 +100,8 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
     },
 
     // ── account/token coordinator (SPEC §6.2) ──
-    /** Upsert connected logins into the account pool, creating the coordinator. */
-    async registerAccounts(accounts: { id: string; configHome: string; provider?: AccountProvider; maxConcurrent?: number }[]): Promise<void> {
+    /** Upsert credentials (logins, ambient, keys) into the pool, creating the coordinator. */
+    async registerAccounts(accounts: { id: string; configHome: string; provider?: AccountProvider; kind?: CredKind; apiKeyHandle?: string; maxConcurrent?: number }[]): Promise<void> {
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
         taskQueue,
@@ -109,15 +110,16 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signalArgs: [{ accounts }],
       });
     },
-    /** Request an account lease for a turn (the coordinator signals the task back).
-     *  `provider` scopes the lease to compatible logins (claude/codex). */
-    async leaseAccount(taskId: string, turnId: string, provider?: AccountProvider): Promise<void> {
+    /** Request a credential lease for a turn (the coordinator signals the task back).
+     *  `allowed` = the credential policy's ordered, enabled keys for this turn; the
+     *  coordinator grants the first available one (empty ⇒ passthrough). */
+    async leaseAccount(taskId: string, turnId: string, provider?: AccountProvider, allowed?: string[]): Promise<void> {
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
         taskQueue,
         args: [{}],
         signal: SIG_LEASE_ACCOUNT,
-        signalArgs: [{ taskId, turnId, provider }],
+        signalArgs: [{ taskId, turnId, provider, allowed }],
       });
     },
     async returnAccount(accountId: string): Promise<void> {

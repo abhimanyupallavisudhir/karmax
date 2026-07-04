@@ -7,9 +7,10 @@
  *   - OpenAI Responses API: `reasoning: { effort }` — reasoning models only.
  *
  * Both API surfaces are model-gated: the effort parameter (or the xhigh/max
- * levels) errors on models that don't support it — notably the current defaults
- * (claude-sonnet-4-5, gpt-4.1). These helpers return `undefined` (send nothing)
- * for unsupported models and clamp levels a supporting model can't take.
+ * levels) errors on models that don't support it. These helpers return `undefined`
+ * (send nothing) for non-reasoning models and clamp levels a supporting model
+ * can't take. Codex facts are from the CLI's own models_cache: gpt-5.x (5.5,
+ * 5.4-mini) support low/medium/high/xhigh; older reasoning models top out at high.
  */
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -27,13 +28,17 @@ export function claudeMessagesEffort(model: string | undefined, effort?: string)
   return e;
 }
 
-/** effort to send on the OpenAI Responses API `reasoning`, or undefined.
- *  Only reasoning models accept it; gpt-4.1 and other non-reasoning models don't. */
-export function codexReasoningEffort(model: string | undefined, effort?: string): 'minimal' | 'low' | 'medium' | 'high' | undefined {
+/** Reasoning effort for Codex — sent on the Responses API `reasoning.effort` and
+ *  the `codex exec` `-c model_reasoning_effort`. Only reasoning models accept it
+ *  (non-reasoning models like gpt-4.1/gpt-4o don't). gpt-5.x accepts xhigh; older
+ *  reasoning models clamp xhigh/max → high. */
+export function codexReasoningEffort(model: string | undefined, effort?: string): 'low' | 'medium' | 'high' | 'xhigh' | undefined {
   if (!effort || !model) return undefined;
   const m = model.toLowerCase();
-  if (!/^(o1|o3|o4|gpt-5|codex)/.test(m) && !m.includes('reasoning')) return undefined;
-  if (effort === 'xhigh' || effort === 'max') return 'high'; // Responses effort tops out at high
+  const isReasoning = /^(o1|o3|o4|gpt-5|codex)/.test(m) || m.includes('reasoning');
+  if (!isReasoning) return undefined;
+  const xhighOk = /^gpt-5/.test(m); // gpt-5.x support xhigh; o-series top out at high
+  if (effort === 'xhigh' || effort === 'max') return xhighOk ? 'xhigh' : 'high';
   if (effort === 'low' || effort === 'medium' || effort === 'high') return effort;
   return undefined;
 }

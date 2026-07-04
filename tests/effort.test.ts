@@ -30,9 +30,11 @@ describe('reasoning-effort → provider parameter mapping (SPEC §10.5)', () => 
       expect(codexReasoningEffort('o3-mini', 'low')).toBe('low');
       expect(codexReasoningEffort('gpt-4.1', 'high')).toBeUndefined(); // project default — not a reasoning model
     });
-    it('clamps xhigh/max down to high (Responses effort tops out at high)', () => {
-      expect(codexReasoningEffort('gpt-5', 'xhigh')).toBe('high');
-      expect(codexReasoningEffort('gpt-5', 'max')).toBe('high');
+    it('sends xhigh for gpt-5.x (they support it), clamping older reasoning models to high', () => {
+      expect(codexReasoningEffort('gpt-5.5', 'xhigh')).toBe('xhigh');
+      expect(codexReasoningEffort('gpt-5.4-mini', 'xhigh')).toBe('xhigh');
+      expect(codexReasoningEffort('gpt-5.5', 'max')).toBe('xhigh'); // max → the model's top tier
+      expect(codexReasoningEffort('o3-mini', 'xhigh')).toBe('high'); // o-series tops out at high
     });
     it('sends nothing when effort is unset', () => {
       expect(codexReasoningEffort('gpt-5', undefined)).toBeUndefined();

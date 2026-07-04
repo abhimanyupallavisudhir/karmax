@@ -14,7 +14,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
-import { capturedToken } from '../autonomy/config-homes.js';
+import { tokenToInject } from '../autonomy/config-homes.js';
 import { manifest } from '../contrib/manifests.js';
 import { attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
@@ -78,6 +78,10 @@ export interface RunAgentTurnArgs {
   /** Config home leased by the account coordinator for this turn (SPEC §6.2);
    * overrides the profile's own auth home so turns rotate across logins. */
   accountConfigHome?: string;
+  /** Broker API-key handle leased by the coordinator for this turn (a `key:handle:*`
+   * credential); resolved JIT and overrides the auth. Env keys carry no handle —
+   * they fall through to the adapter's env credential. */
+  accountApiKeyHandle?: string;
 }
 
 export interface PrepareChildArgs {
@@ -122,6 +126,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return (args.task.agents?.[args.role]?.provider ?? baseProfile.provider) as Provider;
     },
 
+    /** The ordered, enabled credential keys for a turn's provider, per the credential
+     *  policy resolved global→project→task (SPEC §7/§9). The coordinator leases the
+     *  first available one from this list. Empty ⇒ passthrough to the profile default. */
+    async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: 'claude' | 'codex' }): Promise<string[]> {
+      const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
+      const { enumerateCredentials, credentialsForProvider } = await import('../platform/credentials.js');
+      const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker });
+      const all = enumerateCredentials(sources);
+      const layers = readPolicyLayers((k) => store.kvGet(k), { projectId: args.projectId, taskId: args.taskId });
+      return credentialsForProvider(all, args.provider, layers).map((c) => c.key);
+    },
+
     async runAgentTurn(args: RunAgentTurnArgs) {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId, args.task.projectId);
       // Apply the per-role agent override from the task form (SPEC §10.5).
@@ -139,11 +155,31 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Resume a prior agent session if requested (SPEC §10.5): explicit session
       // id, or the stored session of a referenced task for this role.
       let session = args.session;
+      // `messages` may be augmented below (fork-via-replay), so take a mutable copy.
+      let messages = args.messages;
       if (!session && spec?.resumeFrom) {
         const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source role
-        session = spec.resumeFrom.sessionId
-          ?? (spec.resumeFrom.taskId ? store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) : undefined);
-        if (session) record(args.taskId, 'session.resumed', { from: spec.resumeFrom, session });
+        if (spec.resumeFrom.taskId) {
+          // FORK, don't mutate (SPEC §10.5: "forking, not mutating, the source"):
+          // seed a FRESH session by replaying the SOURCE task's conversation, so the
+          // source is never written to and any number of tasks can resume the same
+          // source independently — no shared-session collision. Provider-agnostic:
+          // works whether the source ran on Claude/Codex, key or subscription.
+          const srcView = store.getTask(spec.resumeFrom.taskId)?.lastView;
+          const srcMsgs =
+            srcView?.transcripts?.find((t) => t.role === srcRole)?.messages ??
+            (srcRole === 'do' ? srcView?.messages : undefined) ??
+            [];
+          if (srcMsgs.length) {
+            messages = [...srcMsgs, ...args.messages];
+            record(args.taskId, 'session.forked', { from: { taskId: spec.resumeFrom.taskId, role: srcRole }, replayed: srcMsgs.length });
+          }
+        } else if (spec.resumeFrom.sessionId) {
+          // A raw pasted provider session id = "continue THIS exact session" — resume
+          // it directly (best-effort; it must live in the home this turn runs under).
+          session = spec.resumeFrom.sessionId;
+          record(args.taskId, 'session.resumed', { session });
+        }
       }
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
@@ -180,13 +216,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const { provider: prov, name } = splitAccountRef(effAuth.account, profile.provider);
           home = deps.configHomes.ensure(prov, name);
         }
-        if (home) resolvedAuth = { configHome: home, ...(capturedToken(home) ? { oauthToken: capturedToken(home) } : {}) };
+        if (home) resolvedAuth = { configHome: home, ...(tokenToInject(home) ? { oauthToken: tokenToInject(home) } : {}) };
       }
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {
-        const tok = capturedToken(args.accountConfigHome);
+        const tok = tokenToInject(args.accountConfigHome);
         resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome, ...(tok ? { oauthToken: tok } : {}) };
+      }
+      // A coordinator-leased broker API-key handle wins over both (SPEC §6.2/§7): a
+      // policy that ordered an API key ahead of (or instead of) logins.
+      if (args.accountApiKeyHandle && deps.broker) {
+        const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
+        resolvedAuth = { apiKey };
       }
 
       const systemPrompt = assemblePrompt({
@@ -215,7 +257,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         {
           profile,
           world,
-          messages: args.messages,
+          messages,
           session,
           systemPrompt,
           role: args.role,
@@ -239,8 +281,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         },
       );
       if (token) deps.tokens?.revoke(token);
-      // Persist the session id so other tasks can resume from this one (§10.5).
-      if (result.session) store.kvSet(`session:${args.taskId}:${args.role}`, result.session);
+      // Persist the session id so other tasks can resume from this one (§10.5), plus
+      // which config home + provider minted it — provider sessions are home-bound, so
+      // the CLI resume-command needs the right CONFIG_DIR/CODEX_HOME (§2.5, #2/#3).
+      if (result.session) {
+        store.kvSet(`session:${args.taskId}:${args.role}`, result.session);
+        store.kvSet(
+          `sessionmeta:${args.taskId}:${args.role}`,
+          JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
+        );
+      }
 
       if (result.skills?.length) {
         for (const s of result.skills) record(args.taskId, 'skill.saved', { name: s.name });

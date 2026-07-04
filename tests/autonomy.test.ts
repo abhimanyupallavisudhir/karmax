@@ -6,7 +6,7 @@ import WebSocket from 'ws';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
-import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, capturedToken } from '../src/autonomy/config-homes.js';
+import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, isFullyAuthed, capturedToken, tokenToInject } from '../src/autonomy/config-homes.js';
 import { LoginManager } from '../src/autonomy/login.js';
 import { remoteAccessPlan } from '../src/remote/access.js';
 
@@ -134,6 +134,40 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     await new Promise((res) => setTimeout(res, 200));
     expect(isLoggedIn('claude', r.configHome)).toBe(true);
     expect(capturedToken(r.configHome)).toMatch(/^sk-ant-oat01-/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Full-login era (#6): a setup-token-only home is signed-in but NOT "fully authed",
+  // so `connect` re-runs login to UPGRADE it to a usage-pollable `.credentials.json`.
+  it('distinguishes a setup-token home (signed-in but not fully authed) from a full login', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-auth-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('claude', 'work');
+    // setup-token only:
+    fs.writeFileSync(path.join(home, 'karmax-oauth.json'), JSON.stringify({ token: 'sk-ant-oat01-XYZ' }));
+    expect(isLoggedIn('claude', home)).toBe(true);      // can run agents
+    expect(isFullyAuthed('claude', home)).toBe(false);  // but not usage-pollable → re-login upgrades
+    expect(tokenToInject(home)).toBe('sk-ant-oat01-XYZ'); // inject the setup-token (no native cred yet)
+    // after a full login writes .credentials.json, prefer the native credential:
+    fs.writeFileSync(path.join(home, '.credentials.json'), '{}');
+    expect(isFullyAuthed('claude', home)).toBe(true);
+    expect(tokenToInject(home)).toBeUndefined();         // native cred shadows the restricted setup-token
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('re-runs login on a setup-token home to upgrade it (does not short-circuit)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-upgrade-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('claude', 'work');
+    fs.writeFileSync(path.join(home, 'karmax-oauth.json'), JSON.stringify({ token: 'sk-ant-oat01-OLD' }));
+    let launched = false;
+    const login = new LoginManager(homes, () => {
+      launched = true;
+      return { cmd: 'bash', args: ['-c', 'echo "Visit https://example.com/dev?code=UP"; sleep 0.05'], env: {} as Record<string, string> };
+    });
+    const r = await login.connect('claude', 'work', { urlTimeoutMs: 2000 });
+    expect(launched).toBe(true);            // NOT short-circuited — the full login runs
+    expect(r.status).toBe('awaiting_oauth');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 

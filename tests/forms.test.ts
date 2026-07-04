@@ -153,26 +153,71 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(page.total).toBeGreaterThanOrEqual(page.tasks.length);
   });
 
-  it('resumes a prior agent session via the agent field', async () => {
-    // task A runs and stores its session
+  // Helper: run a source task to done and return it + its stored sessions.
+  const runSource = async (title: string) => {
     const a = await post(`/api/projects/${projectId}/tasks`, {
-      title: 'Session A',
+      title,
       workflow: 'software-dev',
       params: { prompt: '@write a.txt :: a\n@review a' },
     });
     await poll(a.id, 'review');
     await post(`/api/tasks/${a.id}/signal`, { signal: 'confirm' });
     await poll(a.id, 'done');
+    return { a, sessions: await get(`/api/tasks/${a.id}/sessions`) };
+  };
 
-    // task B resumes A's do-session via the agent field
+  it('FORKS a prior agent session via the agent field, without mutating the source (SPEC §10.5)', async () => {
+    const { a, sessions: aBefore } = await runSource('Fork source A');
+    expect(aBefore.do?.id).toBeTruthy(); // A stored a do-session
+
     const b = await post(`/api/projects/${projectId}/tasks`, {
-      title: 'Session B',
+      title: 'Fork B',
       workflow: 'software-dev',
       params: { prompt: '@write b.txt :: b\n@review b', 'agent:do': { provider: 'mock', resumeFrom: { taskId: a.id } } },
     });
     await poll(b.id, 'review');
     const events = await get(`/api/tasks/${b.id}/events?since=0`);
+    // FORK, not continue: B replays A's conversation into a FRESH session.
+    expect(events.some((e: any) => e.type === 'session.forked')).toBe(true);
+    expect(events.some((e: any) => e.type === 'session.resumed')).toBe(false);
+    expect(events.find((e: any) => e.type === 'session.forked').payload.replayed).toBeGreaterThan(0);
+    // Source is untouched: A's stored session is unchanged; B has its own, independent one.
+    expect(await get(`/api/tasks/${a.id}/sessions`)).toEqual(aBefore);
+    expect((await get(`/api/tasks/${b.id}/sessions`)).do?.id).not.toBe(aBefore.do?.id);
+    await post(`/api/tasks/${b.id}/signal`, { signal: 'confirm' });
+    await poll(b.id, 'done');
+  });
+
+  it('lets MULTIPLE tasks fork the same source independently (no shared-session collision)', async () => {
+    const { a, sessions: aBefore } = await runSource('Multi-fork source');
+    const mk = (n: string) =>
+      post(`/api/projects/${projectId}/tasks`, {
+        title: `Resumer ${n}`,
+        workflow: 'software-dev',
+        params: { prompt: `@write ${n}.txt :: ${n}\n@review ${n}`, 'agent:do': { provider: 'mock', resumeFrom: { taskId: a.id } } },
+      });
+    const [b, c] = await Promise.all([mk('b'), mk('c')]);
+    await Promise.all([poll(b.id, 'review'), poll(c.id, 'review')]);
+    for (const t of [b, c]) {
+      const ev = await get(`/api/tasks/${t.id}/events?since=0`);
+      expect(ev.some((e: any) => e.type === 'session.forked')).toBe(true);
+    }
+    // Both forked; the source is still untouched after two concurrent resumes.
+    expect(await get(`/api/tasks/${a.id}/sessions`)).toEqual(aBefore);
+    await Promise.all([post(`/api/tasks/${b.id}/signal`, { signal: 'confirm' }), post(`/api/tasks/${c.id}/signal`, { signal: 'confirm' })]);
+    await Promise.all([poll(b.id, 'done'), poll(c.id, 'done')]);
+  });
+
+  it('CONTINUES (not forks) when given a raw pasted session id', async () => {
+    const b = await post(`/api/projects/${projectId}/tasks`, {
+      title: 'Raw resume',
+      workflow: 'software-dev',
+      params: { prompt: '@write r.txt :: r\n@review r', 'agent:do': { provider: 'mock', resumeFrom: { sessionId: 'sess-explicit-123' } } },
+    });
+    await poll(b.id, 'review');
+    const events = await get(`/api/tasks/${b.id}/events?since=0`);
     expect(events.some((e: any) => e.type === 'session.resumed')).toBe(true);
+    expect(events.some((e: any) => e.type === 'session.forked')).toBe(false);
     await post(`/api/tasks/${b.id}/signal`, { signal: 'confirm' });
     await poll(b.id, 'done');
   });
