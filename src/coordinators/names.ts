@@ -19,6 +19,11 @@ export const SIG_LEASE_ACCOUNT = 'leaseAccount';
 export const SIG_RETURN_ACCOUNT = 'returnAccount';
 export const SIG_ACCOUNT_GRANTED = 'accountGranted';
 export const SIG_REGISTER_ACCOUNTS = 'registerAccounts';
+/** Ground-truth exhaustion feed from auto-resolve: mark a login unavailable +
+ *  arm a refresh timer (SPEC §6.2). */
+export const SIG_REPORT_EXHAUSTED = 'reportExhausted';
+/** Manual override (UI/MCP): set a login available/unavailable + its reset time. */
+export const SIG_SET_ACCOUNT_AVAILABILITY = 'setAccountAvailability';
 export const QRY_ACCOUNTS = 'accounts';
 
 export const SIG_REQUEST_SPEND = 'requestSpend';

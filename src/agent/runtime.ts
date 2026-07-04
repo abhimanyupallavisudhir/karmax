@@ -1,4 +1,5 @@
 import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
+import type { Transition } from '../resolve/transitions.js';
 import { Provider, ReviewInfo } from '../domain/types.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
@@ -34,6 +35,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
 
   let completed = false;
   let reviewInfo: ReviewInfo | undefined;
+  let resolution: Transition | undefined;
   const subTasks: { title: string; prompt: string }[] = [];
   const skills: { name: string; content: string }[] = [];
 
@@ -41,6 +43,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     signalCompletion(summary) {
       completed = true;
       if (summary && !reviewInfo?.summary) reviewInfo = { ...reviewInfo, summary };
+    },
+    resolveDecision(t) {
+      resolution = t;
+      completed = true; // a decision ends the resolve turn
     },
     createReviewInfo(info) {
       reviewInfo = { ...reviewInfo, ...info };
@@ -81,6 +87,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     completed,
     output: turn.output,
     reviewInfo,
+    resolution,
     subTasks: subTasks.length ? subTasks : undefined,
     skills: skills.length ? skills : undefined,
     // If the agent did work but didn't signal completion and spawned no sub-tasks,

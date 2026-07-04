@@ -99,7 +99,7 @@ async function main() {
   // Empty pool ⇒ per-turn leasing stays off (zero behavior change).
   const { makeCoordinatorActivities } = await import('./activities/coordinator.js');
   const coordClient = makeCoordinatorActivities({ client, taskQueue: TASK_QUEUE });
-  const pool = configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path }));
+  const pool = configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path, provider: (a.provider === 'codex' ? 'codex' : 'claude') as 'claude' | 'codex' }));
   if (pool.length) {
     await coordClient.registerAccounts(pool).catch((e) => console.warn('  • account pool register failed', String(e)));
     console.log(`  • Registered ${pool.length} login(s) into the account pool`);

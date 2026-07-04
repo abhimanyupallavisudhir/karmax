@@ -207,6 +207,14 @@ a { color: var(--accent); text-decoration: none; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
 .task-right { display: flex; align-items: center; gap: 12px; }
+.icon-btn svg { display: block; } /* archive/unarchive glyphs sit flush in the icon button */
+
+/* Undo action inside a toast — so an accidental archive is one click to reverse. */
+.toast-action {
+  margin-left: 14px; background: transparent; border: 1px solid var(--paper); color: var(--paper);
+  padding: 2px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.toast-action:hover { background: var(--paper); color: var(--ink); }
 
 /* ── the signature: stage pipeline ─────────────────────────── */
 .pipeline { display: flex; align-items: center; gap: 0; }

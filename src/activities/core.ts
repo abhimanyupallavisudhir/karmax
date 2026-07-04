@@ -115,6 +115,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return world.handle;
     },
 
+    /** The effective provider for a role's turn (task override → seeded profile),
+     *  so the workflow can lease an account of the right provider (SPEC §6.2). */
+    async resolveProvider(args: { role: AgentRole; task: TaskInput }): Promise<Provider> {
+      const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
+      return (args.task.agents?.[args.role]?.provider ?? baseProfile.provider) as Provider;
+    },
+
     async runAgentTurn(args: RunAgentTurnArgs) {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId, args.task.projectId);
       // Apply the per-role agent override from the task form (SPEC §10.5).
@@ -247,8 +254,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return result;
     },
 
-    /** Auto-derive review info from git so Review always shows what changed (§5.5). */
-    async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; diff: string; changedFiles: string[] }> {
+    /** Auto-derive the changed-files summary so Review always shows what changed
+     *  (§5.5). Diffs are intentionally NOT computed — they were removed from the
+     *  review packet; reviewers use the changed-files list + the in-world terminal. */
+    async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; changedFiles: string[] }> {
       const world = await worlds.open(handle);
       const root = handle.root;
       const { git } = await import('../world/git.js');
@@ -258,14 +267,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean),
         ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((f) => `${f} (new)`),
       ];
-      // intent-to-add so new files appear in the diff, then diff vs base (non-destructive).
-      await git(root, ['add', '-AN']);
-      const diffR = await git(root, ['diff', base]);
-      const diff = diffR.stdout.slice(0, 20000);
       void world;
       const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.` : 'No file changes detected.';
       record(handle.id, 'review.built', { files: changedFiles.length });
-      return { summary, diff, changedFiles };
+      return { summary, changedFiles };
     },
 
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {

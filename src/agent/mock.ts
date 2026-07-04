@@ -1,4 +1,5 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
+import { parseTransition } from '../resolve/transitions.js';
 
 /**
  * Deterministic mock agent for hermetic tests. It executes simple directives
@@ -13,6 +14,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './typ
  *   @review <summary>               attach review info
  *   @skill <name> :: <content>      save a skill
  *   @fail <message>                 throw (exercises Resolve)
+ *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
  *   @incomplete                     do NOT signal completion this turn
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
  */
@@ -85,6 +87,18 @@ export class MockAdapter implements AgentAdapter {
         }
         case 'fail':
           throw new Error(rest || 'mock failure');
+        case 'decide': {
+          // @decide <action> [:: reason] — a Resolve agent's structured verdict.
+          const [action, reason = ''] = splitOn(rest, '::');
+          const stageMatch = action.trim().match(/^(\w+)(?:\s+(\S+))?$/); // "gotoStage do"
+          const t = parseTransition({ action: stageMatch?.[1], stage: stageMatch?.[2], reason: reason.trim() });
+          if (t) {
+            ctx.resolveDecision(t);
+            complete = false; // the decision is the completion for a resolve turn
+            outputs.push(`decide: ${t.do}`);
+          }
+          break;
+        }
         case 'incomplete':
           complete = false;
           break;

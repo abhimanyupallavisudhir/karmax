@@ -113,12 +113,13 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     const coord = await h.client.workflow.start('accountCoordinator', {
       taskQueue: TASK_QUEUE,
       workflowId: accountCoordinatorId(),
-      args: [{ state: { accounts: [{ id: 'acct1', configHome: '/tmp/ch', maxConcurrent: 1, inUse: 0, fiveHourLimit: 5, fiveHourUsed: 0, windowResetAt: 0 }], queue: [], processed: 0 } }],
+      args: [{ state: { accounts: [{ id: 'acct1', configHome: '/tmp/ch', provider: 'claude', maxConcurrent: 1, inUse: 0, status: 'available' }], queue: [], processed: 0 } }],
     });
-    await coord.signal('leaseAccount', { taskId: grantee, turnId: 't1' });
+    await coord.signal('leaseAccount', { taskId: grantee, turnId: 't1', provider: 'claude' });
     await expect.poll(async () => ((await coord.query('accounts')) as any).accounts[0].inUse, { timeout: 10_000 }).toBe(1);
     const used = ((await coord.query('accounts')) as any).accounts[0];
-    expect(used.fiveHourUsed).toBe(1);
+    expect(used.status).toBe('available');
+    expect(used.provider).toBe('claude');
     await coord.signal('returnAccount', { accountId: 'acct1' });
     await expect.poll(async () => ((await coord.query('accounts')) as any).accounts[0].inUse, { timeout: 10_000 }).toBe(0);
 
@@ -131,7 +132,7 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
     const coordClient = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
     // Register a pool (creates the singleton coordinator via the new signal path).
-    await coordClient.registerAccounts([{ id: 'claude:work', configHome: '/tmp/karmax-ch-work', maxConcurrent: 2, fiveHourLimit: 100 }]);
+    await coordClient.registerAccounts([{ id: 'mock:work', configHome: '/tmp/karmax-ch-work', provider: 'mock', maxConcurrent: 2 }]);
     const coord = h.client.workflow.getHandle(accountCoordinatorId());
     await expect.poll(async () => ((await coord.query('accounts')) as any).accounts.length, { timeout: 10_000 }).toBe(1);
 
@@ -147,9 +148,10 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     const result = await handle.result();
     expect(result.stage).toBe('done');
 
-    // The do-turn leased the account (fiveHourUsed incremented) and returned it.
+    // The do-turn leased the account and returned it (inUse back to 0, still available).
     const acct = ((await coord.query('accounts')) as any).accounts[0];
-    expect(acct.fiveHourUsed).toBeGreaterThanOrEqual(1);
+    expect(acct.provider).toBe('mock');
+    expect(acct.status).toBe('available');
     await expect.poll(async () => ((await coord.query('accounts')) as any).accounts[0].inUse, { timeout: 10_000 }).toBe(0);
     await coord.terminate('test done');
   });

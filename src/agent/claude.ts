@@ -135,6 +135,12 @@ export class ClaudeAdapter implements AgentAdapter {
         tool('save_skill', 'Save a reusable skill.', { name: zod.string(), content: zod.string() }, async (a: any) => ({
           content: [{ type: 'text', text: await handlers.save_skill!(a) }],
         })),
+        tool(
+          'resolve_decision',
+          'Resolve agents only: report how to get the task back on track (resume/retryStage/gotoStage/parkUntil/escalate) — do not finish the task yourself.',
+          { action: zod.string(), stage: zod.string().optional(), reason: zod.string().optional(), params: zod.any().optional() },
+          async (a: any) => ({ content: [{ type: 'text', text: await handlers.resolve_decision!(a) }] }),
+        ),
       ],
     });
 

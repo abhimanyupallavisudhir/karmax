@@ -1,4 +1,5 @@
 import { AgentProfile, AgentRole, Message, Provider, ReviewInfo } from '../domain/types.js';
+import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
 /**
@@ -17,6 +18,10 @@ export interface PlatformToolContext {
   createSubTask(t: { title: string; prompt: string }): void;
   /** Persist a reusable skill (content, freely editable; SPEC §4.4). */
   saveSkill(s: { name: string; content: string }): void;
+  /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
+   *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
+   *  instead of guessing. Also marks the resolve turn complete. */
+  resolveDecision(t: Transition): void;
   /** Request a payment against the budget lease (SPEC §7.6). Returns the outcome:
    *  granted (charged) | needs_approval | needs_funding | denied. */
   requestSpend(args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -76,6 +81,8 @@ export interface TurnResult {
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
   error?: string;
+  /** The Resolve agent's structured recovery decision (RESOLVE-PLAN §3.2). */
+  resolution?: Transition;
 }
 
 export type { AgentProfile, AgentRole, Provider, Message, ReviewInfo };
