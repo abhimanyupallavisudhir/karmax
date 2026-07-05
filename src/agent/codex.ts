@@ -185,7 +185,10 @@ export class CodexAdapter implements AgentAdapter {
       }
       const t: string = ev.type ?? ev.msg?.type ?? '';
       if (/thread\.(started|created)|session\.created/.test(t)) {
+        const prev = threadId;
         threadId = ev.thread_id ?? ev.threadId ?? ev.session_id ?? ev.id ?? threadId;
+        // Publish it mid-turn for the live "fork this agent" command (#3).
+        if (threadId && threadId !== prev) ctx.onSession?.(threadId);
       }
       // Stream assistant text to the live log; keep the latest as a fallback output.
       const text = ev.item?.text ?? (ev.item?.type === 'agent_message' ? ev.item?.text ?? ev.item?.message : undefined) ?? ev.text;

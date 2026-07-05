@@ -32,6 +32,10 @@ export interface PlatformToolContext {
   }>;
   /** Stream incremental output to the task's live event log. */
   emit(text: string): void;
+  /** Called as soon as the provider session id is known (mid-turn), so the task can
+   *  publish it immediately — the drawer then shows a live "fork this agent" command
+   *  WHILE the turn runs, not only after it ends (RESOLVE-PLAN #3). Fire-once per id. */
+  onSession?: (session: string) => void;
   /** Aborts when the task is cancelled mid-turn (SPEC §5.6): adapters pass this to
    *  fetch and check it between tool iterations so cancel takes effect at once. */
   signal?: AbortSignal;

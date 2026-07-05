@@ -23,7 +23,7 @@ const S = {
   search: '',
   schema: [],
   paramDefaults: {},
-  sessions: {}, // role -> provider session id, for the "resume in CLI" copy command
+  sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
   ws: null,
 };
 
@@ -142,11 +142,11 @@ function renderAgentField(f, spec, inherited) {
       </div>
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
-    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
-      <input class="af-resume-search" placeholder="Search tasks to resume from…" style="width:100%;margin-top:6px;padding:7px 10px" />
+    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Fork a previous agent</summary>
+      <input class="af-resume-search" placeholder="Search tasks to fork from…" style="width:100%;margin-top:6px;padding:7px 10px" />
       <div class="af-resume-results" style="max-height:140px;overflow:auto"></div>
       <div class="af-resume-chosen" style="font-size:12px;color:var(--accent);margin-top:4px">${spec?.resumeFrom ? esc(JSON.stringify(spec.resumeFrom)) : ''}</div>
-      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
+      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
     </details>
   </div>`;
 }
@@ -230,7 +230,7 @@ function wireCombo(combo, getOptions, onChange) {
   });
 }
 
-// Wire agent-field controls: provider→model combobox + resume search (no toggle).
+// Wire agent-field controls: provider→model combobox + fork search (no toggle).
 function wireAgentFields(root) {
   root.querySelectorAll('.agent-field').forEach((box) => {
     const combo = box.querySelector('.af-model-combo');
@@ -316,7 +316,7 @@ function resetAgentField(box) {
   if (eff && inh.effort) eff.value = inh.effort;
 }
 
-// Resume search: find tasks by title, then list their per-role agent sessions.
+// Fork search: find tasks by title, then list their per-role agent sessions.
 async function resumeSearch(box, q, results) {
   const ql = q.toLowerCase().trim();
   if (!ql) { results.innerHTML = ''; return; }
@@ -426,6 +426,8 @@ function connectWs() {
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
         S.liveOutput = '';
         refreshDrawer();
+      } else if (ev.type === 'session.started') {
+        refreshDrawer(); // the session id was just published mid-turn → show the live fork command
       } else renderDrawerEvents();
     }
     clearTimeout(refreshTimer);
@@ -739,6 +741,12 @@ async function openTaskForm(workflow, draft, seedText) {
             <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
             <span style="color:var(--ink-3);font-size:12px">Only you see this — never sent to the agent.</span>
           </div>
+          <details class="advanced" style="margin-top:10px">
+            <summary>Credentials — precedence &amp; enable/disable for this task</summary>
+            ${draft
+              ? `<p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p><div id="cred-editor-newtask">Loading…</div>`
+              : `<p class="task-sub" style="color:var(--ink-3);margin-top:0">This task inherits the project/global order. For task-specific precedence or enable/disable, <b>Save draft</b> first then reopen it (a draft has an id to attach the override to) — or adjust in the task's form once created.</p>`}
+          </details>
         </div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
           <button class="btn" id="tf-draft">Save draft</button>
@@ -757,6 +765,11 @@ async function openTaskForm(workflow, draft, seedText) {
   $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
+  // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
+  // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the
+  // running-task drawer (renderDrawer's #cred-editor-task). Change one → check the other.
+  // Keyed on a draft's id (a brand-new, unsaved task has none → the form shows a note).
+  if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
   const submit = async (draftMode) => {
     const body = collectForm($('#tf-body'), fields);
     // Cosmetic human notes — kept separate from `params` so they never reach the
@@ -895,12 +908,13 @@ function drawerBody(v) {
       const live = t.role === liveRole
         ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
         : '';
-      // Only subscription/CLI-resumable sessions carry a config home; API-key /
-      // stateless sessions can't be resumed from a terminal, so no command is shown.
+      // Only subscription/CLI sessions carry a config home; API-key / stateless
+      // sessions can't be forked from a terminal, so no command is shown. The session
+      // id is published mid-turn (#3), so this appears WHILE the agent runs.
       const sess = S.sessions && S.sessions[t.role];
-      const resumeCmd = sess?.id && sess?.home && v.worldPath ? resumeCommandFor(sess, v.worldPath) : '';
-      const copy = resumeCmd
-        ? `<button class="btn sm copy-cmd" data-cmd="${esc(resumeCmd)}" title="Copy a CLI command to resume this agent in your terminal">⧉ resume cmd</button>`
+      const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
+      const copy = forkCmd
+        ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
         : '';
       return `<details class="conversation" ${t.role === liveRole ? 'open' : ''}>
         <summary class="section-h" style="cursor:pointer;display:flex;align-items:center;gap:8px">
@@ -938,6 +952,11 @@ function drawerBody(v) {
     ${subtasks}
     ${conversations}
     <details class="advanced">
+      <summary>Credentials — precedence &amp; enable/disable for this task</summary>
+      <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the global/project order + enablement, just for this task. Drag to reorder; toggle On/Off. (This is the running-task form — the new-task form has the same control.)</p>
+      <div id="cred-editor-task">Loading…</div>
+    </details>
+    <details class="advanced">
       <summary>Advanced — terminal, live event log, structured state</summary>
       <div class="section-h">Terminal — open a shell in the world (ephemeral)</div>
       <div class="task-sub" style="gap:6px;flex-wrap:wrap">
@@ -948,8 +967,6 @@ function drawerBody(v) {
       <input id="term-in" class="title-in hidden" style="width:100%;margin-top:6px;padding:8px 10px" placeholder="command + Enter" />
       <div class="section-h">Live events</div>
       <div class="events" id="drawer-events"></div>
-      <div class="section-h">Credentials for this task (override precedence / enable-disable)</div>
-      <div id="cred-editor-task">Loading…</div>
       <div class="section-h">Structured state (the view-model floor)</div>
       <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>
     </details>`;
@@ -974,11 +991,12 @@ function waitingLabel(w) {
   }
 }
 
-// Build a copy-pasteable CLI command to resume an agent session in its own config
-// home (provider sessions are home-bound). Run from the task's world directory.
-function resumeCommandFor(sess, worldPath) {
-  if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex exec resume ${sess.id}`;
-  return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id}`;
+// A CLI command to FORK this agent's session into the user's terminal — a branched
+// copy that's safe to open even while the agent is running (it never mutates the live
+// session). Claude: --resume … --fork-session; Codex: `codex fork <id>` (SPEC §10.5, #3).
+function forkCommandFor(sess, worldPath) {
+  if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex fork ${sess.id}`;
+  return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
 }
 
 // Credential-policy editor (SPEC §7/§9): order credentials by precedence and
@@ -1011,14 +1029,17 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const c = byKey[key];
       const isOn = enabled.has(key);
       const login = loginByKey[key];
-      const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">(finish OAuth)</span>' : '';
+      const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">·oauth</span>' : '';
       const acct = canManage && c.kind === 'login';
-      return `<div class="cred-row" draggable="true" data-key="${esc(key)}">
-        <span class="cred-drag" title="Drag to set precedence">⠿</span>
-        <button class="cred-toggle ${isOn ? 'on' : 'off'}" title="${isOn ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${isOn ? 'On' : 'Off'}</button>
-        <span class="cred-label mono">${esc(c.label)}${warn}</span>
-        <span class="chip">${esc(c.kind)}</span>
-        <span class="cred-actions">${acct ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}</span>
+      // Compact inline chip: the kind is obvious from the label (a login is
+      // provider:account; ambient is its home path; a key gets a 🔑), so no chip.
+      const label = c.kind === 'ambient' ? (c.provider === 'codex' ? '~/.codex' : '~/.claude') : c.label;
+      const icon = c.kind === 'key' ? '🔑 ' : '';
+      return `<div class="cred-row${isOn ? '' : ' off'}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
+        <span class="cred-drag">⠿</span>
+        <button class="cred-toggle ${isOn ? 'on' : 'off'}" title="${isOn ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${isOn ? 'on' : 'off'}</button>
+        <span class="cred-label mono">${icon}${esc(label)}${warn}</span>
+        ${acct ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}
       </div>`;
     })
     .join('')}</div>`;
@@ -1062,11 +1083,19 @@ function wireCredDrag(list, onReorder) {
   list.addEventListener('dragover', (e) => {
     e.preventDefault();
     if (!dragging) return;
-    const after = [...list.querySelectorAll('.cred-row:not(.dragging)')].find((r) => {
-      const b = r.getBoundingClientRect();
-      return e.clientY < b.top + b.height / 2;
-    });
-    after ? list.insertBefore(dragging, after) : list.appendChild(dragging);
+    // Reading-order insertion for a wrapping (inline) list: the nearest chip whose
+    // center is AFTER the cursor (next row, or further right on the same row).
+    let best = null, bestDist = Infinity;
+    for (const el of list.querySelectorAll('.cred-row:not(.dragging)')) {
+      const b = el.getBoundingClientRect();
+      const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
+      const sameRow = Math.abs(cy - e.clientY) <= b.height / 2;
+      const after = cy - e.clientY > b.height / 2 || (sameRow && cx > e.clientX);
+      if (!after) continue;
+      const d = Math.hypot(cx - e.clientX, cy - e.clientY);
+      if (d < bestDist) { bestDist = d; best = el; }
+    }
+    best ? list.insertBefore(dragging, best) : list.appendChild(dragging);
   });
   list.addEventListener('drop', (e) => { e.preventDefault(); onReorder([...list.querySelectorAll('.cred-row')].map((r) => r.dataset.key)); });
 }
@@ -1712,18 +1741,14 @@ function globalSettingsView() {
     <p style="color:var(--ink-2);margin-top:-8px">Your defaults across all projects. Projects can override these; tasks override both.</p>
     ${settingsForms('global')}
     ${profilesCard('global')}
-    <div class="card">
-      <div class="section-h">Credentials &amp; precedence</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Order which logins/keys agents try (top = highest precedence) and enable/disable each. API keys are off by default when a subscription exists. Projects and tasks can override this.</p>
-      <div id="cred-editor-global">Loading…</div>
-    </div>
     ${paymentsCard('global')}
     <div class="card" id="accounts-card">
-      <div class="section-h">Accounts</div>
+      <div class="section-h">Accounts &amp; precedence</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Every login and API key agents can use, in one list. <b>Drag</b> to set precedence (top = tried first); toggle <b>On/Off</b> to enable/disable. API keys are off by default when a subscription exists. Projects and each task override this order + enablement (a task in its own form).</p>
+      <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
-      <div style="font-weight:600;margin-bottom:4px">Logins (subscriptions)</div>
+      <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude or Codex account to use its subscription. Each gets an isolated config home you can switch between (dodges token limits). karmax opens the provider's own login — you complete it; karmax never types your credentials.</p>
-      <div id="logins-list" style="margin-bottom:10px"></div>
       <div class="form-row"><label>Connect a login</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <select id="login-provider"><option>claude</option><option>codex</option></select>
@@ -1738,8 +1763,7 @@ function globalSettingsView() {
         <div id="login-result" style="font-size:12px;margin-top:6px"></div>
       </div>
 
-      <div style="font-weight:600;margin:14px 0 4px">API keys</div>
-      <div id="accounts-list" style="margin-bottom:10px"></div>
+      <div style="font-weight:600;margin:14px 0 4px">Register an API key</div>
       <div class="form-row"><label>Register a key</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <select id="acct-provider"><option>claude</option><option>codex</option></select>
@@ -1961,29 +1985,11 @@ async function hydrateProfiles(scope, projectId) {
   }));
 }
 
-// The accounts card (logins + API keys) — a global concept; projects choose which
-// via the per-profile checkboxes above.
+// The logins + API keys now live in the unified credential manager (#cred-editor-global:
+// drag to reorder, On/Off to enable/disable, ✎/✕ to rename/delete a login). This just
+// refreshes it after a connect/register/delete.
 async function hydrateAccounts() {
-  let handles = [], logins = [];
-  try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
-  const accBox = $('#accounts-list');
-  if (accBox) accBox.innerHTML = handles.length ? handles.map((h) => `<span class="chip">${esc(h)}</span>`).join(' ') : '<span style="color:var(--ink-3)">No keys registered.</span>';
-  const loginBox = $('#logins-list');
-  if (loginBox) loginBox.innerHTML = logins.length
-    ? logins.map((l) => `<span class="chip" data-login="${esc(l.provider)}:${esc(l.account)}" title="${l.loggedIn ? 'signed in' : 'connect pending — finish OAuth in your browser'}">
-        ${l.loggedIn ? '🟢' : '🟡'} ${esc(l.provider)}:${esc(l.account)}
-        <span class="login-rename" data-p="${esc(l.provider)}" data-a="${esc(l.account)}" title="Rename" style="cursor:pointer;margin-left:6px">✎</span>
-        <span class="login-del" data-p="${esc(l.provider)}" data-a="${esc(l.account)}" title="Delete" style="cursor:pointer;margin-left:4px">✕</span></span>`).join(' ')
-    : '<span style="color:var(--ink-3)">No logins connected.</span>';
-  loginBox?.querySelectorAll('.login-del').forEach((x) => x.addEventListener('click', async () => {
-    if (!confirm(`Delete login ${x.dataset.p}:${x.dataset.a}? Its stored credentials are removed.`)) return;
-    try { await api(`/api/accounts/logins/${x.dataset.p}/${encodeURIComponent(x.dataset.a)}`, { method: 'DELETE' }); toast('Login deleted'); hydrateAccounts(); } catch (e) { toast(e.message, true); }
-  }));
-  loginBox?.querySelectorAll('.login-rename').forEach((x) => x.addEventListener('click', async () => {
-    const to = prompt(`Rename login ${x.dataset.p}:${x.dataset.a} to:`, x.dataset.a);
-    if (!to || to === x.dataset.a) return;
-    try { await api(`/api/accounts/logins/${x.dataset.p}/${encodeURIComponent(x.dataset.a)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); hydrateAccounts(); } catch (e) { toast(e.message, true); }
-  }));
+  await renderCredentialEditor($('#cred-editor-global'), 'global');
 }
 
 function profilesCard(scope) {
@@ -1996,9 +2002,8 @@ function profilesCard(scope) {
 
 function wireGlobalSettings() {
   hydrateSettingsForms('global');
-  renderCredentialEditor($('#cred-editor-global'), 'global');
+  renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
   hydrateProfiles('global');
-  hydrateAccounts();
   hydrateWorkflows();
   wirePaymentsCard('global');
   $('#wf-install')?.addEventListener('click', async () => {

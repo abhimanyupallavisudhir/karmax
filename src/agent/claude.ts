@@ -210,7 +210,12 @@ export class ClaudeAdapter implements AgentAdapter {
         env,
       },
     });
+    let publishedSession = false;
     for await (const message of iterator) {
+      // Publish the session id the moment it's known — the SDK's init message carries
+      // it — so the drawer shows a live "fork this agent" command mid-turn (#3).
+      const sid: string | undefined = (message as any).session_id;
+      if (sid && !publishedSession) { session = sid; publishedSession = true; ctx.onSession?.(sid); }
       if (message.type === 'assistant') {
         const text = (message.message?.content ?? [])
           .filter((b: any) => b.type === 'text')

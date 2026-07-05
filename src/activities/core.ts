@@ -298,6 +298,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           onEmit: (t) => record(args.taskId, 'agent.output', { text: t }),
+          // Publish the session id + its home the moment the adapter knows it (mid-turn),
+          // so the drawer's live "fork this agent" command appears WHILE the turn runs,
+          // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.
+          onSession: (s) => {
+            store.kvSet(`session:${args.taskId}:${args.role}`, s);
+            store.kvSet(
+              `sessionmeta:${args.taskId}:${args.role}`,
+              JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
+            );
+            record(args.taskId, 'session.started', { role: args.role });
+          },
           ...(deps.payments
             ? {
                 budget: new BudgetService(store, deps.payments),

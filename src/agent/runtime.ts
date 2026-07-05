@@ -22,6 +22,9 @@ export interface RunTurnDeps {
   /** Cancellation propagated from the workflow (SPEC §5.6 mid-turn cancel). */
   signal?: AbortSignal;
   heartbeat?: () => void;
+  /** Publish the provider session id the moment it's known (mid-turn), for the live
+   *  "fork this agent" command in the drawer (RESOLVE-PLAN #3). */
+  onSession?: (session: string) => void;
 }
 
 /**
@@ -76,6 +79,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     emit(text) {
       deps.onEmit?.(text);
     },
+    onSession: deps.onSession,
     signal: deps.signal,
     heartbeat: deps.heartbeat,
   };
