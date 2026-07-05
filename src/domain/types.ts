@@ -57,6 +57,12 @@ export interface TaskRecord {
   createdAt: number;
   order: number;
   parentTaskId?: string;
+  /**
+   * Free-form human notes about the task (SPEC §10). Purely cosmetic — shown only
+   * in the UI and never assembled into any agent prompt. The human jots whatever
+   * they want here; it has no effect on workflow execution.
+   */
+  notes?: string;
   /** Last view snapshot, refreshed opportunistically so terminal/parked tasks list cheaply. */
   lastView?: TaskView;
 }
@@ -126,6 +132,20 @@ export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'l
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
 export type FieldBind = 'prompt' | 'top' | 'project' | 'profile';
+/**
+ * When a param may be edited after the task is queued (SPEC §4.5/§5.5). This is
+ * the single declaration that drives in-flight edits: the workflow validator
+ * enforces it, and the UI/gateway derive which fields to expose as editable.
+ * - `queue`    — frozen once the workflow starts (draft-only). The default.
+ * - `untilUsed`— editable in-flight until the workflow *consumes* it: the target
+ *                branch until a PR opens / the merge enqueue; the merge agent
+ *                until the merge turn runs; the resolve agent until a resolve
+ *                turn runs. Consumption points are workflow-specific.
+ * - `always`   — editable at any time (reserved; unused in v1).
+ * An `untilUsed`/`always` field is only truly live if the workflow actually
+ * re-reads it at consumption time; declaring it without re-reading it is a bug.
+ */
+export type FieldMutable = 'queue' | 'untilUsed' | 'always';
 
 export interface FieldSpec {
   name: string;
@@ -140,6 +160,8 @@ export interface FieldSpec {
   bind: FieldBind;
   /** For agent fields / bind:'profile' — the role this configures (do/merge/resolve). */
   role?: string;
+  /** In-flight editability window (SPEC §4.5/§5.5). Omitted ⇒ `queue`. */
+  mutable?: FieldMutable;
 }
 
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
@@ -169,7 +191,20 @@ export interface TaskView {
   workflow: string;
   stage: Stage;
   status: TaskStatus;
+  /**
+   * Free-form human notes (cosmetic, UI-only — never sent to any agent). Mirrored
+   * onto the view from the task record so the UI can show/edit them at any stage,
+   * even for a task not currently in the loaded list. Not produced by the workflow.
+   */
+  notes?: string;
   messages: Message[];
+  /**
+   * Per-role conversation transcripts (Do / Merge / Resolve). `messages` above is
+   * kept as the Do transcript for back-compat + the live bubble; this carries all
+   * roles so the UI can show each — collapsed except the one owning the active
+   * stage (SPEC §5.5). Roles with no turns yet are omitted.
+   */
+  transcripts?: { role: string; label: string; messages: Message[] }[];
   reviewInfo?: ReviewInfo;
   actions: DeclaredAction[];
   /** Mandatory structured state — keeps search/audit/auto-render working (§10.2). */
@@ -183,7 +218,20 @@ export interface TaskView {
   subTasks?: string[];
   parentTaskId?: string;
   error?: string;
+  /**
+   * What the task is currently parked on, if anything (SPEC §6.2). Surfaced so the
+   * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
+   * agent login to free up or refresh. Cleared once unparked.
+   */
+  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask'; provider?: string; earliestResetAt?: number; detail?: string };
   pointOfNoReturnPassed?: boolean;
+  /**
+   * Task-scope param field names the workflow will accept live edits for right
+   * now (SPEC §5.5). Derived from each field's `mutable` window and the current
+   * stage; the UI renders these editable and everything else read-only. Enriched
+   * by the gateway from the manifest schema (the workflow needn't know its schema).
+   */
+  editableParams?: string[];
   updatedAt: number;
 }
 
@@ -245,6 +293,13 @@ export interface TaskInput {
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */
   grant?: string[];
+  /**
+   * Per-field in-flight editability windows (SPEC §4.5/§5.5), copied from the
+   * workflow manifest at assembly time. Lets the deterministic workflow validate
+   * live param edits without importing the manifest into the Temporal sandbox.
+   * Sparse — only non-`queue` fields are carried; a missing name means `queue`.
+   */
+  paramWindows?: Record<string, FieldMutable>;
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────

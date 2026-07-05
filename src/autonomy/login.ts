@@ -1,7 +1,7 @@
 import { spawn, ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { ConfigHomeManager, scrubbedEnv, isLoggedIn, KARMAX_TOKEN_FILE } from './config-homes.js';
+import { ConfigHomeManager, scrubbedEnv, isLoggedIn, isFullyAuthed, KARMAX_TOKEN_FILE } from './config-homes.js';
 import { Provider } from '../domain/types.js';
 
 /**
@@ -29,7 +29,10 @@ export type LoginCommand = (provider: Provider, configHome: string) => { cmd: st
 const DEFAULT_LOGIN: LoginCommand = (provider, home) => {
   const env = scrubbedEnv({ provider, configHome: home });
   if (provider === 'claude') {
-    return { cmd: process.env.KARMAX_CLAUDE_LOGIN_CMD ?? 'claude', args: (process.env.KARMAX_CLAUDE_LOGIN_ARGS ?? 'setup-token').split(' ').filter(Boolean), env };
+    // Full OAuth login (writes a native `.credentials.json`) — pollable for usage (#6)
+    // and read directly by the Agent SDK. `setup-token` remains available via override
+    // (its token can't read usage). --claudeai = subscription (vs --console = metered).
+    return { cmd: process.env.KARMAX_CLAUDE_LOGIN_CMD ?? 'claude', args: (process.env.KARMAX_CLAUDE_LOGIN_ARGS ?? 'auth login --claudeai').split(' ').filter(Boolean), env };
   }
   if (provider === 'codex') {
     return { cmd: process.env.KARMAX_CODEX_LOGIN_CMD ?? 'codex', args: (process.env.KARMAX_CODEX_LOGIN_ARGS ?? 'login').split(' ').filter(Boolean), env };
@@ -46,7 +49,9 @@ export class LoginManager {
   /** Start (or report) a login for an account. Returns the device URL to open. */
   async connect(provider: Provider, account: string, opts: { urlTimeoutMs?: number } = {}): Promise<LoginResult> {
     const configHome = this.homes.ensure(provider, account);
-    if (isLoggedIn(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
+    // Skip only if fully authed with a native credential. A setup-token-only home
+    // re-runs login here to UPGRADE to a full, usage-pollable credential (#6).
+    if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
     const spec = this.loginCommand(provider, configHome);
     if (!spec) return { provider, account, configHome, status: 'failed', detail: `no login command for ${provider}` };
 
@@ -56,15 +61,15 @@ export class LoginManager {
     } catch (e) {
       return { provider, account, configHome, status: 'failed', detail: `could not launch ${spec.cmd}: ${String((e as Error).message ?? e)}` };
     }
-    // Keep reading the child after the URL: when the user finishes OAuth in the
-    // browser, `claude setup-token` prints a long-lived token — persist it so the
-    // account reads as signed-in (fixes "still not signed in") and the Agent SDK
-    // can use it. `codex login` writes auth.json itself, so this is a no-op there.
+    // Keep reading the child after the URL: `claude auth login` / `codex login`
+    // write the native credential (`.credentials.json` / `auth.json`) directly, so
+    // the account reads as signed-in. If someone overrides back to `setup-token`
+    // (which PRINTS a token instead), persist that too so the SDK can use it.
     persistTokenWhenPrinted(child, configHome);
     const url = await captureUrl(child, opts.urlTimeoutMs ?? 8000);
     child.unref(); // let it keep running while the user completes OAuth
     if (url) return { provider, account, configHome, loginUrl: url, status: 'awaiting_oauth' };
-    if (isLoggedIn(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
+    if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
     return { provider, account, configHome, status: 'failed', detail: 'no login URL captured (is the CLI installed?)' };
   }
 

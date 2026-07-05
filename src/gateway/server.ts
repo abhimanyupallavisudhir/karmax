@@ -270,9 +270,32 @@ export class Gateway {
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
       if (editMatch && method === 'PATCH') {
         const b = await this.body(req);
-        const t = store.getTask(editMatch[1]!);
-        if (t) store.updateTaskParams(editMatch[1]!, { ...t.params, ...b.params });
-        return this.json(res, 200, store.getTask(editMatch[1]!) ?? null);
+        const id = editMatch[1]!;
+        const t = store.getTask(id);
+        if (!t) return this.json(res, 404, { error: 'no such task' });
+        // A draft has no running workflow — edit its stored params in place; they
+        // re-resolve at queue time (SPEC §10.4).
+        if (t.params?.draft) {
+          // Replace the workflow-field overrides wholesale (b.params is the form's
+          // full set of own overrides) so a field reset to its default is actually
+          // removed — a merge would leave the stale override behind. Lifecycle meta
+          // (draft/archived/profiles) is preserved across the edit.
+          const { draft, archived, profiles } = t.params;
+          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}) };
+          const replace = b.replace === true;
+          store.updateTaskParams(id, replace ? { ...meta, ...b.params } : { ...t.params, ...b.params });
+          return this.json(res, 200, store.getTask(id) ?? null);
+        }
+        // Once queued, params are frozen except the ones the workflow declares
+        // in-flight-editable (SPEC §4.5/§5.5). Forward to its validated update and
+        // let the validator reject anything frozen — a clear 409, never a silent
+        // no-op on the stored record (which the running workflow would ignore).
+        try {
+          const applied = await api.updateParams(token, id, b.params ?? {});
+          return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id) });
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {
@@ -287,6 +310,16 @@ export class Gateway {
         if (archived && live) return this.json(res, 400, { error: 'cannot archive a running task; cancel or finish it first' });
         store.updateTaskParams(archiveMatch[1]!, { ...t.params, archived });
         return this.json(res, 200, { ok: true, archived });
+      }
+      const notesMatch = p.match(/^\/api\/tasks\/([^/]+)\/notes$/);
+      if (notesMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        const t = store.getTask(notesMatch[1]!);
+        if (!t) return this.json(res, 404, { error: 'no such task' });
+        // Purely cosmetic human notes — stored on the record, never sent to any agent.
+        const notes = typeof b.notes === 'string' ? b.notes : '';
+        store.setTaskNotes(notesMatch[1]!, notes);
+        return this.json(res, 200, { ok: true, notes });
       }
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
@@ -307,10 +340,18 @@ export class Gateway {
       const sessMatch = p.match(/^\/api\/tasks\/([^/]+)\/sessions$/);
       if (sessMatch && method === 'GET') {
         const id = sessMatch[1]!;
-        const out: Record<string, string> = {};
+        // Each role → { id, home?, provider? } so the UI can build a CLI resume
+        // command targeting the right CONFIG_DIR/CODEX_HOME (provider sessions are
+        // home-bound). `home` is omitted for API-key/stateless sessions.
+        const out: Record<string, { id: string; home?: string; provider?: string }> = {};
         for (const role of ['do', 'merge', 'resolve', 'confirm']) {
           const s = store.kvGet(`session:${id}:${role}`);
-          if (s) out[role] = s;
+          if (!s) continue;
+          let home: string | undefined;
+          let provider: string | undefined;
+          const meta = store.kvGet(`sessionmeta:${id}:${role}`);
+          if (meta) { try { const m = JSON.parse(meta); home = m.home || undefined; provider = m.provider || undefined; } catch { /* ignore */ } }
+          out[role] = { id: s, ...(home ? { home } : {}), ...(provider ? { provider } : {}) };
         }
         return this.json(res, 200, out);
       }
@@ -504,6 +545,83 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
+      // Manual availability override for an agent login (SPEC §6.2): force a login
+      // on/off or edit its reset time (e.g. after upgrading a plan) without waiting
+      // for the old refresh. Signals the account coordinator directly.
+      if (p === '/api/accounts/availability' && method === 'POST') {
+        if (!this.deps.client) return this.json(res, 400, { error: 'no temporal client' });
+        const b = await this.body(req);
+        if (!b.accountId || !b.status) return this.json(res, 400, { error: 'accountId and status required' });
+        const status = ['available', 'manual-off', 'needs-attention', 'exhausted'].includes(b.status) ? b.status : 'exhausted';
+        const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
+        await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).setAccountAvailability({
+          accountId: String(b.accountId),
+          status,
+          ...(b.resetAt != null ? { resetAt: Number(b.resetAt) } : {}),
+        });
+        return this.json(res, 200, { ok: true });
+      }
+
+      // Proactive quota (#6): real usage % + reset for each pollable Claude login.
+      // GET returns the cached snapshots; recheck re-probes on demand (the button).
+      // Codex/API-key/setup-token creds aren't pollable → they show reactive status.
+      if (p === '/api/accounts/usage' && method === 'GET') {
+        const { enumerateCredentials } = await import('../platform/credentials.js');
+        const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+        const { isUsagePollable } = await import('../agent/usage.js');
+        const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+        const usage: Record<string, unknown> = {};
+        const pollable: string[] = [];
+        for (const c of creds) {
+          const canPoll = isUsagePollable(c);
+          if (canPoll) pollable.push(c.key);
+          const cached = store.kvGet(`usage:${c.key}`);
+          if (cached) usage[c.key] = JSON.parse(cached);
+          // Explain absence on a Claude login that CAN'T be polled (setup-token, no
+          // full `.credentials.json`) so the dashboard shows a reason, not a blank.
+          else if (!canPoll && c.provider === 'claude' && c.kind !== 'key') usage[c.key] = { ok: false, reason: 'setup-token' };
+        }
+        return this.json(res, 200, { usage, pollable });
+      }
+      if (p === '/api/accounts/usage/recheck' && method === 'POST') {
+        const b = await this.body(req);
+        const only = b.accountId ? String(b.accountId) : undefined;
+        const usage = await this.refreshUsage(only);
+        return this.json(res, 200, { usage });
+      }
+
+      // Credential policy (SPEC §7/§9): list every credential + its effective
+      // enablement per scope (global→project→task), and set a scope's ordering /
+      // enable-disable overrides.
+      if (p === '/api/credentials' && method === 'GET') {
+        const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
+        const { gatherCredentialSources, parsePolicy, credPolicyKey } = await import('../platform/credential-sources.js');
+        const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+        const projectId = url.searchParams.get('projectId') ?? undefined;
+        const taskId = url.searchParams.get('taskId') ?? undefined;
+        const g = parsePolicy(store.kvGet(credPolicyKey.global()));
+        const pr = projectId ? parsePolicy(store.kvGet(credPolicyKey.project(projectId))) : undefined;
+        const tk = taskId ? parsePolicy(store.kvGet(credPolicyKey.task(taskId))) : undefined;
+        const enabledKeys = (layers: { global?: unknown; project?: unknown; task?: unknown }) =>
+          resolveCredentials(creds, layers as any).map((c) => c.key);
+        return this.json(res, 200, {
+          credentials: creds.map((c) => ({ key: c.key, label: c.label, provider: c.provider, kind: c.kind })),
+          global: { own: g ?? {}, enabled: enabledKeys({ global: g }) },
+          ...(projectId ? { project: { own: pr ?? {}, enabled: enabledKeys({ global: g, project: pr }) } } : {}),
+          ...(taskId ? { task: { own: tk ?? {}, enabled: enabledKeys({ global: g, project: pr, task: tk }) } } : {}),
+        });
+      }
+      if (p === '/api/credentials/policy' && method === 'POST') {
+        const b = await this.body(req);
+        const { credPolicyKey } = await import('../platform/credential-sources.js');
+        const key =
+          b.scope === 'task' && b.taskId ? credPolicyKey.task(String(b.taskId))
+          : b.scope === 'project' && b.projectId ? credPolicyKey.project(String(b.projectId))
+          : credPolicyKey.global();
+        store.kvSet(key, JSON.stringify(b.policy ?? {}));
+        return this.json(res, 200, { ok: true });
+      }
+
       // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms
       if (p === '/api/schema' && method === 'GET') {
         // Built-in + installed workflows, so the New Task form offers both (§21d).
@@ -525,7 +643,7 @@ export class Gateway {
         const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
         const db = repo0 ? await defaultBranch(repo0).catch(() => undefined) : undefined;
         const enrich = (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
-          const out = this.enrichAgentDefaults(m, vals);
+          const out = this.enrichAgentDefaults(m, vals, projectId);
           if (db) {
             if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = db;
             if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = db;
@@ -627,18 +745,45 @@ export class Gateway {
    *  rotation reflects the current set (called after connect/rename/delete). */
   private async refreshLoginPool(): Promise<void> {
     if (!this.deps.configHomes || !this.deps.client) return;
-    const pool = this.deps.configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path }));
+    const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+    const { enumerateCredentials } = await import('../platform/credentials.js');
+    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+    const pool = creds.map((c) => ({ id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}) }));
     if (!pool.length) return;
     const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
     await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);
   }
 
-  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>) {
+  /** Probe usage for the pollable Claude logins (all, or just `only`) and cache the
+   *  snapshots in kv under `usage:<credKey>`. Drives the dashboard's real %; a probe
+   *  shells out `claude -p '/usage'` in an isolated dir so it can't race a leased home. */
+  private async refreshUsage(only?: string): Promise<Record<string, unknown>> {
+    const { store } = this.deps;
+    const { enumerateCredentials } = await import('../platform/credentials.js');
+    const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+    const { probeClaudeUsage, isUsagePollable } = await import('../agent/usage.js');
+    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }))
+      .filter((c) => isUsagePollable(c) && (!only || c.key === only));
+    const out: Record<string, unknown> = {};
+    await Promise.all(creds.map(async (c) => {
+      // ambient uses ~/.claude (no configHome); a login uses its own home.
+      const snap = await probeClaudeUsage({ configHome: c.kind === 'ambient' ? undefined : c.configHome });
+      store.kvSet(`usage:${c.key}`, JSON.stringify(snap));
+      out[c.key] = snap;
+    }));
+    return out;
+  }
+
+  private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
       if (f.type !== 'agent' || !f.role) continue;
       const spec = (out[f.name] as any) || {};
-      const prof = this.deps.store.getProfile(`${f.role}-default`);
+      // The project's role-default overlay overrides the global one (SPEC §9), so a
+      // per-project model/provider default flows through to new tasks' inherited value.
+      const prof =
+        (projectId ? this.deps.store.getProfile(`${projectId}::${f.role}-default`) : undefined) ??
+        this.deps.store.getProfile(`${f.role}-default`);
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);

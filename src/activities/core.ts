@@ -14,7 +14,10 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
-import { capturedToken } from '../autonomy/config-homes.js';
+import { tokenToInject } from '../autonomy/config-homes.js';
+import { materializeFork } from '../agent/fork.js';
+import os from 'node:os';
+import path from 'node:path';
 import { manifest } from '../contrib/manifests.js';
 import { attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
@@ -78,6 +81,10 @@ export interface RunAgentTurnArgs {
   /** Config home leased by the account coordinator for this turn (SPEC §6.2);
    * overrides the profile's own auth home so turns rotate across logins. */
   accountConfigHome?: string;
+  /** Broker API-key handle leased by the coordinator for this turn (a `key:handle:*`
+   * credential); resolved JIT and overrides the auth. Env keys carry no handle —
+   * they fall through to the adapter's env credential. */
+  accountApiKeyHandle?: string;
 }
 
 export interface PrepareChildArgs {
@@ -115,6 +122,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return world.handle;
     },
 
+    /** The effective provider for a role's turn (task override → seeded profile),
+     *  so the workflow can lease an account of the right provider (SPEC §6.2). */
+    async resolveProvider(args: { role: AgentRole; task: TaskInput }): Promise<Provider> {
+      const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
+      return (args.task.agents?.[args.role]?.provider ?? baseProfile.provider) as Provider;
+    },
+
+    /** The ordered, enabled credential keys for a turn's provider, per the credential
+     *  policy resolved global→project→task (SPEC §7/§9). The coordinator leases the
+     *  first available one from this list. Empty ⇒ passthrough to the profile default. */
+    async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: 'claude' | 'codex' }): Promise<string[]> {
+      const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
+      const { enumerateCredentials, credentialsForProvider } = await import('../platform/credentials.js');
+      const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker });
+      const all = enumerateCredentials(sources);
+      const layers = readPolicyLayers((k) => store.kvGet(k), { projectId: args.projectId, taskId: args.taskId });
+      return credentialsForProvider(all, args.provider, layers).map((c) => c.key);
+    },
+
     async runAgentTurn(args: RunAgentTurnArgs) {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId, args.task.projectId);
       // Apply the per-role agent override from the task form (SPEC §10.5).
@@ -129,15 +155,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : baseProfile;
       const world = await worlds.open(args.worldHandle);
 
-      // Resume a prior agent session if requested (SPEC §10.5): explicit session
-      // id, or the stored session of a referenced task for this role.
+      // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
+      // materializing the source session needs this turn's config home + world path.
       let session = args.session;
-      if (!session && spec?.resumeFrom) {
-        const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source role
-        session = spec.resumeFrom.sessionId
-          ?? (spec.resumeFrom.taskId ? store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) : undefined);
-        if (session) record(args.taskId, 'session.resumed', { from: spec.resumeFrom, session });
-      }
+      let messages = args.messages; // may be augmented by the replay fallback
+      let fork = false; // true → the adapter branches a NEW session id from `session`
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
       // capabilities = intersection(profile ceiling, granting principal).
@@ -173,22 +195,84 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const { provider: prov, name } = splitAccountRef(effAuth.account, profile.provider);
           home = deps.configHomes.ensure(prov, name);
         }
-        if (home) resolvedAuth = { configHome: home, ...(capturedToken(home) ? { oauthToken: capturedToken(home) } : {}) };
+        if (home) resolvedAuth = { configHome: home, ...(tokenToInject(home) ? { oauthToken: tokenToInject(home) } : {}) };
       }
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {
-        const tok = capturedToken(args.accountConfigHome);
+        const tok = tokenToInject(args.accountConfigHome);
         resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome, ...(tok ? { oauthToken: tok } : {}) };
       }
+      // A coordinator-leased broker API-key handle wins over both (SPEC §6.2/§7): a
+      // policy that ordered an API key ahead of (or instead of) logins.
+      if (args.accountApiKeyHandle && deps.broker) {
+        const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
+        resolvedAuth = { apiKey };
+      }
 
+      // ── Fork a prior agent (SPEC §10.5) ──────────────────────────────────────
+      // Branch a NEW session from the source's REAL conversation — NOT by stuffing its
+      // transcript into the prompt. Make the source session visible to THIS turn's
+      // (home × world), then let the adapter run a native fork (Claude --fork-session /
+      // Codex exec resume). Falls back to transcript replay only if the source session
+      // file is gone (worlds get cleaned; the session survives in the home) or it's a
+      // cross-provider jump.
+      if (!session && spec?.resumeFrom) {
+        const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
+        if (spec.resumeFrom.sessionId) {
+          // A raw pasted provider session id = "continue THIS exact session" (resume,
+          // not fork). Best-effort: it must live in the home this turn runs under.
+          session = spec.resumeFrom.sessionId;
+          record(args.taskId, 'session.resumed', { session });
+        } else if (spec.resumeFrom.taskId) {
+          const srcSession = store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) || undefined;
+          let srcHome: string | undefined;
+          let srcProvider: string | undefined;
+          const metaRaw = store.kvGet(`sessionmeta:${spec.resumeFrom.taskId}:${srcRole}`);
+          if (metaRaw) { try { const m = JSON.parse(metaRaw); srcHome = m.home || undefined; srcProvider = m.provider || undefined; } catch { /* ignore */ } }
+          const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), profile.provider === 'codex' ? '.codex' : '.claude');
+          let forked = false;
+          if (srcSession && (!srcProvider || srcProvider === profile.provider)) {
+            forked = materializeFork({ provider: profile.provider, session: srcSession, forkHome, worldPath: world.handle.root, srcHome });
+            if (forked) {
+              session = srcSession;
+              fork = true; // adapter branches a NEW session id from it (native fork)
+              record(args.taskId, 'session.forked', { from: spec.resumeFrom, session: srcSession, native: true });
+            }
+          }
+          if (!forked) {
+            // Degraded fallback (no real source session file — e.g. the mock adapter,
+            // a cleaned source, or a cross-provider jump): replay the source transcript
+            // as context. NOT a native fork — flagged `native: false`.
+            const srcView = store.getTask(spec.resumeFrom.taskId)?.lastView;
+            const srcMsgs =
+              srcView?.transcripts?.find((t) => t.role === srcRole)?.messages ??
+              (srcRole === 'do' ? srcView?.messages : undefined) ??
+              [];
+            if (srcMsgs.length) {
+              messages = [...srcMsgs, ...args.messages];
+              record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: srcMsgs.length, native: false });
+            }
+          }
+        }
+      }
+
+      // Self-healing loop (SPEC §3.4): show the Resolve agent the INDEX of prior saved
+      // resolutions (`{{skills}}`) so it reuses a known fix rather than rediscovering
+      // one. Read here (an activity) since the workflow can't touch the filesystem.
+      let bindings = args.bindings;
+      if (args.role === 'resolve') {
+        const { listResolveSkills, renderSkillsIndex } = await import('../resolve/skills.js');
+        const { paths } = await import('../config/paths.js');
+        bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
+      }
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: args.task,
         world: args.worldHandle,
         globalInstructions: deps.globalInstructions ?? GLOBAL_INSTRUCTIONS,
-        bindings: args.bindings,
+        bindings,
       });
       // Snapshot the journaled turn input (SPEC §5.4).
       record(args.taskId, 'turn.prompt', { role: args.role, profile: profile.id, provider: profile.provider });
@@ -208,8 +292,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         {
           profile,
           world,
-          messages: args.messages,
+          messages,
           session,
+          fork,
           systemPrompt,
           role: args.role,
           maxTurns: profile.maxTurns,
@@ -222,6 +307,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           onEmit: (t) => record(args.taskId, 'agent.output', { text: t }),
+          // Publish the session id + its home the moment the adapter knows it (mid-turn),
+          // so the drawer's live "fork this agent" command appears WHILE the turn runs,
+          // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.
+          onSession: (s) => {
+            store.kvSet(`session:${args.taskId}:${args.role}`, s);
+            store.kvSet(
+              `sessionmeta:${args.taskId}:${args.role}`,
+              JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
+            );
+            record(args.taskId, 'session.started', { role: args.role });
+          },
           ...(deps.payments
             ? {
                 budget: new BudgetService(store, deps.payments),
@@ -232,8 +328,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         },
       );
       if (token) deps.tokens?.revoke(token);
-      // Persist the session id so other tasks can resume from this one (§10.5).
-      if (result.session) store.kvSet(`session:${args.taskId}:${args.role}`, result.session);
+      // Persist the session id so other tasks can resume from this one (§10.5), plus
+      // which config home + provider minted it — provider sessions are home-bound, so
+      // the CLI resume-command needs the right CONFIG_DIR/CODEX_HOME (§2.5, #2/#3).
+      if (result.session) {
+        store.kvSet(`session:${args.taskId}:${args.role}`, result.session);
+        store.kvSet(
+          `sessionmeta:${args.taskId}:${args.role}`,
+          JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
+        );
+      }
 
       if (result.skills?.length) {
         for (const s of result.skills) record(args.taskId, 'skill.saved', { name: s.name });
@@ -247,8 +351,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return result;
     },
 
-    /** Auto-derive review info from git so Review always shows what changed (§5.5). */
-    async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; diff: string; changedFiles: string[] }> {
+    /** Auto-derive the changed-files summary so Review always shows what changed
+     *  (§5.5). Diffs are intentionally NOT computed — they were removed from the
+     *  review packet; reviewers use the changed-files list + the in-world terminal. */
+    async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; changedFiles: string[] }> {
       const world = await worlds.open(handle);
       const root = handle.root;
       const { git } = await import('../world/git.js');
@@ -258,14 +364,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean),
         ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((f) => `${f} (new)`),
       ];
-      // intent-to-add so new files appear in the diff, then diff vs base (non-destructive).
-      await git(root, ['add', '-AN']);
-      const diffR = await git(root, ['diff', base]);
-      const diff = diffR.stdout.slice(0, 20000);
       void world;
       const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.` : 'No file changes detected.';
       record(handle.id, 'review.built', { files: changedFiles.length });
-      return { summary, diff, changedFiles };
+      return { summary, changedFiles };
     },
 
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {

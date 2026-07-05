@@ -66,4 +66,4 @@ export const SIG = {
 } as const;
 
 export const QRY = { view: 'view' } as const;
-export const UPD = { setTarget: 'setTarget' } as const;
+export const UPD = { setTarget: 'setTarget', updateParams: 'updateParams' } as const;

@@ -21,6 +21,7 @@ import { ContributionRegistry } from './contrib/registry.js';
 import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
 import { remoteAccessPlan } from './remote/access.js';
+import { withTimeout } from './util/timeout.js';
 
 const VERSION = '1.0.0';
 
@@ -37,12 +38,16 @@ async function main() {
   }
 
   // ── Temporal dev server (SQLite-backed, dynamic ports) ──
-  console.log('  • Starting Temporal…');
+  // One long-lived server, reused across restarts/reloads (see dev-server.ts):
+  // spawning a fresh one per reload against the same SQLite file is what wedges
+  // Temporal. A wedged/dead server is auto-replaced here.
+  console.log('  • Connecting to Temporal…');
   const server = await startDevServer({
     dbFilename: path.join(p.temporal, 'temporal.db'),
     logLevel: 'error',
   });
   const conn = { address: server.address, namespace: server.namespace };
+  console.log(`  • Temporal ${server.reused ? 'reused (already running)' : 'started'} at ${server.address}`);
   if (server.uiUrl) console.log(`    Temporal UI: ${server.uiUrl}`);
 
   const { client, close: closeClient } = await makeClient(conn);
@@ -94,10 +99,15 @@ async function main() {
   // Empty pool ⇒ per-turn leasing stays off (zero behavior change).
   const { makeCoordinatorActivities } = await import('./activities/coordinator.js');
   const coordClient = makeCoordinatorActivities({ client, taskQueue: TASK_QUEUE });
-  const pool = configHomes.list().filter((a) => a.loggedIn).map((a) => ({ id: `${a.provider}:${a.account}`, configHome: a.path }));
+  // Register EVERY credential (logins, ambient, API keys) under its stable policy key
+  // so the coordinator can lease/track any of them (SPEC §6.2/§7).
+  const { gatherCredentialSources } = await import('./platform/credential-sources.js');
+  const { enumerateCredentials } = await import('./platform/credentials.js');
+  const creds = enumerateCredentials(gatherCredentialSources({ configHomes, broker }));
+  const pool = creds.map((c) => ({ id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}) }));
   if (pool.length) {
-    await coordClient.registerAccounts(pool).catch((e) => console.warn('  • account pool register failed', String(e)));
-    console.log(`  • Registered ${pool.length} login(s) into the account pool`);
+    await coordClient.registerAccounts(pool).catch((e) => console.warn('  • credential pool register failed', String(e)));
+    console.log(`  • Registered ${pool.length} credential(s) into the account pool`);
   }
 
   const workflows = new WorkflowManager(workerManager, new WorkflowRepoLoader(p.workflows), undefined, p.workflows);
@@ -126,9 +136,12 @@ async function main() {
   const contributions = new ContributionRegistry();
   const overlays = new Overlays();
 
-  // Ensure a default project exists for first-run UX.
+  // Ensure a default project exists for first-run UX. Seed it with an EMPTY
+  // config so branches inherit from global settings (or the repo's real default
+  // branch) instead of baking a project-scope "main" override that would shadow
+  // a global default like "master".
   if (store.listProjects().length === 0) {
-    store.createProject('My project', { defaultBase: 'main', defaultTarget: 'main' });
+    store.createProject('My project', {});
   }
 
   const staticDir = fileURLToPath(new URL('../web', import.meta.url));
@@ -163,12 +176,20 @@ async function main() {
     /* ignore */
   }
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('\n  shutting down…');
-    await closeGateway().catch(() => {});
-    await workerManager.stop().catch(() => {});
-    await closeClient().catch(() => {});
-    await server.stop().catch(() => {});
+    // Backstop: never let a hung dependency (e.g. a slow worker drain) block exit.
+    setTimeout(() => process.exit(0), 8000).unref();
+    // Bound every step so one wedged call can't strand the whole shutdown.
+    const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 5000).catch(() => {});
+    await step(closeGateway());
+    await step(workerManager.stop());
+    await step(closeClient());
+    await step(server.stop()); // no-op for the shared server — it persists for a fast restart
+    console.log('  (Temporal left running for a fast restart — `npm run reset` stops it)');
     process.exit(0);
   };
   process.on('SIGINT', shutdown);

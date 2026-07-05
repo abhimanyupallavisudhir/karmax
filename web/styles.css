@@ -207,6 +207,14 @@ a { color: var(--accent); text-decoration: none; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
 .task-right { display: flex; align-items: center; gap: 12px; }
+.icon-btn svg { display: block; } /* archive/unarchive glyphs sit flush in the icon button */
+
+/* Undo action inside a toast — so an accidental archive is one click to reverse. */
+.toast-action {
+  margin-left: 14px; background: transparent; border: 1px solid var(--paper); color: var(--paper);
+  padding: 2px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.toast-action:hover { background: var(--paper); color: var(--ink); }
 
 /* ── the signature: stage pipeline ─────────────────────────── */
 .pipeline { display: flex; align-items: center; gap: 0; }
@@ -222,6 +230,9 @@ a { color: var(--accent); text-decoration: none; }
 .pipeline .seg.current.waiting { background: var(--working); }
 .pipeline .seg.current.blocked { background: var(--danger); }
 .pipeline .seg.merged { background: var(--merged); opacity: 1; }
+/* 'escalated' = blocked, awaiting a human — flag the whole track, don't fake a position. */
+.pipeline.escalated .seg { background: var(--danger); opacity: 0.32; }
+.pipeline-lg.escalated .bar { background: var(--danger); opacity: 0.4; }
 .pipeline .ponr { width: 9px; height: 9px; transform: rotate(45deg); background: var(--line-strong); margin: 0 1px; flex: none; }
 .pipeline .ponr.passed { background: var(--merged); }
 .pipeline .ponr.current { background: var(--accent); }
@@ -341,6 +352,37 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
 .switch { display: flex; align-items: center; gap: 10px; }
 .switch input { width: 38px; height: 22px; }
 
+/* label + per-field "reset to default" affordance (SPEC §10.4/§10.5) */
+.label-row { display: flex; align-items: center; gap: 8px; }
+.label-row label { flex: 1; }
+.field-reset {
+  border: none; background: none; cursor: pointer; padding: 0;
+  font-size: 11px; font-weight: 600; color: var(--accent);
+}
+.field-reset[hidden] { display: none; }
+.field-reset:hover { text-decoration: underline; }
+
+/* custom combobox (model picker): a real dropdown that opens on focus/caret,
+   filters as you type, and still accepts free text (SPEC §10.5). */
+.combo { position: relative; display: flex; align-items: stretch; }
+.combo > input { flex: 1; width: 100%; padding-right: 30px !important; }
+.combo-caret {
+  position: absolute; top: 0; right: 0; height: 100%; width: 28px;
+  border: none; background: none; cursor: pointer; color: var(--ink-3);
+  display: flex; align-items: center; justify-content: center; font-size: 12px;
+}
+.combo-caret:hover { color: var(--ink); }
+.combo-menu {
+  position: absolute; top: calc(100% + 3px); left: 0; right: 0; z-index: 70;
+  max-height: 220px; overflow: auto; background: var(--surface);
+  border: 1px solid var(--line-strong); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.14); padding: 4px;
+}
+.combo-menu[hidden] { display: none; }
+.combo-opt { padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.combo-opt:hover, .combo-opt.active { background: var(--accent-weak); }
+.combo-empty { padding: 7px 10px; font-size: 12px; color: var(--ink-3); }
+
 /* empty states */
 .empty { text-align: center; padding: 56px 20px; color: var(--ink-3); }
 .empty .big { font-size: 17px; color: var(--ink-2); margin-bottom: 6px; font-weight: 550; }
@@ -380,3 +422,25 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* Unified credential manager (logins + ambient + API keys): compact inline chips —
+   drag to set precedence, toggle On/Off to enable/disable. Global / project / task. */
+.cred-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.cred-row {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface-2); font-size: 12px; line-height: 1.6;
+}
+.cred-row.off { opacity: 0.5; }
+.cred-row.dragging { opacity: 0.4; }
+.cred-drag { cursor: grab; color: var(--ink-3); user-select: none; font-size: 11px; line-height: 1; }
+.cred-drag:active { cursor: grabbing; }
+.cred-label { white-space: nowrap; }
+.cred-toggle {
+  font-size: 10px; font-weight: 700; padding: 0 7px; border-radius: 999px;
+  cursor: pointer; border: 1px solid var(--line); text-transform: uppercase; flex: none;
+}
+.cred-toggle.on { background: var(--accent); color: #fff; border-color: transparent; }
+.cred-toggle.off { background: transparent; color: var(--ink-3); }
+.cred-rename, .cred-del { cursor: pointer; color: var(--ink-3); font-size: 11px; }
+.cred-rename:hover, .cred-del:hover { color: var(--accent); }

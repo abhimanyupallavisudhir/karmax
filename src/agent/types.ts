@@ -1,4 +1,5 @@
 import { AgentProfile, AgentRole, Message, Provider, ReviewInfo } from '../domain/types.js';
+import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
 /**
@@ -17,6 +18,10 @@ export interface PlatformToolContext {
   createSubTask(t: { title: string; prompt: string }): void;
   /** Persist a reusable skill (content, freely editable; SPEC §4.4). */
   saveSkill(s: { name: string; content: string }): void;
+  /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
+   *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
+   *  instead of guessing. Also marks the resolve turn complete. */
+  resolveDecision(t: Transition): void;
   /** Request a payment against the budget lease (SPEC §7.6). Returns the outcome:
    *  granted (charged) | needs_approval | needs_funding | denied. */
   requestSpend(args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -27,6 +32,10 @@ export interface PlatformToolContext {
   }>;
   /** Stream incremental output to the task's live event log. */
   emit(text: string): void;
+  /** Called as soon as the provider session id is known (mid-turn), so the task can
+   *  publish it immediately — the drawer then shows a live "fork this agent" command
+   *  WHILE the turn runs, not only after it ends (RESOLVE-PLAN #3). Fire-once per id. */
+  onSession?: (session: string) => void;
   /** Aborts when the task is cancelled mid-turn (SPEC §5.6): adapters pass this to
    *  fetch and check it between tool iterations so cancel takes effect at once. */
   signal?: AbortSignal;
@@ -39,8 +48,11 @@ export interface TurnInput {
   world: World;
   /** Conversation so far; the agent acts on the latest user message(s). */
   messages: Message[];
-  /** Resume id from the prior turn (SPEC §7.2). */
+  /** A session to continue (prior turn, SPEC §7.2) OR — with `fork` — to branch from. */
   session?: string;
+  /** Fork `session` into a NEW session instead of continuing it (SPEC §10.5): the
+   *  source is left untouched. Claude → `--fork-session`; Codex → resume a copied rollout. */
+  fork?: boolean;
   /** Assembled system prompt (role template + bindings + instructions), snapshotted upstream. */
   systemPrompt: string;
   role: AgentRole;
@@ -76,6 +88,8 @@ export interface TurnResult {
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
   error?: string;
+  /** The Resolve agent's structured recovery decision (RESOLVE-PLAN §3.2). */
+  resolution?: Transition;
 }
 
 export type { AgentProfile, AgentRole, Provider, Message, ReviewInfo };

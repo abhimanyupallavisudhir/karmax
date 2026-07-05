@@ -23,8 +23,8 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
 }
 
 export function defaultModel(provider: Provider): string | undefined {
-  if (provider === 'codex') return process.env.KARMAX_OPENAI_MODEL ?? 'gpt-4.1';
-  if (provider === 'claude') return process.env.KARMAX_CLAUDE_MODEL ?? 'claude-sonnet-4-5';
+  if (provider === 'codex') return process.env.KARMAX_OPENAI_MODEL ?? 'gpt-5.5';
+  if (provider === 'claude') return process.env.KARMAX_CLAUDE_MODEL ?? 'claude-sonnet-5';
   return undefined;
 }
 

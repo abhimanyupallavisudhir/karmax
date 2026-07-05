@@ -49,7 +49,7 @@ describe('default branch + auto-review (real Temporal + git)', () => {
     await h?.stop();
   });
 
-  it('detects the default branch, lands work there, and auto-builds review (diff + files + agent msg)', async () => {
+  it('detects the default branch, lands work there, and auto-builds review (files + agent msg)', async () => {
     // a repo whose default branch is "trunk", with NO base/target configured
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-pe-'));
     await gitOrThrow(repo, ['init', '-q', '-b', 'trunk']);
@@ -73,11 +73,14 @@ describe('default branch + auto-review (real Temporal + git)', () => {
     }
     expect(v.stage).toBe('review');
     expect(v.targetBranch).toBe('trunk'); // detected, not "main"
-    // auto-review attached from git
+    // auto-review attached from git — changed files only; diffs are intentionally
+    // no longer part of the review packet (reviewers use the terminal / transcripts).
     expect(v.reviewInfo.changedFiles).toEqual(expect.arrayContaining(['feature.js (new)']));
-    expect(v.reviewInfo.diff).toContain('export const z = 42');
+    expect(v.reviewInfo.diff).toBeUndefined();
     // the agent's reply is in the conversation thread
     expect(v.messages.some((m: any) => m.role === 'agent')).toBe(true);
+    // per-role transcripts are exposed (Phase 1): the Do conversation is always present
+    expect(v.transcripts?.some((t: any) => t.role === 'do')).toBe(true);
 
     await fetch(`${base}/api/tasks/${task.id}/signal`, { method: 'POST', headers: auth(), body: JSON.stringify({ signal: 'confirm' }) });
     for (let i = 0; i < 60; i++) {

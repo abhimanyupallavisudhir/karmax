@@ -15,9 +15,16 @@ const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Pr
 // Task-scope only: per-role agent DEFAULTS live in the Agent-profiles editor
 // (with a per-project override), so this is just the one-off per-task override —
 // no duplication with the workflow-defaults settings forms (SPEC §7.1/§10.5).
-const agentField = (role: string, label: string): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role });
+// `mutable`: an agent role whose turn runs LATER (merge, resolve) can be swapped
+// in-flight until that turn runs (SPEC §5.5). The Do agent is left frozen — it
+// runs from the first turn and holds a live resumable session, so the follow-up
+// box is its live-redirect channel, not a mid-session provider swap.
+const agentField = (role: string, label: string, mutable?: FieldSpec['mutable']): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role, ...(mutable ? { mutable } : {}) });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
-const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top' });
+// `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
+// opened against it or the merge enqueue). software-dev re-reads `target` at
+// PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
+const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directory', help: 'Absolute path, or one starting with ~', scopes: ['project'], bind: 'project' });
 const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
 const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', options: ['worktree', 'container'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
@@ -111,15 +118,33 @@ Call signal_completion when the branch is ready to merge.`,
 const RESOLVE_ROLE: WorkflowRole = {
   name: 'resolve',
   label: 'Resolve agent',
-  capabilities: ['signal-completion', 'save-skill'],
+  capabilities: ['signal-completion', 'save-skill', 'resolve-decision'],
   promptTemplate: `{{toolsPreamble}}
 
-The "{{stage}}" step failed for task "{{title}}".
-Error: {{error}}
+You are the RESOLVE agent for task "{{title}}". The "{{stage}}" step failed.
+
+Error:
+{{error}}
+
 Worktree: {{worldPath}}
-Recent transcript: {{transcript}}
-Candidate resolution skills: {{skills}}
-Diagnose and fix so {{stage}} can resume. If you cannot, explain why, then call signal_completion.`,
+Recent transcript:
+{{transcript}}
+
+Candidate resolution skills (read any that look relevant before acting):
+{{skills}}
+
+## Read carefully — your job is narrow
+(a) You are NOT here to finish the task. Your ONLY job is to diagnose THIS error and decide how to get the task back on track, then report that decision with the resolve_decision tool. Do not implement the task's feature.
+
+(b) Our strong preference is that errors are caught by the auto-resolve SCRIPT, never by an agent. This one reached you because no auto-resolve case matched it. So, in order:
+  1. Diagnose the cause. If you can fix it in the worktree (a bad file, a missing dependency, a stale artifact), do so, then call resolve_decision({action:"resume"}) to continue the interrupted agent, or {action:"retryStage"} to re-run the step fresh.
+  2. If this class of error is MECHANICALLY recognizable (a stable error signature → a scripted fix), capture that so it auto-resolves next time WITHOUT an agent: save_skill a skill named "resolve/<slug>" whose content states (i) a regex/signature that matches this error, (ii) the exact fix or retry that resolves it, and (iii) whether it's safe to auto-retry. These skills are the source material for new auto-resolve cases (added later through the reviewed PR gate — the merge-only workflow — so they are tested before they ever run automatically).
+  3. If the failure is rooted NOT in this project's code but in a DEPENDENCY — karmax itself, or another library/tool/service — file a bug against that dependency's own repository using the \`gh\` CLI (or the appropriate tracker). karmax's repo is https://github.com/abhimanyupallavisudhir/karmax/ (e.g. \`gh issue create --repo abhimanyupallavisudhir/karmax --title "..." --body "..."\`). Include the error, a minimal repro, and enough context to reproduce. Then still record a resolve_decision for THIS task (resume/retryStage if you found a workaround, otherwise escalate).
+  4. If you cannot fix it, call resolve_decision({action:"escalate", reason:"<what a human needs to do>"}). Do not loop or keep trying.
+
+(c) The candidate skills above are your index of prior resolutions — prefer reusing a known fix over rediscovering one.
+
+Always finish by calling resolve_decision exactly once.`,
 };
 
 // Lifecycle stages per bundled workflow (the pipeline the UI renders).
@@ -128,7 +153,7 @@ const SOFTWARE_DEV_STAGES: StageDef[] = [
   { key: 'do', label: 'Do', aliases: ['resolve'] },
   { key: 'review', label: 'Review' },
   { key: 'pr', label: 'PR' },
-  { key: 'merge', label: 'Merge', ponr: true, aliases: ['escalated'] },
+  { key: 'merge', label: 'Merge', ponr: true }, // 'escalated' is a blocked state, not a position — the UI flags it separately
   { key: 'done', label: 'End' },
 ];
 
@@ -235,8 +260,8 @@ export const MANIFESTS: WorkflowManifest[] = [
       copyGlobsField(),
       worldProviderField(),
       prToggleField(),
-      agentField('merge', 'Merge agent'),
-      agentField('resolve', 'Resolve agent'),
+      agentField('merge', 'Merge agent', 'untilUsed'),
+      agentField('resolve', 'Resolve agent', 'untilUsed'),
     ],
     onActivate: {
       spawnTask: {
@@ -315,7 +340,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     stages: [
       { key: 'setup', label: 'Setup' },
       { key: 'review', label: 'Review' },
-      { key: 'merge', label: 'Merge', ponr: true, aliases: ['escalated'] },
+      { key: 'merge', label: 'Merge', ponr: true }, // 'escalated' is a blocked state, not a position — the UI flags it separately
       { key: 'done', label: 'End' },
     ],
     params: [

@@ -9,11 +9,18 @@ import {
   SIG_LEASE_ACCOUNT,
   SIG_RETURN_ACCOUNT,
   SIG_REGISTER_ACCOUNTS,
+  SIG_REPORT_EXHAUSTED,
+  SIG_SET_ACCOUNT_AVAILABILITY,
   QRY_QUEUE,
   QRY_ACCOUNTS,
   mergeQueueId,
   accountCoordinatorId,
 } from '../coordinators/names.js';
+
+type AccountProvider = 'claude' | 'codex' | 'mock';
+type CredKind = 'login' | 'ambient' | 'key';
+type LimitWindow = '5h' | 'weekly' | 'model';
+type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';
 
 export interface CoordinatorActivityDeps {
   client: Client;
@@ -93,8 +100,8 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
     },
 
     // ── account/token coordinator (SPEC §6.2) ──
-    /** Upsert connected logins into the account pool, creating the coordinator. */
-    async registerAccounts(accounts: { id: string; configHome: string; maxConcurrent?: number; fiveHourLimit?: number }[]): Promise<void> {
+    /** Upsert credentials (logins, ambient, keys) into the pool, creating the coordinator. */
+    async registerAccounts(accounts: { id: string; configHome: string; provider?: AccountProvider; kind?: CredKind; apiKeyHandle?: string; maxConcurrent?: number }[]): Promise<void> {
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
         taskQueue,
@@ -103,14 +110,16 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signalArgs: [{ accounts }],
       });
     },
-    /** Request an account lease for a turn (the coordinator signals the task back). */
-    async leaseAccount(taskId: string, turnId: string): Promise<void> {
+    /** Request a credential lease for a turn (the coordinator signals the task back).
+     *  `allowed` = the credential policy's ordered, enabled keys for this turn; the
+     *  coordinator grants the first available one (empty ⇒ passthrough). */
+    async leaseAccount(taskId: string, turnId: string, provider?: AccountProvider, allowed?: string[]): Promise<void> {
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
         taskQueue,
         args: [{}],
         signal: SIG_LEASE_ACCOUNT,
-        signalArgs: [{ taskId, turnId }],
+        signalArgs: [{ taskId, turnId, provider, allowed }],
       });
     },
     async returnAccount(accountId: string): Promise<void> {
@@ -118,6 +127,43 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_RETURN_ACCOUNT, { accountId });
       } catch {
         /* coordinator gone — nothing to return */
+      }
+    },
+    /**
+     * Ground-truth exhaustion report (SPEC §6.2): auto-resolve calls this when a
+     * turn fails on a usage/session limit. The wall-clock/timezone math that turns
+     * a human-readable "resets 3:45pm" hint into an absolute instant lives here (a
+     * side-effecting activity), not in the deterministic coordinator.
+     */
+    async reportAccountExhausted(args: { accountId: string; window: LimitWindow; resetHint?: string; note?: string }): Promise<{ resetAt: number }> {
+      const { resetAtFromHint } = await import('../agent/limits.js');
+      const resetAt = resetAtFromHint(args.resetHint, args.window, Date.now());
+      try {
+        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_REPORT_EXHAUSTED, {
+          accountId: args.accountId,
+          window: args.window,
+          resetAt,
+          ...(args.note ? { note: args.note } : {}),
+        });
+      } catch {
+        /* coordinator gone — nothing to update */
+      }
+      return { resetAt };
+    },
+    /** Manual availability override (UI/MCP): force a login on/off, edit its reset. */
+    async setAccountAvailability(args: { accountId: string; status: AccountStatus; resetAt?: number }): Promise<void> {
+      try {
+        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_SET_ACCOUNT_AVAILABILITY, args);
+      } catch {
+        /* coordinator gone */
+      }
+    },
+    /** Full account availability view for the dashboard (empty if not running). */
+    async accountsView(): Promise<{ accounts: unknown[]; waiting: number }> {
+      try {
+        return (await client.workflow.getHandle(accountCoordinatorId()).query(QRY_ACCOUNTS)) as { accounts: unknown[]; waiting: number };
+      } catch {
+        return { accounts: [], waiting: 0 };
       }
     },
     /** How many accounts are in the pool (0 if the coordinator isn't running). */

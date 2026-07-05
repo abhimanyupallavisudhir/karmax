@@ -39,6 +39,24 @@ describe('dynamic port allocation', () => {
     }
   });
 
+  it('findFreePortFrom returns the preferred port when it is free', async () => {
+    const preferred = await findFreePort(); // free right now
+    expect(await findFreePortFrom(preferred)).toBe(preferred);
+  });
+
+  it('findFreePortFrom walks upward when the preferred port is taken', async () => {
+    const preferred = await findFreePort();
+    const srv = net.createServer();
+    await new Promise<void>((r) => srv.listen(preferred, '127.0.0.1', () => r()));
+    try {
+      const port = await findFreePortFrom(preferred);
+      expect(port).toBeGreaterThan(preferred);
+      expect(await isPortFree(port)).toBe(true);
+    } finally {
+      await new Promise<void>((r) => srv.close(() => r()));
+    }
+  });
+
   it('waitForPort resolves once a server is listening', async () => {
     const port = await findFreePort();
     const srv = net.createServer();

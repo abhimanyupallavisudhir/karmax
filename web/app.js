@@ -22,6 +22,8 @@ const S = {
   activity: [],
   search: '',
   schema: [],
+  paramDefaults: {},
+  sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
   ws: null,
 };
 
@@ -43,8 +45,8 @@ const NODES = [
 
 // Provider → model choices for the agent field (free-text also allowed).
 const MODELS = {
-  claude: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-7', 'claude-fable-5'],
-  codex: ['gpt-4.1', 'gpt-4o', 'gpt-4.1-mini'],
+  claude: ['claude-sonnet-5', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-fable-5'],
+  codex: ['gpt-5.5', 'gpt-5.4-mini'],
   mock: ['mock'],
 };
 // Which reasoning-effort levels a given model actually accepts (mirrors the
@@ -60,8 +62,10 @@ function effortLevelsFor(provider, model) {
     return EFFORT_ORDER.filter((l) => ok.has(l));
   }
   if (provider === 'codex') {
-    if (!/^(o1|o3|o4|gpt-5|codex)/.test(m) && !m.includes('reasoning')) return [];
-    return ['low', 'medium', 'high']; // OpenAI Responses reasoning.effort tops out at high
+    // gpt-5.x (5.5, 5.4-mini) accept up to xhigh; older reasoning models top out at high.
+    if (/^gpt-5/.test(m)) return ['low', 'medium', 'high', 'xhigh'];
+    if (/^(o1|o3|o4|codex)/.test(m) || m.includes('reasoning')) return ['low', 'medium', 'high'];
+    return [];
   }
   return [];
 }
@@ -96,23 +100,30 @@ function schemaFor(workflow) {
 const eff = (own, inherited) => (own !== undefined && own !== null && own !== '' ? own : inherited);
 const inhAttr = (val) => `data-inherit='${esc(JSON.stringify(val ?? null))}'`;
 
+// "Reset to default" button — cleared/hidden until the field holds an override,
+// then clicking it drops the override so the field inherits again (SPEC §10.5).
+const resetBtn = (name) => `<button type="button" class="field-reset" data-reset="${esc(name)}" hidden title="Drop this override and inherit the default">↺ Reset to default</button>`;
+const fieldLabel = (f) =>
+  `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtn(f.name)}</div>` +
+  (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
+
 function renderField(f, own, inherited) {
   const v = eff(own, inherited) ?? '';
-  const label = `<label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : ''}`;
+  const label = fieldLabel(f);
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
-  if (f.type === 'agent') return `<div class="form-row">${label}${renderAgentField(f, own, inherited)}</div>`;
+  if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
   if (f.type === 'text')
-    return `<div class="form-row">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
   if (f.type === 'boolean')
-    return `<div class="form-row switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${resetBtn(f.name)}</div></div>`;
   if (f.type === 'select')
-    return `<div class="form-row">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
-    return `<div class="form-row">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
   }
   // string / number / branch / repoPath
-  return `<div class="form-row">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
+  return `<div class="form-row" data-row="${esc(f.name)}">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
 function renderAgentField(f, spec, inherited) {
@@ -124,15 +135,18 @@ function renderAgentField(f, spec, inherited) {
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
-      <input class="af-model" list="models-${esc(role)}" placeholder="model" value="${esc(e.model || '')}" style="flex:1;min-width:140px" />
-      <datalist id="models-${esc(role)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
+      <div class="combo af-model-combo" style="flex:1;min-width:140px">
+        <input class="af-model" placeholder="model" value="${esc(e.model || '')}" autocomplete="off" />
+        <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
+        <div class="combo-menu" hidden></div>
+      </div>
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
-    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Resume from a previous agent</summary>
-      <input class="af-resume-search" placeholder="Search tasks to resume from…" style="width:100%;margin-top:6px;padding:7px 10px" />
+    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Fork a previous agent</summary>
+      <input class="af-resume-search" placeholder="Search tasks to fork from…" style="width:100%;margin-top:6px;padding:7px 10px" />
       <div class="af-resume-results" style="max-height:140px;overflow:auto"></div>
       <div class="af-resume-chosen" style="font-size:12px;color:var(--accent);margin-top:4px">${spec?.resumeFrom ? esc(JSON.stringify(spec.resumeFrom)) : ''}</div>
-      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
+      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
     </details>
   </div>`;
 }
@@ -178,22 +192,131 @@ function collectForm(root, fields) {
   return out;
 }
 
-// Wire agent-field controls: provider→model datalist + resume search (no toggle).
+// A lightweight combobox: a real dropdown that opens on focus and on the caret,
+// filters as you type, and still accepts free text. Replaces <datalist>, whose
+// popup is unreliable (won't open on the caret, flaky while typing).
+function wireCombo(combo, getOptions, onChange) {
+  const input = combo.querySelector('input');
+  const menu = combo.querySelector('.combo-menu');
+  const caret = combo.querySelector('.combo-caret');
+  if (!input || !menu || !caret) return;
+  let open = false;
+  const draw = () => {
+    const q = input.value.trim().toLowerCase();
+    const opts = (getOptions() || []).filter((o) => !q || o.toLowerCase().includes(q));
+    menu.innerHTML = opts.length
+      ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o)}">${esc(o)}</div>`).join('')
+      : `<div class="combo-empty">No matching presets — free text is allowed</div>`;
+  };
+  const show = () => { draw(); menu.hidden = false; open = true; };
+  const hide = () => { menu.hidden = true; open = false; };
+  input.addEventListener('focus', show);
+  input.addEventListener('input', () => { show(); onChange && onChange(); });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') { hide(); input.blur(); } });
+  input.addEventListener('blur', () => setTimeout(hide, 150)); // let a menu click land first
+  // mousedown (not click) so it fires before the input's blur closes the menu
+  caret.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    if (open) hide();
+    else { input.focus(); show(); }
+  });
+  menu.addEventListener('mousedown', (e) => {
+    const opt = e.target.closest('.combo-opt');
+    if (!opt) return;
+    e.preventDefault();
+    input.value = opt.dataset.v;
+    hide();
+    onChange && onChange();
+  });
+}
+
+// Wire agent-field controls: provider→model combobox + fork search (no toggle).
 function wireAgentFields(root) {
   root.querySelectorAll('.agent-field').forEach((box) => {
-    box.querySelector('.af-provider')?.addEventListener('change', (e) => {
-      box.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
-      box.querySelector('.af-model').value = '';
+    const combo = box.querySelector('.af-model-combo');
+    const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
+    if (combo) wireCombo(combo, () => MODELS[providerOf()] || MODELS.claude, () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
+    box.querySelector('.af-provider')?.addEventListener('change', () => {
+      box.querySelector('.af-model').value = ''; // model choices are provider-specific
       refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
     });
-    box.querySelector('.af-model')?.addEventListener('input', () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
     const search = box.querySelector('.af-resume-search');
     const results = box.querySelector('.af-resume-results');
     search?.addEventListener('input', () => resumeSearch(box, search.value, results));
   });
 }
 
-// Resume search: find tasks by title, then list their per-role agent sessions.
+// Wire per-field "Reset to default" buttons: show the button whenever the field
+// diverges from its inherited default, and on click restore the inherited value
+// so the field goes back to inheriting (collectForm then stores no override).
+function wireFieldResets(root, fields) {
+  for (const f of fields) {
+    if (f.required) continue; // a required field always stores a value; nothing to inherit
+    const btn = root.querySelector(`.field-reset[data-reset="${CSS.escape(f.name)}"]`);
+    if (!btn) continue;
+    const sync = () => { btn.hidden = !fieldOverridden(root, f); };
+    if (f.type === 'agent') {
+      const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      box.addEventListener('input', sync);
+      box.addEventListener('change', sync);
+      btn.addEventListener('click', () => { resetAgentField(box); sync(); });
+    } else {
+      const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
+      if (!el) continue;
+      el.addEventListener('input', sync);
+      el.addEventListener('change', sync);
+      btn.addEventListener('click', () => { resetPlainField(el, f); sync(); });
+    }
+    sync();
+  }
+}
+
+// Does the field currently hold a value that differs from the inherited default?
+function fieldOverridden(root, f) {
+  if (f.type === 'agent') {
+    const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+    if (!box) return false;
+    const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+    const spec = { provider: box.querySelector('.af-provider').value };
+    const model = box.querySelector('.af-model').value.trim();
+    const effort = box.querySelector('.af-effort').value;
+    if (model) spec.model = model;
+    if (effort) spec.effort = effort;
+    return !sameJson(normSpec(spec), normSpec(inh));
+  }
+  const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
+  if (!el) return false;
+  const inh = JSON.parse(el.getAttribute('data-inherit') || 'null');
+  let val;
+  if (f.type === 'boolean') val = el.checked;
+  else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
+  else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
+  else val = el.value === '' ? undefined : el.value;
+  if (val === undefined) return false; // empty ⇒ inheriting
+  if (f.type === 'list' && Array.isArray(val) && !val.length) return false;
+  return !sameJson(val, inh);
+}
+
+function resetPlainField(el, f) {
+  const inh = JSON.parse(el.getAttribute('data-inherit') || 'null');
+  if (f.type === 'boolean') el.checked = !!inh;
+  else if (f.type === 'list') el.value = Array.isArray(inh) ? inh.join('\n') : (inh || '');
+  else el.value = inh === undefined || inh === null ? '' : inh;
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function resetAgentField(box) {
+  const inh = JSON.parse(box.getAttribute('data-inherit') || 'null') || {};
+  const prov = box.querySelector('.af-provider');
+  prov.value = inh.provider || 'claude';
+  box.querySelector('.af-model').value = inh.model || '';
+  refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+  const eff = box.querySelector('.af-effort');
+  if (eff && inh.effort) eff.value = inh.effort;
+}
+
+// Fork search: find tasks by title, then list their per-role agent sessions.
 async function resumeSearch(box, q, results) {
   const ql = q.toLowerCase().trim();
   if (!ql) { results.innerHTML = ''; return; }
@@ -205,7 +328,7 @@ async function resumeSearch(box, q, results) {
       const roles = Object.keys(sessions);
       if (!roles.length) return '';
       return roles
-        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role])}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
+        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
         .join('');
     }),
   );
@@ -237,12 +360,23 @@ async function api(path, opts = {}) {
   return body;
 }
 
-function toast(msg, err = false) {
+function toast(msg, err = false, action) {
   const t = document.createElement('div');
   t.className = 'toast' + (err ? ' err' : '');
-  t.textContent = msg;
+  const span = document.createElement('span');
+  span.textContent = msg;
+  t.appendChild(span);
+  // An optional action (e.g. Undo) — gives the toast a clickable button and more
+  // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
+  if (action) {
+    const btn = document.createElement('button');
+    btn.className = 'toast-action';
+    btn.textContent = action.label;
+    btn.addEventListener('click', () => { t.remove(); action.fn(); });
+    t.appendChild(btn);
+  }
   $('#toasts').appendChild(t);
-  setTimeout(() => t.remove(), 3200);
+  setTimeout(() => t.remove(), action ? 6500 : 3200);
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────────
@@ -292,6 +426,8 @@ function connectWs() {
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
         S.liveOutput = '';
         refreshDrawer();
+      } else if (ev.type === 'session.started') {
+        refreshDrawer(); // the session id was just published mid-turn → show the live fork command
       } else renderDrawerEvents();
     }
     clearTimeout(refreshTimer);
@@ -437,9 +573,9 @@ function taskRow(t) {
   // archivable when not progressing on its own / not awaiting review
   const terminal = !['active', 'waiting'].includes(status);
   const archiveBtn = archived
-    ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive">⊕</button>`
+    ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
     : terminal
-      ? `<button class="icon-btn" data-archive="${t.id}" title="Archive">⊟</button>`
+      ? `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`
       : '';
   return `
     <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}">
@@ -471,7 +607,10 @@ function stageIndexOf(stages, stage) {
 
 function pipeline(v) {
   const stages = stagesFor(v.workflow);
-  const idx = stageIndexOf(stages, v.stage);
+  // 'escalated' is a blocked, awaiting-human state — NOT a pipeline position. Don't
+  // pin it to a stage (it used to mis-map onto Merge); flag the whole track instead.
+  const escalated = v.stage === 'escalated';
+  const idx = escalated ? -1 : stageIndexOf(stages, v.stage);
   const done = v.stage === 'done';
   const merged = v.pointOfNoReturnPassed || done;
   const ponrIdx = stages.findIndex((n) => n.ponr);
@@ -487,15 +626,16 @@ function pipeline(v) {
     }
     segs += `<span class="${cls}"></span>`;
   }
-  return `<div class="pipeline" title="${esc(v.stage || '')}">${segs}</div>`;
+  return `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'escalated — awaiting a human' : esc(v.stage || '')}">${segs}</div>`;
 }
 
 function pipelineLarge(v) {
   const stages = stagesFor(v.workflow);
-  const idx = stageIndexOf(stages, v.stage);
+  const escalated = v.stage === 'escalated';
+  const idx = escalated ? -1 : stageIndexOf(stages, v.stage);
   const done = v.stage === 'done';
   const merged = v.pointOfNoReturnPassed || done;
-  return `<div class="pipeline-lg">${stages.map((n, i) => {
+  return `<div class="pipeline-lg${escalated ? ' escalated' : ''}"${escalated ? ' title="escalated — awaiting a human"' : ''}>${stages.map((n, i) => {
     let cls = 'node';
     if (i < idx || (done && i <= idx)) cls += ' done';
     if (i === idx && !done) cls += ' current';
@@ -517,8 +657,15 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
   );
   const setArchived = async (id, archived) => {
-    try { await api(`/api/tasks/${id}/archive`, { method: 'POST', body: JSON.stringify({ archived }) }); toast(archived ? 'Archived' : 'Unarchived'); refreshTasks(); }
-    catch (e) { toast(e.message, true); }
+    const title = S.tasks.find((t) => t.id === id)?.title || 'task';
+    try {
+      await api(`/api/tasks/${id}/archive`, { method: 'POST', body: JSON.stringify({ archived }) });
+      // Archiving only hides — offer an immediate one-click Undo so an accidental
+      // click is trivially reversible (it isn't destructive, just filtered out).
+      if (archived) toast(`Archived “${title.slice(0, 40)}”`, false, { label: 'Undo', fn: () => setArchived(id, false) });
+      else toast('Unarchived');
+      refreshTasks();
+    } catch (e) { toast(e.message, true); }
   };
   $('#main').querySelectorAll('[data-archive]').forEach((b) =>
     b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.archive, true); }),
@@ -546,9 +693,22 @@ function wireTasksView() {
   };
   $('#add-task')?.addEventListener('click', add);
   $('#new-task')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
-  $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value));
+  // Opening the full form via "More" carries over whatever was typed in the
+  // quick-add box into the field that consumes it (Prompt, Command, …).
+  $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
+
+// The task-scope field that consumes the quick-add "Describe a task" text: the
+// workflow's prompt field, else its primary required text/string input (e.g.
+// script-exec's Command). Mirrors how add() maps that text to prompt/command.
+function consumingField(fields) {
+  return (
+    fields.find((f) => f.bind === 'prompt') ||
+    fields.find((f) => (f.type === 'text' || f.type === 'string') && f.required) ||
+    null
+  );
+}
 
 async function deleteDraft(id) {
   // Drafts never started a workflow, so the record is hard-deleted server-side.
@@ -558,10 +718,16 @@ async function deleteDraft(id) {
 }
 
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
-async function openTaskForm(workflow, draft) {
+async function openTaskForm(workflow, draft, seedText) {
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   const values = draft ? { ...draft.params } : {};
+  // Carry over the quick-add text (or whatever was typed before switching
+  // workflows) into the field that consumes it, without clobbering a real value.
+  if (seedText) {
+    const cf = consumingField(fields);
+    if (cf && !values[cf.name]) values[cf.name] = seedText;
+  }
   let inherited = {};
   try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
   const root = $('#overlay-root');
@@ -573,27 +739,66 @@ async function openTaskForm(workflow, draft) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}</div>
+        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
+          <div class="form-row" data-row="__notes">
+            <div class="label-row"><label>Notes</label></div>
+            <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
+            <span style="color:var(--ink-3);font-size:12px">Only you see this — never sent to the agent.</span>
+          </div>
+          <details class="advanced" style="margin-top:10px">
+            <summary>Credentials — precedence &amp; enable/disable for this task</summary>
+            <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
+            <div id="cred-editor-newtask">Loading…</div>
+          </details>
+        </div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
           <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${draft ? 'Queue' : 'Add task'}</button>
         </div>
       </div>
     </div>`;
-  $('#tf-wf')?.addEventListener('change', () => openTaskForm($('#tf-wf').value)); // workflow switch re-renders fields
+  $('#tf-wf')?.addEventListener('change', () => {
+    // Re-render for the new workflow, preserving text typed into the current
+    // consuming field so it moves to the new workflow's consuming field.
+    const cf = consumingField(fields);
+    const carried = cf ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`)?.value : '';
+    openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
+  });
   $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') root.innerHTML = ''; });
   $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
   wireAgentFields($('#tf-body'));
+  wireFieldResets($('#tf-body'), fields);
+  // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
+  // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the
+  // running-task drawer (renderDrawer's #cred-editor-task). Change one → check the other.
+  // A draft has an id → edit its policy directly. A brand-new task has none, so the
+  // editor runs in `local` mode: changes are held here and applied on create (below).
+  let taskCredPolicy = {};
+  if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
+  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; } });
   const submit = async (draftMode) => {
     const body = collectForm($('#tf-body'), fields);
-    const payload = { workflow: wf, params: body, draft: draftMode };
+    // Cosmetic human notes — kept separate from `params` so they never reach the
+    // agent, and editable at any stage (here, pre-queue, in the full form).
+    const notes = $('#tf-notes')?.value ?? '';
+    const payload = { workflow: wf, params: body, notes, draft: draftMode };
     try {
       if (draft) {
         // edit existing draft, then optionally queue
-        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body }) });
+        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true }) });
+        if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
         if (!draftMode) await api(`/api/tasks/${draft.id}/queue`, { method: 'POST', body: '{}' });
       } else {
-        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
+        const hasPol = !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
+        if (hasPol) {
+          // Custom per-task credential order/enablement: create as a draft first so the
+          // override is persisted BEFORE the workflow starts leasing, then queue.
+          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...payload, draft: true }) });
+          await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
+          if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
+        } else {
+          await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
+        }
       }
       root.innerHTML = '';
       toast(draftMode ? 'Draft saved' : 'Task created');
@@ -613,6 +818,8 @@ async function openDrawer(taskId) {
     S.view = await api(`/api/tasks/${taskId}`);
     S.drawerEvents = await api(`/api/tasks/${taskId}/events?since=0`);
     S.widgets = await api(`/api/tasks/${taskId}/widgets`).catch(() => []);
+    S.sessions = await api(`/api/tasks/${taskId}/sessions`).catch(() => ({}));
+    S.paramDefaults = await loadParamDefaults(taskId);
   } catch (e) { toast(e.message, true); }
   renderDrawer();
 }
@@ -621,6 +828,8 @@ async function refreshDrawer() {
   try {
     S.view = await api(`/api/tasks/${S.selected}`);
     S.widgets = await api(`/api/tasks/${S.selected}/widgets`).catch(() => S.widgets);
+    S.sessions = await api(`/api/tasks/${S.selected}/sessions`).catch(() => S.sessions);
+    S.paramDefaults = await loadParamDefaults(S.selected);
   } catch {}
   renderDrawer();
 }
@@ -661,7 +870,11 @@ function renderDrawer() {
   $('#scrim').addEventListener('click', closeDrawer);
   $('#drawer-close').addEventListener('click', closeDrawer);
   wireActions(v);
+  wireParams(v);
+  wireNotes(v);
   wireTerminal(v.taskId);
+  wireCopyButtons();
+  renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId, taskId: v.taskId });
   renderDrawerEvents();
 }
 
@@ -693,8 +906,38 @@ function wireTerminal(taskId) {
 }
 
 function drawerBody(v) {
-  const msgs = (v.messages || [])
-    .map((m) => `<div class="msg ${m.role}"><div class="role">${m.role}</div>${esc(m.text)}</div>`)
+  // Show every agent's conversation (Do / Merge / Resolve), collapsed except the
+  // one owning the active stage (SPEC §5.5). Falls back to `messages` (Do) for
+  // tasks whose workflow predates per-role transcripts.
+  const activeRole = roleForStage(v.stage);
+  const transcripts = (v.transcripts && v.transcripts.length)
+    ? v.transcripts
+    : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
+  const liveRole = transcripts.some((t) => t.role === activeRole) ? activeRole : (transcripts[0] && transcripts[0].role);
+  const conversations = transcripts
+    .map((t) => {
+      const body = (t.messages || [])
+        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}</div>`)
+        .join('') || '<div class="msg system">No messages yet</div>';
+      // Only the active role gets the #live-bubble (one per drawer, updated by the WS stream).
+      const live = t.role === liveRole
+        ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
+        : '';
+      // Only subscription/CLI sessions carry a config home; API-key / stateless
+      // sessions can't be forked from a terminal, so no command is shown. The session
+      // id is published mid-turn (#3), so this appears WHILE the agent runs.
+      const sess = S.sessions && S.sessions[t.role];
+      const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
+      const copy = forkCmd
+        ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
+        : '';
+      return `<details class="conversation" ${t.role === liveRole ? 'open' : ''}>
+        <summary class="section-h" style="cursor:pointer;display:flex;align-items:center;gap:8px">
+          <span>${esc(t.label || t.role)} (${(t.messages || []).length})</span>${copy}
+        </summary>
+        <div class="thread">${body}${live}</div>
+      </details>`;
+    })
     .join('');
   const review = v.reviewInfo
     ? `<div class="section-h">Review</div>
@@ -702,11 +945,13 @@ function drawerBody(v) {
          ${v.reviewInfo.summary ? `<div class="summary">${esc(v.reviewInfo.summary)}</div>` : ''}
          ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin-bottom:8px">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
-         ${v.reviewInfo.diff ? `<div class="diff">${renderDiff(v.reviewInfo.diff)}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
        </div>`
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
+  const waiting = v.waitingFor
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
+    : '';
   const subtasks = v.subTasks?.length
     ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(id)}</span></div>`).join('')}`
     : '';
@@ -714,19 +959,25 @@ function drawerBody(v) {
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
     ${error}
+    ${waiting}
+    ${drawerNotes(v)}
+    ${drawerParams(v)}
     ${review}
     ${renderWidgetGroups(S.widgets)}
     ${subtasks}
-    <details class="conversation" ${['active', 'waiting'].includes(v.status) ? 'open' : ''}>
-      <summary class="section-h" style="cursor:pointer">Conversation${(v.messages || []).length ? ` (${(v.messages || []).length})` : ''}</summary>
-      <div class="thread">${msgs || '<div class="msg system">No messages yet</div>'}
-        <div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>
-      </div>
+    ${conversations}
+    <details class="advanced">
+      <summary>Credentials — precedence &amp; enable/disable for this task</summary>
+      <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the global/project order + enablement, just for this task. Drag to reorder; toggle On/Off. (This is the running-task form — the new-task form has the same control.)</p>
+      <div id="cred-editor-task">Loading…</div>
     </details>
     <details class="advanced">
       <summary>Advanced — terminal, live event log, structured state</summary>
       <div class="section-h">Terminal — open a shell in the world (ephemeral)</div>
-      <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+      <div class="task-sub" style="gap:6px;flex-wrap:wrap">
+        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      </div>
       <pre class="raw hidden" id="term-out" style="height:200px"></pre>
       <input id="term-in" class="title-in hidden" style="width:100%;margin-top:6px;padding:8px 10px" placeholder="command + Enter" />
       <div class="section-h">Live events</div>
@@ -741,6 +992,180 @@ function renderDiff(d) {
     .split('\n')
     .map((l) => (l.startsWith('+') ? `<span class="add">${l}</span>` : l.startsWith('-') ? `<span class="del">${l}</span>` : l))
     .join('\n');
+}
+
+// Human label for a "waiting for" indicator (SPEC §6.2).
+function waitingLabel(w) {
+  if (!w) return '';
+  switch (w.kind) {
+    case 'account': return `a ${w.provider || 'compatible'} login (quota refresh)`;
+    case 'mergeSlot': return 'a merge slot';
+    case 'human': return 'human input';
+    case 'subtask': return 'a sub-task';
+    default: return w.detail || w.kind;
+  }
+}
+
+// A CLI command to FORK this agent's session into the user's terminal — a branched
+// copy that's safe to open even while the agent is running (it never mutates the live
+// session). Claude: --resume … --fork-session; Codex: `codex fork <id>` (SPEC §10.5, #3).
+function forkCommandFor(sess, worldPath) {
+  if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex fork ${sess.id}`;
+  return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
+}
+
+// Credential-policy editor (SPEC §7/§9): order credentials by precedence and
+// enable/disable each, at a given scope (global/project/task). Lower scopes override
+// higher ones; API keys are off by default when a subscription exists.
+async function renderCredentialEditor(el, scope, opts = {}) {
+  if (!el) return;
+  const q = new URLSearchParams();
+  if (opts.projectId) q.set('projectId', opts.projectId);
+  if (opts.taskId) q.set('taskId', opts.taskId);
+  let data, accounts = { logins: [] };
+  try {
+    [data, accounts] = await Promise.all([
+      api(`/api/credentials?${q.toString()}`),
+      api('/api/accounts').catch(() => ({ logins: [] })),
+    ]);
+  } catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
+  // Effective policy for this scope. Normally the server computes it (global→project→
+  // task overlay). In `local` mode — the NEW-task form, which has no taskId yet — we
+  // resolve a client-side draft policy over the inherited project/global base and apply
+  // it when the task is created, so the reorder/enable-disable UI works inline here too.
+  let sd;
+  if (opts.local) {
+    const base = data[opts.projectId ? 'project' : 'global'] || { enabled: [] };
+    const baseEnabled = new Set(base.enabled || []);
+    const pol = opts.policy || {};
+    const onSet = new Set(pol.on || []), offSet = new Set(pol.off || []);
+    const isOn = (k) => (onSet.has(k) ? true : offSet.has(k) ? false : baseEnabled.has(k));
+    const seen = new Set(), eff = [];
+    for (const k of [...(pol.order || []), ...(base.enabled || []), ...(data.credentials || []).map((c) => c.key)]) {
+      if (!seen.has(k) && isOn(k) && !eff.includes(k)) eff.push(k);
+    }
+    sd = { own: pol, enabled: eff };
+  } else {
+    sd = data[scope] || { own: {}, enabled: [] };
+  }
+  const own = sd.own || {};
+  const enabled = new Set(sd.enabled || []);
+  const byKey = Object.fromEntries((data.credentials || []).map((c) => [c.key, c]));
+  // enabled creds in precedence order first, then the disabled ones.
+  const ordered = [...(sd.enabled || []).filter((k) => byKey[k]), ...(data.credentials || []).map((c) => c.key).filter((k) => !enabled.has(k))];
+  if (!ordered.length) { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">No credentials yet — connect a login or add an API key below.</div>'; return; }
+  const loginByKey = {};
+  for (const l of accounts.logins || []) loginByKey[`login:${l.provider}:${l.account}`] = l;
+  const canManage = scope === 'global'; // rename/delete a login only at the global scope
+  el.innerHTML = `<div class="cred-list">${ordered
+    .map((key) => {
+      const c = byKey[key];
+      const isOn = enabled.has(key);
+      const login = loginByKey[key];
+      const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">·oauth</span>' : '';
+      const acct = canManage && c.kind === 'login';
+      // Compact inline chip: the kind is obvious from the label (a login is
+      // provider:account; ambient is its home path; a key gets a 🔑), so no chip.
+      const label = c.kind === 'ambient' ? (c.provider === 'codex' ? '~/.codex' : '~/.claude') : c.label;
+      const icon = c.kind === 'key' ? '🔑 ' : '';
+      return `<div class="cred-row${isOn ? '' : ' off'}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
+        <span class="cred-drag">⠿</span>
+        <button class="cred-toggle ${isOn ? 'on' : 'off'}" title="${isOn ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${isOn ? 'on' : 'off'}</button>
+        <span class="cred-label mono">${icon}${esc(label)}${warn}</span>
+        ${acct ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}
+      </div>`;
+    })
+    .join('')}</div>`;
+  const save = async (policy) => {
+    // Local mode: keep the change client-side (applied when the task is created); else
+    // persist immediately, keyed by taskId/projectId scope.
+    if (opts.local) { opts.onChange?.(policy); renderCredentialEditor(el, scope, { ...opts, policy }); return; }
+    try { await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
+    catch (e) { toast(e.message, true); }
+    renderCredentialEditor(el, scope, opts);
+  };
+  el.querySelectorAll('.cred-row').forEach((row) => {
+    const key = row.dataset.key;
+    row.querySelector('.cred-toggle').addEventListener('click', () => {
+      const on = new Set(own.on || []), off = new Set(own.off || []);
+      if (!enabled.has(key)) { on.add(key); off.delete(key); } else { off.add(key); on.delete(key); }
+      save({ ...own, on: [...on], off: [...off] });
+    });
+    const login = loginByKey[key];
+    row.querySelector('.cred-rename')?.addEventListener('click', async () => {
+      const to = prompt(`Rename login ${login.account} to:`, login.account);
+      if (!to || to === login.account) return;
+      try { await api(`/api/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
+      catch (e) { toast(e.message, true); }
+    });
+    row.querySelector('.cred-del')?.addEventListener('click', async () => {
+      if (!confirm(`Delete login ${login.provider}:${login.account}? Its stored credentials are removed.`)) return;
+      try { await api(`/api/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'DELETE' }); toast('Login deleted'); renderCredentialEditor(el, scope, opts); }
+      catch (e) { toast(e.message, true); }
+    });
+  });
+  // Drag-to-reorder → precedence order for this scope.
+  wireCredDrag(el.querySelector('.cred-list'), (order) => save({ ...own, order }));
+}
+
+// HTML5 drag-and-drop reordering for the credential rows; calls onReorder(keys[]) on drop.
+function wireCredDrag(list, onReorder) {
+  if (!list) return;
+  let dragging = null;
+  list.querySelectorAll('.cred-row').forEach((row) => {
+    row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', row.dataset.key); } catch {} });
+    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+  });
+  list.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    if (!dragging) return;
+    // Reading-order insertion for a wrapping (inline) list: the nearest chip whose
+    // center is AFTER the cursor (next row, or further right on the same row).
+    let best = null, bestDist = Infinity;
+    for (const el of list.querySelectorAll('.cred-row:not(.dragging)')) {
+      const b = el.getBoundingClientRect();
+      const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
+      const sameRow = Math.abs(cy - e.clientY) <= b.height / 2;
+      const after = cy - e.clientY > b.height / 2 || (sameRow && cx > e.clientX);
+      if (!after) continue;
+      const d = Math.hypot(cx - e.clientX, cy - e.clientY);
+      if (d < bestDist) { bestDist = d; best = el; }
+    }
+    best ? list.insertBefore(dragging, best) : list.appendChild(dragging);
+  });
+  list.addEventListener('drop', (e) => { e.preventDefault(); onReorder([...list.querySelectorAll('.cred-row')].map((r) => r.dataset.key)); });
+}
+
+// Which agent role "owns" a given stage — drives which transcript opens by default.
+function roleForStage(s) {
+  if (s === 'resolve') return 'resolve';
+  if (s === 'pr' || s === 'merge') return 'merge';
+  return 'do';
+}
+
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+  return Promise.resolve();
+}
+
+// Copy-command buttons (⧉): copy a shell command to the clipboard without toggling
+// any enclosing <details>/<summary>.
+function wireCopyButtons() {
+  document.querySelectorAll('.copy-cmd').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      copyToClipboard(btn.dataset.cmd || '').then(() => {
+        const prev = btn.textContent;
+        btn.textContent = '✓ copied';
+        setTimeout(() => { btn.textContent = prev; }, 1200);
+      });
+    });
+  });
 }
 
 // ── the host widget library (SPEC §10.2 tier 2): draw server-resolved widget
@@ -792,21 +1217,188 @@ function renderWidget(w) {
   }
 }
 
+// ── in-flight parameters form (SPEC §5.5 / §10.4) ────────────────────────────
+// The task's declared params, editable or frozen per the workflow's lifecycle.
+// Editable fields (view.editableParams) get a live control + Save; everything
+// else — prompt, base, agents — is shown read-only, because those are baked into
+// the task at queue and only a follow-up can redirect the agent afterwards.
+const TERMINAL_STAGES = ['done', 'cancelled', 'failed'];
+// The resolved inherited defaults for the open task's workflow (task scope),
+// same source the New-task / settings forms use, so frozen fields show the real
+// effective value (e.g. the actual Do-agent provider·model) not "(default)".
+async function loadParamDefaults(taskId) {
+  const wf = S.view?.workflow;
+  const pid = S.tasks.find((t) => t.id === taskId)?.projectId || S.projectId;
+  if (!wf || !pid) return {};
+  return api(`/api/defaults/${pid}/${wf}`).then((d) => d?.task?.inherited || {}).catch(() => ({}));
+}
+// Free-form human notes (cosmetic, UI-only — never sent to any agent). Editable
+// at ANY stage (active, done, cancelled, failed, archived) — the endpoint has no
+// stage guard. The current value comes from the freshly-fetched view (`v.notes`),
+// so it's correct even for a task not in the loaded list.
+function drawerNotes(v) {
+  const notes = v.notes || '';
+  return `<div class="section-h">Notes</div>
+    <div id="drawer-notes">
+      <textarea id="task-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(notes)}</textarea>
+      <div class="task-sub" style="margin-top:4px;justify-content:space-between">
+        <span style="color:var(--ink-3)">Only you see this — never sent to the agent.</span>
+        <button class="btn sm" id="notes-save">Save notes</button>
+      </div>
+    </div>`;
+}
+
+function wireNotes(v) {
+  const ta = document.getElementById('task-notes');
+  const btn = document.getElementById('notes-save');
+  if (!ta || !btn) return;
+  const save = async () => {
+    const notes = ta.value;
+    if ((v.notes || '') === notes) return; // no change
+    try {
+      await api(`/api/tasks/${v.taskId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
+      v.notes = notes || undefined; // keep the in-memory view in sync
+      const rec = S.tasks.find((t) => t.id === v.taskId);
+      if (rec) rec.notes = notes || undefined;
+      toast('Notes saved');
+    } catch (e) {
+      toast(e.message, true);
+    }
+  };
+  btn.addEventListener('click', save);
+  // Save on blur too, so notes aren't lost when the drawer closes.
+  ta.addEventListener('blur', save);
+}
+
+function drawerParams(v) {
+  const rec = S.tasks.find((t) => t.id === v.taskId);
+  // Drafts are composed in the full task form (all fields editable pre-queue).
+  if (rec?.params?.draft) {
+    return `<div class="section-h">Parameters</div>
+      <button class="btn sm" id="edit-draft-params">Edit parameters…</button>`;
+  }
+  if (TERMINAL_STAGES.includes(v.stage)) return '';
+  const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task'));
+  if (!fields.length) return '';
+  const editable = new Set(v.editableParams || []);
+  const inheritedAll = S.paramDefaults || {};
+  const lock = `<span title="Frozen — this parameter has already been used (send a follow-up to change direction)" style="color:var(--ink-3)">🔒</span>`;
+  const rows = fields
+    .map((f) => {
+      const own = paramCurrentValue(f, v, rec);
+      const inherited = inheritedAll[f.name];
+      const isEditable = editable.has(f.name);
+      // Agent fields show the full control (provider · model · effort · resume),
+      // exactly like the task form — interactive when editable, disabled when frozen.
+      if (f.type === 'agent') {
+        const control = renderField(f, own, inherited); // full control incl. its own label
+        if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${control}</div>`;
+        // frozen: same control, disabled (read-only), with a lock in the corner
+        return `<div class="form-row" data-row="${esc(f.name)}" style="position:relative">
+          <span style="position:absolute;right:0;top:0" title="Frozen — this agent has already run (send a follow-up to change direction)">🔒</span>
+          <fieldset disabled style="border:none;padding:0;margin:0;min-inline-size:auto;opacity:.65">${control}</fieldset></div>`;
+      }
+      if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
+      // frozen non-agent: read-only effective value (own override, else inherited default)
+      return `<div class="form-row"><div class="label-row"><label>${esc(f.label)}</label>${lock}</div>
+        <div class="pf-ro" style="padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);color:var(--ink-2);white-space:pre-wrap;overflow-wrap:anywhere">${esc(displayParam(f, eff(own, inherited)))}</div></div>`;
+    })
+    .join('');
+  const footer = editable.size
+    ? `<button class="btn sm primary" id="params-save">Save changes</button>`
+    : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
+  return `<div class="section-h">Parameters</div><div id="drawer-params">${rows}${footer}</div>`;
+}
+
+// Best-known current value of a param for a running task (the view carries a few;
+// the task record holds the rest of the user's own overrides).
+function paramCurrentValue(f, v, rec) {
+  const own = (rec && rec.params) || {};
+  if (f.bind === 'prompt') return own.prompt ?? (v.messages || []).find((m) => m.role === 'user')?.text ?? '';
+  if (f.name === 'target') return v.targetBranch ?? own.target ?? '';
+  if (f.name === 'base') return v.base ?? own.base ?? '';
+  return own[f.name];
+}
+function displayParam(f, val) {
+  if (val === undefined || val === null || val === '') return '(default)';
+  if (f.type === 'agent') return [val.provider, val.model].filter(Boolean).join(' · ') || '(default)';
+  if (Array.isArray(val)) return val.join(', ') || '(none)';
+  if (typeof val === 'boolean') return val ? 'on' : 'off';
+  return String(val);
+}
+// Read back the editable param controls as a patch (no inherit-diffing — these
+// are concrete live values, not overlay overrides).
+function collectParamEdits(root, fields) {
+  const out = {};
+  for (const f of fields) {
+    if (f.type === 'agent') {
+      // Reconstruct the AgentSpec from the composite control (same shape the task
+      // form's collectForm produces). Editable agent fields always send a spec.
+      const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      const spec = { provider: box.querySelector('.af-provider').value };
+      const model = box.querySelector('.af-model').value.trim();
+      const effort = box.querySelector('.af-effort')?.value;
+      if (model) spec.model = model;
+      if (effort) spec.effort = effort;
+      const sessionId = box.querySelector('.af-resume-session')?.value.trim();
+      const chosen = box.querySelector('.af-resume-chosen')?.textContent.trim();
+      let resumeFrom;
+      if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
+      if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+      if (resumeFrom) spec.resumeFrom = resumeFrom;
+      out[f.name] = spec;
+      continue;
+    }
+    const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
+    if (!el) continue;
+    let val;
+    if (f.type === 'boolean') val = el.checked;
+    else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    else if (f.type === 'number') val = el.value === '' ? undefined : Number(el.value);
+    else val = el.value.trim() === '' ? undefined : el.value.trim();
+    if (val !== undefined) out[f.name] = val;
+  }
+  return out;
+}
+function wireParams(v) {
+  const editBtn = document.getElementById('edit-draft-params');
+  if (editBtn) {
+    const rec = S.tasks.find((t) => t.id === v.taskId);
+    editBtn.addEventListener('click', () => openTaskForm(v.workflow, rec));
+    return;
+  }
+  const root = document.getElementById('drawer-params');
+  if (root) wireAgentFields(root); // make editable agent controls (model combo, effort, resume) work
+  const saveBtn = document.getElementById('params-save');
+  if (!saveBtn) return;
+  saveBtn.addEventListener('click', async () => {
+    const fields = schemaFor(v.workflow).filter((f) => f.scopes.includes('task') && (v.editableParams || []).includes(f.name));
+    const patch = collectParamEdits(root, fields);
+    if (!Object.keys(patch).length) return toast('No changes');
+    try {
+      await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
+      toast('Parameters updated');
+      setTimeout(refreshDrawer, 250);
+      setTimeout(refreshTasks, 400);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+}
+
 // the generic auto-render floor (SPEC §10.2 tier 1): render declared actions
 function drawerActions(v) {
   const acts = v.actions || [];
   const followUp = acts.find((a) => a.name === 'followUp');
-  const setTarget = acts.find((a) => a.name === 'setTarget');
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
   for (const a of simple) {
     const cls = a.name === 'confirm' ? 'primary' : a.danger ? 'danger' : '';
     html += `<button class="btn ${cls}" data-act="${a.name}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}</button>`;
   }
-  if (setTarget) {
-    html += `<input id="target-in" class="title-in" style="max-width:160px;padding:8px 10px" placeholder="branch" value="${esc(v.targetBranch || '')}" ${setTarget.enabled ? '' : 'disabled'} />
-             <button class="btn sm" data-act="setTarget" ${setTarget.enabled ? '' : 'disabled'}>Set target</button>`;
-  }
+  // Target-branch editing now lives in the Parameters form (drawerParams), which
+  // renders it editable/frozen per the workflow's window — no separate input here.
   html += `</div>`;
   if (followUp) {
     html += `<div class="followup-box">
@@ -829,10 +1421,6 @@ function wireActions(v) {
           await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', text }) });
           $('#followup').value = '';
           toast('Follow-up sent');
-        } else if (act === 'setTarget') {
-          const branch = $('#target-in').value.trim();
-          await api(`/api/tasks/${v.taskId}/target`, { method: 'POST', body: JSON.stringify({ branch }) });
-          toast('Target updated');
         } else {
           await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
           toast(`${act} sent`);
@@ -917,8 +1505,13 @@ async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
   try {
-    const d = await api('/api/dashboard');
+    const [d, u] = await Promise.all([
+      api('/api/dashboard'),
+      api('/api/accounts/usage').catch(() => ({ usage: {}, pollable: [] })),
+    ]);
     const accounts = d.accounts?.accounts || [];
+    const usage = u.usage || {};
+    const pollable = new Set(u.pollable || []);
     box.innerHTML = `
       <div class="page-title">Overview</div>
       <div class="stat-grid">
@@ -926,11 +1519,130 @@ async function renderDashboard() {
         <div class="stat"><div class="n">${d.tasks}</div><div class="l">Tasks</div></div>
         ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(s)}</div></div>`).join('')}
       </div>
-      <div class="section-h">Agent accounts (token / limit status)</div>
+      <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
+        <span>Agent accounts (login availability &amp; quota)</span>
+        ${pollable.size ? `<button class="btn sm usage-recheck-all">↻ Re-check usage</button>` : ''}
+      </div>
       ${accounts.length
-        ? accounts.map((a) => `<div class="card"><b class="mono">${esc(a.id)}</b> — in use ${a.inUse}/${a.maxConcurrent}, window ${a.fiveHourUsed}/${a.fiveHourLimit}${d.accounts.waiting ? ` · ${d.accounts.waiting} waiting` : ''}</div>`).join('')
+        ? accounts.map((a) => {
+            const status = a.status || 'available';
+            const badge = status === 'available'
+              ? '🟢 available'
+              : status === 'manual-off'
+                ? '⏸ off (manual)'
+                : `🔴 ${esc(a.window || 'exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`;
+            const weekly = a.weeklyResetAt ? `<span style="color:var(--ink-3)"> · weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
+            return `<div class="card">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <b class="mono">${esc(a.id)}</b>
+                <span class="chip">${esc(a.provider || '')}</span>
+                <span>${badge}</span>${weekly}
+                <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent}</span>
+              </div>
+              ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
+              <div class="task-sub" style="gap:6px;margin-top:6px">
+                ${status === 'available'
+                  ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
+                  : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available now</button>`}
+                <button class="btn sm acct-reset" data-id="${esc(a.id)}">Set reset time…</button>
+                ${pollable.has(a.id) ? `<button class="btn sm usage-recheck" data-id="${esc(a.id)}">↻ Re-check usage</button>` : ''}
+              </div>
+            </div>`;
+          }).join('') + (d.accounts.waiting ? `<div class="task-sub" style="color:var(--ink-3);margin-top:6px">${d.accounts.waiting} turn(s) waiting for a login</div>` : '')
         : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`;
+    const recheck = async (btn, body) => {
+      const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
+      try { await api('/api/accounts/usage/recheck', { method: 'POST', body: JSON.stringify(body) }); }
+      catch (e) { toast(e.message, true); }
+      btn.textContent = label; renderDashboard();
+    };
+    box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
+    box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
+    box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
+      await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
+      renderDashboard();
+    }));
+    box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
+      const ans = prompt('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
+      if (!ans) return;
+      const mins = Number(ans);
+      const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
+      if (!resetAt || isNaN(resetAt)) { toast('Could not parse a time', true); return; }
+      await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
+      renderDashboard();
+    }));
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+// Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,
+// an "unavailable" record, or undefined (never probed). Non-pollable logins (Codex /
+// API keys / setup-token) render nothing here — their reactive status is shown above.
+function usageBlock(id, snap, isPollable) {
+  if (!snap) {
+    return isPollable
+      ? `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">Usage not checked yet — click “↻ Re-check usage”.</div>`
+      : '';
+  }
+  if (!snap.ok) {
+    const why = snap.reason === 'setup-token'
+      ? 'Usage % needs a full login (this one uses a setup-token) — tracked reactively.'
+      : snap.reason === 'logged-out' ? 'Not logged in.'
+      : snap.reason === 'not-subscription' ? 'No subscription usage to report.'
+      : `Usage unavailable (${esc(snap.reason || '')}).`;
+    return `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">${esc(why)}</div>`;
+  }
+  const rows = [];
+  if (snap.session) rows.push(usageRow('Session', snap.session));
+  if (snap.week) rows.push(usageRow('Week', snap.week));
+  for (const m of snap.models || []) rows.push(usageRow(m.name || 'model', m));
+  return `<div style="margin-top:6px">${rows.join('')}
+    <div class="task-sub" style="color:var(--ink-3);font-size:11px">checked ${esc(fmtAgo(snap.at))}</div></div>`;
+}
+
+function usageRow(label, win) {
+  const pct = Math.max(0, Math.min(100, win.pct || 0));
+  const hue = pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
+  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px">
+    <span style="width:64px;color:var(--ink-2)">${esc(label)}</span>
+    <span style="flex:1;height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:180px">
+      <span style="display:block;height:100%;width:${pct}%;background:${hue}"></span>
+    </span>
+    <span class="mono" style="width:38px;text-align:right">${pct}%</span>
+    <span style="color:var(--ink-3)">resets ${esc(fmtUsageReset(win))}</span>
+  </div>`;
+}
+
+function fmtUsageReset(win) {
+  const cd = win.resetAt ? ` · ${fmtCountdown(win.resetAt)}` : '';
+  return `${win.resetLabel || ''}${win.tz ? ` (${win.tz})` : ''}${cd}`;
+}
+
+function fmtCountdown(epoch) {
+  const ms = epoch - Date.now();
+  if (ms <= 0) return 'now';
+  const mins = Math.floor(ms / 60_000);
+  const d = Math.floor(mins / 1440), h = Math.floor((mins % 1440) / 60), m = mins % 60;
+  if (d) return `in ${d}d ${h}h`;
+  if (h) return `in ${h}h ${m}m`;
+  return `in ${m}m`;
+}
+
+function fmtAgo(epoch) {
+  if (!epoch) return 'just now';
+  const ms = Date.now() - epoch;
+  if (ms < 60_000) return 'just now';
+  const m = Math.floor(ms / 60_000);
+  return m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
+}
+
+// Format an absolute reset instant as a local time + relative countdown.
+function fmtReset(epoch) {
+  const ms = epoch - Date.now();
+  const when = new Date(epoch).toLocaleString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' });
+  if (ms <= 0) return `${when} (now)`;
+  const h = Math.floor(ms / 3600_000);
+  const m = Math.floor((ms % 3600_000) / 60_000);
+  return `${when} (in ${h ? `${h}h ` : ''}${m}m)`;
 }
 
 // ── settings (schema-driven, SPEC §10.4) ─────────────────────────────────────
@@ -964,6 +1676,7 @@ async function hydrateSettingsForms(scope, projectId) {
     const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
     sec.querySelector('.wf-form').innerHTML = fields.map((f) => renderField(f, own[f.name], inherited[f.name])).join('');
     wireAgentFields(sec);
+    wireFieldResets(sec, fields);
   }
 }
 
@@ -973,6 +1686,11 @@ function settingsView(proj) {
     <div class="page-title">Project settings — ${esc(proj.name)}</div>
     <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
     ${settingsForms('project', proj.id)}
+    <div class="card">
+      <div class="section-h">Credentials &amp; precedence</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Override the global credential order/enablement for this project (e.g. enable an API key here that's off globally).</p>
+      <div id="cred-editor-project">Loading…</div>
+    </div>
     ${profilesCard('project')}
     ${paymentsCard('project')}
     <div class="card" id="wf-pins-card">
@@ -984,6 +1702,11 @@ function settingsView(proj) {
       <div class="section-h">Workflow activation</div>
       <p style="color:var(--ink-2);margin-top:0">Activating a workflow resolves its dependencies and may spawn an onActivate preparation task.</p>
       <button class="btn" id="activate-sd">Activate software-dev (runs prep task)</button>
+    </div>
+    <div class="card" style="border-color:var(--danger-weak)">
+      <div class="section-h" style="color:var(--danger)">Danger zone</div>
+      <p style="color:var(--ink-2);margin-top:0">Deleting a project permanently removes it and all of its tasks. This cannot be undone.</p>
+      <button class="btn danger" id="delete-project">Delete project</button>
     </div>`;
 }
 async function hydrateWorkflowPins(projectId) {
@@ -1012,6 +1735,7 @@ async function hydrateWorkflowPins(projectId) {
 }
 function wireSettingsView(proj) {
   hydrateSettingsForms('project', proj.id);
+  renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
   hydrateWorkflowPins(proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
@@ -1031,6 +1755,19 @@ function wireSettingsView(proj) {
       refreshTasks();
     } catch (e) { toast(e.message, true); }
   });
+  $('#delete-project')?.addEventListener('click', async () => {
+    if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
+    try {
+      await api(`/api/projects/${proj.id}`, { method: 'DELETE' });
+      toast(`Deleted project "${proj.name}"`);
+      if (S.projectId === proj.id) S.projectId = null;
+      await loadProjects();
+      S.tab = S.projectId ? 'tasks' : 'dashboard';
+      if (S.projectId) await loadTasks();
+      renderRail();
+      renderMain();
+    } catch (e) { toast(e.message, true); }
+  });
 }
 
 // ── global settings (user scope) ─────────────────────────────────────────────
@@ -1042,11 +1779,12 @@ function globalSettingsView() {
     ${profilesCard('global')}
     ${paymentsCard('global')}
     <div class="card" id="accounts-card">
-      <div class="section-h">Accounts</div>
+      <div class="section-h">Accounts &amp; precedence</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Every login and API key agents can use, in one list. <b>Drag</b> to set precedence (top = tried first); toggle <b>On/Off</b> to enable/disable. API keys are off by default when a subscription exists. Projects and each task override this order + enablement (a task in its own form).</p>
+      <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
-      <div style="font-weight:600;margin-bottom:4px">Logins (subscriptions)</div>
+      <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude or Codex account to use its subscription. Each gets an isolated config home you can switch between (dodges token limits). karmax opens the provider's own login — you complete it; karmax never types your credentials.</p>
-      <div id="logins-list" style="margin-bottom:10px"></div>
       <div class="form-row"><label>Connect a login</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <select id="login-provider"><option>claude</option><option>codex</option></select>
@@ -1061,8 +1799,7 @@ function globalSettingsView() {
         <div id="login-result" style="font-size:12px;margin-top:6px"></div>
       </div>
 
-      <div style="font-weight:600;margin:14px 0 4px">API keys</div>
-      <div id="accounts-list" style="margin-bottom:10px"></div>
+      <div style="font-weight:600;margin:14px 0 4px">Register an API key</div>
       <div class="form-row"><label>Register a key</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <select id="acct-provider"><option>claude</option><option>codex</option></select>
@@ -1219,7 +1956,6 @@ function accountChecks(p, handles, logins) {
 }
 
 function profileRow(p, handles, logins, scope) {
-  const models = MODELS[p.provider] || MODELS.claude;
   const inherited = scope === 'project' && p.scope === 'inherited';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
@@ -1227,8 +1963,11 @@ function profileRow(p, handles, logins, scope) {
       ${inherited ? '<span class="chip" title="Using the global default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
-      <input class="pf-model" list="pm-${esc(p.id)}" placeholder="model" value="${esc(p.model || '')}" style="flex:1;min-width:140px" />
-      <datalist id="pm-${esc(p.id)}">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
+      <div class="combo pf-model-combo" style="flex:1;min-width:140px">
+        <input class="pf-model" placeholder="model" value="${esc(p.model || '')}" autocomplete="off" />
+        <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
+        <div class="combo-menu" hidden></div>
+      </div>
       ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
@@ -1250,15 +1989,15 @@ async function hydrateProfiles(scope, projectId) {
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
   list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles, logins, scope)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
-  list.querySelectorAll('.pf-provider').forEach((sel) => sel.addEventListener('change', (e) => {
-    const card = sel.closest('[data-profile]');
-    card.querySelector('datalist').innerHTML = (MODELS[e.target.value] || []).map((m) => `<option value="${m}">`).join('');
-    card.querySelector('.pf-model').value = '';
-    refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
-  }));
-  list.querySelectorAll('.pf-model').forEach((inp) => inp.addEventListener('input', () =>
-    refreshEffortSelect(inp.closest('[data-profile]'), 'pf-provider', 'pf-model', 'pf-effort'),
-  ));
+  list.querySelectorAll('[data-profile]').forEach((card) => {
+    const combo = card.querySelector('.pf-model-combo');
+    const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
+    if (combo) wireCombo(combo, () => MODELS[providerOf()] || MODELS.claude, () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
+    card.querySelector('.pf-provider')?.addEventListener('change', () => {
+      card.querySelector('.pf-model').value = ''; // model choices are provider-specific
+      refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
+    });
+  });
   const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
   list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
     const card = b.closest('[data-profile]');
@@ -1282,29 +2021,11 @@ async function hydrateProfiles(scope, projectId) {
   }));
 }
 
-// The accounts card (logins + API keys) — a global concept; projects choose which
-// via the per-profile checkboxes above.
+// The logins + API keys now live in the unified credential manager (#cred-editor-global:
+// drag to reorder, On/Off to enable/disable, ✎/✕ to rename/delete a login). This just
+// refreshes it after a connect/register/delete.
 async function hydrateAccounts() {
-  let handles = [], logins = [];
-  try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
-  const accBox = $('#accounts-list');
-  if (accBox) accBox.innerHTML = handles.length ? handles.map((h) => `<span class="chip">${esc(h)}</span>`).join(' ') : '<span style="color:var(--ink-3)">No keys registered.</span>';
-  const loginBox = $('#logins-list');
-  if (loginBox) loginBox.innerHTML = logins.length
-    ? logins.map((l) => `<span class="chip" data-login="${esc(l.provider)}:${esc(l.account)}" title="${l.loggedIn ? 'signed in' : 'connect pending — finish OAuth in your browser'}">
-        ${l.loggedIn ? '🟢' : '🟡'} ${esc(l.provider)}:${esc(l.account)}
-        <span class="login-rename" data-p="${esc(l.provider)}" data-a="${esc(l.account)}" title="Rename" style="cursor:pointer;margin-left:6px">✎</span>
-        <span class="login-del" data-p="${esc(l.provider)}" data-a="${esc(l.account)}" title="Delete" style="cursor:pointer;margin-left:4px">✕</span></span>`).join(' ')
-    : '<span style="color:var(--ink-3)">No logins connected.</span>';
-  loginBox?.querySelectorAll('.login-del').forEach((x) => x.addEventListener('click', async () => {
-    if (!confirm(`Delete login ${x.dataset.p}:${x.dataset.a}? Its stored credentials are removed.`)) return;
-    try { await api(`/api/accounts/logins/${x.dataset.p}/${encodeURIComponent(x.dataset.a)}`, { method: 'DELETE' }); toast('Login deleted'); hydrateAccounts(); } catch (e) { toast(e.message, true); }
-  }));
-  loginBox?.querySelectorAll('.login-rename').forEach((x) => x.addEventListener('click', async () => {
-    const to = prompt(`Rename login ${x.dataset.p}:${x.dataset.a} to:`, x.dataset.a);
-    if (!to || to === x.dataset.a) return;
-    try { await api(`/api/accounts/logins/${x.dataset.p}/${encodeURIComponent(x.dataset.a)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); hydrateAccounts(); } catch (e) { toast(e.message, true); }
-  }));
+  await renderCredentialEditor($('#cred-editor-global'), 'global');
 }
 
 function profilesCard(scope) {
@@ -1317,8 +2038,8 @@ function profilesCard(scope) {
 
 function wireGlobalSettings() {
   hydrateSettingsForms('global');
+  renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
   hydrateProfiles('global');
-  hydrateAccounts();
   hydrateWorkflows();
   wirePaymentsCard('global');
   $('#wf-install')?.addEventListener('click', async () => {
@@ -1434,7 +2155,11 @@ async function newProject() {
   const name = prompt('Project name');
   if (!name) return;
   try {
-    const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: { defaultBase: 'main', defaultTarget: 'main' } }) });
+    // Create with an EMPTY config so branches (and every other field) inherit
+    // from global settings. Hardcoding defaultBase/defaultTarget here would bake
+    // a project-scope override that shadows the global default (e.g. "master"),
+    // which is exactly the inheritance bug this avoids.
+    const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: {} }) });
     await loadProjects();
     S.projectId = p.id;
     renderRail();
