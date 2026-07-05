@@ -194,6 +194,13 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
         });
       }
     }
+    // Reconcile: both callers (main boot + gateway refreshLoginPool) pass the FULL,
+    // authoritative credential set, so an account no longer in it is a stale entry
+    // (e.g. an API-key handle that was removed) — prune it once idle, so removed
+    // credentials don't linger on the dashboard or get leased. Keep any that are
+    // still in-use; a later sync prunes them when their turn finishes.
+    const live = new Set(incoming.map((a) => a.id));
+    accounts = accounts.filter((a) => live.has(a.id) || a.inUse > 0);
   });
   setHandler(leaseAccountSignal, (req) => {
     if (!queue.find((q) => q.taskId === req.taskId && q.turnId === req.turnId)) {
