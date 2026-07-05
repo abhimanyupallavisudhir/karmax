@@ -11,6 +11,8 @@ import { parseTransition } from '../resolve/transitions.js';
  *   @write <path> :: <content>      write a file (\n decoded to newlines)
  *   @run <command...>               run a shell command in the world
  *   @subtask <title> :: <prompt>    spawn a child task
+ *   @respond <action> [:: text]     parent answers a raising child (confirm/comment/retry/cancel)
+ *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
  *   @review <summary>               attach review info
  *   @skill <name> :: <content>      save a skill
  *   @fail <message>                 throw (exercises Resolve)
@@ -52,6 +54,28 @@ export class MockAdapter implements AgentAdapter {
           const [title, prompt = ''] = splitOn(rest, '::');
           ctx.createSubTask({ title: title.trim(), prompt: prompt.trim() });
           outputs.push(`subtask: ${title.trim()}`);
+          break;
+        }
+        case 'respond': {
+          // @respond <action> [:: text] — parent answering a raising child. Omits
+          // child_task_id, so it targets all children currently waiting.
+          const [action, textRest = ''] = splitOn(rest, '::');
+          const act = action.trim();
+          if (['confirm', 'comment', 'retry', 'cancel'].includes(act)) {
+            ctx.respondToSubTask({ action: act as 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined });
+            outputs.push(`respond: ${act}`);
+          }
+          break;
+        }
+        case 'raise': {
+          // @raise <type> [:: detail] — child asking its parent. Pauses the turn.
+          const [type, detail = ''] = splitOn(rest, '::');
+          const t = type.trim();
+          if (['needs_info', 'needs_permission', 'needs_confirmation', 'blocked'].includes(t)) {
+            ctx.raiseToParent({ type: t as 'needs_info' | 'needs_permission' | 'needs_confirmation' | 'blocked', detail: detail.trim() || undefined });
+            complete = false; // raising pauses for a reply; don't signal completion
+            outputs.push(`raise: ${t}`);
+          }
           break;
         }
         case 'review': {

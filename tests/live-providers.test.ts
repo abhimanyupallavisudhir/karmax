@@ -25,6 +25,8 @@ const ctx = (): PlatformToolContext => ({
   signalCompletion() {},
   createReviewInfo() {},
   createSubTask() {},
+  respondToSubTask() {},
+  raiseToParent() {},
   saveSkill() {},
   resolveDecision() {},
   async requestSpend() { return { status: 'denied' as const }; },
