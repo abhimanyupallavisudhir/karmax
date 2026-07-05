@@ -150,27 +150,89 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('cancelled');
   });
 
-  it('spawns and awaits a sub-task, then completes the parent', async () => {
+  // The parent surfaces a child's raise as a system message before it can answer it.
+  // Waiting for that guarantees the parent has the child in `awaitingResponse` (and,
+  // for the mock which only reads the latest message, that our @respond isn't raced by
+  // the incoming raise). A real agent answers in the same turn it sees the raise.
+  const parentSawRaise = async (handle: any, needle: string) =>
+    expect
+      .poll(async () => ((await view(handle)).messages as any[]).some((m) => m.role === 'system' && m.text.includes(needle)), { timeout: 40_000 })
+      .toBe(true);
+
+  it('parent-as-confirmer: a child raises at Review, the parent approves, and the work stacks onto the parent branch then main', async () => {
     const repo = await h.makeRepo('app-sub');
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
-      args: [
-        input({
-          taskId,
-          repo,
-          title: 'Parent',
-          prompt: '@subtask Build helper :: @write helper.txt :: from child\n@review parent done',
-        }),
-      ],
+      args: [input({ taskId, repo, title: 'Parent', prompt: '@subtask Build helper :: @write helper.txt :: from child' })],
     });
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
-    const v = await view(handle);
-    expect(v.subTasks?.length).toBe(1);
+
+    // the child is spawned and tracked on the parent
+    await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 20_000 }).toBe(1);
+    const parentBranch = (await view(handle)).branch as string;
+    const childId = (await view(handle)).subTasks![0];
+    const child = h.client.workflow.getHandle(childId);
+
+    // the child branches off + targets the PARENT's branch (not main), not straight to main
+    await expect
+      .poll(async () => {
+        const cv = (await child.query('view')) as any;
+        return `${cv.base}/${cv.targetBranch}`;
+      }, { timeout: 20_000 })
+      .toBe(`${parentBranch}/${parentBranch}`);
+
+    // it raises to the parent for confirmation — surfaced to the parent's Do agent,
+    // NOT a hidden human (the v1 deadlock)
+    await parentSawRaise(handle, 'needs_confirmation');
+    // nothing has reached main yet — the child merges into the parent, not main
+    expect((await git(repo, ['show', 'main:helper.txt'])).code).not.toBe(0);
+
+    // the parent's Do agent approves the child (respond_to_sub_task → confirm)
+    await handle.signal('followUp', { id: 'r1', role: 'user', text: '@respond confirm', ts: 0 });
+
+    // the parent then reaches its OWN Review with the child's work folded in
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 25_000 }).toBe('review');
     await handle.signal('confirm');
     const result = await handle.result();
     expect(result.stage).toBe('done');
+
+    // the child's work reached main THROUGH the parent — one merge at the top
+    const onMain = await git(repo, ['show', 'main:helper.txt']);
+    expect(onMain.code).toBe(0);
+    expect(onMain.stdout).toContain('from child');
+  });
+
+  it('a stuck child raises "blocked" to its parent instead of deadlocking on a hidden human', async () => {
+    const repo = await h.makeRepo('app-sub-fail');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Parent', prompt: '@subtask Flaky :: @fail child cannot proceed' })],
+    });
+
+    await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 20_000 }).toBe(1);
+    const childId = (await view(handle)).subTasks![0];
+    const child = h.client.workflow.getHandle(childId);
+
+    // the child exhausts resolve, escalates, and raises UP to the parent (not a hidden human)
+    await expect
+      .poll(async () => {
+        const cv = (await child.query('view')) as any;
+        return `${cv.stage}/${cv.waitingFor?.kind}`;
+      }, { timeout: 40_000 })
+      .toBe('escalated/parent');
+    await parentSawRaise(handle, 'blocked');
+
+    // the parent decides to abandon the stuck child
+    await handle.signal('followUp', { id: 'x1', role: 'user', text: '@respond cancel', ts: 0 });
+
+    // the child is cancelled and the parent is unblocked → its own Review
+    await expect.poll(async () => ((await child.query('view')) as any).status, { timeout: 20_000 }).toBe('cancelled');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
   });
 
   it('serializes two tasks through the merge queue onto the same branch', async () => {

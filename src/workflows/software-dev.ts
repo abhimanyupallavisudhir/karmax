@@ -5,12 +5,14 @@ import {
   defineQuery,
   setHandler,
   condition,
-  executeChild,
+  startChild,
+  getExternalWorkflowHandle,
   workflowInfo,
   CancellationScope,
   isCancellation,
   ApplicationFailure,
   log,
+  type ChildWorkflowHandle,
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
@@ -25,6 +27,9 @@ import {
   ReviewInfo,
   DeclaredAction,
   WorldHandleLike,
+  ChildRaise,
+  ParentResponse,
+  SubTaskResponse,
 } from './contract.js';
 
 const core = proxyActivities<coreActivities>({
@@ -45,6 +50,11 @@ export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
+/** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
+export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
+/** A parent answers a child that raised to it — maps onto the same confirm/retry/
+ *  cancel/follow-up transitions a human would drive (SPEC §5.3). */
+export const parentResponseSignal = defineSignal<[ParentResponse]>('parentResponse');
 export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
 /**
  * Generic in-flight param edit (SPEC §4.5/§5.5). Validated: the validator rejects
@@ -103,6 +113,15 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let pr: { url: string; number: number } | undefined;
   let mergeQueuePos: { position: number; total: number } | undefined;
   const subTaskIds: string[] = [];
+  // Sub-task hierarchy (SPEC §5.3). Children are managed, not blindly awaited: their
+  // handles let us await completion, raised requests queue in `raises`, settlements in
+  // `settled`, `outstanding` is the not-yet-finished set, and `awaitingResponse` is the
+  // children currently parked on a reply from us.
+  const childHandles = new Map<string, ChildWorkflowHandle<typeof softwareDev>>();
+  const raises: ChildRaise[] = [];
+  const settled: { childTaskId: string; stage: string; detail?: string }[] = [];
+  const outstanding = new Set<string>();
+  const awaitingResponse = new Set<string>();
   let pointOfNoReturnPassed = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
@@ -274,6 +293,26 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   setHandler(retrySignal, () => {
     retryRequested = true;
   });
+  // A child raised to us: queue it so the Do agent can answer (SPEC §5.3).
+  setHandler(raiseFromChildSignal, (r) => {
+    raises.push(r);
+    awaitingResponse.add(r.childTaskId);
+  });
+  // Our parent answered a raise. Map its decision onto the SAME flags a human drives
+  // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
+  setHandler(parentResponseSignal, (resp) => {
+    if (resp.action === 'confirm') confirmed = true;
+    else if (resp.action === 'retry') retryRequested = true;
+    else if (resp.action === 'cancel') {
+      if (!pointOfNoReturnPassed) {
+        cancelled = true;
+        activeTurn?.cancel();
+      }
+    } else if (resp.action === 'comment') {
+      if (resp.text) msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text, ts: msgs.length });
+      retryRequested = true; // unblocks an escalated child; at Review the new msg drives it
+    }
+  });
   setHandler(mergeGrantedSignal, () => {
     mergeGranted = true;
   });
@@ -366,13 +405,20 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           await publish();
         }
       }
-      // Attempts exhausted → escalate to a human, preserving the failure cause.
+      // Attempts exhausted → escalate. A child raises `blocked` to its parent (which
+      // can retry/answer/cancel it); a top-level task escalates to a human. Either way
+      // it stays resolvable — the v1 bug was a child blocking on a hidden human (§5.3).
       stage = 'escalated';
       status = 'blocked';
       error = lastError;
       retryRequested = false;
+      if (input.parentTaskId) {
+        waitingFor = { kind: 'parent' };
+        await notifyParent('blocked', lastError);
+      }
       await publish();
       await condition(() => retryRequested || cancelled);
+      waitingFor = undefined;
       if (cancelled) throw new Cancelled();
       status = 'active';
       error = undefined;
@@ -462,20 +508,10 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     }
   }
 
-  try {
-  // ── Setup ──
-  await publish();
-  world = (await withResolve('setup', () =>
-    core.createWorld({ taskId, repo: input.project.repos?.[0], base, target, copyGlobs: input.project.copyGlobs, kind }),
-  )) as WorldHandleLike;
-  // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
-  accountPool = await coord.accountPoolSize().catch(() => 0);
-
-  // ── Do ⇄ Review ──
-  for (stage = 'do', status = 'active'; ; ) {
-    await publish();
-    if (cancelled) return await abort();
-
+  // ── Do turn + sub-task hierarchy (SPEC §5.2/§5.3) ──
+  /** Run one Do-agent turn (leased login, resolve-wrapped) and fold its result into
+   *  the running conversation. Shared by the main loop and sub-task management. */
+  async function doTurn() {
     let doHome: string | undefined;
     const turn = await withResolve('do', () =>
       leasedTurn('do', (accountConfigHome, accountApiKeyHandle) => {
@@ -485,8 +521,6 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           role: 'do',
           worldHandle: world as any,
           messages: msgs,
-          // Resume the stored session only if this turn's login minted it (§2.5);
-          // otherwise start fresh under the new login (msgs replays the context).
           session: sessionMatchesHome(accountConfigHome) ? session : undefined,
           task: liveInput,
           accountConfigHome,
@@ -499,39 +533,184 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     if (turn.output?.trim()) msgs.push({ id: `a${msgs.length}`, role: 'agent', text: turn.output, ts: msgs.length });
     seen = msgs.length;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    return turn;
+  }
 
-    // Sub-tasks: spawn child workflows and await them (SPEC §5.3 Do→Do).
-    if (turn.subTasks?.length) {
-      const children = await Promise.all(
-        turn.subTasks.map(async (s) => {
-          const childInput = await core.prepareChildTask({
-            parentTaskId: taskId,
-            projectId: input.projectId,
-            title: s.title,
-            prompt: s.prompt,
-            base,
-            target,
-            project: input.project,
-            profiles: input.profiles,
-          });
-          subTaskIds.push(childInput.taskId);
-          await publish();
-          const res = await executeChild(softwareDev, {
-            workflowId: childInput.taskId,
-            args: [{ ...childInput, autoConfirm: true } as SoftwareDevInput],
-          });
-          return { title: s.title, res };
-        }),
-      );
-      for (const c of children) {
-        msgs.push({ id: `st-${msgs.length}`, role: 'system', text: `Sub-task "${c.title}" finished: ${c.res.stage}.`, ts: msgs.length });
+  /** Record a child's eventual settlement so the management loop can react. */
+  function trackChild(childTaskId: string, child: ChildWorkflowHandle<typeof softwareDev>) {
+    child.result().then(
+      (res) => settled.push({ childTaskId, stage: (res as { stage: Stage }).stage }),
+      (err) => settled.push({ childTaskId, stage: 'failed', detail: describeError(err) }),
+    );
+  }
+
+  /** Spawn sub-tasks as branch-stacked, detached children (SPEC §5.3). Each branches
+   *  off — and merges back into — THIS task's world branch, so `main` sees one merge at
+   *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
+   *  dirty tree) so children fork the current state. */
+  async function spawnSubTasks(list: { title: string; prompt: string }[]) {
+    await core.commitWork(world as any, `karmax: snapshot before sub-tasks for ${taskId}`);
+    for (const s of list) {
+      const childInput = await core.prepareChildTask({
+        parentTaskId: taskId,
+        projectId: input.projectId,
+        title: s.title,
+        prompt: s.prompt,
+        base: world!.branch,
+        target: world!.branch,
+        project: input.project,
+        profiles: input.profiles,
+      });
+      subTaskIds.push(childInput.taskId);
+      outstanding.add(childInput.taskId);
+      const child = await startChild(softwareDev, {
+        workflowId: childInput.taskId,
+        args: [childInput as SoftwareDevInput],
+      });
+      childHandles.set(childInput.taskId, child);
+      trackChild(childInput.taskId, child);
+    }
+    await publish();
+  }
+
+  /** Send the Do agent's answers down to the children they target (SPEC §5.3). */
+  async function applySubTaskResponses(responses: SubTaskResponse[] | undefined) {
+    for (const r of responses ?? []) {
+      const targets = r.childTaskId ? [r.childTaskId] : [...awaitingResponse];
+      const resp: ParentResponse = { action: r.action, text: r.text };
+      for (const cid of targets) {
+        try {
+          await getExternalWorkflowHandle(cid).signal(parentResponseSignal, resp);
+        } catch {
+          /* child already gone */
+        }
+        awaitingResponse.delete(cid);
       }
-      continue; // resume Do so the agent sees results
+    }
+  }
+
+  /** Cancel any still-running children (on our own abort). Best effort. */
+  async function cancelChildren() {
+    for (const cid of outstanding) {
+      try {
+        await getExternalWorkflowHandle(cid).signal(cancelSignal);
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+
+  function subtaskRaiseText(r: ChildRaise): string {
+    return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel).`;
+  }
+
+  /**
+   * Manage outstanding children until they all settle (SPEC §5.3). Surfaces their
+   * raised requests to the Do agent (so it can confirm/answer/retry them) and injects
+   * their results. The parent is NEVER a dead await: it wakes on a raise, a settlement,
+   * or a human follow-up. This is what fixes the v1 deadlock — a child that escalated
+   * used to block on a human who couldn't even see it.
+   */
+  async function manageSubTasks() {
+    for (;;) {
+      while (raises.length) {
+        const r = raises.shift()!;
+        msgs.push({ id: `st-${msgs.length}`, role: 'system', text: subtaskRaiseText(r), ts: msgs.length });
+      }
+      while (settled.length) {
+        const s = settled.shift()!;
+        outstanding.delete(s.childTaskId);
+        awaitingResponse.delete(s.childTaskId);
+        msgs.push({
+          id: `st-${msgs.length}`,
+          role: 'system',
+          text: `Sub-task ${s.childTaskId} finished: ${s.stage}${s.detail ? ` (${s.detail})` : ''}.`,
+          ts: msgs.length,
+        });
+      }
+      if (cancelled) {
+        await cancelChildren();
+        throw new Cancelled();
+      }
+      if (outstanding.size === 0) return; // all children done → resume the main Do loop
+      if (msgs.length > seen) {
+        // New info for the agent (a raise or a human follow-up) → let it react.
+        stage = 'do';
+        status = 'active';
+        waitingFor = undefined;
+        await publish();
+        const t = await doTurn();
+        await applySubTaskResponses(t.subTaskResponses);
+        if (t.subTasks?.length) await spawnSubTasks(t.subTasks);
+        continue;
+      }
+      // Nothing to process → park until a child event or a human follow-up.
+      stage = 'do';
+      status = 'waiting';
+      waitingFor = { kind: 'subtask' };
+      await publish();
+      await condition(() => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen);
+    }
+  }
+
+  /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
+   *  parent is gone the child stays human-resolvable via its own retry/confirm. */
+  async function notifyParent(type: ChildRaise['type'], detail?: string) {
+    if (!input.parentTaskId) return;
+    try {
+      await getExternalWorkflowHandle(input.parentTaskId).signal(raiseFromChildSignal, {
+        childTaskId: taskId,
+        childTitle: input.title,
+        type,
+        detail: detail ?? '',
+      });
+    } catch {
+      /* parent gone → fall back to the human gate */
+    }
+  }
+
+  try {
+  // ── Setup ──
+  await publish();
+  world = (await withResolve('setup', () =>
+    core.createWorld({ taskId, repo: input.project.repos?.[0], base, target, copyGlobs: input.project.copyGlobs, kind }),
+  )) as WorldHandleLike;
+  // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
+  accountPool = await coord.accountPoolSize().catch(() => 0);
+
+  // ── Do ⇄ Review ──
+  for (;;) {
+    // Each iteration starts fresh in Do — clears any park state left by sub-task
+    // management (which may return with status 'waiting'/waitingFor 'subtask').
+    stage = 'do';
+    status = 'active';
+    waitingFor = undefined;
+    await publish();
+    if (cancelled) return await abort();
+
+    const turn = await doTurn();
+
+    // Sub-tasks: spawn (branch-stacked) + manage them to completion (we are their
+    // confirmer), then resume Do so the agent sees their results (SPEC §5.3).
+    if (turn.subTasks?.length) {
+      await spawnSubTasks(turn.subTasks);
+      await applySubTaskResponses(turn.subTaskResponses);
+      await manageSubTasks();
+      if (cancelled) return await abort();
+      continue;
+    }
+    // A turn that only answers children (no new spawns) while some are still running.
+    if (turn.subTaskResponses?.length && outstanding.size) {
+      await applySubTaskResponses(turn.subTaskResponses);
+      await manageSubTasks();
+      if (cancelled) return await abort();
+      continue;
     }
 
-    if (turn.completed || turn.needsInput) {
-      // Goal mode: keep nudging the agent until it signals structured completion.
-      if (input.goalMode && !turn.completed) {
+    if (turn.completed || turn.needsInput || turn.raise) {
+      // Goal mode: keep nudging the agent until it signals structured completion
+      // (unless it's explicitly raising to its parent, which needs an answer).
+      if (input.goalMode && !turn.completed && !turn.raise) {
         msgs.push({
           id: `kg-${msgs.length}`,
           role: 'user',
@@ -554,14 +733,25 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           ...(reviewInfo?.html ? { html: reviewInfo.html } : {}),
         };
       }
+      // An explicit raise carries its own message; show it as the review summary.
+      if (turn.raise?.detail) reviewInfo = { ...reviewInfo, summary: turn.raise.detail };
       stage = 'review';
       status = 'waiting';
-      if (input.autoConfirm) confirmed = true;
+      if (input.autoConfirm) {
+        confirmed = true;
+      } else if (input.parentTaskId) {
+        // Parent-as-confirmer (SPEC §5.3): raise to the parent instead of blocking on
+        // a human the parent-managed child isn't even surfaced to. The parent's reply
+        // drives `confirmed`/follow-up via parentResponseSignal.
+        waitingFor = { kind: 'parent' };
+        await notifyParent(turn.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
+      }
       await publish();
       await condition(() => confirmed || cancelled || msgs.length > seen);
+      waitingFor = undefined;
       if (cancelled) return await abort();
       if (confirmed) break;
-      // follow-up arrived → back to Do
+      // follow-up (a human, or the parent's comment) arrived → back to Do
       stage = 'do';
       status = 'active';
       continue;
@@ -646,14 +836,20 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       pointOfNoReturnPassed = true;
       break;
     }
-    // Merge problem → escalate to a human, who can retry (loop) or cancel.
+    // Merge problem → escalate. A child raises `blocked` to its parent (which can
+    // retry/answer/cancel); a top-level task escalates to a human. Either can retry.
     error = `merge failed: ${result.conflict ?? result.note ?? 'unknown'}`;
     reviewInfo = { ...reviewInfo, summary: error };
     stage = 'escalated';
     status = 'blocked';
     retryRequested = false;
+    if (input.parentTaskId) {
+      waitingFor = { kind: 'parent' };
+      await notifyParent('blocked', error);
+    }
     await publish();
     await condition(() => retryRequested || cancelled);
+    waitingFor = undefined;
     if (cancelled) return await abort();
     error = undefined;
   }
@@ -673,6 +869,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   async function abort() {
     stage = 'cancelled';
     status = 'cancelled';
+    await cancelChildren(); // don't strand children when we go away
     await publish();
     if (world) await core.destroyWorld(world as any);
     return { stage } as { stage: Stage };
