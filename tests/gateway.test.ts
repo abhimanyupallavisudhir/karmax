@@ -200,6 +200,31 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(h.store.getTask(draft.id)!.notes).toBeUndefined();
   });
 
+  it('accepts notes on the create-task form and keeps them off params/prompt', async () => {
+    const project: any = await (
+      await fetch(`${base}/api/projects`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ name: 'FormNotes', config: {} }),
+      })
+    ).json();
+    // The full task form (the "…More" surface) POSTs notes alongside params.
+    const created: any = await (
+      await fetch(`${base}/api/projects/${project.id}/tasks`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ params: { prompt: 'build the thing' }, notes: 'reminder from the form', workflow: 'software-dev', draft: true }),
+      })
+    ).json();
+
+    // notes are returned on the created record and persisted off params
+    expect(created.notes).toBe('reminder from the form');
+    const stored = h.store.getTask(created.id)!;
+    expect(stored.notes).toBe('reminder from the form');
+    expect(stored.params.notes).toBeUndefined();
+    expect(stored.params.prompt).toBe('build the thing');
+  });
+
   it('allows editing notes on a task at any stage — including after it is done', async () => {
     const repo = await h.makeRepo('notes-terminal');
     const project: any = await (
