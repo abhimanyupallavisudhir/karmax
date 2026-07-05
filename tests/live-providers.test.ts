@@ -7,6 +7,8 @@ import { WorktreeProvider } from '../src/world/worktree.js';
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CodexAdapter } from '../src/agent/codex.js';
 import { ConfigHomeManager, capturedToken } from '../src/autonomy/config-homes.js';
+import { materializeFork } from '../src/agent/fork.js';
+import { probeClaudeUsage } from '../src/agent/usage.js';
 import { paths } from '../src/config/paths.js';
 import type { PlatformToolContext } from '../src/agent/types.js';
 
@@ -136,4 +138,47 @@ describe.skipIf(!canSwitch)('LIVE Claude — resume conversation under a SWITCHE
     );
     expect(t2.output.toUpperCase()).toContain('BANANA');
   }, 240_000);
+});
+
+// The fork-bug fix (SPEC §10.5): a NATIVE fork — materialize the source session into
+// the fork's (home × world), run `--fork-session` — must give REAL continuity (recall
+// the source conversation) and a NEW session id, without mutating the source. This is
+// the codified version of the manual codeword-recall proof.
+describe.skipIf(!claudeSub)('LIVE Claude — native fork of a prior session (SPEC §10.5)', () => {
+  it('branches a NEW session that RECALLS the source conversation (not prompt-stuffing)', async () => {
+    const a = new ClaudeAdapter();
+    const home = path.join(os.homedir(), '.claude'); // ambient login home
+    const codeword = 'ZQX' + Math.random().toString(36).slice(2, 8).toUpperCase();
+    // Turn 1 (source) in world A: plant the codeword; capture the session id.
+    const worldA = await makeWorld();
+    const t1 = await a.runTurn(
+      { profile: profile(), world: worldA, messages: [{ id: 'm1', role: 'user', text: `Remember this codeword, I'll ask later: ${codeword}. Reply with only: noted`, ts: 0 }], systemPrompt: SYS, role: 'do' } as any,
+      ctx(),
+    );
+    expect(t1.session).toBeTruthy();
+    // Fork into a FRESH world (new cwd): make the source session visible here, then run
+    // with fork:true. If materialize fails the fork can't be native — fail loudly.
+    const worldB = await makeWorld();
+    expect(materializeFork({ provider: 'claude', session: t1.session!, forkHome: home, worldPath: worldB.handle.root, srcHome: home })).toBe(true);
+    const t2 = await a.runTurn(
+      { profile: profile(), world: worldB, messages: [{ id: 'm2', role: 'user', text: 'What codeword did I give you earlier? Reply with ONLY the codeword.', ts: 0 }], session: t1.session, fork: true, systemPrompt: SYS, role: 'do' } as any,
+      ctx(),
+    );
+    expect(t2.output.toUpperCase()).toContain(codeword); // real continuity
+    expect(t2.session).not.toBe(t1.session); // forked → a new session id, source untouched
+  }, 300_000);
+});
+
+// Proactive quota (#6): `claude -p '/usage'` yields real numbers for a full-login
+// credential (the ambient one). A setup-token login would report unavailable instead.
+describe.skipIf(!claudeSub)('LIVE Claude — /usage polling', () => {
+  it('returns real session/weekly usage for the ambient full-login credential (or a clean unavailable)', async () => {
+    const r = await probeClaudeUsage({}); // ambient ~/.claude
+    if (!r.ok) {
+      expect(['setup-token', 'not-subscription', 'logged-out']).toContain(r.reason);
+      return;
+    }
+    expect(typeof r.session?.pct === 'number' || typeof r.week?.pct === 'number').toBe(true);
+    if (r.session) { expect(r.session.pct).toBeGreaterThanOrEqual(0); expect(r.session.pct).toBeLessThanOrEqual(100); }
+  }, 60_000);
 });
