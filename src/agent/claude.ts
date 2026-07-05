@@ -202,7 +202,9 @@ export class ClaudeAdapter implements AgentAdapter {
         // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models
         // that don't support the level, so no gating is needed here.
         ...(input.profile.effort ? { effort: input.profile.effort } : {}),
-        ...(session ? { resume: session } : {}),
+        // Resume the session, or (fork) branch a NEW session id from it, leaving the
+        // source untouched — SPEC §10.5 (CLI: --resume <id> [--fork-session]).
+        ...(session ? { resume: session, ...(input.fork ? { forkSession: true } : {}) } : {}),
         // The platform MCP (in-process) + any MCP servers the workflow declares (§7.5).
         mcpServers: { karmax: platform, ...agentMcpToConfig(input.agentMcp) },
         env,

@@ -979,31 +979,39 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   const q = new URLSearchParams();
   if (opts.projectId) q.set('projectId', opts.projectId);
   if (opts.taskId) q.set('taskId', opts.taskId);
-  let data;
-  try { data = await api(`/api/credentials?${q.toString()}`); }
-  catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
+  let data, accounts = { logins: [] };
+  try {
+    [data, accounts] = await Promise.all([
+      api(`/api/credentials?${q.toString()}`),
+      api('/api/accounts').catch(() => ({ logins: [] })),
+    ]);
+  } catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
   const sd = data[scope] || { own: {}, enabled: [] };
   const own = sd.own || {};
   const enabled = new Set(sd.enabled || []);
   const byKey = Object.fromEntries((data.credentials || []).map((c) => [c.key, c]));
+  // enabled creds in precedence order first, then the disabled ones.
   const ordered = [...(sd.enabled || []).filter((k) => byKey[k]), ...(data.credentials || []).map((c) => c.key).filter((k) => !enabled.has(k))];
-  if (!ordered.length) { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">No credentials yet — connect a login or add an API key.</div>'; return; }
-  el.innerHTML = ordered
-    .map((key, i) => {
+  if (!ordered.length) { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">No credentials yet — connect a login or add an API key below.</div>'; return; }
+  const loginByKey = {};
+  for (const l of accounts.logins || []) loginByKey[`login:${l.provider}:${l.account}`] = l;
+  const canManage = scope === 'global'; // rename/delete a login only at the global scope
+  el.innerHTML = `<div class="cred-list">${ordered
+    .map((key) => {
       const c = byKey[key];
-      return `<div class="cred-row" data-key="${esc(key)}" style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--line)">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;min-width:0">
-          <input type="checkbox" class="cred-on" ${enabled.has(key) ? 'checked' : ''} />
-          <span class="mono" style="overflow:hidden;text-overflow:ellipsis">${esc(c.label)}</span>
-          <span class="chip">${esc(c.kind)}</span>
-        </label>
-        <span style="display:flex;gap:4px;flex:none">
-          <button class="icon-btn cred-up" ${i === 0 ? 'disabled' : ''} title="Higher precedence">↑</button>
-          <button class="icon-btn cred-down" ${i === ordered.length - 1 ? 'disabled' : ''} title="Lower precedence">↓</button>
-        </span>
+      const isOn = enabled.has(key);
+      const login = loginByKey[key];
+      const warn = login && !login.loggedIn ? ' <span style="color:var(--warn,#e0b15a)">(finish OAuth)</span>' : '';
+      const acct = canManage && c.kind === 'login';
+      return `<div class="cred-row" draggable="true" data-key="${esc(key)}">
+        <span class="cred-drag" title="Drag to set precedence">⠿</span>
+        <button class="cred-toggle ${isOn ? 'on' : 'off'}" title="${isOn ? 'Enabled — click to disable' : 'Disabled — click to enable'}">${isOn ? 'On' : 'Off'}</button>
+        <span class="cred-label mono">${esc(c.label)}${warn}</span>
+        <span class="chip">${esc(c.kind)}</span>
+        <span class="cred-actions">${acct ? '<span class="cred-rename" title="Rename login">✎</span><span class="cred-del" title="Delete login">✕</span>' : ''}</span>
       </div>`;
     })
-    .join('');
+    .join('')}</div>`;
   const save = async (policy) => {
     try { await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
     catch (e) { toast(e.message, true); }
@@ -1011,23 +1019,46 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   };
   el.querySelectorAll('.cred-row').forEach((row) => {
     const key = row.dataset.key;
-    row.querySelector('.cred-on').addEventListener('change', (e) => {
-      const on = new Set(own.on || []);
-      const off = new Set(own.off || []);
-      if (e.target.checked) { on.add(key); off.delete(key); } else { off.add(key); on.delete(key); }
+    row.querySelector('.cred-toggle').addEventListener('click', () => {
+      const on = new Set(own.on || []), off = new Set(own.off || []);
+      if (!enabled.has(key)) { on.add(key); off.delete(key); } else { off.add(key); on.delete(key); }
       save({ ...own, on: [...on], off: [...off] });
     });
-    const move = (dir) => {
-      const a = [...ordered];
-      const i = a.indexOf(key);
-      const j = i + dir;
-      if (j < 0 || j >= a.length) return;
-      [a[i], a[j]] = [a[j], a[i]];
-      save({ ...own, order: a });
-    };
-    row.querySelector('.cred-up').addEventListener('click', () => move(-1));
-    row.querySelector('.cred-down').addEventListener('click', () => move(1));
+    const login = loginByKey[key];
+    row.querySelector('.cred-rename')?.addEventListener('click', async () => {
+      const to = prompt(`Rename login ${login.account} to:`, login.account);
+      if (!to || to === login.account) return;
+      try { await api(`/api/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
+      catch (e) { toast(e.message, true); }
+    });
+    row.querySelector('.cred-del')?.addEventListener('click', async () => {
+      if (!confirm(`Delete login ${login.provider}:${login.account}? Its stored credentials are removed.`)) return;
+      try { await api(`/api/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'DELETE' }); toast('Login deleted'); renderCredentialEditor(el, scope, opts); }
+      catch (e) { toast(e.message, true); }
+    });
   });
+  // Drag-to-reorder → precedence order for this scope.
+  wireCredDrag(el.querySelector('.cred-list'), (order) => save({ ...own, order }));
+}
+
+// HTML5 drag-and-drop reordering for the credential rows; calls onReorder(keys[]) on drop.
+function wireCredDrag(list, onReorder) {
+  if (!list) return;
+  let dragging = null;
+  list.querySelectorAll('.cred-row').forEach((row) => {
+    row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', row.dataset.key); } catch {} });
+    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+  });
+  list.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    if (!dragging) return;
+    const after = [...list.querySelectorAll('.cred-row:not(.dragging)')].find((r) => {
+      const b = r.getBoundingClientRect();
+      return e.clientY < b.top + b.height / 2;
+    });
+    after ? list.insertBefore(dragging, after) : list.appendChild(dragging);
+  });
+  list.addEventListener('drop', (e) => { e.preventDefault(); onReorder([...list.querySelectorAll('.cred-row')].map((r) => r.dataset.key)); });
 }
 
 // Which agent role "owns" a given stage — drives which transcript opens by default.

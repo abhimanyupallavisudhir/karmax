@@ -279,6 +279,22 @@ Built:
 
 **Activated + live-validated (2026-07-05):** user re-added `manyu` + `mats` → both now hold a native `.credentials.json`. Verified end-to-end: `pollable` now lists both; dashboard shows real usage (manyu Session 6%/Week 2%; mats Week 23%/Fable 20% — mats has no active session window, so the parser correctly omits the Session row); and a real inference turn runs on each via the native cred with `CLAUDE_CODE_OAUTH_TOKEN` scrubbed (`KARMAX-LOGIN-OK` / `KARMAX-MATS-OK`). The full-login flip is confirmed working for both usage polling and agent runs.
 
+### Fork-a-prior-agent — REWRITTEN (was broken; native fork instead of prompt-stuffing)
+
+**The bug (user-confirmed 2026-07-05):** `resumeFrom` never did a real session fork. `core.ts` loaded the SOURCE task's transcript TEXT and prepended it to the new turn's messages (`messages = [...srcMsgs, ...args.messages]`); on the Codex-exec / fresh-session path those concatenate into ONE prompt string — so the prior conversation was pasted into the new session's first user message. Proof: fork `task_mr70…` created a fresh session `f6812f8f`, unrelated to source `973218e7`.
+
+**Structural reason (verified on disk):** providers key sessions by **(config-home × cwd)** [Claude: `<home>/projects/<cwd-slug>/<id>.jsonl`] or **by id in the home** [Codex: `<CODEX_HOME>/sessions/**` rollout]. A karmax fork runs in a NEW world (cwd) + possibly a different leased login, so `claude --resume <id>` from the new world can't see the source session. (This is why the original chose replay.) BUT the session file lives in the config home, so it **survives world cleanup** and is portable across logins (a `.jsonl` is pure history, no auth).
+
+**The fix (native fork + replay fallback; user chose this):**
+- `src/agent/fork.ts` `materializeFork()` — makes the source session visible to THIS turn: Claude copies the source `.jsonl` into `<forkHome>/projects/<newWorldSlug>/<id>.jsonl`; Codex ensures the rollout is in the turn's `CODEX_HOME`. Read-only on the source. Proven manually: materialize + `claude --resume <id> --fork-session` recalled real source content and branched a NEW session, source untouched, even with the source world cleaned. 5 hermetic tests (`tests/fork.test.ts`).
+- `core.ts` — after auth resolution, look up the source session id (`session:<task>:<role>`) + home/provider (`sessionmeta:…`), `materializeFork` into the turn's (home × world), set `session` + `fork=true` → adapter runs a native fork. Falls back to (labeled) transcript replay only if the source session is gone / cross-provider. Events: `session.forked {native:true}` vs `session.fork_replayed {native:false}`.
+- `TurnInput.fork` + `claude.ts` passes `{resume, forkSession:true}` (SDK supports `forkSession`). Codex resumes by id (cwd-free) so no adapter change; `-C <world>` sets cwd. Codex non-mutation is best-effort (copies cross-home; same-home resume may append — Claude is the clean non-mutating fork).
+- Terminology: use **fork**, not resume, where we mean forking (UI/comments/events) — in progress.
+
+### Coordinator prunes stale accounts (dashboard `claude:manyu` + `login:claude:manyu` duplicates)
+
+`registerAccountsSignal` was add/update-only, so a removed credential (e.g. an API-key handle) lingered forever in the coordinator's durable state — shown on the dashboard and leasable. Now it **reconciles**: both callers pass the full authoritative set, so accounts absent from it are pruned once idle (in-use ones survive to the next sync). +1 test in `quota-coordinator.test.ts`. Deploys on a coordinator restart.
+
 ### Side-workstream: provider auth parity (both providers × both rails) — mostly DONE (tested; live smoke test pending)
 
 Decision: both Claude and Codex must support **subscription** AND **API-key** logins.

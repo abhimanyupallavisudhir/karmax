@@ -15,6 +15,9 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
+import { materializeFork } from '../agent/fork.js';
+import os from 'node:os';
+import path from 'node:path';
 import { manifest } from '../contrib/manifests.js';
 import { attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
@@ -152,35 +155,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : baseProfile;
       const world = await worlds.open(args.worldHandle);
 
-      // Resume a prior agent session if requested (SPEC §10.5): explicit session
-      // id, or the stored session of a referenced task for this role.
+      // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
+      // materializing the source session needs this turn's config home + world path.
       let session = args.session;
-      // `messages` may be augmented below (fork-via-replay), so take a mutable copy.
-      let messages = args.messages;
-      if (!session && spec?.resumeFrom) {
-        const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source role
-        if (spec.resumeFrom.taskId) {
-          // FORK, don't mutate (SPEC §10.5: "forking, not mutating, the source"):
-          // seed a FRESH session by replaying the SOURCE task's conversation, so the
-          // source is never written to and any number of tasks can resume the same
-          // source independently — no shared-session collision. Provider-agnostic:
-          // works whether the source ran on Claude/Codex, key or subscription.
-          const srcView = store.getTask(spec.resumeFrom.taskId)?.lastView;
-          const srcMsgs =
-            srcView?.transcripts?.find((t) => t.role === srcRole)?.messages ??
-            (srcRole === 'do' ? srcView?.messages : undefined) ??
-            [];
-          if (srcMsgs.length) {
-            messages = [...srcMsgs, ...args.messages];
-            record(args.taskId, 'session.forked', { from: { taskId: spec.resumeFrom.taskId, role: srcRole }, replayed: srcMsgs.length });
-          }
-        } else if (spec.resumeFrom.sessionId) {
-          // A raw pasted provider session id = "continue THIS exact session" — resume
-          // it directly (best-effort; it must live in the home this turn runs under).
-          session = spec.resumeFrom.sessionId;
-          record(args.taskId, 'session.resumed', { session });
-        }
-      }
+      let messages = args.messages; // may be augmented by the replay fallback
+      let fork = false; // true → the adapter branches a NEW session id from `session`
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
       // capabilities = intersection(profile ceiling, granting principal).
@@ -231,6 +210,53 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         resolvedAuth = { apiKey };
       }
 
+      // ── Fork a prior agent (SPEC §10.5) ──────────────────────────────────────
+      // Branch a NEW session from the source's REAL conversation — NOT by stuffing its
+      // transcript into the prompt. Make the source session visible to THIS turn's
+      // (home × world), then let the adapter run a native fork (Claude --fork-session /
+      // Codex exec resume). Falls back to transcript replay only if the source session
+      // file is gone (worlds get cleaned; the session survives in the home) or it's a
+      // cross-provider jump.
+      if (!session && spec?.resumeFrom) {
+        const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
+        if (spec.resumeFrom.sessionId) {
+          // A raw pasted provider session id = "continue THIS exact session" (resume,
+          // not fork). Best-effort: it must live in the home this turn runs under.
+          session = spec.resumeFrom.sessionId;
+          record(args.taskId, 'session.resumed', { session });
+        } else if (spec.resumeFrom.taskId) {
+          const srcSession = store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) || undefined;
+          let srcHome: string | undefined;
+          let srcProvider: string | undefined;
+          const metaRaw = store.kvGet(`sessionmeta:${spec.resumeFrom.taskId}:${srcRole}`);
+          if (metaRaw) { try { const m = JSON.parse(metaRaw); srcHome = m.home || undefined; srcProvider = m.provider || undefined; } catch { /* ignore */ } }
+          const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), profile.provider === 'codex' ? '.codex' : '.claude');
+          let forked = false;
+          if (srcSession && (!srcProvider || srcProvider === profile.provider)) {
+            forked = materializeFork({ provider: profile.provider, session: srcSession, forkHome, worldPath: world.handle.root, srcHome });
+            if (forked) {
+              session = srcSession;
+              fork = true; // adapter branches a NEW session id from it (native fork)
+              record(args.taskId, 'session.forked', { from: spec.resumeFrom, session: srcSession, native: true });
+            }
+          }
+          if (!forked) {
+            // Degraded fallback (no real source session file — e.g. the mock adapter,
+            // a cleaned source, or a cross-provider jump): replay the source transcript
+            // as context. NOT a native fork — flagged `native: false`.
+            const srcView = store.getTask(spec.resumeFrom.taskId)?.lastView;
+            const srcMsgs =
+              srcView?.transcripts?.find((t) => t.role === srcRole)?.messages ??
+              (srcRole === 'do' ? srcView?.messages : undefined) ??
+              [];
+            if (srcMsgs.length) {
+              messages = [...srcMsgs, ...args.messages];
+              record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: srcMsgs.length, native: false });
+            }
+          }
+        }
+      }
+
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
@@ -259,6 +285,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           world,
           messages,
           session,
+          fork,
           systemPrompt,
           role: args.role,
           maxTurns: profile.maxTurns,

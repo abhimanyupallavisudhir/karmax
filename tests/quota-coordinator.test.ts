@@ -128,6 +128,22 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  it('prunes a stale account no longer in the authoritative set, but keeps an in-use one', async () => {
+    const coord = await startCoord([A({ id: 'A' }), A({ id: 'B', configHome: '/tmp/B' })]);
+    // Lease A so it's in-use; B stays idle.
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 't1', allowed: ['A'] });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
+
+    // Re-register with the full set now MISSING both A and B (both "removed"). The
+    // idle one (B) is pruned; the in-use one (A) is kept until its turn finishes.
+    await coord.signal('registerAccounts', { accounts: [{ id: 'C', configHome: '/tmp/C', provider: 'claude', kind: 'login' }] });
+    await expect.poll(async () => ((await accounts()).accounts as any[]).map((a) => a.id).sort(), { timeout: 10_000 })
+      .toEqual(['A', 'C']); // B pruned (idle, removed); A kept (in-use); C added
+    await g.h.signal('finish');
+    await coord.terminate('done');
+  });
+
   it('honors a manual availability override (mark available → the parked request is granted)', async () => {
     const coord = await startCoord([A()]);
     await coord.signal('reportExhausted', { accountId: 'A', window: '5h', resetAt: Date.now() + 3_600_000 }); // far out

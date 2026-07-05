@@ -44,8 +44,11 @@ export interface TurnInput {
   world: World;
   /** Conversation so far; the agent acts on the latest user message(s). */
   messages: Message[];
-  /** Resume id from the prior turn (SPEC §7.2). */
+  /** A session to continue (prior turn, SPEC §7.2) OR — with `fork` — to branch from. */
   session?: string;
+  /** Fork `session` into a NEW session instead of continuing it (SPEC §10.5): the
+   *  source is left untouched. Claude → `--fork-session`; Codex → resume a copied rollout. */
+  fork?: boolean;
   /** Assembled system prompt (role template + bindings + instructions), snapshotted upstream. */
   systemPrompt: string;
   role: AgentRole;
