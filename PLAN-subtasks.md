@@ -13,6 +13,44 @@ flows *up the branch hierarchy*, merging into `main` only once at the top.
 
 ---
 
+## 0. Status (implemented on this branch)
+
+Phases **A (raise channel + non-dormant parent)**, **C (typed escalation,
+parent-as-confirmer)**, and **D (branch stacking)** are **implemented**. The
+remaining gap is the fully-concurrent variant of **B** — the parent can *manage*
+children actively but does not yet run *unrelated* work concurrently with them.
+
+What landed:
+- **Branch stacking** — `spawnSubTasks` passes `base = target = world.branch` and
+  commits-on-spawn (`software-dev.ts`), so a child branches off + merges back into
+  the parent's world branch. `main` gets one merge at the top. `finalizeMerge`
+  already merges into whichever worktree holds the target, so no merge rewrite was
+  needed (the ⚠ in §3-D was a non-issue).
+- **Raise channel** — `raiseFromChild` / `parentResponse` signals; children spawned
+  via `startChild` (not `executeChild`); `manageSubTasks()` keeps the parent live
+  (wakes on a raise / settle / follow-up), never a dead await.
+- **Parent-as-confirmer + typed raises** — a child raises `needs_confirmation` at
+  Review, `blocked` at Escalation/merge-fail, and `needs_info`/`needs_permission`
+  via the new `raise_to_parent` tool. The parent answers with `respond_to_sub_task`
+  (confirm/comment/retry/cancel); its reply maps onto the same confirm/retry/
+  cancel/follow-up transitions a human drives. Children stay human-resolvable as a
+  fallback. `autoConfirm` is kept only for top-level goal tasks (no parent).
+- **Deadlock fixed** — an escalated child no longer blocks on a hidden human; it
+  raises to the parent, which resolves it or bubbles up visibly.
+- Tools: `respond_to_sub_task`, `raise_to_parent` (mock DSL: `@respond`, `@raise`).
+  Tests: parent-as-confirmer + branch stacking, and stuck-child-raises-blocked
+  (`tests/pipeline.test.ts`).
+
+Deferred (**B**, fully-async join): the parent still *manages* children to
+completion before it finishes, rather than doing unrelated feature work in
+parallel with them. The management loop is the interruptible-join half of B; the
+concurrent half (spawn-and-keep-working, explicit `wait_for_subtasks`, end-stage
+barrier, per-task concurrency caps) is the next phase. Also deferred: scoping the
+child's merge capability to `merge-into:karmax/<parent>` (a security nicety — the
+workflow already pins the child's merge target).
+
+---
+
 ## 1. Intended behaviour
 
 - **Delegation, not just fan-out.** A Do agent can spawn child tasks to offload
