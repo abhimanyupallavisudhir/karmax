@@ -607,7 +607,10 @@ function stageIndexOf(stages, stage) {
 
 function pipeline(v) {
   const stages = stagesFor(v.workflow);
-  const idx = stageIndexOf(stages, v.stage);
+  // 'escalated' is a blocked, awaiting-human state — NOT a pipeline position. Don't
+  // pin it to a stage (it used to mis-map onto Merge); flag the whole track instead.
+  const escalated = v.stage === 'escalated';
+  const idx = escalated ? -1 : stageIndexOf(stages, v.stage);
   const done = v.stage === 'done';
   const merged = v.pointOfNoReturnPassed || done;
   const ponrIdx = stages.findIndex((n) => n.ponr);
@@ -623,15 +626,16 @@ function pipeline(v) {
     }
     segs += `<span class="${cls}"></span>`;
   }
-  return `<div class="pipeline" title="${esc(v.stage || '')}">${segs}</div>`;
+  return `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'escalated — awaiting a human' : esc(v.stage || '')}">${segs}</div>`;
 }
 
 function pipelineLarge(v) {
   const stages = stagesFor(v.workflow);
-  const idx = stageIndexOf(stages, v.stage);
+  const escalated = v.stage === 'escalated';
+  const idx = escalated ? -1 : stageIndexOf(stages, v.stage);
   const done = v.stage === 'done';
   const merged = v.pointOfNoReturnPassed || done;
-  return `<div class="pipeline-lg">${stages.map((n, i) => {
+  return `<div class="pipeline-lg${escalated ? ' escalated' : ''}"${escalated ? ' title="escalated — awaiting a human"' : ''}>${stages.map((n, i) => {
     let cls = 'node';
     if (i < idx || (done && i <= idx)) cls += ' done';
     if (i === idx && !done) cls += ' current';
@@ -743,9 +747,8 @@ async function openTaskForm(workflow, draft, seedText) {
           </div>
           <details class="advanced" style="margin-top:10px">
             <summary>Credentials — precedence &amp; enable/disable for this task</summary>
-            ${draft
-              ? `<p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p><div id="cred-editor-newtask">Loading…</div>`
-              : `<p class="task-sub" style="color:var(--ink-3);margin-top:0">This task inherits the project/global order. For task-specific precedence or enable/disable, <b>Save draft</b> first then reopen it (a draft has an id to attach the override to) — or adjust in the task's form once created.</p>`}
+            <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
+            <div id="cred-editor-newtask">Loading…</div>
           </details>
         </div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
@@ -768,8 +771,11 @@ async function openTaskForm(workflow, draft, seedText) {
   // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
   // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the
   // running-task drawer (renderDrawer's #cred-editor-task). Change one → check the other.
-  // Keyed on a draft's id (a brand-new, unsaved task has none → the form shows a note).
+  // A draft has an id → edit its policy directly. A brand-new task has none, so the
+  // editor runs in `local` mode: changes are held here and applied on create (below).
+  let taskCredPolicy = {};
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
+  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; } });
   const submit = async (draftMode) => {
     const body = collectForm($('#tf-body'), fields);
     // Cosmetic human notes — kept separate from `params` so they never reach the
@@ -783,7 +789,16 @@ async function openTaskForm(workflow, draft, seedText) {
         if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
         if (!draftMode) await api(`/api/tasks/${draft.id}/queue`, { method: 'POST', body: '{}' });
       } else {
-        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
+        const hasPol = !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
+        if (hasPol) {
+          // Custom per-task credential order/enablement: create as a draft first so the
+          // override is persisted BEFORE the workflow starts leasing, then queue.
+          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...payload, draft: true }) });
+          await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
+          if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
+        } else {
+          await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
+        }
       }
       root.innerHTML = '';
       toast(draftMode ? 'Draft saved' : 'Task created');
@@ -1014,7 +1029,25 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       api('/api/accounts').catch(() => ({ logins: [] })),
     ]);
   } catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
-  const sd = data[scope] || { own: {}, enabled: [] };
+  // Effective policy for this scope. Normally the server computes it (global→project→
+  // task overlay). In `local` mode — the NEW-task form, which has no taskId yet — we
+  // resolve a client-side draft policy over the inherited project/global base and apply
+  // it when the task is created, so the reorder/enable-disable UI works inline here too.
+  let sd;
+  if (opts.local) {
+    const base = data[opts.projectId ? 'project' : 'global'] || { enabled: [] };
+    const baseEnabled = new Set(base.enabled || []);
+    const pol = opts.policy || {};
+    const onSet = new Set(pol.on || []), offSet = new Set(pol.off || []);
+    const isOn = (k) => (onSet.has(k) ? true : offSet.has(k) ? false : baseEnabled.has(k));
+    const seen = new Set(), eff = [];
+    for (const k of [...(pol.order || []), ...(base.enabled || []), ...(data.credentials || []).map((c) => c.key)]) {
+      if (!seen.has(k) && isOn(k) && !eff.includes(k)) eff.push(k);
+    }
+    sd = { own: pol, enabled: eff };
+  } else {
+    sd = data[scope] || { own: {}, enabled: [] };
+  }
   const own = sd.own || {};
   const enabled = new Set(sd.enabled || []);
   const byKey = Object.fromEntries((data.credentials || []).map((c) => [c.key, c]));
@@ -1044,6 +1077,9 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     })
     .join('')}</div>`;
   const save = async (policy) => {
+    // Local mode: keep the change client-side (applied when the task is created); else
+    // persist immediately, keyed by taskId/projectId scope.
+    if (opts.local) { opts.onChange?.(policy); renderCredentialEditor(el, scope, { ...opts, policy }); return; }
     try { await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
     catch (e) { toast(e.message, true); }
     renderCredentialEditor(el, scope, opts);
