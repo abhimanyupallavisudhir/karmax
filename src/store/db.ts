@@ -29,7 +29,13 @@ export class Store {
   constructor(dbPath = ':memory:') {
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+    // busy_timeout first: waiting (up to 5s) on a locked database beats failing
+    // the caller outright. tsx-watch restarts overlap the outgoing and incoming
+    // app for a few seconds, and the newcomer's boot writes (migrations,
+    // credential registration) must not instantly kill a long agent turn's
+    // event append with "database is locked" (that error cost a merge-agent
+    // turn mid-conflict-resolution — the 05f9802 postmortem).
+    this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.migrate();
     this.migrateData();
   }

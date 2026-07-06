@@ -6,10 +6,7 @@ import {
   setHandler,
   condition,
   startChild,
-<<<<<<< HEAD
-=======
   getExternalWorkflowHandle,
->>>>>>> master
   workflowInfo,
   CancellationScope,
   isCancellation,
@@ -76,6 +73,9 @@ export interface SoftwareDevInput extends TaskInput {
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
+/** A rejected merge (conflicts / leftover markers) loops back to the merge agent
+ *  this many times before escalating to a human/parent (SPEC §5.2). */
+const MAX_MERGE_ATTEMPTS = 3;
 /** Sub-task fan-out bounds (SPEC §5.3): concurrent children, and children over the
  *  task's whole life. Non-blocking spawn makes runaway delegation cheap without these. */
 const MAX_CONCURRENT_SUBTASKS = 8;
@@ -120,12 +120,6 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let pr: { url: string; number: number } | undefined;
   let mergeQueuePos: { position: number; total: number } | undefined;
   const subTaskIds: string[] = [];
-<<<<<<< HEAD
-  // Live child sub-task workflow handles, keyed by taskId. A cancel of this task
-  // must tear down its running sub-tasks too — their agents/worlds don't stop on
-  // their own (SPEC §5.6). We hold handles so we can signal them `cancel`.
-  const childHandles = new Map<string, ChildWorkflowHandle<typeof softwareDev>>();
-=======
   // Sub-task hierarchy (SPEC §5.3). Children are managed, not blindly awaited: their
   // handles let us await completion, raised requests queue in `raises`, settlements in
   // `settled`, `outstanding` is the not-yet-finished set, and `awaitingResponse` is the
@@ -135,7 +129,6 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   const settled: { childTaskId: string; stage: string; detail?: string }[] = [];
   const outstanding = new Set<string>();
   const awaitingResponse = new Set<string>();
->>>>>>> master
   let pointOfNoReturnPassed = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
@@ -551,52 +544,6 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     return turn;
   }
 
-<<<<<<< HEAD
-    // Sub-tasks: spawn child workflows and await them (SPEC §5.3 Do→Do).
-    if (turn.subTasks?.length) {
-      // Start each child and hold its handle before awaiting, so a cancel that
-      // arrives while sub-tasks run can propagate `cancel` to them (SPEC §5.6).
-      const started = await Promise.all(
-        turn.subTasks.map(async (s) => {
-          const childInput = await core.prepareChildTask({
-            parentTaskId: taskId,
-            projectId: input.projectId,
-            title: s.title,
-            prompt: s.prompt,
-            base,
-            target,
-            project: input.project,
-            profiles: input.profiles,
-          });
-          subTaskIds.push(childInput.taskId);
-          const handle = await startChild(softwareDev, {
-            workflowId: childInput.taskId,
-            args: [{ ...childInput, autoConfirm: true } as SoftwareDevInput],
-          });
-          childHandles.set(childInput.taskId, handle);
-          await publish();
-          return { title: s.title, id: childInput.taskId, handle };
-        }),
-      );
-      // If a cancel already landed (before these handles were registered), fan it
-      // out now so we don't wait on children that must stop.
-      if (cancelled) cancelChildren();
-      const children = await Promise.all(
-        started.map(async (c) => {
-          try {
-            const res = await c.handle.result();
-            return { title: c.title, res };
-          } finally {
-            childHandles.delete(c.id);
-          }
-        }),
-      );
-      for (const c of children) {
-        msgs.push({ id: `st-${msgs.length}`, role: 'system', text: `Sub-task "${c.title}" finished: ${c.res.stage}.`, ts: msgs.length });
-      }
-      if (cancelled) return await abort();
-      continue; // resume Do so the agent sees results
-=======
   /** Record a child's eventual settlement so the management loop can react. */
   function trackChild(childTaskId: string, child: ChildWorkflowHandle<typeof softwareDev>) {
     child.result().then(
@@ -765,7 +712,6 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       // Otherwise the agent kept working (spawned/answered this turn) — loop and run
       // another turn; the children's events drain in at the top.
       continue;
->>>>>>> master
     }
 
     // No children outstanding.
@@ -841,6 +787,11 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // Set before any await so no queued edit can slip in and desync the domain.
   targetLocked = true;
   let sha: string | undefined;
+  // Conflict loop-back state: how many rejected merges this round, and the last
+  // rejection's detail (fed into the merge agent's next prompt so it actually
+  // knows what to fix — a human retry resets the attempt budget, not the context).
+  let mergeAttempts = 0;
+  let mergeConflict: string | undefined;
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -865,7 +816,14 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
     // The merge agent is about to run — freeze `agent:merge` (SPEC §5.5).
     consumed.add('agent:merge');
-    const mergeIn: Message = { id: `m-in-${mergeMsgs.length}`, role: 'user', text: `Prepare branch for merge into ${target}.`, ts: mergeMsgs.length };
+    const mergeIn: Message = {
+      id: `m-in-${mergeMsgs.length}`,
+      role: 'user',
+      text: mergeConflict
+        ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
+        : `Prepare branch for merge into ${target}.`,
+      ts: mergeMsgs.length,
+    };
     mergeMsgs.push(mergeIn);
     let result;
     try {
@@ -900,9 +858,26 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       pointOfNoReturnPassed = true;
       break;
     }
-    // Merge problem → escalate. A child raises `blocked` to its parent (which can
-    // retry/answer/cancel); a top-level task escalates to a human. Either can retry.
+    // Merge rejected. Conflicts (including leftover markers) are the merge
+    // agent's job: loop straight back to it with the details, bounded, before
+    // bothering a human/parent (SPEC §5.2).
     error = `merge failed: ${result.conflict ?? result.note ?? 'unknown'}`;
+    if (result.conflict) {
+      mergeConflict = `${result.note ? `${result.note}\n` : ''}${result.conflict}`;
+      if (++mergeAttempts < MAX_MERGE_ATTEMPTS) {
+        mergeMsgs.push({
+          id: `m-sys-${mergeMsgs.length}`,
+          role: 'system',
+          text: `Merge rejected (attempt ${mergeAttempts}/${MAX_MERGE_ATTEMPTS}): ${error}`,
+          ts: mergeMsgs.length,
+        });
+        error = undefined;
+        continue;
+      }
+    }
+    // Attempts exhausted (or a non-conflict failure) → escalate. A child raises
+    // `blocked` to its parent (which can retry/answer/cancel); a top-level task
+    // escalates to a human. Either can retry.
     reviewInfo = { ...reviewInfo, summary: error };
     stage = 'escalated';
     status = 'blocked';
@@ -916,6 +891,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     waitingFor = undefined;
     if (cancelled) return await abort();
     error = undefined;
+    mergeAttempts = 0; // a human/parent retry grants a fresh loop-back budget
   }
 
   stage = 'done';
@@ -935,20 +911,8 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     status = 'cancelled';
     await cancelChildren(); // don't strand children when we go away
     await publish();
-    cancelChildren(); // ensure any still-running sub-task agents are torn down
     if (world) await core.destroyWorld(world as any);
     return { stage } as { stage: Stage };
-  }
-
-  // Fan a `cancel` out to every live child sub-task workflow. Each child handles
-  // the signal gracefully — aborting its in-flight agent turn, destroying its
-  // world, and recursively cancelling its own sub-tasks. Fire-and-forget: the
-  // child result is still awaited where it was started. Idempotent and safe to
-  // call from the cancel handler or abort().
-  function cancelChildren() {
-    for (const handle of childHandles.values()) {
-      handle.signal(cancelSignal).catch(() => {}); // child may have already finished
-    }
   }
 }
 

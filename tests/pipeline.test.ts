@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
@@ -321,6 +323,41 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
 
     // it did NOT wait out the child's ~30s sleep
     expect(Date.now() - t0).toBeLessThan(15_000);
+  });
+
+  it('never lands conflict markers: a conflicted merge loops back to the merge agent, then escalates', async () => {
+    const repo = await h.makeRepo('app-conflict');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Conflicting change', prompt: '@write index.js :: console.log("attempt")' })],
+    });
+
+    // parked at Review — diverge main underneath it, so the merge will conflict
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    fs.writeFileSync(path.join(repo, 'index.js'), 'console.log("mainline")\n');
+    await git(repo, ['add', '-A']);
+    await git(repo, ['commit', '-q', '-m', 'diverge']);
+    await handle.signal('confirm');
+
+    // the mock merge agent can't resolve conflicts → bounded loop-back, then escalate
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('escalated');
+    const v = await view(handle);
+    expect(v.error).toMatch(/merge failed/);
+    expect(v.error).toContain('index.js');
+    // the merge agent got the conflict context on its retry turns
+    const mergeTranscript = v.transcripts.find((t: any) => t.role === 'merge');
+    expect(mergeTranscript.messages.map((m: any) => m.text).join('\n')).toContain('rejected');
+
+    // the target never got the markers — main is pristine
+    const onMain = await git(repo, ['show', 'main:index.js']);
+    expect(onMain.stdout).toContain('mainline');
+    expect(onMain.stdout).not.toContain('<<<<<<<');
+
+    await handle.signal('cancel');
+    const result = await handle.result();
+    expect(result.stage).toBe('cancelled');
   });
 
   it('serializes two tasks through the merge queue onto the same branch', async () => {

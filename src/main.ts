@@ -185,9 +185,12 @@ async function main() {
     shuttingDown = true;
     console.log('\n  shutting down…');
     // Backstop: never let a hung dependency (e.g. a slow worker drain) block exit.
-    setTimeout(() => process.exit(0), 8000).unref();
-    // Bound every step so one wedged call can't strand the whole shutdown.
-    const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 5000).catch(() => {});
+    // Must beat tsx-watch's 5s force-kill: a SIGKILLed worker dies mid-activity,
+    // orphaning agent subprocesses (and karmax's own merges trigger tsx reloads).
+    setTimeout(() => process.exit(0), 4500).unref();
+    // Bound every step so one wedged call can't strand the whole shutdown. The
+    // worker itself resolves within ~3s (shutdownGraceTime/shutdownForceTime).
+    const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     await step(closeGateway());
     await step(workerManager.stop());
     await step(closeClient());
