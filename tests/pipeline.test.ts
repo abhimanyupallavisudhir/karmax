@@ -173,6 +173,42 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('done');
   });
 
+  it('cancels running sub-task agents when the parent is cancelled (SPEC §5.6)', async () => {
+    const repo = await h.makeRepo('app-sub-cancel');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // The child's Do turn sleeps ~30s and never reaches Review, so the parent
+      // is blocked awaiting it. Cancelling the parent must tear the child down —
+      // a naive parent would wait out the child's ~30s sleep.
+      args: [input({ taskId, repo, title: 'Parent', prompt: '@subtask Slow child :: @sleep 30000' })],
+    });
+
+    // wait until the child has been started and the parent is awaiting it
+    await expect
+      .poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 20_000 })
+      .toBe(1);
+    const childId = (await view(handle)).subTasks![0] as string;
+    const child = h.client.workflow.getHandle(childId);
+    // the child's agent turn is actually running (in its ~30s sleep)
+    await expect
+      .poll(async () => (await (child.query('view') as Promise<any>)).stage, { timeout: 15_000 })
+      .toBe('do');
+
+    const t0 = Date.now();
+    await handle.signal('cancel');
+
+    // both the parent and the child wind down as cancelled
+    const parentResult = await handle.result();
+    expect(parentResult.stage).toBe('cancelled');
+    const childResult = (await child.result()) as { stage: string };
+    expect(childResult.stage).toBe('cancelled');
+
+    // it did NOT wait out the child's ~30s sleep
+    expect(Date.now() - t0).toBeLessThan(15_000);
+  });
+
   it('serializes two tasks through the merge queue onto the same branch', async () => {
     const repo = await h.makeRepo('app3');
     const ids = [newId('task'), newId('task')];
