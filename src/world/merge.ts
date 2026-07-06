@@ -31,7 +31,25 @@ export async function finalizeMerge(world: World, target: string): Promise<Merge
 
   await ensureIdentity(root);
 
-  // 1. Commit any pending work on the attempt branch.
+  // 0. A merge-agent turn may have died (or given up) mid-`git merge`, leaving an
+  //    in-progress merge with unresolved conflict hunks. Committing that state
+  //    would COMPLETE the merge and land the conflict markers as file content —
+  //    abort it and report the conflict so the merge agent gets another turn.
+  const unresolved = await git(root, ['diff', '--name-only', '--diff-filter=U']);
+  if (unresolved.stdout.trim()) {
+    await git(root, ['merge', '--abort']);
+    return {
+      merged: false,
+      landedFiles: [],
+      conflict: unresolved.stdout.trim(),
+      note: 'the worktree held an unresolved in-progress merge; aborted it',
+    };
+  }
+
+  // 1. Commit any pending work on the attempt branch. (If the agent resolved a
+  //    merge but forgot to commit — MERGE_HEAD present, everything staged, no
+  //    unresolved paths — this completes that merge on purpose; the marker scan
+  //    below still rejects anything that would land conflict hunks as content.)
   if (await isDirty(root)) {
     await git(root, ['add', '-A']);
     const c = await git(root, ['commit', '-q', '-m', `karmax: work for ${world.handle.id}`]);
@@ -43,6 +61,17 @@ export async function finalizeMerge(world: World, target: string): Promise<Merge
   // Files this attempt changed vs its base (for the landed-files report).
   const changed = await git(root, ['diff', '--name-only', `${base}...HEAD`]);
   const landedFiles = changed.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+
+  // 1b. Never land conflict markers as content: scan what this attempt changed.
+  const marked = await conflictMarkerFiles(root, landedFiles);
+  if (marked.length) {
+    return {
+      merged: false,
+      landedFiles,
+      conflict: marked.join('\n'),
+      note: 'conflict markers are committed in the branch — resolve them and remove every marker',
+    };
+  }
 
   // Ensure the target branch exists; create it at base if missing.
   if ((await git(repo, ['rev-parse', '--verify', target])).code !== 0) {
@@ -117,6 +146,25 @@ export async function finalizeMerge(world: World, target: string): Promise<Merge
   } finally {
     await cleanup?.();
   }
+}
+
+/**
+ * Files (among `files`, at HEAD) that contain a `<<<<<<<`/`>>>>>>>` marker PAIR
+ * at line start. Requiring both ends of the pair keeps files that legitimately
+ * mention a single marker (docs, fixtures) from tripping the guard.
+ */
+async function conflictMarkerFiles(dir: string, files: string[]): Promise<string[]> {
+  if (!files.length) return [];
+  const grep = async (pattern: string): Promise<Set<string>> => {
+    const r = await git(dir, ['grep', '-l', '-E', pattern, 'HEAD', '--', ...files]);
+    return new Set(
+      r.stdout.split('\n').map((l) => l.replace(/^HEAD:/, '').trim()).filter(Boolean),
+    );
+  };
+  const open = await grep('^<{7}( |$)');
+  if (!open.size) return [];
+  const close = await grep('^>{7}( |$)');
+  return [...open].filter((f) => close.has(f));
 }
 
 /** Find the worktree path (if any) that currently has `branch` checked out. */
