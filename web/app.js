@@ -2187,6 +2187,9 @@ function bindKeys() {
     }
     if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); return openPalette(); }
     if (e.key === 'Escape') return S.selected ? closeDrawer() : $('#notif-pop')?.remove();
+    // Single-key shortcuts must not fire while a modifier is held — otherwise
+    // Ctrl+C (copy) would trigger 'confirm', Ctrl+X (cut) would trigger 'cancel', etc.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (e.key === 'n') { e.preventDefault(); switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); }
     if (e.key === '/') { e.preventDefault(); $('#search')?.focus(); }
     if (e.key === 'g') { S._g = true; setTimeout(() => (S._g = false), 600); return; }
