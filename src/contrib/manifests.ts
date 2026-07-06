@@ -153,7 +153,7 @@ const SOFTWARE_DEV_STAGES: StageDef[] = [
   { key: 'do', label: 'Do', aliases: ['resolve'] },
   { key: 'review', label: 'Review' },
   { key: 'pr', label: 'PR' },
-  { key: 'merge', label: 'Merge', ponr: true, aliases: ['escalated'] },
+  { key: 'merge', label: 'Merge', ponr: true }, // 'escalated' is a blocked state, not a position — the UI flags it separately
   { key: 'done', label: 'End' },
 ];
 
@@ -340,7 +340,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     stages: [
       { key: 'setup', label: 'Setup' },
       { key: 'review', label: 'Review' },
-      { key: 'merge', label: 'Merge', ponr: true, aliases: ['escalated'] },
+      { key: 'merge', label: 'Merge', ponr: true }, // 'escalated' is a blocked state, not a position — the UI flags it separately
       { key: 'done', label: 'End' },
     ],
     params: [

@@ -257,13 +257,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
 
+      // Self-healing loop (SPEC §3.4): show the Resolve agent the INDEX of prior saved
+      // resolutions (`{{skills}}`) so it reuses a known fix rather than rediscovering
+      // one. Read here (an activity) since the workflow can't touch the filesystem.
+      let bindings = args.bindings;
+      if (args.role === 'resolve') {
+        const { listResolveSkills, renderSkillsIndex } = await import('../resolve/skills.js');
+        const { paths } = await import('../config/paths.js');
+        bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
+      }
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: args.task,
         world: args.worldHandle,
         globalInstructions: deps.globalInstructions ?? GLOBAL_INSTRUCTIONS,
-        bindings: args.bindings,
+        bindings,
       });
       // Snapshot the journaled turn input (SPEC §5.4).
       record(args.taskId, 'turn.prompt', { role: args.role, profile: profile.id, provider: profile.provider });

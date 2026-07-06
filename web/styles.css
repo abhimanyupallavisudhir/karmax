@@ -230,6 +230,9 @@ a { color: var(--accent); text-decoration: none; }
 .pipeline .seg.current.waiting { background: var(--working); }
 .pipeline .seg.current.blocked { background: var(--danger); }
 .pipeline .seg.merged { background: var(--merged); opacity: 1; }
+/* 'escalated' = blocked, awaiting a human — flag the whole track, don't fake a position. */
+.pipeline.escalated .seg { background: var(--danger); opacity: 0.32; }
+.pipeline-lg.escalated .bar { background: var(--danger); opacity: 0.4; }
 .pipeline .ponr { width: 9px; height: 9px; transform: rotate(45deg); background: var(--line-strong); margin: 0 1px; flex: none; }
 .pipeline .ponr.passed { background: var(--merged); }
 .pipeline .ponr.current { background: var(--accent); }
