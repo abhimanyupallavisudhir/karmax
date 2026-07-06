@@ -223,7 +223,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'parent'; provider?: string; earliestResetAt?: number; detail?: string };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right
@@ -309,4 +309,44 @@ export interface KarmaxEvent {
   taskId: string;
   ts: number;
   payload: Record<string, unknown>;
+}
+
+// ─── Sub-task hierarchy (raise-to-parent) ────────────────────────────────────
+// A child task doesn't block on a hidden human at Review/Escalation; it RAISES a
+// typed event to its parent, whose Do agent decides. The parent's decision maps
+// onto the SAME state transitions a human would drive (confirm/retry/cancel/
+// follow-up), so "the parent as confirmer" is literal (SPEC §5.2/§5.3).
+
+/** Why a child is asking its parent to act. */
+export type RaiseType = 'needs_confirmation' | 'needs_info' | 'needs_permission' | 'blocked';
+
+/** Signal a child sends UP to its parent when it reaches a decision point. */
+export interface ChildRaise {
+  childTaskId: string;
+  childTitle: string;
+  type: RaiseType;
+  detail?: string;
+}
+
+/** How a parent's Do agent answers a child raise (the `respond_to_sub_task` tool). */
+export type SubTaskAction = 'confirm' | 'comment' | 'retry' | 'cancel';
+
+/** Signal a parent sends DOWN to a child in response to a raise. */
+export interface ParentResponse {
+  action: SubTaskAction;
+  text?: string;
+}
+
+/** A parent-agent response emitted in a turn. `childTaskId` omitted ⇒ all children
+ *  currently awaiting a response (the common "confirm my sub-tasks" case). */
+export interface SubTaskResponse {
+  childTaskId?: string;
+  action: SubTaskAction;
+  text?: string;
+}
+
+/** A child-agent's explicit request up to its parent (the `raise_to_parent` tool). */
+export interface RaiseToParent {
+  type: RaiseType;
+  detail?: string;
 }

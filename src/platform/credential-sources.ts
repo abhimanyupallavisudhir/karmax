@@ -26,6 +26,17 @@ export const credPolicyKey = {
   task: (id: string) => `credpolicy:task:${id}`,
 };
 
+/** kv key for a credential's user-set concurrency cap (how many turns may run on it at
+ *  once). */
+export const concurrencyKey = (credKey: string) => `concurrency:${credKey}`;
+
+/** The user-set concurrency cap for a credential, or undefined to use the coordinator's
+ *  default. A stored value of `UNLIMITED_CONCURRENCY` means unbounded. */
+export function concurrencyFor(get: (k: string) => string | undefined, credKey: string): number | undefined {
+  const n = Number(get(concurrencyKey(credKey)));
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 /** Parse a stored policy blob (kv), or undefined. */
 export function parsePolicy(raw: string | undefined): CredPolicy | undefined {
   if (!raw) return undefined;

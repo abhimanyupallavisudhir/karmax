@@ -64,12 +64,46 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'create_sub_task',
-    description: 'Spawn a child task that the parent task awaits before continuing.',
+    description:
+      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. You manage your children to completion before you finish.',
     parameters: {
       type: 'object',
       properties: { title: { type: 'string' }, prompt: { type: 'string' } },
       required: ['title', 'prompt'],
     },
+  },
+  {
+    name: 'respond_to_sub_task',
+    description:
+      'Answer a sub-task that raised to you. action: "confirm" (approve its Review so it merges into your branch), "comment" (send it guidance/answer its question — it goes back to work), "retry" (tell a stuck/blocked child to try its failed step again), or "cancel" (abandon it). Omit child_task_id to answer all sub-tasks currently waiting on you.',
+    parameters: {
+      type: 'object',
+      properties: {
+        child_task_id: { type: 'string', description: 'The raising child; omit to respond to all waiting children.' },
+        action: { type: 'string', enum: ['confirm', 'comment', 'retry', 'cancel'] },
+        text: { type: 'string', description: 'For "comment": the message/answer/guidance to send down.' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'raise_to_parent',
+    description:
+      'Sub-tasks ONLY: ask your parent task for a decision and pause until it replies. type: "needs_info" (a question about your assignment), "needs_permission" (you need approval to do something), "needs_confirmation" (approve what you have), or "blocked" (you are stuck). The parent (or a human) answers; a "comment" reply resumes you with that guidance. Calling this pauses your turn.',
+    parameters: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', enum: ['needs_info', 'needs_permission', 'needs_confirmation', 'blocked'] },
+        detail: { type: 'string', description: 'What you need from the parent (shown to it).' },
+      },
+      required: ['type'],
+    },
+  },
+  {
+    name: 'wait_for_subtasks',
+    description:
+      'Pause until your running sub-tasks finish (or one raises to you). Your sub-tasks run in the background — you can keep working instead of calling this; call it only when you have nothing to do but wait for them. You are resumed the moment a sub-task finishes or needs you.',
+    parameters: { type: 'object', properties: {} },
   },
   {
     name: 'save_skill',
@@ -155,7 +189,29 @@ export function platformToolHandlers(
     },
     async create_sub_task(args) {
       ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? '') });
-      return 'sub-task queued';
+      return 'sub-task spawned (branches off your work; you are its confirmer)';
+    },
+    async respond_to_sub_task(args) {
+      const action = String(args?.action ?? '');
+      if (!['confirm', 'comment', 'retry', 'cancel'].includes(action))
+        return 'invalid action — use confirm | comment | retry | cancel';
+      ctx.respondToSubTask({
+        childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
+        action: action as 'confirm' | 'comment' | 'retry' | 'cancel',
+        text: args?.text ? String(args.text) : undefined,
+      });
+      return `responded to sub-task${args?.child_task_id ? ` ${args.child_task_id}` : 's'}: ${action}`;
+    },
+    async raise_to_parent(args) {
+      const type = String(args?.type ?? '');
+      if (!['needs_info', 'needs_permission', 'needs_confirmation', 'blocked'].includes(type))
+        return 'invalid type — use needs_info | needs_permission | needs_confirmation | blocked';
+      ctx.raiseToParent({ type: type as 'needs_info' | 'needs_permission' | 'needs_confirmation' | 'blocked', detail: args?.detail ? String(args.detail) : undefined });
+      return `raised to parent: ${type}`;
+    },
+    async wait_for_subtasks() {
+      ctx.waitForSubtasks();
+      return 'waiting for sub-tasks to finish (or raise)';
     },
     async save_skill(args) {
       ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });

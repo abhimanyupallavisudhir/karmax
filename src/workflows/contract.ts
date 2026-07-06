@@ -13,6 +13,12 @@ export type {
   DeclaredAction,
   ActionArg,
   ProjectConfig,
+  ChildRaise,
+  ParentResponse,
+  SubTaskResponse,
+  RaiseToParent,
+  RaiseType,
+  SubTaskAction,
 } from '../domain/types.js';
 
 /** Plain (method-free) world handle as carried in workflow state. */
