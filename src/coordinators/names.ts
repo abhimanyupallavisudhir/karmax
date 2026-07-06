@@ -39,3 +39,7 @@ export function mergeQueueId(domain: string): string {
 export function accountCoordinatorId(): string {
   return 'account-coordinator';
 }
+
+/** A login's `maxConcurrent` when the user chooses "unlimited" (empty field in the UI).
+ *  Large enough to never bind; kept finite so coordinator state stays plain-serializable. */
+export const UNLIMITED_CONCURRENCY = 1_000_000;

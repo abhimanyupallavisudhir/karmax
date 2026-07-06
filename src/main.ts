@@ -101,10 +101,13 @@ async function main() {
   const coordClient = makeCoordinatorActivities({ client, taskQueue: TASK_QUEUE });
   // Register EVERY credential (logins, ambient, API keys) under its stable policy key
   // so the coordinator can lease/track any of them (SPEC §6.2/§7).
-  const { gatherCredentialSources } = await import('./platform/credential-sources.js');
+  const { gatherCredentialSources, concurrencyFor } = await import('./platform/credential-sources.js');
   const { enumerateCredentials } = await import('./platform/credentials.js');
   const creds = enumerateCredentials(gatherCredentialSources({ configHomes, broker }));
-  const pool = creds.map((c) => ({ id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}) }));
+  const pool = creds.map((c) => {
+    const maxConcurrent = concurrencyFor((k) => store.kvGet(k), c.key);
+    return { id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}), ...(maxConcurrent != null ? { maxConcurrent } : {}) };
+  });
   if (pool.length) {
     await coordClient.registerAccounts(pool).catch((e) => console.warn('  • credential pool register failed', String(e)));
     console.log(`  • Registered ${pool.length} credential(s) into the account pool`);

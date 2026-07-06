@@ -144,6 +144,26 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  it('defaults a login to 10 concurrent turns, and a re-register raises/lowers the cap', async () => {
+    const coord = await startCoord([]);
+    // Registered via the signal (not seeded) so the kind-based default applies.
+    await coord.signal('registerAccounts', { accounts: [{ id: 'L', configHome: '/tmp/L', provider: 'claude', kind: 'login' }] });
+    await expect.poll(async () => (await acct('L'))?.maxConcurrent, { timeout: 10_000 }).toBe(10); // default, not 1
+
+    // Two turns lease the same login concurrently (both under the cap of 10).
+    const g1 = await grantee(), g2 = await grantee();
+    await coord.signal('leaseAccount', { taskId: g1.id, turnId: 't1', allowed: ['L'] });
+    await coord.signal('leaseAccount', { taskId: g2.id, turnId: 't2', allowed: ['L'] });
+    await expect.poll(async () => (await acct('L')).inUse, { timeout: 10_000 }).toBe(2); // NOT serialized
+
+    // Re-register with an explicit lower cap — the change is applied to the live account.
+    await coord.signal('registerAccounts', { accounts: [{ id: 'L', configHome: '/tmp/L', provider: 'claude', kind: 'login', maxConcurrent: 1 }] });
+    await expect.poll(async () => (await acct('L')).maxConcurrent, { timeout: 10_000 }).toBe(1);
+
+    await g1.h.signal('finish'); await g2.h.signal('finish');
+    await coord.terminate('done');
+  });
+
   it('honors a manual availability override (mark available → the parked request is granted)', async () => {
     const coord = await startCoord([A()]);
     await coord.signal('reportExhausted', { accountId: 'A', window: '5h', resetAt: Date.now() + 3_600_000 }); // far out

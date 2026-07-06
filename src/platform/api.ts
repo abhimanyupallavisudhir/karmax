@@ -375,8 +375,12 @@ export class KarmaxApi {
     this.require(token, 'save_skill');
     const dir = this.deps.contentDir ?? paths().content;
     const skillsDir = path.join(dir, 'skills');
-    fs.mkdirSync(skillsDir, { recursive: true });
-    const file = path.join(skillsDir, `${args.name.replace(/[^a-z0-9_-]/gi, '-')}.md`);
+    // Preserve namespacing subdirs (e.g. "resolve/<slug>" → skills/resolve/<slug>.md,
+    // which listResolveSkills indexes for the self-healing loop, §3.4). Sanitize each
+    // path segment and drop any traversal (`..`) so a name can't escape skills/.
+    const rel = args.name.split('/').map((s) => s.replace(/[^a-z0-9_-]/gi, '-')).filter((s) => s && s !== '-' && s !== '..').join('/') || 'skill';
+    const file = path.join(skillsDir, `${rel}.md`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, args.content);
     return { path: file };
   }

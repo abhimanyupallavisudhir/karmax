@@ -96,6 +96,12 @@ export interface PrepareChildArgs {
   target?: string;
   project: TaskInput['project'];
   profiles?: Record<string, string>;
+  /** The parent's world branch — the child's merge cap is scoped to exactly this
+   *  (SPEC §8.2). The parent owns this branch, so it may grant merge into it. */
+  parentBranch?: string;
+  /** The parent's own capability grant; the child's delegation caps are attenuated
+   *  by it (a restricted parent can't over-grant). Merge is scoped separately. */
+  parentGrant?: string[];
 }
 
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
@@ -257,13 +263,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
 
+      // Self-healing loop (SPEC §3.4): show the Resolve agent the INDEX of prior saved
+      // resolutions (`{{skills}}`) so it reuses a known fix rather than rediscovering
+      // one. Read here (an activity) since the workflow can't touch the filesystem.
+      let bindings = args.bindings;
+      if (args.role === 'resolve') {
+        const { listResolveSkills, renderSkillsIndex } = await import('../resolve/skills.js');
+        const { paths } = await import('../config/paths.js');
+        bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
+      }
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: args.task,
         world: args.worldHandle,
         globalInstructions: deps.globalInstructions ?? GLOBAL_INSTRUCTIONS,
-        bindings: args.bindings,
+        bindings,
       });
       // Snapshot the journaled turn input (SPEC §5.4).
       record(args.taskId, 'turn.prompt', { role: args.role, profile: profile.id, provider: profile.provider });
@@ -455,6 +470,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         parentTaskId: args.parentTaskId,
       });
       record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title });
+      // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
+      // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
+      // branch (which the parent owns and merges into) — never the broad merge-into:*.
+      const delegation = attenuate(
+        ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
+        args.parentGrant ?? DEFAULT_GRANT,
+      );
+      const grant = [...delegation, args.parentBranch ? `merge-into:${args.parentBranch}` : 'merge-into:*'];
       return {
         taskId: child.id,
         projectId: args.projectId,
@@ -465,6 +488,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         parentTaskId: args.parentTaskId,
         project: args.project,
         profiles: args.profiles,
+        grant,
       };
     },
 
