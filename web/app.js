@@ -1537,15 +1537,16 @@ async function renderDashboard() {
                 <b class="mono">${esc(a.id)}</b>
                 <span class="chip">${esc(a.provider || '')}</span>
                 <span>${badge}</span>${weekly}
-                <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent}</span>
+                <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent}</span>
               </div>
               ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
-              <div class="task-sub" style="gap:6px;margin-top:6px">
+              <div class="task-sub" style="gap:6px;margin-top:6px;align-items:center">
                 ${status === 'available'
                   ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
                   : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available now</button>`}
                 <button class="btn sm acct-reset" data-id="${esc(a.id)}">Set reset time…</button>
                 ${pollable.has(a.id) ? `<button class="btn sm usage-recheck" data-id="${esc(a.id)}">↻ Re-check usage</button>` : ''}
+                <label style="display:inline-flex;align-items:center;gap:4px;color:var(--ink-3);font-size:12px">max concurrent <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" title="How many agent turns may run on this login at once; leave empty = unlimited" style="width:52px;padding:2px 6px" /></label>
               </div>
             </div>`;
           }).join('') + (d.accounts.waiting ? `<div class="task-sub" style="color:var(--ink-3);margin-top:6px">${d.accounts.waiting} turn(s) waiting for a login</div>` : '')
@@ -1562,6 +1563,15 @@ async function renderDashboard() {
       await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
       renderDashboard();
     }));
+    box.querySelectorAll('.acct-conc').forEach((inp) => {
+      inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } });
+      inp.addEventListener('change', async () => {
+        const v = inp.value.trim(); // empty = unlimited
+        await api('/api/accounts/concurrency', { method: 'POST', body: JSON.stringify({ accountId: inp.dataset.id, max: v === '' ? null : Number(v) }) })
+          .then(() => toast('Concurrency updated')).catch((e) => toast(e.message, true));
+        renderDashboard();
+      });
+    });
     box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
       const ans = prompt('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
       if (!ans) return;

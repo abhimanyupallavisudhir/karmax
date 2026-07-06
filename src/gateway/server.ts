@@ -562,6 +562,21 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
+      // Per-login concurrency cap — how many agent turns may run on this login at once.
+      // `max` = a positive integer, or null/empty for unlimited. Persisted + re-applied
+      // to the coordinator immediately (concurrency doesn't cost extra quota).
+      if (p === '/api/accounts/concurrency' && method === 'POST') {
+        const b = await this.body(req);
+        if (!b.accountId) return this.json(res, 400, { error: 'accountId required' });
+        const { concurrencyKey } = await import('../platform/credential-sources.js');
+        const { UNLIMITED_CONCURRENCY } = await import('../coordinators/names.js');
+        const n = b.max == null || b.max === '' ? UNLIMITED_CONCURRENCY : Math.floor(Number(b.max));
+        if (!Number.isFinite(n) || n < 1) return this.json(res, 400, { error: 'max must be a positive integer, or empty for unlimited' });
+        store.kvSet(concurrencyKey(String(b.accountId)), String(n));
+        await this.refreshLoginPool();
+        return this.json(res, 200, { ok: true, maxConcurrent: n });
+      }
+
       // Proactive quota (#6): real usage % + reset for each pollable Claude login.
       // GET returns the cached snapshots; recheck re-probes on demand (the button).
       // Codex/API-key/setup-token creds aren't pollable → they show reactive status.
@@ -745,10 +760,13 @@ export class Gateway {
    *  rotation reflects the current set (called after connect/rename/delete). */
   private async refreshLoginPool(): Promise<void> {
     if (!this.deps.configHomes || !this.deps.client) return;
-    const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+    const { gatherCredentialSources, concurrencyFor } = await import('../platform/credential-sources.js');
     const { enumerateCredentials } = await import('../platform/credentials.js');
     const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
-    const pool = creds.map((c) => ({ id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}) }));
+    const pool = creds.map((c) => {
+      const maxConcurrent = concurrencyFor((k) => this.deps.store.kvGet(k), c.key);
+      return { id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}), ...(maxConcurrent != null ? { maxConcurrent } : {}) };
+    });
     if (!pool.length) return;
     const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
     await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);
