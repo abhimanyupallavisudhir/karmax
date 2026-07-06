@@ -164,11 +164,23 @@ export class ClaudeAdapter implements AgentAdapter {
       ...(input.resolvedAuth?.oauthToken ? { extra: { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } } : {}),
     });
 
+    // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
+    // cancels. The Agent SDK spawns a child harness process (the Claude Code
+    // agent); without wiring the abort signal into it, a cancelled task leaves
+    // that agent running — the orphaned-agent bug. The SDK's `abortController`
+    // option terminates the subprocess when aborted, mirroring the codex CLI
+    // adapter's child.kill() and the Messages-API path's fetch(signal).
+    const abortController = new AbortController();
+    const onAbort = () => { try { abortController.abort(); } catch { /* already aborted */ } };
+    if (ctx.signal?.aborted) onAbort();
+    ctx.signal?.addEventListener?.('abort', onAbort, { once: true });
+
     let finalText = '';
     let session = input.session;
     const iterator = query({
       prompt: userText,
       options: {
+        abortController,
         cwd: input.world.handle.root,
         additionalDirectories: [input.world.handle.root],
         // The world is already an isolated git worktree (the sandbox boundary) and
@@ -211,23 +223,33 @@ export class ClaudeAdapter implements AgentAdapter {
       },
     });
     let publishedSession = false;
-    for await (const message of iterator) {
-      // Publish the session id the moment it's known — the SDK's init message carries
-      // it — so the drawer shows a live "fork this agent" command mid-turn (#3).
-      const sid: string | undefined = (message as any).session_id;
-      if (sid && !publishedSession) { session = sid; publishedSession = true; ctx.onSession?.(sid); }
-      if (message.type === 'assistant') {
-        const text = (message.message?.content ?? [])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('\n');
-        if (text) {
-          finalText = text;
-          ctx.emit(text);
+    try {
+      for await (const message of iterator) {
+        if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
+        // Publish the session id the moment it's known — the SDK's init message carries
+        // it — so the drawer shows a live "fork this agent" command mid-turn (#3).
+        const sid: string | undefined = (message as any).session_id;
+        if (sid && !publishedSession) { session = sid; publishedSession = true; ctx.onSession?.(sid); }
+        if (message.type === 'assistant') {
+          const text = (message.message?.content ?? [])
+            .filter((b: any) => b.type === 'text')
+            .map((b: any) => b.text)
+            .join('\n');
+          if (text) {
+            finalText = text;
+            ctx.emit(text);
+          }
+        } else if (message.type === 'result') {
+          session = message.session_id ?? session;
         }
-      } else if (message.type === 'result') {
-        session = message.session_id ?? session;
       }
+    } catch (e) {
+      // A cancellation aborts the SDK subprocess mid-stream — the query iterator
+      // throws an AbortError. The workflow already handled the cancel, so swallow
+      // it (return the partial output); rethrow anything else as a real failure.
+      if (!ctx.signal?.aborted) throw e;
+    } finally {
+      try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
     }
     // The Agent SDK harness completes its own loop; treat a finished query as a
     // turn boundary. If the agent didn't call signal_completion explicitly, the
