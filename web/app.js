@@ -1001,7 +1001,8 @@ function waitingLabel(w) {
     case 'account': return `a ${w.provider || 'compatible'} login (quota refresh)`;
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
-    case 'subtask': return 'a sub-task';
+    case 'subtask': return 'its sub-tasks to finish (or raise)';
+    case 'parent': return 'the parent task to respond';
     default: return w.detail || w.kind;
   }
 }

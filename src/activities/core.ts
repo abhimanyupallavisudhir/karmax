@@ -96,6 +96,12 @@ export interface PrepareChildArgs {
   target?: string;
   project: TaskInput['project'];
   profiles?: Record<string, string>;
+  /** The parent's world branch — the child's merge cap is scoped to exactly this
+   *  (SPEC §8.2). The parent owns this branch, so it may grant merge into it. */
+  parentBranch?: string;
+  /** The parent's own capability grant; the child's delegation caps are attenuated
+   *  by it (a restricted parent can't over-grant). Merge is scoped separately. */
+  parentGrant?: string[];
 }
 
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
@@ -464,6 +470,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         parentTaskId: args.parentTaskId,
       });
       record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title });
+      // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
+      // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
+      // branch (which the parent owns and merges into) — never the broad merge-into:*.
+      const delegation = attenuate(
+        ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
+        args.parentGrant ?? DEFAULT_GRANT,
+      );
+      const grant = [...delegation, args.parentBranch ? `merge-into:${args.parentBranch}` : 'merge-into:*'];
       return {
         taskId: child.id,
         projectId: args.projectId,
@@ -474,6 +488,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         parentTaskId: args.parentTaskId,
         project: args.project,
         profiles: args.profiles,
+        grant,
       };
     },
 

@@ -1,4 +1,4 @@
-import { AgentProfile, AgentRole, Message, Provider, ReviewInfo } from '../domain/types.js';
+import { AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent } from '../domain/types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
@@ -14,8 +14,19 @@ export interface PlatformToolContext {
   signalCompletion(summary?: string): void;
   /** Attach review info (links, diff, polished output) for the Review stage. */
   createReviewInfo(info: ReviewInfo): void;
-  /** Spawn a child task awaited by the parent (SPEC §5.2). */
+  /** Spawn a child task the parent manages (branches off + merges back into the
+   *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
   createSubTask(t: { title: string; prompt: string }): void;
+  /** Parent-agent ONLY: answer a child that raised to you (confirm/comment/retry/
+   *  cancel). `childTaskId` omitted ⇒ all children awaiting a response. */
+  respondToSubTask(r: SubTaskResponse): void;
+  /** Child-agent ONLY: raise a typed request UP to your parent (needs_info /
+   *  needs_permission / needs_confirmation / blocked) and pause for its reply. */
+  raiseToParent(r: RaiseToParent): void;
+  /** Parent-agent ONLY: pause your own work until your running sub-tasks settle (or
+   *  one raises). Use when you have nothing to do but wait; otherwise just keep
+   *  working — sub-tasks run in the background either way. */
+  waitForSubtasks(): void;
   /** Persist a reusable skill (content, freely editable; SPEC §4.4). */
   saveSkill(s: { name: string; content: string }): void;
   /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
@@ -85,6 +96,12 @@ export interface TurnResult {
   output: string;
   reviewInfo?: ReviewInfo;
   subTasks?: { title: string; prompt: string }[];
+  /** Parent-agent responses to child raises this turn (SPEC §5.3). */
+  subTaskResponses?: SubTaskResponse[];
+  /** Child-agent request up to its parent this turn (SPEC §5.3). */
+  raise?: RaiseToParent;
+  /** Parent-agent asked to park until its sub-tasks settle (SPEC §5.3). */
+  waitForSubtasks?: boolean;
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
   error?: string;
