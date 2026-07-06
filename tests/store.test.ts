@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
 import { Store } from '../src/store/db.js';
 
 describe('Store', () => {
@@ -169,5 +170,36 @@ describe('Store', () => {
     });
     expect(store.getProfile('do-default')!.provider).toBe('claude');
     expect(store.listProfiles()).toHaveLength(1);
+  });
+
+  it('opens with a busy timeout so lock collisions wait instead of failing', () => {
+    expect((store.db.prepare('PRAGMA busy_timeout').get() as any).timeout).toBe(5000);
+  });
+
+  it('a write waits out another process holding the write lock (no "database is locked")', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-lock-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const s = new Store(dbPath);
+    const sentinel = path.join(dir, 'locked');
+    // A second process takes the write lock and holds it for ~800ms — the window
+    // a tsx-watch restart creates when the incoming app boots (migrations,
+    // credential writes) while the outgoing one is still appending events.
+    const child = spawn(process.execPath, [
+      '-e',
+      `const { DatabaseSync } = require('node:sqlite');
+       const db = new DatabaseSync(${JSON.stringify(dbPath)});
+       db.exec('BEGIN IMMEDIATE');
+       require('node:fs').writeFileSync(${JSON.stringify(sentinel)}, '1');
+       setTimeout(() => { db.exec('COMMIT'); }, 800);`,
+    ]);
+    try {
+      await expect.poll(() => fs.existsSync(sentinel), { timeout: 10_000 }).toBe(true);
+      // Without busy_timeout this throws ERR_SQLITE_ERROR "database is locked".
+      s.upsertProfile({ id: 'p-lock', name: 'P', role: 'do', provider: 'mock', capabilities: [] } as any);
+      expect(s.getProfile('p-lock')!.name).toBe('P');
+    } finally {
+      child.kill();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
