@@ -172,15 +172,17 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   setHandler(registerAccountsSignal, ({ accounts: incoming }) => {
     for (const a of incoming) {
       const existing = accounts.find((x) => x.id === a.id);
-      // Logins are concurrency-limited (the whole point of leasing); ambient logins
-      // and API keys are effectively high-concurrency.
-      const defMax = a.maxConcurrent ?? (a.kind === 'login' ? 1 : 100);
+      // Default concurrency per credential kind (user-configurable per login; the
+      // caller passes a resolved value, and UNLIMITED for an unbounded login). Concurrency
+      // doesn't cost extra quota, so the default is generous; leasing still respects
+      // precedence order and re-leases on exhaustion.
+      const defMax = a.maxConcurrent ?? (a.kind === 'login' ? 10 : 100);
       if (existing) {
         existing.configHome = a.configHome;
         if (a.provider) existing.provider = a.provider;
         if (a.kind) existing.kind = a.kind;
         if (a.apiKeyHandle !== undefined) existing.apiKeyHandle = a.apiKeyHandle || undefined;
-        if (a.maxConcurrent) existing.maxConcurrent = a.maxConcurrent;
+        if (a.maxConcurrent != null) existing.maxConcurrent = a.maxConcurrent; // apply raises/lowers
       } else {
         accounts.push({
           id: a.id,
