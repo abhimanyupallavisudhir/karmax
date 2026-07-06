@@ -23,6 +23,10 @@ export interface PlatformToolContext {
   /** Child-agent ONLY: raise a typed request UP to your parent (needs_info /
    *  needs_permission / needs_confirmation / blocked) and pause for its reply. */
   raiseToParent(r: RaiseToParent): void;
+  /** Parent-agent ONLY: pause your own work until your running sub-tasks settle (or
+   *  one raises). Use when you have nothing to do but wait; otherwise just keep
+   *  working — sub-tasks run in the background either way. */
+  waitForSubtasks(): void;
   /** Persist a reusable skill (content, freely editable; SPEC §4.4). */
   saveSkill(s: { name: string; content: string }): void;
   /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
@@ -96,6 +100,8 @@ export interface TurnResult {
   subTaskResponses?: SubTaskResponse[];
   /** Child-agent request up to its parent this turn (SPEC §5.3). */
   raise?: RaiseToParent;
+  /** Parent-agent asked to park until its sub-tasks settle (SPEC §5.3). */
+  waitForSubtasks?: boolean;
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
   error?: string;

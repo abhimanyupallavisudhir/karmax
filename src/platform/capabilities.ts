@@ -52,6 +52,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   edit_task: 'edit-task',
   create_sub_task: 'create-sub-task',
   respond_to_sub_task: 'create-sub-task',
+  wait_for_subtasks: 'create-sub-task',
   raise_to_parent: 'signal-completion',
   create_review_info: 'create-review-info',
   signal_completion: 'signal-completion',

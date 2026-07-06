@@ -100,6 +100,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'wait_for_subtasks',
+    description:
+      'Pause until your running sub-tasks finish (or one raises to you). Your sub-tasks run in the background — you can keep working instead of calling this; call it only when you have nothing to do but wait for them. You are resumed the moment a sub-task finishes or needs you.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
     name: 'save_skill',
     description: 'Save a reusable skill (markdown content) for future tasks.',
     parameters: {
@@ -202,6 +208,10 @@ export function platformToolHandlers(
         return 'invalid type — use needs_info | needs_permission | needs_confirmation | blocked';
       ctx.raiseToParent({ type: type as 'needs_info' | 'needs_permission' | 'needs_confirmation' | 'blocked', detail: args?.detail ? String(args.detail) : undefined });
       return `raised to parent: ${type}`;
+    },
+    async wait_for_subtasks() {
+      ctx.waitForSubtasks();
+      return 'waiting for sub-tasks to finish (or raise)';
     },
     async save_skill(args) {
       ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });

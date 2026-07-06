@@ -15,39 +15,44 @@ flows *up the branch hierarchy*, merging into `main` only once at the top.
 
 ## 0. Status (implemented on this branch)
 
-Phases **A (raise channel + non-dormant parent)**, **C (typed escalation,
-parent-as-confirmer)**, and **D (branch stacking)** are **implemented**. The
-remaining gap is the fully-concurrent variant of **B** — the parent can *manage*
-children actively but does not yet run *unrelated* work concurrently with them.
+Phases **A**, **B**, **C**, **D** are all **implemented**. "main" throughout this
+doc means *the top-level task's target branch* (`input.target` → project
+`defaultTarget`), not necessarily the literal `main`.
 
 What landed:
-- **Branch stacking** — `spawnSubTasks` passes `base = target = world.branch` and
-  commits-on-spawn (`software-dev.ts`), so a child branches off + merges back into
-  the parent's world branch. `main` gets one merge at the top. `finalizeMerge`
-  already merges into whichever worktree holds the target, so no merge rewrite was
-  needed (the ⚠ in §3-D was a non-issue).
-- **Raise channel** — `raiseFromChild` / `parentResponse` signals; children spawned
-  via `startChild` (not `executeChild`); `manageSubTasks()` keeps the parent live
-  (wakes on a raise / settle / follow-up), never a dead await.
-- **Parent-as-confirmer + typed raises** — a child raises `needs_confirmation` at
-  Review, `blocked` at Escalation/merge-fail, and `needs_info`/`needs_permission`
-  via the new `raise_to_parent` tool. The parent answers with `respond_to_sub_task`
+- **Branch stacking (D)** — `spawnSubTasks` passes `base = target = world.branch`
+  and commits-on-spawn (`software-dev.ts`), so a child branches off + merges back
+  into the parent's world branch. Only the top-level task merges into *its* target.
+  `finalizeMerge` already merges into whichever worktree holds the target, so no
+  merge rewrite was needed (the ⚠ in §3-D was a non-issue).
+- **Raise channel (A)** — `raiseFromChild` / `parentResponse` signals; children
+  spawned via `startChild` (not `executeChild`); the parent is never a dead await —
+  it drains child events each Do turn and parks only when idle-waiting.
+- **Parent-as-confirmer + typed raises (C)** — a child raises `needs_confirmation`
+  at Review, `blocked` at Escalation/merge-fail, and `needs_info`/`needs_permission`
+  via `raise_to_parent`. The parent answers with `respond_to_sub_task`
   (confirm/comment/retry/cancel); its reply maps onto the same confirm/retry/
   cancel/follow-up transitions a human drives. Children stay human-resolvable as a
   fallback. `autoConfirm` is kept only for top-level goal tasks (no parent).
+- **Async join (B)** — spawn is **non-blocking**: the agent keeps working in the
+  same turn and across turns while children run in the background; child raises and
+  results interleave as messages (`drainChildEvents` at the top of each Do turn).
+  `wait_for_subtasks` lets the agent explicitly park when it has nothing else to do.
+  An **end-stage barrier** holds the parent in Do until its children settle, so its
+  own Review/PR/Merge never races ahead of delegated work. Fan-out is bounded
+  (`MAX_CONCURRENT_SUBTASKS=8`, `MAX_TOTAL_SUBTASKS=50`; over-cap spawns are refused
+  with a surfaced message, never silently). Children are cancelled on parent abort.
 - **Deadlock fixed** — an escalated child no longer blocks on a hidden human; it
   raises to the parent, which resolves it or bubbles up visibly.
-- Tools: `respond_to_sub_task`, `raise_to_parent` (mock DSL: `@respond`, `@raise`).
-  Tests: parent-as-confirmer + branch stacking, and stuck-child-raises-blocked
-  (`tests/pipeline.test.ts`).
+- Tools: `respond_to_sub_task`, `raise_to_parent`, `wait_for_subtasks` (mock DSL:
+  `@respond`, `@raise`, `@wait`). Tests (`tests/pipeline.test.ts`): parent-as-
+  confirmer + branch stacking, stuck-child-raises-blocked, and async-join +
+  end-stage barrier.
 
-Deferred (**B**, fully-async join): the parent still *manages* children to
-completion before it finishes, rather than doing unrelated feature work in
-parallel with them. The management loop is the interruptible-join half of B; the
-concurrent half (spawn-and-keep-working, explicit `wait_for_subtasks`, end-stage
-barrier, per-task concurrency caps) is the next phase. Also deferred: scoping the
-child's merge capability to `merge-into:karmax/<parent>` (a security nicety — the
-workflow already pins the child's merge target).
+Still deferred (nice-to-haves, not blocking): scoping the child's merge capability
+to `merge-into:<parentBranch>` (the workflow already pins the child's merge target,
+so this is defense-in-depth), and a `waitingFor: 'parent'` vs `'subtask'` UI polish
+pass.
 
 ---
 

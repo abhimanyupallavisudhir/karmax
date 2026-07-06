@@ -150,13 +150,22 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('cancelled');
   });
 
-  // The parent surfaces a child's raise as a system message before it can answer it.
-  // Waiting for that guarantees the parent has the child in `awaitingResponse` (and,
-  // for the mock which only reads the latest message, that our @respond isn't raced by
-  // the incoming raise). A real agent answers in the same turn it sees the raise.
+  // Wait until the parent has surfaced a child's raise AND parked afterward (its last
+  // message is the agent's turn on that raise). This guarantees the child is in
+  // `awaitingResponse` and — since the mock only reads the latest message — that a
+  // subsequent @respond follow-up lands on a fresh turn rather than racing the in-flight
+  // turn that drained the raise. A real agent answers in the same turn it sees the raise.
   const parentSawRaise = async (handle: any, needle: string) =>
     expect
-      .poll(async () => ((await view(handle)).messages as any[]).some((m) => m.role === 'system' && m.text.includes(needle)), { timeout: 40_000 })
+      .poll(
+        async () => {
+          const msgs = (await view(handle)).messages as any[];
+          const sawRaise = msgs.some((m) => m.role === 'system' && m.text.includes(needle));
+          const parkedAfter = msgs.length > 0 && msgs[msgs.length - 1].role === 'agent';
+          return sawRaise && parkedAfter;
+        },
+        { timeout: 45_000 },
+      )
       .toBe(true);
 
   it('parent-as-confirmer: a child raises at Review, the parent approves, and the work stacks onto the parent branch then main', async () => {
@@ -233,6 +242,49 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
     await handle.signal('confirm');
     expect((await handle.result()).stage).toBe('done');
+  }, 90_000);
+
+  it('async join: the parent does its own work in the spawning turn, and the end-stage barrier holds its completion until the child finishes', async () => {
+    const repo = await h.makeRepo('app-sub-async');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // one turn: spawn a child AND do the parent's own work (non-blocking spawn), then
+      // signal completion — which must be HELD until the child finishes.
+      args: [
+        input({
+          taskId,
+          repo,
+          title: 'Parent',
+          prompt: '@subtask Child :: @write child.txt :: from child\n@write parent.txt :: from parent',
+        }),
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 30_000 }).toBe(1);
+    const childId = (await view(handle)).subTasks![0];
+
+    // the child reaches Review and raises to the parent…
+    await parentSawRaise(handle, 'needs_confirmation');
+
+    // …and the end-stage barrier holds: the parent COMPLETED its turn but is still in
+    // Do managing the child — it has NOT advanced to its own Review/PR/Merge, and
+    // nothing (not even its own work) has merged to the top target yet.
+    const held = await view(handle);
+    expect(held.stage).toBe('do');
+    expect((await git(repo, ['show', 'main:parent.txt'])).code).not.toBe(0);
+
+    // approve the child; only now does the parent proceed to its own Review
+    await handle.signal('followUp', { id: 'r1', role: 'user', text: '@respond confirm', ts: 0 });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+
+    // both the parent's own work and the child's work landed on the top target
+    expect((await git(repo, ['show', 'main:parent.txt'])).stdout).toContain('from parent');
+    expect((await git(repo, ['show', 'main:child.txt'])).stdout).toContain('from child');
+    void childId;
   }, 90_000);
 
   it('serializes two tasks through the merge queue onto the same branch', async () => {

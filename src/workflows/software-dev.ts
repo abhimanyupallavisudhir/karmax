@@ -73,6 +73,10 @@ export interface SoftwareDevInput extends TaskInput {
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
+/** Sub-task fan-out bounds (SPEC §5.3): concurrent children, and children over the
+ *  task's whole life. Non-blocking spawn makes runaway delegation cheap without these. */
+const MAX_CONCURRENT_SUBTASKS = 8;
+const MAX_TOTAL_SUBTASKS = 50;
 
 /**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
@@ -551,6 +555,16 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   async function spawnSubTasks(list: { title: string; prompt: string }[]) {
     await core.commitWork(world as any, `karmax: snapshot before sub-tasks for ${taskId}`);
     for (const s of list) {
+      // Bound the fan-out (SPEC §5.3): non-blocking spawn makes runaway delegation
+      // cheap, so cap concurrent + lifetime children. Surface drops (never silent).
+      if (outstanding.size >= MAX_CONCURRENT_SUBTASKS || subTaskIds.length >= MAX_TOTAL_SUBTASKS) {
+        const reason =
+          subTaskIds.length >= MAX_TOTAL_SUBTASKS
+            ? `this task's sub-task limit (${MAX_TOTAL_SUBTASKS} total) is reached`
+            : `too many sub-tasks are running at once (${MAX_CONCURRENT_SUBTASKS} max) — wait for some to finish`;
+        msgs.push({ id: `st-${msgs.length}`, role: 'system', text: `Sub-task "${s.title}" was NOT spawned: ${reason}.`, ts: msgs.length });
+        continue;
+      }
       const childInput = await core.prepareChildTask({
         parentTaskId: taskId,
         projectId: input.projectId,
@@ -605,51 +619,26 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   }
 
   /**
-   * Manage outstanding children until they all settle (SPEC §5.3). Surfaces their
-   * raised requests to the Do agent (so it can confirm/answer/retry them) and injects
-   * their results. The parent is NEVER a dead await: it wakes on a raise, a settlement,
-   * or a human follow-up. This is what fixes the v1 deadlock — a child that escalated
-   * used to block on a human who couldn't even see it.
+   * Fold any pending child events (raises + settlements) into the Do conversation so
+   * the agent sees them at the top of its next turn (SPEC §5.3). This is what lets the
+   * parent run its own work turn-after-turn WHILE children run in the background —
+   * their raises/results interleave as messages rather than blocking the loop.
    */
-  async function manageSubTasks() {
-    for (;;) {
-      while (raises.length) {
-        const r = raises.shift()!;
-        msgs.push({ id: `st-${msgs.length}`, role: 'system', text: subtaskRaiseText(r), ts: msgs.length });
-      }
-      while (settled.length) {
-        const s = settled.shift()!;
-        outstanding.delete(s.childTaskId);
-        awaitingResponse.delete(s.childTaskId);
-        msgs.push({
-          id: `st-${msgs.length}`,
-          role: 'system',
-          text: `Sub-task ${s.childTaskId} finished: ${s.stage}${s.detail ? ` (${s.detail})` : ''}.`,
-          ts: msgs.length,
-        });
-      }
-      if (cancelled) {
-        await cancelChildren();
-        throw new Cancelled();
-      }
-      if (outstanding.size === 0) return; // all children done → resume the main Do loop
-      if (msgs.length > seen) {
-        // New info for the agent (a raise or a human follow-up) → let it react.
-        stage = 'do';
-        status = 'active';
-        waitingFor = undefined;
-        await publish();
-        const t = await doTurn();
-        await applySubTaskResponses(t.subTaskResponses);
-        if (t.subTasks?.length) await spawnSubTasks(t.subTasks);
-        continue;
-      }
-      // Nothing to process → park until a child event or a human follow-up.
-      stage = 'do';
-      status = 'waiting';
-      waitingFor = { kind: 'subtask' };
-      await publish();
-      await condition(() => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen);
+  function drainChildEvents(): void {
+    while (raises.length) {
+      const r = raises.shift()!;
+      msgs.push({ id: `st-${msgs.length}`, role: 'system', text: subtaskRaiseText(r), ts: msgs.length });
+    }
+    while (settled.length) {
+      const s = settled.shift()!;
+      outstanding.delete(s.childTaskId);
+      awaitingResponse.delete(s.childTaskId);
+      msgs.push({
+        id: `st-${msgs.length}`,
+        role: 'system',
+        text: `Sub-task ${s.childTaskId} finished: ${s.stage}${s.detail ? ` (${s.detail})` : ''}.`,
+        ts: msgs.length,
+      });
     }
   }
 
@@ -680,34 +669,48 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
   // ── Do ⇄ Review ──
   for (;;) {
-    // Each iteration starts fresh in Do — clears any park state left by sub-task
-    // management (which may return with status 'waiting'/waitingFor 'subtask').
+    // Each iteration starts fresh in Do — clears any park state left by a prior
+    // sub-task wait (status 'waiting'/waitingFor 'subtask').
     stage = 'do';
     status = 'active';
     waitingFor = undefined;
+    // Fold in anything the children did since our last turn (SPEC §5.3) so the agent
+    // sees their raises/results at the top of this turn — this is what lets us keep
+    // working while they run, rather than blocking on them.
+    drainChildEvents();
     await publish();
     if (cancelled) return await abort();
 
     const turn = await doTurn();
+    // Sub-tasks run in the BACKGROUND: spawn is non-blocking, and answers go straight
+    // down to the children they target (SPEC §5.3).
+    if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
+    if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
 
-    // Sub-tasks: spawn (branch-stacked) + manage them to completion (we are their
-    // confirmer), then resume Do so the agent sees their results (SPEC §5.3).
-    if (turn.subTasks?.length) {
-      await spawnSubTasks(turn.subTasks);
-      await applySubTaskResponses(turn.subTaskResponses);
-      await manageSubTasks();
-      if (cancelled) return await abort();
+    const finishing = turn.completed || turn.needsInput || turn.raise;
+
+    // While children are still running, the parent doesn't leave the Do loop:
+    if (outstanding.size > 0) {
+      if (turn.waitForSubtasks || finishing) {
+        // Explicit wait, or a finish deferred by the end-stage barrier — a completion
+        // here is held until the children settle (the agent re-signals once they do),
+        // so the parent's own Review/Merge never races ahead of its delegated work.
+        // Stay responsive: wake on a child raise/settlement or a human follow-up.
+        status = 'waiting';
+        waitingFor = { kind: 'subtask' };
+        await publish();
+        await condition(() => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen);
+        if (cancelled) return await abort();
+      }
+      // Otherwise the agent kept working (spawned/answered this turn) — loop and run
+      // another turn; the children's events drain in at the top.
       continue;
     }
-    // A turn that only answers children (no new spawns) while some are still running.
-    if (turn.subTaskResponses?.length && outstanding.size) {
-      await applySubTaskResponses(turn.subTaskResponses);
-      await manageSubTasks();
-      if (cancelled) return await abort();
-      continue;
-    }
 
-    if (turn.completed || turn.needsInput || turn.raise) {
+    // No children outstanding.
+    if (turn.waitForSubtasks) continue; // nothing to wait for → just take another turn
+
+    {
       // Goal mode: keep nudging the agent until it signals structured completion
       // (unless it's explicitly raising to its parent, which needs an answer).
       if (input.goalMode && !turn.completed && !turn.raise) {

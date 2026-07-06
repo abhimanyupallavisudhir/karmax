@@ -27,6 +27,7 @@ const ctx = (): PlatformToolContext => ({
   createSubTask() {},
   respondToSubTask() {},
   raiseToParent() {},
+  waitForSubtasks() {},
   saveSkill() {},
   resolveDecision() {},
   async requestSpend() { return { status: 'denied' as const }; },

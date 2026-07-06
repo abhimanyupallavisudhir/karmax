@@ -13,6 +13,7 @@ import { parseTransition } from '../resolve/transitions.js';
  *   @subtask <title> :: <prompt>    spawn a child task
  *   @respond <action> [:: text]     parent answers a raising child (confirm/comment/retry/cancel)
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
+ *   @wait                           parent parks until its sub-tasks finish/raise
  *   @review <summary>               attach review info
  *   @skill <name> :: <content>      save a skill
  *   @fail <message>                 throw (exercises Resolve)
@@ -76,6 +77,13 @@ export class MockAdapter implements AgentAdapter {
             complete = false; // raising pauses for a reply; don't signal completion
             outputs.push(`raise: ${t}`);
           }
+          break;
+        }
+        case 'wait': {
+          // @wait — parent parks until its sub-tasks settle/raise. Not a completion.
+          ctx.waitForSubtasks();
+          complete = false;
+          outputs.push('wait');
           break;
         }
         case 'review': {
