@@ -574,6 +574,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         target: world!.branch,
         project: input.project,
         profiles: input.profiles,
+        // Branch-scoped, least-privilege grant for the child (SPEC §8.2).
+        parentBranch: world!.branch,
+        parentGrant: input.grant,
       });
       subTaskIds.push(childInput.taskId);
       outstanding.add(childInput.taskId);

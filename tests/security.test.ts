@@ -28,6 +28,25 @@ describe('capability model + attenuation (SPEC §8.2)', () => {
     expect(allows(eff, 'merge-into:/r:main')).toBe(true);
     expect(allows(eff, 'create-task')).toBe(false);
   });
+
+  it("a sub-task's grant scopes merge to EXACTLY the parent branch, not merge-into:* (SPEC §5.3/§8.2)", () => {
+    // Mirrors prepareChildTask: delegation caps attenuated by the parent's grant,
+    // merge scoped to the parent's own branch.
+    const parentBranch = 'karmax/task_parent';
+    const delegation = attenuate(['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'], ['*']);
+    const childGrant = [...delegation, `merge-into:${parentBranch}`];
+    // The do-agent profile ceiling still carries the broad merge-into:* …
+    const ceiling = ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'];
+    const eff = attenuate(ceiling, childGrant);
+    // … but the child may merge into ONLY its parent's branch.
+    expect(allows(eff, `merge-into:${parentBranch}`)).toBe(true);
+    expect(allows(eff, 'merge-into:main')).toBe(false);
+    expect(allows(eff, 'merge-into:karmax/task_sibling')).toBe(false);
+    expect(allows(eff, 'merge-into:*')).toBe(false);
+    // Delegation caps survive so it can run its own Do/Review/sub-tasks.
+    expect(allows(eff, 'create-sub-task')).toBe(true);
+    expect(allows(eff, 'signal-completion')).toBe(true);
+  });
 });
 
 describe('TokenAuthority (workflow-minted scoped tokens)', () => {
