@@ -297,10 +297,32 @@ export class Store {
     ).map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
-  allEventsSince(seq: number): (KarmaxEvent & { seq: number })[] {
+  allEventsSince(seq: number, limit?: number): (KarmaxEvent & { seq: number })[] {
+    // Bound the read in SQL. Callers that want "the last N" would otherwise
+    // materialize the ENTIRE append-only table before slicing — the events table
+    // is the largest in the DB, so that is the dominant read-path allocation.
+    // Grab the newest N (DESC + LIMIT), then return ascending as before.
+    if (limit && limit > 0) {
+      const rows = this.db
+        .prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq DESC LIMIT ?')
+        .all(seq, limit) as any[];
+      rows.reverse();
+      return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+    }
     return (this.db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq').all(seq) as any[]).map(
       (r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }),
     );
+  }
+
+  /** Retention: drop a task's high-volume live-output rows once it's done. The
+   *  full agent text survives in the task's saved view/transcripts (saveView);
+   *  these per-chunk `agent.output` rows are the biggest driver of table growth
+   *  and are only useful for the live stream while the task runs. */
+  pruneAgentOutput(taskId: string): number {
+    const info = this.db
+      .prepare("DELETE FROM events WHERE taskId = ? AND type = 'agent.output'")
+      .run(taskId);
+    return Number(info.changes);
   }
 
   // ─── Settings (per-scope × workflow parameter values; SPEC §10.4) ────────────

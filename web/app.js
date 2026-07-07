@@ -25,6 +25,7 @@ const S = {
   paramDefaults: {},
   sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
   ws: null,
+  hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
 };
 
 const WORKFLOWS = [
@@ -1502,13 +1503,53 @@ function activityView() {
 }
 
 // ── dashboard ────────────────────────────────────────────────────────────────
+// Host diagnostics + agent-turn admission (GET /api/diagnostics). Reporting only:
+// loadavg, free/total RAM, live agent-slot occupancy, and whether either pressure
+// gate is currently holding new agent leases back (adaptive admission control).
+function hostDiagHtml(diag) {
+  if (!diag) return `<div class="card" style="color:var(--ink-3)">Diagnostics unavailable.</div>`;
+  const h = diag.host || {};
+  const s = diag.agentSlots || {};
+  const load = (h.loadavg || []).map((n) => Number(n).toFixed(2)).join('  /  ');
+  const loadStyle = s.loadHigh ? ' style="color:var(--danger)"' : '';
+  const memStyle = s.memoryTight ? ' style="color:var(--danger)"' : '';
+  const freeG = (Number(h.freeMemMb || 0) / 1024).toFixed(1);
+  const totG = (Number(h.totalMemMb || 0) / 1024).toFixed(1);
+  const gates = [];
+  if (s.memoryTight) gates.push(`low free memory (< ${s.minFreeMb}MB)`);
+  if (s.loadHigh) gates.push(`load above ${s.maxLoadFactor}× cores`);
+  const gate = gates.length
+    ? `<span class="chip waiting">⏸ holding new agent leases — ${esc(gates.join(' + '))}</span>`
+    : `<span class="chip done">admitting agent turns</span>`;
+  return `
+    <div class="stat-grid">
+      <div class="stat"><div class="n"${loadStyle}>${esc(load || '—')}</div><div class="l">Load avg · 1 / 5 / 15 min</div></div>
+      <div class="stat"><div class="n"${loadStyle}>${Number(h.loadPerCore || 0).toFixed(2)}×</div><div class="l">Load per core · ${esc(String(h.cores ?? '?'))} cores</div></div>
+      <div class="stat"><div class="n"${memStyle}>${freeG}G</div><div class="l">Free RAM · of ${totG}G (${esc(String(h.usedMemPct ?? '?'))}% used)</div></div>
+      <div class="stat"><div class="n">${esc(String(s.inUse ?? '?'))}/${esc(String(s.capacity ?? '?'))}${s.waiting ? ` +${esc(String(s.waiting))}` : ''}</div><div class="l">Agent slots in use${s.waiting ? ` · ${esc(String(s.waiting))} waiting` : ''}</div></div>
+    </div>
+    <div class="task-sub" style="margin-top:8px">${gate}</div>`;
+}
+
+// Live-refresh just the host panel every 5s while the Dashboard is open. Self-
+// terminates (no reschedule) once the tab changes or the element is gone.
+async function refreshHostDiag() {
+  if (S.tab !== 'dashboard' || !$('#host-diag')) return;
+  let diag = null;
+  try { diag = await api('/api/diagnostics'); } catch {}
+  const el = $('#host-diag');
+  if (el && S.tab === 'dashboard') el.innerHTML = hostDiagHtml(diag);
+  if (S.tab === 'dashboard') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
+}
+
 async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
   try {
-    const [d, u] = await Promise.all([
+    const [d, u, diag] = await Promise.all([
       api('/api/dashboard'),
       api('/api/accounts/usage').catch(() => ({ usage: {}, pollable: [] })),
+      api('/api/diagnostics').catch(() => null),
     ]);
     const accounts = d.accounts?.accounts || [];
     const usage = u.usage || {};
@@ -1520,6 +1561,8 @@ async function renderDashboard() {
         <div class="stat"><div class="n">${d.tasks}</div><div class="l">Tasks</div></div>
         ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(s)}</div></div>`).join('')}
       </div>
+      <div class="section-h">Host &amp; admission control</div>
+      <div id="host-diag">${hostDiagHtml(diag)}</div>
       <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
         <span>Agent accounts (login availability &amp; quota)</span>
         ${pollable.size ? `<button class="btn sm usage-recheck-all">↻ Re-check usage</button>` : ''}
@@ -1582,6 +1625,10 @@ async function renderDashboard() {
       await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
       renderDashboard();
     }));
+    // Keep the host panel live without re-rendering (and disrupting focus on) the
+    // accounts section; single pending timer (cleared here and inside the loop).
+    clearTimeout(S.hostDiagTimer);
+    S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 

@@ -2,6 +2,69 @@ Memory/RAM audit — what to implement, in priority order
 
 The short version: the codebase honors the SPEC's core discipline ("RAM is consumed strictly during turns, never during waits") in its architecture, but four things undermine it in practice — no host-wide cap on concurrent agent processes, agent subprocesses that can't be killed, unbounded workflow-history growth, and an append-only events table that gets read whole. The first two are what caused the July 5 OOM (5.7G peak, systemd-oomd kill); the second two are slow-burn and will bite long-running/goal-mode tasks.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Implementation status & critical evaluation (2026-07-07)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+I went through every suggestion below, checked it against the current tree, and
+kept only what still makes sense for a SINGLE-HOST karmax (the T480-class target).
+Several items had already been implemented since this file was written; a couple
+are traps that would do more harm than good if applied literally.
+
+DONE already (verified in-tree, no action needed):
+  • #3 Docker resource limits — container.ts:18 `containerLimitArgs()` already sets
+    --memory/--memory-swap/--cpus/--pids-limit (all env-tunable). Fully covered.
+  • #9 reuseV8Context — worker.ts:55 already `true`. Covered.
+  • #1 (the hard part) — a host-wide agent-turn cap already exists as a per-process
+    semaphore, agent-slots.ts (`KARMAX_MAX_AGENT_SLOTS`, default 3), acquired around
+    the model call in core.ts:301 including the empty-pool path. It already backs off
+    on low free memory. See the evaluation of "lease coordinator vs semaphore" below.
+  • #2 (graceful half) — claude.ts AbortController + both adapters' heartbeats +
+    the 1s bounded shutdown all landed (05f9802 / 30f2a7c), as the file already notes.
+
+IMPLEMENTED NOW (this change):
+  • Adaptive admission on LOAD, not just memory (the missing half of #1's parenthetical
+    + the user's request). agent-slots.ts now also parks new turns while the 1-minute
+    loadavg exceeds `cores × KARMAX_AGENT_MAX_LOAD_FACTOR` (default 1.0 → "load may not
+    exceed the core count"). 0 disables; loadavg reads 0 where the OS doesn't report it.
+  • Host diagnostics REPORTING (the user's ask). `hostStats()` (loadavg / free / total
+    MB / cores / used%) is folded into `agentSlotStats()` and exposed read-only at
+    `GET /api/diagnostics` alongside live slot occupancy and which gate is holding
+    admission back — so a human/UI can see WHY leases are being deferred.
+  • Process-tree custody after SIGKILL (the crash half of #2 — the piece that actually
+    would have stopped July-5's orphans). New src/agent/custody.ts: every directly-
+    spawned agent is written as a pidfile under KARMAX_HOME/state/agents/<pid>.json;
+    codex now spawns DETACHED (own process group) and a mid-turn cancel kills the whole
+    GROUP with SIGTERM→SIGKILL escalation (so codex's descendant tool processes die too);
+    at BOOT, `reapOrphans()` (wired in main.ts) hard-kills any groups a prior incarnation
+    left running and clears the files. A /proc cmdline check guards against PID reuse —
+    where it can't verify (non-Linux) it clears the file without killing.
+  • Cancellation-delivery gap: the Claude Agent-SDK streaming path never heartbeated
+    mid-turn, so Temporal could not deliver a cancel to a long SDK turn (codex/Messages
+    already did). Added a 10s heartbeat timer to that path — real parity fix.
+
+DEFERRED with rationale (deliberately NOT implemented):
+  • "Promote the agent-slot cap to a Temporal lease coordinator" (#1's literal wording).
+    The existing per-process semaphore is the right level for a single worker on one
+    host; a coordinator buys nothing until there are multiple workers, and duplicating
+    working code adds replay surface for no benefit. agent-slots.ts already documents
+    this and the call sites `await` an async acquire, so the swap stays localized IF a
+    fleet ever appears. Revisit only then.
+  • "Add heartbeatTimeout to the 45-minute long-activity proxies" (#2, second bullet).
+    This is a TRAP as written. The adapters heartbeat on a TIMER, not on progress, so a
+    heartbeatTimeout would not detect a wedged subprocess (the timer keeps beating from
+    karmax's own event loop) — and with `retry.maximumAttempts: 1` a heartbeat timeout
+    turns a transient worker stall into a HARD task failure. A progress-based heartbeat
+    with a short timeout is worse: a coding agent legitimately runs a 10-minute silent
+    test suite and would be falsely killed. The real hang mitigation is the OS-process
+    custody above (kill the subprocess), which is what this change delivers instead.
+
+Tiers 2–5 below (workflow-history growth, events-table pruning, gateway payloads,
+package-bundle retention, housekeeping) remain valid and UNDONE — they are slow-burn,
+not the OOM class, and are a separate body of work. Ranked findings preserved as-is.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 Tier 1 — prevents the OOM class of incident
 
 1. Add a host-wide host.agent-slot lease. Today there is no dedicated cap on concurrent agent subprocesses. The per-credential caps don't help: login accounts default to maxConcurrent: 10 and API keys to 100 (src/coordinators/account.ts:179), and leasing is bypassed entirely when the account pool is empty (src/workflows/software-dev.ts:451). The only real brake is the worker's KARMAX_MAX_ACT default of 8 (src/temporal/worker.ts:50) — which gates all activities (merges, world setup, scripts), not agent turns, and scales up if you ever raise it for throughput or run a second worker. The fix fits your existing pattern exactly: a fixed-capacity lease (capacity ~2–3 on the 15G T480, env-tunable) in the lease coordinator, acquired around every agent turn including the empty-pool path. Optionally gate lease grants on freemem/loadavg so admission control backs off under memory pressure.

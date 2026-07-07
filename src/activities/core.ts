@@ -7,6 +7,7 @@ import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { ProfileResolver } from '../agent/profiles.js';
 import { AgentAdapter } from '../agent/types.js';
 import { runTurn } from '../agent/runtime.js';
+import { acquireAgentSlot } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
@@ -294,7 +295,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         /* not running inside a Temporal activity (e.g. a direct unit test) */
       }
 
-      const result = await runTurn(
+      // Host-wide agent-turn admission (SPEC §12): cap concurrent model
+      // subprocesses so a burst can't OOM the host. Acquired around the model
+      // call ONLY — the setup above is cheap — and released in `finally` below.
+      const releaseSlot = await acquireAgentSlot(heartbeat);
+      let lastEmit: string | undefined;
+      let result;
+      try {
+        result = await runTurn(
         {
           profile,
           world,
@@ -312,7 +320,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           adapters: deps.adapters,
           signal,
           heartbeat,
-          onEmit: (t) => record(args.taskId, 'agent.output', { text: t }),
+          // Coalesce the live-output stream: adapters re-emit the growing *cumulative*
+          // message text, so consecutive identical/prefix emits carry no new info.
+          // Dropping them cuts the single biggest events-table growth driver
+          // (one row per chunk) without changing what the UI renders.
+          onEmit: (t) => {
+            if (t === lastEmit) return;
+            lastEmit = t;
+            record(args.taskId, 'agent.output', { text: t });
+          },
           // Publish the session id + its home the moment the adapter knows it (mid-turn),
           // so the drawer's live "fork this agent" command appears WHILE the turn runs,
           // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.
@@ -332,7 +348,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               }
             : {}),
         },
-      );
+        );
+      } finally {
+        releaseSlot();
+      }
       if (token) deps.tokens?.revoke(token);
       // Persist the session id so other tasks can resume from this one (§10.5), plus
       // which config home + provider minted it — provider sessions are home-bound, so
