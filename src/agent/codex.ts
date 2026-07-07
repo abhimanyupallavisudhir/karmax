@@ -7,6 +7,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACK
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { codexReasoningEffort } from './effort.js';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
+import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -159,10 +160,19 @@ export class CodexAdapter implements AgentAdapter {
     // Args go straight to execve (no shell), so a multi-line prompt needs no escaping.
     const args = resuming ? ['exec', 'resume', input.session!, ...flags, promptText] : ['exec', ...flags, promptText];
 
-    const child = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Detached ⇒ the child is its own process-group leader, so a kill of the
+    // GROUP (kill(-pid)) reaps codex's descendant tool processes too, not just
+    // the root — the "descendants survive" gap called out in PLAN-efficiency.
+    const child = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
 
-    // Mid-turn cancel (SPEC §5.6): kill the process when the workflow cancels.
-    const onAbort = () => { try { child.kill('SIGTERM'); } catch { /* already gone */ } };
+    // Process-tree custody (src/agent/custody.ts): record the root pid so a
+    // boot-time sweep can reap this group if karmax is SIGKILLed mid-turn
+    // (systemd-oomd / crash), and drop the record when the turn ends normally.
+    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, startedAt: Date.now() });
+
+    // Mid-turn cancel (SPEC §5.6): kill the whole process GROUP when the workflow
+    // cancels — SIGTERM, escalating to SIGKILL after a grace window.
+    const onAbort = () => { void killAgent(child.pid); };
     if (ctx.signal?.aborted) onAbort();
     ctx.signal?.addEventListener?.('abort', onAbort, { once: true });
     // Heartbeat so a long turn isn't killed by Temporal's activity timeout.
@@ -222,6 +232,7 @@ export class CodexAdapter implements AgentAdapter {
     });
     if (buf.trim()) handleLine(buf); // flush a trailing partial line
     if (hb) clearInterval(hb);
+    unregisterAgent(child.pid); // child has exited — clear its custody record
     try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
 
     // Prefer the -o final-message file (authoritative) over the streamed text.

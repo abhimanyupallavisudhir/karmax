@@ -174,6 +174,11 @@ export class ClaudeAdapter implements AgentAdapter {
     const onAbort = () => { try { abortController.abort(); } catch { /* already aborted */ } };
     if (ctx.signal?.aborted) onAbort();
     ctx.signal?.addEventListener?.('abort', onAbort, { once: true });
+    // Heartbeat on a timer while the SDK streams. Temporal delivers a pending
+    // cancellation to the activity's AbortSignal on heartbeat, so without this a
+    // long Agent-SDK turn would never observe a mid-turn cancel (the Messages-API
+    // and codex paths already heartbeat) — the subprocess would run to completion.
+    const hb = ctx.heartbeat ? setInterval(() => { try { ctx.heartbeat!(); } catch { /* ignore */ } }, 10_000) : undefined;
 
     let finalText = '';
     let session = input.session;
@@ -249,6 +254,7 @@ export class ClaudeAdapter implements AgentAdapter {
       // it (return the partial output); rethrow anything else as a real failure.
       if (!ctx.signal?.aborted) throw e;
     } finally {
+      if (hb) clearInterval(hb);
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
     }
     // The Agent SDK harness completes its own loop; treat a finished query as a

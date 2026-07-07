@@ -195,6 +195,15 @@ export class Gateway {
     const { api, store } = this.deps;
 
     try {
+      // Host diagnostics + agent-turn admission state (SPEC §12): loadavg,
+      // free/total memory, and whether either pressure gate is currently holding
+      // new agent leases back. Reporting only — the gate itself lives in
+      // src/activities/agent-slots.ts (same process as the worker).
+      if (p === '/api/diagnostics' && method === 'GET') {
+        const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
+        return this.json(res, 200, { host: hostStats(), agentSlots: agentSlotStats(), ts: Date.now() });
+      }
+
       // projects
       if (p === '/api/projects' && method === 'GET') return this.json(res, 200, store.listProjects());
       if (p === '/api/projects' && method === 'POST') {

@@ -92,6 +92,15 @@ async function main() {
   await workerManager.start();
   console.log('  • Worker started');
 
+  // Process-tree custody (src/agent/custody.ts): reap any agent subprocess
+  // groups a prior incarnation left running after a SIGKILL/crash (systemd-oomd
+  // was the July-5 OOM killer — no graceful teardown ran, so its orphaned
+  // agents outlived the host). A fresh boot owns no agents, so anything recorded
+  // is an orphan.
+  const { reapOrphans } = await import('./agent/custody.js');
+  const orphans = reapOrphans();
+  if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process group(s) from a prior run`);
+
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
   const recon = await reconcileTasks(store, client).catch(() => ({ checked: 0, settled: 0 }));

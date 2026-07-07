@@ -48,6 +48,11 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     maxCachedWorkflows: num(process.env.KARMAX_MAX_CACHED_WORKFLOWS, 20),
     maxConcurrentWorkflowTaskExecutions: num(process.env.KARMAX_MAX_WFT, 8),
     maxConcurrentActivityTaskExecutions: num(process.env.KARMAX_MAX_ACT, 8),
+    // Share ONE V8 context across all cached workflows instead of one isolate per
+    // workflow. With up to `maxCachedWorkflows` (20) sticky executions, per-isolate
+    // heap dominates the worker's RAM; a shared context is the single biggest memory
+    // lever here and is safe — workflow code is already sandboxed and deterministic.
+    reuseV8Context: true,
     // Prompt shutdown: stop polling at once and, after a short grace, CANCEL
     // in-flight activities (the agent adapters kill their subprocess on abort),
     // so the drain completes in ~1-2s instead of waiting out a 45-minute agent
