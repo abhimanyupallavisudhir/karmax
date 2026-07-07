@@ -315,12 +315,14 @@ export class KarmaxApi {
     return this.deps.store.listTasks(projectId);
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string): Promise<void> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string): Promise<void> {
     this.require(token, 'signal_task');
     const handle = this.deps.client.workflow.getHandle(taskId);
     if (signal === SIG.followUp) {
       const msg: Message = { id: `u${Date.now()}`, role: 'user', text: text ?? '', ts: 0 };
-      await handle.signal(SIG.followUp, msg);
+      // `role` (the addressed agent) is optional — single-agent workflows ignore it
+      // and route every follow-up to their sole conversation.
+      await handle.signal(SIG.followUp, msg, role);
     } else {
       await handle.signal(signal);
     }
