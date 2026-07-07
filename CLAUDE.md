@@ -27,7 +27,7 @@ Integration test files each boot a **real** Temporal dev server + Worker (via `t
 - `tests/live-agent.test.ts` runs only with a real API key and spends real tokens; force-skip with `KARMAX_SKIP_LIVE=1`.
 - `tests/container.test.ts` needs Docker (`node:22-slim`); self-skips, or force with `KARMAX_SKIP_DOCKER=1`.
 
-If a run is interrupted, a Temporal dev-server child may be orphaned: `pgrep -af 'temporal server start-dev'` then `pkill -f 'temporal server start-dev'`. Stop the app with Ctrl-C (graceful shutdown kills the Temporal child), never by killing the port.
+If a test run is interrupted, an ephemeral Temporal dev-server child may be orphaned: `pgrep -af 'temporal server start-dev'`. Careful with `pkill -f 'temporal server start-dev'` — it also kills the app's shared long-lived dev server (a systemd user unit `karmax-temporal-*` when available; a running app auto-respawns it at the same address). Stop the app with Ctrl-C — the shared Temporal server intentionally stays up for the next boot (`npm run reset` stops and wipes it) — never by killing the port.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ The load-bearing constraint: **workflows are deterministic, activities do the si
 
 Layers around that core:
 
-- `src/temporal/` — dev-server boot (dynamic ports, one long-lived server **reused** across restarts — spawning a fresh one per reload against the same SQLite file wedges Temporal), worker, client, `worker-pool.ts` (managed worker that can be rolled to pick up newly installed workflow packages without a restart).
+- `src/temporal/` — dev-server boot (dynamic ports, one long-lived server **reused** across restarts — spawning a fresh one per reload against the same SQLite file wedges Temporal; spawned as a transient systemd user unit so closing the terminal that booted it can't kill it, health-watched and auto-respawned at the same address if it dies mid-run), worker, client, `worker-pool.ts` (managed worker that can be rolled to pick up newly installed workflow packages without a restart).
 - `src/coordinators/` — singleton lease coordinators (merge-queue, account/token, budget): the pattern for all resource contention; crash-safe via continue-as-new.
 - `src/agent/` — provider adapters (Claude Agent SDK + Messages API, Codex/OpenAI, mock) + the per-turn runtime with session resume + prompt assembly. With no credentials, karmax runs the mock agent (auto-detect order: `ANTHROPIC_API_KEY` → Claude Code login → `OPENAI_API_KEY`).
 - `src/world/` — world provider interface; worktree (isolated git worktree per task), container (Docker), memory backends. Merges land through `src/world/merge.ts` and the merge-queue coordinator.

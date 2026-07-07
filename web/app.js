@@ -495,6 +495,34 @@ function switchTab(tab) {
   if (tab === 'dashboard') renderDashboard();
 }
 
+// Preserve the focused field (value + caret) across a renderMain() innerHTML
+// swap so a background refresh doesn't clear/de-focus what the user is typing.
+function captureFocus(root) {
+  const el = document.activeElement;
+  if (!el || !el.id || !root.contains(el)) return null;
+  const tag = el.tagName;
+  if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return null;
+  const st = { id: el.id, tag, value: el.value };
+  if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
+    st.selectionStart = el.selectionStart;
+    st.selectionEnd = el.selectionEnd;
+  }
+  return st;
+}
+
+function restoreFocus(root, st) {
+  if (!st) return;
+  const el = root.querySelector(`#${window.CSS && CSS.escape ? CSS.escape(st.id) : st.id}`);
+  if (!el || el.tagName !== st.tag) return;
+  // Only carry over the in-progress value for free-text fields; a fresh empty
+  // composer input would otherwise be reset by the re-render.
+  if (st.tag !== 'SELECT') el.value = st.value;
+  el.focus();
+  if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
+    try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
+  }
+}
+
 // ── main content ───────────────────────────────────────────────────────────
 function renderMain() {
   const main = $('#main');
@@ -517,6 +545,11 @@ function renderMain() {
   else if (S.tab === 'settings') content = settingsView(proj);
   else if (S.tab === 'global') content = globalSettingsView();
 
+  // Background refreshes (a WebSocket event fires renderMain while a task runs)
+  // must not blow away whatever the user is mid-typing in #main. Snapshot the
+  // focused field's value/caret before the innerHTML swap, restore it after.
+  const focusState = captureFocus(main);
+
   main.innerHTML = tabbar + content;
   main.querySelectorAll('.tab[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
   if (S.tab === 'tasks') wireTasksView();
@@ -524,6 +557,8 @@ function renderMain() {
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
+
+  restoreFocus(main, focusState);
   updateBell();
 }
 
