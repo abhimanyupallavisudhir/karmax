@@ -2,7 +2,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 
@@ -126,30 +126,16 @@ export class ClaudeAdapter implements AgentAdapter {
     const zod = (await import('zod')).z;
     const handlers = platformToolHandlers(input.world, ctx);
 
-    // Expose the platform tools as an in-process MCP server.
+    // Expose EVERY platform tool as an in-process MCP server, derived from the shared
+    // PLATFORM_TOOL_SCHEMAS so this path can never again drift out of sync with the
+    // Messages-API path (the drift that left Claude-Code agents without
+    // respond_to_sub_task / raise_to_parent / wait_for_subtasks — a parent literally
+    // could not confirm a child that raised to it). Read/Write/Bash come from the SDK
+    // natively, so they are excluded upstream.
     const platform = createSdkMcpServer({
       name: 'karmax',
       version: '1.0.0',
-      tools: [
-        tool('signal_completion', 'Signal that the turn is complete.', { summary: zod.string().optional() }, async (a: any) => ({
-          content: [{ type: 'text', text: await handlers.signal_completion!(a) }],
-        })),
-        tool('create_review_info', 'Attach review output.', { summary: zod.string().optional(), diff: zod.string().optional(), html: zod.string().optional() }, async (a: any) => ({
-          content: [{ type: 'text', text: await handlers.create_review_info!(a) }],
-        })),
-        tool('create_sub_task', 'Spawn a child task.', { title: zod.string(), prompt: zod.string() }, async (a: any) => ({
-          content: [{ type: 'text', text: await handlers.create_sub_task!(a) }],
-        })),
-        tool('save_skill', 'Save a reusable skill.', { name: zod.string(), content: zod.string() }, async (a: any) => ({
-          content: [{ type: 'text', text: await handlers.save_skill!(a) }],
-        })),
-        tool(
-          'resolve_decision',
-          'Resolve agents only: report how to get the task back on track (resume/retryStage/gotoStage/parkUntil/escalate) — do not finish the task yourself.',
-          { action: zod.string(), stage: zod.string().optional(), reason: zod.string().optional(), params: zod.any().optional() },
-          async (a: any) => ({ content: [{ type: 'text', text: await handlers.resolve_decision!(a) }] }),
-        ),
-      ],
+      tools: buildSdkTools(tool, zod, handlers),
     });
 
     const userText = input.messages.filter((m) => m.role !== 'system').map((m) => m.text).join('\n\n') ||
@@ -262,4 +248,58 @@ export class ClaudeAdapter implements AgentAdapter {
     // runtime surfaces the output at Review.
     return { session, output: finalText };
   }
+}
+
+/** Convert one JSON-schema property into a zod validator (the shapes used by
+ *  PLATFORM_TOOL_SCHEMAS: string, enum, number, boolean, object, array). */
+function jsonPropToZod(zod: any, prop: any): any {
+  let base: any;
+  if (Array.isArray(prop?.enum) && prop.enum.length) base = zod.enum(prop.enum as [string, ...string[]]);
+  else
+    switch (prop?.type) {
+      case 'number':
+      case 'integer':
+        base = zod.number();
+        break;
+      case 'boolean':
+        base = zod.boolean();
+        break;
+      case 'array':
+        base = zod.array(zod.any());
+        break;
+      case 'object':
+        base = zod.any();
+        break;
+      default:
+        base = zod.string();
+    }
+  if (typeof prop?.description === 'string') base = base.describe(prop.description);
+  return base;
+}
+
+/** Build a zod raw-shape (the SDK `tool()`'s 3rd arg) from a tool's JSON parameters. */
+export function jsonSchemaToZodShape(zod: any, schema: any): Record<string, any> {
+  const shape: Record<string, any> = {};
+  const required = new Set<string>(schema?.required ?? []);
+  for (const [key, prop] of Object.entries(schema?.properties ?? {})) {
+    let z = jsonPropToZod(zod, prop);
+    if (!required.has(key)) z = z.optional();
+    shape[key] = z;
+  }
+  return shape;
+}
+
+/** Build the Agent-SDK in-process MCP tool defs for EVERY platform tool, derived from
+ *  PLATFORM_TOOL_SCHEMAS + the shared handlers. Exported so a unit test can assert the
+ *  SDK path exposes the full platform toolset (no silent drift). */
+export function buildSdkTools(
+  tool: (name: string, description: string, shape: Record<string, any>, run: (a: any) => Promise<any>) => any,
+  zod: any,
+  handlers: Record<string, (args: any) => Promise<string>>,
+): any[] {
+  return PLATFORM_TOOL_SCHEMAS.filter((schema) => typeof handlers[schema.name] === 'function').map((schema) =>
+    tool(schema.name, schema.description, jsonSchemaToZodShape(zod, schema.parameters), async (a: any) => ({
+      content: [{ type: 'text', text: await handlers[schema.name]!(a) }],
+    })),
+  );
 }
