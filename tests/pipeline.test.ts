@@ -6,7 +6,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 
-function input(over: { taskId: string; repo: string; prompt: string; title?: string }) {
+function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number }) {
   return {
     taskId: over.taskId,
     projectId: 'p1',
@@ -15,6 +15,7 @@ function input(over: { taskId: string; repo: string; prompt: string; title?: str
     base: 'main',
     target: 'main',
     project: { repos: [over.repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+    ...(over.subtaskNagMs !== undefined ? { subtaskNagMs: over.subtaskNagMs } : {}),
   };
 }
 const view = (h: any) => h.query('view') as Promise<any>;
@@ -157,12 +158,17 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   // `awaitingResponse` and — since the mock only reads the latest message — that a
   // subsequent @respond follow-up lands on a fresh turn rather than racing the in-flight
   // turn that drained the raise. A real agent answers in the same turn it sees the raise.
+  //
+  // The raise MUST be a `role: 'user'` message: the real provider adapters strip
+  // conversation system messages, so a system-role raise would never reach the parent
+  // agent (the "parent not notified" bug). Asserting `role === 'user'` here fails fast
+  // if `drainChildEvents` ever regresses to injecting the raise as a system message.
   const parentSawRaise = async (handle: any, needle: string) =>
     expect
       .poll(
         async () => {
           const msgs = (await view(handle)).messages as any[];
-          const sawRaise = msgs.some((m) => m.role === 'system' && m.text.includes(needle));
+          const sawRaise = msgs.some((m) => m.role === 'user' && m.text.includes(needle));
           const parkedAfter = msgs.length > 0 && msgs[msgs.length - 1].role === 'agent';
           return sawRaise && parkedAfter;
         },
@@ -212,6 +218,40 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const onMain = await git(repo, ['show', 'main:helper.txt']);
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('from child');
+  }, 90_000);
+
+  it('an unanswered child raise re-prompts the parent instead of dead-parking it (no deadlock)', async () => {
+    // Regression for the observed stall: a child reaches Review and raises to the
+    // parent, but the parent's agent does NOT respond that turn. The parent must keep
+    // re-entering Do to re-prompt itself (SPEC §5.3 "keep prompting"), not park on a
+    // condition that can never fire (a child at Review neither re-raises nor settles).
+    const repo = await h.makeRepo('app-sub-nag');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // The mock parent never emits @respond on its own, so the raise stays unanswered
+      // until the human follow-up below — exactly the "agent didn't act" case.
+      args: [input({ taskId, repo, title: 'Parent', prompt: '@subtask Build helper :: @write helper.txt :: from child', subtaskNagMs: 1500 })],
+    });
+
+    await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 30_000 }).toBe(1);
+    // the child raises for confirmation and the parent surfaces it, then parks
+    await parentSawRaise(handle, 'needs_confirmation');
+
+    const agentTurns = async () => ((await view(handle)).messages as any[]).filter((m) => m.role === 'agent').length;
+    const before = await agentTurns();
+    // Without ANY human input, the parent must take further Do turns (nagging itself)
+    // rather than sitting frozen — proof it is not dead-parked on an unwakeable wait.
+    await expect.poll(agentTurns, { timeout: 20_000, interval: 500 }).toBeGreaterThan(before);
+
+    // and it is still fully redirectable: the human (or a real agent) answers, and the
+    // parent proceeds normally to its own Review and merges the stacked work.
+    await handle.signal('followUp', { id: 'r1', role: 'user', text: '@respond confirm', ts: 0 });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:helper.txt'])).stdout).toContain('from child');
   }, 90_000);
 
   it('a stuck child raises "blocked" to its parent instead of deadlocking on a hidden human', async () => {

@@ -66,10 +66,15 @@ export const updateParamsUpdate = defineUpdate<{ applied: string[] }, [Record<st
 export const viewQuery = defineQuery<TaskView>('view');
 
 export interface SoftwareDevInput extends TaskInput {
-  /** Sub-tasks run with the parent as confirmer; v1 auto-confirms to avoid deadlock. */
+  /** Sub-tasks run with the parent as confirmer. Only top-level goal tasks (no parent)
+   *  auto-confirm; a child with a `parentTaskId` always routes its Review to the parent. */
   autoConfirm?: boolean;
   /** Goal workflow (SPEC §4.7): auto-send "keep going" until structured completion. */
   goalMode?: boolean;
+  /** How often (ms) a parent re-enters Do to re-prompt itself while a child is still
+   *  awaiting its response, so an unanswered raise never dead-parks the parent (SPEC
+   *  §5.3 "keep prompting"). Overridable so tests don't wait the full interval. */
+  subtaskNagMs?: number;
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
@@ -80,6 +85,9 @@ const MAX_MERGE_ATTEMPTS = 3;
  *  task's whole life. Non-blocking spawn makes runaway delegation cheap without these. */
 const MAX_CONCURRENT_SUBTASKS = 8;
 const MAX_TOTAL_SUBTASKS = 50;
+/** Default re-prompt cadence for a parent holding an unanswered child raise (SPEC §5.3).
+ *  Bounds the subtask-wait so an ignored raise re-enters Do instead of parking forever. */
+const DEFAULT_SUBTASK_NAG_MS = 60_000;
 
 /**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
@@ -566,7 +574,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           subTaskIds.length >= MAX_TOTAL_SUBTASKS
             ? `this task's sub-task limit (${MAX_TOTAL_SUBTASKS} total) is reached`
             : `too many sub-tasks are running at once (${MAX_CONCURRENT_SUBTASKS} max) — wait for some to finish`;
-        msgs.push({ id: `st-${msgs.length}`, role: 'system', text: `Sub-task "${s.title}" was NOT spawned: ${reason}.`, ts: msgs.length });
+        msgs.push({ id: `st-${msgs.length}`, role: 'user', text: `Sub-task "${s.title}" was NOT spawned: ${reason}.`, ts: msgs.length });
         continue;
       }
       const childInput = await core.prepareChildTask({
@@ -630,11 +638,17 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
    * the agent sees them at the top of its next turn (SPEC §5.3). This is what lets the
    * parent run its own work turn-after-turn WHILE children run in the background —
    * their raises/results interleave as messages rather than blocking the loop.
+   *
+   * These are injected as `role: 'user'`, NOT `role: 'system'`: the real provider
+   * adapters (claude, codex) strip conversation system messages from what the model
+   * sees, so a system-role raise would silently never reach the parent agent — the
+   * "parent not notified" bug. They are genuine new instructions for the agent, so
+   * user-role is also the correct framing.
    */
   function drainChildEvents(): void {
     while (raises.length) {
       const r = raises.shift()!;
-      msgs.push({ id: `st-${msgs.length}`, role: 'system', text: subtaskRaiseText(r), ts: msgs.length });
+      msgs.push({ id: `st-${msgs.length}`, role: 'user', text: subtaskRaiseText(r), ts: msgs.length });
     }
     while (settled.length) {
       const s = settled.shift()!;
@@ -642,7 +656,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       awaitingResponse.delete(s.childTaskId);
       msgs.push({
         id: `st-${msgs.length}`,
-        role: 'system',
+        role: 'user',
         text: `Sub-task ${s.childTaskId} finished: ${s.stage}${s.detail ? ` (${s.detail})` : ''}.`,
         ts: msgs.length,
       });
@@ -706,7 +720,16 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         status = 'waiting';
         waitingFor = { kind: 'subtask' };
         await publish();
-        await condition(() => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen);
+        const wake = () => raises.length > 0 || settled.length > 0 || cancelled || msgs.length > seen;
+        // If a child is still awaiting OUR reply (it raised a needs_confirmation /
+        // needs_info / blocked that we drained but haven't answered), we must not
+        // park forever: a child at Review neither re-raises nor settles, so `wake`
+        // could never fire — the observed deadlock. Bound the wait so we re-enter Do
+        // and re-prompt the agent (the unresolved raise is still in the conversation)
+        // until it acts — SPEC §5.3 "keep prompting". With nothing awaiting us, wait
+        // indefinitely for the next child event or human follow-up.
+        if (awaitingResponse.size > 0) await condition(wake, input.subtaskNagMs ?? DEFAULT_SUBTASK_NAG_MS);
+        else await condition(wake);
         if (cancelled) return await abort();
       }
       // Otherwise the agent kept working (spawned/answered this turn) — loop and run
