@@ -44,7 +44,10 @@ const long = proxyActivities<coreActivities>({
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
 // ─── Signals / updates / query (SPEC §5.6) ───────────────────────────────────
-export const followUpSignal = defineSignal<[Message]>('followUp');
+// The optional second arg is the agent the follow-up addresses (`do` | `merge` |
+// `resolve`); omitted / unknown routes to the Do agent, so old single-arg signals
+// (and the other single-agent workflows) keep working unchanged.
+export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
@@ -293,8 +296,12 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
   // ── handlers ──
   setHandler(viewQuery, buildView);
-  setHandler(followUpSignal, (m) => {
-    msgs.push({ ...m, ts: msgs.length });
+  setHandler(followUpSignal, (m, role) => {
+    // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
+    // Do is the default; merge/resolve queue it so it reaches that agent on its
+    // next turn (each turn is fed its own accumulated transcript).
+    const target = role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : msgs;
+    target.push({ ...m, ts: target.length });
   });
   setHandler(confirmSignal, () => {
     confirmed = true;
@@ -384,7 +391,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
                 taskId,
                 role: 'resolve',
                 worldHandle: world as any,
-                messages: [rin],
+                // Include the resolve agent's full transcript so a human follow-up
+                // addressed to it (SPEC §5.6) reaches it on this turn.
+                messages: resolveMsgs,
                 task: liveInput,
                 bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
                 accountConfigHome,
@@ -856,7 +865,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           taskId,
           role: 'merge',
           worldHandle: world as any,
-          messages: [mergeIn],
+          // Feed the merge agent its full transcript so any human follow-up queued
+          // for it (SPEC §5.6) is included alongside the merge prompt.
+          messages: mergeMsgs,
           session: sessionMatchesHome(accountConfigHome) ? session : undefined,
           task: liveInput,
           bindings: { reviewInfo: reviewInfo?.summary ?? '' },

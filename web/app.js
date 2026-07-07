@@ -906,6 +906,7 @@ function renderDrawer() {
   $('#scrim').addEventListener('click', closeDrawer);
   $('#drawer-close').addEventListener('click', closeDrawer);
   wireActions(v);
+  wireFollowups(v);
   wireParams(v);
   wireNotes(v);
   wireTerminal(v.taskId);
@@ -946,6 +947,11 @@ function drawerBody(v) {
   // one owning the active stage (SPEC §5.5). Falls back to `messages` (Do) for
   // tasks whose workflow predates per-role transcripts.
   const activeRole = roleForStage(v.stage);
+  // The follow-up affordance (SPEC §5.6) now lives INSIDE each agent's conversation
+  // rather than as one shared box at the bottom of the drawer — so a human can address
+  // any agent (Do / Merge / Resolve), not just Do. Enablement follows the workflow's
+  // declared `followUp` action.
+  const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const transcripts = (v.transcripts && v.transcripts.length)
     ? v.transcripts
     : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
@@ -967,11 +973,22 @@ function drawerBody(v) {
       const copy = forkCmd
         ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
         : '';
+      // The follow-up affordance lives INSIDE each agent's conversation (SPEC §5.6),
+      // so a human can address any agent — Do, Merge or Resolve — not just Do. It
+      // appears only when the workflow currently allows follow-ups.
+      const agentName = esc(t.label || t.role);
+      const fu = followUp
+        ? `<div class="followup-box" data-role="${esc(t.role)}">
+            <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…" ${followUp.enabled ? '' : 'disabled'}></textarea>
+            <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
+          </div>`
+        : '';
       return `<details class="conversation" ${t.role === liveRole ? 'open' : ''}>
         <summary class="section-h" style="cursor:pointer;display:flex;align-items:center;gap:8px">
-          <span>${esc(t.label || t.role)} (${(t.messages || []).length})</span>${copy}
+          <span>${agentName} (${(t.messages || []).length})</span>${copy}
         </summary>
         <div class="thread">${body}${live}</div>
+        ${fu}
       </details>`;
     })
     .join('');
@@ -1427,7 +1444,6 @@ function wireParams(v) {
 // the generic auto-render floor (SPEC §10.2 tier 1): render declared actions
 function drawerActions(v) {
   const acts = v.actions || [];
-  const followUp = acts.find((a) => a.name === 'followUp');
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
   for (const a of simple) {
@@ -1436,13 +1452,9 @@ function drawerActions(v) {
   }
   // Target-branch editing now lives in the Parameters form (drawerParams), which
   // renders it editable/frozen per the workflow's window — no separate input here.
+  // The follow-up box is no longer here either: it lives inside each agent's
+  // conversation (drawerBody), so a human can address any agent (SPEC §5.6).
   html += `</div>`;
-  if (followUp) {
-    html += `<div class="followup-box">
-      <textarea id="followup" placeholder="Send a follow-up to the agent…" ${followUp.enabled ? '' : 'disabled'}></textarea>
-      <button class="btn primary" data-act="followUp" ${followUp.enabled ? '' : 'disabled'}>Send</button>
-    </div>`;
-  }
   if (!acts.length) html = `<div style="color:var(--ink-3)">No actions available — task is ${esc(v.stage)}.</div>`;
   return html;
 }
@@ -1452,22 +1464,39 @@ function wireActions(v) {
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
       try {
-        if (act === 'followUp') {
-          const text = $('#followup').value.trim();
-          if (!text) return;
-          await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', text }) });
-          $('#followup').value = '';
-          toast('Follow-up sent');
-        } else {
-          await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
-          toast(`${act} sent`);
-        }
+        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
+        toast(`${act} sent`);
         setTimeout(refreshDrawer, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
     }),
   );
   $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.open)));
+}
+
+// Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
+// agent role it addresses, so a follow-up is delivered to the right agent.
+function wireFollowups(v) {
+  $('#drawer-body').querySelectorAll('.followup-box').forEach((box) => {
+    const role = box.dataset.role;
+    const ta = box.querySelector('.followup-input');
+    const btn = box.querySelector('.followup-send');
+    if (!ta || !btn) return;
+    const send = async () => {
+      const text = ta.value.trim();
+      if (!text) return;
+      try {
+        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', text, role }) });
+        ta.value = '';
+        toast('Follow-up sent');
+        setTimeout(refreshDrawer, 250);
+        setTimeout(refreshTasks, 400);
+      } catch (e) { toast(e.message, true); }
+    };
+    btn.addEventListener('click', send);
+    // ⌘/Ctrl-Enter sends, matching the rest of the console's compose affordances.
+    ta.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); } });
+  });
 }
 
 function updateLiveBubble() {
@@ -2282,12 +2311,19 @@ function bindKeys() {
     if (S.selected) {
       if (e.key === 'c') trigger('confirm');
       if (e.key === 'x') trigger('cancel');
-      if (e.key === 'f') $('#followup')?.focus();
+      if (e.key === 'f') { e.preventDefault(); focusFollowup(); }
     }
   });
 }
 function trigger(act) {
   $(`#drawer-foot [data-act="${act}"]`)?.click();
+}
+// Focus the follow-up box of the open (active) conversation, falling back to the
+// first available one — the box now lives per-agent inside each conversation.
+function focusFollowup() {
+  const ta = document.querySelector('.conversation[open] .followup-input:not([disabled])')
+    || document.querySelector('.followup-input:not([disabled])');
+  if (ta) { ta.closest('details')?.setAttribute('open', ''); ta.focus(); }
 }
 function openPalette() {
   const cmds = S.contributions?.commands || [];
@@ -2311,7 +2347,7 @@ function openPalette() {
   });
 }
 function runCommand(id) {
-  const map = { 'nav.newTask': () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); }, 'nav.search': () => $('#search')?.focus(), 'nav.tasks': () => switchTab('tasks'), 'nav.queue': () => switchTab('queue'), 'nav.dashboard': () => switchTab('dashboard'), 'nav.settings': () => switchTab('settings'), 'nav.close': closeDrawer, 'task.confirm': () => trigger('confirm'), 'task.cancel': () => trigger('cancel'), 'task.followUp': () => $('#followup')?.focus() };
+  const map = { 'nav.newTask': () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); }, 'nav.search': () => $('#search')?.focus(), 'nav.tasks': () => switchTab('tasks'), 'nav.queue': () => switchTab('queue'), 'nav.dashboard': () => switchTab('dashboard'), 'nav.settings': () => switchTab('settings'), 'nav.close': closeDrawer, 'task.confirm': () => trigger('confirm'), 'task.cancel': () => trigger('cancel'), 'task.followUp': () => focusFollowup() };
   map[id]?.();
 }
 

@@ -14,7 +14,7 @@ export interface PlatformOps {
   createTask(a: { projectId: string; title: string; prompt: string; workflow?: string }): Promise<{ id: string }>;
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
-  signalTask(taskId: string, signal: string, text?: string): Promise<void>;
+  signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
   proposeWorkflowEdit(a: { projectId: string; title: string; repo: string; branch: string; target: string }): Promise<{ id: string }>;
@@ -26,7 +26,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     createTask: (a) => api.createTask(getToken(), a),
     getTask: (id) => api.getTaskView(getToken(), id) as Promise<unknown>,
     listTasks: async (pid) => (await api.listTasks(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
-    signalTask: (id, sig, text) => api.signalTask(getToken(), id, sig as any, text),
+    signalTask: (id, sig, text, role) => api.signalTask(getToken(), id, sig as any, text, role),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
     proposeWorkflowEdit: (a) => api.proposeWorkflowEdit(getToken(), a),
@@ -48,7 +48,7 @@ export function httpOps(baseUrl: string, token: string): PlatformOps {
     createTask: (a) => req(`/api/projects/${a.projectId}/tasks`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
     getTask: (id) => req(`/api/tasks/${id}`),
     listTasks: (pid) => req(`/api/projects/${pid}/tasks`) as Promise<{ id: string; title: string; workflow: string }[]>,
-    signalTask: async (id, signal, text) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text }) })),
+    signalTask: async (id, signal, text, role) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role }) })),
     reorderQueue: async (domain, taskId) => void (await req(`/api/queue/prioritize`, { method: 'POST', body: JSON.stringify({ domain, taskId }) })),
     saveSkill: (a) => req(`/api/skills`, { method: 'POST', body: JSON.stringify(a) }),
     proposeWorkflowEdit: (a) => req(`/api/projects/${a.projectId}/propose-workflow-edit`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
@@ -77,8 +77,8 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   server.registerTool('list_tasks', { description: 'List tasks in a project.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTasks(a.projectId)));
   server.registerTool(
     'signal_task',
-    { description: 'Send a signal to a task (confirm, cancel, retry, or followUp with text).', inputSchema: { taskId: z.string(), signal: z.enum(['confirm', 'cancel', 'retry', 'followUp']), text: z.string().optional() } },
-    async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text); return 'signalled'; }),
+    { description: 'Send a signal to a task (confirm, cancel, retry, or followUp with text). For a followUp, `role` optionally addresses a specific agent (do/merge/resolve); it defaults to the Do agent.', inputSchema: { taskId: z.string(), signal: z.enum(['confirm', 'cancel', 'retry', 'followUp']), text: z.string().optional(), role: z.enum(['do', 'merge', 'resolve']).optional() } },
+    async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role); return 'signalled'; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', { description: 'Save a reusable skill (markdown) for future tasks.', inputSchema: { name: z.string(), content: z.string() } }, async (a) => wrap(() => ops.saveSkill(a)));
