@@ -9,6 +9,23 @@ import { paths } from '../config/paths.js';
 const pexec = promisify(execFile);
 const IMAGE = process.env.KARMAX_CONTAINER_IMAGE ?? 'node:22-slim';
 
+/**
+ * Per-container resource caps (SPEC §11.2 isolation). Without them a single
+ * runaway process inside a container world can consume the whole host's RAM/CPU
+ * (the exact failure class behind the July 5 OOM). All env-tunable; set an empty
+ * string to opt a limit out.
+ */
+function containerLimitArgs(): string[] {
+  const memory = process.env.KARMAX_CONTAINER_MEMORY ?? '4g';
+  const cpus = process.env.KARMAX_CONTAINER_CPUS ?? '2';
+  const pids = process.env.KARMAX_CONTAINER_PIDS ?? '512';
+  const args: string[] = [];
+  if (memory) args.push('--memory', memory, '--memory-swap', memory); // no swap headroom beyond --memory
+  if (cpus) args.push('--cpus', cpus);
+  if (pids) args.push('--pids-limit', pids);
+  return args;
+}
+
 async function docker(args: string[], opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
   try {
     const { stdout, stderr } = await pexec('docker', args, { timeout: opts.timeoutMs ?? 120_000, maxBuffer: 64 * 1024 * 1024 });
@@ -44,6 +61,7 @@ export class ContainerWorldProvider implements WorldProvider {
     await docker(['rm', '-f', name]); // clear any stale container
     const run = await docker([
       'run', '-d', '--name', name,
+      ...containerLimitArgs(),
       '-v', `${base.handle.root}:/work`,
       '-w', '/work',
       IMAGE, 'sleep', 'infinity',

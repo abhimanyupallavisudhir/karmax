@@ -153,6 +153,17 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
 ];
 
+/** The world file/shell tools the Claude Agent SDK provides natively (Read/Write/Bash),
+ *  so its in-process MCP server must NOT re-register them. Everything else in
+ *  TOOL_SCHEMAS is a platform tool that the SDK path DOES expose. */
+export const SDK_NATIVE_TOOLS = new Set(['bash', 'read_file', 'write_file']);
+
+/** Platform (non-file/shell) tools — the SINGLE source of truth for what every agent
+ *  adapter exposes. Both the Messages-API path (all of TOOL_SCHEMAS) and the Agent-SDK
+ *  path (this list, minted natively for Read/Write/Bash) derive from it, so the two can
+ *  never drift — the drift that hid `respond_to_sub_task` from Claude-Code agents. */
+export const PLATFORM_TOOL_SCHEMAS: ToolSchema[] = TOOL_SCHEMAS.filter((t) => !SDK_NATIVE_TOOLS.has(t.name));
+
 /** Returns name → executor for the platform tools, bound to a world + context. */
 export function platformToolHandlers(
   world: World,
