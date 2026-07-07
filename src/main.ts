@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensurePaths, paths } from './config/paths.js';
-import { startDevServer } from './temporal/dev-server.js';
+import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager } from './temporal/worker-pool.js';
 import { TASK_QUEUE } from './temporal/config.js';
@@ -42,13 +42,15 @@ async function main() {
   // spawning a fresh one per reload against the same SQLite file is what wedges
   // Temporal. A wedged/dead server is auto-replaced here.
   console.log('  • Connecting to Temporal…');
-  const server = await startDevServer({
-    dbFilename: path.join(p.temporal, 'temporal.db'),
-    logLevel: 'error',
-  });
+  const temporalDb = path.join(p.temporal, 'temporal.db');
+  const server = await startDevServer({ dbFilename: temporalDb, logLevel: 'error' });
   const conn = { address: server.address, namespace: server.namespace };
   console.log(`  • Temporal ${server.reused ? 'reused (already running)' : 'started'} at ${server.address}`);
   if (server.uiUrl) console.log(`    Temporal UI: ${server.uiUrl}`);
+  // If the shared server dies mid-run (terminal scope stopped, pkill, crash),
+  // respawn it at the same address so the worker/client pollers reconnect on
+  // their own — otherwise the app spins on gRPC retries while serving nothing.
+  const serverWatch = watchDevServer(server, { dbFilename: temporalDb, logLevel: 'error' });
 
   const { client, close: closeClient } = await makeClient(conn);
 
@@ -200,6 +202,7 @@ async function main() {
     // Bound every step so one wedged call can't strand the whole shutdown. The
     // worker itself resolves within ~3s (shutdownGraceTime/shutdownForceTime).
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
+    serverWatch.stop(); // don't respawn Temporal out from under a shutdown
     await step(closeGateway());
     await step(workerManager.stop());
     await step(closeClient());

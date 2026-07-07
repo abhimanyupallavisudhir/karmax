@@ -25,9 +25,13 @@ export class MockAdapter implements AgentAdapter {
   readonly provider = 'mock' as const;
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    // Act on the latest human/system message (or the task prompt on turn one),
-    // so directives fire once per turn rather than re-firing the whole history.
-    const recent = input.messages.filter((m) => m.role !== 'agent');
+    // Act on the latest USER message (or the task prompt on turn one), so directives
+    // fire once per turn rather than re-firing the whole history. We deliberately
+    // ignore `role: 'system'` messages to MIRROR the real provider adapters
+    // (claude.ts / codex.ts both strip conversation system messages) — otherwise the
+    // mock "sees" things a real agent never would, masking bugs like a child raise
+    // injected as a system message that never reaches the parent agent.
+    const recent = input.messages.filter((m) => m.role === 'user');
     const text = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
 
     let complete = true;
