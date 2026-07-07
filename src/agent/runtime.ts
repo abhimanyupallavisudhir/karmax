@@ -96,7 +96,25 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     heartbeat: deps.heartbeat,
   };
 
-  const turn = await adapter.runTurn(input, ctx);
+  // Liveness: beat every 10s for the turn's whole duration. Adapters also beat on
+  // activity (to pick up pending cancellations quickly), but only this interval
+  // guarantees a long silent stretch — a big tool run, a slow first token — can't
+  // trip the activity's heartbeat timeout.
+  const hb = deps.heartbeat
+    ? setInterval(() => {
+        try {
+          deps.heartbeat!();
+        } catch {
+          /* never let a heartbeat failure kill the turn */
+        }
+      }, 10_000)
+    : undefined;
+  let turn;
+  try {
+    turn = await adapter.runTurn(input, ctx);
+  } finally {
+    if (hb) clearInterval(hb);
+  }
 
   return {
     session: turn.session,

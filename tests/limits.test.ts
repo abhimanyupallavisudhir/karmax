@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyLimitError, resetAtFromHint } from '../src/agent/limits.js';
+import { classifyLimitError, isTransportError, resetAtFromHint } from '../src/agent/limits.js';
 
 describe('classifyLimitError', () => {
   it('classifies a Claude session-limit string + extracts the reset hint', () => {
@@ -86,5 +86,27 @@ describe('resetAtFromHint', () => {
     const d = new Date(at);
     expect(d.getDay()).toBe(1); // Monday
     expect(d.getHours()).toBe(0);
+  });
+});
+
+describe('isTransportError', () => {
+  it('recognizes the suspend/stream failures seen in production', () => {
+    expect(isTransportError('Claude Code returned an error result: API Error: Connection closed mid-response. The response above may be incomplete.')).toBe(true);
+    expect(isTransportError('fetch failed')).toBe(true);
+    expect(isTransportError('read ECONNRESET')).toBe(true);
+    expect(isTransportError('connect ECONNREFUSED 127.0.0.1:443')).toBe(true);
+    expect(isTransportError('Anthropic API 529: {"error":{"type":"overloaded_error"}}')).toBe(true);
+    expect(isTransportError('Anthropic API 503: upstream connect error')).toBe(true);
+  });
+
+  it('does NOT swallow agent/semantic errors into the retry path', () => {
+    expect(isTransportError('boom goes the agent')).toBe(false);
+    expect(isTransportError('mock failure')).toBe(false);
+    expect(isTransportError('tests failed: 3 assertion errors in merge.test.ts')).toBe(false);
+    expect(isTransportError('no agent adapter for provider "codex"')).toBe(false);
+  });
+
+  it('leaves quota signals to the limit classifier (429 is not transport)', () => {
+    expect(isTransportError('Anthropic API 429: too many requests')).toBe(false);
   });
 });

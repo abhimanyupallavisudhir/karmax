@@ -31,6 +31,23 @@ export interface LimitClassification {
   hard?: boolean;
 }
 
+/**
+ * Transient transport/infrastructure failure: the stream or socket died under
+ * the turn (host slept, network dropped, provider hiccuped) — nothing the agent
+ * said or did. Pure (a string parse). Deliberately conservative: an
+ * unrecognized error is NOT transport, so it keeps flowing to the Resolve path
+ * instead of being blindly retried. Check limits FIRST — a 429 is a quota
+ * signal, not transport.
+ */
+export function isTransportError(message: string): boolean {
+  const lc = String(message ?? '').toLowerCase();
+  return (
+    /connection (closed|error|refused|reset|terminated)|socket hang ?up|network error|fetch failed|premature close|server disconnected|stream (closed|ended unexpectedly|error)|econnreset|econnrefused|etimedout|epipe|enetunreach|eai_again|enotfound|\boverloaded\b/.test(
+      lc,
+    ) || /\b(?:50[234]|529)\b/.test(lc)
+  );
+}
+
 /** Detect + classify a usage/session-limit error from its message. Pure. */
 export function classifyLimitError(message: string): LimitClassification {
   const m = String(message ?? '');

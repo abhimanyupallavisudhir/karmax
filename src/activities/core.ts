@@ -1,5 +1,7 @@
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
+import { ApplicationFailure } from '@temporalio/common';
+import { classifyLimitError, isTransportError } from '../agent/limits.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
 import { WorldHandle, WorldKind } from '../world/types.js';
@@ -25,6 +27,21 @@ import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '.
 import { newId } from '../util/id.js';
 
 const DEFAULT_GRANT = ['*'];
+
+/**
+ * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
+ * workflows) — see src/workflows/failures.ts for the taxonomy. Original
+ * messages are preserved verbatim: the workflow's account-leasing re-parses
+ * them with classifyLimitError, and the Resolve prompt quotes them.
+ */
+function classifyTurnError(err: unknown): Error {
+  const msg = err instanceof Error ? err.message : String(err);
+  const cause = err instanceof Error ? err : undefined;
+  const cls = classifyLimitError(msg);
+  if (cls.limited || cls.hard) return ApplicationFailure.create({ message: msg, type: 'agent-limit', nonRetryable: true, cause });
+  if (isTransportError(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
+  return ApplicationFailure.create({ message: msg, type: 'agent-error', nonRetryable: true, cause });
+}
 
 /** Split an account ref that may be "<provider>:<name>" or just "<name>". */
 function splitAccountRef(ref: string, fallback: Provider): { provider: Provider; name: string } {
@@ -168,6 +185,37 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let messages = args.messages; // may be augmented by the replay fallback
       let fork = false; // true → the adapter branches a NEW session id from `session`
 
+      // Temporal wiring: cancellation aborts the in-flight turn (SPEC §5.6), and
+      // heartbeats carry the live session id so a RETRY of this activity (stream
+      // cut, host slept, heartbeat timeout) RESUMES the interrupted session from
+      // heartbeat details instead of replaying the whole turn from scratch.
+      let signal: AbortSignal | undefined;
+      let heartbeat: (() => void) | undefined;
+      let hbSession: string | undefined; // set once real progress exists (onSession)
+      try {
+        const actx = activityContext.current();
+        signal = actx.cancellationSignal;
+        heartbeat = () => actx.heartbeat(hbSession ? { session: hbSession } : undefined);
+        const prior = (actx.info.heartbeatDetails as { session?: string } | undefined)?.session;
+        if (actx.info.attempt > 1 && prior) {
+          // The interrupted attempt's session already holds the original prompt and
+          // any partial work — continue it rather than re-sending the turn input.
+          session = prior;
+          hbSession = prior;
+          messages = [
+            {
+              id: `retry-${actx.info.attempt}`,
+              role: 'user',
+              text: '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result and signal completion as usual.)',
+              ts: 0,
+            },
+          ];
+          record(args.taskId, 'turn.resumed', { role: args.role, attempt: actx.info.attempt });
+        }
+      } catch {
+        /* not running inside a Temporal activity (e.g. a direct unit test) */
+      }
+
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
       // capabilities = intersection(profile ceiling, granting principal).
       const grant = args.task.grant ?? DEFAULT_GRANT;
@@ -284,17 +332,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Snapshot the journaled turn input (SPEC §5.4).
       record(args.taskId, 'turn.prompt', { role: args.role, profile: profile.id, provider: profile.provider });
 
-      // Temporal cancellation → abort the in-flight turn mid-flight (SPEC §5.6).
-      let signal: AbortSignal | undefined;
-      let heartbeat: (() => void) | undefined;
-      try {
-        const actx = activityContext.current();
-        signal = actx.cancellationSignal;
-        heartbeat = () => actx.heartbeat();
-      } catch {
-        /* not running inside a Temporal activity (e.g. a direct unit test) */
-      }
-
       // Host-wide agent-turn admission (SPEC §12): cap concurrent model
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
@@ -333,6 +370,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // so the drawer's live "fork this agent" command appears WHILE the turn runs,
           // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.
           onSession: (s) => {
+            hbSession = s; // heartbeats now carry it → a retry resumes this session
             store.kvSet(`session:${args.taskId}:${args.role}`, s);
             store.kvSet(
               `sessionmeta:${args.taskId}:${args.role}`,
@@ -349,6 +387,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
         },
         );
+      } catch (err) {
+        if (token) deps.tokens?.revoke(token);
+        if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
+        throw classifyTurnError(err);
       } finally {
         releaseSlot();
       }

@@ -4,13 +4,22 @@ import {
   defineQuery,
   setHandler,
   condition,
+  isCancellation,
   workflowInfo,
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
+import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike } from './contract.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
-const long = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', retry: { maximumAttempts: 1 } });
+// Agent turns heartbeat every ~10s; a 2-minute gap = dead/slept worker → Temporal
+// retries the turn and the next attempt resumes the interrupted session (see
+// software-dev.ts / failures.ts for the full taxonomy).
+const turns = proxyActivities<coreActivities>({
+  startToCloseTimeout: '45 minutes',
+  heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
+});
 
 export const followUpSignal = defineSignal<[Message]>('followUp');
 export const confirmSignal = defineSignal('confirm');
@@ -65,10 +74,22 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   await publish();
   world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base, copyGlobs: input.project.copyGlobs, kind: 'worktree' })) as WorldHandleLike;
 
+  let infraRetries = 0;
   for (stage = 'do'; ; ) {
     await publish();
     if (cancelled) break;
-    const turn = await long.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, task: input });
+    let turn;
+    try {
+      turn = await turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, task: input });
+    } catch (err) {
+      // Infrastructure outage that outlived the activity retries: park with
+      // backoff and re-run the turn (which resumes its session) rather than
+      // failing the task. Anything else propagates as before.
+      if (cancelled || isCancellation(err) || !isInfraFailure(err) || infraRetries >= INFRA_BACKOFF_MS.length) throw err;
+      await condition(() => cancelled, INFRA_BACKOFF_MS[infraRetries++]!);
+      continue;
+    }
+    infraRetries = 0;
     session = turn.session ?? session;
     seen = msgs.length;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;

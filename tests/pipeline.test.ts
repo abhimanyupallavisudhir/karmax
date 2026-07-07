@@ -153,6 +153,31 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('cancelled');
   });
 
+  it('retries a transient transport failure in-place — session resumed, Resolve never runs', async () => {
+    const repo = await h.makeRepo('app-flaky');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // the exact failure shape a suspend/resume produces (2026-07-07 outage)
+      args: [input({ taskId, repo, title: 'Flaky', prompt: '@write ok.txt :: hi\n@failonce API Error: Connection closed mid-response' })],
+    });
+    // the turn dies once (tagged 'agent-infra' → retryable), Temporal re-runs it
+    // (~10s backoff) and the task reaches Review normally
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 60_000 }).toBe('review');
+    const v = await view(handle);
+    // the blip never became a Resolve case…
+    const resolve = (v.transcripts ?? []).find((t: any) => t.role === 'resolve');
+    expect(resolve?.messages?.length ?? 0).toBe(0);
+    // …and the retry RESUMED the interrupted session (heartbeat details) instead
+    // of replaying the whole turn from scratch
+    const events = h.store.eventsSince(taskId, 0);
+    expect(events.some((e) => e.type === 'turn.resumed')).toBe(true);
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+  });
+
   // Wait until the parent has surfaced a child's raise AND parked afterward (its last
   // message is the agent's turn on that raise). This guarantees the child is in
   // `awaitingResponse` and — since the mock only reads the latest message — that a

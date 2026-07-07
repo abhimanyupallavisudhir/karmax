@@ -17,14 +17,26 @@ import { parseTransition } from '../resolve/transitions.js';
  *   @review <summary>               attach review info
  *   @skill <name> :: <content>      save a skill
  *   @fail <message>                 throw (exercises Resolve)
+ *   @failonce <message>             throw only the FIRST time per world (exercises the
+ *                                   transient-infra retry path — no Resolve)
  *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
  *   @incomplete                     do NOT signal completion this turn
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
  */
+// @failonce ledger: activity retries land in the same world, so keying by world+message
+// makes the second attempt succeed. Module-level: survives across turn invocations.
+const failedOnce = new Set<string>();
+
 export class MockAdapter implements AgentAdapter {
   readonly provider = 'mock' as const;
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    // Mirror the real adapters: publish the session id the moment it exists and
+    // beat once, so an interrupted turn's retry can resume it (heartbeat details
+    // carry the session — see runAgentTurn) and pending cancellations deliver.
+    const session = input.session ?? `mock-${input.world.handle.id}`;
+    ctx.onSession?.(session);
+    ctx.heartbeat?.();
     // Act on the latest USER message (or the task prompt on turn one), so directives
     // fire once per turn rather than re-firing the whole history. We deliberately
     // ignore `role: 'system'` messages to MIRROR the real provider adapters
@@ -123,6 +135,17 @@ export class MockAdapter implements AgentAdapter {
         }
         case 'fail':
           throw new Error(rest || 'mock failure');
+        case 'failonce': {
+          const key = `${input.world.handle.id}:${rest}`;
+          if (!failedOnce.has(key)) {
+            failedOnce.add(key);
+            throw new Error(rest || 'mock transient failure');
+          }
+          // Reached only when the retry REPLAYED the original prompt (no session
+          // resume); a resumed retry sees just the continuation nudge instead.
+          outputs.push(`recovered from: ${rest}`);
+          break;
+        }
         case 'decide': {
           // @decide <action> [:: reason] — a Resolve agent's structured verdict.
           const [action, reason = ''] = splitOn(rest, '::');
@@ -145,7 +168,7 @@ export class MockAdapter implements AgentAdapter {
 
     if (outputs.length === 0) outputs.push('(mock agent: no directives; nothing to do)');
     if (complete) ctx.signalCompletion(outputs.join('; '));
-    return { session: input.session ?? `mock-${input.world.handle.id}`, output: outputs.join('\n') };
+    return { session, output: outputs.join('\n') };
   }
 }
 

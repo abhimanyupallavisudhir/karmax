@@ -19,6 +19,7 @@ import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { classifyLimitError } from '../agent/limits.js';
+import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import {
   TaskInput,
   TaskView,
@@ -36,10 +37,22 @@ const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
   retry: { maximumAttempts: 3 },
 });
-// Agent turns + merges can be long-running (real models, test suites).
+// Merges + checks can be long-running (test suites) but don't heartbeat.
 const long = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes',
   retry: { maximumAttempts: 1 },
+});
+// Agent turns heartbeat every ~10s (runtime.ts), so a 2-minute gap means the
+// worker/host died or slept. Temporal then retries the turn, and the next
+// attempt RESUMES the interrupted session from heartbeat details (runAgentTurn)
+// — a retry is "continue where you left off", not a full re-run. Only
+// 'agent-infra' failures and timeouts retry here; limits and agent errors are
+// tagged non-retryable by the activity and flow to account rotation / Resolve
+// exactly as before (see failures.ts).
+const turns = proxyActivities<coreActivities>({
+  startToCloseTimeout: '45 minutes',
+  heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
 });
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
@@ -356,6 +369,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     let lastError = '';
     for (;;) {
       let attempt = 0;
+      let infraRetries = 0;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
         try {
           return await fn();
@@ -367,6 +381,28 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
             lastError = describeError(err);
             error = lastError;
             break;
+          }
+          // Infrastructure died under the turn (stream cut, host slept, activity
+          // timed out) — no agent can fix that, so don't burn a Resolve turn. The
+          // activity already retried quickly with session resume; this handles an
+          // outage that outlived those retries: park with backoff and re-run the
+          // stage. Doesn't consume resolve attempts. A human Retry or a cancel
+          // wakes the park early.
+          if (isInfraFailure(err)) {
+            if (infraRetries < INFRA_BACKOFF_MS.length) {
+              const wait = INFRA_BACKOFF_MS[infraRetries++]!;
+              attempt--; // an infra park is not a resolve attempt
+              error = `infrastructure: ${describeError(err)} — retrying ${stageName} in ${Math.round(wait / 1000)}s (${infraRetries}/${INFRA_BACKOFF_MS.length})`;
+              await publish();
+              await condition(() => cancelled || retryRequested, wait);
+              if (cancelled) throw new Cancelled();
+              retryRequested = false;
+              error = undefined;
+              continue;
+            }
+            lastError = `infrastructure: ${describeError(err)} (still failing after ${INFRA_BACKOFF_MS.length} waits)`;
+            error = lastError;
+            break; // → escalate to a human; Resolve can't fix infrastructure
           }
           lastError = describeError(err);
           error = lastError;
@@ -387,7 +423,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
             };
             resolveMsgs.push(rin);
             const r = await leasedTurn('resolve', (accountConfigHome, accountApiKeyHandle) =>
-              long.runAgentTurn({
+              turns.runAgentTurn({
                 taskId,
                 role: 'resolve',
                 worldHandle: world as any,
@@ -541,7 +577,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const turn = await withResolve('do', () =>
       leasedTurn('do', (accountConfigHome, accountApiKeyHandle) => {
         doHome = accountConfigHome ?? '(profile)';
-        return long.runAgentTurn({
+        return turns.runAgentTurn({
           taskId,
           role: 'do',
           worldHandle: world as any,
@@ -861,7 +897,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     try {
       // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
       const mt = await leasedTurn('merge', (accountConfigHome, accountApiKeyHandle) =>
-        long.runAgentTurn({
+        turns.runAgentTurn({
           taskId,
           role: 'merge',
           worldHandle: world as any,
