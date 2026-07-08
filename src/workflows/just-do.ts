@@ -72,7 +72,7 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   });
 
   await publish();
-  world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base, copyGlobs: input.project.copyGlobs, kind: 'worktree' })) as WorldHandleLike;
+  world = (await core.createWorld({ taskId, repos: input.project.repos, base, copyGlobs: input.project.copyGlobs, kind: 'worktree' })) as WorldHandleLike;
 
   let infraRetries = 0;
   for (stage = 'do'; ; ) {

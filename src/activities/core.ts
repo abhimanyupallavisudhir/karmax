@@ -80,6 +80,8 @@ export interface CoreActivityDeps {
 export interface CreateWorldArgs {
   taskId: string;
   repo?: string;
+  /** Source repos for a multi-repo world; takes precedence over `repo`. */
+  repos?: string[];
   base: string;
   target?: string;
   branch?: string;
@@ -137,6 +139,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await worlds.create(args.kind, {
         taskId: args.taskId,
         repo: args.repo,
+        repos: args.repos,
         base: args.base,
         target: args.target,
         branch: args.branch,
