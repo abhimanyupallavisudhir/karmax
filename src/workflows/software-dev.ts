@@ -197,6 +197,12 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // arrays whose input+output we accumulate here so all three are inspectable.
   const mergeMsgs: Message[] = [];
   const resolveMsgs: Message[] = [];
+  const confirmMsgs: Message[] = [];
+  // Who drives the Review gate (SPEC §5.2). Explicit `input.confirm` wins; otherwise
+  // fall back to the legacy `autoConfirm` flag (top-level goal tasks) → `auto`, else a
+  // human. A child with a `parentTaskId` always routes Review to its parent regardless
+  // (parent-as-confirmer, SPEC §5.3), so this only governs top-level tasks.
+  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? (input.autoConfirm ? 'auto' : 'human');
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, { accountId: string; configHome?: string; apiKeyHandle?: string }>();
   let turnSeq = 0;
@@ -361,6 +367,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const t = [{ role: 'do', label: 'Do agent', messages: msgs }];
     if (mergeMsgs.length) t.push({ role: 'merge', label: 'Merge agent', messages: mergeMsgs });
     if (resolveMsgs.length) t.push({ role: 'resolve', label: 'Resolve agent', messages: resolveMsgs });
+    if (confirmMsgs.length) t.push({ role: 'confirm', label: 'Confirm agent', messages: confirmMsgs });
     return t;
   }
 
@@ -412,7 +419,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
     // Do is the default; merge/resolve queue it so it reaches that agent on its
     // next turn (each turn is fed its own accumulated transcript).
-    const target = role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : msgs;
+    const target = role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs : msgs;
     target.push({ ...m, ts: target.length });
   });
   setHandler(confirmSignal, () => {
@@ -717,6 +724,42 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     return turn;
   }
 
+  /** Run one Confirm-agent turn at the Review gate (SPEC §5.2): it reviews the work and
+   *  returns a structured verdict (confirm / revise / reject) — the same three moves a
+   *  human makes. Leased + resolve-wrapped like every other role. Returns the verdict,
+   *  or undefined if the agent turn failed or declined to decide (caller falls back to
+   *  the human gate so nothing is silently auto-confirmed). */
+  async function confirmTurn(): Promise<import('./contract.js').ConfirmDecision | undefined> {
+    const ct = await withResolve('confirm', () =>
+      leasedTurn('confirm', (accountConfigHome, accountApiKeyHandle) =>
+        // Each Review runs a FRESH confirm turn (session left unset): the reviewer must
+        // re-judge the CURRENT work, so it always gets an up-to-date system prompt
+        // (fresh reviewInfo / changed files) rather than resuming stale context. A
+        // mid-turn activity retry still resumes via heartbeat details inside runAgentTurn.
+        turns.runAgentTurn({
+          taskId,
+          role: 'confirm',
+          worldHandle: world as any,
+          messages: confirmMsgs,
+          task: liveInput,
+          bindings: {
+            reviewInfo: reviewInfo?.summary ?? '',
+            changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+            transcript: lastOutputs(msgs),
+          },
+          accountConfigHome,
+          accountApiKeyHandle,
+        }),
+      ),
+    ).catch((e) => {
+      if (isCancellation(e)) throw e;
+      log.warn('confirm agent turn failed; falling back to the human gate', { e: String(e) });
+      return undefined;
+    });
+    if (ct?.output?.trim()) confirmMsgs.push({ id: `c-out-${confirmMsgs.length}`, role: 'agent', text: ct.output, ts: confirmMsgs.length });
+    return ct?.confirmDecision;
+  }
+
   /** Record a child's eventual settlement so the management loop can react. */
   function trackChild(childTaskId: string, child: ChildWorkflowHandle<typeof softwareDev>) {
     child.result().then(
@@ -976,14 +1019,39 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       }
       stage = 'review';
       status = 'waiting';
-      if (input.autoConfirm) {
-        confirmed = true;
-      } else if (input.parentTaskId) {
+      // Who confirms (SPEC §5.2/§5.3): a child always routes to its parent; a top-level
+      // task uses its configured confirmer — auto, a Confirm agent, or a human.
+      if (input.parentTaskId) {
         // Parent-as-confirmer (SPEC §5.3): raise to the parent instead of blocking on
         // a human the parent-managed child isn't even surfaced to. The parent's reply
         // drives `confirmed`/follow-up via parentResponseSignal.
         waitingFor = { kind: 'parent' };
         await notifyParent(turn.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
+      } else if (confirmMode === 'auto') {
+        confirmed = true;
+      } else if (confirmMode === 'agent') {
+        // Run the Confirm agent; its verdict maps onto the SAME transitions a human
+        // drives (confirm / follow-up-to-Do / cancel).
+        waitingFor = { kind: 'confirm' };
+        await publish();
+        const decision = await confirmTurn();
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        if (decision?.action === 'confirm') {
+          confirmed = true;
+        } else if (decision?.action === 'reject') {
+          if (decision.text) msgs.push({ id: `cr-${msgs.length}`, role: 'system', text: `Confirm agent rejected the work: ${decision.text}`, ts: msgs.length });
+          cancelled = true;
+          return await abort();
+        } else if (decision?.action === 'revise') {
+          // Feedback goes into the Do transcript as a follow-up and we loop back to Do.
+          msgs.push({ id: `cv-${msgs.length}`, role: 'user', text: decision.text || 'Please revise the work per the reviewer feedback.', ts: msgs.length });
+          stage = 'do';
+          status = 'active';
+          continue;
+        }
+        // No verdict (turn failed / declined) → fall through to the human gate below so
+        // nothing is silently auto-confirmed.
       }
       await publish();
       await condition(() => confirmed || cancelled || msgs.length > seen);

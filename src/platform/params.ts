@@ -1,4 +1,4 @@
-import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ProjectConfig, Project } from '../domain/types.js';
+import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ConfirmConfig, ProjectConfig, Project } from '../domain/types.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { expandPath } from '../util/expand.js';
 
@@ -66,6 +66,34 @@ export function assembleTaskInput(
       case 'profile':
         if (f.role && v && typeof v === 'object' && (v as AgentSpec).provider) agents[f.role] = v as AgentSpec;
         break;
+      case 'confirm': {
+        // The confirmer field carries a MODE (human/auto/agent) plus, when mode is
+        // `agent`, the same agent knobs as a bind:'profile' field. Land the mode on
+        // input.confirm; when it's an agent, ALSO register it under agents[role] so
+        // the existing per-role turn machinery (profile resolution + fork/resume)
+        // drives the Confirm-agent turn with zero extra plumbing.
+        if (v && typeof v === 'object') {
+          const c = v as ConfirmConfig;
+          const mode = c.mode ?? 'human';
+          input.confirm = {
+            mode,
+            ...(c.provider ? { provider: c.provider } : {}),
+            ...(c.model ? { model: c.model } : {}),
+            ...(c.effort ? { effort: c.effort } : {}),
+            ...(c.resumeFrom ? { resumeFrom: c.resumeFrom } : {}),
+          };
+          const role = f.role ?? 'confirm';
+          if (mode === 'agent' && c.provider) {
+            agents[role] = {
+              provider: c.provider,
+              ...(c.model ? { model: c.model } : {}),
+              ...(c.effort ? { effort: c.effort } : {}),
+              ...(c.resumeFrom ? { resumeFrom: c.resumeFrom } : {}),
+            };
+          }
+        }
+        break;
+      }
     }
   }
   if (Object.keys(agents).length) input.agents = agents;

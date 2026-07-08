@@ -858,7 +858,7 @@ export class Gateway {
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
-      if (f.type !== 'agent' || !f.role) continue;
+      if ((f.type !== 'agent' && f.type !== 'confirmer') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
@@ -868,7 +868,10 @@ export class Gateway {
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      out[f.name] = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      // A confirmer also carries a MODE (human/auto/agent) that inherits normally; the
+      // agent knobs above are the defaults shown once "agent" mode is selected.
+      out[f.name] = f.type === 'confirmer' ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) } : agent;
     }
     return out;
   }

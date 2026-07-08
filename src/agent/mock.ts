@@ -23,6 +23,7 @@ import { parseTransition } from '../resolve/transitions.js';
  *   @failonce <message>             throw only the FIRST time per world (exercises the
  *                                   transient-infra retry path — no Resolve)
  *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
+ *   @confirm <action> [:: text]     confirm agent verdict (confirm/revise/reject)
  *   @incomplete                     do NOT signal completion this turn
  *   @profile                        echo this turn's model/effort (`profile: <model>/<effort>`)
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
@@ -164,6 +165,17 @@ export class MockAdapter implements AgentAdapter {
             ctx.resolveDecision(t);
             complete = false; // the decision is the completion for a resolve turn
             outputs.push(`decide: ${t.do}`);
+          }
+          break;
+        }
+        case 'confirm': {
+          // @confirm <action> [:: text] — a Confirm agent's Review-gate verdict.
+          const [action, textRest = ''] = splitOn(rest, '::');
+          const act = action.trim();
+          if (['confirm', 'revise', 'reject'].includes(act)) {
+            ctx.confirmDecision({ action: act as 'confirm' | 'revise' | 'reject', text: textRest.trim() || undefined });
+            complete = false; // the verdict is the completion for a confirm turn
+            outputs.push(`confirm: ${act}`);
           }
           break;
         }
