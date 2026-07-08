@@ -108,13 +108,19 @@ const fieldLabel = (f) =>
   `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtn(f.name)}</div>` +
   (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
 
-function renderField(f, own, inherited) {
+function renderField(f, own, inherited, withChips) {
   const v = eff(own, inherited) ?? '';
   const label = fieldLabel(f);
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
-  if (f.type === 'text')
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
+  if (f.type === 'text') {
+    const ta = `<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea>`;
+    // For the prompt field, pasted images render inside the box (below the text),
+    // growing it as needed — rather than in a separate "Images" section.
+    if (withChips)
+      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div></div></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
+  }
   if (f.type === 'boolean')
     return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${resetBtn(f.name)}</div></div>`;
   if (f.type === 'select')
@@ -871,11 +877,14 @@ async function deleteDraft(id) {
 async function openTaskForm(workflow, draft, seedText) {
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
+  // The prompt/consuming field (a textarea) hosts pasted-image chips inside its
+  // own box; only fall back to a standalone "Images" section if there isn't one.
+  const cf = consumingField(fields);
+  const promptField = cf && cf.type === 'text' ? cf : null;
   const values = draft ? { ...draft.params } : {};
   // Carry over the quick-add text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
-    const cf = consumingField(fields);
     if (cf && !values[cf.name]) values[cf.name] = seedText;
   }
   let inherited = {};
@@ -889,12 +898,12 @@ async function openTaskForm(workflow, draft, seedText) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
-          <div class="form-row" data-row="__images">
+        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name], f === promptField)).join('')}
+          ${promptField ? '' : `<div class="form-row" data-row="__images">
             <div class="label-row"><label>Images</label></div>
             <div class="img-chips" id="tf-chips" style="display:none"></div>
             <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
-          </div>
+          </div>`}
           <div class="form-row" data-row="__notes">
             <div class="label-row"><label>Notes</label></div>
             <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
@@ -1209,8 +1218,10 @@ function drawerBody(v) {
       const agentName = esc(t.label || t.role);
       const fu = followUp
         ? `<div class="followup-box" data-role="${esc(t.role)}">
-            <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}></textarea>
-            <div class="img-chips followup-chips" style="display:none"></div>
+            <div class="prompt-field">
+              <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}></textarea>
+              <div class="img-chips followup-chips" style="display:none"></div>
+            </div>
             <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
           </div>`
         : '';

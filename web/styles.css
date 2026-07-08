@@ -321,8 +321,8 @@ a { color: var(--accent); text-decoration: none; }
 /* action forms (the generic auto-render floor) */
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .followup-box { display: flex; gap: 8px; margin-top: 10px; align-items: flex-end; }
-.followup-box textarea { flex: 1; resize: vertical; min-height: 38px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); outline: none; }
-.followup-box textarea:focus { border-color: var(--accent); }
+.followup-box .prompt-field { flex: 1; }
+.followup-box textarea { min-height: 38px; }
 /* The follow-up box now lives inside each conversation — set it apart from the thread above it. */
 .conversation .followup-box { margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
 
@@ -448,6 +448,14 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
 .cred-rename:hover, .cred-del:hover { color: var(--accent); }
 
 /* ── Image attachments (paste/drag an image into a prompt field) ── */
+/* A prompt box whose pasted-image chips sit inside it (below the text), so the
+   whole field grows to fit them rather than shrinking the textarea or spilling
+   into a separate section. The wrapper carries the border; the textarea is bare. */
+.prompt-field { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.prompt-field:focus-within { border-color: var(--accent); }
+.prompt-field > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
+.prompt-field > .img-chips { margin: 0; padding: 0 10px 9px; }
+.form-row .prompt-field { background: var(--surface-2); }
 .img-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
 .img-chip { position: relative; display: inline-flex; }
 .img-chip img {
