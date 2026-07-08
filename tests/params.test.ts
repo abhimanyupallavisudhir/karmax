@@ -8,6 +8,7 @@ import {
   projectSettingsFor,
   globalSettingsFor,
   settingsToProjectConfig,
+  effectiveRepos,
 } from '../src/platform/params.js';
 import { Project } from '../src/domain/types.js';
 
@@ -25,6 +26,41 @@ describe('resolveParams (overlay: task → project → global → default)', () 
     expect(r.target).toBe('develop'); // project wins over global
     expect(r.worldProvider).toBe('container'); // global used (no task/project)
     expect(r.openGithubPr).toBe(false); // field default
+  });
+});
+
+describe('resolveParams treats an empty list at a layer as "inherit", not an override', () => {
+  it('a blank project `repos` list falls through to the lower layer instead of shadowing it', () => {
+    // The scratch-sandbox incident: an empty `repos: []` in the project overlay used
+    // to win over the configured repo (pick() only skipped undefined/null/''), which
+    // stripped the repo and dropped the task into a README-only scratch world.
+    const r = resolveParams(sd, { project: { repos: [] }, global: { repos: ['/fallback'] } });
+    expect(r.repos).toEqual(['/fallback']);
+  });
+
+  it('an empty list everywhere resolves to undefined (no repos)', () => {
+    const r = resolveParams(sd, { project: { repos: [] } });
+    expect(r.repos).toBeUndefined();
+  });
+
+  it('a non-empty list still overrides normally', () => {
+    const r = resolveParams(sd, { project: { repos: ['/a'] }, global: { repos: ['/b'] } });
+    expect(r.repos).toEqual(['/a']);
+  });
+});
+
+describe('effectiveRepos (what the world is actually built from)', () => {
+  it('uses the resolved overlay repos when set', () => {
+    expect(effectiveRepos({ repos: ['/x'] }, { repos: ['/config'] })).toEqual(['/x']);
+  });
+
+  it('falls back to project config when the overlay did not set repos', () => {
+    expect(effectiveRepos({}, { repos: ['/config'] })).toEqual(['/config']);
+  });
+
+  it('drops blank/whitespace entries so they never count as configured', () => {
+    expect(effectiveRepos({ repos: ['', '  '] }, { repos: ['/config'] })).toEqual([]);
+    expect(effectiveRepos({}, { repos: ['   '] })).toEqual([]);
   });
 });
 
