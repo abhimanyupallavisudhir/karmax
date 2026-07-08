@@ -594,12 +594,18 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const turn = await withResolve('do', () =>
       leasedTurn('do', (accountConfigHome, accountApiKeyHandle) => {
         doHome = accountConfigHome ?? '(profile)';
+        // Resume only when the leased login matches the one that minted the session
+        // (§2.5). When we do, the session already holds the first `seen` messages
+        // (everything delivered on prior turns), so send only the delta after them —
+        // a follow-up reaches the agent as a follow-up, not the whole conversation.
+        const resume = sessionMatchesHome(accountConfigHome) ? session : undefined;
         return turns.runAgentTurn({
           taskId,
           role: 'do',
           worldHandle: world as any,
           messages: msgs,
-          session: sessionMatchesHome(accountConfigHome) ? session : undefined,
+          session: resume,
+          deliveredMessages: resume ? seen : 0,
           task: liveInput,
           accountConfigHome,
           accountApiKeyHandle,
