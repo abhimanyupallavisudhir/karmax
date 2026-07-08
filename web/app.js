@@ -932,6 +932,18 @@ function renderDrawer() {
   const v = S.view;
   if (!v) return;
   const root = $('#drawer-root');
+  // A background refresh (or a just-sent follow-up) re-renders the whole drawer,
+  // which would otherwise reset the conversation scroll to the top and drop the
+  // caret out of whatever follow-up box the user is composing in. Snapshot the
+  // scroll offset + focused field first, then restore them after the swap so the
+  // send-message box stays in view and in focus.
+  const prevBody = document.getElementById('drawer-body');
+  const prevScroll = prevBody ? prevBody.scrollTop : null;
+  const focusState = captureFocus(root);
+  // The per-agent follow-up textareas carry no id (captureFocus skips them), so
+  // snapshot the active one by its agent role to re-focus the matching box after
+  // the swap and carry over any half-typed follow-up.
+  const fuState = captureFollowupFocus(root);
   root.innerHTML = `
     <div class="scrim open" id="scrim"></div>
     <aside class="drawer open">
@@ -961,6 +973,39 @@ function renderDrawer() {
   wireCopyButtons();
   renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId, taskId: v.taskId });
   renderDrawerEvents();
+  // Restore the pre-render scroll offset + focus so the send-message box the user
+  // was working in stays put instead of jumping to the top of the conversation.
+  const newBody = document.getElementById('drawer-body');
+  if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
+  restoreFocus(root, focusState);
+  restoreFollowupFocus(root, fuState);
+}
+
+// Follow-up textareas live one-per-agent-conversation and are keyed by the agent
+// role they address rather than an element id, so captureFocus/restoreFocus can't
+// see them. These mirror that pair for the follow-up boxes.
+function captureFollowupFocus(root) {
+  const el = document.activeElement;
+  if (!el || !root.contains(el) || !el.classList || !el.classList.contains('followup-input')) return null;
+  const box = el.closest('.followup-box');
+  if (!box) return null;
+  const st = { role: box.dataset.role || '', value: el.value };
+  if (typeof el.selectionStart === 'number') { st.selectionStart = el.selectionStart; st.selectionEnd = el.selectionEnd; }
+  return st;
+}
+
+function restoreFollowupFocus(root, st) {
+  if (!st) return;
+  const box = root.querySelector(`.followup-box[data-role="${window.CSS && CSS.escape ? CSS.escape(st.role) : st.role}"]`);
+  const el = box && box.querySelector('.followup-input');
+  if (!el || el.disabled) return;
+  // Only carry over the value if the box was cleared by the re-render (a sent
+  // follow-up empties it); never clobber text the box already holds.
+  if (st.value && !el.value) el.value = st.value;
+  el.focus();
+  if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
+    try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
+  }
 }
 
 let termWs = null;
