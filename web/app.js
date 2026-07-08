@@ -896,24 +896,33 @@ async function openTaskForm(workflow, draft, seedText) {
         </div>
       </div>
     </div>`;
-  $('#tf-wf')?.addEventListener('change', () => {
+  // Reassigned below once auto-save is wired; flushes pending edits before closing.
+  let closeForm = () => (root.innerHTML = '');
+  $('#tf-wf')?.addEventListener('change', async () => {
     // Re-render for the new workflow, preserving text typed into the current
     // consuming field so it moves to the new workflow's consuming field.
     const cf = consumingField(fields);
     const carried = cf ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`)?.value : '';
+    // Drop any draft auto-created for the previous workflow — its params won't
+    // map onto the new workflow's schema, and reopening starts fresh anyway.
+    clearTimeout(saveTimer);
+    if (localCred && draftId) { const id = draftId; draftId = null; try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch {} }
     openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
-  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') root.innerHTML = ''; });
-  $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
+  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') closeForm(); });
+  $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
   // Image attachments for the full task form: pasting/dropping an image into any
   // text field attaches it to the prompt. State is local to this form instance.
   const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
-  const paintFormChips = () => renderImageChips($('#tf-chips'), formImages);
+  // Repaint chips and (unless first paint) auto-save — pasting an image fires no
+  // 'input' event, so the debounced auto-save wouldn't otherwise pick it up.
+  // `autoSaveSoon` is a hoisted declaration further down this same scope.
+  const paintFormChips = (save) => { renderImageChips($('#tf-chips'), formImages, () => autoSaveSoon()); if (save) autoSaveSoon(); };
   $('#tf-body')
     .querySelectorAll('textarea, input[type="text"], input:not([type])')
-    .forEach((el) => wireImagePaste(el, () => formImages, paintFormChips));
+    .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
   paintFormChips();
   // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
   // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the
@@ -921,34 +930,80 @@ async function openTaskForm(workflow, draft, seedText) {
   // A draft has an id → edit its policy directly. A brand-new task has none, so the
   // editor runs in `local` mode: changes are held here and applied on create (below).
   let taskCredPolicy = {};
+  const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
-  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; } });
-  const submit = async (draftMode) => {
+  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+
+  // The id of the draft this form is editing. Starts as the passed-in draft; a
+  // brand-new task gets one lazily the first time auto-save persists real content.
+  let draftId = draft?.id || null;
+  const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
+  // Prompt image attachments ride inside `params` (references only), so they flow
+  // through auto-save, draft, and queue the same way the prompt text does.
+  const formState = () => {
     const body = collectForm($('#tf-body'), fields);
-    // Prompt image attachments ride inside `params` (references only), so they
-    // flow through create/draft/queue the same way the prompt does.
-    if (formImages.length) body.images = formImages;
-    // Cosmetic human notes — kept separate from `params` so they never reach the
-    // agent, and editable at any stage (here, pre-queue, in the full form).
-    const notes = $('#tf-notes')?.value ?? '';
-    const payload = { workflow: wf, params: body, notes, draft: draftMode };
+    if (formImages.length) body.images = [...formImages];
+    return { body, notes: $('#tf-notes')?.value ?? '' };
+  };
+  // Whether the user has actually put something worth keeping into a NEW task —
+  // guards against spawning empty drafts just from opening the form.
+  const hasContent = ({ body, notes }) =>
+    notes.trim() !== '' ||
+    hasPolicy() ||
+    formImages.length > 0 ||
+    Object.values(body).some((v) =>
+      Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
+
+  // Persist the current form as a draft without leaving the form. Silent by
+  // design — auto-save shouldn't nag; the explicit buttons surface errors.
+  let lastSaved = null;
+  async function persistDraft(st = formState()) {
+    if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+    const sig = JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
+    if (sig === lastSaved) return; // no change since last write
     try {
-      if (draft) {
-        // edit existing draft, then optionally queue
-        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true }) });
-        if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
-        if (!draftMode) await api(`/api/tasks/${draft.id}/queue`, { method: 'POST', body: '{}' });
+      if (!draftId) {
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        draftId = created.id;
       } else {
-        const hasPol = !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
-        if (hasPol) {
-          // Custom per-task credential order/enablement: create as a draft first so the
-          // override is persisted BEFORE the workflow starts leasing, then queue.
-          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...payload, draft: true }) });
-          await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
-          if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
-        } else {
-          await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
-        }
+        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+      }
+      if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+      lastSaved = sig;
+      refreshTasks();
+    } catch { /* keep the form open; a later save or explicit button will retry */ }
+  }
+
+  // Debounced auto-save while typing.
+  let saveTimer = null;
+  function autoSaveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(() => persistDraft(), 800); }
+  $('#tf-body').addEventListener('input', autoSaveSoon);
+  $('#tf-body').addEventListener('change', autoSaveSoon);
+
+  // Flush any pending edits when the form is dismissed, so closing without
+  // clicking a button still keeps the draft.
+  closeForm = () => { clearTimeout(saveTimer); const st = formState(); root.innerHTML = ''; persistDraft(st); };
+
+  const submit = async (draftMode) => {
+    clearTimeout(saveTimer);
+    const st = formState();
+    try {
+      if (draftId) {
+        // Auto-save (or a prior edit) already materialised the draft — update it in place.
+        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        if (!draftMode) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+      } else if (hasPolicy()) {
+        // Custom per-task credential order/enablement: create as a draft first so the
+        // override is persisted BEFORE the workflow starts leasing, then queue.
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        draftId = created.id;
+        await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
+        if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
+      } else {
+        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode }) });
       }
       root.innerHTML = '';
       toast(draftMode ? 'Draft saved' : 'Task created');

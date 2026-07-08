@@ -4,6 +4,30 @@ Investigation + design for letting users paste images into prompt fields (quick-
 the "⋯ More" task form, and follow-up conversations) and have those images reach the
 Do / Merge / Resolve agents. Layered on top of `SPEC.md`.
 
+## Status: IMPLEMENTED
+
+All layers below are built and tested (`npm run typecheck` clean; new tests in
+`tests/attachments.test.ts` + `tests/codex-exec.test.ts`). Files changed:
+
+- `src/store/attachments.ts` (new) — content-addressed store + validation.
+- `src/config/paths.ts` — `attachments/` dir under `$KARMAX_HOME`.
+- `src/domain/types.ts` — `ImageRef`; `images?` on `Message`/`TaskParams`/`TaskInput`.
+- `src/gateway/server.ts` — `POST /api/attachments` (bounded raw-body reader) +
+  `GET /api/attachments/:id?token=…`; `images` threaded onto the signal route.
+- `src/platform/api.ts` — `images` through `createTask`/`queueTask`/`signalTask`.
+- `src/workflows/{software-dev,just-do,merge-only}.ts` — initial-prompt images on m0
+  (followUp handler already spreads the message, so follow-up images ride along).
+- `src/agent/images.ts` (new) — resolve `ImageRef` → Anthropic/OpenAI base64 blocks
+  or Codex-CLI temp files. Wired into `src/agent/claude.ts` (Messages API + Agent SDK
+  streaming form) and `src/agent/codex.ts` (Responses API + CLI `-i`).
+- `web/{app.js,styles.css}` — paste/drag capture + thumbnail chips at all three entry
+  points; `<img>` thumbnails in transcripts.
+
+Not done (follow-ups): attachment GC/ref-counting, usage-token accounting for image
+tiles, and an opt-in `live-agent` test that sends a real image to a provider.
+
+---
+
 ## TL;DR
 
 - **All three providers already support vision.** Claude Messages API and Codex/OpenAI
