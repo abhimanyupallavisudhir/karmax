@@ -77,4 +77,38 @@ describe('repo-required guard (empty-repo footgun)', () => {
     await expect(api.queueTask(token, draft.id)).rejects.toThrow(/repository/i);
     expect(started).toHaveLength(0); // still not started after the refused queue
   });
+
+  // The scratch-sandbox incident: the guard and the world builder read different
+  // sources. A project-settings overlay with an empty `repos` list shadowed the
+  // configured repo, so the effective repo list resolved to nothing and the task
+  // got a silent scratch world — while the config-only guard happily passed. The
+  // guard now reads the SAME effective repos the world is built from.
+  const startedInput = () => (started[0]![1] as any).args[0];
+
+  it('an empty project-settings repos list does not shadow the configured repo', async () => {
+    const p = store.createProject('OverlayEmpty', { repos: ['/some/repo'] });
+    store.setSettings(p.id, 'software-dev', { repos: [] }); // blank list saved in settings
+    const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
+    expect(task.workflow).toBe('software-dev');
+    expect(started).toHaveLength(1); // runs — falls back to the configured repo, no scratch world
+    expect(startedInput().project.repos).toEqual(['/some/repo']);
+  });
+
+  it('allows the run when the repo comes only from the settings overlay (not project config)', async () => {
+    const p = store.createProject('OverlayOnly', {}); // config has no repo…
+    store.setSettings(p.id, 'software-dev', { repos: ['/from/settings'] }); // …but settings does
+    const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
+    expect(task.workflow).toBe('software-dev');
+    expect(started).toHaveLength(1); // guard reads the effective repos, so this passes
+    expect(startedInput().project.repos).toEqual(['/from/settings']);
+  });
+
+  it('still refuses when the effective repos resolve empty everywhere', async () => {
+    const p = store.createProject('AllEmpty', { repos: ['/cfg'] });
+    store.setSettings(p.id, 'software-dev', { repos: ['   '] }); // whitespace-only overlay wins, resolves empty
+    await expect(
+      api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' }),
+    ).rejects.toThrow(/repository/i);
+    expect(started).toHaveLength(0);
+  });
 });

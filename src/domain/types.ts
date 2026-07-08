@@ -7,7 +7,7 @@
 
 export type Provider = 'claude' | 'codex' | 'mock';
 
-export type AgentRole = 'do' | 'merge' | 'resolve' | (string & {});
+export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | (string & {});
 
 // ─── Project / list / task records (the metadata index) ──────────────────────
 
@@ -153,11 +153,11 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer';
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
-export type FieldBind = 'prompt' | 'top' | 'project' | 'profile';
+export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm';
 /**
  * When a param may be edited after the task is queued (SPEC §4.5/§5.5). This is
  * the single declaration that drives in-flight edits: the workflow validator
@@ -184,7 +184,8 @@ export interface FieldSpec {
   placeholder?: string;
   scopes: FieldScope[];
   bind: FieldBind;
-  /** For agent fields / bind:'profile' — the role this configures (do/merge/resolve). */
+  /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures
+   *  (do/merge/resolve/confirm). */
   role?: string;
   /** In-flight editability window (SPEC §4.5/§5.5). Omitted ⇒ `queue`. */
   mutable?: FieldMutable;
@@ -198,6 +199,27 @@ export interface AgentSpec {
   /** Continue a prior agent session: a source task (+ which role's agent) or a
    *  raw provider conversation/session id. */
   resumeFrom?: { taskId?: string; role?: string; sessionId?: string };
+}
+
+/**
+ * Who drives the Review gate (SPEC §5.2/§5.3). `human` waits for a person to click
+ * Confirm (the default, back-compat behaviour). `auto` confirms the moment Review is
+ * reached. `agent` runs a Confirm-agent turn that reviews the work and returns a
+ * structured verdict (confirm / revise / reject) — the same three transitions a human
+ * drives. When `mode === 'agent'` the remaining `AgentSpec` fields configure that
+ * agent exactly like the Do/Merge/Resolve agent fields (including `resumeFrom`).
+ */
+export type ConfirmMode = 'human' | 'auto' | 'agent';
+export interface ConfirmConfig extends Partial<AgentSpec> {
+  mode: ConfirmMode;
+}
+
+/** The Confirm agent's structured verdict at the Review gate. `confirm` proceeds,
+ *  `revise` sends the task back to Do (with an optional comment), `reject` cancels. */
+export type ConfirmAction = 'confirm' | 'revise' | 'reject';
+export interface ConfirmDecision {
+  action: ConfirmAction;
+  text?: string;
 }
 
 /** A declared action the workflow exposes; auto-rendered as a button/form (§10.2 tier 1). */
@@ -255,7 +277,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'parent'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right
@@ -323,6 +345,9 @@ export interface TaskInput {
   profiles?: Record<string, string>;
   /** Per-role agent overrides (provider/model/effort/resume) from the task form (§10.5). */
   agents?: Record<string, AgentSpec>;
+  /** Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent.
+   *  Absent ⇒ human (or `auto` when the legacy `autoConfirm` flag is set). */
+  confirm?: ConfirmConfig;
   /** A snapshot of project config, captured at creation. */
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */

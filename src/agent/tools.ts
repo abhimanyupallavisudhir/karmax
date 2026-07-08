@@ -151,6 +151,19 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       required: ['action'],
     },
   },
+  {
+    name: 'confirm_decision',
+    description:
+      'Confirm agents ONLY. You are the reviewer at the Review gate — decide whether the work is acceptable, do NOT keep building it. action: "confirm" (accept the work; it proceeds to PR/merge), "revise" (send it back to the Do agent with specific feedback in `text`), or "reject" (the work is unsalvageable; cancel the task, say why in `text`). Calling this ends your turn.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['confirm', 'revise', 'reject'] },
+        text: { type: 'string', description: 'For revise: the feedback the Do agent should act on. For reject: why the work is being cancelled.' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 /** The world file/shell tools the Claude Agent SDK provides natively (Read/Write/Bash),
@@ -245,6 +258,12 @@ export function platformToolHandlers(
       if (!t) return 'invalid resolve decision — use action: resume | retryStage | gotoStage | parkUntil | escalate';
       ctx.resolveDecision(t);
       return `resolution recorded: ${t.do}`;
+    },
+    async confirm_decision(args) {
+      const action = String(args?.action ?? '');
+      if (!['confirm', 'revise', 'reject'].includes(action)) return 'invalid confirm decision — use action: confirm | revise | reject';
+      ctx.confirmDecision({ action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
+      return `confirm decision recorded: ${action}`;
     },
   };
 }

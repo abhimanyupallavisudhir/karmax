@@ -7,6 +7,7 @@ import { claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver } from './history.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
+import { newSubagentTracker, trackTaskMessage, pendingSubagentCount } from './subagents.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -206,6 +207,11 @@ export class ClaudeAdapter implements AgentAdapter {
 
     let finalText = '';
     let session = input.session;
+    // Track in-harness sub-agents (the Task tool). Claude Code auto-backgrounds long
+    // sub-agents, so the main `result` can arrive — completion already signalled —
+    // while a sub-agent is still running. We fold every task-lifecycle message in and
+    // report the residual count so the workflow won't advance Do→Review mid-flight.
+    const subagents = newSubagentTracker();
     const iterator = query({
       prompt: promptArg,
       options: {
@@ -270,6 +276,10 @@ export class ClaudeAdapter implements AgentAdapter {
         // it — so the drawer shows a live "fork this agent" command mid-turn (#3).
         const sid: string | undefined = (message as any).session_id;
         if (sid && !publishedSession) { session = sid; publishedSession = true; ctx.onSession?.(sid); }
+        // Fold sub-agent (Task tool) lifecycle events into the outstanding set. Draining
+        // the stream to its end lets any in-turn settlements clear before we report —
+        // only genuinely still-running sub-agents remain (see subagents.ts).
+        trackTaskMessage(subagents, message);
         if (message.type === 'assistant') {
           const text = (message.message?.content ?? [])
             .filter((b: any) => b.type === 'text')
@@ -295,7 +305,8 @@ export class ClaudeAdapter implements AgentAdapter {
     // The Agent SDK harness completes its own loop; treat a finished query as a
     // turn boundary. If the agent didn't call signal_completion explicitly, the
     // runtime surfaces the output at Review.
-    return { session, output: finalText };
+    const pending = pendingSubagentCount(subagents);
+    return { session, output: finalText, ...(pending ? { pendingSubagents: pending } : {}) };
   }
 }
 

@@ -232,6 +232,7 @@ function renderField(f, own, inherited, withChips) {
   const label = fieldLabel(f);
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
+  if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited)}</div>`;
   if (f.type === 'text') {
     const ta = `<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea>`;
     // For the prompt field, pasted images render inside the box (below the text),
@@ -277,6 +278,21 @@ function renderAgentField(f, spec, inherited) {
   </div>`;
 }
 
+// The confirmer field: a mode selector (human / auto / agent) plus the SAME agent
+// sub-form as Do/Merge/Resolve, shown only when the mode is "agent". Reuses
+// renderAgentField for the agent controls (so provider/model/effort + "Fork a
+// previous agent" all work identically), and carries the mode alongside.
+const CONFIRM_MODE_LABELS = { human: 'Human (you confirm)', auto: 'Auto-confirm', agent: 'Agent confirms' };
+function renderConfirmerField(f, own, inherited) {
+  const inh = inherited || {};
+  const e = own || inh;
+  const mode = e.mode || inh.mode || 'human';
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'>
+    <select class="cf-mode">${['human', 'auto', 'agent'].map((m) => `<option value="${m}" ${m === mode ? 'selected' : ''}>${esc(CONFIRM_MODE_LABELS[m])}</option>`).join('')}</select>
+    <div class="cf-agent" style="margin-top:8px;${mode === 'agent' ? '' : 'display:none'}">${renderAgentField(f, own, inherited)}</div>
+  </div>`;
+}
+
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
 
@@ -301,6 +317,33 @@ function collectForm(root, fields) {
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       // include only if the agent differs from inherited OR a resume was chosen
       if (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))) out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'confirmer') {
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+      const mode = box.querySelector('.cf-mode').value;
+      const spec = { mode };
+      let resumeFrom;
+      if (mode === 'agent') {
+        const ab = box.querySelector('.agent-field');
+        spec.provider = ab.querySelector('.af-provider').value;
+        const model = ab.querySelector('.af-model').value.trim();
+        const effort = ab.querySelector('.af-effort').value;
+        if (model) spec.model = model;
+        if (effort) spec.effort = effort;
+        const sessionId = ab.querySelector('.af-resume-session').value.trim();
+        const chosen = ab.querySelector('.af-resume-chosen').textContent.trim();
+        if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
+        if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+        if (resumeFrom) spec.resumeFrom = resumeFrom;
+      }
+      // Store only when it differs from the inherited default: a different mode, or (in
+      // agent mode) a different agent config or a chosen fork.
+      const inhMode = inh?.mode || 'human';
+      const changed = mode !== inhMode || (mode === 'agent' && (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))));
+      if (f.required || changed) out[f.name] = spec;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -370,6 +413,14 @@ function wireAgentFields(root) {
     const results = box.querySelector('.af-resume-results');
     search?.addEventListener('input', () => resumeSearch(box, search.value, results));
   });
+  // Confirmer fields: show the agent sub-form only when mode is "agent".
+  root.querySelectorAll('.confirmer-field').forEach((box) => {
+    const mode = box.querySelector('.cf-mode');
+    const agentBox = box.querySelector('.cf-agent');
+    mode?.addEventListener('change', () => {
+      if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
+    });
+  });
 }
 
 // Wire per-field "Reset to default" buttons: show the button whenever the field
@@ -387,6 +438,12 @@ function wireFieldResets(root, fields) {
       box.addEventListener('input', sync);
       box.addEventListener('change', sync);
       btn.addEventListener('click', () => { resetAgentField(box); sync(); });
+    } else if (f.type === 'confirmer') {
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      box.addEventListener('input', sync);
+      box.addEventListener('change', sync);
+      btn.addEventListener('click', () => { resetConfirmerField(box); sync(); });
     } else {
       const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
       if (!el) continue;
@@ -407,6 +464,21 @@ function fieldOverridden(root, f) {
     const spec = { provider: box.querySelector('.af-provider').value };
     const model = box.querySelector('.af-model').value.trim();
     const effort = box.querySelector('.af-effort').value;
+    if (model) spec.model = model;
+    if (effort) spec.effort = effort;
+    return !sameJson(normSpec(spec), normSpec(inh));
+  }
+  if (f.type === 'confirmer') {
+    const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+    if (!box) return false;
+    const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+    const mode = box.querySelector('.cf-mode').value;
+    if (mode !== (inh?.mode || 'human')) return true;
+    if (mode !== 'agent') return false;
+    const ab = box.querySelector('.agent-field');
+    const spec = { provider: ab.querySelector('.af-provider').value };
+    const model = ab.querySelector('.af-model').value.trim();
+    const effort = ab.querySelector('.af-effort').value;
     if (model) spec.model = model;
     if (effort) spec.effort = effort;
     return !sameJson(normSpec(spec), normSpec(inh));
@@ -440,6 +512,16 @@ function resetAgentField(box) {
   refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
   const eff = box.querySelector('.af-effort');
   if (eff && inh.effort) eff.value = inh.effort;
+}
+
+function resetConfirmerField(box) {
+  const inh = JSON.parse(box.getAttribute('data-inherit') || 'null') || {};
+  const mode = box.querySelector('.cf-mode');
+  mode.value = inh.mode || 'human';
+  const agentBox = box.querySelector('.cf-agent');
+  if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
+  const ab = box.querySelector('.agent-field');
+  if (ab) resetAgentField(ab);
 }
 
 // Full task list (incl. archived) for the fork picker, cached per project.
@@ -865,11 +947,21 @@ function taskRow(t) {
         <div class="task-sub">
           <span class="wf">${esc(t.workflow)}</span>
           ${v.branch ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          <span class="chip ${status}">${esc(stage)}</span>
+          <span class="chip ${status}">${esc(stageLabel(v))}</span>
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
     </div>`;
+}
+
+// Human-facing stage label. In the `merge` stage a task is either waiting for
+// its merge-queue slot or actively merging — the merge agent only runs once the
+// slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
+// "merge queued" for the wait, which the raw `stage` alone hides.
+function stageLabel(v) {
+  const stage = v.stage || 'setup';
+  if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
+  return stage;
 }
 
 // The workflow's declared stages (SPEC §5), or the software-dev default.
@@ -934,7 +1026,14 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      // Deleting a draft is a hard delete with no undo, so confirm first.
+      const title = S.tasks.find((t) => t.id === b.dataset.deldraft)?.title || 'this draft';
+      if (!confirm(`Delete draft "${title}"? This cannot be undone.`)) return;
+      await deleteDraft(b.dataset.deldraft);
+      toast('Draft removed');
+    }),
   );
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
@@ -1249,7 +1348,7 @@ function renderDrawer() {
         <div class="row1">
           ${v.num != null ? `<span class="task-num" title="Task #${v.num}${(() => { const p = projectById(S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId); return p ? ` — permalink /projects/${projectSlug(p)}/tasks/${v.num}` : ''; })()}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          <span class="chip ${v.status}">${esc(v.stage)}</span>
+          <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
           <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
@@ -1450,7 +1549,9 @@ function waitingLabel(w) {
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
+    case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'parent': return 'the parent task to respond';
+    case 'confirm': return 'the confirm agent to review';
     default: return w.detail || w.kind;
   }
 }
@@ -1940,12 +2041,14 @@ function queueView() {
     .map((t) => {
       const v = t.lastView || {};
       const pos = v.mergeQueue?.position;
-      const current = pos === 0;
-      return `<div class="queue-item ${current ? 'current' : ''}" data-id="${t.id}">
-        <span class="pos">${pos === 0 ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
+      // Holds the slot (merge agent running) only when granted — not merely at
+      // position 0 in a queue whose slot is still held by someone else.
+      const merging = !!v.state?.mergeGranted;
+      return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}">
+        <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
+        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
-        ${!current && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
+        ${!merging && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
       </div>`;
     })
     .join('');
