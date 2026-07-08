@@ -223,7 +223,18 @@ export class ClaudeAdapter implements AgentAdapter {
           if (tool === 'Bash' && typeof toolInput?.command === 'string') ctx.emit(`$ ${toolInput.command}`);
           return { behavior: 'allow' as const, updatedInput: toolInput };
         },
-        systemPrompt: input.systemPrompt,
+        // Run on TOP of Claude Code's own system prompt, not instead of it. A bare
+        // string here is a *custom* prompt that REPLACES the default (SDK docs:
+        // "string - Use a custom system prompt"), stripping the claude_code harness
+        // scaffolding — the persistence/anti-preamble conditioning that makes the CLI
+        // keep working through "I'll apply the edit now."-style narration instead of
+        // ending the turn. Without it the model reverts to conversational-assistant
+        // behavior: it narrates intent, emits no tool call, and the SDK query ends —
+        // which karmax records as a finished turn with completed:false → needsInput →
+        // Review with an empty diff (the "agent just stopped" reports, only in karmax
+        // and never in the CLI, because the CLI always runs this preset). We keep
+        // karmax's own task/tooling instructions by APPENDING them to the preset.
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: input.systemPrompt },
         ...(input.profile.model ? { model: input.profile.model } : {}),
         // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models
         // that don't support the level, so no gating is needed here.
