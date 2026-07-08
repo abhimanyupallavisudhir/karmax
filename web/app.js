@@ -865,11 +865,21 @@ function taskRow(t) {
         <div class="task-sub">
           <span class="wf">${esc(t.workflow)}</span>
           ${v.branch ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          <span class="chip ${status}">${esc(stage)}</span>
+          <span class="chip ${status}">${esc(stageLabel(v))}</span>
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
     </div>`;
+}
+
+// Human-facing stage label. In the `merge` stage a task is either waiting for
+// its merge-queue slot or actively merging — the merge agent only runs once the
+// slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
+// "merge queued" for the wait, which the raw `stage` alone hides.
+function stageLabel(v) {
+  const stage = v.stage || 'setup';
+  if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
+  return stage;
 }
 
 // The workflow's declared stages (SPEC §5), or the software-dev default.
@@ -934,7 +944,14 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      // Deleting a draft is a hard delete with no undo, so confirm first.
+      const title = S.tasks.find((t) => t.id === b.dataset.deldraft)?.title || 'this draft';
+      if (!confirm(`Delete draft "${title}"? This cannot be undone.`)) return;
+      await deleteDraft(b.dataset.deldraft);
+      toast('Draft removed');
+    }),
   );
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
@@ -1249,7 +1266,7 @@ function renderDrawer() {
         <div class="row1">
           ${v.num != null ? `<span class="task-num" title="Task #${v.num}${(() => { const p = projectById(S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId); return p ? ` — permalink /projects/${projectSlug(p)}/tasks/${v.num}` : ''; })()}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          <span class="chip ${v.status}">${esc(v.stage)}</span>
+          <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
           <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
@@ -1450,6 +1467,7 @@ function waitingLabel(w) {
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
+    case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'parent': return 'the parent task to respond';
     default: return w.detail || w.kind;
   }
@@ -1940,12 +1958,14 @@ function queueView() {
     .map((t) => {
       const v = t.lastView || {};
       const pos = v.mergeQueue?.position;
-      const current = pos === 0;
-      return `<div class="queue-item ${current ? 'current' : ''}" data-id="${t.id}">
-        <span class="pos">${pos === 0 ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
+      // Holds the slot (merge agent running) only when granted — not merely at
+      // position 0 in a queue whose slot is still held by someone else.
+      const merging = !!v.state?.mergeGranted;
+      return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}">
+        <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
+        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
-        ${!current && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
+        ${!merging && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
       </div>`;
     })
     .join('');

@@ -92,6 +92,10 @@ export interface SoftwareDevInput extends TaskInput {
    *  awaiting its response, so an unanswered raise never dead-parks the parent (SPEC
    *  §5.3 "keep prompting"). Overridable so tests don't wait the full interval. */
   subtaskNagMs?: number;
+  /** Backoff (ms) the task waits in Do before re-prompting an agent whose own in-harness
+   *  sub-agents were still running when its turn returned — interruptible by a human
+   *  follow-up. Overridable so tests don't wait the full interval. */
+  subagentWaitMs?: number;
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
@@ -105,6 +109,14 @@ const MAX_TOTAL_SUBTASKS = 50;
 /** Default re-prompt cadence for a parent holding an unanswered child raise (SPEC §5.3).
  *  Bounds the subtask-wait so an ignored raise re-enters Do instead of parking forever. */
 const DEFAULT_SUBTASK_NAG_MS = 60_000;
+/** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
+ *  Task tool) are still running. We hold in Do and re-prompt so it waits for them,
+ *  but bound the re-prompts so a wedged sub-agent can't park the task forever. */
+const MAX_SUBAGENT_NUDGES = 5;
+/** Backoff before re-prompting an agent still waiting on its in-harness sub-agents.
+ *  Avoids a hot re-prompt loop and gives the waiting state a visible dwell; a human
+ *  follow-up wakes it early. Overridable via `input.subagentWaitMs`. */
+const DEFAULT_SUBAGENT_WAIT_MS = 10_000;
 
 /**
  * The merge-queue serialization domains for a task — one `<repo>:<target>` per
@@ -161,6 +173,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let error: string | undefined;
   let pr: { url: string; number: number } | undefined;
   let mergeQueuePos: { position: number; total: number } | undefined;
+  // How many times we've re-prompted the agent to wait for its own in-harness
+  // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
+  let subagentNudges = 0;
   const subTaskIds: string[] = [];
   // Sub-task hierarchy (SPEC §5.3). Children are managed, not blindly awaited: their
   // handles let us await completion, raised requests queue in `raises`, settlements in
@@ -890,6 +905,41 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     // No children outstanding.
     if (turn.waitForSubtasks) continue; // nothing to wait for → just take another turn
 
+    // The agent's OWN in-harness sub-agents (Claude Agent SDK Task tool) may still be
+    // running when its turn returned — Claude Code auto-backgrounds long sub-agents, so
+    // the turn can come back "done" while a sub-agent is still working. Completion is
+    // "done AND not waiting on any sub-agents", so don't advance to Review yet: hold in
+    // Do and re-prompt so the agent waits for them and folds in their results before
+    // finishing. Bounded (MAX_SUBAGENT_NUDGES) so a wedged sub-agent can't park forever.
+    if (turn.pendingSubagents && subagentNudges < MAX_SUBAGENT_NUDGES) {
+      subagentNudges++;
+      status = 'waiting';
+      waitingFor = { kind: 'subagent', detail: `${turn.pendingSubagents} sub-agent(s) still running` };
+      await publish();
+      // Back off before re-prompting (avoids a hot loop of subprocess spawns), but stay
+      // redirectable: a human follow-up or a cancel wakes us early.
+      await condition(() => cancelled || msgs.length > seen, input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
+      if (cancelled) return await abort();
+      // Unless a human already redirected us this wait, nudge the agent to wait for its
+      // sub-agents and fold in their results before signalling completion.
+      if (msgs.length === seen) {
+        msgs.push({
+          id: `sa-${msgs.length}`,
+          role: 'user',
+          text: 'Your sub-agents are still running. Wait for all of them to finish, incorporate their results, then call signal_completion.',
+          ts: msgs.length,
+        });
+      }
+      stage = 'do';
+      status = 'active';
+      continue;
+    }
+    // Fell through with sub-agents still reported running ⇒ the nudge budget is spent.
+    // We proceed to Review (liveness over parking), but surface it so the reviewer knows
+    // the work may be missing a wedged sub-agent's output rather than being truly done.
+    const gaveUpOnSubagents = !!turn.pendingSubagents && subagentNudges >= MAX_SUBAGENT_NUDGES;
+    subagentNudges = 0; // sub-agents settled (or nudge budget spent) → reset for next Do phase
+
     {
       // Goal mode: keep nudging the agent until it signals structured completion
       // (unless it's explicitly raising to its parent, which needs an answer).
@@ -918,6 +968,12 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       }
       // An explicit raise carries its own message; show it as the review summary.
       if (turn.raise?.detail) reviewInfo = { ...reviewInfo, summary: turn.raise.detail };
+      // We stopped waiting on still-running sub-agents (budget spent) — prepend a note so
+      // the reviewer knows this reached Review with delegated work possibly incomplete.
+      if (gaveUpOnSubagents) {
+        const note = `⚠️ Proceeded to Review with ${turn.pendingSubagents} sub-agent(s) still reported running after ${MAX_SUBAGENT_NUDGES} waits — a sub-agent may be wedged and its output missing.`;
+        reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
+      }
       stage = 'review';
       status = 'waiting';
       if (input.autoConfirm) {
