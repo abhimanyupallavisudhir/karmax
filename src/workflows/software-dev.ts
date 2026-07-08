@@ -673,6 +673,13 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
    *  the running conversation. Shared by the main loop and sub-task management. */
   async function doTurn() {
     let doHome: string | undefined;
+    // How many leading `msgs` were actually handed to the agent this turn. Captured
+    // at activity-schedule time (the instant Temporal snapshots the args) — NOT after
+    // the turn — so a follow-up that arrives WHILE the turn runs is not mistaken for
+    // "already delivered". Advancing `seen` to `msgs.length` afterwards was the bug:
+    // a mid-turn follow-up landed in `msgs` but got marked consumed, so it silently
+    // never reached the agent (SPEC §5.6 — a queued follow-up must reach the agent).
+    let deliveredNow = seen;
     const turn = await withResolve('do', () =>
       leasedTurn('do', (accountConfigHome, accountApiKeyHandle) => {
         doHome = accountConfigHome ?? '(profile)';
@@ -681,6 +688,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         // (everything delivered on prior turns), so send only the delta after them —
         // a follow-up reaches the agent as a follow-up, not the whole conversation.
         const resume = sessionMatchesHome(accountConfigHome) ? session : undefined;
+        deliveredNow = msgs.length; // everything queued up to this instant is delivered
         return turns.runAgentTurn({
           taskId,
           role: 'do',
@@ -696,8 +704,15 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     );
     session = turn.session ?? session;
     sessionHome = doHome ?? sessionHome;
-    if (turn.output?.trim()) msgs.push({ id: `a${msgs.length}`, role: 'agent', text: turn.output, ts: msgs.length });
-    seen = msgs.length;
+    // Insert the agent's reply at the delivered boundary — BEFORE any follow-up that
+    // arrived while the turn was running. This keeps the transcript honest (the reply
+    // follows the messages it actually answered) and, crucially, leaves that follow-up
+    // AFTER `seen`, so the NEXT turn delivers it instead of skipping past it.
+    if (turn.output?.trim()) {
+      msgs.splice(deliveredNow, 0, { id: `a${deliveredNow}`, role: 'agent', text: turn.output, ts: deliveredNow });
+      deliveredNow += 1;
+    }
+    seen = deliveredNow;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     return turn;
   }
