@@ -1,5 +1,8 @@
 // Verifies captureFocus/restoreFocus (in app.js) preserve a mid-typed field's
-// value + caret across a renderMain() innerHTML swap. Run: node web/focus-preserve.test.js
+// value + caret across a renderMain() innerHTML swap, and that the follow-up
+// variants keep the drawer's send-message box focused/in-view across a
+// renderDrawer() re-render (instead of jumping to the top).
+// Run: node web/focus-preserve.test.cjs
 const fs = require('fs');
 const path = require('path');
 
@@ -35,6 +38,8 @@ global.document = { get activeElement() { return ROOT._active; } };
 
 eval(extractFn('captureFocus'));
 eval(extractFn('restoreFocus'));
+eval(extractFn('captureFollowupFocus'));
+eval(extractFn('restoreFollowupFocus'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
@@ -88,6 +93,54 @@ ROOT._newSel = newSel;
 ROOT.querySelector = () => ROOT._newSel;
 restoreFocus(ROOT, selSt);
 ok(newSel._focused === true, 'select regains focus');
+
+// ── Follow-up box: refresh (after send) must keep the box focused, not jump to top ──
+// A textarea keyed by agent role, not an id, so captureFocus ignores it and the
+// dedicated follow-up helpers must carry focus/caret across the drawer re-render.
+function makeFollowup(role, value) {
+  const ta = {
+    tagName: 'TEXTAREA', value, disabled: false, selectionStart: value.length, selectionEnd: value.length,
+    _focused: false,
+    classList: { contains: (c) => c === 'followup-input' },
+    closest: (sel) => (sel === '.followup-box' ? ta._box : null),
+    focus() { this._focused = true; ROOT._active = this; },
+    setSelectionRange(a, b) { this.selectionStart = a; this.selectionEnd = b; },
+    querySelector: (sel) => (sel === '.followup-input' ? ta : null),
+  };
+  ta._box = { dataset: { role }, querySelector: ta.querySelector };
+  return ta;
+}
+
+// Scenario A: Ctrl-Enter send leaves focus in the (now-empty) box; refresh re-focuses it.
+const sentBox = makeFollowup('do', ''); // value cleared on send
+ROOT = { _active: sentBox, contains: (el) => el === sentBox || el === ROOT._new,
+  querySelector: () => ROOT._new._box };
+const fuSt = captureFollowupFocus(ROOT);
+ok(fuSt && fuSt.role === 'do', 'captures focused follow-up box by role');
+
+const freshBox = makeFollowup('do', '');
+ROOT._new = freshBox;
+ROOT._active = null; // innerHTML swap dropped focus
+restoreFollowupFocus(ROOT, fuSt);
+ok(freshBox._focused === true, 'refresh re-focuses the follow-up box (no jump to top)');
+
+// Scenario B: background refresh mid-typing carries the half-typed value over.
+const typing = makeFollowup('merge', 'please also update the ');
+ROOT = { _active: typing, contains: (el) => el === typing || el === ROOT._new,
+  querySelector: () => ROOT._new._box };
+const typSt = captureFollowupFocus(ROOT);
+const emptyFresh = makeFollowup('merge', '');
+ROOT._new = emptyFresh;
+ROOT._active = null;
+restoreFollowupFocus(ROOT, typSt);
+ok(emptyFresh.value === 'please also update the ', 'carries half-typed follow-up across refresh');
+ok(emptyFresh._focused === true, 'and keeps the box focused');
+
+// Scenario C: nothing follow-up focused → null snapshot, safe no-op restore.
+ROOT = { _active: null, contains: () => false };
+ok(captureFollowupFocus(ROOT) === null, 'no follow-up focus → null snapshot');
+restoreFollowupFocus(ROOT, null);
+ok(true, 'restoreFollowupFocus(null) is a safe no-op');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
