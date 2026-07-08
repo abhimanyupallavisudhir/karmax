@@ -1,6 +1,6 @@
 import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
-import { Provider, ReviewInfo, SubTaskResponse, RaiseToParent } from '../domain/types.js';
+import { Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
 
@@ -39,6 +39,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let completed = false;
   let reviewInfo: ReviewInfo | undefined;
   let resolution: Transition | undefined;
+  let confirmDecision: ConfirmDecision | undefined;
   let raise: RaiseToParent | undefined;
   let waitForSubtasks = false;
   const subTasks: { title: string; prompt: string }[] = [];
@@ -53,6 +54,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     resolveDecision(t) {
       resolution = t;
       completed = true; // a decision ends the resolve turn
+    },
+    confirmDecision(d) {
+      confirmDecision = d;
+      completed = true; // a verdict ends the confirm turn
     },
     createReviewInfo(info) {
       reviewInfo = { ...reviewInfo, ...info };
@@ -122,6 +127,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     output: turn.output,
     reviewInfo,
     resolution,
+    confirmDecision,
     raise,
     waitForSubtasks,
     subTasks: subTasks.length ? subTasks : undefined,

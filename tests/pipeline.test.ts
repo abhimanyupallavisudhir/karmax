@@ -135,6 +135,49 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('hi there');
   });
 
+  it('confirm=auto: lands the work without any human confirmation', async () => {
+    const repo = await h.makeRepo('auto');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'Auto', prompt: 'Do it.\n@write a.txt :: auto\n@review done' }),
+          confirm: { mode: 'auto' },
+        },
+      ],
+    });
+    // No `confirm` signal is ever sent — auto mode confirms itself and merges.
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:a.txt'])).stdout).toContain('auto');
+  });
+
+  it('confirm=agent: a Confirm agent reviews and confirms, no human in the loop', async () => {
+    const repo = await h.makeRepo('confirmer');
+    const taskId = newId('task');
+    // The Confirm-agent prompt embeds the original task prompt, so the mock confirm
+    // agent sees `@confirm confirm` on its own line and returns that verdict.
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'AgentConfirm', prompt: 'Ship it.\n@write b.txt :: reviewed\n@review please review\n@confirm confirm' }),
+          confirm: { mode: 'agent', provider: 'mock' },
+        },
+      ],
+    });
+    // No human `confirm` signal — the Confirm agent's verdict drives it to done.
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:b.txt'])).stdout).toContain('reviewed');
+    // The Confirm agent's transcript is surfaced as its own role.
+    const v = await view(handle).catch(() => undefined);
+    if (v?.transcripts) expect(v.transcripts.some((t: any) => t.role === 'confirm')).toBe(true);
+  });
+
   it('escalates with a clear error when the project repo is misconfigured (no silent scratch)', async () => {
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {

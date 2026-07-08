@@ -1,4 +1,4 @@
-import { AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent } from '../domain/types.js';
+import { AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
@@ -33,6 +33,9 @@ export interface PlatformToolContext {
    *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
    *  instead of guessing. Also marks the resolve turn complete. */
   resolveDecision(t: Transition): void;
+  /** Confirm agent's structured verdict at the Review gate (SPEC §5.2): confirm /
+   *  revise (back to Do with a comment) / reject (cancel). Ends the confirm turn. */
+  confirmDecision(d: ConfirmDecision): void;
   /** Request a payment against the budget lease (SPEC §7.6). Returns the outcome:
    *  granted (charged) | needs_approval | needs_funding | denied. */
   requestSpend(args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -113,6 +116,8 @@ export interface TurnResult {
   error?: string;
   /** The Resolve agent's structured recovery decision (RESOLVE-PLAN §3.2). */
   resolution?: Transition;
+  /** The Confirm agent's Review-gate verdict (SPEC §5.2). */
+  confirmDecision?: ConfirmDecision;
 }
 
 export type { AgentProfile, AgentRole, Provider, Message, ReviewInfo };
