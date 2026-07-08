@@ -905,7 +905,14 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       if (turn.raise?.detail) reviewInfo = { ...reviewInfo, summary: turn.raise.detail };
       stage = 'review';
       status = 'waiting';
-      if (input.autoConfirm) {
+      if (input.autoConfirm && (turn.completed || turn.raise)) {
+        // Auto-confirm only a turn that actually finished its work (or is explicitly
+        // raising for a decision) — never a bare needsInput stall, which would push a
+        // zero-/partial-work diff straight through to merge unseen. Today autoConfirm
+        // is only ever set alongside goalMode, whose loop above already guarantees
+        // completed|raise here, so this is a replay-safe belt-and-suspenders guard: it
+        // changes no reachable path now, but stops a future autoConfirm-without-goalMode
+        // caller from silently merging an empty turn.
         confirmed = true;
       } else if (input.parentTaskId) {
         // Parent-as-confirmer (SPEC §5.3): raise to the parent instead of blocking on

@@ -81,7 +81,10 @@ export class ClaudeAdapter implements AgentAdapter {
         },
         body: JSON.stringify({
           model,
-          max_tokens: 4096,
+          // A whole coding response (a rewritten file, a long explanation + tool call)
+          // can exceed 4096 output tokens; too low a cap truncates mid-response, which
+          // the loop below then has to recover from. 8192 keeps most turns single-shot.
+          max_tokens: 8192,
           system: input.systemPrompt,
           messages,
           tools,
@@ -99,7 +102,19 @@ export class ClaudeAdapter implements AgentAdapter {
         finalText = text;
         ctx.emit(text);
       }
-      if (toolUses.length === 0) break;
+      if (toolUses.length === 0) {
+        // A `max_tokens` cut-off is a TRUNCATED response, not a finished turn — the
+        // model ran out of output budget mid-thought (often right after narrating an
+        // action, before emitting its tool_use). Breaking here treats that chopped-off
+        // preamble as completion, which surfaces the task at Review having done nothing
+        // — the metered-path twin of the "agent just stopped" bug. Ask it to continue
+        // instead; the enclosing maxIters loop bounds this so it can't spin forever.
+        if (data.stop_reason === 'max_tokens') {
+          messages.push({ role: 'user', content: 'Continue.' });
+          continue;
+        }
+        break;
+      }
 
       const toolResults: any[] = [];
       let completed = false;
