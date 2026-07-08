@@ -1467,6 +1467,7 @@ function waitingLabel(w) {
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
+    case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'parent': return 'the parent task to respond';
     default: return w.detail || w.kind;
   }

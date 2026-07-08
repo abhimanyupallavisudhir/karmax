@@ -6,7 +6,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 
-function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number }) {
+function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number }) {
   return {
     taskId: over.taskId,
     projectId: 'p1',
@@ -16,6 +16,7 @@ function input(over: { taskId: string; repo: string; prompt: string; title?: str
     target: 'main',
     project: { repos: [over.repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
     ...(over.subtaskNagMs !== undefined ? { subtaskNagMs: over.subtaskNagMs } : {}),
+    ...(over.subagentWaitMs !== undefined ? { subagentWaitMs: over.subagentWaitMs } : {}),
   };
 }
 const view = (h: any) => h.query('view') as Promise<any>;
@@ -399,6 +400,58 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:child.txt'])).stdout).toContain('from child');
     void childId;
   }, 90_000);
+
+  it('holds Do→Review while the agent is still waiting on its own in-harness sub-agents (Task tool)', async () => {
+    const repo = await h.makeRepo('app-subagents');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // The agent does its work and signals completion in turn one, but reports that
+      // several in-harness sub-agents (Claude Agent SDK Task tool) are still running.
+      // Completion is "done AND not waiting on any sub-agents", so it must NOT advance
+      // to Review — it is held in Do (waitingFor 'subagent') until the count drains.
+      args: [input({ taskId, repo, title: 'Subagents', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@subagents 3', subagentWaitMs: 1500 })],
+    });
+
+    // It surfaces as held-in-Do, waiting on its sub-agents — NOT advanced to Review.
+    await expect
+      .poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind ?? '-'}`; }, { timeout: 20_000 })
+      .toBe('do/subagent');
+    // …and nothing has advanced to Review/Merge while it waits.
+    expect((await git(repo, ['show', 'main:out.txt'])).code).not.toBe(0);
+
+    // Once the sub-agents drain (count → 0), it advances to Review on its own.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    // the work landed only after the sub-agents were done
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
+
+  it('gives up on a wedged sub-agent after the nudge budget, and surfaces a Review note', async () => {
+    const repo = await h.makeRepo('app-subagents-wedged');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // 8 sub-agents drain by one per turn — more than MAX_SUBAGENT_NUDGES (5), so the
+      // count is still > 0 when the budget is spent. The task must then proceed to
+      // Review (liveness, never park forever) with a note that a sub-agent may be wedged.
+      args: [input({ taskId, repo, title: 'Wedged', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@subagents 8', subagentWaitMs: 300 })],
+    });
+
+    // It advances to Review despite sub-agents still being reported as running…
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const review = await view(handle);
+    // …and the reviewer is told why (a sub-agent may be wedged and its output missing).
+    expect(review.reviewInfo?.summary).toContain('sub-agent(s) still reported running');
+    expect(review.reviewInfo?.summary).toContain('may be wedged');
+
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
 
   it('cancels running sub-task agents when the parent is cancelled (SPEC §5.6)', async () => {
     const repo = await h.makeRepo('app-sub-cancel');
