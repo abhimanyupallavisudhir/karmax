@@ -944,7 +944,14 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      // Deleting a draft is a hard delete with no undo, so confirm first.
+      const title = S.tasks.find((t) => t.id === b.dataset.deldraft)?.title || 'this draft';
+      if (!confirm(`Delete draft "${title}"? This cannot be undone.`)) return;
+      await deleteDraft(b.dataset.deldraft);
+      toast('Draft removed');
+    }),
   );
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
