@@ -106,6 +106,21 @@ const MAX_TOTAL_SUBTASKS = 50;
 const DEFAULT_SUBTASK_NAG_MS = 60_000;
 
 /**
+ * The merge-queue serialization domains for a task — one `<repo>:<target>` per
+ * repo the world touches, returned in a GLOBAL total order (sorted, deduped).
+ *
+ * Acquiring the per-repo slots in this order is what keeps concurrent multi-repo
+ * merges deadlock-free (SPEC §6.1, lock ordering). Because every task requests
+ * shared repos in the same sequence, a task only ever waits for a domain ordered
+ * after everything it already holds — so the "waits-for" graph can't cycle. (A
+ * scratch or single-repo world yields one domain, exactly as before.)
+ */
+function mergeDomains(world: WorldHandleLike | undefined, target: string, projectId: string): string[] {
+  const repos = world?.repos?.length ? world.repos.map((r) => r.repo) : world?.repo ? [world.repo] : [projectId];
+  return [...new Set(repos.map((r) => `${r}:${target}`))].sort();
+}
+
+/**
  * Internal sentinel for cancellation. Throwing a plain Error out of workflow
  * code triggers a workflow-TASK failure that Temporal retries forever; we never
  * do that. Cancellation is caught and routed to a graceful `abort()`.
@@ -125,7 +140,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = input.prompt ? [{ id: 'm0', role: 'user', text: input.prompt, ts: 0 }] : [];
+  const msgs: Message[] = input.prompt || input.images?.length
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+    : [];
   let target = input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let confirmed = false;
@@ -283,7 +300,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         worldReady: !!world,
         mergeGranted,
         targetLocked,
-        mergeDomain: world ? `${world.repo ?? input.projectId}:${target}` : undefined,
+        mergeDomain: world ? mergeDomains(world, target, input.projectId)[0] : undefined,
       },
       branch: world?.branch,
       base,
@@ -728,7 +745,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // ── Setup ──
   await publish();
   world = (await withResolve('setup', () =>
-    core.createWorld({ taskId, repo: input.project.repos?.[0], base, target, copyGlobs: input.project.copyGlobs, kind }),
+    core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, kind }),
   )) as WorldHandleLike;
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
   accountPool = await coord.accountPoolSize().catch(() => 0);
@@ -867,16 +884,33 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     await publish();
     if (cancelled) return await abort();
 
-    const domain = `${world!.repo ?? input.projectId}:${target}`;
-    await coord.enqueueMerge(domain, taskId);
-    // Wait for the grant; allow cancel only before it.
-    while (!mergeGranted && !cancelled) {
-      mergeQueuePos = await coord.mergeQueuePosition(domain, taskId);
-      await publish();
-      await condition(() => mergeGranted || cancelled, '5s');
+    // Acquire the merge slot for EVERY repo this task touches, one at a time in a
+    // fixed global order (sorted). Ordered acquisition is what makes concurrent
+    // multi-repo merges deadlock-free (SPEC §6.1): all tasks request shared repos
+    // in the same sequence, so the wait-for graph can't form a cycle. Acquiring
+    // sequentially (not all at once) also keeps the payload-less grant signal
+    // unambiguous — we only ever wait on a single coordinator at a time.
+    const domains = mergeDomains(world, target, input.projectId);
+    const held: string[] = [];
+    let acquireCancelled = false;
+    for (const domain of domains) {
+      mergeGranted = false;
+      await coord.enqueueMerge(domain, taskId);
+      // Wait for this domain's grant; allow cancel only before it.
+      while (!mergeGranted && !cancelled) {
+        mergeQueuePos = await coord.mergeQueuePosition(domain, taskId);
+        await publish();
+        await condition(() => mergeGranted || cancelled, '5s');
+      }
+      if (cancelled && !mergeGranted) {
+        await coord.cancelMerge(domain, taskId); // drop the slot we're still waiting on
+        acquireCancelled = true;
+        break;
+      }
+      held.push(domain);
     }
-    if (cancelled && !mergeGranted) {
-      await coord.cancelMerge(domain, taskId);
+    if (acquireCancelled) {
+      for (const d of held) await coord.releaseMerge(d, taskId); // release every slot already held
       return await abort();
     }
     mergeQueuePos = { position: 0, total: mergeQueuePos?.total ?? 1 };
@@ -921,7 +955,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     } catch (err) {
       result = { merged: false, landedFiles: [], note: String(err) };
     }
-    await coord.releaseMerge(domain, taskId);
+    for (const d of held) await coord.releaseMerge(d, taskId);
 
     if (result.merged) {
       sha = result.sha;

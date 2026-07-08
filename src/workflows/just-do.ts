@@ -34,7 +34,9 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = input.prompt ? [{ id: 'm0', role: 'user', text: input.prompt, ts: 0 }] : [];
+  const msgs: Message[] = input.prompt || input.images?.length
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+    : [];
   let confirmed = false;
   let cancelled = false;
   let world: WorldHandleLike | undefined;
@@ -72,7 +74,7 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   });
 
   await publish();
-  world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base, copyGlobs: input.project.copyGlobs, kind: 'worktree' })) as WorldHandleLike;
+  world = (await core.createWorld({ taskId, repos: input.project.repos, base, copyGlobs: input.project.copyGlobs, kind: 'worktree' })) as WorldHandleLike;
 
   let infraRetries = 0;
   for (stage = 'do'; ; ) {

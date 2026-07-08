@@ -63,6 +63,52 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
+  it('multi-repo: passes every configured repo to the agent and lands work in each', async () => {
+    // A project with TWO repos → one world with a worktree per repo (each a
+    // subdirectory named after the repo). The agent writes into both; the merge
+    // lands the work on main in BOTH source repos.
+    const fe = await h.makeRepo('frontend');
+    const be = await h.makeRepo('backend');
+    const feName = path.basename(fe);
+    const beName = path.basename(be);
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          taskId,
+          projectId: 'p1',
+          title: 'Wire frontend to backend',
+          prompt:
+            `Add a client and a server.\n` +
+            `@write ${feName}/client.js :: export const call = () => fetch('/api');\n` +
+            `@write ${beName}/server.js :: export const serve = () => 'ok';\n` +
+            `@review Added client.js (frontend) and server.js (backend)`,
+          base: 'main',
+          target: 'main',
+          project: { repos: [fe, be], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+        },
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+
+    // the work really landed on main in EACH source repo
+    const feFile = await git(fe, ['show', 'main:client.js']);
+    expect(feFile.code).toBe(0);
+    expect(feFile.stdout).toContain('fetch');
+    const beFile = await git(be, ['show', 'main:server.js']);
+    expect(beFile.code).toBe(0);
+    expect(beFile.stdout).toContain('serve');
+    // and a real merge commit exists in each repo (point of no return, per repo)
+    expect((await git(fe, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
+    expect((await git(be, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
+  });
+
   it('returns to Do on a follow-up, then merges after confirm', async () => {
     const repo = await h.makeRepo('app2');
     const taskId = newId('task');
@@ -455,5 +501,71 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const f1 = await git(repo, ['show', 'main:file1.txt']);
     expect(f0.stdout).toContain('content 0');
     expect(f1.stdout).toContain('content 1');
+  });
+
+  it('multi-repo merge queue: three pairwise-overlapping tasks drain without deadlock (ordered acquisition)', async () => {
+    // The classic circular-wait setup (dining philosophers): three repos, three
+    // tasks each touching a different PAIR — A&B, A&C, B&C. A naive "grab a slot
+    // in every repo's queue at once" scheme can deadlock (each task holds one
+    // repo and waits on another in a cycle). Ordered acquisition (sorted repo
+    // order, one at a time) makes a cycle impossible, so all three must finish.
+    const A = await h.makeRepo('repoA');
+    const B = await h.makeRepo('repoB');
+    const C = await h.makeRepo('repoC');
+    const nm = (r: string) => path.basename(r);
+
+    const specs = [
+      { label: 'AB', repos: [A, B] },
+      { label: 'AC', repos: [A, C] },
+      { label: 'BC', repos: [B, C] },
+    ];
+    const started = specs.map((s) => {
+      const taskId = newId('task');
+      // write a distinct file into each of the task's two repos
+      const prompt =
+        s.repos.map((r) => `@write ${nm(r)}/from-${s.label}.txt :: ${s.label} in ${nm(r)}`).join('\n') +
+        `\n@review ${s.label} touched ${s.repos.map(nm).join(' + ')}`;
+      const handle = h.client.workflow.start('softwareDev', {
+        taskQueue: TASK_QUEUE,
+        workflowId: taskId,
+        args: [
+          {
+            taskId,
+            projectId: 'p1',
+            title: `task ${s.label}`,
+            prompt,
+            base: 'main',
+            target: 'main',
+            project: { repos: s.repos, defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+          },
+        ],
+      });
+      return { s, taskId, handle };
+    });
+    const runs = await Promise.all(started.map(async (r) => ({ ...r, handle: await r.handle })));
+
+    // Drive every task to Review and confirm — they now all contend at Merge.
+    for (const r of runs) {
+      await expect.poll(async () => (await view(r.handle)).stage, { timeout: 20_000 }).toBe('review');
+    }
+    for (const r of runs) await r.handle.signal('confirm');
+
+    // If ordered acquisition were wrong, the shared queues would deadlock and
+    // these never resolve — the result() await is the deadlock detector.
+    const results = await Promise.all(runs.map((r) => r.handle.result()));
+    for (const res of results) expect(res.stage).toBe('done');
+
+    // Every repo received the work from BOTH tasks that touched it, landed on main.
+    for (const [repo, labels] of [
+      [A, ['AB', 'AC']],
+      [B, ['AB', 'BC']],
+      [C, ['AC', 'BC']],
+    ] as const) {
+      for (const label of labels) {
+        const shown = await git(repo, ['show', `main:from-${label}.txt`]);
+        expect(shown.code, `from-${label}.txt should be on main of ${path.basename(repo)}`).toBe(0);
+        expect(shown.stdout).toContain(label);
+      }
+    }
   });
 });

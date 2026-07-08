@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { World } from './types.js';
+import { World, WorldRepo, worldRepos } from './types.js';
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
 
 export interface MergeResult {
@@ -12,21 +12,41 @@ export interface MergeResult {
 }
 
 /**
- * The authoritative merge (SPEC §5.2 "Merge", the point of no return). Robust
- * by design: it commits any pending work on the attempt branch, brings the
- * target into the branch (surfacing conflicts), then lands the branch on the
- * target. This is the deterministic backstop that guarantees real work actually
- * lands — a prior build's showstopper was a merge stage that committed nothing.
- *
- * The merge into the target runs in whichever worktree has the target checked
- * out (git forbids checking a branch out twice); if none, a temporary worktree
- * is used and removed.
+ * The authoritative merge (SPEC §5.2 "Merge", the point of no return). For a
+ * multi-repo world it merges every repo, each into `target`, aggregating the
+ * landed files (prefixed by repo name) and stopping at the first conflict so the
+ * merge agent can resolve it and re-run — repos that already landed re-merge as
+ * no-ops, so the retry is safe (partial-merge recoverable, not atomic).
  */
 export async function finalizeMerge(world: World, target: string): Promise<MergeResult> {
-  const root = world.handle.root;
-  const repo = world.handle.repo;
-  const branch = world.handle.branch;
-  const base = world.handle.base;
+  const repos = worldRepos(world.handle);
+  if (!repos.length) return { merged: false, landedFiles: [], note: 'no source repo (non-git world)' };
+  if (repos.length === 1) return finalizeMergeRepo(repos[0]!, target, world.handle.id);
+
+  const landedFiles: string[] = [];
+  let sha: string | undefined;
+  for (const r of repos) {
+    const res = await finalizeMergeRepo(r, target, world.handle.id);
+    landedFiles.push(...res.landedFiles.map((f) => `${r.name}/${f}`));
+    if (!res.merged) {
+      return {
+        merged: false,
+        landedFiles,
+        conflict: res.conflict,
+        note: `repo "${r.name}": ${res.note ?? (res.conflict ? 'merge conflict' : 'merge failed')}`,
+      };
+    }
+    sha = res.sha;
+  }
+  return { merged: true, sha, landedFiles, note: `merged ${repos.length} repos into ${target}` };
+}
+
+/** Merge one repo's attempt branch into `target` (the per-repo primitive). */
+async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: string): Promise<MergeResult> {
+  const root = worldRepo.root;
+  const repo = worldRepo.repo;
+  const branch = worldRepo.branch;
+  const base = worldRepo.base;
   if (!repo) return { merged: false, landedFiles: [], note: 'no source repo (non-git world)' };
 
   await ensureIdentity(root);
@@ -52,7 +72,7 @@ export async function finalizeMerge(world: World, target: string): Promise<Merge
   //    below still rejects anything that would land conflict hunks as content.)
   if (await isDirty(root)) {
     await git(root, ['add', '-A']);
-    const c = await git(root, ['commit', '-q', '-m', `karmax: work for ${world.handle.id}`]);
+    const c = await git(root, ['commit', '-q', '-m', `karmax: work for ${worldId}`]);
     if (c.code !== 0 && !/nothing to commit/.test(c.stdout + c.stderr)) {
       return { merged: false, landedFiles: [], note: `commit failed: ${c.stderr || c.stdout}` };
     }
@@ -113,7 +133,7 @@ export async function finalizeMerge(world: World, target: string): Promise<Merge
     }
     dir = targetDir;
   } else {
-    const tmp = path.join(repo, '..', `.karmax-merge-${world.handle.id}`);
+    const tmp = path.join(repo, '..', `.karmax-merge-${worldId}-${worldRepo.name}`);
     if (fs.existsSync(tmp)) {
       await git(repo, ['worktree', 'remove', '--force', tmp]);
       fs.rmSync(tmp, { recursive: true, force: true });

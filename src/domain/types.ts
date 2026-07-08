@@ -77,6 +77,8 @@ export interface TaskRecord {
 
 export interface TaskParams {
   prompt: string;
+  /** Images attached to the initial prompt (references, never inline bytes). */
+  images?: ImageRef[];
   base?: string;
   target?: string;
   /** role -> profile id overrides. */
@@ -105,11 +107,27 @@ export type Stage =
 
 export type TaskStatus = 'active' | 'waiting' | 'blocked' | 'done' | 'failed' | 'cancelled';
 
+/**
+ * A reference to a user-attached image, stored content-addressed on disk under
+ * `$KARMAX_HOME/attachments/<id>` (SPEC — image prompts; PLAN_IMAGE_PROMPTS.md).
+ * Deliberately carries NO bytes: only this lightweight handle flows through
+ * Temporal workflow input/signals/history. Bytes are resolved back to base64
+ * (Claude/OpenAI APIs) or temp files (Codex CLI) at the activity boundary.
+ */
+export interface ImageRef {
+  /** Content hash (sha256, hex) — also the storage filename stem. */
+  id: string;
+  mediaType: string; // 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  bytes: number;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'agent' | 'system';
   text: string;
   ts: number;
+  /** User-attached images (references, never inline bytes). Absent ⇒ text-only. */
+  images?: ImageRef[];
 }
 
 export interface ReviewInfo {
@@ -293,6 +311,8 @@ export interface TaskInput {
   workflow?: string;
   title: string;
   prompt: string;
+  /** Images attached to the initial prompt (references, never inline bytes). */
+  images?: ImageRef[];
   base?: string;
   target?: string;
   /** Existing branch to merge (merge-only workflow). */

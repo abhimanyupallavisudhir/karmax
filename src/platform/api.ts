@@ -7,7 +7,7 @@ import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, ImageRef } from '../domain/types.js';
 import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
@@ -103,6 +103,8 @@ export class KarmaxApi {
       projectId: string;
       title?: string;
       prompt?: string;
+      /** Images attached to the initial prompt (references, never inline bytes). */
+      images?: ImageRef[];
       workflow?: string;
       base?: string;
       target?: string;
@@ -135,6 +137,9 @@ export class KarmaxApi {
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
+    // Image attachments ride alongside the prompt but aren't a manifest param, so
+    // carry them explicitly (references only — bytes live in the attachment store).
+    if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
@@ -167,6 +172,8 @@ export class KarmaxApi {
     });
     input.workflow = workflow;
     if (args.profiles) input.profiles = args.profiles;
+    const initialImages = taskOverrides.images as ImageRef[] | undefined;
+    if (initialImages?.length) input.images = initialImages;
 
     // Pin the execution to the manifest version stamped on the task (§21b), so a
     // later version upgrade only affects new tasks, never this running one.
@@ -261,7 +268,7 @@ export class KarmaxApi {
     // Re-resolve against the CURRENT project/global defaults. The task stored only
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived) aren't overrides.
-    const { profiles, draft: _d, archived: _a, ...overrides } = task.params as Record<string, unknown>;
+    const { profiles, draft: _d, archived: _a, images, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
@@ -271,6 +278,7 @@ export class KarmaxApi {
     });
     input.workflow = task.workflow;
     if (profiles) input.profiles = profiles as Record<string, string>;
+    if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     this.deps.store.clearDraft(taskId);
     // Bounded + compensated: on a wedged engine, restore the draft flag so a
     // failed queue attempt leaves the task saved (not stranded, non-draft, with
@@ -315,11 +323,17 @@ export class KarmaxApi {
     return this.deps.store.listTasks(projectId);
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string): Promise<void> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
     this.require(token, 'signal_task');
     const handle = this.deps.client.workflow.getHandle(taskId);
     if (signal === SIG.followUp) {
-      const msg: Message = { id: `u${Date.now()}`, role: 'user', text: text ?? '', ts: 0 };
+      const msg: Message = {
+        id: `u${Date.now()}`,
+        role: 'user',
+        text: text ?? '',
+        ts: 0,
+        ...(images?.length ? { images } : {}),
+      };
       // `role` (the addressed agent) is optional — single-agent workflows ignore it
       // and route every follow-up to their sole conversation.
       await handle.signal(SIG.followUp, msg, role);

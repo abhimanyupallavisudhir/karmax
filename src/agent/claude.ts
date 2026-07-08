@@ -4,6 +4,7 @@ import path from 'node:path';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
+import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 
 /**
@@ -55,7 +56,10 @@ export class ClaudeAdapter implements AgentAdapter {
     const userMsgs = input.messages.filter((m) => m.role !== 'system');
     if (userMsgs.length) {
       for (const m of userMsgs) {
-        messages.push({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text });
+        messages.push({
+          role: m.role === 'agent' ? 'assistant' : 'user',
+          content: m.role === 'agent' ? m.text : anthropicUserContent(m),
+        });
       }
     } else {
       messages.push({ role: 'user', content: 'Begin the task. Call signal_completion when done.' });
@@ -141,6 +145,20 @@ export class ClaudeAdapter implements AgentAdapter {
     const userText = input.messages.filter((m) => m.role !== 'system').map((m) => m.text).join('\n\n') ||
       'Begin the task described in the system prompt. Call signal_completion when done.';
 
+    // Images force the streaming-input form: the SDK's plain-string `prompt` can't
+    // carry image blocks, so when there are attachments we hand it an
+    // AsyncIterable<SDKUserMessage> whose MessageParam content mixes text + images.
+    // (Text-only turns keep the string prompt, byte-for-byte unchanged.)
+    const imageBlocks = collectAnthropicImageBlocks(input.messages);
+    const promptArg: any = imageBlocks.length
+      ? (async function* () {
+          const content: any[] = [];
+          if (userText) content.push({ type: 'text', text: userText });
+          content.push(...imageBlocks);
+          yield { type: 'user', parent_tool_use_id: null, message: { role: 'user', content } };
+        })()
+      : userText;
+
     // Scrubbed, config-home-isolated env (SPEC §7.3).
     const { scrubbedEnv } = await import('../autonomy/config-homes.js');
     const env = scrubbedEnv({
@@ -169,7 +187,7 @@ export class ClaudeAdapter implements AgentAdapter {
     let finalText = '';
     let session = input.session;
     const iterator = query({
-      prompt: userText,
+      prompt: promptArg,
       options: {
         abortController,
         cwd: input.world.handle.root,

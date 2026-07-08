@@ -225,13 +225,19 @@ const fieldLabel = (f) =>
   `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtn(f.name)}</div>` +
   (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
 
-function renderField(f, own, inherited) {
+function renderField(f, own, inherited, withChips) {
   const v = eff(own, inherited) ?? '';
   const label = fieldLabel(f);
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
-  if (f.type === 'text')
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
+  if (f.type === 'text') {
+    const ta = `<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea>`;
+    // For the prompt field, pasted images render inside the box (below the text),
+    // growing it as needed — rather than in a separate "Images" section.
+    if (withChips)
+      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div></div></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
+  }
   if (f.type === 'boolean')
     return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${resetBtn(f.name)}</div></div>`;
   if (f.type === 'select')
@@ -434,12 +440,28 @@ function resetAgentField(box) {
   if (eff && inh.effort) eff.value = inh.effort;
 }
 
+// Full task list (incl. archived) for the fork picker, cached per project.
+// Archived tasks are the completed ones you most often want to fork from, so the
+// fork search must see them regardless of the "Show archived" toggle. Cached to
+// avoid re-fetching (and re-enriching) the whole list on every keystroke;
+// loadTasks() clears the cache so newly created/updated tasks show up.
+async function forkTaskPool() {
+  if (!S.projectId) return S.tasks;
+  if (S.forkPool?.projectId === S.projectId) return S.forkPool.tasks;
+  const tasks = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
+  S.forkPool = { projectId: S.projectId, tasks };
+  return tasks;
+}
+
 // Fork search: find tasks by title, then list their per-role agent sessions.
 async function resumeSearch(box, q, results) {
   const ql = q.toLowerCase().trim();
   if (!ql) { results.innerHTML = ''; return; }
-  // Search previous tasks by title OR by their `#num` (SPEC §10.6).
-  const matches = S.tasks.filter((t) => !t.params?.draft && taskMatches(t, ql)).slice(0, 6);
+  // The pool includes archived tasks (the ones most often forked from); match by
+  // title OR by their `#num` (SPEC §10.6).
+  let pool = S.tasks;
+  try { pool = await forkTaskPool(); } catch {}
+  const matches = pool.filter((t) => !t.params?.draft && taskMatches(t, ql)).slice(0, 6);
   const rows = await Promise.all(
     matches.map(async (t) => {
       let sessions = {};
@@ -478,6 +500,90 @@ async function api(path, opts = {}) {
   const body = ct.includes('json') ? await res.json() : await res.text();
   if (!res.ok) throw new Error(body?.error || `HTTP ${res.status}`);
   return body;
+}
+
+// ─── Image attachments (paste / drag-drop an image into a prompt field) ───────
+// Bytes are uploaded to the content-addressed store immediately, so the task /
+// follow-up payloads carry only the returned lightweight { id, mediaType, bytes }
+// reference. Thumbnails are served back via /api/attachments/:id?token=… (an
+// <img> can't send a Bearer header, so the session token rides in the query).
+async function uploadImage(file) {
+  const res = await fetch('/api/attachments', {
+    method: 'POST',
+    headers: { 'content-type': file.type || 'application/octet-stream', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
+    body: file,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
+  return body; // ImageRef
+}
+
+function attachmentUrl(id) {
+  return `/api/attachments/${encodeURIComponent(id)}?token=${encodeURIComponent(S.token || '')}`;
+}
+
+function renderImageChips(container, store, onChange) {
+  if (!container) return;
+  container.innerHTML = (store || [])
+    .map(
+      (ref, i) =>
+        `<span class="img-chip" title="${esc(ref.mediaType)} · ${Math.round((ref.bytes || 0) / 1024)} KB"><img src="${attachmentUrl(ref.id)}" alt="attachment"/><button class="img-chip-x" data-i="${i}" title="Remove">✕</button></span>`,
+    )
+    .join('');
+  container.style.display = (store || []).length ? 'flex' : 'none';
+  container.querySelectorAll('.img-chip-x').forEach((b) =>
+    b.addEventListener('click', () => {
+      store.splice(Number(b.dataset.i), 1);
+      renderImageChips(container, store, onChange);
+      if (onChange) onChange();
+    }),
+  );
+}
+
+// Wire paste + drag-drop image capture onto a text input. `getStore` returns the
+// live ImageRef array; `onChange` re-renders the chips. Idempotent per element.
+function wireImagePaste(inputEl, getStore, onChange) {
+  if (!inputEl || inputEl._imgWired) return;
+  inputEl._imgWired = true;
+  const ingest = async (files) => {
+    const imgs = [...files].filter((f) => f && f.type && f.type.startsWith('image/'));
+    if (!imgs.length) return false;
+    for (const file of imgs) {
+      try {
+        const ref = await uploadImage(file);
+        getStore().push(ref);
+        onChange();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    }
+    return true;
+  };
+  inputEl.addEventListener('paste', (e) => {
+    const items = [...(e.clipboardData?.items || [])];
+    const files = items.filter((i) => i.kind === 'file' && i.type.startsWith('image/')).map((i) => i.getAsFile());
+    if (!files.length) return; // let normal text paste through
+    e.preventDefault();
+    ingest(files);
+  });
+  inputEl.addEventListener('dragover', (e) => {
+    if ([...(e.dataTransfer?.items || [])].some((i) => i.type && i.type.startsWith('image/'))) e.preventDefault();
+  });
+  inputEl.addEventListener('drop', (e) => {
+    const files = [...(e.dataTransfer?.files || [])];
+    if (files.some((f) => f.type && f.type.startsWith('image/'))) {
+      e.preventDefault();
+      ingest(files);
+    }
+  });
+}
+
+// Render read-only image thumbnails for a message that carried attachments.
+function renderMessageImages(images) {
+  if (!images || !images.length) return '';
+  return `<div class="msg-images">${images
+    .map((ref) => `<a href="${attachmentUrl(ref.id)}" target="_blank" rel="noopener"><img src="${attachmentUrl(ref.id)}" alt="attachment"/></a>`)
+    .join('')}</div>`;
 }
 
 function toast(msg, err = false, action) {
@@ -524,6 +630,7 @@ async function loadProjects() {
 
 async function loadTasks() {
   if (!S.projectId) return;
+  S.forkPool = null; // let the fork picker re-fetch its archived-inclusive pool
   S.tasks = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
 }
 
@@ -702,11 +809,12 @@ function tasksView() {
   const archivedCount = S.tasks.filter((t) => t.params?.archived).length;
   return `
     <div class="composer">
-      <input class="title-in" id="new-task" placeholder="Describe a task and press Enter…  ( n )" />
+      <input class="title-in" id="new-task" placeholder="Describe a task and press Enter…  ( n )  ·  paste an image to attach" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
       <button class="btn" id="expand-task" title="Full task form">⋯ More</button>
       <button class="btn primary" id="add-task">Add</button>
     </div>
+    <div class="img-chips" id="new-task-chips" style="display:none"></div>
     <div class="switch" style="justify-content:flex-end;margin:4px 0">
       <input type="checkbox" id="show-archived" ${S.showArchived ? 'checked' : ''} />
       <label for="show-archived" style="font-size:12px;color:var(--ink-3)">Show archived${S.showArchived && archivedCount ? ` (${archivedCount})` : ''}</label>
@@ -841,14 +949,23 @@ function wireTasksView() {
   const add = async () => {
     const input = $('#new-task');
     const title = input.value.trim();
-    if (!title) return;
+    const images = S.newTaskImages || [];
+    if (!title && !images.length) return;
     const workflow = $('#new-wf').value;
     input.value = '';
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify({ title: firstLine(title), prompt: title, command: workflow === 'script-exec' ? title : undefined, workflow }),
+        body: JSON.stringify({
+          title: firstLine(title || 'Image task'),
+          prompt: title,
+          command: workflow === 'script-exec' ? title : undefined,
+          workflow,
+          ...(images.length ? { images } : {}),
+        }),
       });
+      S.newTaskImages = [];
+      renderImageChips($('#new-task-chips'), S.newTaskImages);
       toast('Task created');
       await refreshTasks();
     } catch (e) {
@@ -857,6 +974,10 @@ function wireTasksView() {
   };
   $('#add-task')?.addEventListener('click', add);
   $('#new-task')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+  // Paste / drag-drop an image into the quick-add box to attach it (SPEC — image prompts).
+  if (!S.newTaskImages) S.newTaskImages = [];
+  wireImagePaste($('#new-task'), () => S.newTaskImages, () => renderImageChips($('#new-task-chips'), S.newTaskImages));
+  renderImageChips($('#new-task-chips'), S.newTaskImages);
   // Opening the full form via "More" carries over whatever was typed in the
   // quick-add box into the field that consumes it (Prompt, Command, …).
   $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
@@ -885,11 +1006,14 @@ async function deleteDraft(id) {
 async function openTaskForm(workflow, draft, seedText) {
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
+  // The prompt/consuming field (a textarea) hosts pasted-image chips inside its
+  // own box; only fall back to a standalone "Images" section if there isn't one.
+  const cf = consumingField(fields);
+  const promptField = cf && cf.type === 'text' ? cf : null;
   const values = draft ? { ...draft.params } : {};
   // Carry over the quick-add text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
-    const cf = consumingField(fields);
     if (cf && !values[cf.name]) values[cf.name] = seedText;
   }
   let inherited = {};
@@ -903,7 +1027,12 @@ async function openTaskForm(workflow, draft, seedText) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
+        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name], f === promptField)).join('')}
+          ${promptField ? '' : `<div class="form-row" data-row="__images">
+            <div class="label-row"><label>Images</label></div>
+            <div class="img-chips" id="tf-chips" style="display:none"></div>
+            <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
+          </div>`}
           <div class="form-row" data-row="__notes">
             <div class="label-row"><label>Notes</label></div>
             <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
@@ -921,48 +1050,114 @@ async function openTaskForm(workflow, draft, seedText) {
         </div>
       </div>
     </div>`;
-  $('#tf-wf')?.addEventListener('change', () => {
+  // Reassigned below once auto-save is wired; flushes pending edits before closing.
+  let closeForm = () => (root.innerHTML = '');
+  $('#tf-wf')?.addEventListener('change', async () => {
     // Re-render for the new workflow, preserving text typed into the current
     // consuming field so it moves to the new workflow's consuming field.
     const cf = consumingField(fields);
     const carried = cf ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`)?.value : '';
+    // Drop any draft auto-created for the previous workflow — its params won't
+    // map onto the new workflow's schema, and reopening starts fresh anyway.
+    clearTimeout(saveTimer);
+    if (localCred && draftId) { const id = draftId; draftId = null; try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch {} }
     openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
-  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') root.innerHTML = ''; });
-  $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
+  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') closeForm(); });
+  $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
+  // Image attachments for the full task form: pasting/dropping an image into any
+  // text field attaches it to the prompt. State is local to this form instance.
+  const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
+  // Repaint chips and (unless first paint) auto-save — pasting an image fires no
+  // 'input' event, so the debounced auto-save wouldn't otherwise pick it up.
+  // `autoSaveSoon` is a hoisted declaration further down this same scope.
+  const paintFormChips = (save) => { renderImageChips($('#tf-chips'), formImages, () => autoSaveSoon()); if (save) autoSaveSoon(); };
+  $('#tf-body')
+    .querySelectorAll('textarea, input[type="text"], input:not([type])')
+    .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
+  paintFormChips();
   // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
   // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the
   // running-task drawer (renderDrawer's #cred-editor-task). Change one → check the other.
   // A draft has an id → edit its policy directly. A brand-new task has none, so the
   // editor runs in `local` mode: changes are held here and applied on create (below).
   let taskCredPolicy = {};
+  const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
-  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; } });
-  const submit = async (draftMode) => {
+  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+
+  // The id of the draft this form is editing. Starts as the passed-in draft; a
+  // brand-new task gets one lazily the first time auto-save persists real content.
+  let draftId = draft?.id || null;
+  const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
+  // Prompt image attachments ride inside `params` (references only), so they flow
+  // through auto-save, draft, and queue the same way the prompt text does.
+  const formState = () => {
     const body = collectForm($('#tf-body'), fields);
-    // Cosmetic human notes — kept separate from `params` so they never reach the
-    // agent, and editable at any stage (here, pre-queue, in the full form).
-    const notes = $('#tf-notes')?.value ?? '';
-    const payload = { workflow: wf, params: body, notes, draft: draftMode };
+    if (formImages.length) body.images = [...formImages];
+    return { body, notes: $('#tf-notes')?.value ?? '' };
+  };
+  // Whether the user has actually put something worth keeping into a NEW task —
+  // guards against spawning empty drafts just from opening the form.
+  const hasContent = ({ body, notes }) =>
+    notes.trim() !== '' ||
+    hasPolicy() ||
+    formImages.length > 0 ||
+    Object.values(body).some((v) =>
+      Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
+
+  // Persist the current form as a draft without leaving the form. Silent by
+  // design — auto-save shouldn't nag; the explicit buttons surface errors.
+  let lastSaved = null;
+  async function persistDraft(st = formState()) {
+    if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+    const sig = JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
+    if (sig === lastSaved) return; // no change since last write
     try {
-      if (draft) {
-        // edit existing draft, then optionally queue
-        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true }) });
-        if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
-        if (!draftMode) await api(`/api/tasks/${draft.id}/queue`, { method: 'POST', body: '{}' });
+      if (!draftId) {
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        draftId = created.id;
       } else {
-        const hasPol = !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
-        if (hasPol) {
-          // Custom per-task credential order/enablement: create as a draft first so the
-          // override is persisted BEFORE the workflow starts leasing, then queue.
-          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...payload, draft: true }) });
-          await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
-          if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
-        } else {
-          await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
-        }
+        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+      }
+      if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+      lastSaved = sig;
+      refreshTasks();
+    } catch { /* keep the form open; a later save or explicit button will retry */ }
+  }
+
+  // Debounced auto-save while typing.
+  let saveTimer = null;
+  function autoSaveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(() => persistDraft(), 800); }
+  $('#tf-body').addEventListener('input', autoSaveSoon);
+  $('#tf-body').addEventListener('change', autoSaveSoon);
+
+  // Flush any pending edits when the form is dismissed, so closing without
+  // clicking a button still keeps the draft.
+  closeForm = () => { clearTimeout(saveTimer); const st = formState(); root.innerHTML = ''; persistDraft(st); };
+
+  const submit = async (draftMode) => {
+    clearTimeout(saveTimer);
+    const st = formState();
+    try {
+      if (draftId) {
+        // Auto-save (or a prior edit) already materialised the draft — update it in place.
+        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        if (!draftMode) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+      } else if (hasPolicy()) {
+        // Custom per-task credential order/enablement: create as a draft first so the
+        // override is persisted BEFORE the workflow starts leasing, then queue.
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        draftId = created.id;
+        await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
+        if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
+      } else {
+        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode }) });
       }
       root.innerHTML = '';
       toast(draftMode ? 'Draft saved' : 'Task created');
@@ -1144,7 +1339,7 @@ function drawerBody(v) {
   const conversations = transcripts
     .map((t) => {
       const body = (t.messages || [])
-        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}</div>`)
+        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}${renderMessageImages(m.images)}</div>`)
         .join('') || '<div class="msg system">No messages yet</div>';
       // Only the active role gets the #live-bubble (one per drawer, updated by the WS stream).
       const live = t.role === liveRole
@@ -1164,7 +1359,10 @@ function drawerBody(v) {
       const agentName = esc(t.label || t.role);
       const fu = followUp
         ? `<div class="followup-box" data-role="${esc(t.role)}">
-            <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…" ${followUp.enabled ? '' : 'disabled'}></textarea>
+            <div class="prompt-field">
+              <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}></textarea>
+              <div class="img-chips followup-chips" style="display:none"></div>
+            </div>
             <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
           </div>`
         : '';
@@ -1662,17 +1860,31 @@ function wireActions(v) {
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
 // agent role it addresses, so a follow-up is delivered to the right agent.
 function wireFollowups(v) {
+  if (!S.followupImages) S.followupImages = {};
   $('#drawer-body').querySelectorAll('.followup-box').forEach((box) => {
     const role = box.dataset.role;
     const ta = box.querySelector('.followup-input');
     const btn = box.querySelector('.followup-send');
     if (!ta || !btn) return;
+    // Per-(task,role) image store, so pasted attachments survive the drawer's
+    // frequent WS-driven re-renders (like the textarea text is preserved).
+    const key = `${v.taskId}/${role}`;
+    const store = (S.followupImages[key] ||= []);
+    const chips = box.querySelector('.followup-chips');
+    const paint = () => renderImageChips(chips, store);
+    wireImagePaste(ta, () => store, paint);
+    paint();
     const send = async () => {
       const text = ta.value.trim();
-      if (!text) return;
+      if (!text && !store.length) return;
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', text, role }) });
+        await api(`/api/tasks/${v.taskId}/signal`, {
+          method: 'POST',
+          body: JSON.stringify({ signal: 'followUp', text, role, ...(store.length ? { images: [...store] } : {}) }),
+        });
         ta.value = '';
+        store.length = 0;
+        paint();
         toast('Follow-up sent');
         setTimeout(refreshDrawer, 250);
         setTimeout(refreshTasks, 400);

@@ -25,7 +25,7 @@ const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
-const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directory', help: 'Absolute path, or one starting with ~', scopes: ['project'], bind: 'project' });
+const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directories', help: 'One per line — absolute path, or starting with ~. Multiple repos are each checked out in their own subdirectory of the task world.', scopes: ['project'], bind: 'project' });
 const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
 const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', options: ['worktree', 'container'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
 const prToggleField = (): FieldSpec => ({ name: 'openGithubPr', type: 'boolean', label: 'Open a GitHub PR on confirm', default: false, scopes: ['project', 'global'], bind: 'project' });
@@ -101,6 +101,7 @@ const DO_ROLE: WorkflowRole = {
 
 # World
 Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
+{{worldRepos}}
 
 {{instructions}}`,
 };
@@ -111,6 +112,7 @@ const MERGE_ROLE: WorkflowRole = {
   promptTemplate: `{{toolsPreamble}}
 
 You are merging task "{{title}}". Its work is on branch {{branch}} in the worktree at {{worldPath}}.
+{{worldRepos}}
 Merge {{target}} into this branch, resolve any conflicts, ensure the build and tests pass, then the work will be merged into {{target}}.
 Review context: {{reviewInfo}}
 Call signal_completion when the branch is ready to merge.`,

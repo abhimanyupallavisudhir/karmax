@@ -6,6 +6,7 @@ import { WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
 import { Store } from '../store/db.js';
+import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
@@ -64,6 +65,7 @@ export class Gateway {
   private sessions = new Map<string, Session>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
+  private attachments = new AttachmentStore();
 
   constructor(private deps: GatewayDeps) {}
 
@@ -188,6 +190,22 @@ export class Gateway {
       });
     }
 
+    // Serve an image attachment. Auth via `?token=` (session id) because a plain
+    // <img src> can't set an Authorization header; the token is the same session
+    // secret used everywhere else, so this is no weaker than the Bearer path.
+    const attGet = p.match(/^\/api\/attachments\/([^/]+)$/);
+    if (attGet && method === 'GET') {
+      const sid = url.searchParams.get('token') ?? '';
+      if (!this.sessions.has(sid)) return this.json(res, 401, { error: 'unauthorized' });
+      const got = this.attachments.read(attGet[1]!);
+      if (!got) return void res.writeHead(404).end('not found');
+      res.writeHead(200, {
+        'content-type': got.mediaType,
+        'cache-control': 'private, max-age=31536000, immutable',
+      });
+      return void res.end(got.buf);
+    }
+
     // ── authenticated endpoints ──
     const session = this.auth(req);
     if (!session) return this.json(res, 401, { error: 'unauthorized' });
@@ -202,6 +220,28 @@ export class Gateway {
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
         return this.json(res, 200, { host: hostStats(), agentSlots: agentSlotStats(), ts: Date.now() });
+      }
+
+      // image attachments (image prompts). The ONLY endpoints that handle raw
+      // image bytes; everything downstream carries lightweight ImageRef handles.
+      if (p === '/api/attachments' && method === 'POST') {
+        const ctype = String(req.headers['content-type'] ?? '');
+        try {
+          let ref;
+          if (ctype.includes('application/json')) {
+            const b = await this.body(req);
+            if (typeof b.dataUrl !== 'string') return this.json(res, 400, { error: 'expected { dataUrl }' });
+            ref = this.attachments.putDataUrl(b.dataUrl);
+          } else {
+            // Raw binary upload — content-type is the image MIME.
+            const buf = await this.rawBody(req, MAX_IMAGE_BYTES);
+            ref = this.attachments.put(buf, ctype || undefined);
+          }
+          return this.json(res, 200, ref);
+        } catch (e) {
+          if (e instanceof AttachmentError) return this.json(res, 400, { error: e.message });
+          throw e;
+        }
       }
 
       // projects
@@ -347,7 +387,7 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role);
+        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
         return this.json(res, 200, { ok: true });
       }
       const targetMatch = p.match(/^\/api\/tasks\/([^/]+)\/target$/);
@@ -886,6 +926,21 @@ export class Gateway {
     } catch {
       return {};
     }
+  }
+  /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`
+   *  (the JSON `body()` reader is unbounded — binary uploads must be capped). */
+  private async rawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const c of req) {
+      total += (c as Buffer).length;
+      if (total > maxBytes) {
+        req.destroy();
+        throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
+      }
+      chunks.push(c as Buffer);
+    }
+    return Buffer.concat(chunks);
   }
   private fail(res: http.ServerResponse, e: unknown) {
     try {

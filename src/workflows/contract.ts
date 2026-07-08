@@ -21,6 +21,15 @@ export type {
   SubTaskAction,
 } from '../domain/types.js';
 
+/** One repo checked out in a (possibly multi-repo) world, as carried in state. */
+export interface WorldRepoLike {
+  name: string;
+  repo: string;
+  root: string;
+  branch: string;
+  base: string;
+}
+
 /** Plain (method-free) world handle as carried in workflow state. */
 export interface WorldHandleLike {
   kind: 'worktree' | 'container' | 'memory';
@@ -30,5 +39,6 @@ export interface WorldHandleLike {
   base: string;
   repo?: string;
   target?: string;
+  repos?: WorldRepoLike[];
   meta?: Record<string, unknown>;
 }
