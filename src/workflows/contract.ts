@@ -8,6 +8,7 @@ export type {
   TaskView,
   Stage,
   TaskStatus,
+  AgentSpec,
   Message,
   ReviewInfo,
   DeclaredAction,

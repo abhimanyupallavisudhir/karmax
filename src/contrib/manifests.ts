@@ -15,10 +15,14 @@ const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Pr
 // Task-scope only: per-role agent DEFAULTS live in the Agent-profiles editor
 // (with a per-project override), so this is just the one-off per-task override —
 // no duplication with the workflow-defaults settings forms (SPEC §7.1/§10.5).
-// `mutable`: an agent role whose turn runs LATER (merge, resolve) can be swapped
-// in-flight until that turn runs (SPEC §5.5). The Do agent is left frozen — it
-// runs from the first turn and holds a live resumable session, so the follow-up
-// box is its live-redirect channel, not a mid-session provider swap.
+// `mutable: 'always'`: an agent role's *model* and *effort* can be re-tuned
+// in-flight at any time up to the point of no return (SPEC §5.5) — the change
+// lands at the next best convenience in the conversation (the next turn the role
+// runs, e.g. a follow-up). What stays gated is the role's IDENTITY (provider /
+// resumed session), enforced by the workflow's update validator: the Do agent
+// holds a live resumable session from its first turn so its provider can't be
+// swapped mid-flight (retune model/effort, or send a follow-up to redirect it);
+// merge/resolve can still be fully swapped until their own turn runs.
 const agentField = (role: string, label: string, mutable?: FieldSpec['mutable']): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role, ...(mutable ? { mutable } : {}) });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
@@ -255,15 +259,18 @@ export const MANIFESTS: WorkflowManifest[] = [
     stages: SOFTWARE_DEV_STAGES,
     params: [
       promptField(),
-      agentField('do', 'Do agent'),
+      // `always`: the Do/Merge/Resolve agents' model + effort can be retuned
+      // in-flight up to the point of no return (SPEC §5.5); software-dev's update
+      // validator still gates the IDENTITY swap (provider/session) per role.
+      agentField('do', 'Do agent', 'always'),
       baseField(),
       targetField(),
       reposField(),
       copyGlobsField(),
       worldProviderField(),
       prToggleField(),
-      agentField('merge', 'Merge agent', 'untilUsed'),
-      agentField('resolve', 'Resolve agent', 'untilUsed'),
+      agentField('merge', 'Merge agent', 'always'),
+      agentField('resolve', 'Resolve agent', 'always'),
     ],
     onActivate: {
       spawnTask: {

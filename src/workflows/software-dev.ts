@@ -24,6 +24,7 @@ import {
   TaskInput,
   TaskView,
   Stage,
+  AgentSpec,
   Message,
   ReviewInfo,
   DeclaredAction,
@@ -193,28 +194,94 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
 
   // ── in-flight param edits (SPEC §4.5/§5.5) ──
   // A working copy of the per-role agent overrides that later turns re-read, so a
-  // merge/resolve agent swapped mid-flight actually takes effect. The Do agent runs
-  // from the first turn holding a live session, so it stays frozen (use a follow-up).
+  // model/effort retune — or, before its turn, a full swap — actually takes effect.
+  // Every role re-reads `liveInput.agents[role]` at turn start, so a change lands at
+  // the next best convenience in the conversation: the next turn that role runs
+  // (e.g. a Do follow-up, a merge retry, or the next resolve attempt).
   const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
   // Params the workflow has already consumed (value now load-bearing). `target` is
-  // consumed once locked (PR open / merge enqueue); merge/resolve agents when their
-  // turn runs.
+  // consumed once locked (PR open / merge enqueue); a merge/resolve agent's IDENTITY
+  // (provider/session) once its turn runs — its model/effort stay retunable after.
   const consumed = new Set<string>();
   const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
   const paramEditable = (name: string): boolean =>
     !cancelled && editableInFlight(input.paramWindows?.[name], { consumed: isConsumed(name), pointOfNoReturnPassed });
   const editableParamsNow = (): string[] => Object.keys(input.paramWindows ?? {}).filter(paramEditable);
-  /** Update validator: reject (before admission, SPEC §2) any field not editable now. */
+
+  // The role behind an `agent:<role>` param (or undefined for a non-agent field).
+  const agentRoleOf = (name: string): string | undefined => (name.startsWith('agent:') ? name.slice('agent:'.length) : undefined);
+  /** Whether a role's IDENTITY (provider / resumed session) may still be swapped now.
+   *  The Do agent runs on a live resumable session from turn one, so its identity is
+   *  frozen in-flight; merge/resolve can be swapped until their own turn runs. Model
+   *  and effort are NOT gated here — they retune whenever `paramEditable` allows. */
+  const agentIdentityEditable = (role: string): boolean =>
+    role !== 'do' && paramEditable(`agent:${role}`) && !isConsumed(`agent:${role}`);
+  type AgentPlan = { ok: false; reason: string } | { ok: true; next: AgentSpec };
+  /** Resolve an `agent:<role>` patch against live state (SPEC §5.5). While the role's
+   *  identity is still editable, a full swap is accepted; once locked, only its model
+   *  and effort may change — overlaid onto the current spec so provider/session stay
+   *  pinned. Shared by the validator (reject) and the applier (apply) so they agree. */
+  function planAgentPatch(role: string, raw: unknown): AgentPlan {
+    if (!raw || typeof raw !== 'object') return { ok: false, reason: `"agent:${role}" must be an agent spec` };
+    const spec = raw as AgentSpec;
+    const cur = liveInput.agents?.[role];
+    // A retune (like any edit) stops at cancel and the point of no return.
+    if (!paramEditable(`agent:${role}`))
+      return { ok: false, reason: `the ${role} agent can't be changed now — the task is ${cancelled ? 'cancelled' : 'past the point of no return'}` };
+    if (agentIdentityEditable(role)) {
+      if (!spec.provider) return { ok: false, reason: `the ${role} agent override needs a provider` };
+      return { ok: true, next: spec };
+    }
+    // Identity locked → only model/effort may change. The provider (the agent
+    // itself) and the resumed session stay pinned to whatever the running turn
+    // used and are NEVER taken from the incoming patch — a provider that clearly
+    // differs is rejected outright; when the turn ran on the role's profile default
+    // (no explicit override) we simply keep that default, ignoring the patch's
+    // provider. So the provider is only editable while the role is un-consumed —
+    // exactly as before this change.
+    if (spec.resumeFrom || (!!spec.provider && !!cur?.provider && spec.provider !== cur.provider))
+      return {
+        ok: false,
+        reason:
+          role === 'do'
+            ? `the Do agent's provider/session is frozen in-flight — only its model and effort can change (they apply to the next turn); send a follow-up to redirect it`
+            : `the ${role} agent's provider/session is locked once its turn has started — only its model and effort can still change`,
+      };
+    const modelChanged = spec.model !== undefined && spec.model !== cur?.model;
+    const effortChanged = spec.effort !== undefined && spec.effort !== cur?.effort;
+    if (!modelChanged && !effortChanged) return { ok: false, reason: `no model/effort change for the ${role} agent` };
+    const model = spec.model !== undefined ? spec.model : cur?.model;
+    const effort = spec.effort !== undefined ? spec.effort : cur?.effort;
+    // `provider` may be absent when the turn ran on the profile default — omit it so
+    // the activity keeps falling back to that default (core.ts: spec.provider ?? base).
+    return {
+      ok: true,
+      next: {
+        ...(cur?.provider ? { provider: cur.provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+        ...(effort !== undefined ? { effort } : {}),
+        ...(cur?.resumeFrom ? { resumeFrom: cur.resumeFrom } : {}),
+      } as AgentSpec,
+    };
+  }
+  /** Update validator: reject (before admission, SPEC §2) any edit not allowed now. */
   function validateParamPatch(patch: Record<string, unknown>): void {
     const names = Object.keys(patch);
     if (!names.length) throw ApplicationFailure.nonRetryable('no params to edit', 'ParamEditEmpty');
-    for (const name of names)
+    for (const name of names) {
+      const role = agentRoleOf(name);
+      if (role) {
+        const plan = planAgentPatch(role, patch[name]);
+        if (!plan.ok) throw ApplicationFailure.nonRetryable(plan.reason, 'ParamLocked', name);
+        continue;
+      }
       if (!paramEditable(name))
         throw ApplicationFailure.nonRetryable(
           `"${name}" can't be edited now — it's frozen after queue, already in use, or past the point of no return`,
           'ParamLocked',
           name,
         );
+    }
   }
   /** Apply an already-validated patch to live state. `target` is re-read at PR/merge;
    *  `agent:<role>` overrides are re-read when that role's turn runs. */
@@ -224,13 +291,13 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       target = patch.target;
       applied.push('target');
     }
-    for (const role of ['merge', 'resolve']) {
-      const key = `agent:${role}`;
-      const spec = patch[key];
-      if (spec && typeof spec === 'object' && (spec as { provider?: string }).provider) {
-        liveInput.agents = { ...(liveInput.agents ?? {}), [role]: spec as NonNullable<SoftwareDevInput['agents']>[string] };
-        applied.push(key);
-      }
+    for (const name of Object.keys(patch)) {
+      const role = agentRoleOf(name);
+      if (!role) continue;
+      const plan = planAgentPatch(role, patch[name]);
+      if (!plan.ok) continue; // the validator already rejected illegal patches
+      liveInput.agents = { ...(liveInput.agents ?? {}), [role]: plan.next };
+      applied.push(name);
     }
     return { applied };
   }

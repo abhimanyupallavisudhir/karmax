@@ -21,6 +21,7 @@ import { parseTransition } from '../resolve/transitions.js';
  *                                   transient-infra retry path — no Resolve)
  *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
  *   @incomplete                     do NOT signal completion this turn
+ *   @profile                        echo this turn's model/effort (`profile: <model>/<effort>`)
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
  */
 // @failonce ledger: activity retries land in the same world, so keying by world+message
@@ -160,6 +161,11 @@ export class MockAdapter implements AgentAdapter {
         }
         case 'incomplete':
           complete = false;
+          break;
+        case 'profile':
+          // Echo the model/effort this turn actually ran with, so tests can assert
+          // an in-flight retune (SPEC §5.5) reaches the agent on its next turn.
+          outputs.push(`profile: ${input.profile.model ?? '(none)'}/${input.profile.effort ?? '(none)'}`);
           break;
         default:
           break;
