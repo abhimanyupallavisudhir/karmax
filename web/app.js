@@ -317,11 +317,26 @@ function resetAgentField(box) {
   if (eff && inh.effort) eff.value = inh.effort;
 }
 
+// Full task list (incl. archived) for the fork picker, cached per project.
+// Archived tasks are the completed ones you most often want to fork from, so the
+// fork search must see them regardless of the "Show archived" toggle. Cached to
+// avoid re-fetching (and re-enriching) the whole list on every keystroke;
+// loadTasks() clears the cache so newly created/updated tasks show up.
+async function forkTaskPool() {
+  if (!S.projectId) return S.tasks;
+  if (S.forkPool?.projectId === S.projectId) return S.forkPool.tasks;
+  const tasks = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
+  S.forkPool = { projectId: S.projectId, tasks };
+  return tasks;
+}
+
 // Fork search: find tasks by title, then list their per-role agent sessions.
 async function resumeSearch(box, q, results) {
   const ql = q.toLowerCase().trim();
   if (!ql) { results.innerHTML = ''; return; }
-  const matches = S.tasks.filter((t) => !t.params?.draft && t.title.toLowerCase().includes(ql)).slice(0, 6);
+  let pool = S.tasks;
+  try { pool = await forkTaskPool(); } catch {}
+  const matches = pool.filter((t) => !t.params?.draft && t.title.toLowerCase().includes(ql)).slice(0, 6);
   const rows = await Promise.all(
     matches.map(async (t) => {
       let sessions = {};
@@ -403,6 +418,7 @@ async function loadProjects() {
 
 async function loadTasks() {
   if (!S.projectId) return;
+  S.forkPool = null; // let the fork picker re-fetch its archived-inclusive pool
   S.tasks = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
 }
 
