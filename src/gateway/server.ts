@@ -259,9 +259,23 @@ export class Gateway {
       }
 
       // tasks
+      // Resolve a per-project sequential number (SPEC §10.6) → its canonical id, so a
+      // `/projects/<name>/tasks/<num>` permalink can be opened even when the task
+      // isn't in the client's loaded list (e.g. an archived task).
+      const byNumMatch = p.match(/^\/api\/projects\/([^/]+)\/tasks\/by-num\/(\d+)$/);
+      if (byNumMatch && method === 'GET') {
+        const rec = store.getTaskByNum(byNumMatch[1]!, Number(byNumMatch[2]!));
+        if (!rec) return this.json(res, 404, { error: 'no such task' });
+        return this.json(res, 200, { id: rec.id, num: rec.num, projectId: rec.projectId });
+      }
       const viewMatch = p.match(/^\/api\/tasks\/([^/]+)$/);
       if (viewMatch && method === 'GET') {
-        return this.json(res, 200, (await api.getTaskView(token, viewMatch[1]!)) ?? null);
+        const view = await api.getTaskView(token, viewMatch[1]!);
+        if (!view) return this.json(res, 200, null);
+        // Mirror the record's sequential number onto the view (the workflow only
+        // knows the opaque id) so the drawer can show `#num` + a permalink.
+        const rec = store.getTask(viewMatch[1]!);
+        return this.json(res, 200, rec?.num != null ? { ...view, num: rec.num } : view);
       }
       if (viewMatch && method === 'DELETE') {
         // Hard-delete is for drafts only (they never started a workflow). Running
