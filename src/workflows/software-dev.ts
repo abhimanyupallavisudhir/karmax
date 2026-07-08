@@ -1028,7 +1028,14 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         waitingFor = { kind: 'parent' };
         await notifyParent(turn.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
       } else if (confirmMode === 'auto') {
-        confirmed = true;
+        // Auto-confirm only a turn that actually finished its work (or is explicitly
+        // raising for a decision) — never a bare needsInput stall, which would push a
+        // zero-/partial-work diff straight through to merge unseen. `auto` today comes
+        // only from a top-level goal task (autoConfirm) or an explicit confirm.mode:auto;
+        // in goal mode the loop above already guarantees completed|raise here, so this is
+        // a replay-safe guard — it changes no reachable path now but stops an empty turn
+        // from being silently merged. A stall falls through to the human gate below.
+        if (turn.completed || turn.raise) confirmed = true;
       } else if (confirmMode === 'agent') {
         // Run the Confirm agent; its verdict maps onto the SAME transitions a human
         // drives (confirm / follow-up-to-Do / cancel).

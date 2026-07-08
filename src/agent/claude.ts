@@ -82,7 +82,10 @@ export class ClaudeAdapter implements AgentAdapter {
         },
         body: JSON.stringify({
           model,
-          max_tokens: 4096,
+          // A whole coding response (a rewritten file, a long explanation + tool call)
+          // can exceed 4096 output tokens; too low a cap truncates mid-response, which
+          // the loop below then has to recover from. 8192 keeps most turns single-shot.
+          max_tokens: 8192,
           system: input.systemPrompt,
           messages,
           tools,
@@ -100,7 +103,19 @@ export class ClaudeAdapter implements AgentAdapter {
         finalText = text;
         ctx.emit(text);
       }
-      if (toolUses.length === 0) break;
+      if (toolUses.length === 0) {
+        // A `max_tokens` cut-off is a TRUNCATED response, not a finished turn — the
+        // model ran out of output budget mid-thought (often right after narrating an
+        // action, before emitting its tool_use). Breaking here treats that chopped-off
+        // preamble as completion, which surfaces the task at Review having done nothing
+        // — the metered-path twin of the "agent just stopped" bug. Ask it to continue
+        // instead; the enclosing maxIters loop bounds this so it can't spin forever.
+        if (data.stop_reason === 'max_tokens') {
+          messages.push({ role: 'user', content: 'Continue.' });
+          continue;
+        }
+        break;
+      }
 
       const toolResults: any[] = [];
       let completed = false;
@@ -229,7 +244,18 @@ export class ClaudeAdapter implements AgentAdapter {
           if (tool === 'Bash' && typeof toolInput?.command === 'string') ctx.emit(`$ ${toolInput.command}`);
           return { behavior: 'allow' as const, updatedInput: toolInput };
         },
-        systemPrompt: input.systemPrompt,
+        // Run on TOP of Claude Code's own system prompt, not instead of it. A bare
+        // string here is a *custom* prompt that REPLACES the default (SDK docs:
+        // "string - Use a custom system prompt"), stripping the claude_code harness
+        // scaffolding — the persistence/anti-preamble conditioning that makes the CLI
+        // keep working through "I'll apply the edit now."-style narration instead of
+        // ending the turn. Without it the model reverts to conversational-assistant
+        // behavior: it narrates intent, emits no tool call, and the SDK query ends —
+        // which karmax records as a finished turn with completed:false → needsInput →
+        // Review with an empty diff (the "agent just stopped" reports, only in karmax
+        // and never in the CLI, because the CLI always runs this preset). We keep
+        // karmax's own task/tooling instructions by APPENDING them to the preset.
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: input.systemPrompt },
         ...(input.profile.model ? { model: input.profile.model } : {}),
         // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models
         // that don't support the level, so no gating is needed here.
