@@ -63,6 +63,14 @@ export class WorktreeProvider implements WorldProvider {
     await gitOrThrow(repo, addArgs);
     await ensureIdentity(root);
 
+    // Make the checkout runnable: a git worktree does NOT inherit the origin
+    // repo's `node_modules` (it's gitignored), so any Node project checked out
+    // into a world cannot run itself — e.g. karmax dogfooding karmax fails at
+    // `import('@anthropic-ai/claude-agent-sdk')` with "Cannot find package …"
+    // resolved from the world's own src/. Link the origin's installed deps in so
+    // module resolution (and `npm start`/`tsx`) works without a per-world install.
+    await this.linkNodeModules(repo, root);
+
     // Copy gitignored files the project names (e.g. .env) into the world.
     if (spec.copyGlobs?.length) await this.copyGlobs(repo, root, spec.copyGlobs);
 
@@ -92,6 +100,41 @@ export class WorktreeProvider implements WorldProvider {
     await git(repo, ['add', '-A']);
     await git(repo, ['commit', '-q', '-m', 'init']);
     return repo;
+  }
+
+  /**
+   * Symlink the origin repo's `node_modules` into the worktree so the checkout
+   * is immediately runnable (deps resolve, the project can run itself). No-op
+   * when the origin has no `node_modules` (non-Node project or deps not yet
+   * installed) or the worktree already has one. Best-effort: a failure here must
+   * never abort world creation — the world is still usable for source edits.
+   */
+  private async linkNodeModules(repo: string, root: string) {
+    try {
+      const src = path.join(repo, 'node_modules');
+      const dst = path.join(root, 'node_modules');
+      if (!fs.existsSync(src)) return; // nothing to link (e.g. scratch/non-Node repo)
+      if (fs.existsSync(dst)) return; // worktree already has its own deps
+      fs.symlinkSync(src, dst, 'dir');
+      // A `node_modules/` .gitignore rule (trailing slash) matches directories
+      // only — NOT a symlink named `node_modules`. Left untracked, an agent's
+      // `git add -A` would stage the link and it could be committed/merged. Add
+      // an anchored ignore rule to the worktree's exclude so git never sees it.
+      await this.ensureIgnored(root, '/node_modules');
+    } catch {
+      // Best-effort — a broken/duplicate link is preferable to failing the world.
+    }
+  }
+
+  /** Idempotently add a pattern to this worktree's git exclude file. */
+  private async ensureIgnored(root: string, pattern: string) {
+    const r = await git(root, ['rev-parse', '--git-path', 'info/exclude']);
+    if (r.code !== 0) return;
+    const excludePath = path.resolve(root, r.stdout.trim());
+    fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+    const cur = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf8') : '';
+    if (cur.split('\n').some((l) => l.trim() === pattern)) return; // already ignored
+    fs.appendFileSync(excludePath, `${cur && !cur.endsWith('\n') ? '\n' : ''}${pattern}\n`);
   }
 
   private async copyGlobs(repo: string, root: string, globs: string[]) {
