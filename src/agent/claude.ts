@@ -5,6 +5,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACK
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
+import { messagesToDeliver } from './history.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 
 /**
@@ -142,14 +143,18 @@ export class ClaudeAdapter implements AgentAdapter {
       tools: buildSdkTools(tool, zod, handlers),
     });
 
-    const userText = input.messages.filter((m) => m.role !== 'system').map((m) => m.text).join('\n\n') ||
-      'Begin the task described in the system prompt. Call signal_completion when done.';
+    // Only the messages new since the resumed session last advanced (the whole
+    // conversation on a fresh session) — the session already holds the rest, so
+    // re-sending it would replay the agent's own past replies back at it (§7.2).
+    const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
+    const userText = convo.map((m) => m.text).join('\n\n') ||
+      (input.session ? 'Continue from the latest instruction.' : 'Begin the task described in the system prompt. Call signal_completion when done.');
 
     // Images force the streaming-input form: the SDK's plain-string `prompt` can't
     // carry image blocks, so when there are attachments we hand it an
     // AsyncIterable<SDKUserMessage> whose MessageParam content mixes text + images.
     // (Text-only turns keep the string prompt, byte-for-byte unchanged.)
-    const imageBlocks = collectAnthropicImageBlocks(input.messages);
+    const imageBlocks = collectAnthropicImageBlocks(convo);
     const promptArg: any = imageBlocks.length
       ? (async function* () {
           const content: any[] = [];
