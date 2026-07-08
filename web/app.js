@@ -28,7 +28,124 @@ const S = {
   sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
   ws: null,
   hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
+  returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
 };
+
+// ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
+// Every page is a host-owned route; the browser URL is the single source of truth
+// for {project, tab, open task}. Workflows/coordinators never own a URL — a page
+// like the merge queue is a first-party route that projects coordinator/task state.
+// Projects are addressed by a slug of their name; tasks are numbered per project.
+// Scheme:
+//   /                                    → home (redirects to a project's tasks)
+//   /dashboard                           → global dashboard
+//   /settings                            → global settings
+//   /projects/:name/tasks                → task list (also /queue, /activity, /settings)
+//   /projects/:name/tasks/:num           → task list with task #num open (permalink)
+function slugify(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+}
+function projectSlug(p) { return p ? slugify(p.name) : ''; }
+function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+// Resolve a URL slug back to a project. Matches the slugified name (the common,
+// human case), falling back to a raw project id for safety. On a slug collision
+// the first-created project wins (names are expected distinct).
+function projectBySlug(slug) {
+  const s = slugify(slug);
+  return (S.projects || []).find((p) => slugify(p.name) === s) || (S.projects || []).find((p) => p.id === slug);
+}
+
+function parseRoute(pathname) {
+  const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
+  if (!seg.length) return { name: 'home' };
+  if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard' };
+  if (seg[0] === 'settings') return { name: 'global', tab: 'global' };
+  if (seg[0] === 'projects' && seg[1]) {
+    const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
+    return { name: 'project', slug: seg[1], tab, taskKey };
+  }
+  return { name: 'home' };
+}
+
+// The list/tab route for a project (by id), addressed by name-slug.
+function projectRoute(pid, tab = 'tasks') {
+  const p = projectById(pid);
+  return p ? `/projects/${projectSlug(p)}/${tab}` : '/dashboard';
+}
+
+// Navigate: update the URL then reconcile app state to it. `replace` swaps the
+// current history entry instead of pushing a new one.
+function go(path, opts = {}) {
+  if (path !== location.pathname) {
+    history[opts.replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', path);
+  }
+  return applyRoute();
+}
+
+// Resolve a per-project task URL key (a numeric #num, or a raw task id) → task id.
+async function resolveProjectTaskKey(projectId, key) {
+  if (/^\d+$/.test(key)) {
+    const local = (S.tasks || []).find((t) => t.projectId === projectId && String(t.num) === key);
+    if (local) return local.id;
+    const r = await api(`/api/projects/${projectId}/tasks/by-num/${key}`).catch(() => null);
+    return r?.id ?? null;
+  }
+  const local = (S.tasks || []).find((t) => t.id === key);
+  return local ? local.id : key; // raw-id fallback
+}
+
+async function applyRoute() {
+  const r = parseRoute(location.pathname);
+  if (r.name === 'home') {
+    const pid = S.projectId || S.projects[0]?.id;
+    return go(pid ? projectRoute(pid) : '/dashboard', { replace: true });
+  }
+  if (r.name === 'global') {
+    closeDrawerDom();
+    S.tab = r.tab;
+    renderRail();
+    renderMain();
+    if (r.tab === 'dashboard') renderDashboard();
+    return;
+  }
+  // project / task routes → resolve the project (by name-slug) + optional open task
+  const proj = projectBySlug(r.slug);
+  if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
+  const pid = proj.id;
+  const tab = r.tab || 'tasks';
+  if (pid !== S.projectId) { S.projectId = pid; await loadTasks().catch(() => {}); }
+  else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
+  S.tab = tab;
+  renderRail();
+  renderMain();
+  if (tab === 'activity') seedActivity();
+  if (tab === 'dashboard') renderDashboard();
+  // reconcile the open task from the URL (loaded tasks are in hand now)
+  let taskId = null;
+  if (r.taskKey) {
+    taskId = await resolveProjectTaskKey(pid, r.taskKey);
+    if (!taskId) toast(`Task #${r.taskKey} not found`, true);
+  }
+  if (taskId) { if (S.selected !== taskId) await openDrawer(taskId); else highlightRow(); }
+  else closeDrawerDom();
+}
+
+// Push a task permalink (/projects/:name/tasks/:num) and remember where to return
+// on close (so closing lands back on the list/queue we opened from).
+function goToTask(id) {
+  const rec = (S.tasks || []).find((t) => t.id === id);
+  const p = projectById(rec?.projectId || S.projectId);
+  const keyPart = rec && rec.num != null ? String(rec.num) : id;
+  S.returnRoute = location.pathname;
+  return go(p ? `/projects/${projectSlug(p)}/tasks/${keyPart}` : location.pathname);
+}
+
+// A short human label for a task id: `#num` when known, else a short id.
+function numLabel(taskId) {
+  const t = (S.tasks || []).find((x) => x.id === taskId);
+  return t && t.num != null ? `#${t.num}` : String(taskId || '').slice(0, 8);
+}
 
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
@@ -342,17 +459,20 @@ async function forkTaskPool() {
 async function resumeSearch(box, q, results) {
   const ql = q.toLowerCase().trim();
   if (!ql) { results.innerHTML = ''; return; }
+  // The pool includes archived tasks (the ones most often forked from); match by
+  // title OR by their `#num` (SPEC §10.6).
   let pool = S.tasks;
   try { pool = await forkTaskPool(); } catch {}
-  const matches = pool.filter((t) => !t.params?.draft && t.title.toLowerCase().includes(ql)).slice(0, 6);
+  const matches = pool.filter((t) => !t.params?.draft && taskMatches(t, ql)).slice(0, 6);
   const rows = await Promise.all(
     matches.map(async (t) => {
       let sessions = {};
       try { sessions = await api(`/api/tasks/${t.id}/sessions`); } catch {}
       const roles = Object.keys(sessions);
       if (!roles.length) return '';
+      const numTag = t.num != null ? `<span class="task-num">#${t.num}</span> ` : '';
       return roles
-        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
+        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${numTag}${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
         .join('');
     }),
   );
@@ -501,6 +621,8 @@ async function boot() {
   connectWs();
   renderShell();
   bindKeys();
+  window.addEventListener('popstate', () => applyRoute());
+  await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
 
 async function loadProjects() {
@@ -573,9 +695,8 @@ function renderShell() {
   $('#search').addEventListener('input', (e) => { S.search = e.target.value; if (S.tab === 'tasks') renderMain(); });
   $('#theme').addEventListener('click', toggleTheme);
   $('#bell').addEventListener('click', toggleNotifications);
-  renderRail();
-  renderMain();
-  refreshTasks();
+  // The rail/main are painted by applyRoute() (boot calls it right after), so the
+  // shell reflects the initial URL instead of a default view.
 }
 
 function renderRail() {
@@ -596,18 +717,17 @@ function renderRail() {
     <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard">▦ Dashboard</div>
     <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global">⚙ Global settings</div>`;
   rail.querySelectorAll('.proj[data-id]').forEach((e) =>
-    e.addEventListener('click', () => { S.projectId = e.dataset.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); }),
+    e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
 }
 
 function switchTab(tab) {
-  S.tab = tab;
-  renderRail();
-  renderMain();
-  if (tab === 'activity') seedActivity();
-  if (tab === 'dashboard') renderDashboard();
+  if (tab === 'dashboard') return go('/dashboard');
+  if (tab === 'global') return go('/settings');
+  const pid = S.projectId || S.projects[0]?.id;
+  return go(pid ? projectRoute(pid, tab) : '/dashboard');
 }
 
 // Preserve the focused field (value + caret) across a renderMain() innerHTML
@@ -678,8 +798,17 @@ function renderMain() {
 }
 
 // ── tasks ────────────────────────────────────────────────────────────────────
+// Match a task against a search query: by title, or by its `#num` (so "42" and
+// "#42" both find task #42).
+function taskMatches(t, q) {
+  if (!q) return true;
+  const ql = q.toLowerCase().trim();
+  if (t.title.toLowerCase().includes(ql)) return true;
+  if (t.num != null && `#${t.num}`.includes(ql.startsWith('#') ? ql : `#${ql}`)) return true;
+  return false;
+}
 function tasksView() {
-  const filtered = S.tasks.filter((t) => (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())));
+  const filtered = S.tasks.filter((t) => taskMatches(t, S.search));
   const rows = filtered
     .slice()
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
@@ -708,7 +837,7 @@ function taskRow(t) {
     <div class="task-row" data-draft="${t.id}">
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
         <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span></div>
       </div>
       <div class="task-right">
@@ -732,7 +861,7 @@ function taskRow(t) {
     <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
           <span class="wf">${esc(t.workflow)}</span>
           ${v.branch ? `<span class="branch">${esc(v.branch)}</span>` : ''}
@@ -797,7 +926,7 @@ function pipelineLarge(v) {
 }
 
 function wireTasksView() {
-  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.id)));
+  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.id)));
   $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
   );
@@ -1075,7 +1204,18 @@ async function refreshDrawer() {
   } catch {}
   renderDrawer();
 }
+// Close the drawer by navigating back to the underlying list/queue; applyRoute()
+// then tears the drawer DOM down. Kept as a navigation so the URL + history stay
+// in sync (the ✕ button, the scrim, Esc and the palette all route through here).
 function closeDrawer() {
+  const pid = (S.view && S.tasks.find((t) => t.id === S.view.taskId)?.projectId) || S.projectId;
+  const back = S.returnRoute || (pid ? projectRoute(pid) : '/dashboard');
+  S.returnRoute = null;
+  return go(back, { replace: true });
+}
+// Tear down the drawer DOM without navigating (called by applyRoute()).
+function closeDrawerDom() {
+  if (!S.selected && !S.view) return;
   S.selected = null;
   S.view = null;
   if (termWs) { try { termWs.close(); } catch {} termWs = null; }
@@ -1107,6 +1247,7 @@ function renderDrawer() {
     <aside class="drawer open">
       <div class="drawer-head">
         <div class="row1">
+          ${v.num != null ? `<span class="task-num" title="Task #${v.num}${(() => { const p = projectById(S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId); return p ? ` — permalink /projects/${projectSlug(p)}/tasks/${v.num}` : ''; })()}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
           <span class="chip ${v.status}">${esc(v.stage)}</span>
           <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
@@ -1260,7 +1401,7 @@ function drawerBody(v) {
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
     : '';
   const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(id)}</span></div>`).join('')}`
+    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
     : '';
   return `
     <div class="section-h">Pipeline</div>
@@ -1725,7 +1866,7 @@ function wireActions(v) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.open)));
+  $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.open)));
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
@@ -1802,7 +1943,7 @@ function queueView() {
       const current = pos === 0;
       return `<div class="queue-item ${current ? 'current' : ''}" data-id="${t.id}">
         <span class="pos">${pos === 0 ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${esc(t.title)}</div>
+        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
         ${!current && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
       </div>`;
@@ -1810,7 +1951,7 @@ function queueView() {
     .join('');
 }
 function wireQueueView() {
-  $('#main').querySelectorAll('.queue-item').forEach((e) => e.addEventListener('click', (ev) => { if (!ev.target.dataset.prio) openDrawer(e.dataset.id); }));
+  $('#main').querySelectorAll('.queue-item').forEach((e) => e.addEventListener('click', (ev) => { if (!ev.target.dataset.prio) goToTask(e.dataset.id); }));
   $('#main').querySelectorAll('[data-prio]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
@@ -1830,7 +1971,7 @@ function activityView() {
   if (!S.activity.length) return `<div class="empty"><div class="big">No activity yet</div>Events stream here as agents work.</div>`;
   return `<div class="card"><div class="events" style="max-height:none">${S.activity
     .slice(0, 300)
-    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span style="color:var(--ink-3)">${esc(e.taskId?.slice(0, 14))}</span><span>${esc(summarize(e.payload))}</span></div>`)
+    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span class="mono" style="color:var(--ink-3)">${esc(numLabel(e.taskId))}</span><span>${esc(summarize(e.payload))}</span></div>`)
     .join('')}</div></div>`;
 }
 
@@ -2520,10 +2661,10 @@ function toggleNotifications() {
   pop.className = 'popover';
   pop.id = 'notif-pop';
   pop.innerHTML = `<div class="ph">Needs attention (${items.length})</div>${
-    items.length ? items.map((t) => `<div class="pi" data-id="${t.id}"><b>${esc(t.title)}</b><div class="task-sub"><span class="chip ${t.lastView.status}">${esc(t.lastView.stage)}</span></div></div>`).join('') : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'
+    items.length ? items.map((t) => `<div class="pi" data-id="${t.id}"><b>${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</b><div class="task-sub"><span class="chip ${t.lastView.status}">${esc(t.lastView.stage)}</span></div></div>`).join('') : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'
   }`;
   $('#overlay-root').appendChild(pop);
-  pop.querySelectorAll('.pi[data-id]').forEach((e) => e.addEventListener('click', () => { pop.remove(); openDrawer(e.dataset.id); }));
+  pop.querySelectorAll('.pi[data-id]').forEach((e) => e.addEventListener('click', () => { pop.remove(); goToTask(e.dataset.id); }));
   setTimeout(() => document.addEventListener('click', function h(ev) { if (!pop.contains(ev.target) && ev.target.id !== 'bell') { pop.remove(); document.removeEventListener('click', h); } }), 10);
 }
 
