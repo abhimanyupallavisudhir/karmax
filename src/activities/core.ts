@@ -95,6 +95,9 @@ export interface RunAgentTurnArgs {
   worldHandle: WorldHandle;
   messages: Message[];
   session?: string;
+  /** How many leading `messages` the resumed `session` already holds — forwarded to
+   *  the adapter so a resumed turn sends only the delta, not the whole transcript. */
+  deliveredMessages?: number;
   task: TaskInput;
   bindings?: Record<string, string>;
   explicitProfileId?: string;
@@ -186,6 +189,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // materializing the source session needs this turn's config home + world path.
       let session = args.session;
       let messages = args.messages; // may be augmented by the replay fallback
+      let deliveredMessages = args.deliveredMessages; // leading messages already in `session`
       let fork = false; // true → the adapter branches a NEW session id from `session`
 
       // Temporal wiring: cancellation aborts the in-flight turn (SPEC §5.6), and
@@ -205,6 +209,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // any partial work — continue it rather than re-sending the turn input.
           session = prior;
           hbSession = prior;
+          // `messages` is replaced by the single continuation notice below, so the
+          // delivered-boundary from the workflow no longer applies — send all of it.
+          deliveredMessages = 0;
           messages = [
             {
               id: `retry-${actx.info.attempt}`,
@@ -348,6 +355,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           world,
           messages,
           session,
+          deliveredMessages,
           fork,
           systemPrompt,
           role: args.role,
