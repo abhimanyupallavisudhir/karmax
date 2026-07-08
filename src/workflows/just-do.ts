@@ -81,6 +81,11 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
     await publish();
     if (cancelled) break;
     let turn;
+    // How many leading `msgs` are actually delivered this turn — captured at
+    // schedule time, NOT after. A follow-up that arrives WHILE the turn runs lands
+    // in `msgs` at a higher index; advancing `seen` to `msgs.length` afterwards would
+    // mark it consumed and it would silently never reach the agent (SPEC §5.6).
+    const deliveredNow = msgs.length;
     try {
       // On resume the session already holds the first `seen` messages, so send only
       // the delta after them (a follow-up), not the whole conversation again.
@@ -95,7 +100,7 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
     }
     infraRetries = 0;
     session = turn.session ?? session;
-    seen = msgs.length;
+    seen = deliveredNow;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     stage = 'review';
     status = 'waiting';

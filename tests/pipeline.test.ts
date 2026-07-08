@@ -135,6 +135,43 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('hi there');
   });
 
+  it('delivers a follow-up sent WHILE a turn is running on the next turn (SPEC §5.6)', async () => {
+    // Regression: a follow-up that arrives mid-turn used to be marked "already seen"
+    // (seen = msgs.length AFTER the turn) and so silently never reached the agent —
+    // it must instead be delivered on the next turn.
+    const repo = await h.makeRepo('app-midturn');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // Turn one sleeps ~3s — a window to send a follow-up while the turn is running.
+      args: [input({ taskId, repo, title: 'Mid-turn', prompt: '@sleep 3000\n@review turn one' })],
+    });
+    // wait until the Do turn is actually running, then send the follow-up MID-turn
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await new Promise((r) => setTimeout(r, 700)); // ensure we're inside the sleeping turn
+    await handle.signal('followUp', {
+      id: 'mid1',
+      role: 'user',
+      text: '@write mid.txt :: delivered after all\n@review done now',
+      ts: 0,
+    });
+    // The agent must actually RUN the follow-up on its next turn (not park at Review
+    // with it marked consumed). Its reply proves the directive was delivered+executed.
+    await expect
+      .poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text?.includes('wrote mid.txt')), {
+        timeout: 15_000,
+      })
+      .toBe(true);
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    // the follow-up's work really landed on main
+    const onMain = await git(repo, ['show', 'main:mid.txt']);
+    expect(onMain.code).toBe(0);
+    expect(onMain.stdout).toContain('delivered after all');
+  });
+
   it('escalates with a clear error when the project repo is misconfigured (no silent scratch)', async () => {
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
