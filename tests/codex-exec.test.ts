@@ -3,6 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { CodexAdapter } from '../src/agent/codex.js';
+import { AttachmentStore } from '../src/store/attachments.js';
+
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
+  'base64',
+);
 
 /**
  * Exercises the Codex SUBSCRIPTION adapter path (`codex exec --json`) without a
@@ -15,6 +21,11 @@ const fs = require('fs');
 const argv = process.argv.slice(2);
 const oi = argv.indexOf('-o');
 const outFile = oi >= 0 ? argv[oi + 1] : null;
+if (process.env.STUB_ARGV_OUT) {
+  const imgs = [];
+  for (let k = 0; k < argv.length; k++) if (argv[k] === '-i') { const pth = argv[k + 1]; imgs.push({ path: pth, exists: fs.existsSync(pth), size: fs.existsSync(pth) ? fs.statSync(pth).size : 0 }); }
+  fs.writeFileSync(process.env.STUB_ARGV_OUT, JSON.stringify({ argv, imgs }));
+}
 const mode = process.env.STUB_MODE || 'ok';
 if (mode === 'limit') {
   process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
@@ -66,5 +77,31 @@ describe('CodexAdapter subscription path (codex exec)', () => {
   it('throws a usage-limit error carrying the reset on a turn.failed limit event', async () => {
     process.env.STUB_MODE = 'limit';
     await expect(adapter.runTurn(makeInput() as any, ctx)).rejects.toThrow(/usage limit reached.*1800s/i);
+  });
+
+  it('attaches prompt images via `-i <file>` and cleans up the temp files', async () => {
+    delete process.env.STUB_MODE;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-home-'));
+    const prevHome = process.env.KARMAX_HOME;
+    process.env.KARMAX_HOME = home;
+    const argvOut = path.join(home, 'argv.json');
+    process.env.STUB_ARGV_OUT = argvOut;
+    try {
+      const ref = new AttachmentStore({ home }).put(PNG, 'image/png');
+      const input = makeInput() as any;
+      input.messages = [{ id: 'm', role: 'user', text: 'what is in this image?', ts: 0, images: [ref] }];
+      await adapter.runTurn(input, ctx);
+      const rec = JSON.parse(fs.readFileSync(argvOut, 'utf8'));
+      expect(rec.imgs.length).toBe(1);
+      expect(rec.imgs[0].exists).toBe(true); // the file existed WHILE codex ran
+      expect(rec.imgs[0].size).toBe(PNG.length);
+      // …and was cleaned up after the turn finished.
+      expect(fs.existsSync(rec.imgs[0].path)).toBe(false);
+    } finally {
+      delete process.env.STUB_ARGV_OUT;
+      if (prevHome === undefined) delete process.env.KARMAX_HOME;
+      else process.env.KARMAX_HOME = prevHome;
+      try { fs.rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   });
 });
