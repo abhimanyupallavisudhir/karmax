@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { codexReasoningEffort } from './effort.js';
+import { openaiUserContent, materializeImageFiles } from './images.js';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 
@@ -65,8 +66,8 @@ export class CodexAdapter implements AgentAdapter {
     let respId: string | undefined = input.session; // resume from a prior response id
     const nonAgent = input.messages.filter((m) => m.role !== 'agent');
     let nextInput: any[] = respId
-      ? [{ role: 'user', content: nonAgent.length ? nonAgent[nonAgent.length - 1]!.text : 'Continue.' }]
-      : (input.messages.filter((m) => m.role !== 'system').map((m) => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text }))
+      ? [{ role: 'user', content: nonAgent.length ? openaiUserContent(nonAgent[nonAgent.length - 1]!) : 'Continue.' }]
+      : (input.messages.filter((m) => m.role !== 'system').map((m) => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.role === 'agent' ? m.text : openaiUserContent(m) }))
           .concat(input.messages.some((m) => m.role !== 'system') ? [] : [{ role: 'user', content: 'Begin the task described in the instructions. Call signal_completion when done.' }]));
 
     // Turn cap is optional: unset ⇒ effectively unlimited (a high runaway backstop
@@ -157,6 +158,14 @@ export class CodexAdapter implements AgentAdapter {
     const flags = ['--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-o', lastFile];
     if (model) flags.push('-m', model);
     if (effort) flags.push('-c', `model_reasoning_effort=${effort}`);
+    // Image attachments: `codex exec -i <FILE>` (and `exec resume -i <FILE>`) take
+    // real file paths, so materialize the referenced attachments to a temp dir and
+    // attach each. Fresh turn → every message's images; resuming → only the latest
+    // message's (history is server-side). One `-i` per file to avoid the multi-value
+    // flag swallowing the positional prompt.
+    const imageMsgs = resuming ? (nonSystem.length ? [nonSystem[nonSystem.length - 1]!] : []) : nonSystem;
+    const { files: imageFiles, cleanup: cleanupImages } = materializeImageFiles(imageMsgs);
+    for (const f of imageFiles) flags.push('-i', f);
     // Args go straight to execve (no shell), so a multi-line prompt needs no escaping.
     const args = resuming ? ['exec', 'resume', input.session!, ...flags, promptText] : ['exec', ...flags, promptText];
 
@@ -232,6 +241,7 @@ export class CodexAdapter implements AgentAdapter {
     });
     if (buf.trim()) handleLine(buf); // flush a trailing partial line
     if (hb) clearInterval(hb);
+    cleanupImages(); // remove the temp image files now the child has consumed them
     unregisterAgent(child.pid); // child has exited — clear its custody record
     try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
 

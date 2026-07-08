@@ -125,7 +125,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = input.prompt ? [{ id: 'm0', role: 'user', text: input.prompt, ts: 0 }] : [];
+  const msgs: Message[] = input.prompt || input.images?.length
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+    : [];
   let target = input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let confirmed = false;
