@@ -736,11 +736,21 @@ function taskRow(t) {
         <div class="task-sub">
           <span class="wf">${esc(t.workflow)}</span>
           ${v.branch ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          <span class="chip ${status}">${esc(stage)}</span>
+          <span class="chip ${status}">${esc(stageLabel(v))}</span>
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
     </div>`;
+}
+
+// Human-facing stage label. In the `merge` stage a task is either waiting for
+// its merge-queue slot or actively merging — the merge agent only runs once the
+// slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
+// "merge queued" for the wait, which the raw `stage` alone hides.
+function stageLabel(v) {
+  const stage = v.stage || 'setup';
+  if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
+  return stage;
 }
 
 // The workflow's declared stages (SPEC §5), or the software-dev default.
@@ -1108,7 +1118,7 @@ function renderDrawer() {
       <div class="drawer-head">
         <div class="row1">
           <h2>${esc(v.title)}</h2>
-          <span class="chip ${v.status}">${esc(v.stage)}</span>
+          <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
           <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
@@ -1799,12 +1809,14 @@ function queueView() {
     .map((t) => {
       const v = t.lastView || {};
       const pos = v.mergeQueue?.position;
-      const current = pos === 0;
-      return `<div class="queue-item ${current ? 'current' : ''}" data-id="${t.id}">
-        <span class="pos">${pos === 0 ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${esc(t.title)}</div>
+      // Holds the slot (merge agent running) only when granted — not merely at
+      // position 0 in a queue whose slot is still held by someone else.
+      const merging = !!v.state?.mergeGranted;
+      return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}">
+        <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
+        <div style="flex:1"><div class="task-title">${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
-        ${!current && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
+        ${!merging && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
       </div>`;
     })
     .join('');
