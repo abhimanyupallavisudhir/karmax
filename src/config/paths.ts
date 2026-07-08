@@ -21,6 +21,7 @@ export interface KarmaxPaths {
   vault: string; // credential broker storage
   temporal: string; // temporal dev-server db
   overlays: string; // user/project overlays (safe-mode resolution)
+  attachments: string; // content-addressed user image attachments (image prompts)
 }
 
 export function paths(home = karmaxHome()): KarmaxPaths {
@@ -34,6 +35,7 @@ export function paths(home = karmaxHome()): KarmaxPaths {
     vault: path.join(home, 'vault'),
     temporal: path.join(home, 'temporal'),
     overlays: path.join(home, 'overlays'),
+    attachments: path.join(home, 'attachments'),
   };
 }
 

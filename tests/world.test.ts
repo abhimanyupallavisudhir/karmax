@@ -57,6 +57,31 @@ describe('WorktreeProvider (real git)', () => {
     await world.destroy();
   });
 
+  it('links the origin node_modules into the world so the checkout can run itself', async () => {
+    // Simulate an installed dependency in the origin repo.
+    const dep = path.join(repo, 'node_modules', 'left-pad');
+    fs.mkdirSync(dep, { recursive: true });
+    fs.writeFileSync(path.join(dep, 'index.js'), 'module.exports = 1\n');
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({ taskId: 'deps1', repo, base: 'main' });
+    // The world can resolve the origin's installed deps without a per-world install.
+    const linked = path.join(world.handle.root, 'node_modules', 'left-pad', 'index.js');
+    expect(fs.existsSync(linked)).toBe(true);
+    expect(fs.readFileSync(linked, 'utf8')).toContain('module.exports');
+    // The link must be git-ignored — a `node_modules/` rule matches dirs only,
+    // not a symlink, so without an explicit exclude an agent could commit it.
+    const others = await git(world.handle.root, ['ls-files', '--others', '--exclude-standard']);
+    expect(others.stdout).not.toContain('node_modules');
+    await world.destroy();
+  });
+
+  it('does not link node_modules when the origin has none (scratch/non-Node repo)', async () => {
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({ taskId: 'deps2', repo, base: 'main' });
+    expect(fs.existsSync(path.join(world.handle.root, 'node_modules'))).toBe(false);
+    await world.destroy();
+  });
+
   it('copies named gitignored files into the world', async () => {
     fs.writeFileSync(path.join(repo, '.env'), 'SECRET=1\n');
     const provider = new WorktreeProvider(home);

@@ -44,7 +44,9 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = input.prompt ? [{ id: 'm0', role: 'user', text: input.prompt, ts: 0 }] : [];
+  const msgs: Message[] = input.prompt || input.images?.length
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+    : [];
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let target = input.target ?? input.project.defaultTarget ?? base;
   let confirmed = false;
