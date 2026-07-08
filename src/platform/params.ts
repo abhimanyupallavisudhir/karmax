@@ -25,7 +25,12 @@ export function resolveParams(
 }
 
 function pick<T>(a: T, fallback: T): T {
-  return a === undefined || a === null || a === '' ? fallback : a;
+  // An empty value at a layer means "don't override" — defer to the layer below.
+  // Empty arrays count: a blank `repos`/`copyGlobs` list in project settings must
+  // fall through to the configured value, not shadow it with `[]` (which would
+  // silently strip a project's repo and drop the task into a scratch sandbox).
+  const empty = a === undefined || a === null || a === '' || (Array.isArray(a) && a.length === 0);
+  return empty ? fallback : a;
 }
 
 /** Build a TaskInput from resolved field values, by each field's `bind`. */
@@ -108,6 +113,19 @@ function toList(v: unknown): string[] {
   if (Array.isArray(v)) return v.map(String).filter(Boolean);
   if (typeof v === 'string') return v.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   return [];
+}
+
+/**
+ * The repo list a world will actually be built from — the resolved `repos` overlay
+ * when set, else the project config's repos. Mirrors how `assembleTaskInput` fills
+ * `input.project.repos` (which flows into `createWorld`), so callers can guard on
+ * exactly what the world provider will see rather than on `project.config` alone
+ * (those two can diverge — an empty overlay used to slip past the guard and drop a
+ * repo-oriented task into a silent scratch sandbox).
+ */
+export function effectiveRepos(resolved: ValueMap, config: ProjectConfig): string[] {
+  const raw = resolved.repos !== undefined ? toList(resolved.repos) : config.repos ?? [];
+  return raw.map((s) => String(s).trim()).filter((s) => s.length > 0);
 }
 
 function expandList(name: string, list: string[]): string[] {

@@ -130,12 +130,15 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     confirmDecision,
     raise,
     waitForSubtasks,
+    pendingSubagents: turn.pendingSubagents,
     subTasks: subTasks.length ? subTasks : undefined,
     subTaskResponses: subTaskResponses.length ? subTaskResponses : undefined,
     skills: skills.length ? skills : undefined,
     // If the agent did work but didn't signal completion — and didn't spawn, answer,
-    // raise, or wait on a sub-task (those route through the workflow's sub-task
-    // handling, not the human Review gate) — it is surfaced as needs-input.
-    needsInput: !completed && subTasks.length === 0 && subTaskResponses.length === 0 && !raise && !waitForSubtasks,
+    // raise, or wait on a sub-task, and isn't still waiting on its own in-harness
+    // sub-agents (those route through the workflow, not the human Review gate) — it is
+    // surfaced as needs-input.
+    needsInput:
+      !completed && subTasks.length === 0 && subTaskResponses.length === 0 && !raise && !waitForSubtasks && !turn.pendingSubagents,
   };
 }

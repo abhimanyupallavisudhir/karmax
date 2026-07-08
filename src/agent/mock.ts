@@ -14,6 +14,9 @@ import { parseTransition } from '../resolve/transitions.js';
  *   @respond <action> [:: text]     parent answers a raising child (confirm/comment/retry/cancel)
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
  *   @wait                           parent parks until its sub-tasks finish/raise
+ *   @subagents <n>                  report in-harness sub-agents (Task tool) still running:
+ *                                   N this turn, then N-1, … draining by one each turn until
+ *                                   0 — models sub-agents that settle over several turns
  *   @review <summary>               attach review info
  *   @skill <name> :: <content>      save a skill
  *   @fail <message>                 throw (exercises Resolve)
@@ -28,6 +31,10 @@ import { parseTransition } from '../resolve/transitions.js';
 // @failonce ledger: activity retries land in the same world, so keying by world+message
 // makes the second attempt succeed. Module-level: survives across turn invocations.
 const failedOnce = new Set<string>();
+// `@subagents N` ledger: the sub-agent count drains by one each turn (keyed by world),
+// so a turn that "finished" is HELD in Do until the count reaches 0 — modelling
+// auto-backgrounded Claude Agent SDK sub-agents that settle over several turns.
+const stickySubagents = new Map<string, number>();
 
 export class MockAdapter implements AgentAdapter {
   readonly provider = 'mock' as const;
@@ -49,6 +56,7 @@ export class MockAdapter implements AgentAdapter {
     const text = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
 
     let complete = true;
+    let pendingSubagents = 0;
     const outputs: string[] = [];
 
     for (const raw of text.split('\n')) {
@@ -174,6 +182,13 @@ export class MockAdapter implements AgentAdapter {
         case 'incomplete':
           complete = false;
           break;
+        case 'subagents': {
+          // Simulate a Claude-Agent-SDK turn that returned while N in-harness
+          // sub-agents (Task tool) are still running — the completion must be HELD.
+          stickySubagents.set(input.world.handle.id, Number(rest.trim()) || 0);
+          outputs.push(`subagents: ${rest.trim()}`);
+          break;
+        }
         case 'profile':
           // Echo the model/effort this turn actually ran with, so tests can assert
           // an in-flight retune (SPEC §5.5) reaches the agent on its next turn.
@@ -184,9 +199,17 @@ export class MockAdapter implements AgentAdapter {
       }
     }
 
+    // Drain any sticky sub-agent count by one: report the current count as still
+    // in flight this turn, so the workflow holds until it reaches 0.
+    const sticky = stickySubagents.get(input.world.handle.id) ?? 0;
+    if (sticky > 0) {
+      pendingSubagents = sticky;
+      stickySubagents.set(input.world.handle.id, sticky - 1);
+    }
+
     if (outputs.length === 0) outputs.push('(mock agent: no directives; nothing to do)');
     if (complete) ctx.signalCompletion(outputs.join('; '));
-    return { session, output: outputs.join('\n') };
+    return { session, output: outputs.join('\n'), ...(pendingSubagents ? { pendingSubagents } : {}) };
   }
 }
 

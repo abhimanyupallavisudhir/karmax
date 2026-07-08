@@ -91,6 +91,11 @@ export const RUNAWAY_BACKSTOP = 1000;
 export interface AdapterTurn {
   session?: string;
   output: string;
+  /** Claude-Agent-SDK sub-agents (the Task tool) still in flight when the turn's
+   *  main loop returned — e.g. auto-backgrounded long sub-agents that only settle
+   *  later. The workflow holds in Do until this reaches 0 so a task is never
+   *  reported "done" while the agent is still waiting on its sub-agents. */
+  pendingSubagents?: number;
 }
 
 export interface AgentAdapter {
@@ -111,6 +116,10 @@ export interface TurnResult {
   raise?: RaiseToParent;
   /** Parent-agent asked to park until its sub-tasks settle (SPEC §5.3). */
   waitForSubtasks?: boolean;
+  /** In-harness sub-agents (Claude Agent SDK Task tool) still running when the turn
+   *  returned. While > 0 the workflow keeps the agent in Do rather than advancing to
+   *  Review — completion is "done AND not waiting on any sub-agents". */
+  pendingSubagents?: number;
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
   error?: string;
