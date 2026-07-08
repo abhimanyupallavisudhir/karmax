@@ -22,8 +22,17 @@ function input(over: { taskId: string; repo: string; prompt: string; target?: st
     base: 'main',
     target: over.target ?? 'main',
     project: { repos: [over.repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
-    // target until PR/merge; merge & resolve agents until their turn runs (SPEC §5.5).
-    paramWindows: { target: 'untilUsed' as const, 'agent:merge': 'untilUsed' as const, 'agent:resolve': 'untilUsed' as const },
+    // A concrete Do agent so its provider is pinned (a mid-flight provider swap is
+    // rejected; only model/effort retune, SPEC §5.5).
+    agents: { do: { provider: 'mock' as const } },
+    // target until PR/merge; every agent's model+effort is retunable in-flight
+    // ('always'), while an identity swap is gated by the workflow validator (SPEC §5.5).
+    paramWindows: {
+      target: 'untilUsed' as const,
+      'agent:do': 'always' as const,
+      'agent:merge': 'always' as const,
+      'agent:resolve': 'always' as const,
+    },
   };
 }
 
@@ -46,13 +55,12 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     });
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
 
-    // the view advertises target + the not-yet-run merge/resolve agents as editable,
-    // and NOT the fields already used (prompt, base, the running Do agent)
+    // the view advertises target + all three agents (their model/effort is retunable
+    // in-flight), and NOT the fields already used (prompt, base)
     const v0 = await view(handle);
-    expect(v0.editableParams).toEqual(expect.arrayContaining(['target', 'agent:merge', 'agent:resolve']));
+    expect(v0.editableParams).toEqual(expect.arrayContaining(['target', 'agent:do', 'agent:merge', 'agent:resolve']));
     expect(v0.editableParams).not.toContain('prompt');
     expect(v0.editableParams).not.toContain('base');
-    expect(v0.editableParams).not.toContain('agent:do');
 
     // a target edit is accepted and reflected in the view
     const applied = await handle.executeUpdate('updateParams', { args: [{ target: 'release' }] });
@@ -63,10 +71,15 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     const appliedMerge = await handle.executeUpdate('updateParams', { args: [{ 'agent:merge': { provider: 'mock', model: 'mock' } }] });
     expect(appliedMerge).toEqual({ applied: ['agent:merge'] });
 
+    // the Do agent's model/effort CAN be retuned in-flight — it lands on the next turn
+    const appliedDo = await handle.executeUpdate('updateParams', { args: [{ 'agent:do': { provider: 'mock', model: 'mock-fast', effort: 'high' } }] });
+    expect(appliedDo).toEqual({ applied: ['agent:do'] });
+
     // fields already used are REJECTED (a real update rejection, not a silent no-op)
     await expect(handle.executeUpdate('updateParams', { args: [{ prompt: 'nope' }] })).rejects.toThrow();
     await expect(handle.executeUpdate('updateParams', { args: [{ base: 'other' }] })).rejects.toThrow();
-    await expect(handle.executeUpdate('updateParams', { args: [{ 'agent:do': { provider: 'mock' } }] })).rejects.toThrow();
+    // but the Do agent's IDENTITY (provider) is frozen mid-flight — retune, don't swap
+    await expect(handle.executeUpdate('updateParams', { args: [{ 'agent:do': { provider: 'codex' } }] })).rejects.toThrow();
 
     // confirm → the EDITED target is what actually gets merged into
     await handle.signal('confirm');
@@ -80,6 +93,43 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
 
     // past the point of no return: no edits accepted
     await expect(handle.executeUpdate('updateParams', { args: [{ target: 'x' }] })).rejects.toThrow();
+  });
+
+  it('a Do-agent model/effort retune lands on the NEXT turn (a follow-up), not the running one', async () => {
+    const repo = await h.makeRepo('paramedit-do');
+    const taskId = newId('task');
+    // Turn one echoes its model/effort, then parks at Review awaiting a follow-up.
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, prompt: '@profile\n@review turn-one' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+
+    // The first turn ran on the pinned default (model undefined on the bare spec).
+    const doMsgs1 = (await view(handle)).transcripts.find((t: any) => t.role === 'do').messages;
+    expect(doMsgs1.some((m: any) => m.text.includes('profile: (none)/(none)'))).toBe(true);
+
+    // Retune the Do agent mid-flight — provider stays 'mock', model/effort change.
+    const applied = await handle.executeUpdate('updateParams', {
+      args: [{ 'agent:do': { provider: 'mock', model: 'mock-turbo', effort: 'high' } }],
+    });
+    expect(applied).toEqual({ applied: ['agent:do'] });
+
+    // A follow-up re-enters Do; that turn must run on the NEW model/effort.
+    await handle.signal('followUp', { id: 'f1', role: 'user', text: '@profile\n@review turn-two', ts: 0 }, 'do');
+    await expect
+      .poll(
+        async () => {
+          const doMsgs = (await view(handle)).transcripts.find((t: any) => t.role === 'do')?.messages ?? [];
+          return doMsgs.some((m: any) => m.text.includes('profile: mock-turbo/high'));
+        },
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
   });
 
   it('the setTarget shim keeps its legacy boolean contract', async () => {

@@ -48,6 +48,14 @@ export interface TaskList {
 /** The persisted index record for a task. The live view comes from the workflow query. */
 export interface TaskRecord {
   id: string;
+  /**
+   * Simple, human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
+   * project's tasks run #1, #2, …, assigned at creation. The UI displays `#num` and
+   * the URL scheme uses it (`/projects/<name>/tasks/<num>`); the opaque `id` above
+   * stays the canonical key (it is the Temporal workflowId, event key, and session
+   * key, so it must never change).
+   */
+  num?: number;
   projectId: string;
   listId: string;
   title: string;
@@ -205,6 +213,12 @@ export interface DeclaredAction {
 /** The typed projection of a task's state + allowed actions the UI renders. */
 export interface TaskView {
   taskId: string;
+  /**
+   * Human-facing sequential id (SPEC §10.6), mirrored onto the view from the task
+   * record by the gateway so the UI can show `#num` and build permalinks. Not
+   * produced by the workflow (which only knows the opaque `taskId`).
+   */
+  num?: number;
   title: string;
   workflow: string;
   stage: Stage;
@@ -241,7 +255,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'parent'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'parent'; provider?: string; earliestResetAt?: number; detail?: string };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right

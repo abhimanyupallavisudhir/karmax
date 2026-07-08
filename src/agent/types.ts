@@ -61,6 +61,12 @@ export interface TurnInput {
   messages: Message[];
   /** A session to continue (prior turn, SPEC §7.2) OR — with `fork` — to branch from. */
   session?: string;
+  /** How many leading `messages` the resumed `session` already holds (delivered on
+   *  prior turns). On resume the adapter sends only the delta after this boundary —
+   *  the session carries the rest server-side, so re-sending it wastes tokens and
+   *  folds the agent's own past replies back in as user input. Ignored on a fresh
+   *  session / fork (the full transcript is sent). See `messagesToDeliver`. */
+  deliveredMessages?: number;
   /** Fork `session` into a NEW session instead of continuing it (SPEC §10.5): the
    *  source is left untouched. Claude → `--fork-session`; Codex → resume a copied rollout. */
   fork?: boolean;
@@ -82,6 +88,11 @@ export const RUNAWAY_BACKSTOP = 1000;
 export interface AdapterTurn {
   session?: string;
   output: string;
+  /** Claude-Agent-SDK sub-agents (the Task tool) still in flight when the turn's
+   *  main loop returned — e.g. auto-backgrounded long sub-agents that only settle
+   *  later. The workflow holds in Do until this reaches 0 so a task is never
+   *  reported "done" while the agent is still waiting on its sub-agents. */
+  pendingSubagents?: number;
 }
 
 export interface AgentAdapter {
@@ -102,6 +113,10 @@ export interface TurnResult {
   raise?: RaiseToParent;
   /** Parent-agent asked to park until its sub-tasks settle (SPEC §5.3). */
   waitForSubtasks?: boolean;
+  /** In-harness sub-agents (Claude Agent SDK Task tool) still running when the turn
+   *  returned. While > 0 the workflow keeps the agent in Do rather than advancing to
+   *  Review — completion is "done AND not waiting on any sub-agents". */
+  pendingSubagents?: number;
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
   error?: string;

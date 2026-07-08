@@ -5,7 +5,9 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACK
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
+import { messagesToDeliver } from './history.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
+import { newSubagentTracker, trackTaskMessage, pendingSubagentCount } from './subagents.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -142,14 +144,18 @@ export class ClaudeAdapter implements AgentAdapter {
       tools: buildSdkTools(tool, zod, handlers),
     });
 
-    const userText = input.messages.filter((m) => m.role !== 'system').map((m) => m.text).join('\n\n') ||
-      'Begin the task described in the system prompt. Call signal_completion when done.';
+    // Only the messages new since the resumed session last advanced (the whole
+    // conversation on a fresh session) — the session already holds the rest, so
+    // re-sending it would replay the agent's own past replies back at it (§7.2).
+    const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
+    const userText = convo.map((m) => m.text).join('\n\n') ||
+      (input.session ? 'Continue from the latest instruction.' : 'Begin the task described in the system prompt. Call signal_completion when done.');
 
     // Images force the streaming-input form: the SDK's plain-string `prompt` can't
     // carry image blocks, so when there are attachments we hand it an
     // AsyncIterable<SDKUserMessage> whose MessageParam content mixes text + images.
     // (Text-only turns keep the string prompt, byte-for-byte unchanged.)
-    const imageBlocks = collectAnthropicImageBlocks(input.messages);
+    const imageBlocks = collectAnthropicImageBlocks(convo);
     const promptArg: any = imageBlocks.length
       ? (async function* () {
           const content: any[] = [];
@@ -186,6 +192,11 @@ export class ClaudeAdapter implements AgentAdapter {
 
     let finalText = '';
     let session = input.session;
+    // Track in-harness sub-agents (the Task tool). Claude Code auto-backgrounds long
+    // sub-agents, so the main `result` can arrive — completion already signalled —
+    // while a sub-agent is still running. We fold every task-lifecycle message in and
+    // report the residual count so the workflow won't advance Do→Review mid-flight.
+    const subagents = newSubagentTracker();
     const iterator = query({
       prompt: promptArg,
       options: {
@@ -239,6 +250,10 @@ export class ClaudeAdapter implements AgentAdapter {
         // it — so the drawer shows a live "fork this agent" command mid-turn (#3).
         const sid: string | undefined = (message as any).session_id;
         if (sid && !publishedSession) { session = sid; publishedSession = true; ctx.onSession?.(sid); }
+        // Fold sub-agent (Task tool) lifecycle events into the outstanding set. Draining
+        // the stream to its end lets any in-turn settlements clear before we report —
+        // only genuinely still-running sub-agents remain (see subagents.ts).
+        trackTaskMessage(subagents, message);
         if (message.type === 'assistant') {
           const text = (message.message?.content ?? [])
             .filter((b: any) => b.type === 'text')
@@ -264,7 +279,8 @@ export class ClaudeAdapter implements AgentAdapter {
     // The Agent SDK harness completes its own loop; treat a finished query as a
     // turn boundary. If the agent didn't call signal_completion explicitly, the
     // runtime surfaces the output at Review.
-    return { session, output: finalText };
+    const pending = pendingSubagentCount(subagents);
+    return { session, output: finalText, ...(pending ? { pendingSubagents: pending } : {}) };
   }
 }
 

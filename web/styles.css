@@ -203,6 +203,9 @@ a { color: var(--accent); text-decoration: none; }
 .status-dot.cancelled { background: var(--ink-3); }
 .task-main { min-width: 0; }
 .task-title { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Human-facing sequential task id (SPEC §10.6): a quiet monospace tag before the title. */
+.task-num { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); font-weight: 500; }
+.drawer-head .row1 .task-num { font-size: 13px; align-self: center; }
 .task-sub { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-3); margin-top: 3px; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }

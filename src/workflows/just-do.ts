@@ -82,7 +82,9 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
     if (cancelled) break;
     let turn;
     try {
-      turn = await turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, task: input });
+      // On resume the session already holds the first `seen` messages, so send only
+      // the delta after them (a follow-up), not the whole conversation again.
+      turn = await turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input });
     } catch (err) {
       // Infrastructure outage that outlived the activity retries: park with
       // backoff and re-run the turn (which resumes its session) rather than
