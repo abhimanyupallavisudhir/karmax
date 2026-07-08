@@ -13,6 +13,8 @@ const S = {
   projects: [],
   projectId: null,
   tasks: [],
+  deleted: new Set(), // ids of drafts deleted this session — tombstones so a stale
+  // in-flight list refresh (issued before the DELETE landed) can't resurrect them.
   tab: 'tasks',
   selected: null, // taskId
   view: null, // selected task view
@@ -631,7 +633,13 @@ async function loadProjects() {
 async function loadTasks() {
   if (!S.projectId) return;
   S.forkPool = null; // let the fork picker re-fetch its archived-inclusive pool
-  S.tasks = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
+  const fetched = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
+  // Drop any draft we just deleted: a list request issued before the DELETE landed
+  // can still return it and clobber the optimistic removal. Once a fresh fetch no
+  // longer contains a tombstoned id, the server has caught up — retire it so the
+  // set can't grow without bound (task ids are never reused).
+  for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
+  S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
 }
 
 // ── websocket live stream ──────────────────────────────────────────────────
@@ -997,7 +1005,11 @@ function consumingField(fields) {
 
 async function deleteDraft(id) {
   // Drafts never started a workflow, so the record is hard-deleted server-side.
-  try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch (e) { return toast(e.message, true); }
+  // A 404 means it's already gone (e.g. a racing double-delete) — treat that as
+  // success rather than surfacing a confusing "no such task" error.
+  try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); }
+  catch (e) { if (!/no such task|HTTP 404/i.test(e.message || '')) return toast(e.message, true); }
+  S.deleted.add(id); // tombstone before a debounced refresh can re-fetch the stale list
   S.tasks = S.tasks.filter((t) => t.id !== id);
   renderMain();
 }
