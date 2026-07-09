@@ -946,12 +946,22 @@ function taskRow(t) {
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
           <span class="wf">${esc(t.workflow)}</span>
-          ${v.branch ? `<span class="branch">${esc(v.branch)}</span>` : ''}
+          ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
     </div>`;
+}
+
+// Every task gets an isolated worktree on an auto-generated `karmax/<taskId>`
+// branch — the taskId is a noisy random slug, so echoing it in the byline just
+// clutters the list/drawer (it's still reachable via the drawer's terminal +
+// fork commands, which carry the world path). Only surface the branch when it's
+// a *custom* one the human would recognize — e.g. an existing branch checked out
+// by a merge-only workflow.
+function customBranch(v, taskId) {
+  return v.branch && v.branch !== `karmax/${taskId}`;
 }
 
 // Human-facing stage label. In the `merge` stage a task is either waiting for
@@ -1372,7 +1382,7 @@ function renderDrawer() {
         </div>
         <div class="meta">
           <span>${esc(v.workflow)}${(() => { const rec = S.tasks.find((t) => t.id === v.taskId); return rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''; })()}</span>
-          ${v.branch ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
+          ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
         </div>
