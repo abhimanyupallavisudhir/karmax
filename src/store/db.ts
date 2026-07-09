@@ -22,6 +22,13 @@ import {
 import { newId } from '../util/id.js';
 
 /**
+ * Terminal statuses that auto-archive a task when it first reaches one (see
+ * `Store.saveView`). Only fully-resolved outcomes — a failed task stays visible
+ * because it usually needs attention.
+ */
+const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
+
+/**
  * The metadata index. Temporal holds the authoritative live workflow state;
  * this store is the searchable index of projects/lists/tasks/profiles plus an
  * append-only event log that powers the live UI stream.
@@ -333,7 +340,20 @@ export class Store {
   }
 
   saveView(taskId: string, view: TaskView) {
+    // Auto-archive on resolution: the moment a task reaches a terminal, no-further-
+    // action status (done or cancelled) it drops out of the default active list
+    // without a manual archive step — the same effect the /archive endpoint has, but
+    // automatic. Failed tasks are deliberately left visible (they usually need a look).
+    // Fire only on the *transition* into that status (previous snapshot wasn't
+    // already done/cancelled) so a later view re-save can't override a user who
+    // deliberately un-archived a finished task.
+    const prev = this.getTask(taskId);
     this.db.prepare('UPDATE tasks SET lastView = ? WHERE id = ?').run(JSON.stringify(view), taskId);
+    const resolvedNow =
+      AUTO_ARCHIVE_STATUS.has(view.status) && !AUTO_ARCHIVE_STATUS.has(prev?.lastView?.status ?? '');
+    if (prev && resolvedNow && !prev.params?.archived) {
+      this.updateTaskParams(taskId, { ...prev.params, archived: true });
+    }
   }
 
   reorderTask(taskId: string, ord: number) {
