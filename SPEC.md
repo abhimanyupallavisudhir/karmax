@@ -477,6 +477,16 @@ The `agent` field type is the reusable control for choosing the agent that runs 
 
 The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.
 
+**Quick-task defaults.** A task can be created two ways: from the expanded task form (§10.4.1) where every field is set explicitly, or from the **quick one-line composer**, which sets only a prompt and takes everything else from defaults. Those two paths can want *different* defaults — e.g. quick captures should auto-confirm while considered, full-form tasks should not. So alongside the general per-workflow defaults, each of the project- and global-settings pages carries a **"Quick task defaults"** section: the same declared field schema, saved to a separate `quick:`-namespaced overlay that applies **only** to tasks added from the quick box (`create_task({ quick: true })`).
+
+Quick defaults are purely opt-in and inherit from the general defaults until a field is set, so the overlay stack for a quick task is (highest → lowest precedence):
+
+```
+task override → project-quick → global-quick → project-general → global-general → field default
+```
+
+This realizes the two inheritances the settings UI exposes: the **global** quick defaults inherit from the general global defaults (one "Reset to inherited" button per field); the **project** quick defaults inherit from *either* the global quick defaults (their natural parent) *or* the project's general defaults (two "Reset to inherited" buttons per field — ↺ Global quick / ↺ Project default — each snapping the field to that source). Full-form tasks skip the quick layers entirely, so the two paths stay independent.
+
 ### 10.6 URLs and task numbers — every view is bookmarkable
 
 The console is a single-page app, but every page has its own **URL** so a specific task, project, settings page, or the dashboard can be bookmarked, shared, and reached with the browser's back/forward buttons. The URL — not an in-memory tab variable — is the single source of truth for *{active project, active tab, open task}*. The gateway already serves `index.html` for any non-asset path (the SPA fallback), so the client owns routing via the History API; a deep link like `/t/42` loads the app and reconciles state to that URL on boot.

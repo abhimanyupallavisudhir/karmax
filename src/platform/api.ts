@@ -11,7 +11,7 @@ import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, Saved
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
-import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
+import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
@@ -145,6 +145,9 @@ export class KarmaxApi {
       notes?: string;
       /** Save without starting the workflow (SPEC §10.4 drafts). */
       draft?: boolean;
+      /** Added from the quick-task box (not the full form): layer the quick-task
+       *  defaults over the general defaults when resolving (SPEC §10.4). */
+      quick?: boolean;
     },
   ): Promise<TaskRecord> {
     this.require(token, 'create_task');
@@ -165,7 +168,7 @@ export class KarmaxApi {
     // Image attachments ride alongside the prompt but aren't a manifest param, so
     // carry them explicitly (references only — bytes live in the attachment store).
     if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
-    const resolved = await this.resolveTaskParams(manifest, project, taskOverrides);
+    const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
     // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
     // (drafts may still be saved without one, then checked again at queueTask).
     // Checked after resolution so the guard sees the same repos the world will.
@@ -255,16 +258,22 @@ export class KarmaxApi {
    * creation and draft queueing so both pick up the live defaults, and so an
    * unqueued task inherits any default change made after it was saved.
    */
-  private async resolveTaskParams(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap): Promise<ValueMap> {
+  private async resolveTaskParams(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, quick = false): Promise<ValueMap> {
     const getSettings = (s: string, w: string) => this.deps.store.getSettings(s, w);
     const projectVals = projectSettingsFor(getSettings, project, manifest.name);
     const globalVals = globalSettingsFor(getSettings, manifest.name);
-    const resolved = resolveParams(manifest, { task: taskOverrides, project: projectVals, global: globalVals });
+    // Quick tasks layer the quick-task defaults (project-quick → global-quick) above
+    // the general defaults; a full-form task skips them entirely (SPEC §10.4).
+    const layers: (ValueMap | undefined)[] = quick
+      ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name), projectVals, globalVals]
+      : [taskOverrides, projectVals, globalVals];
+    const resolved = resolveParamsLayers(manifest, layers);
 
     // Auto-detect the repo's default branch when base/target weren't set anywhere,
     // instead of guessing "main" (which would create a phantom target branch).
-    const explicitBase = taskOverrides.base ?? projectVals.base ?? globalVals.base;
-    const explicitTarget = taskOverrides.target ?? projectVals.target ?? globalVals.target;
+    const firstSet = (name: string) => layers.map((l) => l?.[name]).find((v) => v !== undefined && v !== null && v !== '');
+    const explicitBase = firstSet('base');
+    const explicitTarget = firstSet('target');
     const repo0 = project.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
     if (repo0 && (!explicitBase || !explicitTarget)) {
       const db = await defaultBranch(repo0).catch(() => undefined);
