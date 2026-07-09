@@ -9,7 +9,8 @@ import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
-import { registerAgent, unregisterAgent, killAgent } from './custody.js';
+import { registerAgent, unregisterAgent, killAgent, killProcessGroup } from './custody.js';
+import { trackProcess } from '../util/processes.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -179,7 +180,20 @@ export class CodexAdapter implements AgentAdapter {
     // Process-tree custody (src/agent/custody.ts): record the root pid so a
     // boot-time sweep can reap this group if karmax is SIGKILLed mid-turn
     // (systemd-oomd / crash), and drop the record when the turn ends normally.
-    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, startedAt: Date.now() });
+    // Also surface it in the live task-manager registry (dashboard Processes
+    // panel) under its task.
+    let untrack = () => {};
+    if (child.pid) {
+      registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });
+      untrack = trackProcess({
+        pid: child.pid,
+        kind: 'agent',
+        label: `codex agent (${input.role})`,
+        taskId: input.world.handle.id,
+        startedAt: Date.now(),
+        kill: (sig) => (sig === 'SIGKILL' ? killProcessGroup(child.pid, 'SIGKILL') : void killAgent(child.pid)),
+      });
+    }
 
     // Mid-turn cancel (SPEC §5.6): kill the whole process GROUP when the workflow
     // cancels — SIGTERM, escalating to SIGKILL after a grace window.
@@ -245,6 +259,7 @@ export class CodexAdapter implements AgentAdapter {
     if (hb) clearInterval(hb);
     cleanupImages(); // remove the temp image files now the child has consumed them
     unregisterAgent(child.pid); // child has exited — clear its custody record
+    untrack();
     try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
 
     // Prefer the -o final-message file (authoritative) over the streamed text.
