@@ -49,7 +49,8 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // it pauses at Review for human confirmation
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
     const review = await view(handle);
-    expect(review.reviewInfo?.summary).toContain('factorial');
+    // @review sets the terse caption; the git-derived summary/changedFiles are added automatically.
+    expect(review.reviewInfo?.caption).toContain('factorial');
     expect(review.actions.map((a: any) => a.name)).toContain('confirm');
 
     await handle.signal('confirm');

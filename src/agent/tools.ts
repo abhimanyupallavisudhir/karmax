@@ -51,10 +51,28 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'create_review_info',
-    description: 'Attach polished review output (summary, links, diff, html) shown at the Review stage.',
+    description:
+      "Attach click-to-verify affordances for the Review stage — the exact things a human clicks to check your work, NOT a prose summary of what you did (that belongs in your messages). Provide `actions`: each is either a `run` (a shell command executed in the task's world — e.g. start a server or app; set `server: true` for a long-lived process and list `openUrls` to open once it's up) or an `open` (a produced artifact to open: a world-relative file path — PDF, notebook, image, video — or an absolute URL, in `target`). Add a one-line `caption` saying what to verify. The changed-files list is added automatically.",
     parameters: {
       type: 'object',
       properties: {
+        caption: { type: 'string', description: 'One line: WHAT to verify (not a narrative of what you did).' },
+        actions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', enum: ['run', 'open'] },
+              label: { type: 'string', description: 'Short button label.' },
+              command: { type: 'string', description: 'run: the shell command executed in the world.' },
+              server: { type: 'boolean', description: 'run: command is a long-lived server/watcher (stream logs + Stop).' },
+              openUrls: { type: 'array', items: { type: 'string' }, description: 'run: URLs to open once it is up.' },
+              target: { type: 'string', description: 'open: a world-relative file path or an absolute URL.' },
+            },
+            required: ['kind', 'label'],
+          },
+        },
+        // Legacy free-form fields, still accepted for back-compat.
         summary: { type: 'string' },
         links: { type: 'array', items: { type: 'object', properties: { label: { type: 'string' }, url: { type: 'string' } } } },
         diff: { type: 'string' },
@@ -191,6 +209,8 @@ export function platformToolHandlers(
     },
     async create_review_info(args) {
       ctx.createReviewInfo({
+        caption: args?.caption,
+        actions: Array.isArray(args?.actions) ? args.actions : undefined,
         summary: args?.summary,
         links: args?.links,
         diff: args?.diff,

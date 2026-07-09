@@ -910,6 +910,7 @@ function renderDrawer() {
   wireParams(v);
   wireNotes(v);
   wireTerminal(v.taskId);
+  wireReviewActions(v);
   wireCopyButtons();
   renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId, taskId: v.taskId });
   renderDrawerEvents();
@@ -940,6 +941,81 @@ function wireTerminal(taskId) {
       if (e.key === 'Enter') { ws.send(JSON.stringify({ type: 'input', data: inp.value + '\r' })); inp.value = ''; }
     };
   });
+}
+
+// ── review actions: click-to-verify buttons (run in the world / open artifacts) ──
+function reviewActionBtn(a, i) {
+  const isRun = a.kind === 'run';
+  const icon = isRun ? (a.server ? '▶' : '⚡') : '↗';
+  const label = `${icon} ${esc(a.label || (isRun ? 'Run' : 'Open'))}`;
+  const title = isRun ? esc(a.command || '') : esc(a.target || '');
+  return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
+}
+
+let reviewActionWs = null;
+async function openArtifact(url, external) {
+  if (external) { window.open(url, '_blank', 'noopener'); return; }
+  // Artifact endpoints need the auth header, so fetch as a blob then open it.
+  try {
+    const res = await fetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
+    if (!res.ok) { toast('could not open artifact', true); return; }
+    const obj = URL.createObjectURL(await res.blob());
+    window.open(obj, '_blank', 'noopener');
+    setTimeout(() => URL.revokeObjectURL(obj), 60_000);
+  } catch (e) { toast(e.message, true); }
+}
+function wireReviewActions(v) {
+  const wrap = document.getElementById('review-actions');
+  if (!wrap) return;
+  const out = document.getElementById('review-action-out');
+  wrap.querySelectorAll('.review-action').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = Number(btn.getAttribute('data-idx'));
+      const kind = btn.getAttribute('data-kind');
+      try {
+        const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
+        if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        // kind === 'run': stream output; open follow-up URLs; offer Stop.
+        if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
+        if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}`);
+        reviewActionWs = ws;
+        ws.onmessage = (m) => {
+          try {
+            const msg = JSON.parse(m.data);
+            if (!out) return;
+            if (msg.type === 'data') { out.textContent += stripAnsi(msg.data); out.scrollTop = out.scrollHeight; }
+            else if (msg.type === 'exit') { out.textContent += `\n[exited: code ${msg.code}]\n`; setStopBtn(false); }
+          } catch {}
+        };
+        ws.onclose = () => setStopBtn(false);
+        setStopBtn(true, r.procId, v.taskId);
+        // A server keeps running — open its pages once it's had a moment to boot.
+        if (r.server && Array.isArray(r.openUrls)) {
+          setTimeout(() => r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
+        } else if (Array.isArray(r.openUrls) && r.openUrls.length) {
+          r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener'));
+        }
+      } catch (e) { toast(e.message, true); }
+    });
+  });
+}
+function setStopBtn(running, procId, taskId) {
+  const wrap = document.getElementById('review-actions');
+  if (!wrap) return;
+  let stop = document.getElementById('review-action-stop');
+  if (!running) { if (stop) stop.remove(); return; }
+  if (!stop) {
+    stop = document.createElement('button');
+    stop.id = 'review-action-stop';
+    stop.className = 'btn sm danger';
+    stop.textContent = '■ Stop';
+    wrap.appendChild(stop);
+  }
+  stop.onclick = async () => {
+    try { await api(`/api/tasks/${taskId}/review-action/${procId}/stop`, { method: 'POST' }); } catch (e) { toast(e.message, true); }
+  };
 }
 
 function drawerBody(v) {
@@ -992,11 +1068,14 @@ function drawerBody(v) {
       </details>`;
     })
     .join('');
+  const caption = v.reviewInfo?.caption || v.reviewInfo?.summary;
   const review = v.reviewInfo
     ? `<div class="section-h">Review</div>
        <div class="review">
-         ${v.reviewInfo.summary ? `<div class="summary">${esc(v.reviewInfo.summary)}</div>` : ''}
-         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin-bottom:8px">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
+         ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
+         ${v.reviewInfo.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
+         <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
+         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin:8px 0">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
        </div>`

@@ -308,6 +308,10 @@ a { color: var(--accent); text-decoration: none; }
 .review { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; background: var(--surface-2); }
 .review .summary { margin-bottom: 10px; }
 .review .links { display: flex; flex-wrap: wrap; gap: 8px; }
+.review .review-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
+.review .review-actions .btn.review-action { font-family: var(--font-mono); }
+.btn.danger { border-color: var(--danger); color: var(--danger); }
+#review-action-out { margin-top: 8px; }
 .review iframe { width: 100%; min-height: 220px; border: 1px solid var(--line); border-radius: var(--r-sm); background: #fff; }
 .diff { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; white-space: pre; }
 .diff .add { color: var(--merged); }

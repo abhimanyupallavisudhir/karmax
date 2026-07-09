@@ -55,7 +55,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       completed = true; // a decision ends the resolve turn
     },
     createReviewInfo(info) {
-      reviewInfo = { ...reviewInfo, ...info };
+      // Accumulate `actions` across calls (an agent may attach them incrementally);
+      // every other field is last-write-wins.
+      const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
+      reviewInfo = { ...reviewInfo, ...info, ...(actions ? { actions } : {}) };
     },
     createSubTask(t) {
       subTasks.push(t);
