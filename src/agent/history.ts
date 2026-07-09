@@ -30,3 +30,19 @@ export function messagesToDeliver(input: TurnInput): Message[] {
   const delivered = Math.min(Math.max(input.deliveredMessages ?? 0, 0), input.messages.length);
   return input.messages.slice(delivered);
 }
+
+/**
+ * Serialize delivered messages into ONE prompt string, for provider inputs that
+ * only accept a single user string (the Claude Agent SDK's `prompt`, `codex exec`).
+ *
+ * Agent turns are attributed with an `assistant:` label so that when a full
+ * transcript is replayed — a fork, or a resume whose provider session couldn't be
+ * reattached (login switch) — the agent's OWN prior replies are not folded back in
+ * as if the human had typed them. A bare `messages.map(m => m.text).join()` loses
+ * the role and produces exactly that bug (an assistant's answer masquerading as a
+ * user instruction). On the common single-follow-up delta there's no agent message,
+ * so the output is byte-for-byte the user's text — unchanged.
+ */
+export function conversationToPromptText(messages: Message[]): string {
+  return messages.map((m) => (m.role === 'agent' ? `assistant: ${m.text}` : m.text)).join('\n\n');
+}

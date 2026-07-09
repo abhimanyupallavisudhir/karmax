@@ -1055,6 +1055,23 @@ async function openTaskForm(workflow, draft, seedText) {
 async function openDrawer(taskId) {
   S.selected = taskId;
   S.drawerEvents = [];
+  // Reset the live-output accumulator on task switch. It's only cleared by a
+  // turn.result/view.updated event for the *selected* task (see the WS handler),
+  // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
+  // "let me merge master into this branch") bleeds into THIS drawer's live bubble
+  // until the next event arrives — a stale cross-task render, never in the store/.jsonl.
+  S.liveOutput = '';
+  // Drop the previous task's view + per-task derived state up front. `S.view` is
+  // re-fetched first below, but the siblings (sessions/widgets/paramDefaults) are
+  // fetched a few awaits later — so a render firing in that gap (a WS event, a
+  // background refresh) would pair the NEW view with the OLD task's fork command /
+  // widgets / param defaults. renderDrawer no-ops while `S.view` is null, and empty
+  // siblings render as "no command / no widgets / (default)" — both corrected a beat
+  // later by the awaited fetches. Never show another task's data, even for one frame.
+  S.view = null;
+  S.sessions = {};
+  S.widgets = [];
+  S.paramDefaults = {};
   highlightRow();
   try {
     S.view = await api(`/api/tasks/${taskId}`);
@@ -1078,6 +1095,8 @@ async function refreshDrawer() {
 function closeDrawer() {
   S.selected = null;
   S.view = null;
+  S.liveOutput = ''; // drop any streamed live text so it can't reappear in the next drawer
+  S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next drawer
   if (termWs) { try { termWs.close(); } catch {} termWs = null; }
   $('#drawer-root').innerHTML = '';
   highlightRow();

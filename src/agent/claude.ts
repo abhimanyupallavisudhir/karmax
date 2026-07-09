@@ -5,7 +5,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACK
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
-import { messagesToDeliver } from './history.js';
+import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 
 /**
@@ -147,7 +147,13 @@ export class ClaudeAdapter implements AgentAdapter {
     // conversation on a fresh session) — the session already holds the rest, so
     // re-sending it would replay the agent's own past replies back at it (§7.2).
     const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
-    const userText = convo.map((m) => m.text).join('\n\n') ||
+    // Attribute agent turns (`assistant:`) so a replayed full transcript — a fork, or
+    // a resume whose provider session couldn't be reattached — never folds the agent's
+    // OWN prior replies back in as fresh user input (§7.2). The SDK's `prompt` accepts
+    // only user text, so this single-string form is the best fidelity available; it
+    // matches the codex-exec path. A single-follow-up delta has no agent message, so
+    // the string is unchanged.
+    const userText = conversationToPromptText(convo) ||
       (input.session ? 'Continue from the latest instruction.' : 'Begin the task described in the system prompt. Call signal_completion when done.');
 
     // Images force the streaming-input form: the SDK's plain-string `prompt` can't

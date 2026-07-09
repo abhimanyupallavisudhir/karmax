@@ -7,7 +7,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACK
 import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
-import { messagesToDeliver } from './history.js';
+import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 
@@ -148,7 +148,7 @@ export class CodexAdapter implements AgentAdapter {
     // system channel). Resuming: the thread already holds the history, so send only
     // the new messages.
     const promptText = resuming
-      ? (toSend.length ? toSend.map((m) => (m.role === 'agent' ? `assistant: ${m.text}` : m.text)).join('\n\n') : 'Continue.')
+      ? (toSend.length ? conversationToPromptText(toSend) : 'Continue.')
       : `${input.systemPrompt}\n\n----- CONVERSATION -----\n${
           toSend.map((m) => `${m.role === 'agent' ? 'assistant' : m.role}: ${m.text}`).join('\n\n') || 'Begin the task.'
         }`;

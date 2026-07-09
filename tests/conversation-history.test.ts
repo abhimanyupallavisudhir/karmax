@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { messagesToDeliver } from '../src/agent/history.js';
+import { messagesToDeliver, conversationToPromptText } from '../src/agent/history.js';
 import { CodexAdapter } from '../src/agent/codex.js';
 import type { Message } from '../src/domain/types.js';
 
@@ -50,6 +50,39 @@ describe('messagesToDeliver', () => {
 
   it('clamps a delivered count past the end to an empty delta', () => {
     expect(messagesToDeliver({ messages: convo, session: 's1', deliveredMessages: 99 } as any)).toEqual([]);
+  });
+});
+
+/**
+ * Single-string serialization (Claude Agent SDK `prompt`, `codex exec`): both
+ * providers accept only ONE user string, so a replayed transcript must attribute
+ * the agent's own turns — otherwise its prior replies fold back in as fresh user
+ * input (the "This is the merge task…" folded blob seen in a real session).
+ */
+describe('conversationToPromptText', () => {
+  it('leaves a single user follow-up (the resume delta) byte-for-byte unchanged', () => {
+    expect(conversationToPromptText([msg('m1', 'user', 'a follow-up')])).toBe('a follow-up');
+  });
+
+  it('attributes agent turns so a replayed reply is never bare user text', () => {
+    const out = conversationToPromptText([
+      msg('m0', 'user', 'ORIGINAL_TASK'),
+      msg('a0', 'agent', 'AGENT_REPLY'),
+      msg('m1', 'user', 'NEW_ASK'),
+    ]);
+    // The agent's own reply is labeled, not folded in as if the user said it.
+    expect(out).toContain('assistant: AGENT_REPLY');
+    expect(out).not.toContain('\n\nAGENT_REPLY'); // never appears as a bare (user) block
+    // User turns stay unlabeled and in order.
+    expect(out).toBe('ORIGINAL_TASK\n\nassistant: AGENT_REPLY\n\nNEW_ASK');
+  });
+
+  it('joins multiple user turns queued since the last turn with a blank line', () => {
+    expect(conversationToPromptText([msg('a', 'user', 'one'), msg('b', 'user', 'two')])).toBe('one\n\ntwo');
+  });
+
+  it('is empty for an empty delivery (caller substitutes a Continue/Begin fallback)', () => {
+    expect(conversationToPromptText([])).toBe('');
   });
 });
 
