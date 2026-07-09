@@ -477,6 +477,29 @@ The `agent` field type is the reusable control for choosing the agent that runs 
 
 The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.
 
+### 10.6 URLs and task numbers — every view is bookmarkable
+
+The console is a single-page app, but every page has its own **URL** so a specific task, project, settings page, or the dashboard can be bookmarked, shared, and reached with the browser's back/forward buttons. The URL — not an in-memory tab variable — is the single source of truth for *{active project, active tab, open task}*. The gateway already serves `index.html` for any non-asset path (the SPA fallback), so the client owns routing via the History API; a deep link like `/t/42` loads the app and reconciles state to that URL on boot.
+
+**The scheme (all host-owned).** Projects are addressed by a **slug of their name**, not their opaque id, so a bookmark reads like `/projects/acme-web/settings`:
+
+```
+/                                    → home (redirects to a project's task list)
+/dashboard                           → global dashboard
+/settings                            → global settings
+/projects/:name/tasks                → task list          (the primary surface)
+/projects/:name/queue                → merge queue
+/projects/:name/activity             → activity feed
+/projects/:name/settings             → project settings
+/projects/:name/tasks/:num           → a task permalink (opens the drawer over its list)
+```
+
+The `/projects/` prefix keeps project names out of the top-level namespace, so a project called "dashboard" or "settings" can never shadow a reserved route. The slug resolves to a project by matching the slugified name (case-insensitive); names are expected distinct, and on the rare collision the first-created project wins. Because the console loads the full project list at boot, slug↔project resolution is entirely client-side — no round-trip to open a deep link.
+
+**Workflows do not own URLs.** This is the answer to "does a workflow own its page?": no. Every page is a first-party **core UI module** (§10.3) whose *route* is host-owned; a workflow only ever *augments* a host page through the declared contribution system (§10.1) — a slot, a widget, an action, a param field — never by claiming a path. The merge queue is the illustrative case: it looks "produced by a workflow," but it is a host route that *projects* the merge-queue **coordinator's** query state (`{queue, current}`, §6.1) joined with each task's `mergeQueue` position. The coordinator is queried; it does not render or route. The same holds for the dashboard (projects the account coordinator's query). Keeping routes host-owned means the URL space is finite, stable, and knowable without loading any workflow package.
+
+**Task numbers (`num`).** Each task carries a simple, human-facing sequential id — numbered **per project**, so every project runs its own `#1`, `#2`, … assigned at creation, alongside the opaque `id`. The **`id` never changes**: it is the Temporal `workflowId`, the event key, and the session key, so it must stay stable for replay and cross-task signalling. `num` is purely the human/URL handle: the UI shows `#num` everywhere a task is named (list rows, drawer header, merge queue, notifications, sub-task links), the permalink is `/projects/:name/tasks/:num`, and it is a search key — both the task search box and the "Fork a previous agent" picker match on `#num` as well as title. The store owns `num` (unique per `(projectId, num)`, backfilled per project in creation order for pre-existing installs); the gateway resolves `(:projectId, :num) → id` (so a permalink to an archived/not-yet-loaded task still opens) and mirrors `num` onto the task view (the workflow only knows the opaque `id`).
+
 ---
 
 ## 11. Worlds

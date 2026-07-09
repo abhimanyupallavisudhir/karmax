@@ -8,7 +8,7 @@ import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
 import { TaskRecord, TaskView, Message, Project, ImageRef } from '../domain/types.js';
-import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
+import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
@@ -84,10 +84,16 @@ export class KarmaxApi {
    * (the empty-repo footgun). Refuse the *run* early, with an actionable message,
    * rather than let a whole attempt burn against the wrong world.
    */
-  private assertRepoConfigured(manifest: WorkflowManifest, project: Project) {
+  private assertRepoConfigured(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
     if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
-    const configured = (project.config.repos ?? []).some((r) => !!r && r.trim().length > 0);
+    // Guard on the EFFECTIVE repo list the world will be built from (the resolved
+    // settings overlay, falling back to project config) — the same value that
+    // reaches createWorld — not project.config alone. Those two can diverge (an
+    // empty settings-overlay repos list resolving to nothing while config still
+    // holds a repo), and checking config-only let that case slip through into a
+    // silent scratch sandbox — the very footgun this guard exists to prevent.
+    const configured = effectiveRepos(resolved, project.config).length > 0;
     if (!configured) {
       throw new Error(
         `Workflow "${manifest.name}" works on a repository, but project "${project.name}" has no repository ` +
@@ -128,9 +134,6 @@ export class KarmaxApi {
     const { manifest, startType } = start;
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
-    // Refuse to *run* a repo-oriented workflow with no repository configured
-    // (drafts may still be saved without one, then checked again at queueTask).
-    if (!args.draft) this.assertRepoConfigured(manifest, project);
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
@@ -141,6 +144,10 @@ export class KarmaxApi {
     // carry them explicitly (references only — bytes live in the attachment store).
     if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides);
+    // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
+    // (drafts may still be saved without one, then checked again at queueTask).
+    // Checked after resolution so the guard sees the same repos the world will.
+    if (!args.draft) this.assertRepoConfigured(manifest, project, resolved);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
     // Persist only the task's OWN overrides (sparse), not the resolved snapshot.
@@ -264,12 +271,13 @@ export class KarmaxApi {
     const start = this.resolveStart(task.workflow, task.workflowVersion);
     if (!project || !start) throw new Error(`cannot queue task ${taskId}`);
     const { manifest, startType } = start;
-    this.assertRepoConfigured(manifest, project); // same guard as createTask, before we clear the draft
     // Re-resolve against the CURRENT project/global defaults. The task stored only
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived) aren't overrides.
     const { profiles, draft: _d, archived: _a, images, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
+    // Same guard as createTask, on the resolved effective repos, before we clear the draft.
+    this.assertRepoConfigured(manifest, project, resolved);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,

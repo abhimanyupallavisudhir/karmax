@@ -299,9 +299,23 @@ export class Gateway {
       }
 
       // tasks
+      // Resolve a per-project sequential number (SPEC §10.6) → its canonical id, so a
+      // `/projects/<name>/tasks/<num>` permalink can be opened even when the task
+      // isn't in the client's loaded list (e.g. an archived task).
+      const byNumMatch = p.match(/^\/api\/projects\/([^/]+)\/tasks\/by-num\/(\d+)$/);
+      if (byNumMatch && method === 'GET') {
+        const rec = store.getTaskByNum(byNumMatch[1]!, Number(byNumMatch[2]!));
+        if (!rec) return this.json(res, 404, { error: 'no such task' });
+        return this.json(res, 200, { id: rec.id, num: rec.num, projectId: rec.projectId });
+      }
       const viewMatch = p.match(/^\/api\/tasks\/([^/]+)$/);
       if (viewMatch && method === 'GET') {
-        return this.json(res, 200, (await api.getTaskView(token, viewMatch[1]!)) ?? null);
+        const view = await api.getTaskView(token, viewMatch[1]!);
+        if (!view) return this.json(res, 200, null);
+        // Mirror the record's sequential number onto the view (the workflow only
+        // knows the opaque id) so the drawer can show `#num` + a permalink.
+        const rec = store.getTask(viewMatch[1]!);
+        return this.json(res, 200, rec?.num != null ? { ...view, num: rec.num } : view);
       }
       if (viewMatch && method === 'DELETE') {
         // Hard-delete is for drafts only (they never started a workflow). Running
@@ -844,7 +858,7 @@ export class Gateway {
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
-      if (f.type !== 'agent' || !f.role) continue;
+      if ((f.type !== 'agent' && f.type !== 'confirmer') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
@@ -854,7 +868,10 @@ export class Gateway {
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      out[f.name] = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      // A confirmer also carries a MODE (human/auto/agent) that inherits normally; the
+      // agent knobs above are the defaults shown once "agent" mode is selected.
+      out[f.name] = f.type === 'confirmer' ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) } : agent;
     }
     return out;
   }

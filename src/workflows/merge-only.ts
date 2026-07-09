@@ -13,10 +13,16 @@ import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike } from './contract.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision } from './contract.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 const long = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', retry: { maximumAttempts: 1 } });
+// Agent turns heartbeat (~10s); a 2-minute gap = dead worker → Temporal retries.
+const turns = proxyActivities<coreActivities>({
+  startToCloseTimeout: '45 minutes',
+  heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
+});
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
 export const confirmSignal = defineSignal('confirm');
@@ -52,6 +58,9 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   let confirmed = false;
   let cancelled = false;
   let world: WorldHandleLike | undefined;
+  // Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent. The
+  // legacy `autoConfirm` flag maps to `auto`; explicit `input.confirm` wins.
+  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? (input.autoConfirm ? 'auto' : 'human');
   let reviewInfo: ReviewInfo | undefined;
   let mergeGranted = false;
   let checks: { passed: boolean; detail?: string } | undefined;
@@ -94,6 +103,30 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   }
   const publish = async () => core.publishView(taskId, view());
 
+  /** Run one Confirm-agent turn (SPEC §5.2): review the branch, return a verdict, or
+   *  undefined on failure so the caller leaves the gate to a human. */
+  async function runConfirm(): Promise<ConfirmDecision | undefined> {
+    try {
+      // Fresh turn each Review so the reviewer judges the current branch; a mid-turn
+      // retry still resumes via runAgentTurn heartbeat details.
+      const ct = await turns.runAgentTurn({
+        taskId,
+        role: 'confirm',
+        worldHandle: world as any,
+        messages: [],
+        task: input,
+        bindings: {
+          reviewInfo: reviewInfo?.summary ?? '',
+          changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+          transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
+        },
+      });
+      return ct.confirmDecision;
+    } catch {
+      return undefined;
+    }
+  }
+
   setHandler(viewQuery, view);
   setHandler(confirmSignal, () => {
     confirmed = true;
@@ -125,7 +158,20 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
 
   stage = 'review';
   status = 'waiting';
-  if (input.autoConfirm && (checks?.passed ?? true)) confirmed = true;
+  // Never confirm a workflow-edit whose checks failed, whatever the confirmer says.
+  const mayConfirm = !input.workflowEdit || (checks?.passed ?? true);
+  if (mayConfirm && confirmMode === 'auto') {
+    confirmed = true;
+  } else if (mayConfirm && confirmMode === 'agent') {
+    await publish();
+    const decision = await runConfirm();
+    if (decision?.action === 'confirm') confirmed = true;
+    else if (decision?.action === 'reject') {
+      if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
+      cancelled = true;
+    }
+    // `revise` / no verdict → leave it for a human (no Do stage to send it back to).
+  }
   await publish();
   await condition(() => confirmed || cancelled);
   if (cancelled || (input.workflowEdit && !checks?.passed && !confirmed)) {

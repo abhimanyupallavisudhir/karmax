@@ -92,6 +92,10 @@ export interface SoftwareDevInput extends TaskInput {
    *  awaiting its response, so an unanswered raise never dead-parks the parent (SPEC
    *  §5.3 "keep prompting"). Overridable so tests don't wait the full interval. */
   subtaskNagMs?: number;
+  /** Backoff (ms) the task waits in Do before re-prompting an agent whose own in-harness
+   *  sub-agents were still running when its turn returned — interruptible by a human
+   *  follow-up. Overridable so tests don't wait the full interval. */
+  subagentWaitMs?: number;
 }
 
 const MAX_RESOLVE_ATTEMPTS = 2;
@@ -105,6 +109,14 @@ const MAX_TOTAL_SUBTASKS = 50;
 /** Default re-prompt cadence for a parent holding an unanswered child raise (SPEC §5.3).
  *  Bounds the subtask-wait so an ignored raise re-enters Do instead of parking forever. */
 const DEFAULT_SUBTASK_NAG_MS = 60_000;
+/** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
+ *  Task tool) are still running. We hold in Do and re-prompt so it waits for them,
+ *  but bound the re-prompts so a wedged sub-agent can't park the task forever. */
+const MAX_SUBAGENT_NUDGES = 5;
+/** Backoff before re-prompting an agent still waiting on its in-harness sub-agents.
+ *  Avoids a hot re-prompt loop and gives the waiting state a visible dwell; a human
+ *  follow-up wakes it early. Overridable via `input.subagentWaitMs`. */
+const DEFAULT_SUBAGENT_WAIT_MS = 10_000;
 
 /**
  * The merge-queue serialization domains for a task — one `<repo>:<target>` per
@@ -161,6 +173,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   let error: string | undefined;
   let pr: { url: string; number: number } | undefined;
   let mergeQueuePos: { position: number; total: number } | undefined;
+  // How many times we've re-prompted the agent to wait for its own in-harness
+  // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
+  let subagentNudges = 0;
   const subTaskIds: string[] = [];
   // Sub-task hierarchy (SPEC §5.3). Children are managed, not blindly awaited: their
   // handles let us await completion, raised requests queue in `raises`, settlements in
@@ -182,6 +197,12 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // arrays whose input+output we accumulate here so all three are inspectable.
   const mergeMsgs: Message[] = [];
   const resolveMsgs: Message[] = [];
+  const confirmMsgs: Message[] = [];
+  // Who drives the Review gate (SPEC §5.2). Explicit `input.confirm` wins; otherwise
+  // fall back to the legacy `autoConfirm` flag (top-level goal tasks) → `auto`, else a
+  // human. A child with a `parentTaskId` always routes Review to its parent regardless
+  // (parent-as-confirmer, SPEC §5.3), so this only governs top-level tasks.
+  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? (input.autoConfirm ? 'auto' : 'human');
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, { accountId: string; configHome?: string; apiKeyHandle?: string }>();
   let turnSeq = 0;
@@ -346,6 +367,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const t = [{ role: 'do', label: 'Do agent', messages: msgs }];
     if (mergeMsgs.length) t.push({ role: 'merge', label: 'Merge agent', messages: mergeMsgs });
     if (resolveMsgs.length) t.push({ role: 'resolve', label: 'Resolve agent', messages: resolveMsgs });
+    if (confirmMsgs.length) t.push({ role: 'confirm', label: 'Confirm agent', messages: confirmMsgs });
     return t;
   }
 
@@ -397,7 +419,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
     // Do is the default; merge/resolve queue it so it reaches that agent on its
     // next turn (each turn is fed its own accumulated transcript).
-    const target = role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : msgs;
+    const target = role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs : msgs;
     target.push({ ...m, ts: target.length });
   });
   setHandler(confirmSignal, () => {
@@ -658,6 +680,13 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
    *  the running conversation. Shared by the main loop and sub-task management. */
   async function doTurn() {
     let doHome: string | undefined;
+    // How many leading `msgs` were actually handed to the agent this turn. Captured
+    // at activity-schedule time (the instant Temporal snapshots the args) — NOT after
+    // the turn — so a follow-up that arrives WHILE the turn runs is not mistaken for
+    // "already delivered". Advancing `seen` to `msgs.length` afterwards was the bug:
+    // a mid-turn follow-up landed in `msgs` but got marked consumed, so it silently
+    // never reached the agent (SPEC §5.6 — a queued follow-up must reach the agent).
+    let deliveredNow = seen;
     const turn = await withResolve('do', () =>
       leasedTurn('do', (accountConfigHome, accountApiKeyHandle) => {
         doHome = accountConfigHome ?? '(profile)';
@@ -666,6 +695,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         // (everything delivered on prior turns), so send only the delta after them —
         // a follow-up reaches the agent as a follow-up, not the whole conversation.
         const resume = sessionMatchesHome(accountConfigHome) ? session : undefined;
+        deliveredNow = msgs.length; // everything queued up to this instant is delivered
         return turns.runAgentTurn({
           taskId,
           role: 'do',
@@ -681,10 +711,53 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     );
     session = turn.session ?? session;
     sessionHome = doHome ?? sessionHome;
-    if (turn.output?.trim()) msgs.push({ id: `a${msgs.length}`, role: 'agent', text: turn.output, ts: msgs.length });
-    seen = msgs.length;
+    // Insert the agent's reply at the delivered boundary — BEFORE any follow-up that
+    // arrived while the turn was running. This keeps the transcript honest (the reply
+    // follows the messages it actually answered) and, crucially, leaves that follow-up
+    // AFTER `seen`, so the NEXT turn delivers it instead of skipping past it.
+    if (turn.output?.trim()) {
+      msgs.splice(deliveredNow, 0, { id: `a${deliveredNow}`, role: 'agent', text: turn.output, ts: deliveredNow });
+      deliveredNow += 1;
+    }
+    seen = deliveredNow;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     return turn;
+  }
+
+  /** Run one Confirm-agent turn at the Review gate (SPEC §5.2): it reviews the work and
+   *  returns a structured verdict (confirm / revise / reject) — the same three moves a
+   *  human makes. Leased + resolve-wrapped like every other role. Returns the verdict,
+   *  or undefined if the agent turn failed or declined to decide (caller falls back to
+   *  the human gate so nothing is silently auto-confirmed). */
+  async function confirmTurn(): Promise<import('./contract.js').ConfirmDecision | undefined> {
+    const ct = await withResolve('confirm', () =>
+      leasedTurn('confirm', (accountConfigHome, accountApiKeyHandle) =>
+        // Each Review runs a FRESH confirm turn (session left unset): the reviewer must
+        // re-judge the CURRENT work, so it always gets an up-to-date system prompt
+        // (fresh reviewInfo / changed files) rather than resuming stale context. A
+        // mid-turn activity retry still resumes via heartbeat details inside runAgentTurn.
+        turns.runAgentTurn({
+          taskId,
+          role: 'confirm',
+          worldHandle: world as any,
+          messages: confirmMsgs,
+          task: liveInput,
+          bindings: {
+            reviewInfo: reviewInfo?.summary ?? '',
+            changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+            transcript: lastOutputs(msgs),
+          },
+          accountConfigHome,
+          accountApiKeyHandle,
+        }),
+      ),
+    ).catch((e) => {
+      if (isCancellation(e)) throw e;
+      log.warn('confirm agent turn failed; falling back to the human gate', { e: String(e) });
+      return undefined;
+    });
+    if (ct?.output?.trim()) confirmMsgs.push({ id: `c-out-${confirmMsgs.length}`, role: 'agent', text: ct.output, ts: confirmMsgs.length });
+    return ct?.confirmDecision;
   }
 
   /** Record a child's eventual settlement so the management loop can react. */
@@ -875,6 +948,41 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     // No children outstanding.
     if (turn.waitForSubtasks) continue; // nothing to wait for → just take another turn
 
+    // The agent's OWN in-harness sub-agents (Claude Agent SDK Task tool) may still be
+    // running when its turn returned — Claude Code auto-backgrounds long sub-agents, so
+    // the turn can come back "done" while a sub-agent is still working. Completion is
+    // "done AND not waiting on any sub-agents", so don't advance to Review yet: hold in
+    // Do and re-prompt so the agent waits for them and folds in their results before
+    // finishing. Bounded (MAX_SUBAGENT_NUDGES) so a wedged sub-agent can't park forever.
+    if (turn.pendingSubagents && subagentNudges < MAX_SUBAGENT_NUDGES) {
+      subagentNudges++;
+      status = 'waiting';
+      waitingFor = { kind: 'subagent', detail: `${turn.pendingSubagents} sub-agent(s) still running` };
+      await publish();
+      // Back off before re-prompting (avoids a hot loop of subprocess spawns), but stay
+      // redirectable: a human follow-up or a cancel wakes us early.
+      await condition(() => cancelled || msgs.length > seen, input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
+      if (cancelled) return await abort();
+      // Unless a human already redirected us this wait, nudge the agent to wait for its
+      // sub-agents and fold in their results before signalling completion.
+      if (msgs.length === seen) {
+        msgs.push({
+          id: `sa-${msgs.length}`,
+          role: 'user',
+          text: 'Your sub-agents are still running. Wait for all of them to finish, incorporate their results, then call signal_completion.',
+          ts: msgs.length,
+        });
+      }
+      stage = 'do';
+      status = 'active';
+      continue;
+    }
+    // Fell through with sub-agents still reported running ⇒ the nudge budget is spent.
+    // We proceed to Review (liveness over parking), but surface it so the reviewer knows
+    // the work may be missing a wedged sub-agent's output rather than being truly done.
+    const gaveUpOnSubagents = !!turn.pendingSubagents && subagentNudges >= MAX_SUBAGENT_NUDGES;
+    subagentNudges = 0; // sub-agents settled (or nudge budget spent) → reset for next Do phase
+
     {
       // Goal mode: keep nudging the agent until it signals structured completion
       // (unless it's explicitly raising to its parent, which needs an answer).
@@ -903,16 +1011,54 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       }
       // An explicit raise carries its own message; show it as the review summary.
       if (turn.raise?.detail) reviewInfo = { ...reviewInfo, summary: turn.raise.detail };
+      // We stopped waiting on still-running sub-agents (budget spent) — prepend a note so
+      // the reviewer knows this reached Review with delegated work possibly incomplete.
+      if (gaveUpOnSubagents) {
+        const note = `⚠️ Proceeded to Review with ${turn.pendingSubagents} sub-agent(s) still reported running after ${MAX_SUBAGENT_NUDGES} waits — a sub-agent may be wedged and its output missing.`;
+        reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
+      }
       stage = 'review';
       status = 'waiting';
-      if (input.autoConfirm) {
-        confirmed = true;
-      } else if (input.parentTaskId) {
+      // Who confirms (SPEC §5.2/§5.3): a child always routes to its parent; a top-level
+      // task uses its configured confirmer — auto, a Confirm agent, or a human.
+      if (input.parentTaskId) {
         // Parent-as-confirmer (SPEC §5.3): raise to the parent instead of blocking on
         // a human the parent-managed child isn't even surfaced to. The parent's reply
         // drives `confirmed`/follow-up via parentResponseSignal.
         waitingFor = { kind: 'parent' };
         await notifyParent(turn.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
+      } else if (confirmMode === 'auto') {
+        // Auto-confirm only a turn that actually finished its work (or is explicitly
+        // raising for a decision) — never a bare needsInput stall, which would push a
+        // zero-/partial-work diff straight through to merge unseen. `auto` today comes
+        // only from a top-level goal task (autoConfirm) or an explicit confirm.mode:auto;
+        // in goal mode the loop above already guarantees completed|raise here, so this is
+        // a replay-safe guard — it changes no reachable path now but stops an empty turn
+        // from being silently merged. A stall falls through to the human gate below.
+        if (turn.completed || turn.raise) confirmed = true;
+      } else if (confirmMode === 'agent') {
+        // Run the Confirm agent; its verdict maps onto the SAME transitions a human
+        // drives (confirm / follow-up-to-Do / cancel).
+        waitingFor = { kind: 'confirm' };
+        await publish();
+        const decision = await confirmTurn();
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        if (decision?.action === 'confirm') {
+          confirmed = true;
+        } else if (decision?.action === 'reject') {
+          if (decision.text) msgs.push({ id: `cr-${msgs.length}`, role: 'system', text: `Confirm agent rejected the work: ${decision.text}`, ts: msgs.length });
+          cancelled = true;
+          return await abort();
+        } else if (decision?.action === 'revise') {
+          // Feedback goes into the Do transcript as a follow-up and we loop back to Do.
+          msgs.push({ id: `cv-${msgs.length}`, role: 'user', text: decision.text || 'Please revise the work per the reviewer feedback.', ts: msgs.length });
+          stage = 'do';
+          status = 'active';
+          continue;
+        }
+        // No verdict (turn failed / declined) → fall through to the human gate below so
+        // nothing is silently auto-confirmed.
       }
       await publish();
       await condition(() => confirmed || cancelled || msgs.length > seen);

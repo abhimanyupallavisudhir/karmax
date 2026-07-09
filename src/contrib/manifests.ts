@@ -24,6 +24,12 @@ const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Pr
 // swapped mid-flight (retune model/effort, or send a follow-up to redirect it);
 // merge/resolve can still be fully swapped until their own turn runs.
 const agentField = (role: string, label: string, mutable?: FieldSpec['mutable']): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role, ...(mutable ? { mutable } : {}) });
+// The confirmer field selects WHO drives the Review gate — human / auto / an agent.
+// Unlike the agent fields it spans all scopes (task/project/global) so the mode has
+// the usual default-inheritance; when the mode is `agent` it carries the same agent
+// knobs (provider/model/effort/fork) as the Do/Merge/Resolve fields. Chosen at task
+// creation (queue-time), like the other agent selections.
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm agent', help: 'Who confirms at the Review gate: a human, an agent, or auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { mode: 'human' } });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
@@ -152,6 +158,36 @@ Candidate resolution skills (read any that look relevant before acting):
 
 Always finish by calling resolve_decision exactly once.`,
 };
+const CONFIRM_ROLE: WorkflowRole = {
+  name: 'confirm',
+  label: 'Confirm agent',
+  capabilities: ['confirm-decision', 'signal-completion'],
+  defaults: { effort: 'low' },
+  promptTemplate: `{{toolsPreamble}}
+
+You are the CONFIRM (review) agent for task "{{title}}". The Do agent believes the work is finished and it has reached the Review gate. Your job is to decide whether to accept it — NOT to keep building it.
+
+# Original task
+{{prompt}}
+
+# Work under review
+Worktree: {{worldPath}} (branch {{branch}} off {{base}}).
+{{worldRepos}}
+Review summary: {{reviewInfo}}
+Changed files:
+{{changedFiles}}
+
+Recent Do-agent transcript:
+{{transcript}}
+
+## How to review
+Inspect the diff and the worktree (read files, run the build/tests) to judge whether the work actually satisfies the task. Then finish by calling confirm_decision exactly once:
+- action:"confirm" — the work is acceptable; it proceeds to PR/merge.
+- action:"revise"  — it needs changes; put specific, actionable feedback in \`text\` and it goes back to the Do agent.
+- action:"reject"  — it is unsalvageable or the task should not proceed; say why in \`text\` (this cancels the task).
+
+Do not implement the task yourself. Decide, then call confirm_decision.`,
+};
 
 // Lifecycle stages per bundled workflow (the pipeline the UI renders).
 const SOFTWARE_DEV_STAGES: StageDef[] = [
@@ -255,7 +291,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { id: 'task.followUp', title: 'Send follow-up', keybinding: 'f' },
       { id: 'task.cancel', title: 'Cancel task', keybinding: 'x' },
     ],
-    roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE],
+    roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
     params: [
       promptField(),
@@ -271,6 +307,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       prToggleField(),
       agentField('merge', 'Merge agent', 'always'),
       agentField('resolve', 'Resolve agent', 'always'),
+      confirmerField(),
     ],
     onActivate: {
       spawnTask: {
@@ -290,7 +327,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'just-do.done', description: 'Single agent call finished.', fields: {} }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
-    roles: [DO_ROLE],
+    roles: [DO_ROLE, CONFIRM_ROLE],
     // No merge machinery: do → review → done.
     stages: [
       { key: 'setup', label: 'Setup' },
@@ -298,7 +335,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), worldProviderField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), worldProviderField(), confirmerField()],
   },
   {
     name: 'script-exec',
@@ -331,9 +368,9 @@ export const MANIFESTS: WorkflowManifest[] = [
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
     // goal delegates to softwareDev, so it runs merge/resolve too.
-    roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE],
+    roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), prToggleField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), prToggleField(), confirmerField()],
   },
   {
     name: 'merge-only',
@@ -344,7 +381,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     events: [{ type: 'merge-only.merged', description: 'Reviewed branch merged.', fields: { sha: 'string' } }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
-    roles: [MERGE_ROLE],
+    roles: [MERGE_ROLE, CONFIRM_ROLE],
     // Review an existing branch, then merge it (no Do).
     stages: [
       { key: 'setup', label: 'Setup' },
@@ -357,6 +394,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       targetField(),
       reposField(),
       agentField('merge', 'Merge agent'),
+      confirmerField(),
     ],
   },
   {
