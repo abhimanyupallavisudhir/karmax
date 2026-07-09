@@ -28,6 +28,7 @@ const S = {
   sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
   ws: null,
   hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
+  cursorId: null, // the list cursor (roving selection) on the tasks/queue views
   returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
 };
 
@@ -788,21 +789,23 @@ function renderRail() {
     <div class="label">Projects</div>
     ${S.projects
       .map(
-        (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}">
+        (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" tabindex="0">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
         </div>`,
       )
       .join('')}
-    <div class="proj add" id="new-project"><span>+</span> <span>New project</span></div>
+    <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
     <div class="label">Global</div>
-    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard">▦ Dashboard</div>
-    <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global">⚙ Global settings</div>`;
+    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
+    <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
+    <div class="nav-item" id="rail-palette" tabindex="0" title="Every command, task, and project — searchable">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
   rail.querySelectorAll('.proj[data-id]').forEach((e) =>
     e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
+  $('#rail-palette')?.addEventListener('click', openPalette);
 }
 
 function switchTab(tab) {
@@ -899,10 +902,10 @@ function tasksView() {
   const archivedCount = S.tasks.filter((t) => t.params?.archived).length;
   return `
     <div class="composer">
-      <input class="title-in" id="new-task" placeholder="Describe a task and press Enter…  ( n )  ·  paste an image to attach" />
+      <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
-      <button class="btn" id="expand-task" title="Full task form">⋯ More</button>
-      <button class="btn primary" id="add-task">Add</button>
+      <button class="btn" id="expand-task" title="Full task form ( N or ↵ )">⋯ More</button>
+      <button class="btn primary" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )">Add</button>
     </div>
     <div class="img-chips" id="new-task-chips" style="display:none"></div>
     <div class="switch" style="justify-content:flex-end;margin:4px 0">
@@ -916,7 +919,7 @@ function taskRow(t) {
   const isDraft = t.params?.draft;
   if (isDraft) {
     return `
-    <div class="task-row" data-draft="${t.id}">
+    <div class="task-row" data-draft="${t.id}" tabindex="0">
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
@@ -940,7 +943,7 @@ function taskRow(t) {
       ? `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`
       : '';
   return `
-    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}">
+    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
@@ -1090,7 +1093,14 @@ function wireTasksView() {
     }
   };
   $('#add-task')?.addEventListener('click', add);
-  $('#new-task')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+  // Enter opens the FULL form (carrying the typed text into its prompt field) so
+  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly.
+  $('#new-task')?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    if (e.metaKey || e.ctrlKey) add();
+    else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
+  });
   // Paste / drag-drop an image into the quick-add box to attach it (SPEC — image prompts).
   if (!S.newTaskImages) S.newTaskImages = [];
   wireImagePaste($('#new-task'), () => S.newTaskImages, () => renderImageChips($('#new-task-chips'), S.newTaskImages));
@@ -1098,6 +1108,9 @@ function wireTasksView() {
   // Opening the full form via "More" carries over whatever was typed in the
   // quick-add box into the field that consumes it (Prompt, Command, …).
   $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
+  // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
+  applyCursor();
+  $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
 
@@ -1199,6 +1212,15 @@ async function openTaskForm(workflow, draft, seedText) {
     .querySelectorAll('textarea, input[type="text"], input:not([type])')
     .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
   paintFormChips();
+  // Focus the consuming field (prompt/command) with the caret at the end, so
+  // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
+  // (the consuming field) is resolved once at the top of this function.
+  const cfEl = cf && $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`);
+  if (cfEl) {
+    cfEl.focus();
+    const end = cfEl.value?.length ?? 0;
+    if (typeof cfEl.setSelectionRange === 'function') { try { cfEl.setSelectionRange(end, end); } catch {} }
+  }
   // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
   // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the
   // running-task drawer (renderDrawer's #cred-editor-task). Change one → check the other.
@@ -1971,9 +1993,11 @@ function drawerActions(v) {
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
+  let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' ? 'primary' : a.danger ? 'danger' : '';
-    html += `<button class="btn ${cls}" data-act="${a.name}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}</button>`;
+    const kbd = a.enabled && slot < 9 ? `<span class="kbd">${++slot}</span>` : '';
+    html += `<button class="btn ${cls}" data-act="${a.name}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}${kbd}</button>`;
   }
   // Target-branch editing now lives in the Parameters form (drawerParams), which
   // renders it editable/frozen per the workflow's window — no separate input here.
@@ -2073,7 +2097,7 @@ function queueView() {
       // Holds the slot (merge agent running) only when granted — not merely at
       // position 0 in a queue whose slot is still held by someone else.
       const merging = !!v.state?.mergeGranted;
-      return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}">
+      return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" tabindex="0">
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
         <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
@@ -2093,6 +2117,8 @@ function wireQueueView() {
       } catch (e) { toast(e.message, true); }
     }),
   );
+  applyCursor();
+  $('#main').querySelectorAll('.queue-item').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 
 // ── activity ─────────────────────────────────────────────────────────────────
@@ -2830,66 +2856,409 @@ async function newProject() {
   } catch (e) { toast(e.message, true); }
 }
 
-// ── keyboard navigation / command palette (SPEC §10.1 command registry) ──────
-function bindKeys() {
-  document.addEventListener('keydown', (e) => {
-    if (e.target.matches('input, textarea')) {
-      if (e.key === 'Escape') e.target.blur();
-      return;
+// ── keyboard navigation / command registry (SPEC §10.1) ─────────────────────
+// ONE registry feeds three views: key dispatch, the ⌘K palette, and the "?"
+// help overlay — so they can never drift apart. Commands come from three tiers:
+//   1. host commands — the console's own navigation + interaction grammar;
+//   2. server-declared commands (GET /api/contributions): workflow packages
+//      contribute `task.<action>` commands with default keybindings, and the
+//      host maps them GENERICALLY onto the selected task's declared actions —
+//      the host never hardcodes a workflow's action vocabulary;
+//   3. the declared actions themselves (the auto-render floor, SPEC §10.2): every
+//      enabled action of the selected task is a palette entry, and digits 1–9
+//      press the drawer's action buttons — so a workflow that declares no
+//      keybindings at all is still fully keyboard-operable.
+
+// -- keybinding strings ('meta+k', 'g t', '?', 'J') → step sequences ----------
+const KEY_NAMES = { esc: 'escape', return: 'enter', up: 'arrowup', down: 'arrowdown', left: 'arrowleft', right: 'arrowright', cmd: 'meta', mod: 'meta' };
+function parseKeybinding(binding) {
+  return String(binding || '').trim().split(/\s+/).filter(Boolean).map((step) => {
+    const parts = step.split('+').filter(Boolean);
+    const raw = parts.pop() || '+'; // 'meta++' → the '+' key
+    // single chars stay case-sensitive ('J' means shift+j); named keys normalize
+    const key = raw.length === 1 ? raw : (KEY_NAMES[raw.toLowerCase()] || raw.toLowerCase());
+    const out = { key };
+    for (const p of parts) {
+      const m = KEY_NAMES[p.toLowerCase()] || p.toLowerCase();
+      if (m === 'meta') out.meta = true;
+      else if (m === 'ctrl') out.ctrl = true;
+      else if (m === 'alt') out.alt = true;
+      else if (m === 'shift') out.shift = true;
     }
-    if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); return openPalette(); }
-    if (e.key === 'Escape') return S.selected ? closeDrawer() : $('#notif-pop')?.remove();
-    // Single-key shortcuts must not fire while a modifier is held — otherwise
-    // Ctrl+C (copy) would trigger 'confirm', Ctrl+X (cut) would trigger 'cancel', etc.
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (e.key === 'n') { e.preventDefault(); switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); }
-    if (e.key === '/') { e.preventDefault(); $('#search')?.focus(); }
-    if (e.key === 'g') { S._g = true; setTimeout(() => (S._g = false), 600); return; }
-    if (S._g) {
-      const map = { t: 'tasks', q: 'queue', d: 'dashboard', s: 'settings', a: 'activity' };
-      if (map[e.key]) { switchTab(map[e.key]); S._g = false; }
-    }
-    if (S.selected) {
-      if (e.key === 'c') trigger('confirm');
-      if (e.key === 'x') trigger('cancel');
-      if (e.key === 'f') { e.preventDefault(); focusFollowup(); }
-    }
+    return out;
   });
 }
-function trigger(act) {
-  $(`#drawer-foot [data-act="${act}"]`)?.click();
+// Does a keydown (or a stored snapshot of one) match a binding step? 'meta'
+// accepts Ctrl too (Linux/Windows); bare steps refuse held modifiers so Ctrl+C
+// (copy) can never trigger a plain-'c' command.
+function stepMatches(step, e) {
+  const key = e.key.length === 1 ? e.key : e.key.toLowerCase();
+  if (key !== step.key) return false;
+  if (!!step.alt !== !!e.altKey) return false;
+  if (step.meta) return !!(e.metaKey || e.ctrlKey);
+  if (step.ctrl) return !!e.ctrlKey && !e.metaKey;
+  return !e.metaKey && !e.ctrlKey;
 }
+// Which commands could still match after `pending` steps, given keystroke `snap`?
+// Pure (unit-tested in web/keynav.test.cjs); `cmds` carry parsed `keys`.
+function chordCandidates(cmds, pending, snap) {
+  return cmds.filter((c) => {
+    if (!c.keys || c.keys.length <= pending.length) return false;
+    if (!pending.every((p, i) => stepMatches(c.keys[i], p))) return false;
+    return stepMatches(c.keys[pending.length], snap);
+  });
+}
+// Human-readable keybinding for chips ('meta+k' → ⌘K / Ctrl+K).
+function fmtKeys(binding) {
+  const mac = /Mac|iP/.test((typeof navigator !== 'undefined' && navigator.platform) || '');
+  const NAME = { escape: 'Esc', enter: '↵', arrowup: '↑', arrowdown: '↓', arrowleft: '←', arrowright: '→', ' ': 'Space' };
+  return parseKeybinding(binding)
+    .map((s) => `${s.ctrl ? 'Ctrl+' : ''}${s.alt ? (mac ? '⌥' : 'Alt+') : ''}${s.meta ? (mac ? '⌘' : 'Ctrl+') : ''}${s.shift ? '⇧' : ''}${NAME[s.key] || s.key}`)
+    .join(' ');
+}
+// Subsequence fuzzy match: score (higher = better), or -1 for no match.
+function fuzzyScore(q, s) {
+  if (!q) return 0;
+  const hay = String(s).toLowerCase();
+  let score = 0, at = 0, run = 0;
+  for (const ch of String(q).toLowerCase()) {
+    const idx = hay.indexOf(ch, at);
+    if (idx < 0) return -1;
+    run = idx === at && at > 0 ? run + 1 : 1;
+    score += run * 2 + (idx === 0 || /[\s\-_./:]/.test(hay[idx - 1]) ? 3 : 0) - Math.min(idx - at, 6) * 0.5;
+    at = idx + 1;
+  }
+  return score;
+}
+
+// -- the assembled registry ---------------------------------------------------
+// Host commands. `key` is only the fallback — the binding of record comes from
+// the server's command registry (S.contributions), so packages can rebind ids.
+const HOST_COMMANDS = [
+  { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', run: () => openPalette() },
+  { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
+  { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
+  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm($('#new-wf')?.value, undefined, $('#new-task')?.value.trim()); } },
+  { id: 'nav.search', title: 'Search', key: '/', run: () => $('#search')?.focus() },
+  { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
+  { id: 'nav.queue', title: 'Go to merge queue', key: 'g q', run: () => switchTab('queue') },
+  { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
+  { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g d', run: () => switchTab('dashboard') },
+  { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
+  { id: 'nav.global', title: 'Go to global settings', key: 'g g', run: () => switchTab('global') },
+  { id: 'nav.projects', title: 'Go to projects', key: 'g p', run: () => focusRail() },
+  { id: 'nav.notifications', title: 'Go to notifications', key: 'g n', run: () => toggleNotifications() },
+  { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
+];
+
+function allCommands() {
+  const declared = new Map((S.contributions?.commands || []).map((c) => [c.id, c]));
+  const out = [];
+  const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
+  for (const h of HOST_COMMANDS) {
+    const d = declared.get(h.id);
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', run: h.run });
+  }
+  // Interaction grammar (host-owned, not server-declared): a list cursor on the
+  // tasks/queue views; with a drawer open the same keys walk between tasks. When
+  // focus sits in the projects rail (g p), the same keys walk the rail instead.
+  const rail = inRail();
+  const listy = ['tasks', 'queue'].includes(S.tab) && !rail;
+  add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
+  add({ id: 'list.prev', title: 'Previous task / row', keybinding: 'k', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(-1) : moveCursor(-1)) });
+  add({ id: 'list.next.arrow', title: 'Next task / row', keybinding: 'ArrowDown', group: 'List', palette: false, help: false, available: listy && !S.selected, run: () => moveCursor(1) });
+  add({ id: 'list.prev.arrow', title: 'Previous task / row', keybinding: 'ArrowUp', group: 'List', palette: false, help: false, available: listy && !S.selected, run: () => moveCursor(-1) });
+  add({ id: 'list.open', title: 'Open selected row', keybinding: 'o', group: 'List', palette: false, available: listy && !S.selected && !!S.cursorId, run: openCursorRow });
+  add({ id: 'list.open.enter', title: 'Open selected row', keybinding: 'Enter', group: 'List', palette: false, help: false, available: listy && !S.selected && !!S.cursorId, run: openCursorRow });
+  add({ id: 'list.archive', title: 'Archive / unarchive selected row', keybinding: 'e', group: 'List', palette: false, available: listy && !S.selected && !!S.cursorId, run: archiveCursorRow });
+  // Projects rail (after g p): j/k walk projects + global entries, ↵ selects,
+  // Esc returns. Same keys as the list — the two contexts are exclusive.
+  add({ id: 'rail.next', title: 'Next project', keybinding: 'j', group: 'Projects', palette: false, available: rail, run: () => moveRail(1) });
+  add({ id: 'rail.prev', title: 'Previous project', keybinding: 'k', group: 'Projects', palette: false, available: rail, run: () => moveRail(-1) });
+  add({ id: 'rail.next.arrow', title: 'Next project', keybinding: 'ArrowDown', group: 'Projects', palette: false, help: false, available: rail, run: () => moveRail(1) });
+  add({ id: 'rail.prev.arrow', title: 'Previous project', keybinding: 'ArrowUp', group: 'Projects', palette: false, help: false, available: rail, run: () => moveRail(-1) });
+  add({ id: 'rail.open', title: 'Switch to project / open entry', keybinding: 'Enter', group: 'Projects', palette: false, available: rail, run: () => document.activeElement?.click() });
+  add({ id: 'rail.open.o', title: 'Switch to project / open entry', keybinding: 'o', group: 'Projects', palette: false, help: false, available: rail, run: () => document.activeElement?.click() });
+  // Workflow-contributed task commands: `task.<action>` binds to the selected
+  // task's DECLARED action of that name — available only when the selected
+  // task runs the contributing workflow and the action is currently enabled.
+  const covered = new Set();
+  for (const c of S.contributions?.commands || []) {
+    if (c.workflow === 'core' || !c.id.startsWith('task.')) continue;
+    const name = c.id.slice(5);
+    covered.add(`${c.workflow}:${name}`);
+    const action = S.view && S.view.workflow === c.workflow ? (S.view.actions || []).find((a) => a.name === name) : null;
+    add({
+      id: c.id, title: c.title, keybinding: c.keybinding, group: 'Task', workflow: c.workflow,
+      available: !!(S.selected && action && action.enabled), danger: action?.danger,
+      run: () => action && runDeclaredAction(action),
+    });
+  }
+  // The declared-actions floor: any enabled action of the selected task not
+  // already reachable through a contributed command still gets a palette entry.
+  if (S.selected && S.view) {
+    for (const a of S.view.actions || []) {
+      if (covered.has(`${S.view.workflow}:${a.name}`)) continue;
+      add({ id: `task.action.${a.name}`, title: a.label || a.name, group: 'Task', workflow: S.view.workflow, available: !!a.enabled, danger: a.danger, run: () => runDeclaredAction(a) });
+    }
+    // digits 1–9 press the Nth enabled action button in the drawer footer
+    const btns = [...document.querySelectorAll('#drawer-foot [data-act]:not([disabled])')].slice(0, 9);
+    btns.forEach((b, i) => add({ id: `task.slot.${i + 1}`, title: `Press “${b.textContent.replace(/\d+$/, '').trim()}”`, keybinding: String(i + 1), group: 'Task', palette: false, help: false, run: () => b.click() }));
+  }
+  return out;
+}
+
+// Run a workflow-declared action generically: plain actions signal straight
+// through the generic endpoint; the followUp action's affordance is its compose
+// box; any other action with declared args gets an auto-rendered form (§10.2).
+async function runDeclaredAction(a) {
+  if (!S.selected) return;
+  if (a.name === 'followUp') return focusFollowup();
+  if (a.args && a.args.length) return openActionForm(a);
+  try {
+    await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
+    toast(`${a.label || a.name} sent`);
+    setTimeout(refreshDrawer, 250);
+    setTimeout(refreshTasks, 400);
+  } catch (e) { toast(e.message, true); }
+}
+
+// Auto-rendered argument form for a declared action (ActionArg[] → controls).
+function openActionForm(a) {
+  const root = $('#overlay-root');
+  const control = (arg) => {
+    const label = `<div class="label-row"><label>${esc(arg.label || arg.name)}${arg.required ? ' *' : ''}</label></div>`;
+    if (arg.type === 'text') return `<div class="form-row">${label}<textarea data-arg="${esc(arg.name)}" rows="3">${esc(arg.default ?? '')}</textarea></div>`;
+    if (arg.type === 'boolean') return `<div class="form-row"><div class="switch"><input type="checkbox" data-arg="${esc(arg.name)}" ${arg.default ? 'checked' : ''} /><label>${esc(arg.label || arg.name)}</label></div></div>`;
+    if (arg.type === 'select') return `<div class="form-row">${label}<select data-arg="${esc(arg.name)}">${(arg.options || []).map((o) => `<option ${o === arg.default ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+    return `<div class="form-row">${label}<input data-arg="${esc(arg.name)}" type="${arg.type === 'number' ? 'number' : 'text'}" value="${esc(arg.default ?? '')}" /></div>`;
+  };
+  root.innerHTML = `<div class="palette-scrim" id="act-scrim"><div class="palette" style="width:min(480px,92vw)">
+    <div style="padding:14px 16px;border-bottom:1px solid var(--line)"><b>${esc(a.label || a.name)}</b></div>
+    <div style="padding:14px 16px">${(a.args || []).map(control).join('')}</div>
+    <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
+      <button class="btn" id="act-cancel">Cancel</button>
+      <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send">${esc(a.label || a.name)}</button>
+    </div></div></div>`;
+  const close = () => (root.innerHTML = '');
+  $('#act-scrim').addEventListener('click', (e) => { if (e.target.id === 'act-scrim') close(); });
+  $('#act-cancel').addEventListener('click', close);
+  root.querySelector('[data-arg]')?.focus();
+  $('#act-send').addEventListener('click', async () => {
+    const body = { signal: a.name };
+    for (const arg of a.args || []) {
+      const el = root.querySelector(`[data-arg="${CSS.escape(arg.name)}"]`);
+      if (!el) continue;
+      const val = arg.type === 'boolean' ? el.checked : arg.type === 'number' ? (el.value === '' ? undefined : Number(el.value)) : el.value;
+      if (arg.required && (val === undefined || val === '')) { el.focus(); return toast(`${arg.label || arg.name} is required`, true); }
+      if (val !== undefined && val !== '') body[arg.name] = val;
+    }
+    try {
+      await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify(body) });
+      close();
+      toast(`${a.label || a.name} sent`);
+      setTimeout(refreshDrawer, 250);
+      setTimeout(refreshTasks, 400);
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
 // Focus the follow-up box of the open (active) conversation, falling back to the
-// first available one — the box now lives per-agent inside each conversation.
+// first available one — the box lives per-agent inside each conversation.
 function focusFollowup() {
   const ta = document.querySelector('.conversation[open] .followup-input:not([disabled])')
     || document.querySelector('.followup-input:not([disabled])');
   if (ta) { ta.closest('details')?.setAttribute('open', ''); ta.focus(); }
 }
-function openPalette() {
-  const cmds = S.contributions?.commands || [];
-  const root = $('#overlay-root');
-  root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
-    <input id="pal-in" placeholder="Type a command…" />
-    <div id="pal-list">${cmds.map((c, i) => `<div class="opt ${i === 0 ? 'active' : ''}" data-id="${c.id}">${esc(c.title)}${c.keybinding ? `<span class="key">${esc(c.keybinding)}</span>` : ''}</div>`).join('')}</div>
-  </div></div>`;
-  const input = $('#pal-in');
-  input.focus();
-  const run = (id) => { root.innerHTML = ''; runCommand(id); };
-  $('#pal-scrim').addEventListener('click', (e) => { if (e.target.id === 'pal-scrim') root.innerHTML = ''; });
-  $('#pal-list').querySelectorAll('.opt').forEach((o) => o.addEventListener('click', () => run(o.dataset.id)));
-  input.addEventListener('input', () => {
-    const q = input.value.toLowerCase();
-    $('#pal-list').querySelectorAll('.opt').forEach((o) => (o.style.display = o.textContent.toLowerCase().includes(q) ? '' : 'none'));
-  });
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') root.innerHTML = '';
-    if (e.key === 'Enter') { const first = $('#pal-list .opt:not([style*="none"])'); if (first) run(first.dataset.id); }
+
+// -- list cursor (roving selection on the tasks / merge-queue views) ----------
+function cursorRows() {
+  return [...document.querySelectorAll('#main .task-row, #main .queue-item')];
+}
+function rowKey(r) { return r.dataset.id || r.dataset.draft; }
+function applyCursor() {
+  cursorRows().forEach((r) => r.classList.toggle('cursor', rowKey(r) === S.cursorId));
+}
+function moveCursor(delta) {
+  const rows = cursorRows();
+  if (!rows.length) return;
+  let i = rows.findIndex((r) => rowKey(r) === S.cursorId);
+  i = i < 0 ? (delta > 0 ? 0 : rows.length - 1) : Math.min(rows.length - 1, Math.max(0, i + delta));
+  S.cursorId = rowKey(rows[i]);
+  applyCursor();
+  rows[i].scrollIntoView({ block: 'nearest' });
+  rows[i].focus?.(); // rows carry tabindex=0, so the cursor and Tab order agree
+}
+function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId); }
+function openCursorRow() { cursorRow()?.click(); }
+function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
+// With the drawer open, j/k walk the same task order the list shows.
+function taskOrder() {
+  return S.tasks
+    .filter((t) => !t.params?.draft && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())))
+    .slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .map((t) => t.id);
+}
+function openAdjacentTask(delta) {
+  const order = taskOrder();
+  const i = order.indexOf(S.selected);
+  const next = order[i < 0 ? 0 : i + delta];
+  if (next) { S.cursorId = next; goToTask(next); }
+}
+
+// -- projects rail focus (g p): walk projects + global entries by keyboard ----
+function railRows() { return [...document.querySelectorAll('#rail .proj, #rail .nav-item')]; }
+function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
+function focusRail() {
+  const rows = railRows();
+  (rows.find((r) => r.dataset.id === S.projectId) || rows[0])?.focus();
+}
+function moveRail(delta) {
+  const rows = railRows();
+  if (!rows.length) return;
+  let i = rows.indexOf(document.activeElement);
+  i = i < 0 ? 0 : Math.min(rows.length - 1, Math.max(0, i + delta));
+  rows[i].focus();
+  rows[i].scrollIntoView({ block: 'nearest' });
+}
+
+// -- Escape layering: pop the topmost surface ---------------------------------
+function closeTopOverlay() {
+  const pop = $('#notif-pop');
+  if (pop) return pop.remove();
+  const overlay = $('#overlay-root').firstElementChild;
+  if (overlay) {
+    if (overlay.id === 'tf-scrim') return overlay.click(); // task form: its scrim-close flushes the draft
+    return ($('#overlay-root').innerHTML = '');
+  }
+  if (S.selected) return closeDrawer();
+}
+
+// -- the dispatcher ------------------------------------------------------------
+const CHORD = { pending: [], timer: 0 };
+function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
+function dispatchKey(e) {
+  const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
+  const cmds = allCommands().filter((c) => c.keys && c.available);
+  const candidates = chordCandidates(cmds, CHORD.pending, snap);
+  if (!candidates.length) { resetChord(); return false; }
+  e.preventDefault();
+  const exact = candidates.find((c) => c.keys.length === CHORD.pending.length + 1);
+  const longer = candidates.some((c) => c.keys.length > CHORD.pending.length + 1);
+  if (exact && !longer) { resetChord(); exact.run(); return true; }
+  CHORD.pending.push(snap); // a chord prefix ('g' …) — wait briefly for the rest
+  clearTimeout(CHORD.timer);
+  CHORD.timer = setTimeout(resetChord, 900);
+  return true;
+}
+function bindKeys() {
+  document.addEventListener('keydown', (e) => {
+    const t = e.target;
+    const typing = t && t.matches && (t.matches('input, textarea, select') || t.isContentEditable);
+    const overlayOpen = $('#overlay-root').childElementCount > 0;
+    if (typing) {
+      if (e.key === 'Escape') { t.blur(); resetChord(); }
+      // modifier-bearing bindings (⌘K) still work while typing outside overlays
+      else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
+      return;
+    }
+    if (overlayOpen) { // an overlay owns the keyboard; Esc pops it
+      if (e.key === 'Escape') closeTopOverlay();
+      return;
+    }
+    if (e.key === 'Escape') {
+      resetChord();
+      if (inRail()) return document.activeElement.blur(); // leave the rail, don't close panels
+      return closeTopOverlay();
+    }
+    // Enter on a focused button/link is native activation, not the list cursor.
+    if (e.key === 'Enter' && t && t.closest && t.closest('button, a, summary, [role="button"]')) return;
+    dispatchKey(e);
   });
 }
-function runCommand(id) {
-  const map = { 'nav.newTask': () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); }, 'nav.search': () => $('#search')?.focus(), 'nav.tasks': () => switchTab('tasks'), 'nav.queue': () => switchTab('queue'), 'nav.dashboard': () => switchTab('dashboard'), 'nav.settings': () => switchTab('settings'), 'nav.close': closeDrawer, 'task.confirm': () => trigger('confirm'), 'task.cancel': () => trigger('cancel'), 'task.followUp': () => focusFollowup() };
-  map[id]?.();
+
+// -- the ⌘K palette: fuzzy over the registry + jump-to-task/project -----------
+function openPalette() {
+  const root = $('#overlay-root');
+  root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
+    <input id="pal-in" placeholder="Type a command, task, or project…" autocomplete="off" />
+    <div id="pal-list"></div>
+  </div></div>`;
+  const input = $('#pal-in');
+  const list = $('#pal-list');
+  const close = () => (root.innerHTML = '');
+  let items = [];
+  let active = 0;
+  const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2, Tasks: 3, Projects: 4 };
+  const build = () => {
+    const q = input.value.trim();
+    items = [];
+    for (const c of allCommands()) {
+      if (c.palette === false || !c.available) continue;
+      const score = fuzzyScore(q, c.title);
+      if (score < 0) continue;
+      items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.workflow, danger: c.danger, score, run: c.run });
+    }
+    if (q) { // jump-to entries only once there's a query — the empty palette is the command list
+      for (const t of S.tasks) {
+        if (t.params?.archived) continue;
+        const score = fuzzyScore(q, t.title);
+        if (score >= 0) items.push({ group: 'Tasks', title: t.title, sub: `${t.workflow}${t.params?.draft ? ' · draft' : t.lastView?.stage ? ` · ${t.lastView.stage}` : ''}`, score, run: () => (t.params?.draft ? openTaskForm(undefined, t) : goToTask(t.id)) });
+      }
+      for (const p of S.projects) {
+        const score = fuzzyScore(q, p.name);
+        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => { S.projectId = p.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); } });
+      }
+    }
+    items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
+    items = items.slice(0, 14);
+    active = 0;
+    draw();
+  };
+  const draw = () => {
+    let lastGroup = null;
+    list.innerHTML = items.map((it, i) => {
+      const head = it.group !== lastGroup ? `<div class="pal-group">${esc(it.group)}</div>` : '';
+      lastGroup = it.group;
+      return `${head}<div class="opt ${i === active ? 'active' : ''}${it.danger ? ' danger' : ''}" data-i="${i}">${esc(it.title)}${it.sub ? `<span class="pal-sub">${esc(it.sub)}</span>` : ''}${it.kbd ? `<span class="key">${esc(fmtKeys(it.kbd))}</span>` : ''}</div>`;
+    }).join('') || `<div class="pal-empty">No matches</div>`;
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  const run = (i) => { const it = items[i]; if (!it) return; close(); it.run(); };
+  input.addEventListener('input', build);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(items.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); run(active); }
+  });
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) run(Number(o.dataset.i)); });
+  list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
+  $('#pal-scrim').addEventListener('click', (e) => { if (e.target.id === 'pal-scrim') close(); });
+  build();
+  input.focus();
+}
+
+// -- "?" help: the same registry, grouped — includes every workflow's commands -
+function openHelp() {
+  const root = $('#overlay-root');
+  const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
+  const groups = [...new Set(cmds.map((c) => c.group))];
+  const row = (k, title, sub) => `<div class="help-row"><span class="key">${k}</span><span>${title}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
+  root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette" style="width:min(560px,92vw);max-height:80vh;overflow:auto">
+    <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center"><b>Keyboard shortcuts</b><span style="flex:1"></span><button class="icon-btn" id="help-close">✕</button></div>
+    <div style="padding:6px 16px 16px">
+      ${groups.map((g) => `<div class="section-h">${esc(g)}</div>${cmds.filter((c) => c.group === g).map((c) => row(esc(fmtKeys(c.keybinding)), esc(c.title), c.workflow)).join('')}`).join('')}
+      <div class="section-h">In the task drawer</div>
+      ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
+      ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
+      ${row('Esc', 'Close the topmost panel / leave a text field')}
+      <div class="section-h">Quick add</div>
+      ${row('↵', 'Open the full task form with what you typed')}
+      ${row(esc(fmtKeys('meta+Enter')), 'Add the task directly')}
+    </div></div></div>`;
+  $('#help-close').addEventListener('click', () => (root.innerHTML = ''));
+  $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.innerHTML = ''; });
 }
 
 // ── login ────────────────────────────────────────────────────────────────────
