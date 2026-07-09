@@ -5,6 +5,9 @@
 
 // ─── Identity ────────────────────────────────────────────────────────────────
 
+import type { TaskTrigger, TriggerState } from './triggers.js';
+export type { TaskTrigger, TriggerState } from './triggers.js';
+
 export type Provider = 'claude' | 'codex' | 'mock';
 
 export type AgentRole = 'do' | 'merge' | 'resolve' | (string & {});
@@ -78,6 +81,26 @@ export interface TaskParams {
   /** UI lifecycle: stored-not-queued (draft) / hidden from the default list (archived). */
   draft?: boolean;
   archived?: boolean;
+  /**
+   * Triggers (generic, workflow-agnostic): gate *when* this task's workflow
+   * starts — on other tasks completing, on a schedule, or on any karmax event.
+   * A task with triggers is stored-not-started and armed; the dispatcher starts
+   * it when a trigger is satisfied (see src/domain/triggers.ts). Kept here (not
+   * in a workflow manifest) because a trigger is orthogonal to what the workflow
+   * does — the same tier as `draft`.
+   */
+  triggers?: TaskTrigger[];
+  /** Set by the dispatcher: `armed` = waiting on a trigger, `fired` = already started. */
+  triggerState?: TriggerState;
+  /**
+   * Repeatable "series" (Model A — template + runs). A repeatable task never runs
+   * its own workflow; it spawns independent **run** records (each a normal task
+   * with its own history) on each trigger fire or "Run again". A cron trigger
+   * forces this on. Off (default) = a one-off task that runs exactly once.
+   */
+  repeatable?: boolean;
+  /** Set on a run: the id of the series (repeatable template) it was spawned from. */
+  runOf?: string;
   [k: string]: unknown;
 }
 

@@ -389,6 +389,7 @@ async function boot() {
   try {
     S.contributions = await api('/api/contributions');
     S.schema = await api('/api/schema');
+    S.eventCatalog = await api('/api/events/catalog').catch(() => []);
   } catch {}
   await loadProjects();
   connectWs();
@@ -565,7 +566,13 @@ function renderMain() {
 
 // ── tasks ────────────────────────────────────────────────────────────────────
 function tasksView() {
-  const filtered = S.tasks.filter((t) => (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())));
+  // Runs (spawned from a repeatable series) are grouped under their series row,
+  // not shown at the top level. Build the lookup once for taskRow/seriesRow.
+  S._runsBySeries = {};
+  for (const t of S.tasks) if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
+  const filtered = S.tasks.filter(
+    (t) => !t.params?.runOf && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())),
+  );
   const rows = filtered
     .slice()
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
@@ -586,8 +593,81 @@ function tasksView() {
     ${rows || `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`}`;
 }
 
+// A one-line human summary of a task's triggers (armed-row subtitle).
+function triggerSummary(triggers) {
+  const arr = Array.isArray(triggers) ? triggers : [];
+  return arr
+    .map((t) => {
+      if (t.kind === 'dependency') {
+        const n = (t.tasks || []).length;
+        return `after ${n} task${n === 1 ? '' : 's'}`;
+      }
+      if (t.kind === 'schedule') return t.cron ? `cron ${t.cron}` : t.at ? `at ${new Date(t.at).toLocaleString()}` : 'schedule';
+      if (t.kind === 'event') return `on ${t.type}`;
+      return t.kind;
+    })
+    .join('  ·  ');
+}
+
+// A repeatable series (Model A): one row that owns its runs. Shows a repeatable
+// badge, the schedule/next-trigger summary, the run count + latest status, and
+// expands to list the individual runs.
+function seriesRow(t) {
+  const runs = (S._runsBySeries?.[t.id] || []).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const expanded = S.expandedSeries?.has(t.id);
+  const latest = runs[0]?.lastView;
+  const dot = latest ? latest.status || 'active' : 'waiting';
+  const bits = [];
+  if (t.params?.triggers?.length) bits.push(triggerSummary(t.params.triggers));
+  bits.push(`${runs.length} run${runs.length === 1 ? '' : 's'}`);
+  const runsHtml = expanded ? runs.map(runSubRow).join('') : '';
+  return `
+    <div class="task-row series-row" data-series="${t.id}">
+      <button class="icon-btn series-caret" data-expand="${t.id}" title="Show runs">${expanded ? '▾' : '▸'}</button>
+      <span class="status-dot ${dot}" title="repeatable series"></span>
+      <div class="task-main">
+        <div class="task-title">${esc(t.title)} <span class="chip">repeatable</span></div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
+      </div>
+      <div class="task-right">
+        <button class="btn sm" data-runagain="${t.id}">Run again</button>
+        <button class="btn sm danger" data-delseries="${t.id}">Delete</button>
+      </div>
+    </div>${runsHtml}`;
+}
+
+function runSubRow(r) {
+  const v = r.lastView || {};
+  const status = v.status || 'active';
+  const stage = v.stage || 'setup';
+  return `
+    <div class="task-row run-row" data-id="${r.id}">
+      <span class="status-dot ${status}" title="${esc(status)}"></span>
+      <div class="task-main">
+        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stage)}</span></div>
+        <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
+      </div>
+      <div class="task-right">${pipeline(v)}</div>
+    </div>`;
+}
+
 function taskRow(t) {
   const isDraft = t.params?.draft;
+  if (t.params?.repeatable) return seriesRow(t);
+  if (t.params?.triggerState === 'armed') {
+    return `
+    <div class="task-row" data-armed="${t.id}">
+      <span class="status-dot waiting" title="waiting for trigger"></span>
+      <div class="task-main">
+        <div class="task-title">${esc(t.title)}</div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+      </div>
+      <div class="task-right">
+        <button class="btn sm" data-runnow="${t.id}">Run now</button>
+        <button class="btn sm danger" data-canceltrig="${t.id}">Cancel</button>
+      </div>
+    </div>`;
+  }
   if (isDraft) {
     return `
     <div class="task-row" data-draft="${t.id}">
@@ -692,6 +772,29 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
   );
+  $('#main').querySelectorAll('[data-runnow]').forEach((b) =>
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.runnow}/run-now`, { method: 'POST', body: '{}' }); toast('Started'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+  );
+  $('#main').querySelectorAll('[data-canceltrig]').forEach((b) =>
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.canceltrig}/cancel-trigger`, { method: 'POST', body: '{}' }); toast('Triggers cancelled — saved as a draft'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+  );
+  // Clicking a waiting task's body opens the same form as a draft — fully editable, triggers included.
+  $('#main').querySelectorAll('[data-armed]').forEach((e) =>
+    e.addEventListener('click', (ev) => { if (!ev.target.dataset.runnow && !ev.target.dataset.canceltrig) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.armed)); }),
+  );
+  // Repeatable series: run again, expand/collapse its runs, edit (body click), delete.
+  $('#main').querySelectorAll('[data-runagain]').forEach((b) =>
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.runagain}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+  );
+  $('#main').querySelectorAll('[data-expand]').forEach((b) =>
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); S.expandedSeries ||= new Set(); const id = b.dataset.expand; S.expandedSeries.has(id) ? S.expandedSeries.delete(id) : S.expandedSeries.add(id); renderMain(); }),
+  );
+  $('#main').querySelectorAll('[data-delseries]').forEach((b) =>
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (!confirm('Delete this repeatable task? Its past runs are kept.')) return; try { await api(`/api/tasks/${b.dataset.delseries}`, { method: 'DELETE' }); toast('Repeatable task deleted'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+  );
+  $('#main').querySelectorAll('[data-series]').forEach((e) =>
+    e.addEventListener('click', (ev) => { if (!ev.target.closest('button')) openDrawer(e.dataset.series); }),
+  );
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
     try {
@@ -753,11 +856,226 @@ async function deleteDraft(id) {
   renderMain();
 }
 
+// ── triggers section of the task form (generic, workflow-agnostic) ───────────
+const CRON_FIELDS = [
+  { id: 'cron-min', label: 'Minute', hint: '0–59' },
+  { id: 'cron-hour', label: 'Hour', hint: '0–23' },
+  { id: 'cron-dom', label: 'Day', hint: '1–31' },
+  { id: 'cron-mon', label: 'Month', hint: '1–12' },
+  { id: 'cron-dow', label: 'Day of week', hint: '0–6 (Sun–Sat)' },
+];
+
+function triggersSection(values, selfId) {
+  const existing = Array.isArray(values.triggers) ? values.triggers : [];
+  const sched = existing.find((t) => t.kind === 'schedule' && t.cron);
+  const at = existing.find((t) => t.kind === 'schedule' && t.at !== undefined);
+  const cronParts = (sched?.cron || '').trim().split(/\s+/);
+  const cronVal = (i) => (cronParts.length === 5 ? cronParts[i] : '');
+  let atVal = '';
+  if (at?.at) {
+    const d = new Date(at.at);
+    const p = (n) => String(n).padStart(2, '0');
+    atVal = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  const gridCells = CRON_FIELDS.map(
+    (f, i) => `<label class="cron-cell">${f.label}<input id="${f.id}" placeholder="*" value="${esc(cronVal(i))}"><small>${f.hint}</small></label>`,
+  ).join('');
+  return `
+    <details class="advanced" style="margin-top:10px" ${existing.length ? 'open' : ''}>
+      <summary>Triggers — start this task on a dependency or a schedule</summary>
+      <p class="task-sub" style="color:var(--ink-3);margin-top:0">Leave empty to start immediately.</p>
+      <div class="form-row">
+        <div class="label-row"><label>Task dependencies</label></div>
+        <div class="chip-input" id="dep-box">
+          <span class="chips" id="dep-chips"></span>
+          <input id="dep-input" class="chip-text" placeholder="Type to search tasks…" autocomplete="off">
+        </div>
+        <div class="dep-menu" id="dep-menu"></div>
+      </div>
+      <div class="form-row">
+        <div class="label-row"><label>On a schedule <span class="hint" title="Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.">cron, UTC ⓘ</span></div>
+        <div class="cron-grid">${gridCells}</div>
+      </div>
+      <div class="form-row">
+        <div class="label-row"><label>Or run once at</label></div>
+        <input id="trig-at" type="datetime-local" value="${atVal}" style="width:100%">
+      </div>
+      ${eventSection(existing)}
+    </details>`;
+}
+
+// A prominent, always-visible task-level toggle (repeatable is a lifecycle choice,
+// not a trigger — so it lives outside the collapsible Triggers section).
+function repeatableToggleHtml(values) {
+  return `
+    <div class="form-row repeat-row">
+      <label class="repeat-toggle"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
+        <span><b>Repeatable</b> — each run is kept; a trigger (or “Run again”) spawns a fresh run instead of running once.</span>
+      </label>
+    </div>`;
+}
+
+// ── schedule: the 5 labelled cron cells ──────────────────────────────────────
+function readCronCells() {
+  return CRON_FIELDS.map((f) => ($('#' + f.id)?.value || '').trim() || '*');
+}
+
+// A schedule forces "repeatable" on (a cron fires forever) and locks the box.
+function wireScheduleBuilder() {
+  const syncRepeatable = () => {
+    const cb = $('#trig-repeatable');
+    if (!cb) return;
+    const cronSet = readCronCells().join(' ') !== '* * * * *';
+    if (cronSet) { cb.checked = true; cb.disabled = true; } else { cb.disabled = false; }
+  };
+  CRON_FIELDS.forEach((f) => $('#' + f.id)?.addEventListener('input', syncRepeatable));
+  syncRepeatable();
+}
+
+// The dependency task ids currently chipped into the picker (state lives in the DOM).
+function selectedDepIds() {
+  return [...document.querySelectorAll('#dep-chips [data-depid]')].map((e) => e.dataset.depid);
+}
+
+// Read the triggers section back into a TaskTrigger[] (empty ⇒ starts immediately).
+// Dependencies default to mode:'all' (AND) and on:'success' server-side, so we
+// only carry the task ids.
+function collectTriggers() {
+  const trigs = [];
+  const deps = selectedDepIds();
+  if (deps.length) trigs.push({ kind: 'dependency', tasks: deps });
+  const cron = readCronCells().join(' ');
+  if (cron !== '* * * * *') trigs.push({ kind: 'schedule', cron }); // all-* ⇒ no schedule set
+  const at = $('#trig-at')?.value;
+  if (at) {
+    const ms = Date.parse(at);
+    if (!isNaN(ms)) trigs.push({ kind: 'schedule', at: ms });
+  }
+  const evType = $('#trig-event-type')?.value;
+  if (evType) {
+    const tr = { kind: 'event', type: evType };
+    const where = {};
+    document.querySelectorAll('#event-extra [data-wherekey]').forEach((inp) => {
+      const raw = inp.value.trim();
+      if (raw) where[inp.dataset.wherekey] = coerceScalar(raw);
+    });
+    if (Object.keys(where).length) tr.where = where;
+    const src = $('#ev-source')?.value;
+    if (src) tr.taskId = src;
+    trigs.push(tr);
+  }
+  return trigs;
+}
+
+// Coerce a filter value string to the scalar the event payload likely holds, so
+// the server's strict `===` match works (numbers/booleans, else string).
+function coerceScalar(s) {
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
+  return s;
+}
+
+// ── event trigger builder (schema-driven from the event catalog) ─────────────
+function eventSection(existing) {
+  const catalog = S.eventCatalog || [];
+  const cur = existing.find((t) => t.kind === 'event');
+  if (!catalog.length && !cur) return ''; // catalog not loaded and nothing to show
+  const bySource = {};
+  for (const e of catalog) (bySource[e.source || 'other'] ||= []).push(e);
+  const groups = Object.entries(bySource)
+    .map(([src, evs]) => `<optgroup label="${esc(src)}">${evs.map((e) => `<option value="${esc(e.type)}" ${cur?.type === e.type ? 'selected' : ''}>${esc(e.type)}</option>`).join('')}</optgroup>`)
+    .join('');
+  return `
+    <div class="form-row">
+      <div class="label-row"><label>On an event</label></div>
+      <select id="trig-event-type"><option value="">(none)</option>${groups}</select>
+      <div id="event-extra" class="event-extra"></div>
+    </div>`;
+}
+
+function eventExtraHtml(desc, cur) {
+  if (!desc) return '';
+  const fields = desc.fields || {};
+  const filters = Object.entries(fields)
+    .map(([k, ty]) => `<label class="ev-filter">${esc(k)} <small>${esc(String(ty))}</small><input data-wherekey="${esc(k)}" placeholder="any" value="${esc(cur?.where?.[k] ?? '')}"></label>`)
+    .join('');
+  const taskOpts = (S.tasks || [])
+    .filter((t) => !t.params?.runOf && !t.params?.repeatable)
+    .map((t) => `<option value="${t.id}" ${cur?.taskId === t.id ? 'selected' : ''}>${esc(t.title)}</option>`)
+    .join('');
+  return `
+    ${desc.description ? `<p class="task-sub" style="color:var(--ink-3);margin:2px 0">${esc(desc.description)}</p>` : ''}
+    ${filters ? `<div class="ev-filter-hint">Only when</div><div class="ev-filters">${filters}</div>` : ''}
+    <label class="ev-source">From task <select id="ev-source"><option value="">any</option>${taskOpts}</select></label>`;
+}
+
+function wireEventBuilder(values) {
+  const sel = $('#trig-event-type');
+  const extra = $('#event-extra');
+  if (!sel || !extra) return;
+  const cur = (Array.isArray(values.triggers) ? values.triggers : []).find((t) => t.kind === 'event');
+  const render = (preset) => {
+    const desc = (S.eventCatalog || []).find((e) => e.type === sel.value);
+    extra.innerHTML = sel.value ? eventExtraHtml(desc, preset) : '';
+  };
+  sel.addEventListener('change', () => render(null));
+  render(cur); // prefill filters/source for an existing event trigger
+}
+
+// Wire the dependency chip-input: search-as-you-type dropdown, click/Enter to add
+// a chip, ✕ or Backspace to remove. Seeded from an existing dependency trigger.
+function wireDepPicker(values, selfId) {
+  const box = $('#dep-chips');
+  const input = $('#dep-input');
+  const menu = $('#dep-menu');
+  if (!box || !input || !menu) return;
+  const taskById = (id) => (S.tasks || []).find((t) => t.id === id) || { id, title: id };
+  const chip = (t) => `<span class="dep-chip" data-depid="${t.id}">${esc(t.title)}<button type="button" class="dep-x" data-depx="${t.id}" title="Remove">✕</button></span>`;
+  const paint = (ids) => {
+    box.innerHTML = ids.map((id) => chip(taskById(id))).join('');
+    box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx)); input.focus(); }));
+  };
+  const add = (id) => { const ids = selectedDepIds(); if (!ids.includes(id)) paint([...ids, id]); input.value = ''; closeMenu(); input.focus(); };
+  const closeMenu = () => { menu.classList.remove('open'); menu.innerHTML = ''; };
+  let hi = 0;
+  const openMenu = (q) => {
+    const chosen = new Set(selectedDepIds());
+    const items = (S.tasks || [])
+      .filter((t) => t.id !== selfId && !chosen.has(t.id) && !t.params?.draft && !t.params?.runOf && !t.params?.repeatable && t.title.toLowerCase().includes(q.toLowerCase()))
+      .slice(0, 8);
+    if (!items.length) return closeMenu();
+    hi = 0;
+    menu.innerHTML = items
+      .map((t, i) => `<div class="dep-item ${i === 0 ? 'hi' : ''}" data-pick="${t.id}">${esc(t.title)}<span class="dep-item-wf">${esc(t.workflow)}</span></div>`)
+      .join('');
+    menu.classList.add('open');
+    menu.querySelectorAll('[data-pick]').forEach((el) => (el.onmousedown = (e) => { e.preventDefault(); add(el.dataset.pick); }));
+  };
+  const paintHi = () => menu.querySelectorAll('.dep-item').forEach((el, i) => el.classList.toggle('hi', i === hi));
+  input.addEventListener('input', (e) => openMenu(e.target.value));
+  input.addEventListener('focus', (e) => openMenu(e.target.value));
+  input.addEventListener('blur', () => setTimeout(closeMenu, 120));
+  input.addEventListener('keydown', (e) => {
+    const items = [...menu.querySelectorAll('[data-pick]')];
+    if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hi + 1, items.length - 1); paintHi(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); hi = Math.max(hi - 1, 0); paintHi(); }
+    else if (e.key === 'Enter') { if (items[hi]) { e.preventDefault(); add(items[hi].dataset.pick); } }
+    else if (e.key === 'Backspace' && !e.target.value) { const ids = selectedDepIds(); if (ids.length) paint(ids.slice(0, -1)); }
+    else if (e.key === 'Escape') { closeMenu(); }
+  });
+  const existing = (Array.isArray(values.triggers) ? values.triggers : []).find((t) => t.kind === 'dependency');
+  paint(existing?.tasks || []);
+}
+
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
 async function openTaskForm(workflow, draft, seedText) {
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   const values = draft ? { ...draft.params } : {};
+  const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
+  const series = !!draft?.params?.repeatable; // a repeatable template
+  const editInPlace = armed || series; // neither has a running workflow — edit its stored params
   // Carry over the quick-add text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
@@ -771,7 +1089,7 @@ async function openTaskForm(workflow, draft, seedText) {
     <div class="palette-scrim" id="tf-scrim">
       <div class="palette" style="width:min(640px,94vw);max-height:84vh;overflow:auto">
         <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px">
-          <b>${draft ? 'Edit draft' : 'New task'}</b>
+          <b>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</b>
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
@@ -786,10 +1104,12 @@ async function openTaskForm(workflow, draft, seedText) {
             <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
             <div id="cred-editor-newtask">Loading…</div>
           </details>
+          ${triggersSection(values, draft?.id)}
+          ${repeatableToggleHtml(values)}
         </div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
-          <button class="btn" id="tf-draft">Save draft</button>
-          <button class="btn primary" id="tf-queue">${draft ? 'Queue' : 'Add task'}</button>
+          <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
+          <button class="btn primary" id="tf-queue">${draft ? (editInPlace ? 'Save' : 'Queue') : 'Add task'}</button>
         </div>
       </div>
     </div>`;
@@ -812,14 +1132,27 @@ async function openTaskForm(workflow, draft, seedText) {
   let taskCredPolicy = {};
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; } });
+  wireDepPicker(values, draft?.id);
+  wireScheduleBuilder(values);
+  wireEventBuilder(values);
   const submit = async (draftMode) => {
     const body = collectForm($('#tf-body'), fields);
+    // Triggers are a generic (workflow-agnostic) param, not part of the manifest
+    // schema, so they're collected separately and merged onto params.
+    const triggers = collectTriggers();
+    if (triggers.length) body.triggers = triggers;
+    if ($('#trig-repeatable')?.checked) body.repeatable = true; // generic param, like triggers
     // Cosmetic human notes — kept separate from `params` so they never reach the
     // agent, and editable at any stage (here, pre-queue, in the full form).
     const notes = $('#tf-notes')?.value ?? '';
     const payload = { workflow: wf, params: body, notes, draft: draftMode };
     try {
-      if (draft) {
+      if (editInPlace) {
+        // A waiting task or a repeatable series edits in place (incl. its triggers).
+        // "Save" re-arms / keeps the series; "Save as draft" (draftMode) disarms it.
+        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true, keepArmed: !draftMode }) });
+        if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
+      } else if (draft) {
         // edit existing draft, then optionally queue
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true }) });
         if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
@@ -837,7 +1170,7 @@ async function openTaskForm(workflow, draft, seedText) {
         }
       }
       root.innerHTML = '';
-      toast(draftMode ? 'Draft saved' : 'Task created');
+      toast(editInPlace ? (draftMode ? 'Moved to drafts' : 'Saved') : draftMode ? 'Draft saved' : 'Task created');
       refreshTasks();
     } catch (e) { toast(e.message, true); }
   };
@@ -846,7 +1179,101 @@ async function openTaskForm(workflow, draft, seedText) {
 }
 
 // ── drawer ───────────────────────────────────────────────────────────────────
+// The config drawer for a repeatable series: edit its parameters + triggers in
+// the usual drawer, see its runs, and Run again. Saved via the same in-place path
+// as a waiting task (updateArmedParams) — the series never runs its own workflow.
+async function renderSeriesDrawer(rec) {
+  const wf = rec.workflow;
+  const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
+  const values = { ...rec.params };
+  let inherited = {};
+  try { inherited = (await api(`/api/defaults/${rec.projectId}/${wf}`)).task.inherited; } catch {}
+  const runs = await api(`/api/tasks/${rec.id}/runs`).catch(() => []);
+  const root = $('#drawer-root');
+  root.innerHTML = `
+    <div class="scrim open" id="scrim"></div>
+    <aside class="drawer open">
+      <div class="drawer-head">
+        <div class="row1">
+          <h2>${esc(rec.title)}</h2>
+          <span class="chip">repeatable</span>
+          <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
+        </div>
+        <div class="meta">
+          <span>${esc(wf)}</span>
+          ${rec.params?.triggers?.length ? `<span>${esc(triggerSummary(rec.params.triggers))}</span>` : ''}
+          <span>${runs.length} run${runs.length === 1 ? '' : 's'}</span>
+        </div>
+      </div>
+      <div class="drawer-body" id="drawer-body">
+        <div id="tf-body">
+          ${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
+          <div class="form-row" data-row="__notes">
+            <div class="label-row"><label>Notes</label></div>
+            <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent" style="width:100%">${esc(rec.notes || '')}</textarea>
+          </div>
+          <details class="advanced" style="margin-top:10px">
+            <summary>Credentials — precedence &amp; enable/disable</summary>
+            <div id="cred-editor-newtask">Loading…</div>
+          </details>
+          ${triggersSection(values, rec.id)}
+          ${repeatableToggleHtml(values)}
+        </div>
+        <div class="series-runs">
+          <div class="series-runs-h">Runs</div>
+          ${runs.length ? runs.map(runDrawerRow).join('') : '<p class="task-sub" style="color:var(--ink-3);margin:2px 0">No runs yet.</p>'}
+        </div>
+      </div>
+      <div class="drawer-foot">
+        <button class="btn" id="sd-runagain">Run again</button>
+        <span style="flex:1"></span>
+        <button class="btn primary" id="sd-save">Save changes</button>
+      </div>
+    </aside>`;
+  $('#scrim').addEventListener('click', closeDrawer);
+  $('#drawer-close').addEventListener('click', closeDrawer);
+  wireAgentFields($('#tf-body'));
+  wireFieldResets($('#tf-body'), fields);
+  renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: rec.projectId, taskId: rec.id });
+  wireDepPicker(values, rec.id);
+  wireScheduleBuilder(values);
+  wireEventBuilder(values);
+  $('#drawer-body').querySelectorAll('[data-runopen]').forEach((el) => el.addEventListener('click', () => openDrawer(el.dataset.runopen)));
+  $('#sd-runagain').addEventListener('click', async () => {
+    try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeDrawer(); refreshTasks(); }
+    catch (e) { toast(e.message, true); }
+  });
+  $('#sd-save').addEventListener('click', async () => {
+    const body = collectForm($('#tf-body'), fields);
+    const triggers = collectTriggers();
+    if (triggers.length) body.triggers = triggers;
+    body.repeatable = !!$('#trig-repeatable')?.checked;
+    const notes = $('#tf-notes')?.value ?? '';
+    try {
+      await api(`/api/tasks/${rec.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true, keepArmed: true }) });
+      if ((rec.notes || '') !== notes) await api(`/api/tasks/${rec.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
+      toast('Saved'); closeDrawer(); refreshTasks();
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
+function runDrawerRow(r) {
+  const v = r.lastView || {};
+  const status = v.status || 'active';
+  return `<div class="run-drawer-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(v.stage || 'setup')}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
+}
+
 async function openDrawer(taskId) {
+  // A repeatable series has no running workflow — open the config drawer instead
+  // (edit its parameters + triggers, see its runs, run again).
+  const rec = S.tasks.find((t) => t.id === taskId);
+  if (rec?.params?.repeatable) {
+    S.selected = taskId;
+    S.view = null;
+    highlightRow();
+    await renderSeriesDrawer(rec);
+    return;
+  }
   S.selected = taskId;
   S.drawerEvents = [];
   highlightRow();
@@ -861,6 +1288,9 @@ async function openDrawer(taskId) {
 }
 async function refreshDrawer() {
   if (!S.selected) return;
+  // The series config drawer holds an editable form — don't live-refresh it (that
+  // would clobber in-progress edits); it re-renders only on open / explicit save.
+  if (S.tasks.find((t) => t.id === S.selected)?.params?.repeatable) return;
   try {
     S.view = await api(`/api/tasks/${S.selected}`);
     S.widgets = await api(`/api/tasks/${S.selected}/widgets`).catch(() => S.widgets);

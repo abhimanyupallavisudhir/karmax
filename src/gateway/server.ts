@@ -282,6 +282,17 @@ export class Gateway {
         const id = editMatch[1]!;
         const t = store.getTask(id);
         if (!t) return this.json(res, 404, { error: 'no such task' });
+        // A waiting (armed) task or a repeatable series hasn't started its own
+        // workflow — edit its stored params + triggers in place, then re-arm (or
+        // drop to a draft). `keepArmed:false` (Save as draft) disarms it.
+        if (t.params?.triggerState === 'armed' || t.params?.repeatable) {
+          try {
+            const updated = await api.updateArmedParams(token, id, b.params ?? {}, { replace: b.replace === true, keepArmed: b.keepArmed !== false });
+            return this.json(res, 200, updated);
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
         // A draft has no running workflow — edit its stored params in place; they
         // re-resolve at queue time (SPEC §10.4).
         if (t.params?.draft) {
@@ -293,6 +304,9 @@ export class Gateway {
           const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}) };
           const replace = b.replace === true;
           store.updateTaskParams(id, replace ? { ...meta, ...b.params } : { ...t.params, ...b.params });
+          // Keep the title tracking the edited prompt (title was derived from it).
+          const prompt = b.params?.prompt;
+          if (typeof prompt === 'string' && prompt.trim()) store.setTaskTitle(id, (prompt.split('\n')[0] ?? '').slice(0, 80));
           return this.json(res, 200, store.getTask(id) ?? null);
         }
         // Once queued, params are frozen except the ones the workflow declares
@@ -340,6 +354,22 @@ export class Gateway {
       if (targetMatch && method === 'POST') {
         const b = await this.body(req);
         return this.json(res, 200, { ok: await api.setTarget(token, targetMatch[1]!, b.branch) });
+      }
+      const cancelTrigMatch = p.match(/^\/api\/tasks\/([^/]+)\/cancel-trigger$/);
+      if (cancelTrigMatch && method === 'POST') {
+        return this.json(res, 200, await api.cancelTrigger(token, cancelTrigMatch[1]!));
+      }
+      const runNowMatch = p.match(/^\/api\/tasks\/([^/]+)\/run-now$/);
+      if (runNowMatch && method === 'POST') {
+        return this.json(res, 200, await api.runArmedNow(token, runNowMatch[1]!));
+      }
+      const runAgainMatch = p.match(/^\/api\/tasks\/([^/]+)\/run-again$/);
+      if (runAgainMatch && method === 'POST') {
+        return this.json(res, 200, await api.runAgain(token, runAgainMatch[1]!));
+      }
+      const runsMatch = p.match(/^\/api\/tasks\/([^/]+)\/runs$/);
+      if (runsMatch && method === 'GET') {
+        return this.json(res, 200, store.runsOf(runsMatch[1]!));
       }
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
@@ -650,6 +680,10 @@ export class Gateway {
       if (p === '/api/schema' && method === 'GET') {
         // Built-in + installed workflows, so the New Task form offers both (§21d).
         return this.json(res, 200, api.workflowSchemas());
+      }
+      if (p === '/api/events/catalog' && method === 'GET') {
+        // Workflow + platform events for the event-trigger picker (SPEC §5).
+        return this.json(res, 200, api.eventCatalog());
       }
 
       // resolved/inherited defaults per scope — drives form placeholders (SPEC §10.4)

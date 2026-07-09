@@ -131,6 +131,21 @@ async function main() {
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows });
 
+  // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
+  // dependency completes, a schedule fires, or a matching event occurs. Runs
+  // in-process off the same bus as the self-heal loop; the store is the durable
+  // source of truth, so it re-arms every armed task on boot.
+  const { TriggerScheduler } = await import('./platform/trigger-scheduler.js');
+  const triggerToken = tokens.mintPrincipal('system:triggers', ['*']).token;
+  const triggerScheduler = new TriggerScheduler({
+    store,
+    bus,
+    fire: (taskId, mode) => api.fireTriggeredTask(triggerToken, taskId, mode),
+    log: (m) => console.log('  • ' + m),
+  });
+  api.setTriggerArmer(triggerScheduler);
+  triggerScheduler.start();
+
   // Self-healing loop (SPEC §4.4): when a workflow-edit PR merges (its merge-only
   // task reaches done), reload the edited workflow from its repo so new tasks pick
   // up the published version. Runs in this process (not inside a workflow), so
@@ -203,6 +218,7 @@ async function main() {
     // worker itself resolves within ~3s (shutdownGraceTime/shutdownForceTime).
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
+    triggerScheduler.stop();
     await step(closeGateway());
     await step(workerManager.stop());
     await step(closeClient());

@@ -446,3 +446,100 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
 .cred-toggle.off { background: transparent; color: var(--ink-3); }
 .cred-rename, .cred-del { cursor: pointer; color: var(--ink-3); font-size: 11px; }
 .cred-rename:hover, .cred-del:hover { color: var(--accent); }
+
+/* ── Trigger dependency chip-input (task form) ────────────────────────────── */
+.chip-input {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: 5px 7px; background: var(--surface); min-height: 34px;
+}
+.chip-input:focus-within { border-color: var(--accent); }
+.chip-input .chips { display: contents; }
+.dep-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--accent-weak); color: var(--accent-ink);
+  border-radius: 999px; padding: 2px 6px 2px 9px; font-size: 12px; white-space: nowrap;
+}
+.dep-chip .dep-x {
+  border: 0; background: transparent; color: inherit; cursor: pointer;
+  font-size: 11px; line-height: 1; padding: 0; opacity: .65;
+}
+.dep-chip .dep-x:hover { opacity: 1; }
+.chip-input .chip-text {
+  flex: 1; min-width: 120px; border: 0; outline: 0; background: transparent;
+  color: var(--ink); font: inherit; padding: 2px;
+}
+.dep-menu {
+  position: relative; margin-top: 2px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: var(--surface); box-shadow: var(--shadow);
+  max-height: 208px; overflow: auto; display: none; z-index: 5;
+}
+.dep-menu.open { display: block; }
+.dep-item {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 6px 9px; cursor: pointer; font-size: 13px;
+}
+.dep-item.hi, .dep-item:hover { background: var(--accent-weak); }
+.dep-item-wf { color: var(--ink-3); font-size: 11px; }
+.label-row .hint { font-weight: 400; color: var(--ink-3); font-size: 12px; cursor: help; }
+
+/* ── Schedule builder + 5-field cron grid (task form) ─────────────────────── */
+.sched-builder { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.sched-extra { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--ink-2); font-size: 13px; }
+.sched-extra input[type="time"], .sched-extra input[type="number"] {
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 3px 6px; background: var(--surface); color: var(--ink);
+}
+.dow-row { display: inline-flex; gap: 3px; }
+.dow-chip {
+  width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line);
+  background: transparent; color: var(--ink-2); cursor: pointer; font-size: 12px; padding: 0;
+}
+.dow-chip.on { background: var(--accent); color: #fff; border-color: transparent; }
+.cron-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.cron-cell { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--ink-3); }
+.cron-cell input {
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px 6px;
+  background: var(--surface); color: var(--ink); font-family: var(--font-mono); font-size: 13px; text-align: center;
+}
+.cron-cell input:focus { border-color: var(--accent); outline: none; }
+.cron-cell small { color: var(--ink-3); font-size: 10px; }
+
+/* ── Repeatable series + runs (task list) ─────────────────────────────────── */
+.repeat-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); cursor: pointer; }
+.repeat-toggle input { margin: 0; }
+.series-row .series-caret { margin-right: 2px; color: var(--ink-3); }
+.run-row { padding-left: 34px; background: var(--surface-2); }
+.run-row .task-title { font-size: 13px; }
+.run-row::before {
+  content: ""; position: absolute; left: 20px; top: 0; bottom: 0; width: 1px; background: var(--line);
+}
+.run-row { position: relative; }
+
+/* ── Event trigger builder ────────────────────────────────────────────────── */
+.event-extra { margin-top: 6px; }
+.ev-filter-hint { font-size: 12px; color: var(--ink-3); margin: 4px 0 2px; }
+.ev-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; }
+.ev-filter { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--ink-2); }
+.ev-filter small { color: var(--ink-3); font-size: 10px; }
+.ev-filter input, .ev-source select {
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 4px 6px; background: var(--surface); color: var(--ink); font-size: 13px;
+}
+.ev-source { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--ink-2); }
+
+/* ── Repeatable toggle (prominent, task-level) ───────────────────────────── */
+.repeat-row { margin-top: 12px; }
+.repeat-toggle { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: var(--ink-2); cursor: pointer;
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 9px 11px; background: var(--surface-2); }
+.repeat-toggle input { margin: 2px 0 0; }
+.repeat-toggle b { color: var(--ink); }
+
+/* ── Series row + runs (list + drawer) ───────────────────────────────────── */
+.series-row .series-caret { margin-right: 2px; color: var(--ink-3); background: transparent; border: 0; cursor: pointer; }
+.run-row { position: relative; padding-left: 40px; background: var(--surface-2); }
+.run-row .task-title { font-size: 13px; font-weight: 500; }
+.run-row::before { content: ""; position: absolute; left: 22px; top: -1px; bottom: 50%; width: 10px; border-left: 1px solid var(--line); border-bottom: 1px solid var(--line); border-bottom-left-radius: 4px; }
+.series-runs { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+.series-runs-h { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-3); margin-bottom: 6px; }
+.run-drawer-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: var(--r-sm); cursor: pointer; }
+.run-drawer-row:hover { background: var(--surface-2); }
+.run-drawer-row .run-when { margin-left: auto; color: var(--ink-3); font-size: 12px; }

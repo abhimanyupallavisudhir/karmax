@@ -4,10 +4,11 @@ import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
-import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
+import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput } from '../domain/types.js';
+import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
@@ -18,6 +19,19 @@ import { paths } from '../config/paths.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
+}
+
+/**
+ * The dispatcher hook (SPEC §3.3). A triggered task is stored-not-started and
+ * *armed* through this so the in-process scheduler can start it when a trigger
+ * fires. Kept structural (not an import) so the API doesn't depend on the
+ * scheduler, and so tests can pass a fake. Optional everywhere: with no armer
+ * wired, triggered tasks are simply held as armed rows and picked up on the next
+ * boot's re-arm (the store is the durable source of truth).
+ */
+export interface TriggerArmer {
+  arm(task: TaskRecord): void;
+  disarm(taskId: string): void;
 }
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
@@ -67,7 +81,13 @@ export interface KarmaxApiDeps {
  * so authz lives in exactly one place.
  */
 export class KarmaxApi {
+  private armer?: TriggerArmer;
   constructor(private deps: KarmaxApiDeps) {}
+
+  /** Attach the trigger dispatcher after construction (resolves the ctor cycle). */
+  setTriggerArmer(armer: TriggerArmer) {
+    this.armer = armer;
+  }
 
   private require(token: string, tool: string) {
     const cap = TOOL_CAPABILITY[tool] ?? tool;
@@ -138,6 +158,8 @@ export class KarmaxApi {
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
+    // A repeatable "series" (Model A) — forced on by a cron/recurring trigger.
+    const repeatable = !!taskOverrides.repeatable || forcesRepeatable(normalizeTriggers(taskOverrides));
     // Persist only the task's OWN overrides (sparse), not the resolved snapshot.
     // A baked snapshot would freeze inherited values, so later changes to the
     // project/global defaults could never reach an unqueued task. Keeping the
@@ -148,7 +170,7 @@ export class KarmaxApi {
       title,
       workflow,
       workflowVersion: manifest.version,
-      params: { ...taskOverrides, prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''), profiles: args.profiles, draft: !!args.draft },
+      params: { ...taskOverrides, prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''), profiles: args.profiles, draft: !!args.draft, ...(repeatable ? { repeatable: true } : {}) },
     });
     // Cosmetic human notes live in a dedicated column, never in `params`, so they
     // are structurally incapable of reaching the agent (SPEC §10). Persist them the
@@ -158,6 +180,29 @@ export class KarmaxApi {
       task.notes = args.notes || undefined;
     }
     if (args.draft) return task; // stored but not queued
+
+    // A repeatable series never runs its own workflow — it spawns run records.
+    // With no trigger, spawn its first run now so it isn't inert; with a trigger,
+    // it arms below (each fire spawns a run — see fireTriggeredTask/'clone').
+    if (task.params.repeatable && !hasActiveTriggers(task.params)) {
+      await this.spawnRun(token, task.id);
+      return this.deps.store.getTask(task.id)!;
+    }
+
+    // Triggered tasks are stored-not-started and *armed* (SPEC §3.3): the
+    // dispatcher starts them when a trigger fires. This is generic and
+    // workflow-agnostic — a trigger gates *when* the workflow starts, not what
+    // it does, so it applies to any task with any workflow.
+    if (hasActiveTriggers(task.params)) {
+      try {
+        const armed = this.armStoredTask(task.id);
+        if (typeof args.notes === 'string') armed.notes = args.notes || undefined;
+        return armed;
+      } catch (e) {
+        this.deps.store.deleteTask(task.id); // undo the just-created row on an invalid trigger
+        throw e;
+      }
+    }
 
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
@@ -246,22 +291,19 @@ export class KarmaxApi {
     return out;
   }
 
-  /** Start a previously-saved draft (SPEC §10.4). */
-  async queueTask(token: string, taskId: string): Promise<TaskRecord> {
-    this.require(token, 'create_task');
-    const task = this.deps.store.getTask(taskId);
-    if (!task) throw new Error(`no task ${taskId}`);
+  /**
+   * Resolve a stored task into the (startType, TaskInput) needed to launch its
+   * workflow. Shared by draft queueing and trigger firing so both re-resolve
+   * against the CURRENT project/global defaults and pin the stamped version.
+   * Meta fields (profiles/draft/archived/triggers) aren't workflow overrides.
+   */
+  private async buildStart(task: TaskRecord): Promise<{ startType: string; input: TaskInput }> {
     const project = this.deps.store.getProject(task.projectId);
-    // Pin to the version stamped when the draft was created, not whatever is
-    // current now — queueing a draft after an upgrade must not silently swap code.
     const start = this.resolveStart(task.workflow, task.workflowVersion);
-    if (!project || !start) throw new Error(`cannot queue task ${taskId}`);
+    if (!project || !start) throw new Error(`cannot start task ${task.id}`);
     const { manifest, startType } = start;
-    this.assertRepoConfigured(manifest, project); // same guard as createTask, before we clear the draft
-    // Re-resolve against the CURRENT project/global defaults. The task stored only
-    // its own overrides, so a draft queued after a default change picks up the new
-    // default (SPEC §10.4). Meta fields (profiles/draft/archived) aren't overrides.
-    const { profiles, draft: _d, archived: _a, ...overrides } = task.params as Record<string, unknown>;
+    this.assertRepoConfigured(manifest, project);
+    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
@@ -271,6 +313,45 @@ export class KarmaxApi {
     });
     input.workflow = task.workflow;
     if (profiles) input.profiles = profiles as Record<string, string>;
+    return { startType, input };
+  }
+
+  /**
+   * Mark a stored task as *armed* on its triggers and register it with the
+   * dispatcher (SPEC §3.3). Shared by createTask and queueTask so both the
+   * "create with triggers" and "save draft → queue" paths gate correctly.
+   * Clears any draft flag — an armed task is live (waiting), not a draft.
+   */
+  private armStoredTask(taskId: string): TaskRecord {
+    const task = this.deps.store.getTask(taskId)!;
+    const errs = validateTriggers(normalizeTriggers(task.params));
+    if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
+    this.deps.store.updateTaskParams(taskId, { ...task.params, draft: false, triggerState: 'armed' });
+    const armed = this.deps.store.getTask(taskId)!;
+    this.armer?.arm(armed);
+    return armed;
+  }
+
+  /** Start a previously-saved draft (SPEC §10.4). */
+  async queueTask(token: string, taskId: string): Promise<TaskRecord> {
+    this.require(token, 'create_task');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    // Queuing a task that carries triggers ARMS it (activates its triggers) rather
+    // than starting now — otherwise a triggered draft would start immediately and
+    // its triggers would be pointless. `fired` tasks have already started.
+    if (hasActiveTriggers(task.params) && task.params.triggerState !== 'fired') {
+      return this.armStoredTask(taskId);
+    }
+    // A repeatable series never runs its own workflow — queueing it spawns a run.
+    if (task.params.repeatable) {
+      this.deps.store.clearDraft(taskId);
+      await this.spawnRun(token, taskId);
+      return this.deps.store.getTask(taskId)!;
+    }
+    // Pin to the version stamped when the draft was created, not whatever is
+    // current now — queueing a draft after an upgrade must not silently swap code.
+    const { startType, input } = await this.buildStart(task);
     this.deps.store.clearDraft(taskId);
     // Bounded + compensated: on a wedged engine, restore the draft flag so a
     // failed queue attempt leaves the task saved (not stranded, non-draft, with
@@ -287,6 +368,137 @@ export class KarmaxApi {
           `It's still saved as a draft — check that Temporal is healthy and try again.`,
       );
     }
+    return this.deps.store.getTask(taskId)!;
+  }
+
+  /**
+   * Spawn a **run** from a series (repeatable template) and start it — a fresh
+   * task record linked to the series via `runOf`, with trigger/series metadata
+   * stripped so it's a plain one-off execution with its own history. Used on
+   * each trigger fire of a repeatable series, and by "Run again".
+   */
+  async spawnRun(token: string, seriesId: string): Promise<TaskRecord> {
+    this.require(token, 'create_task');
+    const series = this.deps.store.getTask(seriesId);
+    if (!series) throw new Error(`no task ${seriesId}`);
+    const run = this.deps.store.createTask({
+      projectId: series.projectId,
+      listId: series.listId,
+      title: series.title,
+      workflow: series.workflow,
+      workflowVersion: series.workflowVersion,
+      params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId },
+      parentTaskId: series.parentTaskId,
+    });
+    const { startType, input } = await this.buildStart(run);
+    try {
+      await withTimeout(
+        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: run.id, args: [input] }),
+        START_TIMEOUT_MS,
+      );
+    } catch (e) {
+      this.deps.store.deleteTask(run.id); // no orphan run row on a wedged engine
+      throw e;
+    }
+    return run;
+  }
+
+  /** "Run again": spawn a fresh run from a series on demand. */
+  async runAgain(token: string, seriesId: string): Promise<{ startedTaskId: string }> {
+    return { startedTaskId: (await this.spawnRun(token, seriesId)).id };
+  }
+
+  /**
+   * Start an armed triggered task because a trigger fired (called by the
+   * dispatcher). `self` starts the armed task itself (a non-repeatable one-off);
+   * `clone` spawns a run from the series and leaves the armed template in place
+   * (a repeatable series — cron, or any recurring trigger). Re-arms the task on a
+   * start failure so a fire is never silently lost.
+   */
+  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone'): Promise<{ startedTaskId: string }> {
+    this.require(token, 'create_task');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+
+    if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId)).id };
+
+    const fired = { ...(task.params as Record<string, unknown>), triggerState: 'fired' };
+    this.deps.store.updateTaskParams(taskId, fired as any);
+    try {
+      const { startType, input } = await this.buildStart({ ...task, params: fired as any });
+      await withTimeout(
+        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
+        START_TIMEOUT_MS,
+      );
+    } catch (e) {
+      this.deps.store.updateTaskParams(taskId, { ...(task.params as Record<string, unknown>), triggerState: 'armed' } as any);
+      throw e;
+    }
+    return { startedTaskId: taskId };
+  }
+
+  /**
+   * Start an armed task immediately, bypassing the wait (the UI "Run now"). A
+   * repeatable series spawns a run and stays armed; a one-off starts itself and
+   * is disarmed.
+   */
+  async runArmedNow(token: string, taskId: string): Promise<{ startedTaskId: string }> {
+    const task = this.deps.store.getTask(taskId);
+    if (task?.params?.repeatable) return this.runAgain(token, taskId);
+    this.armer?.disarm(taskId); // take it off the dispatcher so no later event double-fires
+    return this.fireTriggeredTask(token, taskId, 'self');
+  }
+
+  /** Cancel a task's triggers: disarm it and keep it as an editable draft. */
+  async cancelTrigger(token: string, taskId: string): Promise<TaskRecord> {
+    this.require(token, 'edit_task');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    this.armer?.disarm(taskId);
+    const { triggerState: _s, ...rest } = task.params as Record<string, unknown>;
+    this.deps.store.updateTaskParams(taskId, { ...rest, draft: true } as any);
+    return this.deps.store.getTask(taskId)!;
+  }
+
+  /**
+   * Edit a waiting (armed) task in place — its workflow hasn't started, so its
+   * stored params (including its triggers) are freely editable, exactly like a
+   * draft. `keepArmed` re-arms with the new triggers (Save); otherwise it disarms
+   * back to a draft (Save as draft). Removing all triggers also drops it to a draft.
+   */
+  async updateArmedParams(
+    token: string,
+    taskId: string,
+    params: Record<string, unknown>,
+    opts: { replace?: boolean; keepArmed?: boolean } = {},
+  ): Promise<TaskRecord> {
+    this.require(token, 'edit_task');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    const { profiles } = task.params;
+    const meta = profiles !== undefined ? { profiles } : {};
+    const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
+    delete base.triggerState; // lifecycle flags are managed below, never taken from the form
+    delete base.draft;
+    // Keep the display title tracking the (edited) prompt — the title was derived
+    // from the prompt at creation, so an edit should carry through (SPEC §10).
+    if (typeof base.prompt === 'string' && base.prompt.trim()) this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt)));
+    // A cron/recurring trigger forces the series flag on (mirrors createTask).
+    if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;
+    // A repeatable series stays a series when saved: persist, then arm it if it
+    // has triggers (each fire spawns a run) or leave it as a manual template.
+    if (base.repeatable && opts.keepArmed !== false) {
+      this.deps.store.updateTaskParams(taskId, base as any);
+      if (hasActiveTriggers(base)) return this.armStoredTask(taskId);
+      this.armer?.disarm(taskId);
+      return this.deps.store.getTask(taskId)!;
+    }
+    if (opts.keepArmed !== false && hasActiveTriggers(base)) {
+      this.deps.store.updateTaskParams(taskId, base as any);
+      return this.armStoredTask(taskId); // re-validate + re-arm (disarm old, arm new)
+    }
+    this.armer?.disarm(taskId);
+    this.deps.store.updateTaskParams(taskId, { ...base, draft: true } as any);
     return this.deps.store.getTask(taskId)!;
   }
 
@@ -449,6 +661,15 @@ export class KarmaxApi {
   workflowSchemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
     if (this.deps.workflows) return this.deps.workflows.schemas();
     return MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
+  }
+
+  /**
+   * The event catalog for the event-trigger picker (SPEC §5): every workflow's
+   * declared events + the core platform events, each with payload fields a filter
+   * can match. Read-only, session-gated by the gateway (like workflowSchemas).
+   */
+  eventCatalog(): { type: string; description: string; fields: Record<string, string>; source: string }[] {
+    return eventCatalog();
   }
 
   /**
