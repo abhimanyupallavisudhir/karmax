@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
@@ -176,7 +177,14 @@ export class Gateway {
       if (msg.type === 'input') term.write(msg.data);
       else if (msg.type === 'resize') term.resize(msg.cols || 80, msg.rows || 24);
     });
-    ws.on('close', () => { try { term.kill(); } catch {} });
+    // Closing the socket (navigating away OR the user hitting "Kill terminal")
+    // tears the whole thing down — not just the shell, but every process it
+    // spawned. node-pty runs the shell as a session leader (its pid == the
+    // session id), so we kill the entire session: `pkill -s` reaps foreground
+    // AND background jobs, which a bare process-group kill would miss (bash job
+    // control puts each pipeline in its own group). The group kill + term.kill()
+    // are belt-and-suspenders fallbacks.
+    ws.on('close', () => killPtySession(term));
   }
 
   /** Stream a running review action's output to the UI. `procId` names a process
@@ -1078,6 +1086,20 @@ export class Gateway {
       /* ignore */
     }
   }
+}
+
+/** Tear down a check-in PTY and everything running inside it. The interactive
+ *  shell node-pty spawned is a session leader (pid == session id), so killing
+ *  the whole session reaps its children — foreground and background jobs alike.
+ *  `pkill -s` is the thorough path; the process-group kill and `term.kill()` are
+ *  fallbacks for platforms without pkill or if the session id trick misses. */
+function killPtySession(term: { pid?: number; kill?: () => void }): void {
+  const pid = term?.pid;
+  if (typeof pid === 'number') {
+    try { spawn('pkill', ['-KILL', '-s', String(pid)], { stdio: 'ignore' }).on('error', () => {}); } catch { /* no pkill */ }
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+  }
+  try { term.kill?.(); } catch { /* already dead */ }
 }
 
 /** Expand ~ / $HOME in repo paths so a configured repo resolves to a real dir. */

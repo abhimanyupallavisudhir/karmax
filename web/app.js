@@ -821,6 +821,9 @@ function captureFocus(root) {
   const el = document.activeElement;
   if (!el || !el.id || !root.contains(el)) return null;
   const tag = el.tagName;
+  // The terminal screen is a focusable <pre> the user types straight into —
+  // keep it focused across re-renders so keystrokes keep reaching the shell.
+  if (tag === 'PRE' && el.classList.contains('term-screen')) return { id: el.id, tag };
   if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return null;
   const st = { id: el.id, tag, value: el.value };
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
@@ -834,6 +837,7 @@ function restoreFocus(root, st) {
   if (!st) return;
   const el = root.querySelector(`#${window.CSS && CSS.escape ? CSS.escape(st.id) : st.id}`);
   if (!el || el.tagName !== st.tag) return;
+  if (st.tag === 'PRE') { el.focus(); return; } // terminal screen: just re-focus (no value to restore)
   // Only carry over the in-progress value for free-text fields; a fresh empty
   // composer input would otherwise be reset by the re-render.
   if (st.tag !== 'SELECT') el.value = st.value;
@@ -1368,7 +1372,7 @@ function closeDrawerDom() {
   S.view = null;
   S.liveOutput = ''; // drop any streamed live text so it can't reappear in the next drawer
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next drawer
-  if (termWs) { try { termWs.close(); } catch {} termWs = null; }
+  if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // closing the drawer kills the check-in shell
   $('#drawer-root').innerHTML = '';
   highlightRow();
 }
@@ -1458,30 +1462,199 @@ function restoreFollowupFocus(root, st) {
   }
 }
 
-let termWs = null;
 function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/\r/g, '');
 }
+
+// ── check-in terminal: a real PTY streamed over a WebSocket ──────────────────
+// The session outlives drawer re-renders (which rebuild the DOM on every event),
+// so it lives in module state and rebinds to the freshly-rendered <pre> each
+// time. `makeTermScreen` is a tiny terminal emulator that turns the PTY byte
+// stream — echo, backspace, cursor moves, line erases — into displayable text,
+// so the user can type STRAIGHT into the terminal (Ctrl-C and friends included)
+// without pulling in a heavyweight emulator like xterm.js (which would break the
+// no-build-step, offline console this app is built around).
+let term = null; // { taskId, ws, screen } while a session is live; null otherwise
+
+function termIsOpenFor(taskId) {
+  return !!(term && term.taskId === taskId && term.ws && term.ws.readyState <= 1);
+}
+
+// Minimal line-oriented emulator: enough to render an interactive shell's echo,
+// backspace, history recall and Ctrl-C cleanly. Full-screen TUIs (vim, htop) use
+// absolute cursor positioning we intentionally ignore — those genuinely need a
+// full emulator; a line-mode check-in terminal doesn't.
+function makeTermScreen(maxLines = 2000) {
+  let lines = [''];
+  let row = 0, col = 0;
+  const ensureRow = () => { while (lines.length <= row) lines.push(''); };
+  const put = (i, ch) => {
+    let line = lines[row];
+    if (line.length < i) line += ' '.repeat(i - line.length);
+    lines[row] = line.slice(0, i) + ch + line.slice(i + 1);
+  };
+  function csi(final, params) {
+    const n = parseInt(params, 10);
+    const num = Number.isNaN(n) ? (final === 'K' || final === 'J' ? 0 : 1) : n;
+    ensureRow();
+    const line = lines[row];
+    switch (final) {
+      case 'C': col += num; break;                                      // cursor right
+      case 'D': col = Math.max(0, col - num); break;                    // cursor left
+      case 'G': col = Math.max(0, num - 1); break;                      // cursor to column
+      case 'K':                                                          // erase in line
+        lines[row] = num === 1 ? ' '.repeat(col) + line.slice(col) : num === 2 ? '' : line.slice(0, col);
+        break;
+      case 'P': lines[row] = line.slice(0, col) + line.slice(col + num); break; // delete chars
+      case 'J':                                                          // erase display
+        if (num >= 2) { lines = ['']; row = 0; col = 0; }
+        else { lines[row] = line.slice(0, col); lines = lines.slice(0, row + 1); }
+        break;
+      default: break;                                                    // ignore the rest (cursor up/down, SGR colors, …)
+    }
+  }
+  function write(data) {
+    for (let k = 0; k < data.length; k++) {
+      const ch = data[k];
+      if (ch === '\x1b') {
+        if (data[k + 1] === '[') {                                       // CSI — read params until the final byte
+          let j = k + 2, params = '';
+          while (j < data.length && !(data.charCodeAt(j) >= 0x40 && data.charCodeAt(j) <= 0x7e)) params += data[j++];
+          csi(data[j], params);
+          k = j;
+        } else if (data[k + 1] === ']') {                               // OSC — skip to BEL or ST
+          let j = k + 2;
+          while (j < data.length && data[j] !== '\x07' && !(data[j] === '\x1b' && data[j + 1] === '\\')) j++;
+          k = data[j] === '\x1b' ? j + 1 : j;
+        } else { k++; }                                                  // 2-char escape — skip the pair
+        continue;
+      }
+      if (ch === '\r') { col = 0; continue; }
+      if (ch === '\n') { row++; ensureRow(); continue; }
+      if (ch === '\b') { if (col > 0) col--; continue; }
+      const code = data.charCodeAt(k);
+      if (code < 32 || code === 127) continue;                          // drop other control chars (bell, etc.)
+      ensureRow();
+      put(col, ch);
+      col++;
+    }
+    if (lines.length > maxLines) {                                       // bound scrollback memory
+      const drop = lines.length - maxLines;
+      lines.splice(0, drop);
+      row = Math.max(0, row - drop);
+    }
+  }
+  return { write, render: () => lines.join('\n') };
+}
+
+// Translate a browser keydown into the bytes a PTY expects. Returns null to let
+// the browser keep the event (copy/paste shortcuts, unhandled combos).
+function keyToPtyBytes(e) {
+  if (e.altKey || e.metaKey) return null;
+  const k = e.key;
+  if (e.ctrlKey) {
+    if (e.shiftKey) return null;                                        // Ctrl+Shift+C/V → let the browser copy/paste
+    if (/^[a-zA-Z]$/.test(k)) return String.fromCharCode(k.toLowerCase().charCodeAt(0) - 96); // ^A..^Z, incl. Ctrl-C (^C = \x03)
+    if (k === ' ') return '\x00';
+    return null;
+  }
+  switch (k) {
+    case 'Enter': return '\r';
+    case 'Backspace': return '\x7f';
+    case 'Tab': return '\t';
+    case 'Escape': return '\x1b';
+    case 'ArrowUp': return '\x1b[A';
+    case 'ArrowDown': return '\x1b[B';
+    case 'ArrowRight': return '\x1b[C';
+    case 'ArrowLeft': return '\x1b[D';
+    case 'Home': return '\x1b[H';
+    case 'End': return '\x1b[F';
+    case 'Delete': return '\x1b[3~';
+    default: return k.length === 1 ? k : null;                          // a printable char, else ignore
+  }
+}
+
+// Point the (freshly rendered) <pre> at the live session: repaint the buffer,
+// stream new bytes into it, and forward keystrokes/paste straight to the PTY.
+function bindTermScreen(out) {
+  if (!term || !out) return;
+  out.classList.remove('hidden');
+  out.textContent = term.screen.render();
+  out.scrollTop = out.scrollHeight;
+  const ws = term.ws;
+  ws.onmessage = (m) => {
+    try {
+      const msg = JSON.parse(m.data);
+      if (msg.type === 'data') { term.screen.write(msg.data); out.textContent = term.screen.render(); out.scrollTop = out.scrollHeight; }
+    } catch {}
+  };
+  const send = (data) => { if (term && term.ws && term.ws.readyState === 1) term.ws.send(JSON.stringify({ type: 'input', data })); };
+  out.onkeydown = (e) => {
+    const bytes = keyToPtyBytes(e);
+    if (bytes == null) return;                                          // leave copy/paste, F-keys, etc. to the browser
+    e.preventDefault();
+    send(bytes);
+  };
+  out.onpaste = (e) => {
+    const text = (e.clipboardData || window.clipboardData)?.getData('text');
+    if (!text) return;
+    e.preventDefault();
+    send(text);
+  };
+}
+
+function openTerminal(taskId) {
+  if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}`);
+  term = { taskId, ws, screen: makeTermScreen() };
+  ws.onclose = () => {
+    if (!term || term.ws !== ws) return;                               // superseded by a newer session
+    term.screen.write('\r\n[terminal closed]\r\n');
+    const out = document.getElementById('term-out');
+    if (out) out.textContent = term.screen.render();
+    term = null;
+    syncTermButton();
+  };
+  bindTermScreen(document.getElementById('term-out'));
+  const out = document.getElementById('term-out');
+  if (out) out.focus();
+  syncTermButton();
+}
+
+// Killing the terminal is just closing the socket: the gateway's ws-close handler
+// kills the PTY's whole session — the shell AND every process running in it (see
+// killPtySession in src/gateway/server.ts).
+function killTerminal() {
+  if (term && term.ws) { try { term.ws.close(); } catch {} }
+}
+
+function syncTermButton() {
+  const btn = document.getElementById('term-open');
+  if (!btn) return;
+  const live = !!(term && term.ws && term.ws.readyState <= 1);
+  const hasWorld = btn.dataset.hasWorld === '1';
+  if (live) {
+    btn.textContent = 'Kill terminal';
+    btn.classList.add('danger');
+    btn.disabled = false;
+  } else {
+    btn.classList.remove('danger');
+    btn.textContent = hasWorld ? 'Open terminal' : 'No world yet';
+    btn.disabled = !hasWorld;
+  }
+}
+
 function wireTerminal(taskId) {
   const btn = document.getElementById('term-open');
   if (!btn) return;
+  btn.dataset.hasWorld = btn.disabled ? '0' : '1';                     // capture world presence before we mutate the label
+  if (termIsOpenFor(taskId)) bindTermScreen(document.getElementById('term-out'));  // reattach a session that outlived the re-render
+  else if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; } // switched tasks → drop the old shell
+  syncTermButton();
   btn.addEventListener('click', () => {
-    const out = document.getElementById('term-out');
-    const inp = document.getElementById('term-in');
-    out.classList.remove('hidden');
-    inp.classList.remove('hidden');
-    inp.focus();
-    if (termWs) { try { termWs.close(); } catch {} }
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}`);
-    termWs = ws;
-    ws.onmessage = (m) => {
-      try { const msg = JSON.parse(m.data); if (msg.type === 'data') { out.textContent += stripAnsi(msg.data); out.scrollTop = out.scrollHeight; } } catch {}
-    };
-    ws.onclose = () => { out.textContent += '\n[terminal closed]\n'; };
-    inp.onkeydown = (e) => {
-      if (e.key === 'Enter') { ws.send(JSON.stringify({ type: 'input', data: inp.value + '\r' })); inp.value = ''; }
-    };
+    if (termIsOpenFor(taskId)) killTerminal();
+    else openTerminal(taskId);
   });
 }
 
@@ -1632,6 +1805,21 @@ function drawerBody(v) {
   const subtasks = v.subTasks?.length
     ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
     : '';
+  // Terminal — a top-level section (like an agent conversation), NOT buried in
+  // Advanced. It stays fully visible (no collapse) so the shell is one click away.
+  // Open a real PTY in the task's world; type straight into it (Ctrl-C and friends
+  // land in the shell). "Open terminal" flips to "Kill terminal" while a session is
+  // live — that button closes the socket, which kills the shell and every process
+  // running in it.
+  const terminalSection = `
+    <div class="terminal-section">
+      <div class="section-h">Ephemeral Terminal</div>
+      <div class="task-sub" style="gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      </div>
+      <pre class="raw hidden term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell" style="height:240px;outline:none"></pre>
+    </div>`;
   return `
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
@@ -1643,20 +1831,14 @@ function drawerBody(v) {
     ${renderWidgetGroups(S.widgets)}
     ${subtasks}
     ${conversations}
+    ${terminalSection}
     <details class="advanced">
       <summary>Credentials — precedence &amp; enable/disable for this task</summary>
       <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the global/project order + enablement, just for this task. Drag to reorder; toggle On/Off. (This is the running-task form — the new-task form has the same control.)</p>
       <div id="cred-editor-task">Loading…</div>
     </details>
     <details class="advanced">
-      <summary>Advanced — terminal, live event log, structured state</summary>
-      <div class="section-h">Terminal — open a shell in the world (ephemeral)</div>
-      <div class="task-sub" style="gap:6px;flex-wrap:wrap">
-        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
-        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      </div>
-      <pre class="raw hidden" id="term-out" style="height:200px"></pre>
-      <input id="term-in" class="title-in hidden" style="width:100%;margin-top:6px;padding:8px 10px" placeholder="command + Enter" />
+      <summary>Advanced — live event log, structured state</summary>
       <div class="section-h">Live events</div>
       <div class="events" id="drawer-events"></div>
       <div class="section-h">Structured state (the view-model floor)</div>
