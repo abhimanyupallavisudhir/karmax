@@ -235,17 +235,26 @@ const inhAttr = (val) => `data-inherit='${esc(JSON.stringify(val ?? null))}'`;
 
 // "Reset to default" button — cleared/hidden until the field holds an override,
 // then clicking it drops the override so the field inherits again (SPEC §10.5).
-const resetBtn = (name) => `<button type="button" class="field-reset" data-reset="${esc(name)}" hidden title="Drop this override and inherit the default">↺ Reset to default</button>`;
-const fieldLabel = (f) =>
-  `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtn(f.name)}</div>` +
+// `kind` distinguishes the primary reset (→ data-inherit) from an alternate reset
+// (→ data-inherit-alt) — the quick-task project defaults have TWO parents (global
+// quick + project general) and so render two buttons per field (SPEC §10.4).
+const resetBtn = (name, label = 'Reset to default', kind = 'primary') =>
+  `<button type="button" class="field-reset" data-reset="${esc(name)}" data-reset-kind="${esc(kind)}" hidden title="Drop this override and inherit the default">↺ ${esc(label)}</button>`;
+// `alt` (optional): { primaryLabel, altLabel } — when present, render two reset
+// buttons (primary → data-inherit, alt → data-inherit-alt).
+const resetBtns = (name, alt) =>
+  alt ? resetBtn(name, alt.primaryLabel, 'primary') + resetBtn(name, alt.altLabel, 'alt') : resetBtn(name);
+const fieldLabel = (f, alt) =>
+  `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtns(f.name, alt)}</div>` +
   (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
 
-function renderField(f, own, inherited, withChips) {
+function renderField(f, own, inherited, withChips, alt) {
   const v = eff(own, inherited) ?? '';
-  const label = fieldLabel(f);
-  const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
+  const label = fieldLabel(f, alt);
+  const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
+  const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}${altAttr}`;
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
-  if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited)}</div>`;
+  if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
     const ta = `<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea>`;
     // For the prompt field, pasted images render inside the box (below the text),
@@ -255,7 +264,7 @@ function renderField(f, own, inherited, withChips) {
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
   if (f.type === 'boolean')
-    return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${resetBtn(f.name)}</div></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${f.required ? '' : resetBtns(f.name, alt)}</div></div>`;
   if (f.type === 'select')
     return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
   if (f.type === 'list') {
@@ -296,11 +305,12 @@ function renderAgentField(f, spec, inherited) {
 // renderAgentField for the agent controls (so provider/model/effort + "Fork a
 // previous agent" all work identically), and carries the mode alongside.
 const CONFIRM_MODE_LABELS = { human: 'Human (you confirm)', auto: 'Auto-confirm', agent: 'Agent confirms' };
-function renderConfirmerField(f, own, inherited) {
+function renderConfirmerField(f, own, inherited, alt) {
   const inh = inherited || {};
   const e = own || inh;
   const mode = e.mode || inh.mode || 'human';
-  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'>
+  const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr}>
     <select class="cf-mode">${['human', 'auto', 'agent'].map((m) => `<option value="${m}" ${m === mode ? 'selected' : ''}>${esc(CONFIRM_MODE_LABELS[m])}</option>`).join('')}</select>
     <div class="cf-agent" style="margin-top:8px;${mode === 'agent' ? '' : 'display:none'}">${renderAgentField(f, own, inherited)}</div>
   </div>`;
@@ -442,38 +452,43 @@ function wireAgentFields(root) {
 function wireFieldResets(root, fields) {
   for (const f of fields) {
     if (f.required) continue; // a required field always stores a value; nothing to inherit
-    const btn = root.querySelector(`.field-reset[data-reset="${CSS.escape(f.name)}"]`);
-    if (!btn) continue;
-    const sync = () => { btn.hidden = !fieldOverridden(root, f); };
-    if (f.type === 'agent') {
-      const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
-      if (!box) continue;
-      box.addEventListener('input', sync);
-      box.addEventListener('change', sync);
-      btn.addEventListener('click', () => { resetAgentField(box); sync(); });
-    } else if (f.type === 'confirmer') {
-      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
-      if (!box) continue;
-      box.addEventListener('input', sync);
-      box.addEventListener('change', sync);
-      btn.addEventListener('click', () => { resetConfirmerField(box); sync(); });
-    } else {
-      const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
-      if (!el) continue;
-      el.addEventListener('input', sync);
-      el.addEventListener('change', sync);
-      btn.addEventListener('click', () => { resetPlainField(el, f); sync(); });
+    // A field can carry >1 reset button (quick-task project defaults have two
+    // parents — global-quick via `data-inherit`, project-general via
+    // `data-inherit-alt`). Each button resets to, and shows/hides against, its own
+    // source, so you can snap the field to either inherited value.
+    const btns = [...root.querySelectorAll(`.field-reset[data-reset="${CSS.escape(f.name)}"]`)];
+    if (!btns.length) continue;
+    let box = null;
+    let el = null;
+    if (f.type === 'agent') box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
+    else if (f.type === 'confirmer') box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+    else el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
+    const target = box || el;
+    if (!target) continue;
+    const attrFor = (btn) => (btn.dataset.resetKind === 'alt' ? 'data-inherit-alt' : 'data-inherit');
+    const sync = () => { for (const btn of btns) btn.hidden = !fieldDiffers(root, f, attrFor(btn)); };
+    target.addEventListener('input', sync);
+    target.addEventListener('change', sync);
+    for (const btn of btns) {
+      const attr = attrFor(btn);
+      btn.addEventListener('click', () => {
+        if (f.type === 'agent') resetAgentField(box, attr);
+        else if (f.type === 'confirmer') resetConfirmerField(box, attr);
+        else resetPlainField(el, f, attr);
+        sync();
+      });
     }
     sync();
   }
 }
 
-// Does the field currently hold a value that differs from the inherited default?
-function fieldOverridden(root, f) {
+// Does the field currently hold a value that differs from the value stored in
+// `attr` (the inherited default, or an alternate inherited source)?
+function fieldDiffers(root, f, attr = 'data-inherit') {
   if (f.type === 'agent') {
     const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
     if (!box) return false;
-    const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+    const inh = JSON.parse(box.getAttribute(attr) || 'null');
     const spec = { provider: box.querySelector('.af-provider').value };
     const model = box.querySelector('.af-model').value.trim();
     const effort = box.querySelector('.af-effort').value;
@@ -484,7 +499,7 @@ function fieldOverridden(root, f) {
   if (f.type === 'confirmer') {
     const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
     if (!box) return false;
-    const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+    const inh = JSON.parse(box.getAttribute(attr) || 'null');
     const mode = box.querySelector('.cf-mode').value;
     if (mode !== (inh?.mode || 'human')) return true;
     if (mode !== 'agent') return false;
@@ -498,7 +513,7 @@ function fieldOverridden(root, f) {
   }
   const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
   if (!el) return false;
-  const inh = JSON.parse(el.getAttribute('data-inherit') || 'null');
+  const inh = JSON.parse(el.getAttribute(attr) || 'null');
   let val;
   if (f.type === 'boolean') val = el.checked;
   else if (f.type === 'list') val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
@@ -509,16 +524,16 @@ function fieldOverridden(root, f) {
   return !sameJson(val, inh);
 }
 
-function resetPlainField(el, f) {
-  const inh = JSON.parse(el.getAttribute('data-inherit') || 'null');
+function resetPlainField(el, f, attr = 'data-inherit') {
+  const inh = JSON.parse(el.getAttribute(attr) || 'null');
   if (f.type === 'boolean') el.checked = !!inh;
   else if (f.type === 'list') el.value = Array.isArray(inh) ? inh.join('\n') : (inh || '');
   else el.value = inh === undefined || inh === null ? '' : inh;
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
-function resetAgentField(box) {
-  const inh = JSON.parse(box.getAttribute('data-inherit') || 'null') || {};
+function resetAgentField(box, attr = 'data-inherit') {
+  const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
   const prov = box.querySelector('.af-provider');
   prov.value = inh.provider || 'claude';
   box.querySelector('.af-model').value = inh.model || '';
@@ -527,14 +542,14 @@ function resetAgentField(box) {
   if (eff && inh.effort) eff.value = inh.effort;
 }
 
-function resetConfirmerField(box) {
-  const inh = JSON.parse(box.getAttribute('data-inherit') || 'null') || {};
+function resetConfirmerField(box, attr = 'data-inherit') {
+  const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
   const mode = box.querySelector('.cf-mode');
   mode.value = inh.mode || 'human';
   const agentBox = box.querySelector('.cf-agent');
   if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
   const ab = box.querySelector('.agent-field');
-  if (ab) resetAgentField(ab);
+  if (ab) resetAgentField(ab, attr);
 }
 
 // Full task list (incl. archived) for the fork picker, cached per project.
@@ -1631,6 +1646,8 @@ function wireTasksView() {
           prompt: title,
           command: workflow === 'script-exec' ? title : undefined,
           workflow,
+          // Added from the quick box → apply the Quick task defaults overlay (SPEC §10.4).
+          quick: true,
           ...(images.length ? { images } : {}),
         }),
       });
@@ -3892,12 +3909,76 @@ async function hydrateSettingsForms(scope, projectId) {
   }
 }
 
+// ── Quick task defaults (SPEC §10.4) ─────────────────────────────────────────
+// A separate overlay applied ONLY to tasks added from the quick-task box (not the
+// full "⋯ More" form). Same per-workflow fields as the general defaults, saved to
+// a distinct `quick:`-scoped settings row. Global-quick inherits from the general
+// global defaults; project-quick inherits from EITHER global-quick or the project's
+// general defaults — so each project-quick field gets two "Reset to inherited"
+// buttons (↺ Global quick / ↺ Project default).
+function quickSettingsForms(scope, projectId) {
+  const wfs = S.schema.filter((s) => WORKFLOWS.some((w) => w.id === s.name));
+  return wfs
+    .map((s) => {
+      const fields = s.params.filter((f) => f.scopes.includes(scope));
+      if (!fields.length) return '';
+      return `<details class="card" data-qwf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
+        <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— quick-task defaults</span></summary>
+        <div class="wf-form" style="margin-top:10px"></div>
+        <button class="btn primary sm" data-qsave="${esc(s.name)}">Save ${esc(s.name)} quick defaults</button>
+      </details>`;
+    })
+    .join('');
+}
+
+async function hydrateQuickSettingsForms(scope, projectId) {
+  const key = scope === 'global' ? 'globalQuick' : 'projectQuick';
+  for (const sec of $('#main').querySelectorAll('[data-qwf]')) {
+    const wf = sec.dataset.qwf;
+    let d = null;
+    try { d = await api(`/api/defaults/${projectId || 'global'}/${wf}`); } catch {}
+    const own = d?.[key]?.own || {};
+    const inherited = d?.[key]?.inherited || {};
+    const inheritedAlt = d?.[key]?.inheritedAlt || {};
+    const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
+    sec.querySelector('.wf-form').innerHTML = fields
+      .map((f) => {
+        // Project-quick fields have two inheritance sources → two reset buttons.
+        const alt = scope === 'project' ? { primaryLabel: 'Global quick', altLabel: 'Project default', value: inheritedAlt[f.name] } : undefined;
+        return renderField(f, own[f.name], inherited[f.name], false, alt);
+      })
+      .join('');
+    wireAgentFields(sec);
+    wireFieldResets(sec, fields);
+  }
+}
+
+// Save handlers for the quick-defaults forms (shared by global + project scopes).
+function wireQuickSettingsSave(scope, projectId) {
+  $('#main').querySelectorAll('[data-qsave]').forEach((b) =>
+    b.addEventListener('click', async () => {
+      const wf = b.dataset.qsave;
+      const sec = b.closest('[data-qwf]');
+      const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
+      const values = collectForm(sec.querySelector('.wf-form'), fields);
+      const url = scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
+      try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); toast(`${wf} quick defaults saved`); } catch (e) { toast(e.message, true); }
+    }),
+  );
+}
+
+const quickDefaultsHeader = (blurb) =>
+  `<div style="margin-top:26px;font-size:15px;font-weight:700">Quick task defaults</div>
+   <p style="color:var(--ink-2);margin:4px 0 8px;font-size:12px">${blurb}</p>`;
+
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `
     <div class="page-title">Project settings — ${esc(proj.name)}</div>
     <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
     ${settingsForms('project', proj.id)}
+    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box in this project (not the full “⋯ More” form). Each field inherits from your <b>global quick defaults</b> (↺ Global quick) or this project's <b>general defaults</b> above (↺ Project default) until you set it here.`)}
+    ${quickSettingsForms('project', proj.id)}
     <div class="card">
       <div class="section-h">Credentials &amp; precedence</div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">Override the global credential order/enablement for this project (e.g. enable an API key here that's off globally).</p>
@@ -3947,6 +4028,8 @@ async function hydrateWorkflowPins(projectId) {
 }
 function wireSettingsView(proj) {
   hydrateSettingsForms('project', proj.id);
+  hydrateQuickSettingsForms('project', proj.id);
+  wireQuickSettingsSave('project', proj.id);
   renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
   hydrateWorkflowPins(proj.id);
@@ -3988,6 +4071,8 @@ function globalSettingsView() {
     <div class="page-title">Global settings</div>
     <p style="color:var(--ink-2);margin-top:-8px">Your defaults across all projects. Projects can override these; tasks override both.</p>
     ${settingsForms('global')}
+    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from your general global defaults above (↺ Reset to default) until you set it here.`)}
+    ${quickSettingsForms('global')}
     ${profilesCard('global')}
     ${paymentsCard('global')}
     <div class="card" id="accounts-card">
@@ -4250,6 +4335,8 @@ function profilesCard(scope) {
 
 function wireGlobalSettings() {
   hydrateSettingsForms('global');
+  hydrateQuickSettingsForms('global');
+  wireQuickSettingsSave('global');
   renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
   hydrateProfiles('global');
   hydrateWorkflows();

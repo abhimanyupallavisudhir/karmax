@@ -13,7 +13,7 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
-import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams } from '../platform/params.js';
+import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort } from '../agent/profiles.js';
 import { defaultBranch } from '../world/git.js';
@@ -1003,10 +1003,25 @@ export class Gateway {
           }
           return out;
         };
+        // Quick-task defaults (SPEC §10.4): a separate overlay that only applies to
+        // tasks added from the quick box. Global-quick inherits from global-general;
+        // project-quick inherits from global-quick (primary) with project-general as
+        // the alternative source (the two "Reset to inherited" buttons in the UI).
+        const globalQuickVals = quickGlobalSettingsFor(gs, wf);
+        const projectQuickVals = project ? quickProjectSettingsFor(gs, project.id, wf) : {};
         return this.json(res, 200, {
           task: { own: {}, inherited: enrich(resolveParams(m, { project: projectVals, global: globalVals }), {}) },
           project: { own: projectVals, inherited: enrich(resolveParams(m, { global: globalVals }), projectVals) },
           global: { own: globalVals, inherited: enrich(resolveParams(m, {}), { ...projectVals, ...globalVals }) },
+          globalQuick: { own: globalQuickVals, inherited: enrich(resolveParams(m, { global: globalVals }), globalQuickVals) },
+          projectQuick: {
+            own: projectQuickVals,
+            // Primary inherited: the full quick chain minus project-quick itself
+            // (global-quick → project-general → global-general → default).
+            inherited: enrich(resolveParamsLayers(m, [globalQuickVals, projectVals, globalVals]), { ...projectVals, ...globalVals, ...globalQuickVals, ...projectQuickVals }),
+            // Alternative inherited source: the project's general defaults.
+            inheritedAlt: enrich(resolveParams(m, { project: projectVals, global: globalVals }), { ...projectVals, ...globalVals, ...projectQuickVals }),
+          },
         });
       }
 
@@ -1037,6 +1052,36 @@ export class Gateway {
           // Mirror bound-project fields into ProjectConfig for back-compat.
           const m = manifest(wf);
           if (m) store.updateProjectConfig(projectId, settingsToProjectConfig(m, values));
+          return this.json(res, 200, { ok: true });
+        }
+      }
+
+      // quick-task defaults (SPEC §10.4) — a separate opt-in overlay stored under a
+      // `quick:` namespaced scope; applied only to tasks from the quick-add box.
+      const qgset = p.match(/^\/api\/settings\/quick\/global\/([^/]+)$/);
+      if (qgset) {
+        const wf = qgset[1]!;
+        if (method === 'GET') return this.json(res, 200, quickGlobalSettingsFor((s, w) => store.getSettings(s, w), wf));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          store.setSettings(quickScopeKey('global'), wf, b.values ?? {});
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const qpset = p.match(/^\/api\/settings\/quick\/project\/([^/]+)\/([^/]+)$/);
+      if (qpset) {
+        const projectId = qpset[1]!;
+        const wf = qpset[2]!;
+        if (method === 'GET') {
+          const project = store.getProject(projectId);
+          if (!project) return this.json(res, 404, { error: 'no project' });
+          return this.json(res, 200, quickProjectSettingsFor((s, w) => store.getSettings(s, w), projectId, wf));
+        }
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          // Quick-task defaults are UI-only overlays (never mirrored into ProjectConfig,
+          // which drives full-form/general resolution), so just persist the row.
+          store.setSettings(quickScopeKey(projectId), wf, b.values ?? {});
           return this.json(res, 200, { ok: true });
         }
       }
