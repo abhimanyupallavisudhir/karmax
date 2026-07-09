@@ -31,6 +31,7 @@ const S = {
   procTimer: null, // live-refresh handle for the dashboard processes (task manager) panel
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
   returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
+  queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
 };
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
@@ -122,6 +123,7 @@ async function applyRoute() {
   renderRail();
   renderMain();
   if (tab === 'activity') seedActivity();
+  if (tab === 'queue') seedQueue();
   if (tab === 'dashboard') renderDashboard();
   // reconcile the open task from the URL (loaded tasks are in hand now)
   let taskId = null;
@@ -758,7 +760,7 @@ function connectWs() {
 }
 
 async function refreshTasks() {
-  try { await loadTasks(); if (S.tab === 'tasks' || S.tab === 'queue') renderMain(); renderRail(); } catch {}
+  try { await loadTasks(); if (S.tab === 'tasks' || S.tab === 'queue') renderMain(); renderRail(); if (S.tab === 'queue') seedQueue(); } catch {}
 }
 
 // ── shell ────────────────────────────────────────────────────────────────────
@@ -2348,39 +2350,155 @@ function summarize(p) {
 }
 
 // ── queue ────────────────────────────────────────────────────────────────────
+// Fetch the coordinator's authoritative queue order for every domain currently in
+// the merge stage, so the view reflects reorders immediately (the per-task polled
+// position lags up to a workflow poll interval). Re-renders the queue tab on arrival.
+async function seedQueue() {
+  const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
+  const domains = [...new Set(inMerge.map((t) => t.lastView?.state?.mergeDomain).filter(Boolean))];
+  const orders = {};
+  await Promise.all(
+    domains.map(async (d) => {
+      try {
+        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}`);
+        orders[d] = { queue: v.queue || [], current: v.current };
+      } catch {}
+    }),
+  );
+  S.queueOrders = orders;
+  if (S.tab === 'queue') renderMain();
+}
+
+// Rank a task within its domain: the leased (merging) task pins to the top, then the
+// coordinator's queue order when known, else the task's last-published position.
+function queueRank(t) {
+  const v = t.lastView || {};
+  if (v.state?.mergeGranted) return -1;
+  const ord = S.queueOrders[v.state?.mergeDomain];
+  if (ord) { const i = ord.queue.indexOf(t.id); return i < 0 ? 1e6 : i; }
+  const p = v.mergeQueue?.position;
+  return p > 0 ? p : 1e6 - 1;
+}
+
 function queueView() {
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
   if (!inMerge.length) return `<div class="empty"><div class="big">Merge queue is empty</div>Tasks appear here when they reach the merge stage.</div>`;
-  inMerge.sort((a, b) => (a.lastView?.mergeQueue?.position ?? 99) - (b.lastView?.mergeQueue?.position ?? 99));
-  return inMerge
-    .map((t) => {
-      const v = t.lastView || {};
-      const pos = v.mergeQueue?.position;
-      // Holds the slot (merge agent running) only when granted — not merely at
-      // position 0 in a queue whose slot is still held by someone else.
-      const merging = !!v.state?.mergeGranted;
-      return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" tabindex="0">
+  // Group by merge domain — reordering is only meaningful within a single serialization
+  // domain. With one domain (the common case) this renders as a single list.
+  const groups = new Map();
+  for (const t of inMerge) {
+    const d = t.lastView?.state?.mergeDomain || '';
+    if (!groups.has(d)) groups.set(d, []);
+    groups.get(d).push(t);
+  }
+  const multi = groups.size > 1;
+  return [...groups.entries()]
+    .map(([domain, tasks]) => {
+      tasks.sort((a, b) => queueRank(a) - queueRank(b));
+      const rows = tasks
+        .map((t) => {
+          const v = t.lastView || {};
+          const pos = v.mergeQueue?.position;
+          const merging = !!v.state?.mergeGranted;
+          const canMove = !merging && !!v.state?.mergeDomain;
+          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
+        ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
         <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
-        ${!merging && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
+        ${canMove ? `<div class="queue-actions"><button class="btn sm" data-move="top" data-id="${t.id}" data-domain="${esc(domain)}">Move to top</button><button class="btn sm" data-move="bottom" data-id="${t.id}" data-domain="${esc(domain)}">Move to bottom</button></div>` : ''}
       </div>`;
+        })
+        .join('');
+      const label = multi && domain ? `<div class="queue-domain">${esc(domain)}</div>` : '';
+      return `${label}<div class="queue-list" data-domain="${esc(domain)}">${rows}</div>`;
     })
     .join('');
 }
+
+// Optimistically mutate the cached order for a domain so the reorder shows instantly,
+// before the coordinator signal round-trips. Missing orders are seeded from the
+// current DOM/rank so a move still animates while the first fetch is in flight.
+function localQueue(domain) {
+  const ord = S.queueOrders[domain];
+  if (ord) return ord;
+  const ids = S.tasks
+    .filter((t) => (t.lastView?.state?.mergeDomain || '') === domain && !t.lastView?.state?.mergeGranted && ['merge', 'pr'].includes(t.lastView?.stage))
+    .sort((a, b) => queueRank(a) - queueRank(b))
+    .map((t) => t.id);
+  const seeded = { queue: ids };
+  S.queueOrders[domain] = seeded;
+  return seeded;
+}
+
 function wireQueueView() {
-  $('#main').querySelectorAll('.queue-item').forEach((e) => e.addEventListener('click', (ev) => { if (!ev.target.dataset.prio) goToTask(e.dataset.id); }));
-  $('#main').querySelectorAll('[data-prio]').forEach((b) =>
+  $('#main').querySelectorAll('.queue-item').forEach((e) =>
+    e.addEventListener('click', (ev) => { if (!ev.target.closest('[data-move]') && !ev.target.closest('.drag-handle')) goToTask(e.dataset.id); }),
+  );
+  $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
+      const { domain, id } = b.dataset;
+      const q = localQueue(domain);
+      const rest = q.queue.filter((t) => t !== id);
+      q.queue = b.dataset.move === 'top' ? [id, ...rest] : [...rest, id];
+      renderMain();
       try {
-        await api('/api/queue/prioritize', { method: 'POST', body: JSON.stringify({ domain: b.dataset.domain, taskId: b.dataset.prio }) });
-        toast('Prioritized'); setTimeout(refreshTasks, 300);
-      } catch (e) { toast(e.message, true); }
+        if (b.dataset.move === 'top') {
+          await api('/api/queue/prioritize', { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
+        } else {
+          await api('/api/queue/move', { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
+        }
+        toast(b.dataset.move === 'top' ? 'Moved to top' : 'Moved to bottom');
+        setTimeout(seedQueue, 300);
+      } catch (e) { toast(e.message, true); seedQueue(); }
     }),
   );
+  $('#main').querySelectorAll('.queue-list').forEach(wireQueueDrag);
   applyCursor();
   $('#main').querySelectorAll('.queue-item').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
+}
+
+// HTML5 drag-and-drop reordering within one domain's queue list. On drop we send the
+// single moved task with the id it now sits before (or none → bottom).
+function wireQueueDrag(list) {
+  if (!list) return;
+  const domain = list.dataset.domain;
+  let dragging = null;
+  list.querySelectorAll('.queue-item[draggable="true"]').forEach((row) => {
+    row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', row.dataset.id); } catch {} });
+    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+  });
+  list.addEventListener('dragover', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    // Insert before the nearest movable row whose vertical center is below the cursor;
+    // past the last one → append. The merging row (not draggable) stays pinned on top.
+    let best = null, bestDist = Infinity;
+    for (const el of list.querySelectorAll('.queue-item[draggable="true"]:not(.dragging)')) {
+      const b = el.getBoundingClientRect();
+      const cy = b.top + b.height / 2;
+      if (cy < e.clientY) continue;
+      const d = cy - e.clientY;
+      if (d < bestDist) { bestDist = d; best = el; }
+    }
+    best ? list.insertBefore(dragging, best) : list.appendChild(dragging);
+  });
+  list.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    if (!dragging) return;
+    const id = dragging.dataset.id;
+    const rows = [...list.querySelectorAll('.queue-item[draggable="true"]')];
+    const order = rows.map((r) => r.dataset.id);
+    const q = localQueue(domain);
+    q.queue = order;
+    const at = order.indexOf(id);
+    const beforeTaskId = at >= 0 && at < order.length - 1 ? order[at + 1] : '';
+    try {
+      await api('/api/queue/move', { method: 'POST', body: JSON.stringify({ domain, taskId: id, beforeTaskId }) });
+      setTimeout(seedQueue, 300);
+    } catch (err) { toast(err.message, true); seedQueue(); }
+  });
 }
 
 // ── activity ─────────────────────────────────────────────────────────────────

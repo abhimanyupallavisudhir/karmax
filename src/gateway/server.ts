@@ -585,6 +585,11 @@ export class Gateway {
         await api.reorderQueue(token, b.domain, b.taskId);
         return this.json(res, 200, { ok: true });
       }
+      if (p === '/api/queue/move' && method === 'POST') {
+        const b = await this.body(req);
+        await api.moveQueueItem(token, b.domain, b.taskId, b.beforeTaskId || undefined);
+        return this.json(res, 200, { ok: true });
+      }
       // platform API surface used by the MCP server (save skill / propose edit)
       if (p === '/api/skills' && method === 'POST') {
         const b = await this.body(req);
