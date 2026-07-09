@@ -35,6 +35,37 @@ describe('host diagnostics', () => {
   });
 });
 
+describe('admissionDecision (memory-gate decision — karmax#4)', () => {
+  it('backpressures when free memory is below the floor', () => {
+    const d = slots.admissionDecision({ freeMemMb: 200, loadavg1: 0, cores: 8 }, { minFreeMb: 512, maxLoadFactor: 1.0 });
+    expect(d.memoryTight).toBe(true);
+    expect(d.loadHigh).toBe(false);
+    expect(d.backpressure).toBe(true);
+  });
+
+  it('admits when free memory is above the floor and load is easy', () => {
+    const d = slots.admissionDecision({ freeMemMb: 4096, loadavg1: 1, cores: 8 }, { minFreeMb: 512, maxLoadFactor: 1.0 });
+    expect(d.memoryTight).toBe(false);
+    expect(d.loadHigh).toBe(false);
+    expect(d.backpressure).toBe(false);
+  });
+
+  it('backpressures when the 1-minute load exceeds cores × factor', () => {
+    const d = slots.admissionDecision({ freeMemMb: 4096, loadavg1: 12, cores: 8 }, { minFreeMb: 512, maxLoadFactor: 1.0 });
+    expect(d.memoryTight).toBe(false);
+    expect(d.loadHigh).toBe(true);
+    expect(d.backpressure).toBe(true);
+  });
+
+  it('treats a 0 threshold as "check disabled" (each gate independently)', () => {
+    const noMem = slots.admissionDecision({ freeMemMb: 1, loadavg1: 0, cores: 8 }, { minFreeMb: 0, maxLoadFactor: 1.0 });
+    expect(noMem.memoryTight).toBe(false);
+    const noLoad = slots.admissionDecision({ freeMemMb: 4096, loadavg1: 999, cores: 8 }, { minFreeMb: 512, maxLoadFactor: 0 });
+    expect(noLoad.loadHigh).toBe(false);
+    expect(noLoad.backpressure).toBe(false);
+  });
+});
+
 describe('agent-slot admission semaphore', () => {
   it('admits up to capacity, parks the overflow, and hands the slot off on release', async () => {
     const r1 = await slots.acquireAgentSlot();

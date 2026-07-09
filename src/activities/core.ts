@@ -1,7 +1,8 @@
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { classifyLimitError, isTransportError } from '../agent/limits.js';
+import { classifyLimitError, isTransportError, isResourceKill } from '../agent/limits.js';
+import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
 import { WorldHandle, WorldKind } from '../world/types.js';
@@ -39,8 +40,41 @@ function classifyTurnError(err: unknown): Error {
   const cause = err instanceof Error ? err : undefined;
   const cls = classifyLimitError(msg);
   if (cls.limited || cls.hard) return ApplicationFailure.create({ message: msg, type: 'agent-limit', nonRetryable: true, cause });
+  // A signal-9/SIGKILL agent death is environmental, not a code bug (karmax#4):
+  // classify it as retryable 'agent-infra' with an ACTIONABLE message — the raw
+  // "terminated by signal SIGKILL" tells an operator nothing. Temporal re-runs the
+  // turn and the retry re-enters the host-admission gate (acquireAgentSlot) and
+  // resumes the interrupted session. isResourceKill is the shared predicate
+  // (src/agent/limits.ts) the software-dev auto-resolve task reuses.
+  if (isResourceKill(msg)) return ApplicationFailure.create({ message: signalKillMessage(msg), type: 'agent-infra', nonRetryable: false, cause });
   if (isTransportError(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   return ApplicationFailure.create({ message: msg, type: 'agent-error', nonRetryable: true, cause });
+}
+
+/**
+ * Turn an opaque SIGKILL into an operator-actionable line — WITHOUT asserting a
+ * cause the evidence doesn't support. A signal-9 agent death has two very
+ * different senders on this single-host deployment, and the message must not name
+ * one when the other is true (karmax#4 diagnosis, 2026-07: the observed kills were
+ * karmax's OWN reapOrphans() sweep after a tsx-watch reload — journalctl -k and
+ * systemd-oomd logged zero kills — NOT the kernel OOM killer). So branch on LIVE
+ * host memory:
+ *   - memory genuinely tight → likely the OS OOM killer; the operator should
+ *     reduce concurrency / free RAM (and the gated retry waits for RAM to recover).
+ *   - memory healthy → NOT OOM; most likely a karmax restart/reload orphan-sweep
+ *     (reapOrphans, src/agent/custody.ts) or an external kill. The retry admits
+ *     immediately and resumes the session.
+ * Either way the raw signal string is appended (truncated) for diagnostics.
+ */
+function signalKillMessage(raw: string): string {
+  const h = hostStats();
+  const mem = `${h.freeMemMb}MB free of ${h.totalMemMb}MB (${h.usedMemPct}% used, load ${h.loadPerCore}/core)`;
+  const diagnosis = hostMemoryTight()
+    ? `host out of memory — the agent was likely killed by the OS OOM killer (${mem}). ` +
+      `Reduce concurrency (lower KARMAX_MAX_AGENT_SLOTS / raise KARMAX_AGENT_MIN_FREE_MB) or free RAM.`
+    : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a karmax ` +
+      `restart/reload orphan-sweep (reapOrphans after a tsx-watch reload or redeploy) or an external kill.`;
+  return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
 }
 
 /** Split an account ref that may be "<provider>:<name>" or just "<name>". */

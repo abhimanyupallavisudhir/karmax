@@ -28,6 +28,16 @@ interface ResolveCase {
   outcome: ResolveOutcome;
 }
 
+// NOTE (karmax#4): a signal-9/SIGKILL agent kill is already classified upstream as a
+// retryable `agent-infra` failure in src/activities/core.ts (via the shared
+// `isResourceKill` predicate in src/agent/limits.ts), so it parks-and-retries and
+// does not reach Resolve. The software-dev auto-resolve case for it is tracked as a
+// separate task — when added here, reuse `isResourceKill` rather than a new regex so
+// both paths agree on "is this a signal-9/OOM kill?". IMPORTANT: do NOT hard-code an
+// "out of memory" note. The confirmed sender in the 2026-07 incident was karmax's own
+// reapOrphans() reload sweep, not the kernel OOM killer (journalctl/oomd logged zero
+// kills) — branch on live memory like signalKillMessage() does, or keep the note
+// cause-neutral, so the resolve messaging doesn't encode a misdiagnosis.
 const CASES: ResolveCase[] = [
   {
     name: 'transient-network',
