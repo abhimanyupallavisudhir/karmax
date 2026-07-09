@@ -55,6 +55,13 @@ export interface PlatformToolContext {
   signal?: AbortSignal;
   /** Called between tool iterations so Temporal delivers a pending cancellation. */
   heartbeat?: () => void;
+  /** Pull follow-up messages that landed in the workflow AT OR AFTER `fromIndex`
+   *  (a `msgs`-array index), so a streaming-capable adapter can inject them into the
+   *  LIVE agent session mid-turn instead of waiting for the next turn (SPEC §5.6).
+   *  Returns only genuine follow-ups (user/system), never the agent's own replies.
+   *  Undefined when there is no live channel (a resumed retry, or a unit test with no
+   *  workflow) — the adapter then just runs the snapshot it was given. */
+  pullFollowUps?: (fromIndex: number) => Promise<Message[]>;
 }
 
 export interface TurnInput {
@@ -91,6 +98,13 @@ export const RUNAWAY_BACKSTOP = 1000;
 export interface AdapterTurn {
   session?: string;
   output: string;
+  /** How many leading `input.messages` this turn actually delivered to the agent —
+   *  the initial delta PLUS any follow-ups injected in-flight (streaming adapters).
+   *  Absolute index into the `msgs` conversation, so the workflow can position the
+   *  agent's reply after exactly the messages it answered and advance its delivered
+   *  boundary past them (never dropping a mid-turn follow-up, never re-sending one).
+   *  Omitted ⇒ the adapter delivered exactly `input.messages` (the schedule snapshot). */
+  delivered?: number;
   /** Claude-Agent-SDK sub-agents (the Task tool) still in flight when the turn's
    *  main loop returned — e.g. auto-backgrounded long sub-agents that only settle
    *  later. The workflow holds in Do until this reaches 0 so a task is never
@@ -122,6 +136,8 @@ export interface TurnResult {
   pendingSubagents?: number;
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
+  /** Absolute count of conversation messages the turn delivered (see AdapterTurn.delivered). */
+  delivered?: number;
   error?: string;
   /** The Resolve agent's structured recovery decision (RESOLVE-PLAN §3.2). */
   resolution?: Transition;
