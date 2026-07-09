@@ -113,9 +113,13 @@ describe('codex exec sends only the delta when resuming a thread', () => {
     fs.writeFileSync(stubPath, STUB);
     fs.chmodSync(stubPath, 0o755);
     process.env.KARMAX_CODEX_EXEC_CMD = stubPath;
+    // These assert the `codex exec` delta wire format; force the exec rail (the
+    // subscription default is now the app-server — see codex.ts runSubscription).
+    process.env.KARMAX_CODEX_USE_EXEC = '1';
   });
   afterAll(() => {
     delete process.env.KARMAX_CODEX_EXEC_CMD;
+    delete process.env.KARMAX_CODEX_USE_EXEC;
     delete process.env.STUB_ARGV_OUT;
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });

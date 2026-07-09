@@ -46,19 +46,39 @@ export class MockAdapter implements AgentAdapter {
     const session = input.session ?? `mock-${input.world.handle.id}`;
     ctx.onSession?.(session);
     ctx.heartbeat?.();
-    // Act on the latest USER message (or the task prompt on turn one), so directives
-    // fire once per turn rather than re-firing the whole history. We deliberately
-    // ignore `role: 'system'` messages to MIRROR the real provider adapters
-    // (claude.ts / codex.ts both strip conversation system messages) — otherwise the
-    // mock "sees" things a real agent never would, masking bugs like a child raise
-    // injected as a system message that never reaches the parent agent.
-    const recent = input.messages.filter((m) => m.role === 'user');
-    const text = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
 
     let complete = true;
     let pendingSubagents = 0;
     const outputs: string[] = [];
+    // How many `msgs` this turn has consumed — the schedule snapshot to start, then
+    // one more per in-flight follow-up injected below (SPEC §5.6). Reported so the
+    // workflow advances its boundary past exactly what we processed.
+    let deliveredIndex = input.messages.length;
 
+    // Pull + process any follow-ups queued in the workflow at/after `deliveredIndex`,
+    // mirroring the Claude Agent SDK's live injection: a follow-up sent WHILE this turn
+    // runs is handled in the SAME turn, not deferred to the next one. System messages
+    // are skipped (as the real adapters strip them) but still advance the index.
+    const drainFollowUps = async (): Promise<number> => {
+      if (!ctx.pullFollowUps) return 0;
+      let injected = 0;
+      for (;;) {
+        const news = await ctx.pullFollowUps(deliveredIndex);
+        if (!news.length) break;
+        for (const m of news) {
+          if (m.role !== 'system' && m.role !== 'agent') {
+            await processText(m.text);
+            injected++;
+          }
+          deliveredIndex++;
+        }
+      }
+      return injected;
+    };
+
+    // Process every directive line in one message's text (shared by the initial
+    // delivered batch and each injected follow-up).
+    const processText = async (text: string): Promise<void> => {
     for (const raw of text.split('\n')) {
       const line = raw.trim();
       if (!line.startsWith('@')) continue;
@@ -147,14 +167,21 @@ export class MockAdapter implements AgentAdapter {
           break;
         }
         case 'sleep': {
-          // Simulate a long turn that honors mid-turn cancellation (SPEC §5.6).
-          ctx.heartbeat?.();
+          // Simulate a long turn that honors mid-turn cancellation (SPEC §5.6) AND
+          // in-flight follow-up injection: sleep in small steps, polling for follow-ups
+          // between them so a message sent during the turn is processed in-flight.
           const ms = Number(rest.trim()) || 1000;
-          await new Promise<void>((resolve, reject) => {
-            if (ctx.signal?.aborted) return reject(new Error('aborted'));
-            const t = setTimeout(resolve, ms);
-            ctx.signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')); }, { once: true });
-          });
+          const step = 100;
+          for (let waited = 0; waited < ms; waited += step) {
+            if (ctx.signal?.aborted) throw new Error('aborted');
+            ctx.heartbeat?.();
+            await drainFollowUps();
+            await new Promise<void>((resolve, reject) => {
+              if (ctx.signal?.aborted) return reject(new Error('aborted'));
+              const t = setTimeout(resolve, Math.min(step, ms - waited));
+              ctx.signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')); }, { once: true });
+            });
+          }
           outputs.push(`slept ${ms}ms`);
           break;
         }
@@ -213,6 +240,20 @@ export class MockAdapter implements AgentAdapter {
           break;
       }
     }
+    };
+
+    // Act on the latest USER message (or the task prompt on turn one), so directives
+    // fire once per turn rather than re-firing the whole history. We deliberately
+    // ignore `role: 'system'` messages to MIRROR the real provider adapters
+    // (claude.ts / codex.ts both strip conversation system messages) — otherwise the
+    // mock "sees" things a real agent never would, masking bugs like a child raise
+    // injected as a system message that never reaches the parent agent.
+    const recent = input.messages.filter((m) => m.role === 'user');
+    const initialText = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
+    await processText(initialText);
+    // Catch any follow-up that landed near the end of the turn (or during a non-sleep
+    // turn) — process it in-flight rather than deferring it to the next turn.
+    await drainFollowUps();
 
     // Drain any sticky sub-agent count by one: report the current count as still
     // in flight this turn, so the workflow holds until it reaches 0.
@@ -224,7 +265,7 @@ export class MockAdapter implements AgentAdapter {
 
     if (outputs.length === 0) outputs.push('(mock agent: no directives; nothing to do)');
     if (complete) ctx.signalCompletion(outputs.join('; '));
-    return { session, output: outputs.join('\n'), ...(pendingSubagents ? { pendingSubagents } : {}) };
+    return { session, output: outputs.join('\n'), delivered: deliveredIndex, ...(pendingSubagents ? { pendingSubagents } : {}) };
   }
 }
 

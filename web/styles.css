@@ -345,6 +345,9 @@ a { color: var(--accent); text-decoration: none; }
 details.advanced { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 12px; }
 details.advanced summary { cursor: pointer; color: var(--ink-3); font-size: 12px; user-select: none; }
 pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; max-height: 260px; }
+/* The check-in terminal: a focusable screen the user types straight into. */
+pre.term-screen { overflow-y: auto; white-space: pre-wrap; word-break: break-word; cursor: text; }
+pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-weak); }
 
 /* ── queue / dashboard / settings ──────────────────────────── */
 .card { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); padding: 16px; margin-bottom: 12px; }
