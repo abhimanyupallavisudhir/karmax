@@ -1316,6 +1316,14 @@ async function openTaskForm(workflow, draft, seedText) {
   };
   $('#tf-draft').addEventListener('click', () => submit(true));
   $('#tf-queue').addEventListener('click', () => submit(false));
+  // Keyboard on the expanded form (fires before the global handler, which would
+  // otherwise only blur the focused field on Escape). ⌘/Ctrl-Enter = Add task /
+  // Queue; Escape closes — and closeForm() flushes the draft on the way out, so
+  // dismissing with the keyboard saves just like clicking away does.
+  $('#tf-scrim').addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); submit(false); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeForm(); }
+  });
 }
 
 // ── drawer ───────────────────────────────────────────────────────────────────
