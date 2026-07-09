@@ -300,6 +300,21 @@ export class Store {
     return this.attachTags(projectId, tasks);
   }
 
+  /** Tasks currently armed on a trigger (stored-not-started), across all projects.
+   *  The durable source of truth the dispatcher re-arms from on boot (SPEC §3.3). */
+  listArmedTasks(): TaskRecord[] {
+    return (this.db.prepare('SELECT * FROM tasks ORDER BY createdAt').all() as any[])
+      .map(rowToTask)
+      .filter((t) => t.params?.triggerState === 'armed');
+  }
+
+  /** Runs spawned from a series (repeatable template), newest first. */
+  runsOf(seriesId: string): TaskRecord[] {
+    return (this.db.prepare('SELECT * FROM tasks ORDER BY createdAt DESC').all() as any[])
+      .map(rowToTask)
+      .filter((t) => t.params?.runOf === seriesId);
+  }
+
   childTasks(parentTaskId: string): TaskRecord[] {
     const tasks = (
       this.db.prepare('SELECT * FROM tasks WHERE parentTaskId = ? ORDER BY createdAt').all(parentTaskId) as any[]
@@ -347,6 +362,11 @@ export class Store {
 
   updateTaskParams(taskId: string, params: TaskParams) {
     this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId);
+  }
+
+  /** Update a task's display title (e.g. to track an edited prompt). */
+  setTaskTitle(taskId: string, title: string) {
+    if (title) this.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run(title, taskId);
   }
 
   /** Set the human notes on a task (cosmetic, UI-only; empty string clears them). */
