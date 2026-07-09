@@ -22,7 +22,14 @@ const S = {
   liveOutput: '',
   drawerSeq: 0,
   activity: [],
-  search: '',
+  search: '', // the working query string (Linear-style tokens + free text)
+  // Task organization (PLAN-search-views): a view IS a saved query.
+  tags: [], // project tag catalogue (labels + topics, hierarchical)
+  views: [], // saved views (named queries)
+  fields: [], // searchable-field registry (drives the filter/sort/group menus)
+  activeView: null, // id of the selected saved view, or null for the ad-hoc/default view
+  searchResult: null, // { tasks, groups, total } from the last server evaluation
+  orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
   paramDefaults: {},
   sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
@@ -119,6 +126,8 @@ async function applyRoute() {
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) { S.projectId = pid; await loadTasks().catch(() => {}); }
   else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
+  await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
+  if (tab === 'tasks') await runSearch().catch(() => {});
   S.tab = tab;
   renderRail();
   renderMain();
@@ -719,13 +728,106 @@ async function loadProjects() {
 async function loadTasks() {
   if (!S.projectId) return;
   S.forkPool = null; // let the fork picker re-fetch its archived-inclusive pool
-  const fetched = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
+  // Always fetch the full set incl. archived; the task list decides visibility via the
+  // query (default -is:archived). S.tasks is the shared pool for the drawer, counts, etc.
+  const fetched = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
   // Drop any draft we just deleted: a list request issued before the DELETE landed
   // can still return it and clobber the optimistic removal. Once a fresh fetch no
   // longer contains a tombstoned id, the server has caught up — retire it so the
   // set can't grow without bound (task ids are never reused).
   for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
   S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
+}
+
+// ── task organization: tags, saved views, query search ──────────────────────
+// A view IS a saved query: `S.search` holds the working query string (Linear-style
+// tokens + free text), which the server evaluates via /search into `S.searchResult`.
+// The field registry (`S.fields`) drives the filter/sort/group menus.
+async function loadOrg() {
+  if (!S.projectId) return;
+  const pid = S.projectId;
+  const [tags, views, fields] = await Promise.all([
+    api(`/api/projects/${pid}/tags`).catch(() => []),
+    api(`/api/projects/${pid}/views`).catch(() => []),
+    S.fields.length ? Promise.resolve(S.fields) : api(`/api/search/fields`).catch(() => []),
+  ]);
+  S.tags = tags || [];
+  S.views = views || [];
+  S.fields = fields || [];
+  S.orgProjectId = pid;
+}
+
+// The map id→tag for quick lookups + hierarchy path rendering.
+function tagById(id) { return S.tags.find((t) => t.id === id); }
+function tagPathStr(id) {
+  const parts = [];
+  const seen = new Set();
+  let cur = tagById(id);
+  while (cur && !seen.has(cur.id)) { seen.add(cur.id); parts.unshift(cur.name); cur = cur.parentId ? tagById(cur.parentId) : null; }
+  return parts.join('/');
+}
+const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
+
+// Evaluate the working query on the server and stash the result. The default list
+// (empty query) is just an evaluation too. We overlay each result's freshest live
+// `lastView` from S.tasks so status chips reflect the latest transition.
+async function runSearch() {
+  if (!S.projectId) return;
+  const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
+  try {
+    const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(q)}`);
+    const live = new Map(S.tasks.map((t) => [t.id, t]));
+    const overlay = (t) => ({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
+    r.tasks = (r.tasks || []).map(overlay);
+    if (r.groups) r.groups = r.groups.map((g) => ({ ...g, tasks: (g.tasks || []).map(overlay) }));
+    S.searchResult = r;
+  } catch { S.searchResult = null; }
+}
+
+let searchDebounce = null;
+function scheduleSearch() {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(async () => { await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
+}
+
+// Programmatically set the working query (view selection, filter/sort/group menus).
+// Updates the topbar box (which renderMain doesn't own), re-evaluates, re-renders.
+async function setQuery(q) {
+  S.search = q || '';
+  const box = $('#task-search');
+  if (box) box.value = S.search;
+  await runSearch();
+  if (S.tab === 'tasks') renderMain();
+}
+
+// Replace a directive token (group:/sort:) in the query string, or remove it when
+// `value` is empty. Keeps everything else intact so it composes with typed tokens.
+function setDirective(q, key, value) {
+  const re = new RegExp(`(?:^|\\s)${key}:\\S+`, 'g');
+  let out = (q || '').replace(re, '').replace(/\s+/g, ' ').trim();
+  if (value) out = (out + ` ${key}:${value}`).trim();
+  return out;
+}
+// Append a filter clause `field:value` (value may already carry an op prefix).
+function addClause(q, field, value) {
+  const tok = value.includes(' ') ? `${field}:"${value}"` : `${field}:${value}`;
+  return ((q || '') + ' ' + tok).trim();
+}
+
+// Browser-side query stringifier — mirrors src/domain/query-language.ts so a saved
+// view's structured query round-trips into the one search box.
+function stringifyQuery(q) {
+  const parts = [];
+  for (const c of q.filters || []) {
+    const prefix = c.negate ? '-' : '';
+    const op = c.op === 'gt' ? '>' : c.op === 'gte' ? '>=' : c.op === 'lt' ? '<' : c.op === 'lte' ? '<=' : '';
+    const vals = (c.values || []).map((v) => (String(v).includes(' ') ? `"${v}"` : v)).join(',');
+    parts.push(`${prefix}${c.field}:${op}${vals}`);
+  }
+  for (const s of q.sort || []) parts.push(`sort:${s.field}-${s.dir}`);
+  if (q.group) parts.push(`group:${q.group}`);
+  if (q.text) parts.push(String(q.text).includes(' ') ? `"${q.text}"` : q.text);
+  return parts.join(' ');
 }
 
 // ── websocket live stream ──────────────────────────────────────────────────
@@ -760,7 +862,13 @@ function connectWs() {
 }
 
 async function refreshTasks() {
-  try { await loadTasks(); if (S.tab === 'tasks' || S.tab === 'queue') renderMain(); renderRail(); if (S.tab === 'queue') seedQueue(); } catch {}
+  try {
+    await loadTasks();
+    if (S.tab === 'tasks') await runSearch();
+    if (S.tab === 'tasks' || S.tab === 'queue') renderMain();
+    renderRail();
+    if (S.tab === 'queue') seedQueue();
+  } catch {}
 }
 
 // ── shell ────────────────────────────────────────────────────────────────────
@@ -769,8 +877,8 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <div class="brand"><span class="mark">◇</span> karmax</div>
-      <div class="search"><span>⌕</span><input id="search" placeholder="Search tasks…  ( / )" /></div>
       <div class="spacer"></div>
+      <button class="icon-btn" id="topbar-palette" title="Search everything ( ${esc(fmtKeys('meta+k'))} )">⌕</button>
       <button class="icon-btn has-badge" id="bell" title="Needs attention">🔔<span class="badge hidden" id="bell-badge">0</span></button>
       <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
     </div>
@@ -778,7 +886,9 @@ function renderShell() {
       <div class="rail" id="rail"></div>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>`;
-  $('#search').addEventListener('input', (e) => { S.search = e.target.value; if (S.tab === 'tasks') renderMain(); });
+  // Task search now lives at the top of the task list (see tasksView); the topbar
+  // glass icon opens the global command palette (commands, tasks, projects).
+  $('#topbar-palette').addEventListener('click', openPalette);
   $('#theme').addEventListener('click', toggleTheme);
   $('#bell').addEventListener('click', toggleNotifications);
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
@@ -890,23 +1000,134 @@ function renderMain() {
 }
 
 // ── tasks ────────────────────────────────────────────────────────────────────
-// Match a task against a search query: by title, or by its `#num` (so "42" and
-// "#42" both find task #42).
+// Client-side twin of the authoritative `matchText` in src/domain/search.ts — used as
+// the pre-server fallback AND by the fork-from picker (resumeSearch). Keep the two in
+// sync: token-AND over title / notes / #num, so "login fix" matches "fix login".
 function taskMatches(t, q) {
-  if (!q) return true;
-  const ql = q.toLowerCase().trim();
-  if (t.title.toLowerCase().includes(ql)) return true;
-  if (t.num != null && `#${t.num}`.includes(ql.startsWith('#') ? ql : `#${ql}`)) return true;
-  return false;
+  const s = (q || '').toLowerCase().trim();
+  if (!s) return true;
+  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
+  return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
-function tasksView() {
-  const filtered = S.tasks.filter((t) => taskMatches(t, S.search));
-  const rows = filtered
-    .slice()
-    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-    .map(taskRow)
+
+// "Show archived" is not a separate toggle — it's just the `is:archived` facet in the
+// query. The default search hides archived tasks by transparently appending `-is:archived`
+// (Linear/Jira behaviour); the moment the user's query mentions archived-ness (adds
+// `is:archived`, `-is:archived`, or groups by it), we leave it alone. The clean `S.search`
+// stays in the box; only the evaluated query carries the default.
+function queryMentionsArchived(q) { return /(^|\s)-?(is|has):[^\s]*archived/i.test(q || ''); }
+function effectiveQuery(q) {
+  const s = (q || '').trim();
+  if (queryMentionsArchived(s)) return s;
+  return s ? `${s} -is:archived` : '-is:archived';
+}
+
+// The saved-views switcher — every chip is a query. "All" is the built-in default;
+// each saved view carries a ✕ to delete it (confirmed in wireOrgControls).
+function viewsBar() {
+  const saved = S.views
+    .map(
+      (v) => `<div class="view-chip ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
+    )
     .join('');
-  const archivedCount = S.tasks.filter((t) => t.params?.archived).length;
+  return `<div class="views-bar">
+    <div class="view-chip ${!S.activeView ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
+    ${saved}
+    <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
+  </div>`;
+}
+
+// Workflow params are searchable/organizable too, via synthetic fields the server
+// resolves on demand (src/domain/search.ts — keep this list of skipped types in step
+// with what fieldByKey understands). Scalar params become `param.<name>`; agent/confirmer
+// params expand into three model sub-fields each — `agent_<role>.agent` (provider),
+// `.model`, `.effort` — so you can filter/group/sort by the model an agent ran on.
+const PARAM_SCALAR_SKIP = new Set(['agent', 'confirmer', 'prompt', 'list']);
+const PARAM_NAME_SKIP = new Set(['repos', 'prompt']);
+const AGENT_SUBFIELDS = [
+  { sub: 'agent', label: 'agent' },
+  { sub: 'model', label: 'model' },
+  { sub: 'effort', label: 'effort' },
+];
+function paramMenuFields() {
+  const seen = new Map();
+  for (const s of S.schema || []) {
+    for (const p of s.params || []) {
+      if (PARAM_NAME_SKIP.has(p.name)) continue;
+      if (p.type === 'agent' || p.type === 'confirmer') {
+        for (const { sub, label } of AGENT_SUBFIELDS) {
+          const key = `agent_${p.name}.${sub}`;
+          if (!seen.has(key)) seen.set(key, { key, label: `${p.label || p.name} · ${label}`, type: 'text', param: true });
+        }
+        continue;
+      }
+      if (PARAM_SCALAR_SKIP.has(p.type) || seen.has(p.name)) continue;
+      seen.set(p.name, {
+        key: 'param.' + p.name,
+        label: p.label || p.name,
+        type: 'text',
+        param: true,
+        options: p.type === 'select' && p.options ? p.options.map((o) => ({ value: o, label: o })) : undefined,
+      });
+    }
+  }
+  return [...seen.values()];
+}
+// The base registry + the project's param fields — what all the menus draw from.
+function allMenuFields() { return [...(S.fields || []), ...paramMenuFields()]; }
+function menuFieldByKey(key) { return allMenuFields().find((f) => f.key === key); }
+
+// The query toolbar: the field-driven quick filters + group + sort selectors. It
+// reads the searchable-field registry (+ workflow params) so it never drifts from the parser.
+function queryToolbar() {
+  const q = S.search || '';
+  const fields = allMenuFields();
+  const params = paramMenuFields();
+  // Filter menu: everything with discrete-ish values (skip free-text title/notes),
+  // but always include param fields even though they're text-typed.
+  const filterFields = fields.filter((f) => f.type !== 'text' && !f.param);
+  const grpFields = fields.filter((f) => f.groupable || f.param);
+  const sortFields = fields.filter((f) => f.sortable || f.param);
+  const curGroup = (q.match(/(?:^|\s)group:(\S+)/) || [])[1] || '';
+  const curSort = (q.match(/(?:^|\s)sort:(\S+)/) || [])[1] || '';
+  const opt = (v, label, sel) => `<option value="${esc(v)}" ${sel ? 'selected' : ''}>${esc(label)}</option>`;
+  const grp = (label, inner) => (inner ? `<optgroup label="${esc(label)}">${inner}</optgroup>` : '');
+  return `<div class="query-bar">
+    <select id="q-filter-field" class="q-sel" title="Add a filter"><option value="">＋ Filter…</option>
+      ${filterFields.map((f) => opt(f.key, f.label)).join('')}
+      ${grp('Workflow params', params.map((f) => opt(f.key, f.label)).join(''))}</select>
+    <select id="q-group" class="q-sel" title="Group by">
+      ${opt('', 'No grouping', !curGroup)}${grpFields.filter((f) => !f.param).map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join('')}
+      ${grp('Workflow params', params.map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join(''))}</select>
+    <select id="q-sort" class="q-sel" title="Sort by">
+      ${opt('', 'Sort: default', !curSort)}${sortFields.filter((f) => !f.param).map((f) => opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc') + opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc')).join('')}
+      ${grp('Workflow params', params.map((f) => opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc') + opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc')).join(''))}</select>
+    <div class="q-spacer"></div>
+    <button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>
+  </div>`;
+}
+
+function tasksView() {
+  const r = S.searchResult;
+  // The server already applied the query (incl. the default -is:archived from effectiveQuery).
+  // Fallback (before the first result lands) filters client-side and drops archived to match.
+  const flat = r
+    ? r.tasks
+    : S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const groups = r && r.groups ? r.groups : null;
+  const count = flat.length;
+  const archivedShown = queryMentionsArchived(S.search);
+  let body;
+  if (groups) {
+    body = groups
+      .map((g) => `<div class="group-h">${esc(g.label)} <span class="pill">${g.tasks.length}</span></div>${g.tasks.map(taskRow).join('')}`)
+      .join('');
+  } else {
+    body = flat.map(taskRow).join('');
+  }
+  const empty = S.search
+    ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
+    : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
     <div class="composer">
       <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
@@ -915,11 +1136,34 @@ function tasksView() {
       <button class="btn primary" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )">Add</button>
     </div>
     <div class="img-chips" id="new-task-chips" style="display:none"></div>
-    <div class="switch" style="justify-content:flex-end;margin:4px 0">
-      <input type="checkbox" id="show-archived" ${S.showArchived ? 'checked' : ''} />
-      <label for="show-archived" style="font-size:12px;color:var(--ink-3)">Show archived${S.showArchived && archivedCount ? ` (${archivedCount})` : ''}</label>
+    <div class="organizer">
+      <div class="search-box">
+        <span class="search-ic">⌕</span>
+        <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
+          placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
+        ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
+      </div>
+      ${viewsBar()}
+      ${queryToolbar()}
     </div>
-    ${rows || `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`}`;
+    <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
+      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
+      <span style="font-size:12px;color:var(--ink-3)">${archivedShown ? '<a href="#" id="arch-toggle">← back to active</a>' : '<a href="#" id="arch-toggle">show archived</a>'}</span>
+    </div>
+    ${body || empty}`;
+}
+
+// Small colored tag chip + priority flag shown on a task row.
+function tagChips(t) {
+  if (!t.tags || !t.tags.length) return '';
+  return t.tags
+    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<span class="tag-chip ${tag.kind || ''}"${c}>${esc(tagPathStr(id))}</span>`; })
+    .join('');
+}
+function priorityFlag(t) {
+  const p = Number(t.params?.priority || 0);
+  if (!p) return '';
+  return `<span class="prio p${p}" title="Priority: ${PRIORITY_NAMES[p]}">${'▲'}${p >= 3 ? '' : ''} ${PRIORITY_NAMES[p]}</span>`;
 }
 
 function taskRow(t) {
@@ -930,7 +1174,7 @@ function taskRow(t) {
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span></div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${tagChips(t)}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Queue</button>
@@ -958,6 +1202,7 @@ function taskRow(t) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
+          ${priorityFlag(t)}${tagChips(t)}
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
@@ -1037,7 +1282,199 @@ function pipelineLarge(v) {
   }).join('')}</div>`;
 }
 
+// ── task-organization control wiring (views bar + query toolbar + modals) ─────
+function wireOrgControls() {
+  const main = $('#main');
+  // Saved-view chips: each selects a query; "All" is the default (empty) view.
+  main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
+    el.addEventListener('click', (ev) => {
+      if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
+      const id = el.dataset.view;
+      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      const v = S.views.find((x) => x.id === id);
+      if (!v) return;
+      S.activeView = id;
+      setQuery(stringifyQuery(v.query || {}));
+    }),
+  );
+  // Delete a saved view (with confirmation) — the API/gateway already support it.
+  main.querySelectorAll('[data-delview]').forEach((x) =>
+    x.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const id = x.dataset.delview;
+      const v = S.views.find((y) => y.id === id);
+      if (!confirm(`Delete the view “${v?.name || 'this view'}”? This can't be undone.`)) return;
+      try {
+        await api(`/api/views/${id}`, { method: 'DELETE' });
+        S.views = S.views.filter((y) => y.id !== id);
+        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
+        toast('View deleted');
+      } catch (e) { toast(e.message, true); }
+    }),
+  );
+  $('#save-view')?.addEventListener('click', saveCurrentView);
+  $('#manage-tags')?.addEventListener('click', openTagsManager);
+  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
+  // Show-archived is just the `is:archived` facet — toggle it on/off the current query.
+  $('#arch-toggle')?.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    S.activeView = null;
+    const q = (S.search || '').replace(/(^|\s)-?(is|has):archived\b/gi, ' ').replace(/\s+/g, ' ').trim();
+    setQuery(queryMentionsArchived(S.search) ? q : `${q} is:archived`.trim());
+  });
+
+  // The in-list search box drives the working query. Debounced re-evaluation keeps
+  // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
+  const search = $('#task-search');
+  if (search) {
+    search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
+  }
+
+  $('#q-group')?.addEventListener('change', (e) => { S.activeView = null; setQuery(setDirective(S.search, 'group', e.target.value)); });
+  $('#q-sort')?.addEventListener('change', (e) => { S.activeView = null; setQuery(setDirective(S.search, 'sort', e.target.value)); });
+  $('#q-filter-field')?.addEventListener('change', (e) => {
+    const key = e.target.value;
+    e.target.value = '';
+    if (key) openFilterPicker(key);
+  });
+}
+
+// Persist the current working query as a named view (Save-view button).
+async function saveCurrentView() {
+  const name = prompt('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
+  if (!name) return;
+  try {
+    // The API persists a structured TaskQuery, so parse the working string into one
+    // (parseQueryClient mirrors the server grammar; it round-trips back through it).
+    const v = await api(`/api/projects/${S.projectId}/views`, {
+      method: 'POST',
+      body: JSON.stringify({ name, query: parseQueryClient(S.search) }),
+    });
+    S.views.push(v);
+    S.activeView = v.id;
+    renderMain();
+    toast(`Saved view “${name}”`);
+  } catch (err) { toast(err.message, true); }
+}
+
+// A minimal browser-side parser sufficient to persist a saved view's structured
+// query (the authoritative parser is server-side; this mirrors its token grammar so
+// what we store round-trips through it). Unknown tokens fold into free text.
+function parseQueryClient(input) {
+  const q = { filters: [], sort: [] };
+  const text = [];
+  const re = /"([^"]*)"|(\S+)/g; let m;
+  const OPS = [['>=', 'gte'], ['<=', 'lte'], ['>', 'gt'], ['<', 'lt'], ['=', 'is']];
+  while ((m = re.exec(input))) {
+    const quoted = m[1] !== undefined;
+    const tok = quoted ? m[1] : m[2];
+    const colon = quoted ? -1 : tok.indexOf(':');
+    if (colon < 0) { if (tok) text.push(tok); continue; }
+    let key = tok.slice(0, colon); let rest = tok.slice(colon + 1); let negate = false;
+    if (key[0] === '-' || key[0] === '!') { negate = true; key = key.slice(1); }
+    if (key === 'sort') { let dir = 'asc'; let k = rest; if (k[0] === '-') { dir = 'desc'; k = k.slice(1); } const dm = k.match(/^(.*)[-:](asc|desc)$/i); if (dm) { k = dm[1]; dir = dm[2].toLowerCase(); } q.sort.push({ field: k, dir }); continue; }
+    if (key === 'group') { q.group = rest; continue; }
+    // `param.<key>` / `p.<key>` are synthetic workflow-param fields (text-typed).
+    // `param.<key>` / `p.<key>` and `agent_<role>.<sub>` are synthetic (text) fields.
+    const isParam = /^(param|p)\.[^.\s]+$/i.test(key) || /^agent_[a-z0-9]+\.(agent|model|effort)$/i.test(key);
+    const fld = isParam ? { key, type: 'text' } : S.fields.find((f) => f.key === key || (f.aliases || []).includes(key));
+    if (!fld) { text.push(tok); continue; }
+    let op = fld.type === 'text' ? 'contains' : 'is';
+    for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
+    const values = rest.split(',').map((s) => s.trim()).filter(Boolean);
+    if (values.length) q.filters.push(negate ? { field: fld.key, op, values, negate: true } : { field: fld.key, op, values });
+  }
+  if (!q.filters.length) delete q.filters;
+  if (!q.sort.length) delete q.sort;
+  const t = text.join(' ').trim(); if (t) q.text = t;
+  return q;
+}
+
+// A value picker for the chosen filter field — options for enum/facet/tag, a typed
+// value (with comparison ops) for number/date/text.
+function openFilterPicker(fieldKey) {
+  const field = menuFieldByKey(fieldKey);
+  if (!field) return;
+  const root = $('#modal-root');
+  const apply = (value, negate) => { root.innerHTML = ''; if (value === '' || value == null) return; S.activeView = null; setQuery(addClause(S.search, (negate ? '-' : '') + field.key, value)); };
+
+  let inner = '';
+  if (field.type === 'tag') {
+    // Show the hierarchy as indented paths; picking one adds tag:<path>.
+    const rows = S.tags.length
+      ? S.tags.map((t) => `<div class="opt" data-val="${esc(tagPathStr(t.id))}">${esc(tagPathStr(t.id))}${t.kind ? ` <span class="pal-sub">${esc(t.kind)}</span>` : ''}</div>`).join('')
+      : `<div class="pal-empty">No tags yet — add some via 🏷 Tags.</div>`;
+    inner = rows;
+  } else if (field.options) {
+    inner = field.options.map((o) => `<div class="opt" data-val="${esc(o.value)}">${esc(o.label)}</div>`).join('');
+  } else {
+    const ops = field.type === 'number' || field.type === 'date'
+      ? `<select id="fp-op" class="q-sel"><option value="">is</option><option value=">=">≥</option><option value="<=">≤</option><option value=">">&gt;</option><option value="<">&lt;</option></select>`
+      : '';
+    const ph = field.type === 'date' ? 'e.g. 7d, today, 2026-01-01' : 'value';
+    inner = `<div class="fp-row">${ops}<input id="fp-val" class="title-in" placeholder="${ph}" /></div><button class="btn primary" id="fp-add">Add filter</button>`;
+  }
+  root.innerHTML = `<div class="palette-scrim" id="fp-scrim"><div class="palette fp">
+    <div class="fp-head">Filter by ${esc(field.label)} <label class="fp-neg"><input type="checkbox" id="fp-negate" /> exclude</label></div>
+    <div id="fp-list">${inner}</div>
+  </div></div>`;
+  const neg = () => $('#fp-negate')?.checked;
+  $('#fp-scrim').addEventListener('click', (e) => { if (e.target.id === 'fp-scrim') root.innerHTML = ''; });
+  root.querySelectorAll('.opt[data-val]').forEach((o) => o.addEventListener('click', () => apply(o.dataset.val, neg())));
+  $('#fp-add')?.addEventListener('click', () => { const op = $('#fp-op')?.value || ''; const val = $('#fp-val')?.value.trim(); if (val) apply(op + val, neg()); });
+  $('#fp-val')?.focus();
+  $('#fp-val')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const op = $('#fp-op')?.value || ''; const val = e.target.value.trim(); if (val) apply(op + val, neg()); } });
+}
+
+// Project tag catalogue manager — create/rename/recolor/reparent/delete tags.
+function openTagsManager() {
+  const root = $('#modal-root');
+  const draw = () => {
+    const rows = S.tags.length
+      ? S.tags.map((t) => `<div class="tagm-row">
+          <span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''}>${esc(tagPathStr(t.id))}</span>
+          <span class="pal-sub">${esc(t.kind || '')}</span>
+          <span class="q-spacer"></span>
+          <button class="btn sm" data-rename="${t.id}">Rename</button>
+          <button class="btn sm danger" data-deltag="${t.id}">Delete</button>
+        </div>`).join('')
+      : `<div class="pal-empty">No tags yet.</div>`;
+    root.innerHTML = `<div class="palette-scrim" id="tagm-scrim"><div class="palette tagm">
+      <div class="fp-head">Tags</div>
+      <div id="tagm-list">${rows}</div>
+      <div class="tagm-new">
+        <input id="tagm-name" class="title-in" placeholder="new tag  ·  use / for nesting (e.g. frontend/web)" />
+        <select id="tagm-kind" class="q-sel"><option value="topic">topic</option><option value="type">type</option></select>
+        <input id="tagm-color" type="color" value="#6b7fd7" title="color" />
+        <button class="btn primary" id="tagm-add">Add tag</button>
+      </div>
+      <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth).</div>
+    </div></div>`;
+    $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') root.innerHTML = ''; });
+    const addTag = async () => {
+      const name = $('#tagm-name').value.trim(); if (!name) return;
+      try {
+        await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({ name, kind: $('#tagm-kind').value, color: $('#tagm-color').value }) });
+        await loadOrg(); draw();
+      } catch (e) { toast(e.message, true); }
+    };
+    $('#tagm-add').addEventListener('click', addTag);
+    $('#tagm-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') addTag(); });
+    root.querySelectorAll('[data-rename]').forEach((b) => b.addEventListener('click', async () => {
+      const t = tagById(b.dataset.rename); const name = prompt('Rename tag:', t?.name); if (!name) return;
+      try { await api(`/api/tags/${b.dataset.rename}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await loadOrg(); draw(); if (S.tab === 'tasks') renderMain(); } catch (e) { toast(e.message, true); }
+    }));
+    root.querySelectorAll('[data-deltag]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Delete this tag? Its children are promoted to its parent and it is removed from all tasks.')) return;
+      try { await api(`/api/tags/${b.dataset.deltag}`, { method: 'DELETE' }); await loadOrg(); draw(); if (S.tab === 'tasks') { await runSearch(); renderMain(); } } catch (e) { toast(e.message, true); }
+    }));
+  };
+  draw();
+}
+
 function wireTasksView() {
+  wireOrgControls();
   $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.id)));
   $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
@@ -1072,7 +1509,6 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-unarchive]').forEach((b) =>
     b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.unarchive, false); }),
   );
-  $('#show-archived')?.addEventListener('change', (e) => { S.showArchived = e.target.checked; refreshTasks(); });
   const add = async () => {
     const input = $('#new-task');
     const title = input.value.trim();
@@ -1179,6 +1615,11 @@ async function openTaskForm(workflow, draft, seedText) {
             <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
             <span style="color:var(--ink-3);font-size:12px">Only you see this — never sent to the agent.</span>
           </div>
+          <div class="form-row" data-row="__org">
+            <div class="label-row"><label>Priority &amp; tags</label></div>
+            ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
+            <span style="color:var(--ink-3);font-size:12px">For search / organization only — never sent to the agent. Use / for nested tags.</span>
+          </div>
           <details class="advanced" style="margin-top:10px">
             <summary>Credentials — precedence &amp; enable/disable for this task</summary>
             <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
@@ -1238,6 +1679,9 @@ async function openTaskForm(workflow, draft, seedText) {
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
 
+  // The priority+tags editor is wired further down, once `draftId`/`ensureDraft` exist
+  // (a brand-new task needs a draft persisted before tags/priority can attach).
+
   // The id of the draft this form is editing. Starts as the passed-in draft; a
   // brand-new task gets one lazily the first time auto-save persists real content.
   let draftId = draft?.id || null;
@@ -1284,6 +1728,32 @@ async function openTaskForm(workflow, draft, seedText) {
   function autoSaveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(() => persistDraft(), 800); }
   $('#tf-body').addEventListener('input', autoSaveSoon);
   $('#tf-body').addEventListener('change', autoSaveSoon);
+
+  // ── Priority + tags editor (organization; never sent to the agent) ──────────
+  // IMPORTANT: this is ONE of TWO places the tag/priority editor lives — here in the full
+  // task form (new + draft), and in the running-task drawer (renderDrawer → drawerOrg).
+  // Both go through orgEditorHtml/wireOrgEditor. If you change one, check the other.
+  // Tags/priority need a taskId to attach to; a brand-new task has none until it's saved,
+  // so `ensureDraft` persists (or force-creates) a draft on the first tag/priority edit.
+  async function ensureDraft() {
+    if (draftId) return draftId;
+    await persistDraft();
+    if (draftId) return draftId;
+    // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
+    const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: formState().body, draft: true }) });
+    draftId = created.id;
+    refreshTasks();
+    return draftId;
+  }
+  const orgRec = draft
+    ? { id: draft.id, params: { priority: draft.params?.priority || 0 }, tags: (draft.tags || []).slice() }
+    : { id: null, params: {}, tags: [] };
+  const refreshOrg = () => {
+    const box = root.querySelector('[data-row="__org"] .drawer-org');
+    if (box) { box.outerHTML = orgEditorHtml(orgRec); wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg }); }
+    if (S.tab === 'tasks') renderMain();
+  };
+  wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg });
 
   // Flush any pending edits when the form is dismissed, so closing without
   // clicking a button still keeps the draft.
@@ -1383,6 +1853,133 @@ function highlightRow() {
   document.querySelectorAll('.task-row').forEach((r) => r.classList.toggle('sel', r.dataset.id === S.selected));
 }
 
+// A task's organizational metadata (priority + tags). Both are purely for
+// search/organization and never reach the agent, so they're editable at any
+// lifecycle stage (draft included) — unlike workflow params. Shared by the drawer
+// (running tasks) and the task form (drafts).
+function orgEditorHtml(rec) {
+  const prio = Number(rec?.params?.priority || 0);
+  const tags = (rec?.tags || []).map((id) => { const t = tagById(id); if (!t) return ''; return `<span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} data-untag="${id}" title="Remove">${esc(tagPathStr(id))} ✕</span>`; }).join('');
+  const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? '▲ ' : ''}${n[0].toUpperCase() + n.slice(1)}</option>`).join('');
+  return `<div class="drawer-org">
+    <label class="org-prio">Priority
+      <select class="q-sel org-priority">${prioOpts}</select>
+    </label>
+    <div class="org-tags">${tags || '<span class="pal-sub">no tags</span>'}
+      <button class="btn sm org-add-tag" title="Add a tag">＋ tag</button>
+    </div>
+  </div>`;
+}
+
+// Wire the priority/tags editor rooted at `rootEl` over a mutable `rec` ({id, params, tags}).
+// `opts.ensureId()` resolves the task id (drawer/existing draft: identity; NEW task form:
+// persists a draft first so tags/priority have somewhere to attach), and `opts.afterChange`
+// re-renders the surrounding surface. There is exactly one `.drawer-org` per surface.
+// Callers: renderDrawer (running tasks) and openTaskForm (new + draft) — keep both in mind.
+function wireOrgEditor(rootEl, rec, opts) {
+  const box = rootEl.querySelector('.drawer-org');
+  if (!box) return;
+  const ensureId = opts.ensureId || (async () => rec.id);
+  const afterChange = opts.afterChange || (() => {});
+  box.querySelector('.org-priority')?.addEventListener('change', async (e) => {
+    const priority = Number(e.target.value);
+    try {
+      const id = await ensureId(); if (!id) return;
+      rec.id = id;
+      await api(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) });
+      rec.params = { ...(rec.params || {}), priority };
+      if (S.tab === 'tasks') await runSearch();
+      afterChange();
+      toast('Priority updated');
+    } catch (err) { toast(err.message, true); }
+  });
+  const setTags = async (ids) => {
+    const id = await ensureId(); if (!id) return;
+    rec.id = id;
+    const r = await api(`/api/tasks/${id}/tags`, { method: 'PUT', body: JSON.stringify({ tagIds: ids }) });
+    rec.tags = r.tags;
+    if (S.tab === 'tasks') await runSearch();
+    afterChange();
+  };
+  box.querySelectorAll('[data-untag]').forEach((el) => el.addEventListener('click', () => {
+    setTags((rec.tags || []).filter((id) => id !== el.dataset.untag)).catch((e) => toast(e.message, true));
+  }));
+  box.querySelector('.org-add-tag')?.addEventListener('click', () => openTagPicker(rec, setTags));
+}
+
+// Drawer's copy of the priority/tags editor. NOTE: the task FORM (openTaskForm) has the
+// other copy — both share orgEditorHtml/wireOrgEditor; change one, check the other.
+function drawerOrg(v) {
+  const rec = S.tasks.find((t) => t.id === v.taskId);
+  return rec ? orgEditorHtml(rec) : '';
+}
+function wireDrawerOrg(v) {
+  const rec = S.tasks.find((t) => t.id === v.taskId);
+  if (!rec) return;
+  wireOrgEditor($('#drawer-root'), rec, { ensureId: async () => v.taskId, afterChange: () => { renderDrawer(); if (S.tab === 'tasks') renderMain(); } });
+}
+
+// Type-to-add tag combobox: filter existing tags as you type; a non-matching entry
+// offers "Create …". Supports slash paths (frontend/web) — the server builds the
+// hierarchy. Arrow keys navigate, Enter picks the highlighted row.
+function openTagPicker(rec, setTags) {
+  const root = $('#modal-root');
+  const current = new Set(rec?.tags || []);
+  let items = [];
+  let active = 0;
+  root.innerHTML = `<div class="palette-scrim" id="tp-scrim"><div class="palette fp">
+    <input id="tp-in" placeholder="Type a tag…  use / for nesting (e.g. frontend/web)" autocomplete="off" spellcheck="false" />
+    <div id="tp-list"></div>
+  </div></div>`;
+  const input = $('#tp-in');
+  const list = $('#tp-list');
+  const close = () => (root.innerHTML = '');
+  const add = async (item) => {
+    if (!item) return;
+    try {
+      let id = item.id;
+      if (item.create) {
+        const t = await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({ name: item.name }) });
+        await loadOrg();
+        id = t.id;
+      }
+      close();
+      await setTags([...(rec?.tags || []), id]);
+    } catch (e) { toast(e.message, true); }
+  };
+  const build = () => {
+    const q = input.value.trim();
+    const ql = q.toLowerCase();
+    const avail = S.tags.filter((t) => !current.has(t.id));
+    items = avail
+      .map((t) => ({ id: t.id, name: t.name, path: tagPathStr(t.id), kind: t.kind }))
+      .filter((it) => !ql || it.path.toLowerCase().includes(ql))
+      .sort((a, b) => a.path.localeCompare(b.path));
+    // Offer creation when the typed text doesn't already exist verbatim as a path.
+    const exists = q && S.tags.some((t) => tagPathStr(t.id).toLowerCase() === ql);
+    if (q && !exists) items.unshift({ create: true, name: q, path: q });
+    active = 0;
+    draw();
+  };
+  const draw = () => {
+    list.innerHTML = items.length
+      ? items.map((it, i) => `<div class="opt ${i === active ? 'active' : ''}" data-i="${i}">${it.create ? `＋ Create <b>${esc(it.path)}</b>` : esc(it.path)}${!it.create && it.kind ? ` <span class="pal-sub">${esc(it.kind)}</span>` : ''}</div>`).join('')
+      : `<div class="pal-empty">Start typing to create a tag.</div>`;
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  $('#tp-scrim').addEventListener('click', (e) => { if (e.target.id === 'tp-scrim') close(); });
+  input.addEventListener('input', build);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(items.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); add(items[active]); }
+  });
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) add(items[Number(o.dataset.i)]); });
+  build();
+  input.focus();
+}
+
 function renderDrawer() {
   const v = S.view;
   if (!v) return;
@@ -1415,6 +2012,7 @@ function renderDrawer() {
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
         </div>
+        ${drawerOrg(v)}
       </div>
       <div class="drawer-body" id="drawer-body">${drawerBody(v)}</div>
       <div class="drawer-foot" id="drawer-foot">${drawerActions(v)}</div>
@@ -1425,6 +2023,7 @@ function renderDrawer() {
   wireFollowups(v);
   wireParams(v);
   wireNotes(v);
+  wireDrawerOrg(v);
   wireTerminal(v.taskId);
   wireReviewActions(v);
   wireCopyButtons();
@@ -3425,7 +4024,7 @@ const HOST_COMMANDS = [
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
   { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
   { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm($('#new-wf')?.value, undefined, $('#new-task')?.value.trim()); } },
-  { id: 'nav.search', title: 'Search', key: '/', run: () => $('#search')?.focus() },
+  { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to merge queue', key: 'g q', run: () => switchTab('queue') },
   { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
@@ -3612,6 +4211,9 @@ function moveRail(delta) {
 function closeTopOverlay() {
   const pop = $('#notif-pop');
   if (pop) return pop.remove();
+  // Secondary modals (filter picker, tags manager, tag picker) stack above the
+  // form/drawer in #modal-root — pop them first.
+  if ($('#modal-root').firstElementChild) return ($('#modal-root').innerHTML = '');
   const overlay = $('#overlay-root').firstElementChild;
   if (overlay) {
     if (overlay.id === 'tf-scrim') return overlay.click(); // task form: its scrim-close flushes the draft
@@ -3641,7 +4243,7 @@ function bindKeys() {
   document.addEventListener('keydown', (e) => {
     const t = e.target;
     const typing = t && t.matches && (t.matches('input, textarea, select') || t.isContentEditable);
-    const overlayOpen = $('#overlay-root').childElementCount > 0;
+    const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
     if (typing) {
       if (e.key === 'Escape') { t.blur(); resetChord(); }
       // modifier-bearing bindings (⌘K) still work while typing outside overlays
