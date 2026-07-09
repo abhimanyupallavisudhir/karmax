@@ -6,7 +6,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 
-function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number }) {
+function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number }) {
   return {
     taskId: over.taskId,
     projectId: 'p1',
@@ -16,6 +16,7 @@ function input(over: { taskId: string; repo: string; prompt: string; title?: str
     target: 'main',
     project: { repos: [over.repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
     ...(over.subtaskNagMs !== undefined ? { subtaskNagMs: over.subtaskNagMs } : {}),
+    ...(over.subagentWaitMs !== undefined ? { subagentWaitMs: over.subagentWaitMs } : {}),
   };
 }
 const view = (h: any) => h.query('view') as Promise<any>;
@@ -63,6 +64,52 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
+  it('multi-repo: passes every configured repo to the agent and lands work in each', async () => {
+    // A project with TWO repos → one world with a worktree per repo (each a
+    // subdirectory named after the repo). The agent writes into both; the merge
+    // lands the work on main in BOTH source repos.
+    const fe = await h.makeRepo('frontend');
+    const be = await h.makeRepo('backend');
+    const feName = path.basename(fe);
+    const beName = path.basename(be);
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          taskId,
+          projectId: 'p1',
+          title: 'Wire frontend to backend',
+          prompt:
+            `Add a client and a server.\n` +
+            `@write ${feName}/client.js :: export const call = () => fetch('/api');\n` +
+            `@write ${beName}/server.js :: export const serve = () => 'ok';\n` +
+            `@review Added client.js (frontend) and server.js (backend)`,
+          base: 'main',
+          target: 'main',
+          project: { repos: [fe, be], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+        },
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+
+    // the work really landed on main in EACH source repo
+    const feFile = await git(fe, ['show', 'main:client.js']);
+    expect(feFile.code).toBe(0);
+    expect(feFile.stdout).toContain('fetch');
+    const beFile = await git(be, ['show', 'main:server.js']);
+    expect(beFile.code).toBe(0);
+    expect(beFile.stdout).toContain('serve');
+    // and a real merge commit exists in each repo (point of no return, per repo)
+    expect((await git(fe, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
+    expect((await git(be, ['log', '--oneline', 'main'])).stdout).toMatch(new RegExp(`merge karmax/${taskId} into main`));
+  });
+
   it('returns to Do on a follow-up, then merges after confirm', async () => {
     const repo = await h.makeRepo('app2');
     const taskId = newId('task');
@@ -87,6 +134,86 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('done');
     const onMain = await git(repo, ['show', 'main:hello.txt']);
     expect(onMain.stdout).toContain('hi there');
+  });
+
+  it('delivers a follow-up sent WHILE a turn is running on the next turn (SPEC §5.6)', async () => {
+    // Regression: a follow-up that arrives mid-turn used to be marked "already seen"
+    // (seen = msgs.length AFTER the turn) and so silently never reached the agent —
+    // it must instead be delivered on the next turn.
+    const repo = await h.makeRepo('app-midturn');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // Turn one sleeps ~3s — a window to send a follow-up while the turn is running.
+      args: [input({ taskId, repo, title: 'Mid-turn', prompt: '@sleep 3000\n@review turn one' })],
+    });
+    // wait until the Do turn is actually running, then send the follow-up MID-turn
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await new Promise((r) => setTimeout(r, 700)); // ensure we're inside the sleeping turn
+    await handle.signal('followUp', {
+      id: 'mid1',
+      role: 'user',
+      text: '@write mid.txt :: delivered after all\n@review done now',
+      ts: 0,
+    });
+    // The agent must actually RUN the follow-up on its next turn (not park at Review
+    // with it marked consumed). Its reply proves the directive was delivered+executed.
+    await expect
+      .poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text?.includes('wrote mid.txt')), {
+        timeout: 15_000,
+      })
+      .toBe(true);
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    // the follow-up's work really landed on main
+    const onMain = await git(repo, ['show', 'main:mid.txt']);
+    expect(onMain.code).toBe(0);
+    expect(onMain.stdout).toContain('delivered after all');
+  });
+
+  it('confirm=auto: lands the work without any human confirmation', async () => {
+    const repo = await h.makeRepo('auto');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'Auto', prompt: 'Do it.\n@write a.txt :: auto\n@review done' }),
+          confirm: { mode: 'auto' },
+        },
+      ],
+    });
+    // No `confirm` signal is ever sent — auto mode confirms itself and merges.
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:a.txt'])).stdout).toContain('auto');
+  });
+
+  it('confirm=agent: a Confirm agent reviews and confirms, no human in the loop', async () => {
+    const repo = await h.makeRepo('confirmer');
+    const taskId = newId('task');
+    // The Confirm-agent prompt embeds the original task prompt, so the mock confirm
+    // agent sees `@confirm confirm` on its own line and returns that verdict.
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'AgentConfirm', prompt: 'Ship it.\n@write b.txt :: reviewed\n@review please review\n@confirm confirm' }),
+          confirm: { mode: 'agent', provider: 'mock' },
+        },
+      ],
+    });
+    // No human `confirm` signal — the Confirm agent's verdict drives it to done.
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:b.txt'])).stdout).toContain('reviewed');
+    // The Confirm agent's transcript is surfaced as its own role.
+    const v = await view(handle).catch(() => undefined);
+    if (v?.transcripts) expect(v.transcripts.some((t: any) => t.role === 'confirm')).toBe(true);
   });
 
   it('escalates with a clear error when the project repo is misconfigured (no silent scratch)', async () => {
@@ -354,6 +481,58 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     void childId;
   }, 90_000);
 
+  it('holds Do→Review while the agent is still waiting on its own in-harness sub-agents (Task tool)', async () => {
+    const repo = await h.makeRepo('app-subagents');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // The agent does its work and signals completion in turn one, but reports that
+      // several in-harness sub-agents (Claude Agent SDK Task tool) are still running.
+      // Completion is "done AND not waiting on any sub-agents", so it must NOT advance
+      // to Review — it is held in Do (waitingFor 'subagent') until the count drains.
+      args: [input({ taskId, repo, title: 'Subagents', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@subagents 3', subagentWaitMs: 1500 })],
+    });
+
+    // It surfaces as held-in-Do, waiting on its sub-agents — NOT advanced to Review.
+    await expect
+      .poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind ?? '-'}`; }, { timeout: 20_000 })
+      .toBe('do/subagent');
+    // …and nothing has advanced to Review/Merge while it waits.
+    expect((await git(repo, ['show', 'main:out.txt'])).code).not.toBe(0);
+
+    // Once the sub-agents drain (count → 0), it advances to Review on its own.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    // the work landed only after the sub-agents were done
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
+
+  it('gives up on a wedged sub-agent after the nudge budget, and surfaces a Review note', async () => {
+    const repo = await h.makeRepo('app-subagents-wedged');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // 8 sub-agents drain by one per turn — more than MAX_SUBAGENT_NUDGES (5), so the
+      // count is still > 0 when the budget is spent. The task must then proceed to
+      // Review (liveness, never park forever) with a note that a sub-agent may be wedged.
+      args: [input({ taskId, repo, title: 'Wedged', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@subagents 8', subagentWaitMs: 300 })],
+    });
+
+    // It advances to Review despite sub-agents still being reported as running…
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const review = await view(handle);
+    // …and the reviewer is told why (a sub-agent may be wedged and its output missing).
+    expect(review.reviewInfo?.summary).toContain('sub-agent(s) still reported running');
+    expect(review.reviewInfo?.summary).toContain('may be wedged');
+
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
+
   it('cancels running sub-task agents when the parent is cancelled (SPEC §5.6)', async () => {
     const repo = await h.makeRepo('app-sub-cancel');
     const taskId = newId('task');
@@ -455,5 +634,71 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const f1 = await git(repo, ['show', 'main:file1.txt']);
     expect(f0.stdout).toContain('content 0');
     expect(f1.stdout).toContain('content 1');
+  });
+
+  it('multi-repo merge queue: three pairwise-overlapping tasks drain without deadlock (ordered acquisition)', async () => {
+    // The classic circular-wait setup (dining philosophers): three repos, three
+    // tasks each touching a different PAIR — A&B, A&C, B&C. A naive "grab a slot
+    // in every repo's queue at once" scheme can deadlock (each task holds one
+    // repo and waits on another in a cycle). Ordered acquisition (sorted repo
+    // order, one at a time) makes a cycle impossible, so all three must finish.
+    const A = await h.makeRepo('repoA');
+    const B = await h.makeRepo('repoB');
+    const C = await h.makeRepo('repoC');
+    const nm = (r: string) => path.basename(r);
+
+    const specs = [
+      { label: 'AB', repos: [A, B] },
+      { label: 'AC', repos: [A, C] },
+      { label: 'BC', repos: [B, C] },
+    ];
+    const started = specs.map((s) => {
+      const taskId = newId('task');
+      // write a distinct file into each of the task's two repos
+      const prompt =
+        s.repos.map((r) => `@write ${nm(r)}/from-${s.label}.txt :: ${s.label} in ${nm(r)}`).join('\n') +
+        `\n@review ${s.label} touched ${s.repos.map(nm).join(' + ')}`;
+      const handle = h.client.workflow.start('softwareDev', {
+        taskQueue: TASK_QUEUE,
+        workflowId: taskId,
+        args: [
+          {
+            taskId,
+            projectId: 'p1',
+            title: `task ${s.label}`,
+            prompt,
+            base: 'main',
+            target: 'main',
+            project: { repos: s.repos, defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+          },
+        ],
+      });
+      return { s, taskId, handle };
+    });
+    const runs = await Promise.all(started.map(async (r) => ({ ...r, handle: await r.handle })));
+
+    // Drive every task to Review and confirm — they now all contend at Merge.
+    for (const r of runs) {
+      await expect.poll(async () => (await view(r.handle)).stage, { timeout: 20_000 }).toBe('review');
+    }
+    for (const r of runs) await r.handle.signal('confirm');
+
+    // If ordered acquisition were wrong, the shared queues would deadlock and
+    // these never resolve — the result() await is the deadlock detector.
+    const results = await Promise.all(runs.map((r) => r.handle.result()));
+    for (const res of results) expect(res.stage).toBe('done');
+
+    // Every repo received the work from BOTH tasks that touched it, landed on main.
+    for (const [repo, labels] of [
+      [A, ['AB', 'AC']],
+      [B, ['AB', 'BC']],
+      [C, ['AC', 'BC']],
+    ] as const) {
+      for (const label of labels) {
+        const shown = await git(repo, ['show', `main:from-${label}.txt`]);
+        expect(shown.code, `from-${label}.txt should be on main of ${path.basename(repo)}`).toBe(0);
+        expect(shown.stdout).toContain(label);
+      }
+    }
   });
 });

@@ -4,7 +4,10 @@ import path from 'node:path';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
+import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
+import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
+import { newSubagentTracker, trackTaskMessage, pendingSubagentCount } from './subagents.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -55,7 +58,10 @@ export class ClaudeAdapter implements AgentAdapter {
     const userMsgs = input.messages.filter((m) => m.role !== 'system');
     if (userMsgs.length) {
       for (const m of userMsgs) {
-        messages.push({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text });
+        messages.push({
+          role: m.role === 'agent' ? 'assistant' : 'user',
+          content: m.role === 'agent' ? m.text : anthropicUserContent(m),
+        });
       }
     } else {
       messages.push({ role: 'user', content: 'Begin the task. Call signal_completion when done.' });
@@ -76,7 +82,10 @@ export class ClaudeAdapter implements AgentAdapter {
         },
         body: JSON.stringify({
           model,
-          max_tokens: 4096,
+          // A whole coding response (a rewritten file, a long explanation + tool call)
+          // can exceed 4096 output tokens; too low a cap truncates mid-response, which
+          // the loop below then has to recover from. 8192 keeps most turns single-shot.
+          max_tokens: 8192,
           system: input.systemPrompt,
           messages,
           tools,
@@ -94,7 +103,19 @@ export class ClaudeAdapter implements AgentAdapter {
         finalText = text;
         ctx.emit(text);
       }
-      if (toolUses.length === 0) break;
+      if (toolUses.length === 0) {
+        // A `max_tokens` cut-off is a TRUNCATED response, not a finished turn — the
+        // model ran out of output budget mid-thought (often right after narrating an
+        // action, before emitting its tool_use). Breaking here treats that chopped-off
+        // preamble as completion, which surfaces the task at Review having done nothing
+        // — the metered-path twin of the "agent just stopped" bug. Ask it to continue
+        // instead; the enclosing maxIters loop bounds this so it can't spin forever.
+        if (data.stop_reason === 'max_tokens') {
+          messages.push({ role: 'user', content: 'Continue.' });
+          continue;
+        }
+        break;
+      }
 
       const toolResults: any[] = [];
       let completed = false;
@@ -138,8 +159,32 @@ export class ClaudeAdapter implements AgentAdapter {
       tools: buildSdkTools(tool, zod, handlers),
     });
 
-    const userText = input.messages.filter((m) => m.role !== 'system').map((m) => m.text).join('\n\n') ||
-      'Begin the task described in the system prompt. Call signal_completion when done.';
+    // Only the messages new since the resumed session last advanced (the whole
+    // conversation on a fresh session) — the session already holds the rest, so
+    // re-sending it would replay the agent's own past replies back at it (§7.2).
+    const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
+    // Attribute agent turns (`assistant:`) so a replayed full transcript — a fork, or
+    // a resume whose provider session couldn't be reattached — never folds the agent's
+    // OWN prior replies back in as fresh user input (§7.2). The SDK's `prompt` accepts
+    // only user text, so this single-string form is the best fidelity available; it
+    // matches the codex-exec path. A single-follow-up delta has no agent message, so
+    // the string is unchanged.
+    const userText = conversationToPromptText(convo) ||
+      (input.session ? 'Continue from the latest instruction.' : 'Begin the task described in the system prompt. Call signal_completion when done.');
+
+    // Images force the streaming-input form: the SDK's plain-string `prompt` can't
+    // carry image blocks, so when there are attachments we hand it an
+    // AsyncIterable<SDKUserMessage> whose MessageParam content mixes text + images.
+    // (Text-only turns keep the string prompt, byte-for-byte unchanged.)
+    const imageBlocks = collectAnthropicImageBlocks(convo);
+    const promptArg: any = imageBlocks.length
+      ? (async function* () {
+          const content: any[] = [];
+          if (userText) content.push({ type: 'text', text: userText });
+          content.push(...imageBlocks);
+          yield { type: 'user', parent_tool_use_id: null, message: { role: 'user', content } };
+        })()
+      : userText;
 
     // Scrubbed, config-home-isolated env (SPEC §7.3).
     const { scrubbedEnv } = await import('../autonomy/config-homes.js');
@@ -168,8 +213,13 @@ export class ClaudeAdapter implements AgentAdapter {
 
     let finalText = '';
     let session = input.session;
+    // Track in-harness sub-agents (the Task tool). Claude Code auto-backgrounds long
+    // sub-agents, so the main `result` can arrive — completion already signalled —
+    // while a sub-agent is still running. We fold every task-lifecycle message in and
+    // report the residual count so the workflow won't advance Do→Review mid-flight.
+    const subagents = newSubagentTracker();
     const iterator = query({
-      prompt: userText,
+      prompt: promptArg,
       options: {
         abortController,
         cwd: input.world.handle.root,
@@ -200,7 +250,18 @@ export class ClaudeAdapter implements AgentAdapter {
           if (tool === 'Bash' && typeof toolInput?.command === 'string') ctx.emit(`$ ${toolInput.command}`);
           return { behavior: 'allow' as const, updatedInput: toolInput };
         },
-        systemPrompt: input.systemPrompt,
+        // Run on TOP of Claude Code's own system prompt, not instead of it. A bare
+        // string here is a *custom* prompt that REPLACES the default (SDK docs:
+        // "string - Use a custom system prompt"), stripping the claude_code harness
+        // scaffolding — the persistence/anti-preamble conditioning that makes the CLI
+        // keep working through "I'll apply the edit now."-style narration instead of
+        // ending the turn. Without it the model reverts to conversational-assistant
+        // behavior: it narrates intent, emits no tool call, and the SDK query ends —
+        // which karmax records as a finished turn with completed:false → needsInput →
+        // Review with an empty diff (the "agent just stopped" reports, only in karmax
+        // and never in the CLI, because the CLI always runs this preset). We keep
+        // karmax's own task/tooling instructions by APPENDING them to the preset.
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: input.systemPrompt },
         ...(input.profile.model ? { model: input.profile.model } : {}),
         // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models
         // that don't support the level, so no gating is needed here.
@@ -221,6 +282,10 @@ export class ClaudeAdapter implements AgentAdapter {
         // it — so the drawer shows a live "fork this agent" command mid-turn (#3).
         const sid: string | undefined = (message as any).session_id;
         if (sid && !publishedSession) { session = sid; publishedSession = true; ctx.onSession?.(sid); }
+        // Fold sub-agent (Task tool) lifecycle events into the outstanding set. Draining
+        // the stream to its end lets any in-turn settlements clear before we report —
+        // only genuinely still-running sub-agents remain (see subagents.ts).
+        trackTaskMessage(subagents, message);
         if (message.type === 'assistant') {
           const text = (message.message?.content ?? [])
             .filter((b: any) => b.type === 'text')
@@ -246,7 +311,8 @@ export class ClaudeAdapter implements AgentAdapter {
     // The Agent SDK harness completes its own loop; treat a finished query as a
     // turn boundary. If the agent didn't call signal_completion explicitly, the
     // runtime surfaces the output at Review.
-    return { session, output: finalText };
+    const pending = pendingSubagentCount(subagents);
+    return { session, output: finalText, ...(pending ? { pendingSubagents: pending } : {}) };
   }
 }
 

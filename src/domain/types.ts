@@ -7,7 +7,7 @@
 
 export type Provider = 'claude' | 'codex' | 'mock';
 
-export type AgentRole = 'do' | 'merge' | 'resolve' | (string & {});
+export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | (string & {});
 
 // ─── Project / list / task records (the metadata index) ──────────────────────
 
@@ -48,6 +48,14 @@ export interface TaskList {
 /** The persisted index record for a task. The live view comes from the workflow query. */
 export interface TaskRecord {
   id: string;
+  /**
+   * Simple, human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
+   * project's tasks run #1, #2, …, assigned at creation. The UI displays `#num` and
+   * the URL scheme uses it (`/projects/<name>/tasks/<num>`); the opaque `id` above
+   * stays the canonical key (it is the Temporal workflowId, event key, and session
+   * key, so it must never change).
+   */
+  num?: number;
   projectId: string;
   listId: string;
   title: string;
@@ -69,6 +77,8 @@ export interface TaskRecord {
 
 export interface TaskParams {
   prompt: string;
+  /** Images attached to the initial prompt (references, never inline bytes). */
+  images?: ImageRef[];
   base?: string;
   target?: string;
   /** role -> profile id overrides. */
@@ -97,11 +107,27 @@ export type Stage =
 
 export type TaskStatus = 'active' | 'waiting' | 'blocked' | 'done' | 'failed' | 'cancelled';
 
+/**
+ * A reference to a user-attached image, stored content-addressed on disk under
+ * `$KARMAX_HOME/attachments/<id>` (SPEC — image prompts; PLAN_IMAGE_PROMPTS.md).
+ * Deliberately carries NO bytes: only this lightweight handle flows through
+ * Temporal workflow input/signals/history. Bytes are resolved back to base64
+ * (Claude/OpenAI APIs) or temp files (Codex CLI) at the activity boundary.
+ */
+export interface ImageRef {
+  /** Content hash (sha256, hex) — also the storage filename stem. */
+  id: string;
+  mediaType: string; // 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  bytes: number;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'agent' | 'system';
   text: string;
   ts: number;
+  /** User-attached images (references, never inline bytes). Absent ⇒ text-only. */
+  images?: ImageRef[];
 }
 
 export interface ReviewInfo {
@@ -127,11 +153,11 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer';
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
-export type FieldBind = 'prompt' | 'top' | 'project' | 'profile';
+export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm';
 /**
  * When a param may be edited after the task is queued (SPEC §4.5/§5.5). This is
  * the single declaration that drives in-flight edits: the workflow validator
@@ -158,7 +184,8 @@ export interface FieldSpec {
   placeholder?: string;
   scopes: FieldScope[];
   bind: FieldBind;
-  /** For agent fields / bind:'profile' — the role this configures (do/merge/resolve). */
+  /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures
+   *  (do/merge/resolve/confirm). */
   role?: string;
   /** In-flight editability window (SPEC §4.5/§5.5). Omitted ⇒ `queue`. */
   mutable?: FieldMutable;
@@ -174,6 +201,27 @@ export interface AgentSpec {
   resumeFrom?: { taskId?: string; role?: string; sessionId?: string };
 }
 
+/**
+ * Who drives the Review gate (SPEC §5.2/§5.3). `human` waits for a person to click
+ * Confirm (the default, back-compat behaviour). `auto` confirms the moment Review is
+ * reached. `agent` runs a Confirm-agent turn that reviews the work and returns a
+ * structured verdict (confirm / revise / reject) — the same three transitions a human
+ * drives. When `mode === 'agent'` the remaining `AgentSpec` fields configure that
+ * agent exactly like the Do/Merge/Resolve agent fields (including `resumeFrom`).
+ */
+export type ConfirmMode = 'human' | 'auto' | 'agent';
+export interface ConfirmConfig extends Partial<AgentSpec> {
+  mode: ConfirmMode;
+}
+
+/** The Confirm agent's structured verdict at the Review gate. `confirm` proceeds,
+ *  `revise` sends the task back to Do (with an optional comment), `reject` cancels. */
+export type ConfirmAction = 'confirm' | 'revise' | 'reject';
+export interface ConfirmDecision {
+  action: ConfirmAction;
+  text?: string;
+}
+
 /** A declared action the workflow exposes; auto-rendered as a button/form (§10.2 tier 1). */
 export interface DeclaredAction {
   name: string;
@@ -187,6 +235,12 @@ export interface DeclaredAction {
 /** The typed projection of a task's state + allowed actions the UI renders. */
 export interface TaskView {
   taskId: string;
+  /**
+   * Human-facing sequential id (SPEC §10.6), mirrored onto the view from the task
+   * record by the gateway so the UI can show `#num` and build permalinks. Not
+   * produced by the workflow (which only knows the opaque `taskId`).
+   */
+  num?: number;
   title: string;
   workflow: string;
   stage: Stage;
@@ -223,7 +277,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'parent'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right
@@ -279,6 +333,8 @@ export interface TaskInput {
   workflow?: string;
   title: string;
   prompt: string;
+  /** Images attached to the initial prompt (references, never inline bytes). */
+  images?: ImageRef[];
   base?: string;
   target?: string;
   /** Existing branch to merge (merge-only workflow). */
@@ -289,6 +345,9 @@ export interface TaskInput {
   profiles?: Record<string, string>;
   /** Per-role agent overrides (provider/model/effort/resume) from the task form (§10.5). */
   agents?: Record<string, AgentSpec>;
+  /** Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent.
+   *  Absent ⇒ human (or `auto` when the legacy `autoConfirm` flag is set). */
+  confirm?: ConfirmConfig;
   /** A snapshot of project config, captured at creation. */
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */

@@ -116,12 +116,12 @@ class ContainerWorld implements World {
   }
   async destroy(): Promise<void> {
     await docker(['rm', '-f', this.name]);
-    const { repo, root } = this.handle;
     const { git } = await import('./git.js');
-    if (repo) {
-      await git(repo, ['worktree', 'remove', '--force', root]);
-      await git(repo, ['worktree', 'prune']);
+    const { worldRepos } = await import('./types.js');
+    for (const r of worldRepos(this.handle)) {
+      await git(r.repo, ['worktree', 'remove', '--force', r.root]);
+      await git(r.repo, ['worktree', 'prune']);
     }
-    if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+    if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
   }
 }

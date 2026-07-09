@@ -13,6 +13,8 @@ const S = {
   projects: [],
   projectId: null,
   tasks: [],
+  deleted: new Set(), // ids of drafts deleted this session — tombstones so a stale
+  // in-flight list refresh (issued before the DELETE landed) can't resurrect them.
   tab: 'tasks',
   selected: null, // taskId
   view: null, // selected task view
@@ -27,7 +29,124 @@ const S = {
   ws: null,
   hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
+  returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
 };
+
+// ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
+// Every page is a host-owned route; the browser URL is the single source of truth
+// for {project, tab, open task}. Workflows/coordinators never own a URL — a page
+// like the merge queue is a first-party route that projects coordinator/task state.
+// Projects are addressed by a slug of their name; tasks are numbered per project.
+// Scheme:
+//   /                                    → home (redirects to a project's tasks)
+//   /dashboard                           → global dashboard
+//   /settings                            → global settings
+//   /projects/:name/tasks                → task list (also /queue, /activity, /settings)
+//   /projects/:name/tasks/:num           → task list with task #num open (permalink)
+function slugify(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+}
+function projectSlug(p) { return p ? slugify(p.name) : ''; }
+function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+// Resolve a URL slug back to a project. Matches the slugified name (the common,
+// human case), falling back to a raw project id for safety. On a slug collision
+// the first-created project wins (names are expected distinct).
+function projectBySlug(slug) {
+  const s = slugify(slug);
+  return (S.projects || []).find((p) => slugify(p.name) === s) || (S.projects || []).find((p) => p.id === slug);
+}
+
+function parseRoute(pathname) {
+  const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
+  if (!seg.length) return { name: 'home' };
+  if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard' };
+  if (seg[0] === 'settings') return { name: 'global', tab: 'global' };
+  if (seg[0] === 'projects' && seg[1]) {
+    const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
+    return { name: 'project', slug: seg[1], tab, taskKey };
+  }
+  return { name: 'home' };
+}
+
+// The list/tab route for a project (by id), addressed by name-slug.
+function projectRoute(pid, tab = 'tasks') {
+  const p = projectById(pid);
+  return p ? `/projects/${projectSlug(p)}/${tab}` : '/dashboard';
+}
+
+// Navigate: update the URL then reconcile app state to it. `replace` swaps the
+// current history entry instead of pushing a new one.
+function go(path, opts = {}) {
+  if (path !== location.pathname) {
+    history[opts.replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', path);
+  }
+  return applyRoute();
+}
+
+// Resolve a per-project task URL key (a numeric #num, or a raw task id) → task id.
+async function resolveProjectTaskKey(projectId, key) {
+  if (/^\d+$/.test(key)) {
+    const local = (S.tasks || []).find((t) => t.projectId === projectId && String(t.num) === key);
+    if (local) return local.id;
+    const r = await api(`/api/projects/${projectId}/tasks/by-num/${key}`).catch(() => null);
+    return r?.id ?? null;
+  }
+  const local = (S.tasks || []).find((t) => t.id === key);
+  return local ? local.id : key; // raw-id fallback
+}
+
+async function applyRoute() {
+  const r = parseRoute(location.pathname);
+  if (r.name === 'home') {
+    const pid = S.projectId || S.projects[0]?.id;
+    return go(pid ? projectRoute(pid) : '/dashboard', { replace: true });
+  }
+  if (r.name === 'global') {
+    closeDrawerDom();
+    S.tab = r.tab;
+    renderRail();
+    renderMain();
+    if (r.tab === 'dashboard') renderDashboard();
+    return;
+  }
+  // project / task routes → resolve the project (by name-slug) + optional open task
+  const proj = projectBySlug(r.slug);
+  if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
+  const pid = proj.id;
+  const tab = r.tab || 'tasks';
+  if (pid !== S.projectId) { S.projectId = pid; await loadTasks().catch(() => {}); }
+  else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
+  S.tab = tab;
+  renderRail();
+  renderMain();
+  if (tab === 'activity') seedActivity();
+  if (tab === 'dashboard') renderDashboard();
+  // reconcile the open task from the URL (loaded tasks are in hand now)
+  let taskId = null;
+  if (r.taskKey) {
+    taskId = await resolveProjectTaskKey(pid, r.taskKey);
+    if (!taskId) toast(`Task #${r.taskKey} not found`, true);
+  }
+  if (taskId) { if (S.selected !== taskId) await openDrawer(taskId); else highlightRow(); }
+  else closeDrawerDom();
+}
+
+// Push a task permalink (/projects/:name/tasks/:num) and remember where to return
+// on close (so closing lands back on the list/queue we opened from).
+function goToTask(id) {
+  const rec = (S.tasks || []).find((t) => t.id === id);
+  const p = projectById(rec?.projectId || S.projectId);
+  const keyPart = rec && rec.num != null ? String(rec.num) : id;
+  S.returnRoute = location.pathname;
+  return go(p ? `/projects/${projectSlug(p)}/tasks/${keyPart}` : location.pathname);
+}
+
+// A short human label for a task id: `#num` when known, else a short id.
+function numLabel(taskId) {
+  const t = (S.tasks || []).find((x) => x.id === taskId);
+  return t && t.num != null ? `#${t.num}` : String(taskId || '').slice(0, 8);
+}
 
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
@@ -109,13 +228,20 @@ const fieldLabel = (f) =>
   `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtn(f.name)}</div>` +
   (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
 
-function renderField(f, own, inherited) {
+function renderField(f, own, inherited, withChips) {
   const v = eff(own, inherited) ?? '';
   const label = fieldLabel(f);
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
-  if (f.type === 'text')
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
+  if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited)}</div>`;
+  if (f.type === 'text') {
+    const ta = `<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea>`;
+    // For the prompt field, pasted images render inside the box (below the text),
+    // growing it as needed — rather than in a separate "Images" section.
+    if (withChips)
+      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div></div></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
+  }
   if (f.type === 'boolean')
     return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${resetBtn(f.name)}</div></div>`;
   if (f.type === 'select')
@@ -153,6 +279,21 @@ function renderAgentField(f, spec, inherited) {
   </div>`;
 }
 
+// The confirmer field: a mode selector (human / auto / agent) plus the SAME agent
+// sub-form as Do/Merge/Resolve, shown only when the mode is "agent". Reuses
+// renderAgentField for the agent controls (so provider/model/effort + "Fork a
+// previous agent" all work identically), and carries the mode alongside.
+const CONFIRM_MODE_LABELS = { human: 'Human (you confirm)', auto: 'Auto-confirm', agent: 'Agent confirms' };
+function renderConfirmerField(f, own, inherited) {
+  const inh = inherited || {};
+  const e = own || inh;
+  const mode = e.mode || inh.mode || 'human';
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'>
+    <select class="cf-mode">${['human', 'auto', 'agent'].map((m) => `<option value="${m}" ${m === mode ? 'selected' : ''}>${esc(CONFIRM_MODE_LABELS[m])}</option>`).join('')}</select>
+    <div class="cf-agent" style="margin-top:8px;${mode === 'agent' ? '' : 'display:none'}">${renderAgentField(f, own, inherited)}</div>
+  </div>`;
+}
+
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
 
@@ -177,6 +318,33 @@ function collectForm(root, fields) {
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       // include only if the agent differs from inherited OR a resume was chosen
       if (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))) out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'confirmer') {
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+      const mode = box.querySelector('.cf-mode').value;
+      const spec = { mode };
+      let resumeFrom;
+      if (mode === 'agent') {
+        const ab = box.querySelector('.agent-field');
+        spec.provider = ab.querySelector('.af-provider').value;
+        const model = ab.querySelector('.af-model').value.trim();
+        const effort = ab.querySelector('.af-effort').value;
+        if (model) spec.model = model;
+        if (effort) spec.effort = effort;
+        const sessionId = ab.querySelector('.af-resume-session').value.trim();
+        const chosen = ab.querySelector('.af-resume-chosen').textContent.trim();
+        if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
+        if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+        if (resumeFrom) spec.resumeFrom = resumeFrom;
+      }
+      // Store only when it differs from the inherited default: a different mode, or (in
+      // agent mode) a different agent config or a chosen fork.
+      const inhMode = inh?.mode || 'human';
+      const changed = mode !== inhMode || (mode === 'agent' && (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))));
+      if (f.required || changed) out[f.name] = spec;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -246,6 +414,14 @@ function wireAgentFields(root) {
     const results = box.querySelector('.af-resume-results');
     search?.addEventListener('input', () => resumeSearch(box, search.value, results));
   });
+  // Confirmer fields: show the agent sub-form only when mode is "agent".
+  root.querySelectorAll('.confirmer-field').forEach((box) => {
+    const mode = box.querySelector('.cf-mode');
+    const agentBox = box.querySelector('.cf-agent');
+    mode?.addEventListener('change', () => {
+      if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
+    });
+  });
 }
 
 // Wire per-field "Reset to default" buttons: show the button whenever the field
@@ -263,6 +439,12 @@ function wireFieldResets(root, fields) {
       box.addEventListener('input', sync);
       box.addEventListener('change', sync);
       btn.addEventListener('click', () => { resetAgentField(box); sync(); });
+    } else if (f.type === 'confirmer') {
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      box.addEventListener('input', sync);
+      box.addEventListener('change', sync);
+      btn.addEventListener('click', () => { resetConfirmerField(box); sync(); });
     } else {
       const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
       if (!el) continue;
@@ -283,6 +465,21 @@ function fieldOverridden(root, f) {
     const spec = { provider: box.querySelector('.af-provider').value };
     const model = box.querySelector('.af-model').value.trim();
     const effort = box.querySelector('.af-effort').value;
+    if (model) spec.model = model;
+    if (effort) spec.effort = effort;
+    return !sameJson(normSpec(spec), normSpec(inh));
+  }
+  if (f.type === 'confirmer') {
+    const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+    if (!box) return false;
+    const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+    const mode = box.querySelector('.cf-mode').value;
+    if (mode !== (inh?.mode || 'human')) return true;
+    if (mode !== 'agent') return false;
+    const ab = box.querySelector('.agent-field');
+    const spec = { provider: ab.querySelector('.af-provider').value };
+    const model = ab.querySelector('.af-model').value.trim();
+    const effort = ab.querySelector('.af-effort').value;
     if (model) spec.model = model;
     if (effort) spec.effort = effort;
     return !sameJson(normSpec(spec), normSpec(inh));
@@ -318,19 +515,47 @@ function resetAgentField(box) {
   if (eff && inh.effort) eff.value = inh.effort;
 }
 
+function resetConfirmerField(box) {
+  const inh = JSON.parse(box.getAttribute('data-inherit') || 'null') || {};
+  const mode = box.querySelector('.cf-mode');
+  mode.value = inh.mode || 'human';
+  const agentBox = box.querySelector('.cf-agent');
+  if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
+  const ab = box.querySelector('.agent-field');
+  if (ab) resetAgentField(ab);
+}
+
+// Full task list (incl. archived) for the fork picker, cached per project.
+// Archived tasks are the completed ones you most often want to fork from, so the
+// fork search must see them regardless of the "Show archived" toggle. Cached to
+// avoid re-fetching (and re-enriching) the whole list on every keystroke;
+// loadTasks() clears the cache so newly created/updated tasks show up.
+async function forkTaskPool() {
+  if (!S.projectId) return S.tasks;
+  if (S.forkPool?.projectId === S.projectId) return S.forkPool.tasks;
+  const tasks = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
+  S.forkPool = { projectId: S.projectId, tasks };
+  return tasks;
+}
+
 // Fork search: find tasks by title, then list their per-role agent sessions.
 async function resumeSearch(box, q, results) {
   const ql = q.toLowerCase().trim();
   if (!ql) { results.innerHTML = ''; return; }
-  const matches = S.tasks.filter((t) => !t.params?.draft && t.title.toLowerCase().includes(ql)).slice(0, 6);
+  // The pool includes archived tasks (the ones most often forked from); match by
+  // title OR by their `#num` (SPEC §10.6).
+  let pool = S.tasks;
+  try { pool = await forkTaskPool(); } catch {}
+  const matches = pool.filter((t) => !t.params?.draft && taskMatches(t, ql)).slice(0, 6);
   const rows = await Promise.all(
     matches.map(async (t) => {
       let sessions = {};
       try { sessions = await api(`/api/tasks/${t.id}/sessions`); } catch {}
       const roles = Object.keys(sessions);
       if (!roles.length) return '';
+      const numTag = t.num != null ? `<span class="task-num">#${t.num}</span> ` : '';
       return roles
-        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
+        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${numTag}${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
         .join('');
     }),
   );
@@ -360,6 +585,90 @@ async function api(path, opts = {}) {
   const body = ct.includes('json') ? await res.json() : await res.text();
   if (!res.ok) throw new Error(body?.error || `HTTP ${res.status}`);
   return body;
+}
+
+// ─── Image attachments (paste / drag-drop an image into a prompt field) ───────
+// Bytes are uploaded to the content-addressed store immediately, so the task /
+// follow-up payloads carry only the returned lightweight { id, mediaType, bytes }
+// reference. Thumbnails are served back via /api/attachments/:id?token=… (an
+// <img> can't send a Bearer header, so the session token rides in the query).
+async function uploadImage(file) {
+  const res = await fetch('/api/attachments', {
+    method: 'POST',
+    headers: { 'content-type': file.type || 'application/octet-stream', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
+    body: file,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
+  return body; // ImageRef
+}
+
+function attachmentUrl(id) {
+  return `/api/attachments/${encodeURIComponent(id)}?token=${encodeURIComponent(S.token || '')}`;
+}
+
+function renderImageChips(container, store, onChange) {
+  if (!container) return;
+  container.innerHTML = (store || [])
+    .map(
+      (ref, i) =>
+        `<span class="img-chip" title="${esc(ref.mediaType)} · ${Math.round((ref.bytes || 0) / 1024)} KB"><img src="${attachmentUrl(ref.id)}" alt="attachment"/><button class="img-chip-x" data-i="${i}" title="Remove">✕</button></span>`,
+    )
+    .join('');
+  container.style.display = (store || []).length ? 'flex' : 'none';
+  container.querySelectorAll('.img-chip-x').forEach((b) =>
+    b.addEventListener('click', () => {
+      store.splice(Number(b.dataset.i), 1);
+      renderImageChips(container, store, onChange);
+      if (onChange) onChange();
+    }),
+  );
+}
+
+// Wire paste + drag-drop image capture onto a text input. `getStore` returns the
+// live ImageRef array; `onChange` re-renders the chips. Idempotent per element.
+function wireImagePaste(inputEl, getStore, onChange) {
+  if (!inputEl || inputEl._imgWired) return;
+  inputEl._imgWired = true;
+  const ingest = async (files) => {
+    const imgs = [...files].filter((f) => f && f.type && f.type.startsWith('image/'));
+    if (!imgs.length) return false;
+    for (const file of imgs) {
+      try {
+        const ref = await uploadImage(file);
+        getStore().push(ref);
+        onChange();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    }
+    return true;
+  };
+  inputEl.addEventListener('paste', (e) => {
+    const items = [...(e.clipboardData?.items || [])];
+    const files = items.filter((i) => i.kind === 'file' && i.type.startsWith('image/')).map((i) => i.getAsFile());
+    if (!files.length) return; // let normal text paste through
+    e.preventDefault();
+    ingest(files);
+  });
+  inputEl.addEventListener('dragover', (e) => {
+    if ([...(e.dataTransfer?.items || [])].some((i) => i.type && i.type.startsWith('image/'))) e.preventDefault();
+  });
+  inputEl.addEventListener('drop', (e) => {
+    const files = [...(e.dataTransfer?.files || [])];
+    if (files.some((f) => f.type && f.type.startsWith('image/'))) {
+      e.preventDefault();
+      ingest(files);
+    }
+  });
+}
+
+// Render read-only image thumbnails for a message that carried attachments.
+function renderMessageImages(images) {
+  if (!images || !images.length) return '';
+  return `<div class="msg-images">${images
+    .map((ref) => `<a href="${attachmentUrl(ref.id)}" target="_blank" rel="noopener"><img src="${attachmentUrl(ref.id)}" alt="attachment"/></a>`)
+    .join('')}</div>`;
 }
 
 function toast(msg, err = false, action) {
@@ -395,6 +704,8 @@ async function boot() {
   connectWs();
   renderShell();
   bindKeys();
+  window.addEventListener('popstate', () => applyRoute());
+  await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
 
 async function loadProjects() {
@@ -404,7 +715,14 @@ async function loadProjects() {
 
 async function loadTasks() {
   if (!S.projectId) return;
-  S.tasks = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
+  S.forkPool = null; // let the fork picker re-fetch its archived-inclusive pool
+  const fetched = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
+  // Drop any draft we just deleted: a list request issued before the DELETE landed
+  // can still return it and clobber the optimistic removal. Once a fresh fetch no
+  // longer contains a tombstoned id, the server has caught up — retire it so the
+  // set can't grow without bound (task ids are never reused).
+  for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
+  S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
 }
 
 // ── websocket live stream ──────────────────────────────────────────────────
@@ -460,9 +778,8 @@ function renderShell() {
   $('#search').addEventListener('input', (e) => { S.search = e.target.value; if (S.tab === 'tasks') renderMain(); });
   $('#theme').addEventListener('click', toggleTheme);
   $('#bell').addEventListener('click', toggleNotifications);
-  renderRail();
-  renderMain();
-  refreshTasks();
+  // The rail/main are painted by applyRoute() (boot calls it right after), so the
+  // shell reflects the initial URL instead of a default view.
 }
 
 function renderRail() {
@@ -484,7 +801,7 @@ function renderRail() {
     <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
     <div class="nav-item" id="rail-palette" tabindex="0" title="Every command, task, and project — searchable">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
   rail.querySelectorAll('.proj[data-id]').forEach((e) =>
-    e.addEventListener('click', () => { S.projectId = e.dataset.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); }),
+    e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
@@ -492,11 +809,10 @@ function renderRail() {
 }
 
 function switchTab(tab) {
-  S.tab = tab;
-  renderRail();
-  renderMain();
-  if (tab === 'activity') seedActivity();
-  if (tab === 'dashboard') renderDashboard();
+  if (tab === 'dashboard') return go('/dashboard');
+  if (tab === 'global') return go('/settings');
+  const pid = S.projectId || S.projects[0]?.id;
+  return go(pid ? projectRoute(pid, tab) : '/dashboard');
 }
 
 // Preserve the focused field (value + caret) across a renderMain() innerHTML
@@ -567,8 +883,17 @@ function renderMain() {
 }
 
 // ── tasks ────────────────────────────────────────────────────────────────────
+// Match a task against a search query: by title, or by its `#num` (so "42" and
+// "#42" both find task #42).
+function taskMatches(t, q) {
+  if (!q) return true;
+  const ql = q.toLowerCase().trim();
+  if (t.title.toLowerCase().includes(ql)) return true;
+  if (t.num != null && `#${t.num}`.includes(ql.startsWith('#') ? ql : `#${ql}`)) return true;
+  return false;
+}
 function tasksView() {
-  const filtered = S.tasks.filter((t) => (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())));
+  const filtered = S.tasks.filter((t) => taskMatches(t, S.search));
   const rows = filtered
     .slice()
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
@@ -577,11 +902,12 @@ function tasksView() {
   const archivedCount = S.tasks.filter((t) => t.params?.archived).length;
   return `
     <div class="composer">
-      <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )" />
+      <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
       <button class="btn" id="expand-task" title="Full task form ( N or ↵ )">⋯ More</button>
       <button class="btn primary" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )">Add</button>
     </div>
+    <div class="img-chips" id="new-task-chips" style="display:none"></div>
     <div class="switch" style="justify-content:flex-end;margin:4px 0">
       <input type="checkbox" id="show-archived" ${S.showArchived ? 'checked' : ''} />
       <label for="show-archived" style="font-size:12px;color:var(--ink-3)">Show archived${S.showArchived && archivedCount ? ` (${archivedCount})` : ''}</label>
@@ -596,7 +922,7 @@ function taskRow(t) {
     <div class="task-row" data-draft="${t.id}" tabindex="0">
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
         <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span></div>
       </div>
       <div class="task-right">
@@ -620,15 +946,25 @@ function taskRow(t) {
     <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
           <span class="wf">${esc(t.workflow)}</span>
           ${v.branch ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          <span class="chip ${status}">${esc(stage)}</span>
+          <span class="chip ${status}">${esc(stageLabel(v))}</span>
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
     </div>`;
+}
+
+// Human-facing stage label. In the `merge` stage a task is either waiting for
+// its merge-queue slot or actively merging — the merge agent only runs once the
+// slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
+// "merge queued" for the wait, which the raw `stage` alone hides.
+function stageLabel(v) {
+  const stage = v.stage || 'setup';
+  if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
+  return stage;
 }
 
 // The workflow's declared stages (SPEC §5), or the software-dev default.
@@ -685,7 +1021,7 @@ function pipelineLarge(v) {
 }
 
 function wireTasksView() {
-  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.id)));
+  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.id)));
   $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
   );
@@ -693,7 +1029,14 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      // Deleting a draft is a hard delete with no undo, so confirm first.
+      const title = S.tasks.find((t) => t.id === b.dataset.deldraft)?.title || 'this draft';
+      if (!confirm(`Delete draft "${title}"? This cannot be undone.`)) return;
+      await deleteDraft(b.dataset.deldraft);
+      toast('Draft removed');
+    }),
   );
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
@@ -716,14 +1059,23 @@ function wireTasksView() {
   const add = async () => {
     const input = $('#new-task');
     const title = input.value.trim();
-    if (!title) return;
+    const images = S.newTaskImages || [];
+    if (!title && !images.length) return;
     const workflow = $('#new-wf').value;
     input.value = '';
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify({ title: firstLine(title), prompt: title, command: workflow === 'script-exec' ? title : undefined, workflow }),
+        body: JSON.stringify({
+          title: firstLine(title || 'Image task'),
+          prompt: title,
+          command: workflow === 'script-exec' ? title : undefined,
+          workflow,
+          ...(images.length ? { images } : {}),
+        }),
       });
+      S.newTaskImages = [];
+      renderImageChips($('#new-task-chips'), S.newTaskImages);
       toast('Task created');
       await refreshTasks();
     } catch (e) {
@@ -739,6 +1091,10 @@ function wireTasksView() {
     if (e.metaKey || e.ctrlKey) add();
     else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
   });
+  // Paste / drag-drop an image into the quick-add box to attach it (SPEC — image prompts).
+  if (!S.newTaskImages) S.newTaskImages = [];
+  wireImagePaste($('#new-task'), () => S.newTaskImages, () => renderImageChips($('#new-task-chips'), S.newTaskImages));
+  renderImageChips($('#new-task-chips'), S.newTaskImages);
   // Opening the full form via "More" carries over whatever was typed in the
   // quick-add box into the field that consumes it (Prompt, Command, …).
   $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
@@ -761,7 +1117,11 @@ function consumingField(fields) {
 
 async function deleteDraft(id) {
   // Drafts never started a workflow, so the record is hard-deleted server-side.
-  try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch (e) { return toast(e.message, true); }
+  // A 404 means it's already gone (e.g. a racing double-delete) — treat that as
+  // success rather than surfacing a confusing "no such task" error.
+  try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); }
+  catch (e) { if (!/no such task|HTTP 404/i.test(e.message || '')) return toast(e.message, true); }
+  S.deleted.add(id); // tombstone before a debounced refresh can re-fetch the stale list
   S.tasks = S.tasks.filter((t) => t.id !== id);
   renderMain();
 }
@@ -770,11 +1130,14 @@ async function deleteDraft(id) {
 async function openTaskForm(workflow, draft, seedText) {
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
+  // The prompt/consuming field (a textarea) hosts pasted-image chips inside its
+  // own box; only fall back to a standalone "Images" section if there isn't one.
+  const cf = consumingField(fields);
+  const promptField = cf && cf.type === 'text' ? cf : null;
   const values = draft ? { ...draft.params } : {};
   // Carry over the quick-add text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
-    const cf = consumingField(fields);
     if (cf && !values[cf.name]) values[cf.name] = seedText;
   }
   let inherited = {};
@@ -788,7 +1151,12 @@ async function openTaskForm(workflow, draft, seedText) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
+        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name], f === promptField)).join('')}
+          ${promptField ? '' : `<div class="form-row" data-row="__images">
+            <div class="label-row"><label>Images</label></div>
+            <div class="img-chips" id="tf-chips" style="display:none"></div>
+            <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
+          </div>`}
           <div class="form-row" data-row="__notes">
             <div class="label-row"><label>Notes</label></div>
             <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
@@ -823,9 +1191,20 @@ async function openTaskForm(workflow, draft, seedText) {
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
+  // Image attachments for the full task form: pasting/dropping an image into any
+  // text field attaches it to the prompt. State is local to this form instance.
+  const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
+  // Repaint chips and (unless first paint) auto-save — pasting an image fires no
+  // 'input' event, so the debounced auto-save wouldn't otherwise pick it up.
+  // `autoSaveSoon` is a hoisted declaration further down this same scope.
+  const paintFormChips = (save) => { renderImageChips($('#tf-chips'), formImages, () => autoSaveSoon()); if (save) autoSaveSoon(); };
+  $('#tf-body')
+    .querySelectorAll('textarea, input[type="text"], input:not([type])')
+    .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
+  paintFormChips();
   // Focus the consuming field (prompt/command) with the caret at the end, so
-  // Enter-from-quick-add flows straight into elaborating what was typed.
-  const cf = consumingField(fields);
+  // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
+  // (the consuming field) is resolved once at the top of this function.
   const cfEl = cf && $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`);
   if (cfEl) {
     cfEl.focus();
@@ -846,12 +1225,19 @@ async function openTaskForm(workflow, draft, seedText) {
   // brand-new task gets one lazily the first time auto-save persists real content.
   let draftId = draft?.id || null;
   const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
-  const formState = () => ({ body: collectForm($('#tf-body'), fields), notes: $('#tf-notes')?.value ?? '' });
+  // Prompt image attachments ride inside `params` (references only), so they flow
+  // through auto-save, draft, and queue the same way the prompt text does.
+  const formState = () => {
+    const body = collectForm($('#tf-body'), fields);
+    if (formImages.length) body.images = [...formImages];
+    return { body, notes: $('#tf-notes')?.value ?? '' };
+  };
   // Whether the user has actually put something worth keeping into a NEW task —
   // guards against spawning empty drafts just from opening the form.
   const hasContent = ({ body, notes }) =>
     notes.trim() !== '' ||
     hasPolicy() ||
+    formImages.length > 0 ||
     Object.values(body).some((v) =>
       Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
 
@@ -919,6 +1305,23 @@ async function openTaskForm(workflow, draft, seedText) {
 async function openDrawer(taskId) {
   S.selected = taskId;
   S.drawerEvents = [];
+  // Reset the live-output accumulator on task switch. It's only cleared by a
+  // turn.result/view.updated event for the *selected* task (see the WS handler),
+  // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
+  // "let me merge master into this branch") bleeds into THIS drawer's live bubble
+  // until the next event arrives — a stale cross-task render, never in the store/.jsonl.
+  S.liveOutput = '';
+  // Drop the previous task's view + per-task derived state up front. `S.view` is
+  // re-fetched first below, but the siblings (sessions/widgets/paramDefaults) are
+  // fetched a few awaits later — so a render firing in that gap (a WS event, a
+  // background refresh) would pair the NEW view with the OLD task's fork command /
+  // widgets / param defaults. renderDrawer no-ops while `S.view` is null, and empty
+  // siblings render as "no command / no widgets / (default)" — both corrected a beat
+  // later by the awaited fetches. Never show another task's data, even for one frame.
+  S.view = null;
+  S.sessions = {};
+  S.widgets = [];
+  S.paramDefaults = {};
   highlightRow();
   try {
     S.view = await api(`/api/tasks/${taskId}`);
@@ -939,9 +1342,22 @@ async function refreshDrawer() {
   } catch {}
   renderDrawer();
 }
+// Close the drawer by navigating back to the underlying list/queue; applyRoute()
+// then tears the drawer DOM down. Kept as a navigation so the URL + history stay
+// in sync (the ✕ button, the scrim, Esc and the palette all route through here).
 function closeDrawer() {
+  const pid = (S.view && S.tasks.find((t) => t.id === S.view.taskId)?.projectId) || S.projectId;
+  const back = S.returnRoute || (pid ? projectRoute(pid) : '/dashboard');
+  S.returnRoute = null;
+  return go(back, { replace: true });
+}
+// Tear down the drawer DOM without navigating (called by applyRoute()).
+function closeDrawerDom() {
+  if (!S.selected && !S.view) return;
   S.selected = null;
   S.view = null;
+  S.liveOutput = ''; // drop any streamed live text so it can't reappear in the next drawer
+  S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next drawer
   if (termWs) { try { termWs.close(); } catch {} termWs = null; }
   $('#drawer-root').innerHTML = '';
   highlightRow();
@@ -971,8 +1387,9 @@ function renderDrawer() {
     <aside class="drawer open">
       <div class="drawer-head">
         <div class="row1">
+          ${v.num != null ? `<span class="task-num" title="Task #${v.num}${(() => { const p = projectById(S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId); return p ? ` — permalink /projects/${projectSlug(p)}/tasks/${v.num}` : ''; })()}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          <span class="chip ${v.status}">${esc(v.stage)}</span>
+          <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
           <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
@@ -1074,7 +1491,7 @@ function drawerBody(v) {
   const conversations = transcripts
     .map((t) => {
       const body = (t.messages || [])
-        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}</div>`)
+        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}${renderMessageImages(m.images)}</div>`)
         .join('') || '<div class="msg system">No messages yet</div>';
       // Only the active role gets the #live-bubble (one per drawer, updated by the WS stream).
       const live = t.role === liveRole
@@ -1094,7 +1511,10 @@ function drawerBody(v) {
       const agentName = esc(t.label || t.role);
       const fu = followUp
         ? `<div class="followup-box" data-role="${esc(t.role)}">
-            <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…" ${followUp.enabled ? '' : 'disabled'}></textarea>
+            <div class="prompt-field">
+              <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}></textarea>
+              <div class="img-chips followup-chips" style="display:none"></div>
+            </div>
             <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
           </div>`
         : '';
@@ -1121,7 +1541,7 @@ function drawerBody(v) {
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
     : '';
   const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(id)}</span></div>`).join('')}`
+    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
     : '';
   return `
     <div class="section-h">Pipeline</div>
@@ -1170,7 +1590,9 @@ function waitingLabel(w) {
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
+    case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'parent': return 'the parent task to respond';
+    case 'confirm': return 'the confirm agent to review';
     default: return w.detail || w.kind;
   }
 }
@@ -1588,23 +2010,37 @@ function wireActions(v) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.open)));
+  $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.open)));
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
 // agent role it addresses, so a follow-up is delivered to the right agent.
 function wireFollowups(v) {
+  if (!S.followupImages) S.followupImages = {};
   $('#drawer-body').querySelectorAll('.followup-box').forEach((box) => {
     const role = box.dataset.role;
     const ta = box.querySelector('.followup-input');
     const btn = box.querySelector('.followup-send');
     if (!ta || !btn) return;
+    // Per-(task,role) image store, so pasted attachments survive the drawer's
+    // frequent WS-driven re-renders (like the textarea text is preserved).
+    const key = `${v.taskId}/${role}`;
+    const store = (S.followupImages[key] ||= []);
+    const chips = box.querySelector('.followup-chips');
+    const paint = () => renderImageChips(chips, store);
+    wireImagePaste(ta, () => store, paint);
+    paint();
     const send = async () => {
       const text = ta.value.trim();
-      if (!text) return;
+      if (!text && !store.length) return;
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', text, role }) });
+        await api(`/api/tasks/${v.taskId}/signal`, {
+          method: 'POST',
+          body: JSON.stringify({ signal: 'followUp', text, role, ...(store.length ? { images: [...store] } : {}) }),
+        });
         ta.value = '';
+        store.length = 0;
+        paint();
         toast('Follow-up sent');
         setTimeout(refreshDrawer, 250);
         setTimeout(refreshTasks, 400);
@@ -1648,18 +2084,20 @@ function queueView() {
     .map((t) => {
       const v = t.lastView || {};
       const pos = v.mergeQueue?.position;
-      const current = pos === 0;
-      return `<div class="queue-item ${current ? 'current' : ''}" data-id="${t.id}" tabindex="0">
-        <span class="pos">${pos === 0 ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${esc(t.title)}</div>
+      // Holds the slot (merge agent running) only when granted — not merely at
+      // position 0 in a queue whose slot is still held by someone else.
+      const merging = !!v.state?.mergeGranted;
+      return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" tabindex="0">
+        <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
+        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
-        ${!current && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
+        ${!merging && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
       </div>`;
     })
     .join('');
 }
 function wireQueueView() {
-  $('#main').querySelectorAll('.queue-item').forEach((e) => e.addEventListener('click', (ev) => { if (!ev.target.dataset.prio) openDrawer(e.dataset.id); }));
+  $('#main').querySelectorAll('.queue-item').forEach((e) => e.addEventListener('click', (ev) => { if (!ev.target.dataset.prio) goToTask(e.dataset.id); }));
   $('#main').querySelectorAll('[data-prio]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
@@ -1681,7 +2119,7 @@ function activityView() {
   if (!S.activity.length) return `<div class="empty"><div class="big">No activity yet</div>Events stream here as agents work.</div>`;
   return `<div class="card"><div class="events" style="max-height:none">${S.activity
     .slice(0, 300)
-    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span style="color:var(--ink-3)">${esc(e.taskId?.slice(0, 14))}</span><span>${esc(summarize(e.payload))}</span></div>`)
+    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span class="mono" style="color:var(--ink-3)">${esc(numLabel(e.taskId))}</span><span>${esc(summarize(e.payload))}</span></div>`)
     .join('')}</div></div>`;
 }
 
@@ -2371,10 +2809,10 @@ function toggleNotifications() {
   pop.className = 'popover';
   pop.id = 'notif-pop';
   pop.innerHTML = `<div class="ph">Needs attention (${items.length})</div>${
-    items.length ? items.map((t) => `<div class="pi" data-id="${t.id}"><b>${esc(t.title)}</b><div class="task-sub"><span class="chip ${t.lastView.status}">${esc(t.lastView.stage)}</span></div></div>`).join('') : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'
+    items.length ? items.map((t) => `<div class="pi" data-id="${t.id}"><b>${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</b><div class="task-sub"><span class="chip ${t.lastView.status}">${esc(t.lastView.stage)}</span></div></div>`).join('') : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'
   }`;
   $('#overlay-root').appendChild(pop);
-  pop.querySelectorAll('.pi[data-id]').forEach((e) => e.addEventListener('click', () => { pop.remove(); openDrawer(e.dataset.id); }));
+  pop.querySelectorAll('.pi[data-id]').forEach((e) => e.addEventListener('click', () => { pop.remove(); goToTask(e.dataset.id); }));
   setTimeout(() => document.addEventListener('click', function h(ev) { if (!pop.contains(ev.target) && ev.target.id !== 'bell') { pop.remove(); document.removeEventListener('click', h); } }), 10);
 }
 
@@ -2655,7 +3093,7 @@ function openAdjacentTask(delta) {
   const order = taskOrder();
   const i = order.indexOf(S.selected);
   const next = order[i < 0 ? 0 : i + delta];
-  if (next) { S.cursorId = next; openDrawer(next); }
+  if (next) { S.cursorId = next; goToTask(next); }
 }
 
 // -- projects rail focus (g p): walk projects + global entries by keyboard ----
@@ -2755,7 +3193,7 @@ function openPalette() {
       for (const t of S.tasks) {
         if (t.params?.archived) continue;
         const score = fuzzyScore(q, t.title);
-        if (score >= 0) items.push({ group: 'Tasks', title: t.title, sub: `${t.workflow}${t.params?.draft ? ' · draft' : t.lastView?.stage ? ` · ${t.lastView.stage}` : ''}`, score, run: () => (t.params?.draft ? openTaskForm(undefined, t) : openDrawer(t.id)) });
+        if (score >= 0) items.push({ group: 'Tasks', title: t.title, sub: `${t.workflow}${t.params?.draft ? ' · draft' : t.lastView?.stage ? ` · ${t.lastView.stage}` : ''}`, score, run: () => (t.params?.draft ? openTaskForm(undefined, t) : goToTask(t.id)) });
       }
       for (const p of S.projects) {
         const score = fuzzyScore(q, p.name);

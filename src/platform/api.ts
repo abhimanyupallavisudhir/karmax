@@ -7,8 +7,8 @@ import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project } from '../domain/types.js';
-import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
+import { TaskRecord, TaskView, Message, Project, ImageRef } from '../domain/types.js';
+import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
@@ -84,10 +84,16 @@ export class KarmaxApi {
    * (the empty-repo footgun). Refuse the *run* early, with an actionable message,
    * rather than let a whole attempt burn against the wrong world.
    */
-  private assertRepoConfigured(manifest: WorkflowManifest, project: Project) {
+  private assertRepoConfigured(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
     if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
-    const configured = (project.config.repos ?? []).some((r) => !!r && r.trim().length > 0);
+    // Guard on the EFFECTIVE repo list the world will be built from (the resolved
+    // settings overlay, falling back to project config) — the same value that
+    // reaches createWorld — not project.config alone. Those two can diverge (an
+    // empty settings-overlay repos list resolving to nothing while config still
+    // holds a repo), and checking config-only let that case slip through into a
+    // silent scratch sandbox — the very footgun this guard exists to prevent.
+    const configured = effectiveRepos(resolved, project.config).length > 0;
     if (!configured) {
       throw new Error(
         `Workflow "${manifest.name}" works on a repository, but project "${project.name}" has no repository ` +
@@ -103,6 +109,8 @@ export class KarmaxApi {
       projectId: string;
       title?: string;
       prompt?: string;
+      /** Images attached to the initial prompt (references, never inline bytes). */
+      images?: ImageRef[];
       workflow?: string;
       base?: string;
       target?: string;
@@ -126,16 +134,20 @@ export class KarmaxApi {
     const { manifest, startType } = start;
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
-    // Refuse to *run* a repo-oriented workflow with no repository configured
-    // (drafts may still be saved without one, then checked again at queueTask).
-    if (!args.draft) this.assertRepoConfigured(manifest, project);
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
+    // Image attachments ride alongside the prompt but aren't a manifest param, so
+    // carry them explicitly (references only — bytes live in the attachment store).
+    if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides);
+    // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
+    // (drafts may still be saved without one, then checked again at queueTask).
+    // Checked after resolution so the guard sees the same repos the world will.
+    if (!args.draft) this.assertRepoConfigured(manifest, project, resolved);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
     // Persist only the task's OWN overrides (sparse), not the resolved snapshot.
@@ -167,6 +179,8 @@ export class KarmaxApi {
     });
     input.workflow = workflow;
     if (args.profiles) input.profiles = args.profiles;
+    const initialImages = taskOverrides.images as ImageRef[] | undefined;
+    if (initialImages?.length) input.images = initialImages;
 
     // Pin the execution to the manifest version stamped on the task (§21b), so a
     // later version upgrade only affects new tasks, never this running one.
@@ -257,12 +271,13 @@ export class KarmaxApi {
     const start = this.resolveStart(task.workflow, task.workflowVersion);
     if (!project || !start) throw new Error(`cannot queue task ${taskId}`);
     const { manifest, startType } = start;
-    this.assertRepoConfigured(manifest, project); // same guard as createTask, before we clear the draft
     // Re-resolve against the CURRENT project/global defaults. The task stored only
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived) aren't overrides.
-    const { profiles, draft: _d, archived: _a, ...overrides } = task.params as Record<string, unknown>;
+    const { profiles, draft: _d, archived: _a, images, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
+    // Same guard as createTask, on the resolved effective repos, before we clear the draft.
+    this.assertRepoConfigured(manifest, project, resolved);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,
@@ -271,6 +286,7 @@ export class KarmaxApi {
     });
     input.workflow = task.workflow;
     if (profiles) input.profiles = profiles as Record<string, string>;
+    if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     this.deps.store.clearDraft(taskId);
     // Bounded + compensated: on a wedged engine, restore the draft flag so a
     // failed queue attempt leaves the task saved (not stranded, non-draft, with
@@ -315,11 +331,17 @@ export class KarmaxApi {
     return this.deps.store.listTasks(projectId);
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string): Promise<void> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
     this.require(token, 'signal_task');
     const handle = this.deps.client.workflow.getHandle(taskId);
     if (signal === SIG.followUp) {
-      const msg: Message = { id: `u${Date.now()}`, role: 'user', text: text ?? '', ts: 0 };
+      const msg: Message = {
+        id: `u${Date.now()}`,
+        role: 'user',
+        text: text ?? '',
+        ts: 0,
+        ...(images?.length ? { images } : {}),
+      };
       // `role` (the addressed agent) is optional — single-agent workflows ignore it
       // and route every follow-up to their sole conversation.
       await handle.signal(SIG.followUp, msg, role);
