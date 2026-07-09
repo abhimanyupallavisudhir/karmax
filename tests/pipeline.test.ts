@@ -137,16 +137,17 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('hi there');
   });
 
-  it('delivers a follow-up sent WHILE a turn is running on the next turn (SPEC §5.6)', async () => {
-    // Regression: a follow-up that arrives mid-turn used to be marked "already seen"
-    // (seen = msgs.length AFTER the turn) and so silently never reached the agent —
-    // it must instead be delivered on the next turn.
+  it('injects a follow-up sent WHILE a turn is running INTO that live turn (SPEC §5.6)', async () => {
+    // A follow-up that arrives mid-turn is polled from the workflow (pendingMessages
+    // query) and injected into the LIVE agent session — it is executed in the SAME
+    // turn, not deferred to the next one, and never dropped nor re-concatenated.
     const repo = await h.makeRepo('app-midturn');
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       // Turn one sleeps ~3s — a window to send a follow-up while the turn is running.
+      // The mock polls for follow-ups between sleep steps and processes them in-flight.
       args: [input({ taskId, repo, title: 'Mid-turn', prompt: '@sleep 3000\n@review turn one' })],
     });
     // wait until the Do turn is actually running, then send the follow-up MID-turn
@@ -155,16 +156,21 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await handle.signal('followUp', {
       id: 'mid1',
       role: 'user',
-      text: '@write mid.txt :: delivered after all\n@review done now',
+      text: '@write mid.txt :: delivered after all',
       ts: 0,
     });
-    // The agent must actually RUN the follow-up on its next turn (not park at Review
-    // with it marked consumed). Its reply proves the directive was delivered+executed.
+    // The single Do turn folds the follow-up in: its reply proves the directive was
+    // injected + executed in-flight.
     await expect
       .poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text?.includes('wrote mid.txt')), {
         timeout: 15_000,
       })
       .toBe(true);
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    // In-flight, NOT next-turn: exactly one Do turn ran, so there is exactly one agent
+    // reply in the transcript — the follow-up did not spawn a second turn.
+    const agentReplies = (await view(handle)).messages.filter((m: any) => m.role === 'agent');
+    expect(agentReplies.length).toBe(1);
     await handle.signal('confirm');
     const result = await handle.result();
     expect(result.stage).toBe('done');
