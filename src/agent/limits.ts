@@ -48,6 +48,38 @@ export function isTransportError(message: string): boolean {
   );
 }
 
+/**
+ * A signal-9 / OOM-signature kill: the model subprocess was reaped by SIGKILL
+ * (signal 9) or an explicit out-of-memory error surfaced — nothing the agent said
+ * or did. The Claude Agent SDK surfaces this as the opaque "Claude Code process
+ * terminated by signal SIGKILL" (karmax#4).
+ *
+ * The SENDER is not encoded in the message and is NOT always the kernel OOM
+ * killer. On karmax's single-host deployment two senders dominate: (1) the OS OOM
+ * killer under real memory pressure, and (2) karmax's OWN reapOrphans() sweep
+ * (src/agent/custody.ts), which SIGKILLs a prior incarnation's in-flight agents
+ * after a restart/reload — the confirmed cause in the 2026-07 incident, where
+ * journalctl/oomd logged zero kills. Both are environmental and both should
+ * retry-and-resume, so this predicate matches either; the caller decides the
+ * wording by checking live memory (see signalKillMessage in activities/core.ts).
+ *
+ * Pure (a string parse) so it is the ONE shared predicate for both the activity's
+ * error classifier (classifyTurnError) and the software-dev auto-resolve path
+ * (tracked separately) — the two must agree on "is this a signal-9/OOM kill?".
+ * Cancellation is filtered out upstream (an aborted turn rethrows before
+ * classification), so a SIGKILL that reaches classification is environmental.
+ */
+export function isResourceKill(message: string): boolean {
+  const lc = String(message ?? '').toLowerCase();
+  return (
+    /\bsigkill\b/.test(lc) ||
+    /terminated by signal\s+9\b/.test(lc) ||
+    /\bsignal\s+9\b/.test(lc) ||
+    /\benomem\b/.test(lc) ||
+    /out of memory|cannot allocate memory|memory exhausted|oom[\s-]?kill(?:ed|er)?/.test(lc)
+  );
+}
+
 /** Detect + classify a usage/session-limit error from its message. Pure. */
 export function classifyLimitError(message: string): LimitClassification {
   const m = String(message ?? '');

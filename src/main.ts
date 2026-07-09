@@ -22,6 +22,7 @@ import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
 import { remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
+import { registerAppInstance } from './util/instance.js';
 
 const VERSION = '1.0.0';
 
@@ -30,6 +31,21 @@ async function main() {
   const { provider, reason } = defaultProvider();
 
   console.log('\n  karmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
+
+  // Duplicate app-instance guard (karmax#4): the July-5 OOM had 14 `src/main.ts`
+  // running against one KARMAX_HOME — each with its own worker fanning out agent
+  // turns, multiplying RAM pressure for no gain (one app serves the whole list).
+  // Advisory, not a lock: a fast Ctrl-C→restart is intentional, so we warn loudly
+  // and let the operator decide rather than refusing to boot.
+  const instance = registerAppInstance();
+  if (instance.others.length) {
+    console.warn(
+      `\n  ⚠  ${instance.others.length} other karmax app instance(s) already running against ${p.home}` +
+        ` (pids ${instance.others.join(', ')}).\n` +
+        `     Each runs its own worker + agent fan-out and competes for the same RAM —\n` +
+        `     the exact condition behind the July-5 OOM (karmax#4). Stop the extras unless this is deliberate.\n`,
+    );
+  }
   if (provider === 'mock') {
     console.log('  ⚠  NO AGENT CREDENTIALS DETECTED — running with the MOCK agent (no real work).');
     console.log('     Set OPENAI_API_KEY or ANTHROPIC_API_KEY, or log in to Claude Code, then restart.\n');
@@ -218,6 +234,7 @@ async function main() {
     // worker itself resolves within ~3s (shutdownGraceTime/shutdownForceTime).
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
+    instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     await step(closeGateway());
     await step(workerManager.stop());

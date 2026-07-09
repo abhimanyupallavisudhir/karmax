@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyLimitError, isTransportError, resetAtFromHint } from '../src/agent/limits.js';
+import { classifyLimitError, isTransportError, isResourceKill, resetAtFromHint } from '../src/agent/limits.js';
 
 describe('classifyLimitError', () => {
   it('classifies a Claude session-limit string + extracts the reset hint', () => {
@@ -108,5 +108,30 @@ describe('isTransportError', () => {
 
   it('leaves quota signals to the limit classifier (429 is not transport)', () => {
     expect(isTransportError('Anthropic API 429: too many requests')).toBe(false);
+  });
+});
+
+describe('isResourceKill (OOM / signal-9 predicate — karmax#4)', () => {
+  it('classifies the opaque SDK SIGKILL string the OOM killer produced', () => {
+    // The exact string the July-5 activity failed with.
+    expect(isResourceKill('Claude Code process terminated by signal SIGKILL')).toBe(true);
+  });
+
+  it('recognizes signal-9 and explicit out-of-memory signatures', () => {
+    expect(isResourceKill('process terminated by signal 9')).toBe(true);
+    expect(isResourceKill('Killed by signal 9')).toBe(true);
+    expect(isResourceKill('spawn ENOMEM')).toBe(true);
+    expect(isResourceKill('fork failed: Cannot allocate memory')).toBe(true);
+    expect(isResourceKill('the host is out of memory')).toBe(true);
+    expect(isResourceKill('oom-killed by systemd-oomd')).toBe(true);
+  });
+
+  it('does NOT classify ordinary agent/semantic failures as resource kills', () => {
+    expect(isResourceKill('boom goes the agent')).toBe(false);
+    expect(isResourceKill('tests failed: 3 assertion errors')).toBe(false);
+    expect(isResourceKill("You've hit your session limit · resets 3:45pm")).toBe(false);
+    expect(isResourceKill('Anthropic API 429: too many requests')).toBe(false);
+    // A graceful SIGTERM (cancellation) is not an OOM kill.
+    expect(isResourceKill('process terminated by signal SIGTERM')).toBe(false);
   });
 });
