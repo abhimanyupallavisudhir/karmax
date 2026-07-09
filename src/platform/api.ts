@@ -6,7 +6,7 @@ import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
-import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
+import { mergeQueueId, SIG_PRIORITIZE, SIG_REORDER, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
 import { TaskRecord, TaskView, Message, Project, ImageRef } from '../domain/types.js';
 import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
@@ -383,6 +383,21 @@ export class KarmaxApi {
       args: [{ domain }],
       signal: SIG_PRIORITIZE,
       signalArgs: [{ taskId }],
+    });
+  }
+
+  /**
+   * Reposition a queued task (drag-and-drop / move-to-bottom): place `taskId`
+   * immediately before `beforeTaskId`, or at the end when no anchor is given.
+   */
+  async moveQueueItem(token: string, domain: string, taskId: string, beforeTaskId?: string): Promise<void> {
+    this.require(token, 'reorder_queue');
+    await this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
+      workflowId: mergeQueueId(domain),
+      taskQueue: this.deps.taskQueue,
+      args: [{ domain }],
+      signal: SIG_REORDER,
+      signalArgs: [{ taskId, beforeTaskId }],
     });
   }
 

@@ -155,4 +155,35 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await expect.poll(async () => ((await coord.query('accounts')) as any).accounts[0].inUse, { timeout: 10_000 }).toBe(0);
     await coord.terminate('test done');
   });
+
+  it('merge queue reorders: prioritize (top), move-to-bottom, and drag (insert-before)', async () => {
+    const { mergeQueueId } = await import('../src/coordinators/names.js');
+    const domain = 'repo:main';
+    // Seed with a held slot so the coordinator parks instead of draining the queue.
+    const wf = await h.client.workflow.start('mergeQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: mergeQueueId(domain),
+      args: [{ domain, state: { domain, queue: ['t1', 't2', 't3'], current: 'held', processed: 0 } }],
+    });
+    const q = async () => ((await wf.query('queue')) as any).queue as string[];
+    expect(await q()).toEqual(['t1', 't2', 't3']);
+
+    // Move to top (the old "Prioritize").
+    await wf.signal('prioritize', { taskId: 't3' });
+    await expect.poll(q, { timeout: 10_000 }).toEqual(['t3', 't1', 't2']);
+
+    // Move to bottom (reorder with no anchor).
+    await wf.signal('reorderQueue', { taskId: 't3' });
+    await expect.poll(q, { timeout: 10_000 }).toEqual(['t1', 't2', 't3']);
+
+    // Drag: place t1 immediately before t3.
+    await wf.signal('reorderQueue', { taskId: 't1', beforeTaskId: 't3' });
+    await expect.poll(q, { timeout: 10_000 }).toEqual(['t2', 't1', 't3']);
+
+    // Unknown anchor → falls to the bottom.
+    await wf.signal('reorderQueue', { taskId: 't2', beforeTaskId: 'gone' });
+    await expect.poll(q, { timeout: 10_000 }).toEqual(['t1', 't3', 't2']);
+
+    await wf.terminate('test done');
+  });
 });

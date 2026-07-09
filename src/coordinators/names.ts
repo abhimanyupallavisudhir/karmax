@@ -11,6 +11,9 @@ export const BUDGET_COORDINATOR_WORKFLOW = 'budgetCoordinator';
 export const SIG_ENQUEUE = 'enqueue';
 export const SIG_RELEASE = 'release';
 export const SIG_PRIORITIZE = 'prioritize';
+/** Generic queue reorder (drag / move-to-bottom): move a task before another,
+ *  or to the end when no anchor is given. Move-to-top stays SIG_PRIORITIZE. */
+export const SIG_REORDER = 'reorderQueue';
 export const SIG_CANCEL_MERGE = 'cancelMerge';
 export const SIG_MERGE_GRANTED = 'mergeGranted';
 export const QRY_QUEUE = 'queue';
