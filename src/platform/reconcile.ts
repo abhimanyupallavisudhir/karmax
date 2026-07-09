@@ -41,6 +41,8 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
   for (const project of store.listProjects()) {
     for (const t of store.listTasks(project.id)) {
       if (t.params?.draft) continue; // drafts are intentionally not started
+      if (t.params?.triggerState === 'armed') continue; // armed triggered tasks have no workflow yet
+      if (t.params?.repeatable) continue; // a series never runs its own workflow — only its runs do
       const v: TaskView | undefined = t.lastView;
       if (v && TERMINAL.includes(v.status)) continue;
       checked++;
