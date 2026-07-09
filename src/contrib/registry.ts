@@ -48,12 +48,18 @@ export class ContributionRegistry {
 
 /** Core commands the host registers (keyboard navigation; SPEC §10.1, §10.3). */
 export const CORE_COMMANDS: CommandDecl[] = [
-  { id: 'nav.newTask', title: 'New task', keybinding: 'n' },
+  { id: 'nav.newTask', title: 'New task (quick add)', keybinding: 'n' },
+  { id: 'nav.newTaskForm', title: 'New task (full form)', keybinding: 'N' },
   { id: 'nav.search', title: 'Search', keybinding: '/' },
   { id: 'nav.tasks', title: 'Go to tasks', keybinding: 'g t' },
   { id: 'nav.queue', title: 'Go to merge queue', keybinding: 'g q' },
+  { id: 'nav.activity', title: 'Go to activity', keybinding: 'g a' },
   { id: 'nav.dashboard', title: 'Go to dashboard', keybinding: 'g d' },
-  { id: 'nav.settings', title: 'Go to settings', keybinding: 'g s' },
-  { id: 'nav.close', title: 'Close drawer', keybinding: 'Escape' },
+  { id: 'nav.settings', title: 'Go to project settings', keybinding: 'g s' },
+  { id: 'nav.global', title: 'Go to global settings', keybinding: 'g g' },
+  { id: 'nav.projects', title: 'Go to projects', keybinding: 'g p' },
+  { id: 'nav.notifications', title: 'Go to notifications', keybinding: 'g n' },
+  { id: 'nav.close', title: 'Close panel', keybinding: 'Escape' },
   { id: 'nav.commandPalette', title: 'Command palette', keybinding: 'meta+k' },
+  { id: 'help.keyboard', title: 'Keyboard shortcuts', keybinding: '?' },
 ];
