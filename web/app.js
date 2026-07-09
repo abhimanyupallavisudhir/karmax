@@ -28,6 +28,7 @@ const S = {
   sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
   ws: null,
   hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
+  procTimer: null, // live-refresh handle for the dashboard processes (task manager) panel
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
   returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
 };
@@ -2252,6 +2253,109 @@ async function refreshHostDiag() {
   if (S.tab === 'dashboard') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
 }
 
+// ── processes (task manager) ─────────────────────────────────────────────────
+// GET /api/processes: every process karmax is responsible for — agent
+// subprocesses (and the scripts they run), embedded-terminal PTYs (and what's
+// typed into them), the Temporal server, git/exec helpers — grouped by owning
+// entity with live CPU% / RSS. Kill via POST /api/processes/kill (SIGTERM;
+// shift-click for SIGKILL). Protected infrastructure gets no kill button.
+const PROC_KIND_LABEL = { agent: 'agent', terminal: 'terminal', temporal: 'infra', login: 'login', probe: 'probe', app: 'karmax', untracked: 'misc' };
+
+function fmtDur(sec) {
+  if (!sec || sec < 0) return '—';
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`;
+  return `${Math.floor(sec / 86400)}d${Math.floor((sec % 86400) / 3600)}h`;
+}
+
+function procPanelHtml(sample) {
+  if (!sample) return `<div class="card" style="color:var(--ink-3)">Process list unavailable.</div>`;
+  if (!sample.supported) return `<div class="card" style="color:var(--ink-3)">Process accounting needs Linux procfs — not available on this host.</div>`;
+  const t = sample.totals || {};
+  // A row is either killable (button) or protected (visible lock, so the kill
+  // affordance is discoverable even on an idle instance where only protected
+  // infrastructure — karmax itself + Temporal — is running).
+  const LOCK = `<span class="proc-lock" title="Protected — karmax can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
+  const killBtn = (pid, label, killable) =>
+    killable
+      ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
+      : LOCK;
+  const rows = (sample.groups || [])
+    .map((g) => {
+      const kindChip = `<span class="chip">${esc(PROC_KIND_LABEL[g.kind] || g.kind)}</span>`;
+      const taskChip = g.taskId
+        ? `<button class="chip proc-task" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</button>`
+        : '';
+      // A group is killable at the root when it's a registered entity (agents,
+      // terminals, logins, probes) — its registered killer escalates properly.
+      const rootKillable = !g.protected && g.kind !== 'app' && g.kind !== 'untracked';
+      const head = `<tr class="proc-group">
+        <td class="cmd">${esc(g.label)} ${kindChip}${taskChip}</td>
+        <td class="mono num">${g.procs.length}</td>
+        <td class="mono num">${g.cpuPct.toFixed(1)}%</td>
+        <td class="mono num">${g.rssMb >= 1024 ? (g.rssMb / 1024).toFixed(2) + 'G' : g.rssMb.toFixed(0) + 'M'}</td>
+        <td class="num">${rootKillable ? killBtn(g.key, g.label, true) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
+      </tr>`;
+      const body = g.procs
+        .map((r) => {
+          // Never offer to kill karmax itself (the 'app' group's only row); any
+          // other row — including a registered root's own line — is fair game.
+          const killable = g.kind !== 'app' && !(g.protected && String(r.pid) === g.key);
+          return `<tr>
+            <td class="cmd mono" title="${esc(r.cmd)}">${esc(r.cmd)}</td>
+            <td class="mono num">${r.pid}<span class="proc-age"> · ${fmtDur(r.ageSec)}</span></td>
+            <td class="mono num">${r.cpuPct.toFixed(1)}%</td>
+            <td class="mono num">${r.rssMb >= 1024 ? (r.rssMb / 1024).toFixed(2) + 'G' : r.rssMb.toFixed(0) + 'M'}</td>
+            <td class="num">${killBtn(r.pid, r.cmd.slice(0, 60), killable)}</td>
+          </tr>`;
+        })
+        .join('');
+      return head + body;
+    })
+    .join('');
+  return `<div class="card" style="padding:0;overflow:auto">
+    <table class="proc-table">
+      <thead><tr><th>process</th><th class="num">pid · age</th><th class="num">cpu</th><th class="num">mem</th><th class="num"></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (karmax core &amp; Temporal); everything else gets a ✕ kill button</div>
+  </div>`;
+}
+
+function wireProcPanel(el) {
+  el.querySelectorAll('.proc-task').forEach((b) => b.addEventListener('click', () => goToTask(b.dataset.task)));
+  el.querySelectorAll('.proc-kill').forEach((b) =>
+    b.addEventListener('click', async (ev) => {
+      const pid = Number(b.dataset.kill);
+      const signal = ev.shiftKey ? 'SIGKILL' : 'SIGTERM';
+      if (!confirm(`Send ${signal} to pid ${pid}?\n\n${b.dataset.label}`)) return;
+      b.disabled = true;
+      try {
+        await api('/api/processes/kill', { method: 'POST', body: JSON.stringify({ pid, signal }) });
+        toast(`${signal} sent to ${pid}`);
+      } catch (e) { toast(e.message, true); }
+      refreshProcPanel(true);
+    }),
+  );
+}
+
+// Live-refresh the processes panel every 5s while the Dashboard is open; same
+// self-terminating pattern as refreshHostDiag. CPU% is a delta between samples,
+// so the very first paint shows 0% and settles from the second sample on.
+async function refreshProcPanel(now = false) {
+  if (S.tab !== 'dashboard' || !$('#proc-panel')) return;
+  clearTimeout(S.procTimer);
+  let sample = null;
+  try { sample = await api('/api/processes'); } catch {}
+  const el = $('#proc-panel');
+  if (el && S.tab === 'dashboard') {
+    el.innerHTML = procPanelHtml(sample);
+    wireProcPanel(el);
+  }
+  if (S.tab === 'dashboard') { clearTimeout(S.procTimer); S.procTimer = setTimeout(refreshProcPanel, now ? 1200 : 5000); }
+}
+
 async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
@@ -2273,6 +2377,8 @@ async function renderDashboard() {
       </div>
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
+      <div class="section-h">Processes — everything karmax is running</div>
+      <div id="proc-panel"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
         <span>Agent accounts (login availability &amp; quota)</span>
         ${pollable.size ? `<button class="btn sm usage-recheck-all">↻ Re-check usage</button>` : ''}
@@ -2339,6 +2445,7 @@ async function renderDashboard() {
     // accounts section; single pending timer (cleared here and inside the loop).
     clearTimeout(S.hostDiagTimer);
     S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
+    refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 
