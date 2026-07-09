@@ -1,4 +1,4 @@
-import { AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent } from '../domain/types.js';
+import { AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
@@ -33,6 +33,9 @@ export interface PlatformToolContext {
    *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
    *  instead of guessing. Also marks the resolve turn complete. */
   resolveDecision(t: Transition): void;
+  /** Confirm agent's structured verdict at the Review gate (SPEC §5.2): confirm /
+   *  revise (back to Do with a comment) / reject (cancel). Ends the confirm turn. */
+  confirmDecision(d: ConfirmDecision): void;
   /** Request a payment against the budget lease (SPEC §7.6). Returns the outcome:
    *  granted (charged) | needs_approval | needs_funding | denied. */
   requestSpend(args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -61,6 +64,12 @@ export interface TurnInput {
   messages: Message[];
   /** A session to continue (prior turn, SPEC §7.2) OR — with `fork` — to branch from. */
   session?: string;
+  /** How many leading `messages` the resumed `session` already holds (delivered on
+   *  prior turns). On resume the adapter sends only the delta after this boundary —
+   *  the session carries the rest server-side, so re-sending it wastes tokens and
+   *  folds the agent's own past replies back in as user input. Ignored on a fresh
+   *  session / fork (the full transcript is sent). See `messagesToDeliver`. */
+  deliveredMessages?: number;
   /** Fork `session` into a NEW session instead of continuing it (SPEC §10.5): the
    *  source is left untouched. Claude → `--fork-session`; Codex → resume a copied rollout. */
   fork?: boolean;
@@ -82,6 +91,11 @@ export const RUNAWAY_BACKSTOP = 1000;
 export interface AdapterTurn {
   session?: string;
   output: string;
+  /** Claude-Agent-SDK sub-agents (the Task tool) still in flight when the turn's
+   *  main loop returned — e.g. auto-backgrounded long sub-agents that only settle
+   *  later. The workflow holds in Do until this reaches 0 so a task is never
+   *  reported "done" while the agent is still waiting on its sub-agents. */
+  pendingSubagents?: number;
 }
 
 export interface AgentAdapter {
@@ -102,11 +116,17 @@ export interface TurnResult {
   raise?: RaiseToParent;
   /** Parent-agent asked to park until its sub-tasks settle (SPEC §5.3). */
   waitForSubtasks?: boolean;
+  /** In-harness sub-agents (Claude Agent SDK Task tool) still running when the turn
+   *  returned. While > 0 the workflow keeps the agent in Do rather than advancing to
+   *  Review — completion is "done AND not waiting on any sub-agents". */
+  pendingSubagents?: number;
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
   error?: string;
   /** The Resolve agent's structured recovery decision (RESOLVE-PLAN §3.2). */
   resolution?: Transition;
+  /** The Confirm agent's Review-gate verdict (SPEC §5.2). */
+  confirmDecision?: ConfirmDecision;
 }
 
 export type { AgentProfile, AgentRole, Provider, Message, ReviewInfo };

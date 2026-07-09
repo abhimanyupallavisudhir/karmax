@@ -30,6 +30,7 @@ const ctx = (): PlatformToolContext => ({
   waitForSubtasks() {},
   saveSkill() {},
   resolveDecision() {},
+  confirmDecision() {},
   async requestSpend() { return { status: 'denied' as const }; },
   emit() {},
 });

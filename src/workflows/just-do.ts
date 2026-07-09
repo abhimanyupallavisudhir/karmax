@@ -9,7 +9,7 @@ import {
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike } from './contract.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision } from './contract.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 // Agent turns heartbeat every ~10s; a 2-minute gap = dead/slept worker → Temporal
@@ -34,7 +34,9 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = input.prompt ? [{ id: 'm0', role: 'user', text: input.prompt, ts: 0 }] : [];
+  const msgs: Message[] = input.prompt || input.images?.length
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+    : [];
   let confirmed = false;
   let cancelled = false;
   let world: WorldHandleLike | undefined;
@@ -42,6 +44,10 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   let reviewInfo: ReviewInfo | undefined;
   let seen = 0;
   const base = input.base ?? input.project.defaultBase ?? 'main';
+  // Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent. A child
+  // routes to its parent (handled by the confirm signal from the parent), so this drives
+  // top-level tasks; back-compat with the legacy autoConfirm-less just-do → human.
+  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? 'human';
 
   function actions(): DeclaredAction[] {
     const followUp: DeclaredAction = { name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', required: true }] };
@@ -60,6 +66,31 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   }
   const publish = async () => core.publishView(taskId, view());
 
+  /** Run one Confirm-agent turn (SPEC §5.2): review the work, return a verdict, or
+   *  undefined on failure so the caller falls back to the human gate. */
+  async function runConfirm(): Promise<ConfirmDecision | undefined> {
+    try {
+      // A fresh turn each Review so the reviewer judges the current work (up-to-date
+      // system prompt); a mid-turn retry still resumes via runAgentTurn heartbeat details.
+      const ct = await turns.runAgentTurn({
+        taskId,
+        role: 'confirm',
+        worldHandle: world as any,
+        messages: [],
+        task: input,
+        bindings: {
+          reviewInfo: reviewInfo?.summary ?? '',
+          changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+          transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
+        },
+      });
+      return ct.confirmDecision;
+    } catch (err) {
+      if (isCancellation(err)) throw err;
+      return undefined;
+    }
+  }
+
   setHandler(viewQuery, view);
   setHandler(followUpSignal, (m) => {
     msgs.push({ ...m, ts: msgs.length });
@@ -72,15 +103,22 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   });
 
   await publish();
-  world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base, copyGlobs: input.project.copyGlobs, kind: 'worktree' })) as WorldHandleLike;
+  world = (await core.createWorld({ taskId, repos: input.project.repos, base, copyGlobs: input.project.copyGlobs, kind: 'worktree' })) as WorldHandleLike;
 
   let infraRetries = 0;
   for (stage = 'do'; ; ) {
     await publish();
     if (cancelled) break;
     let turn;
+    // How many leading `msgs` are actually delivered this turn — captured at
+    // schedule time, NOT after. A follow-up that arrives WHILE the turn runs lands
+    // in `msgs` at a higher index; advancing `seen` to `msgs.length` afterwards would
+    // mark it consumed and it would silently never reach the agent (SPEC §5.6).
+    const deliveredNow = msgs.length;
     try {
-      turn = await turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, task: input });
+      // On resume the session already holds the first `seen` messages, so send only
+      // the delta after them (a follow-up), not the whole conversation again.
+      turn = await turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input });
     } catch (err) {
       // Infrastructure outage that outlived the activity retries: park with
       // backoff and re-run the turn (which resumes its session) rather than
@@ -91,10 +129,30 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
     }
     infraRetries = 0;
     session = turn.session ?? session;
-    seen = msgs.length;
+    seen = deliveredNow;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     stage = 'review';
     status = 'waiting';
+    if (confirmMode === 'auto') {
+      confirmed = true;
+    } else if (confirmMode === 'agent') {
+      await publish();
+      const decision = await runConfirm();
+      if (cancelled) break;
+      if (decision?.action === 'confirm') {
+        confirmed = true;
+      } else if (decision?.action === 'reject') {
+        if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
+        cancelled = true;
+        break;
+      } else if (decision?.action === 'revise') {
+        msgs.push({ id: `cv${msgs.length}`, role: 'user', text: decision.text || 'Please revise per the reviewer feedback.', ts: msgs.length });
+        stage = 'do';
+        status = 'active';
+        continue;
+      }
+      // no verdict → fall through to the human gate
+    }
     await publish();
     await condition(() => confirmed || cancelled || msgs.length > seen);
     if (confirmed || cancelled) break;

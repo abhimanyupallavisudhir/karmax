@@ -2,7 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult } from './types.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, worldRepos } from './types.js';
 import { git, gitOrThrow, isGitRepo, ensureIdentity } from './git.js';
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
@@ -27,44 +27,45 @@ export class WorktreeProvider implements WorldProvider {
     const branch = spec.branch ?? `karmax/${spec.taskId}`;
     const root = path.join(this.home, spec.taskId);
 
-    let repo = spec.repo ? expandPath(spec.repo) : undefined;
-    if (repo) {
-      // A repo was configured. It MUST be a valid git repo — never silently fall
-      // back to a throwaway scratch repo (that produces invisible "merges").
-      if (!(await isGitRepo(repo))) {
+    // Normalize the configured sources: `repos` (multi) wins over `repo` (legacy single).
+    const sources = (spec.repos?.length ? spec.repos : spec.repo ? [spec.repo] : [])
+      .map((s) => s?.trim())
+      .filter((s): s is string => !!s);
+
+    // Resolve + validate each source to its git toplevel up-front, so a bad path
+    // fails before we start creating worktrees.
+    const resolvedSources: string[] = [];
+    for (const s of sources) {
+      const r = expandPath(s);
+      if (!(await isGitRepo(r))) {
         throw new Error(
-          `Configured repository "${spec.repo}" is not a git repository (resolved to "${repo}"). ` +
+          `Configured repository "${s}" is not a git repository (resolved to "${r}"). ` +
             `Fix the repository path in project Settings (an absolute path, or one starting with ~), ` +
             `or run \`git init\` there.`,
         );
       }
-      repo = await gitOrThrow(repo, ['rev-parse', '--show-toplevel']);
+      resolvedSources.push(await gitOrThrow(r, ['rev-parse', '--show-toplevel']));
+    }
+
+    const repos: WorldRepo[] = [];
+    if (resolvedSources.length === 0) {
+      // No repo configured — a scratch sandbox (the world itself is the deliverable).
+      const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
+      repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec));
+    } else if (resolvedSources.length === 1) {
+      // Single repo: the worktree IS the world root (unchanged layout).
+      repos.push(await this.addWorktree(resolvedSources[0]!, root, repoName(resolvedSources[0]!), branch, spec));
     } else {
-      // No repo configured at all — a scratch sandbox (the world is the deliverable).
-      repo = await this.makeScratchRepo(spec.taskId, spec.base);
+      // Multi-repo: the world root is a parent dir holding one worktree per repo,
+      // each in a subdirectory named after the repo (deduped on collision).
+      if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+      fs.mkdirSync(root, { recursive: true });
+      const names = uniqueNames(resolvedSources.map(repoName));
+      for (let i = 0; i < resolvedSources.length; i++) {
+        const name = names[i]!;
+        repos.push(await this.addWorktree(resolvedSources[i]!, path.join(root, name), name, branch, spec));
+      }
     }
-
-    // Resolve a real base ref; fall back to HEAD if the named base is absent.
-    let baseRef = spec.base;
-    const verify = await git(repo, ['rev-parse', '--verify', `${spec.base}`]);
-    if (verify.code !== 0) baseRef = await gitOrThrow(repo, ['rev-parse', 'HEAD']);
-
-    // Clean any stale worktree at this path.
-    if (fs.existsSync(root)) {
-      await git(repo, ['worktree', 'remove', '--force', root]);
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-    await git(repo, ['worktree', 'prune']);
-    // Reuse the branch if it already exists, else create it.
-    const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
-    const addArgs = branchExists
-      ? ['worktree', 'add', root, branch]
-      : ['worktree', 'add', '-b', branch, root, baseRef];
-    await gitOrThrow(repo, addArgs);
-    await ensureIdentity(root);
-
-    // Copy gitignored files the project names (e.g. .env) into the world.
-    if (spec.copyGlobs?.length) await this.copyGlobs(repo, root, spec.copyGlobs);
 
     const handle: WorldHandle = {
       kind: 'worktree',
@@ -72,10 +73,49 @@ export class WorktreeProvider implements WorldProvider {
       root,
       branch,
       base: spec.base,
-      repo,
+      repo: repos[0]!.repo,
       target: spec.target,
+      repos,
     };
     return new WorktreeWorld(handle);
+  }
+
+  /**
+   * Add a `karmax/<taskId>` worktree for one repo at `wt`, off `spec.base`
+   * (falling back to HEAD if that ref is absent). Returns the `WorldRepo` record.
+   */
+  private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec): Promise<WorldRepo> {
+    // Resolve a real base ref per repo; fall back to HEAD if the named base is absent.
+    let baseRef = spec.base;
+    const verify = await git(repo, ['rev-parse', '--verify', `${spec.base}`]);
+    if (verify.code !== 0) baseRef = await gitOrThrow(repo, ['rev-parse', 'HEAD']);
+
+    // Clean any stale worktree at this path.
+    if (fs.existsSync(wt)) {
+      await git(repo, ['worktree', 'remove', '--force', wt]);
+      fs.rmSync(wt, { recursive: true, force: true });
+    }
+    await git(repo, ['worktree', 'prune']);
+    // Reuse the branch if it already exists, else create it.
+    const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
+    const addArgs = branchExists
+      ? ['worktree', 'add', wt, branch]
+      : ['worktree', 'add', '-b', branch, wt, baseRef];
+    await gitOrThrow(repo, addArgs);
+    await ensureIdentity(wt);
+
+    // Make the checkout runnable: a git worktree does NOT inherit the origin
+    // repo's `node_modules` (it's gitignored), so any Node project checked out
+    // into a world cannot run itself — e.g. karmax dogfooding karmax fails at
+    // `import('@anthropic-ai/claude-agent-sdk')` with "Cannot find package …"
+    // resolved from the world's own src/. Link the origin's installed deps in so
+    // module resolution (and `npm start`/`tsx`) works without a per-world install.
+    await this.linkNodeModules(repo, wt);
+
+    // Copy gitignored files the project names (e.g. .env) into this repo's worktree.
+    if (spec.copyGlobs?.length) await this.copyGlobs(repo, wt, spec.copyGlobs);
+
+    return { name, repo, root: wt, branch, base: spec.base };
   }
 
   async open(handle: WorldHandle): Promise<World> {
@@ -92,6 +132,41 @@ export class WorktreeProvider implements WorldProvider {
     await git(repo, ['add', '-A']);
     await git(repo, ['commit', '-q', '-m', 'init']);
     return repo;
+  }
+
+  /**
+   * Symlink the origin repo's `node_modules` into the worktree so the checkout
+   * is immediately runnable (deps resolve, the project can run itself). No-op
+   * when the origin has no `node_modules` (non-Node project or deps not yet
+   * installed) or the worktree already has one. Best-effort: a failure here must
+   * never abort world creation — the world is still usable for source edits.
+   */
+  private async linkNodeModules(repo: string, root: string) {
+    try {
+      const src = path.join(repo, 'node_modules');
+      const dst = path.join(root, 'node_modules');
+      if (!fs.existsSync(src)) return; // nothing to link (e.g. scratch/non-Node repo)
+      if (fs.existsSync(dst)) return; // worktree already has its own deps
+      fs.symlinkSync(src, dst, 'dir');
+      // A `node_modules/` .gitignore rule (trailing slash) matches directories
+      // only — NOT a symlink named `node_modules`. Left untracked, an agent's
+      // `git add -A` would stage the link and it could be committed/merged. Add
+      // an anchored ignore rule to the worktree's exclude so git never sees it.
+      await this.ensureIgnored(root, '/node_modules');
+    } catch {
+      // Best-effort — a broken/duplicate link is preferable to failing the world.
+    }
+  }
+
+  /** Idempotently add a pattern to this worktree's git exclude file. */
+  private async ensureIgnored(root: string, pattern: string) {
+    const r = await git(root, ['rev-parse', '--git-path', 'info/exclude']);
+    if (r.code !== 0) return;
+    const excludePath = path.resolve(root, r.stdout.trim());
+    fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+    const cur = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf8') : '';
+    if (cur.split('\n').some((l) => l.trim() === pattern)) return; // already ignored
+    fs.appendFileSync(excludePath, `${cur && !cur.endsWith('\n') ? '\n' : ''}${pattern}\n`);
   }
 
   private async copyGlobs(repo: string, root: string, globs: string[]) {
@@ -138,18 +213,45 @@ class WorktreeWorld implements World {
   }
 
   async listFiles(): Promise<string[]> {
-    const r = await git(this.handle.root, ['ls-files', '--cached', '--others', '--exclude-standard']);
-    return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    const repos = worldRepos(this.handle);
+    // Single-repo world: root is the worktree, list it directly.
+    if (repos.length <= 1) {
+      const dir = repos[0]?.root ?? this.handle.root;
+      const r = await git(dir, ['ls-files', '--cached', '--others', '--exclude-standard']);
+      return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    }
+    // Multi-repo world: root is the parent — aggregate each repo, prefixed by its subdir.
+    const out: string[] = [];
+    for (const r of repos) {
+      const listed = await git(r.root, ['ls-files', '--cached', '--others', '--exclude-standard']);
+      for (const f of listed.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) out.push(`${r.name}/${f}`);
+    }
+    return out;
   }
 
   async destroy(): Promise<void> {
-    const { repo, root } = this.handle;
-    if (repo) {
-      await git(repo, ['worktree', 'remove', '--force', root]);
-      await git(repo, ['worktree', 'prune']);
+    const repos = worldRepos(this.handle);
+    for (const r of repos) {
+      await git(r.repo, ['worktree', 'remove', '--force', r.root]);
+      await git(r.repo, ['worktree', 'prune']);
     }
-    if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+    if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
   }
+}
+
+/** The repo's basename (its worktree subdirectory name in a multi-repo world). */
+function repoName(repo: string): string {
+  return repo.split('/').filter(Boolean).pop() ?? 'repo';
+}
+
+/** Disambiguate colliding repo basenames by suffixing `-2`, `-3`, … in order. */
+function uniqueNames(names: string[]): string[] {
+  const seen = new Map<string, number>();
+  return names.map((n) => {
+    const count = seen.get(n) ?? 0;
+    seen.set(n, count + 1);
+    return count === 0 ? n : `${n}-${count + 1}`;
+  });
 }
 
 function globToRegExp(glob: string): RegExp {

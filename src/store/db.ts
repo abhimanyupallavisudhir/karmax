@@ -98,6 +98,40 @@ export class Store {
     if (!cols.some((c) => c.name === 'notes')) {
       this.db.exec('ALTER TABLE tasks ADD COLUMN notes TEXT');
     }
+    // Simple human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
+    // project's tasks run #1, #2, … A separate integer alongside the opaque `id`
+    // (which stays the Temporal workflowId and must never change). The per-project
+    // unique index doubles as the migration marker: if it isn't present yet, we
+    // (re)assign numbers per project in creation order — this both backfills fresh
+    // installs and re-numbers any install that briefly had the earlier global scheme.
+    if (!cols.some((c) => c.name === 'num')) this.db.exec('ALTER TABLE tasks ADD COLUMN num INTEGER');
+    const hasPerProjectIdx = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tasks_num_project'")
+      .get();
+    if (!hasPerProjectIdx) {
+      this.db.exec('DROP INDEX IF EXISTS idx_tasks_num'); // retire the old global-unique index
+      const projects = this.db.prepare('SELECT DISTINCT projectId FROM tasks').all() as any[];
+      const upd = this.db.prepare('UPDATE tasks SET num = ? WHERE id = ?');
+      for (const { projectId } of projects) {
+        // Creation order within the project (createdAt, rowid as a stable tiebreak).
+        const rows = this.db
+          .prepare('SELECT id FROM tasks WHERE projectId = ? ORDER BY createdAt, rowid')
+          .all(projectId) as any[];
+        let n = 0;
+        for (const r of rows) upd.run(++n, r.id);
+      }
+      this.db.exec('CREATE UNIQUE INDEX idx_tasks_num_project ON tasks(projectId, num)');
+    }
+  }
+
+  /** Next task number within a project: MAX(num)+1 scoped to that project. node:sqlite
+   *  is synchronous and single-threaded, so read-then-write within one createTask
+   *  call cannot race. */
+  private nextTaskNum(projectId: string): number {
+    return (
+      (this.db.prepare('SELECT COALESCE(MAX(num), 0) AS m FROM tasks WHERE projectId = ?').get(projectId) as any)
+        .m as number
+    ) + 1;
   }
 
   // ─── Projects ──────────────────────────────────────────────────────────────
@@ -178,6 +212,7 @@ export class Store {
         .get(listId) as any).m + 1;
     const t: TaskRecord = {
       id: newId('task'),
+      num: this.nextTaskNum(input.projectId),
       projectId: input.projectId,
       listId,
       title: input.title,
@@ -190,11 +225,12 @@ export class Store {
     };
     this.db
       .prepare(
-        `INSERT INTO tasks (id, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
+        t.num ?? null,
         t.projectId,
         t.listId,
         t.title,
@@ -212,6 +248,12 @@ export class Store {
 
   getTask(id: string): TaskRecord | undefined {
     const r = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as any;
+    return r ? rowToTask(r) : undefined;
+  }
+
+  /** Resolve a task by its per-project sequential number (SPEC §10.6). */
+  getTaskByNum(projectId: string, num: number): TaskRecord | undefined {
+    const r = this.db.prepare('SELECT * FROM tasks WHERE projectId = ? AND num = ?').get(projectId, num) as any;
     return r ? rowToTask(r) : undefined;
   }
 
@@ -404,6 +446,7 @@ function rowToList(r: any): TaskList {
 function rowToTask(r: any): TaskRecord {
   return {
     id: r.id,
+    num: r.num ?? undefined,
     projectId: r.projectId,
     listId: r.listId,
     title: r.title,

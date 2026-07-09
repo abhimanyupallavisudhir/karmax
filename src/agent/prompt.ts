@@ -1,5 +1,5 @@
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
-import { WorldHandle } from '../world/types.js';
+import { WorldHandle, worldRepos } from '../world/types.js';
 import { roleDef, manifest } from '../contrib/manifests.js';
 
 /**
@@ -28,6 +28,7 @@ const FALLBACK_TEMPLATE = `{{toolsPreamble}}
 
 # World
 Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
+{{worldRepos}}
 
 {{instructions}}`;
 
@@ -55,6 +56,7 @@ export function assemblePrompt(args: AssembleArgs): string {
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: args.world.root,
+    worldRepos: describeRepos(args.world),
     branch: args.world.branch,
     base: args.world.base,
     target: args.task.target ?? args.world.target ?? args.world.base,
@@ -67,4 +69,19 @@ export function assemblePrompt(args: AssembleArgs): string {
     ...(args.bindings ?? {}),
   };
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
+}
+
+/**
+ * A `{{worldRepos}}` block describing a multi-repo world's layout so the agent
+ * knows each repo lives in its own subdirectory of the working directory. Empty
+ * for a single-repo (or scratch) world, where the working directory IS the repo.
+ */
+function describeRepos(world: WorldHandle): string {
+  const repos = worldRepos(world);
+  if (repos.length <= 1) return '';
+  const lines = repos.map((r) => `- ${r.name}/ — checkout of ${r.repo}`).join('\n');
+  return (
+    `This world spans ${repos.length} repositories, each checked out in its own subdirectory of the working directory ` +
+    `(all on branch ${world.branch}). \`cd\` into a subdirectory to run git/build commands for that repo:\n${lines}`
+  );
 }

@@ -6,6 +6,7 @@ import { WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
 import { Store } from '../store/db.js';
+import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
@@ -86,6 +87,7 @@ export class Gateway {
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions = new ReviewActionRunner();
+  private attachments = new AttachmentStore();
 
   constructor(private deps: GatewayDeps) {}
 
@@ -242,6 +244,22 @@ export class Gateway {
       });
     }
 
+    // Serve an image attachment. Auth via `?token=` (session id) because a plain
+    // <img src> can't set an Authorization header; the token is the same session
+    // secret used everywhere else, so this is no weaker than the Bearer path.
+    const attGet = p.match(/^\/api\/attachments\/([^/]+)$/);
+    if (attGet && method === 'GET') {
+      const sid = url.searchParams.get('token') ?? '';
+      if (!this.sessions.has(sid)) return this.json(res, 401, { error: 'unauthorized' });
+      const got = this.attachments.read(attGet[1]!);
+      if (!got) return void res.writeHead(404).end('not found');
+      res.writeHead(200, {
+        'content-type': got.mediaType,
+        'cache-control': 'private, max-age=31536000, immutable',
+      });
+      return void res.end(got.buf);
+    }
+
     // ── authenticated endpoints ──
     const session = this.auth(req);
     if (!session) return this.json(res, 401, { error: 'unauthorized' });
@@ -256,6 +274,28 @@ export class Gateway {
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
         return this.json(res, 200, { host: hostStats(), agentSlots: agentSlotStats(), ts: Date.now() });
+      }
+
+      // image attachments (image prompts). The ONLY endpoints that handle raw
+      // image bytes; everything downstream carries lightweight ImageRef handles.
+      if (p === '/api/attachments' && method === 'POST') {
+        const ctype = String(req.headers['content-type'] ?? '');
+        try {
+          let ref;
+          if (ctype.includes('application/json')) {
+            const b = await this.body(req);
+            if (typeof b.dataUrl !== 'string') return this.json(res, 400, { error: 'expected { dataUrl }' });
+            ref = this.attachments.putDataUrl(b.dataUrl);
+          } else {
+            // Raw binary upload — content-type is the image MIME.
+            const buf = await this.rawBody(req, MAX_IMAGE_BYTES);
+            ref = this.attachments.put(buf, ctype || undefined);
+          }
+          return this.json(res, 200, ref);
+        } catch (e) {
+          if (e instanceof AttachmentError) return this.json(res, 400, { error: e.message });
+          throw e;
+        }
       }
 
       // projects
@@ -313,9 +353,23 @@ export class Gateway {
       }
 
       // tasks
+      // Resolve a per-project sequential number (SPEC §10.6) → its canonical id, so a
+      // `/projects/<name>/tasks/<num>` permalink can be opened even when the task
+      // isn't in the client's loaded list (e.g. an archived task).
+      const byNumMatch = p.match(/^\/api\/projects\/([^/]+)\/tasks\/by-num\/(\d+)$/);
+      if (byNumMatch && method === 'GET') {
+        const rec = store.getTaskByNum(byNumMatch[1]!, Number(byNumMatch[2]!));
+        if (!rec) return this.json(res, 404, { error: 'no such task' });
+        return this.json(res, 200, { id: rec.id, num: rec.num, projectId: rec.projectId });
+      }
       const viewMatch = p.match(/^\/api\/tasks\/([^/]+)$/);
       if (viewMatch && method === 'GET') {
-        return this.json(res, 200, (await api.getTaskView(token, viewMatch[1]!)) ?? null);
+        const view = await api.getTaskView(token, viewMatch[1]!);
+        if (!view) return this.json(res, 200, null);
+        // Mirror the record's sequential number onto the view (the workflow only
+        // knows the opaque id) so the drawer can show `#num` + a permalink.
+        const rec = store.getTask(viewMatch[1]!);
+        return this.json(res, 200, rec?.num != null ? { ...view, num: rec.num } : view);
       }
       if (viewMatch && method === 'DELETE') {
         // Hard-delete is for drafts only (they never started a workflow). Running
@@ -387,7 +441,7 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role);
+        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
         return this.json(res, 200, { ok: true });
       }
       const targetMatch = p.match(/^\/api\/tasks\/([^/]+)\/target$/);
@@ -906,7 +960,7 @@ export class Gateway {
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
-      if (f.type !== 'agent' || !f.role) continue;
+      if ((f.type !== 'agent' && f.type !== 'confirmer') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
@@ -916,7 +970,10 @@ export class Gateway {
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      out[f.name] = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      // A confirmer also carries a MODE (human/auto/agent) that inherits normally; the
+      // agent knobs above are the defaults shown once "agent" mode is selected.
+      out[f.name] = f.type === 'confirmer' ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) } : agent;
     }
     return out;
   }
@@ -998,6 +1055,21 @@ export class Gateway {
     } catch {
       return {};
     }
+  }
+  /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`
+   *  (the JSON `body()` reader is unbounded — binary uploads must be capped). */
+  private async rawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const c of req) {
+      total += (c as Buffer).length;
+      if (total > maxBytes) {
+        req.destroy();
+        throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
+      }
+      chunks.push(c as Buffer);
+    }
+    return Buffer.concat(chunks);
   }
   private fail(res: http.ServerResponse, e: unknown) {
     try {
