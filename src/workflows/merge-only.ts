@@ -33,6 +33,9 @@ export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
  *  editable — until it's committed to the merge queue. */
 export const updateParamsUpdate = defineUpdate<{ applied: string[] }, [Record<string, unknown>]>('updateParams');
 export const viewQuery = defineQuery<TaskView>('view');
+/** Live follow-up feed for in-flight injection (SPEC §5.6): a running turn polls
+ *  this to inject messages queued at/after `fromIndex` without waiting a full turn. */
+export const pendingMessagesQuery = defineQuery<Message[], [string, number]>('pendingMessages');
 
 export interface MergeOnlyInput extends TaskInput {
   /** Run workflow-repo edit checks (tests + replay-compat) before merge (SPEC §4.4). */
@@ -128,6 +131,7 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   }
 
   setHandler(viewQuery, view);
+  setHandler(pendingMessagesQuery, (_role, fromIndex) => msgs.slice(Math.max(0, fromIndex)));
   setHandler(confirmSignal, () => {
     confirmed = true;
   });
