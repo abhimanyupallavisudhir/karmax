@@ -9,6 +9,9 @@ import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount } from './subagents.js';
+import { spawn } from 'node:child_process';
+import { registerAgent, unregisterAgent, killAgent } from './custody.js';
+import { trackProcess } from '../util/processes.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -341,6 +344,39 @@ export class ClaudeAdapter implements AgentAdapter {
         // The platform MCP (in-process) + any MCP servers the workflow declares (§7.5).
         mcpServers: { karmax: platform, ...agentMcpToConfig(input.agentMcp) },
         env,
+        // Spawn the agent harness ourselves (same call the SDK makes internally:
+        // stdio ['pipe','pipe','ignore'], the SDK's forwarded abort signal) so the
+        // subprocess pid is visible to karmax. That buys the two things the SDK's
+        // opaque default spawn couldn't give us:
+        //  - custody (src/agent/custody.ts): a pidfile + detached process group,
+        //    so a SIGKILLed karmax can reap this agent's whole tool subtree at
+        //    next boot — parity with the codex adapter;
+        //  - the live task-manager registry (dashboard Processes panel), with the
+        //    task attribution and an escalating kill.
+        spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
+          const child = spawn(o.command, o.args, {
+            cwd: o.cwd,
+            env: o.env,
+            signal: o.signal,
+            stdio: ['pipe', 'pipe', 'ignore'],
+            windowsHide: true,
+            detached: true, // own process group ⇒ group kills reap tool subprocesses too
+          });
+          if (child.pid) {
+            const pid = child.pid;
+            registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });
+            const untrack = trackProcess({
+              pid,
+              kind: 'agent',
+              label: `claude agent (${input.role})`,
+              taskId: input.world.handle.id,
+              startedAt: Date.now(),
+              kill: () => killAgent(pid),
+            });
+            child.once('exit', () => { untrack(); unregisterAgent(pid); });
+          }
+          return child;
+        },
       },
     });
     let publishedSession = false;

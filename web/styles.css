@@ -314,6 +314,10 @@ a { color: var(--accent); text-decoration: none; }
 .review { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; background: var(--surface-2); }
 .review .summary { margin-bottom: 10px; }
 .review .links { display: flex; flex-wrap: wrap; gap: 8px; }
+.review .review-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
+.review .review-actions .btn.review-action { font-family: var(--font-mono); }
+.btn.danger { border-color: var(--danger); color: var(--danger); }
+#review-action-out { margin-top: 8px; }
 .review iframe { width: 100%; min-height: 220px; border: 1px solid var(--line); border-radius: var(--r-sm); background: #fff; }
 .diff { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; white-space: pre; }
 .diff .add { color: var(--merged); }
@@ -492,3 +496,18 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
   max-width: 180px; max-height: 180px; object-fit: contain;
   border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2);
 }
+
+/* ── dashboard processes (task manager) ── */
+.proc-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.proc-table th, .proc-table td { text-align: left; padding: 5px 12px; border-bottom: 1px solid var(--line); }
+.proc-table th { color: var(--ink-3); font-weight: 600; }
+.proc-table th.num, .proc-table td.num { text-align: right; white-space: nowrap; }
+.proc-table td.cmd { max-width: 0; width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proc-table tr.proc-group td { background: var(--surface-2); font-weight: 600; }
+.proc-table tr.proc-group td.cmd { font-family: var(--font-ui); }
+.proc-table .proc-age { color: var(--ink-3); font-weight: 400; }
+.proc-table .proc-kill { padding: 0 7px; line-height: 18px; }
+.proc-table .proc-task { cursor: pointer; }
+.proc-table .proc-task:hover { color: var(--accent); border-color: var(--accent); }
+.proc-table .proc-lock { opacity: .55; cursor: help; font-size: 11px; }
+.proc-table .proc-kill { white-space: nowrap; }
