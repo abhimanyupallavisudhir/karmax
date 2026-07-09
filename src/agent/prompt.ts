@@ -13,7 +13,7 @@ import { roleDef, manifest } from '../contrib/manifests.js';
 
 const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
 - create_sub_task(title, prompt): spawn a child task the parent awaits.
-- create_review_info(summary, links?, diff?, html?): attach polished review output for the human/parent at the Review stage.
+- create_review_info(caption?, actions?): attach click-to-verify affordances for the Review stage — the exact commands/artifacts a human clicks to check your work, NOT a prose summary (that goes in your messages). Each action is a "run" (a shell command run in this world — e.g. start a server/app; set server:true + openUrls for a long-lived one) or an "open" (a produced file or URL to open). The changed-files list is added automatically.
 - save_skill(name, content): persist a reusable skill for future tasks.
 - signal_completion(summary?): structured signal that your turn's work is complete. Call this exactly when you are done — do not write a "done" sentence instead.
 Do real work directly in the working directory (create/edit files, run commands). When finished, call signal_completion.`;

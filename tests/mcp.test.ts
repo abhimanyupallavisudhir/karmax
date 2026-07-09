@@ -122,3 +122,49 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(res.content[0].text).toMatch(/permission denied/i);
   });
 });
+
+// The stdio bridge (src/mcp/stdio.ts) hands httpOps a lazy resolver instead of a
+// baked token so a CLI-launched agent can acquire a gateway session itself. This
+// is the path that used to fail as `Failed to reconnect to karmax: -32000` when
+// no KARMAX_TOKEN was present (the bridge process exited before the handshake).
+describe('httpOps token resolution (CLI bridge)', () => {
+  const jsonRes = (status: number, body: unknown) =>
+    ({ ok: status < 400, status, headers: { get: () => 'application/json' }, json: async () => body, text: async () => JSON.stringify(body) }) as any;
+
+  it('sends the resolved token as a Bearer and re-acquires on a 401', async () => {
+    const seen: (string | null)[] = [];
+    let issued = 0;
+    const fetchMock = async (_url: string, init: any = {}) => {
+      const auth = (init.headers?.authorization as string) ?? null;
+      seen.push(auth);
+      // First call carries the stale token → 401; after re-resolve it succeeds.
+      return auth === 'Bearer s_fresh' ? jsonRes(200, []) : jsonRes(401, { error: 'unauthorized' });
+    };
+    const orig = globalThis.fetch;
+    (globalThis as any).fetch = fetchMock;
+    try {
+      const ops = httpOps('http://gw', async () => (issued++ === 0 ? 's_stale' : 's_fresh'));
+      const list = await ops.listTasks('p1');
+      expect(list).toEqual([]);
+      expect(seen).toEqual(['Bearer s_stale', 'Bearer s_fresh']); // retried once with a fresh session
+    } finally {
+      (globalThis as any).fetch = orig;
+    }
+  });
+
+  it('still issues the request (unauthenticated) when no token can be resolved', async () => {
+    let auth: string | null | undefined;
+    const orig = globalThis.fetch;
+    (globalThis as any).fetch = async (_url: string, init: any = {}) => {
+      auth = (init.headers?.authorization as string) ?? null;
+      return jsonRes(200, []);
+    };
+    try {
+      const ops = httpOps('http://gw', async () => undefined);
+      await expect(ops.listTasks('p1')).resolves.toEqual([]);
+      expect(auth).toBeNull(); // no Authorization header, but the call is still made
+    } finally {
+      (globalThis as any).fetch = orig;
+    }
+  });
+});

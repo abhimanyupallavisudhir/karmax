@@ -81,6 +81,14 @@ export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
  */
 export const updateParamsUpdate = defineUpdate<{ applied: string[] }, [Record<string, unknown>]>('updateParams');
 export const viewQuery = defineQuery<TaskView>('view');
+/**
+ * Live follow-up feed for in-flight injection (SPEC §5.6). A running agent turn
+ * (the activity) polls this to pull messages queued in the addressed role's
+ * transcript AT OR AFTER `fromIndex`, and injects them into the live session
+ * WITHOUT waiting for the next turn. Returns the raw `msgs` slice (indices stay
+ * aligned with the workflow's array); the adapter skips the agent's own replies.
+ */
+export const pendingMessagesQuery = defineQuery<Message[], [string, number]>('pendingMessages');
 
 export interface SoftwareDevInput extends TaskInput {
   /** Sub-tasks run with the parent as confirmer. Only top-level goal tasks (no parent)
@@ -414,12 +422,22 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   }
 
   // ── handlers ──
+  // Which conversation an addressed role reads/writes (Do is the default).
+  const conversationFor = (role?: string): Message[] =>
+    role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs : msgs;
   setHandler(viewQuery, buildView);
+  setHandler(pendingMessagesQuery, (role, fromIndex) => {
+    // The raw slice from `fromIndex` (indices align with the array the activity is
+    // tracking). A negative/over-range index clamps to a safe empty/whole slice.
+    const target = conversationFor(role);
+    return target.slice(Math.max(0, fromIndex));
+  });
   setHandler(followUpSignal, (m, role) => {
     // Route the follow-up into the addressed agent's transcript (SPEC §5.5/§5.6).
     // Do is the default; merge/resolve queue it so it reaches that agent on its
-    // next turn (each turn is fed its own accumulated transcript).
-    const target = role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs : msgs;
+    // next turn (each turn is fed its own accumulated transcript). A turn currently
+    // running polls `pendingMessagesQuery` and injects it live (in-flight).
+    const target = conversationFor(role);
     target.push({ ...m, ts: target.length });
   });
   setHandler(confirmSignal, () => {
@@ -711,15 +729,21 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     );
     session = turn.session ?? session;
     sessionHome = doHome ?? sessionHome;
-    // Insert the agent's reply at the delivered boundary — BEFORE any follow-up that
-    // arrived while the turn was running. This keeps the transcript honest (the reply
-    // follows the messages it actually answered) and, crucially, leaves that follow-up
-    // AFTER `seen`, so the NEXT turn delivers it instead of skipping past it.
+    // The turn reports how many `msgs` it actually delivered — the batch captured at
+    // schedule PLUS any follow-ups it injected in-flight (SPEC §5.6). Fall back to the
+    // schedule snapshot for adapters that don't inject. Clamp within the array in case
+    // more follow-ups landed after the turn's final poll (they stay after the boundary
+    // → delivered on the next turn, never dropped, never re-sent).
+    const delivered = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
+    // Insert the agent's reply right after exactly the messages it answered — BEFORE
+    // any follow-up that arrived after the last poll. This keeps the transcript honest
+    // and leaves that follow-up AFTER `seen`, so the NEXT turn delivers it.
     if (turn.output?.trim()) {
-      msgs.splice(deliveredNow, 0, { id: `a${deliveredNow}`, role: 'agent', text: turn.output, ts: deliveredNow });
-      deliveredNow += 1;
+      msgs.splice(delivered, 0, { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered });
+      seen = delivered + 1;
+    } else {
+      seen = delivered;
     }
-    seen = deliveredNow;
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     return turn;
   }
@@ -1003,8 +1027,11 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       const auto = await core.buildReview(world as any, base).catch(() => undefined);
       if (auto) {
         reviewInfo = {
+          // Prefer the agent's terse caption; fall back to the git-derived summary.
+          caption: reviewInfo?.caption,
           summary: reviewInfo?.summary ?? auto.summary,
           changedFiles: auto.changedFiles,
+          ...(reviewInfo?.actions ? { actions: reviewInfo.actions } : {}),
           ...(reviewInfo?.links ? { links: reviewInfo.links } : {}),
           ...(reviewInfo?.html ? { html: reviewInfo.html } : {}),
         };

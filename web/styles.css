@@ -314,6 +314,10 @@ a { color: var(--accent); text-decoration: none; }
 .review { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; background: var(--surface-2); }
 .review .summary { margin-bottom: 10px; }
 .review .links { display: flex; flex-wrap: wrap; gap: 8px; }
+.review .review-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
+.review .review-actions .btn.review-action { font-family: var(--font-mono); }
+.btn.danger { border-color: var(--danger); color: var(--danger); }
+#review-action-out { margin-top: 8px; }
 .review iframe { width: 100%; min-height: 220px; border: 1px solid var(--line); border-radius: var(--r-sm); background: #fff; }
 .diff { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; white-space: pre; }
 .diff .add { color: var(--merged); }
@@ -341,12 +345,22 @@ a { color: var(--accent); text-decoration: none; }
 details.advanced { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 12px; }
 details.advanced summary { cursor: pointer; color: var(--ink-3); font-size: 12px; user-select: none; }
 pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; max-height: 260px; }
+/* The check-in terminal: a focusable screen the user types straight into. */
+pre.term-screen { overflow-y: auto; white-space: pre-wrap; word-break: break-word; cursor: text; }
+pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-weak); }
 
 /* ── queue / dashboard / settings ──────────────────────────── */
 .card { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); padding: 16px; margin-bottom: 12px; }
 .queue-item { display: flex; align-items: center; gap: 12px; padding: 11px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); margin-bottom: 8px; }
 .queue-item .pos { font-family: var(--font-mono); font-weight: 700; color: var(--accent); width: 28px; }
 .queue-item.current { border-color: var(--merged); background: var(--merged-weak); }
+.queue-item.dragging { opacity: 0.4; }
+.queue-item[draggable="true"] { cursor: grab; }
+.queue-item .drag-handle { color: var(--ink-3); cursor: grab; width: 14px; text-align: center; user-select: none; }
+.queue-item .drag-handle.placeholder { cursor: default; }
+.queue-actions { display: flex; gap: 6px; }
+.queue-domain { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); margin: 14px 0 6px; }
+.queue-domain:first-child { margin-top: 0; }
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
 .stat { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; background: var(--surface); }
 .stat .n { font-size: 26px; font-weight: 700; font-family: var(--font-mono); letter-spacing: -0.02em; }
@@ -581,3 +595,18 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
 .tagm-new input[type="color"] { width: 30px; height: 30px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: none; }
 .tagm-new input.title-in { flex: 1; min-width: 160px; }
 .tagm-hint { padding: 0 16px 14px; font-size: 11px; color: var(--ink-3); line-height: 1.5; }
+
+/* ── dashboard processes (task manager) ── */
+.proc-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.proc-table th, .proc-table td { text-align: left; padding: 5px 12px; border-bottom: 1px solid var(--line); }
+.proc-table th { color: var(--ink-3); font-weight: 600; }
+.proc-table th.num, .proc-table td.num { text-align: right; white-space: nowrap; }
+.proc-table td.cmd { max-width: 0; width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proc-table tr.proc-group td { background: var(--surface-2); font-weight: 600; }
+.proc-table tr.proc-group td.cmd { font-family: var(--font-ui); }
+.proc-table .proc-age { color: var(--ink-3); font-weight: 400; }
+.proc-table .proc-kill { padding: 0 7px; line-height: 18px; }
+.proc-table .proc-task { cursor: pointer; }
+.proc-table .proc-task:hover { color: var(--accent); border-color: var(--accent); }
+.proc-table .proc-lock { opacity: .55; cursor: help; font-size: 11px; }
+.proc-table .proc-kill { white-space: nowrap; }

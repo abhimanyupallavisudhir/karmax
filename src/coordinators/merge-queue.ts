@@ -15,6 +15,7 @@ import {
   SIG_ENQUEUE,
   SIG_RELEASE,
   SIG_PRIORITIZE,
+  SIG_REORDER,
   SIG_CANCEL_MERGE,
   SIG_MERGE_GRANTED,
   QRY_QUEUE,
@@ -41,6 +42,7 @@ export interface QueueView {
 export const enqueueMergeSignal = defineSignal<[{ taskId: string }]>(SIG_ENQUEUE);
 export const releaseMergeSignal = defineSignal<[{ taskId: string }]>(SIG_RELEASE);
 export const prioritizeMergeSignal = defineSignal<[{ taskId: string }]>(SIG_PRIORITIZE);
+export const reorderMergeSignal = defineSignal<[{ taskId: string; beforeTaskId?: string }]>(SIG_REORDER);
 export const cancelMergeSignal = defineSignal<[{ taskId: string }]>(SIG_CANCEL_MERGE);
 export const queueQuery = defineQuery<QueueView>(QRY_QUEUE);
 
@@ -73,6 +75,15 @@ export async function mergeQueue(input: { domain: string; state?: MergeQueueStat
   });
   setHandler(prioritizeMergeSignal, ({ taskId }) => {
     if (queue.includes(taskId)) queue = [taskId, ...queue.filter((t) => t !== taskId)];
+  });
+  // Move `taskId` to sit immediately before `beforeTaskId` (drag-and-drop); with no
+  // anchor (or an anchor no longer in the queue) it falls to the bottom. Only reorders
+  // the waiting queue — the leased `current` task keeps its slot.
+  setHandler(reorderMergeSignal, ({ taskId, beforeTaskId }) => {
+    if (!queue.includes(taskId)) return;
+    const rest = queue.filter((t) => t !== taskId);
+    const idx = beforeTaskId ? rest.indexOf(beforeTaskId) : -1;
+    queue = idx < 0 ? [...rest, taskId] : [...rest.slice(0, idx), taskId, ...rest.slice(idx)];
   });
   setHandler(cancelMergeSignal, ({ taskId }) => {
     queue = queue.filter((t) => t !== taskId);

@@ -25,6 +25,9 @@ export interface RunTurnDeps {
   /** Publish the provider session id the moment it's known (mid-turn), for the live
    *  "fork this agent" command in the drawer (RESOLVE-PLAN #3). */
   onSession?: (session: string) => void;
+  /** Pull follow-up messages queued in the workflow at/after `fromIndex` so a
+   *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
+  pullFollowUps?: (fromIndex: number) => Promise<import('../domain/types.js').Message[]>;
 }
 
 /**
@@ -60,7 +63,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       completed = true; // a verdict ends the confirm turn
     },
     createReviewInfo(info) {
-      reviewInfo = { ...reviewInfo, ...info };
+      // Accumulate `actions` across calls (an agent may attach them incrementally);
+      // every other field is last-write-wins.
+      const actions = info.actions ? [...(reviewInfo?.actions ?? []), ...info.actions] : reviewInfo?.actions;
+      reviewInfo = { ...reviewInfo, ...info, ...(actions ? { actions } : {}) };
     },
     createSubTask(t) {
       subTasks.push(t);
@@ -99,6 +105,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     onSession: deps.onSession,
     signal: deps.signal,
     heartbeat: deps.heartbeat,
+    pullFollowUps: deps.pullFollowUps,
   };
 
   // Liveness: beat every 10s for the turn's whole duration. Adapters also beat on
@@ -125,6 +132,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     session: turn.session,
     completed,
     output: turn.output,
+    delivered: turn.delivered,
     reviewInfo,
     resolution,
     confirmDecision,

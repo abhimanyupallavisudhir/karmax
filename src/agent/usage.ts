@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
+import { trackProcess } from '../util/processes.js';
 
 /**
  * Proactive quota (RESOLVE-PLAN §2 / #6). `claude -p '/usage'` prints a parseable
@@ -189,6 +190,12 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
     let out = '';
     let done = false;
     const child = spawn(cmd, ['-p', '/usage'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (child.pid) {
+      // Task-manager registry (dashboard Processes panel) — short-lived, but a
+      // hung probe eating a core should be visible and killable like anything else.
+      const untrack = trackProcess({ pid: child.pid, kind: 'probe', label: 'claude usage probe', startedAt: Date.now() });
+      child.once('exit', untrack);
+    }
     const finish = (err?: Error) => {
       if (done) return;
       done = true;

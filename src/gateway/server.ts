@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
@@ -21,6 +22,7 @@ import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
+import { ReviewActionRunner } from './review-actions.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -56,6 +58,25 @@ const MIME: Record<string, string> = {
   '.ico': 'image/x-icon',
 };
 
+/** Content types for review "open" artifacts (a superset of the static MIME map). */
+const ARTIFACT_MIME: Record<string, string> = {
+  ...MIME,
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/plain; charset=utf-8',
+  '.log': 'text/plain; charset=utf-8',
+  '.csv': 'text/csv; charset=utf-8',
+  '.ipynb': 'application/json; charset=utf-8',
+};
+
 interface Session {
   user: string;
   apiToken: string;
@@ -65,6 +86,8 @@ export class Gateway {
   private sessions = new Map<string, Session>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
+  /** Runs review "run" actions (dev servers, scripts) in the task's world. */
+  private reviewActions = new ReviewActionRunner();
   private attachments = new AttachmentStore();
 
   constructor(private deps: GatewayDeps) {}
@@ -87,10 +110,12 @@ export class Gateway {
     //  /ws/terminal — a PTY against the task's world (cheap check-in, SPEC §5.5).
     const wssEvents = new WebSocketServer({ noServer: true });
     const wssTerm = new WebSocketServer({ noServer: true });
+    const wssAction = new WebSocketServer({ noServer: true });
     server.on('upgrade', (req, socket, head) => {
       const { pathname } = new URL(req.url ?? '/', 'http://localhost');
       if (pathname === '/ws') wssEvents.handleUpgrade(req, socket, head, (ws) => wssEvents.emit('connection', ws, req));
       else if (pathname === '/ws/terminal') wssTerm.handleUpgrade(req, socket, head, (ws) => wssTerm.emit('connection', ws, req));
+      else if (pathname === '/ws/review-action') wssAction.handleUpgrade(req, socket, head, (ws) => wssAction.emit('connection', ws, req));
       else socket.destroy();
     });
     wssEvents.on('connection', (ws) => {
@@ -101,6 +126,7 @@ export class Gateway {
       ws.on('error', off);
     });
     wssTerm.on('connection', (ws, req) => this.terminal(ws, req));
+    wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
 
     await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', () => resolve()));
     return {
@@ -108,8 +134,10 @@ export class Gateway {
       port,
       close: () =>
         new Promise<void>((resolve) => {
+          this.reviewActions.stopAll();
           wssEvents.close();
           wssTerm.close();
+          wssAction.close();
           server.close(() => resolve());
         }),
     };
@@ -141,15 +169,62 @@ export class Gateway {
       cwd,
       env: { ...process.env, PS1: 'karmax:\\W$ ' },
     });
+    // Task-manager registry: the PTY (and anything the user runs in it) shows up
+    // in the dashboard Processes panel under its task, and can be killed there.
+    const { trackProcess } = await import('../util/processes.js');
+    const untrack = term.pid
+      ? trackProcess({
+          pid: term.pid,
+          kind: 'terminal',
+          label: 'task terminal (bash)',
+          taskId,
+          startedAt: Date.now(),
+          kill: () => { try { term.kill(); } catch { /* already gone */ } },
+        })
+      : () => {};
     term.onData((d: string) => { try { ws.send(JSON.stringify({ type: 'data', data: d })); } catch {} });
-    term.onExit(() => { try { ws.close(); } catch {} });
+    term.onExit(() => { untrack(); try { ws.close(); } catch {} });
     ws.on('message', (raw) => {
       let msg: any;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'input') term.write(msg.data);
       else if (msg.type === 'resize') term.resize(msg.cols || 80, msg.rows || 24);
     });
-    ws.on('close', () => { try { term.kill(); } catch {} });
+    // Closing the socket (navigating away OR the user hitting "Kill terminal")
+    // tears the whole thing down — not just the shell, but every process it
+    // spawned. node-pty runs the shell as a session leader (its pid == the
+    // session id), so we kill the entire session: `pkill -s` reaps foreground
+    // AND background jobs, which a bare process-group kill would miss (bash job
+    // control puts each pipeline in its own group). The group kill + term.kill()
+    // are belt-and-suspenders fallbacks.
+    ws.on('close', () => killPtySession(term));
+  }
+
+  /** Stream a running review action's output to the UI. `procId` names a process
+   *  the client already started via POST /review-action. We replay the buffered
+   *  output first, then push the live tail until it exits or the socket closes. */
+  private reviewActionStream(ws: import('ws').WebSocket, req: http.IncomingMessage) {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const procId = url.searchParams.get('procId') ?? '';
+    const rec = this.reviewActions.get(procId);
+    if (!rec) {
+      try { ws.send(JSON.stringify({ type: 'exit', code: -1, data: 'No such action process.\n' })); } catch {}
+      ws.close();
+      return;
+    }
+    const send = (obj: unknown) => { try { ws.send(JSON.stringify(obj)); } catch {} };
+    if (rec.output) send({ type: 'data', data: rec.output });
+    if (!rec.running) {
+      send({ type: 'exit', code: rec.exitCode });
+      ws.close();
+      return;
+    }
+    const off = this.reviewActions.attach(procId, (chunk, done, code) => {
+      if (chunk) send({ type: 'data', data: chunk });
+      if (done) { send({ type: 'exit', code }); try { ws.close(); } catch {} }
+    });
+    ws.on('close', off);
+    ws.on('error', off);
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
@@ -220,6 +295,22 @@ export class Gateway {
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
         return this.json(res, 200, { host: hostStats(), agentSlots: agentSlotStats(), ts: Date.now() });
+      }
+
+      // Task manager (dashboard Processes panel): every process karmax is
+      // responsible for — agent subprocesses and their tool children, embedded-
+      // terminal PTYs and what runs in them, the Temporal server, git/exec
+      // helpers — grouped by owning entity with live CPU/RSS. See
+      // src/util/processes.ts for the coverage model.
+      if (p === '/api/processes' && method === 'GET') {
+        const { sampleProcesses } = await import('../util/processes.js');
+        return this.json(res, 200, sampleProcesses());
+      }
+      if (p === '/api/processes/kill' && method === 'POST') {
+        const b = await this.body(req);
+        const { killTracked } = await import('../util/processes.js');
+        const out = await killTracked(Number(b.pid), b.signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM');
+        return this.json(res, out.ok ? 200 : 400, out);
       }
 
       // image attachments (image prompts). The ONLY endpoints that handle raw
@@ -492,6 +583,54 @@ export class Gateway {
         const b = await this.body(req);
         return this.json(res, 200, { ok: await api.setTarget(token, targetMatch[1]!, b.branch) });
       }
+      // ── review actions (SPEC §5.5): click-to-verify affordances ──
+      // Start a "run" action (or resolve an "open" one). The command is looked up
+      // from the task's stored review info by index — the client only sends the
+      // index, so it can never inject an arbitrary command.
+      const raStartMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action$/);
+      if (raStartMatch && method === 'POST') {
+        const taskId = raStartMatch[1]!;
+        const b = await this.body(req);
+        // Resolve the action from the AUTHORITATIVE live view (the stored lastView
+        // can lag the workflow), by index — the client never supplies the command,
+        // so only agent-authored actions are runnable.
+        const view = (await api.getTaskView(token, taskId).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        const action = view?.reviewInfo?.actions?.[Number(b.index)];
+        if (!action) return this.json(res, 404, { error: 'no such review action' });
+        const worldPath = view?.worldPath;
+        if (action.kind === 'open') {
+          const target = String(action.target ?? '');
+          if (/^https?:\/\//i.test(target)) return this.json(res, 200, { kind: 'open', url: target, external: true });
+          if (!target) return this.json(res, 400, { error: 'open action has no target' });
+          const url2 = `/api/tasks/${encodeURIComponent(taskId)}/artifact?path=${encodeURIComponent(target)}`;
+          return this.json(res, 200, { kind: 'open', url: url2, external: false });
+        }
+        // kind: 'run'
+        if (!action.command) return this.json(res, 400, { error: 'run action has no command' });
+        if (!worldPath) return this.json(res, 400, { error: 'no world for this task yet' });
+        const rec = this.reviewActions.start({
+          taskId,
+          cwd: worldPath,
+          label: action.label,
+          command: action.command,
+          server: action.server,
+          openUrls: action.openUrls,
+        });
+        return this.json(res, 200, { kind: 'run', procId: rec.procId, server: rec.server, openUrls: rec.openUrls });
+      }
+      const raStopMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action\/([^/]+)\/stop$/);
+      if (raStopMatch && method === 'POST') {
+        return this.json(res, 200, { ok: this.reviewActions.stop(raStopMatch[2]!) });
+      }
+      const raStatusMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action\/([^/]+)$/);
+      if (raStatusMatch && method === 'GET') {
+        const st = this.reviewActions.status(raStatusMatch[2]!);
+        return this.json(res, st ? 200 : 404, st ?? { error: 'no such action process' });
+      }
+      const artifactMatch = p.match(/^\/api\/tasks\/([^/]+)\/artifact$/);
+      if (artifactMatch && method === 'GET') {
+        return this.serveArtifact(res, artifactMatch[1]!, url.searchParams.get('path') ?? '');
+      }
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
@@ -541,6 +680,11 @@ export class Gateway {
       if (p === '/api/queue/prioritize' && method === 'POST') {
         const b = await this.body(req);
         await api.reorderQueue(token, b.domain, b.taskId);
+        return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/queue/move' && method === 'POST') {
+        const b = await this.body(req);
+        await api.moveQueueItem(token, b.domain, b.taskId, b.beforeTaskId || undefined);
         return this.json(res, 200, { ok: true });
       }
       // platform API surface used by the MCP server (save skill / propose edit)
@@ -1006,6 +1150,30 @@ export class Gateway {
     }
   }
 
+  /** Serve a produced artifact (an `open` action's file target) from the task's
+   *  world, so the UI can open a PDF/image/video/notebook it generated. Path is
+   *  confined to the world root — no traversal outside it. */
+  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string) {
+    const worldPath = this.deps.store.getTask(taskId)?.lastView?.worldPath;
+    if (!worldPath) return this.json(res, 404, { error: 'no world for this task' });
+    if (!relPath) return this.json(res, 400, { error: 'missing path' });
+    const root = path.resolve(worldPath);
+    const file = path.resolve(root, relPath);
+    if (file !== root && !file.startsWith(root + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
+    try {
+      const stat = await fs.promises.stat(file);
+      if (stat.isDirectory()) return this.json(res, 400, { error: 'path is a directory' });
+      const data = await fs.promises.readFile(file);
+      res.writeHead(200, {
+        'content-type': ARTIFACT_MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
+        'content-length': String(data.length),
+      });
+      res.end(data);
+    } catch {
+      this.json(res, 404, { error: 'artifact not found' });
+    }
+  }
+
   // ── helpers ──
   private auth(req: http.IncomingMessage): Session | undefined {
     const h = req.headers['authorization'];
@@ -1049,6 +1217,20 @@ export class Gateway {
       /* ignore */
     }
   }
+}
+
+/** Tear down a check-in PTY and everything running inside it. The interactive
+ *  shell node-pty spawned is a session leader (pid == session id), so killing
+ *  the whole session reaps its children — foreground and background jobs alike.
+ *  `pkill -s` is the thorough path; the process-group kill and `term.kill()` are
+ *  fallbacks for platforms without pkill or if the session id trick misses. */
+function killPtySession(term: { pid?: number; kill?: () => void }): void {
+  const pid = term?.pid;
+  if (typeof pid === 'number') {
+    try { spawn('pkill', ['-KILL', '-s', String(pid)], { stdio: 'ignore' }).on('error', () => {}); } catch { /* no pkill */ }
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+  }
+  try { term.kill?.(); } catch { /* already dead */ }
 }
 
 /** Expand ~ / $HOME in repo paths so a configured repo resolves to a real dir. */

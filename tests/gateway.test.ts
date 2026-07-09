@@ -109,6 +109,77 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(dash.tasks).toBeGreaterThanOrEqual(1);
   });
 
+  it('runs a review "run" action in the world and serves an "open" artifact', async () => {
+    const repo = await h.makeRepo('gw-actions');
+    const project: any = await (
+      await fetch(`${base}/api/projects`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({ name: 'GWA', config: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } }),
+      })
+    ).json();
+    const task: any = await (
+      await fetch(`${base}/api/projects/${project.id}/tasks`, {
+        method: 'POST',
+        headers: auth(),
+        body: JSON.stringify({
+          title: 'Action task',
+          prompt:
+            '@write out.txt :: hello-artifact\n' +
+            '@runaction print :: cat out.txt && echo DONE_MARKER\n' +
+            '@openaction the file :: out.txt\n' +
+            '@review verify the output',
+          workflow: 'software-dev',
+        }),
+      })
+    ).json();
+
+    // poll to Review
+    let view: any;
+    for (let i = 0; i < 60; i++) {
+      view = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+      if (view?.stage === 'review') break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    expect(view.stage).toBe('review');
+    // the terse caption + accumulated actions are on the review info
+    expect(view.reviewInfo.caption).toContain('verify');
+    expect(view.reviewInfo.actions.map((a: any) => a.kind)).toEqual(['run', 'open']);
+
+    // run action (index 0) → executes `cat out.txt && echo DONE_MARKER` in the world
+    const started: any = await (
+      await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST', headers: auth(), body: JSON.stringify({ index: 0 }) })
+    ).json();
+    expect(started.kind).toBe('run');
+    expect(started.procId).toBeTruthy();
+    let status: any;
+    for (let i = 0; i < 40; i++) {
+      status = await (await fetch(`${base}/api/tasks/${task.id}/review-action/${started.procId}`, { headers: auth() })).json();
+      if (status && status.running === false) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(status.running).toBe(false);
+    expect(status.exitCode).toBe(0);
+    expect(status.output).toContain('hello-artifact');
+    expect(status.output).toContain('DONE_MARKER');
+
+    // open action (index 1) → resolves to an artifact URL served from the world
+    const opened: any = await (
+      await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST', headers: auth(), body: JSON.stringify({ index: 1 }) })
+    ).json();
+    expect(opened.kind).toBe('open');
+    expect(opened.external).toBe(false);
+    const artifact = await fetch(`${base}${opened.url}`, { headers: auth() });
+    expect(artifact.status).toBe(200);
+    expect(await artifact.text()).toContain('hello-artifact');
+
+    // a bad index is rejected; artifact traversal is refused
+    const bad = await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST', headers: auth(), body: JSON.stringify({ index: 99 }) });
+    expect(bad.status).toBe(404);
+    const escape = await fetch(`${base}/api/tasks/${task.id}/artifact?path=${encodeURIComponent('../../../etc/passwd')}`, { headers: auth() });
+    expect(escape.status).toBe(400);
+  });
+
   it('inherits defaults live: drafts store only overrides and re-resolve when queued', async () => {
     const project: any = await (
       await fetch(`${base}/api/projects`, {

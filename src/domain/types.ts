@@ -223,7 +223,41 @@ export interface Message {
   images?: ImageRef[];
 }
 
+/**
+ * A single click-to-verify affordance the reviewer can act on. Review info is a
+ * list of these — NOT a prose changelog (that belongs in the conversation). Two
+ * primitives:
+ *  - `run`  — a shell command executed IN THE TASK'S WORLD (start a server, run an
+ *             app or script). A long-lived one (`server: true`) streams logs and can
+ *             be stopped; `openUrls` are opened once it's up.
+ *  - `open` — open a produced artifact: a world-relative file (PDF, notebook, image,
+ *             video) or an absolute URL. No command runs.
+ */
+export type ReviewActionKind = 'run' | 'open';
+
+export interface ReviewAction {
+  kind: ReviewActionKind;
+  /** Short button label, e.g. "Start dev server", "Open coverage report". */
+  label: string;
+  /** `run` only: the exact shell command executed in the task's world. */
+  command?: string;
+  /** `run` only: the command is a long-lived server/watcher (stream logs + Stop). */
+  server?: boolean;
+  /** `run` only: URLs to open once the command is up (e.g. a dev server page). */
+  openUrls?: string[];
+  /** `open` only: world-relative file path OR an absolute URL to open. */
+  target?: string;
+}
+
 export interface ReviewInfo {
+  /**
+   * Terse orientation — WHAT to verify, not a narrative of what was done. One line.
+   * Prose about the work belongs in the conversation/messages, not here.
+   */
+  caption?: string;
+  /** Click-to-verify affordances (SPEC §5.5): the primary review payload. */
+  actions?: ReviewAction[];
+  /** @deprecated Legacy free-form summary; kept for back-compat rendering only. */
   summary?: string;
   links?: { label: string; url: string }[];
   diff?: string;

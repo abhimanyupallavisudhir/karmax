@@ -25,6 +25,9 @@ export const followUpSignal = defineSignal<[Message]>('followUp');
 export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const viewQuery = defineQuery<TaskView>('view');
+/** Live follow-up feed for in-flight injection (SPEC §5.6): a running turn polls
+ *  this to inject messages queued at/after `fromIndex` without waiting a full turn. */
+export const pendingMessagesQuery = defineQuery<Message[], [string, number]>('pendingMessages');
 
 /**
  * just-do (SPEC §4.7): a single straightforward agent call, no merge machinery.
@@ -92,6 +95,7 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   }
 
   setHandler(viewQuery, view);
+  setHandler(pendingMessagesQuery, (_role, fromIndex) => msgs.slice(Math.max(0, fromIndex)));
   setHandler(followUpSignal, (m) => {
     msgs.push({ ...m, ts: msgs.length });
   });
@@ -129,7 +133,10 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
     }
     infraRetries = 0;
     session = turn.session ?? session;
-    seen = deliveredNow;
+    // Advance past exactly what the turn delivered — the schedule snapshot plus any
+    // follow-ups it injected in-flight (SPEC §5.6). Follow-ups that landed after the
+    // turn's last poll stay after `seen` → delivered on the next turn.
+    seen = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     stage = 'review';
     status = 'waiting';

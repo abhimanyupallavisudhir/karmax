@@ -35,8 +35,10 @@ const S = {
   sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
   ws: null,
   hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
+  procTimer: null, // live-refresh handle for the dashboard processes (task manager) panel
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
   returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
+  queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
 };
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
@@ -130,6 +132,7 @@ async function applyRoute() {
   renderRail();
   renderMain();
   if (tab === 'activity') seedActivity();
+  if (tab === 'queue') seedQueue();
   if (tab === 'dashboard') renderDashboard();
   // reconcile the open task from the URL (loaded tasks are in hand now)
   let taskId = null;
@@ -864,6 +867,7 @@ async function refreshTasks() {
     if (S.tab === 'tasks') await runSearch();
     if (S.tab === 'tasks' || S.tab === 'queue') renderMain();
     renderRail();
+    if (S.tab === 'queue') seedQueue();
   } catch {}
 }
 
@@ -930,6 +934,9 @@ function captureFocus(root) {
   const el = document.activeElement;
   if (!el || !el.id || !root.contains(el)) return null;
   const tag = el.tagName;
+  // The terminal screen is a focusable <pre> the user types straight into —
+  // keep it focused across re-renders so keystrokes keep reaching the shell.
+  if (tag === 'PRE' && el.classList.contains('term-screen')) return { id: el.id, tag };
   if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return null;
   const st = { id: el.id, tag, value: el.value };
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
@@ -943,6 +950,7 @@ function restoreFocus(root, st) {
   if (!st) return;
   const el = root.querySelector(`#${window.CSS && CSS.escape ? CSS.escape(st.id) : st.id}`);
   if (!el || el.tagName !== st.tag) return;
+  if (st.tag === 'PRE') { el.focus(); return; } // terminal screen: just re-focus (no value to restore)
   // Only carry over the in-progress value for free-text fields; a fresh empty
   // composer input would otherwise be reset by the re-render.
   if (st.tag !== 'SELECT') el.value = st.value;
@@ -1837,7 +1845,7 @@ function closeDrawerDom() {
   S.view = null;
   S.liveOutput = ''; // drop any streamed live text so it can't reappear in the next drawer
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next drawer
-  if (termWs) { try { termWs.close(); } catch {} termWs = null; }
+  if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // closing the drawer kills the check-in shell
   $('#drawer-root').innerHTML = '';
   highlightRow();
 }
@@ -2017,6 +2025,7 @@ function renderDrawer() {
   wireNotes(v);
   wireDrawerOrg(v);
   wireTerminal(v.taskId);
+  wireReviewActions(v);
   wireCopyButtons();
   renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId, taskId: v.taskId });
   renderDrawerEvents();
@@ -2055,31 +2064,275 @@ function restoreFollowupFocus(root, st) {
   }
 }
 
-let termWs = null;
 function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/\r/g, '');
 }
+
+// ── check-in terminal: a real PTY streamed over a WebSocket ──────────────────
+// The session outlives drawer re-renders (which rebuild the DOM on every event),
+// so it lives in module state and rebinds to the freshly-rendered <pre> each
+// time. `makeTermScreen` is a tiny terminal emulator that turns the PTY byte
+// stream — echo, backspace, cursor moves, line erases — into displayable text,
+// so the user can type STRAIGHT into the terminal (Ctrl-C and friends included)
+// without pulling in a heavyweight emulator like xterm.js (which would break the
+// no-build-step, offline console this app is built around).
+let term = null; // { taskId, ws, screen } while a session is live; null otherwise
+
+function termIsOpenFor(taskId) {
+  return !!(term && term.taskId === taskId && term.ws && term.ws.readyState <= 1);
+}
+
+// Minimal line-oriented emulator: enough to render an interactive shell's echo,
+// backspace, history recall and Ctrl-C cleanly. Full-screen TUIs (vim, htop) use
+// absolute cursor positioning we intentionally ignore — those genuinely need a
+// full emulator; a line-mode check-in terminal doesn't.
+function makeTermScreen(maxLines = 2000) {
+  let lines = [''];
+  let row = 0, col = 0;
+  const ensureRow = () => { while (lines.length <= row) lines.push(''); };
+  const put = (i, ch) => {
+    let line = lines[row];
+    if (line.length < i) line += ' '.repeat(i - line.length);
+    lines[row] = line.slice(0, i) + ch + line.slice(i + 1);
+  };
+  function csi(final, params) {
+    const n = parseInt(params, 10);
+    const num = Number.isNaN(n) ? (final === 'K' || final === 'J' ? 0 : 1) : n;
+    ensureRow();
+    const line = lines[row];
+    switch (final) {
+      case 'C': col += num; break;                                      // cursor right
+      case 'D': col = Math.max(0, col - num); break;                    // cursor left
+      case 'G': col = Math.max(0, num - 1); break;                      // cursor to column
+      case 'K':                                                          // erase in line
+        lines[row] = num === 1 ? ' '.repeat(col) + line.slice(col) : num === 2 ? '' : line.slice(0, col);
+        break;
+      case 'P': lines[row] = line.slice(0, col) + line.slice(col + num); break; // delete chars
+      case 'J':                                                          // erase display
+        if (num >= 2) { lines = ['']; row = 0; col = 0; }
+        else { lines[row] = line.slice(0, col); lines = lines.slice(0, row + 1); }
+        break;
+      default: break;                                                    // ignore the rest (cursor up/down, SGR colors, …)
+    }
+  }
+  function write(data) {
+    for (let k = 0; k < data.length; k++) {
+      const ch = data[k];
+      if (ch === '\x1b') {
+        if (data[k + 1] === '[') {                                       // CSI — read params until the final byte
+          let j = k + 2, params = '';
+          while (j < data.length && !(data.charCodeAt(j) >= 0x40 && data.charCodeAt(j) <= 0x7e)) params += data[j++];
+          csi(data[j], params);
+          k = j;
+        } else if (data[k + 1] === ']') {                               // OSC — skip to BEL or ST
+          let j = k + 2;
+          while (j < data.length && data[j] !== '\x07' && !(data[j] === '\x1b' && data[j + 1] === '\\')) j++;
+          k = data[j] === '\x1b' ? j + 1 : j;
+        } else { k++; }                                                  // 2-char escape — skip the pair
+        continue;
+      }
+      if (ch === '\r') { col = 0; continue; }
+      if (ch === '\n') { row++; ensureRow(); continue; }
+      if (ch === '\b') { if (col > 0) col--; continue; }
+      const code = data.charCodeAt(k);
+      if (code < 32 || code === 127) continue;                          // drop other control chars (bell, etc.)
+      ensureRow();
+      put(col, ch);
+      col++;
+    }
+    if (lines.length > maxLines) {                                       // bound scrollback memory
+      const drop = lines.length - maxLines;
+      lines.splice(0, drop);
+      row = Math.max(0, row - drop);
+    }
+  }
+  return { write, render: () => lines.join('\n') };
+}
+
+// Translate a browser keydown into the bytes a PTY expects. Returns null to let
+// the browser keep the event (copy/paste shortcuts, unhandled combos).
+function keyToPtyBytes(e) {
+  if (e.altKey || e.metaKey) return null;
+  const k = e.key;
+  if (e.ctrlKey) {
+    if (e.shiftKey) return null;                                        // Ctrl+Shift+C/V → let the browser copy/paste
+    if (/^[a-zA-Z]$/.test(k)) return String.fromCharCode(k.toLowerCase().charCodeAt(0) - 96); // ^A..^Z, incl. Ctrl-C (^C = \x03)
+    if (k === ' ') return '\x00';
+    return null;
+  }
+  switch (k) {
+    case 'Enter': return '\r';
+    case 'Backspace': return '\x7f';
+    case 'Tab': return '\t';
+    case 'Escape': return '\x1b';
+    case 'ArrowUp': return '\x1b[A';
+    case 'ArrowDown': return '\x1b[B';
+    case 'ArrowRight': return '\x1b[C';
+    case 'ArrowLeft': return '\x1b[D';
+    case 'Home': return '\x1b[H';
+    case 'End': return '\x1b[F';
+    case 'Delete': return '\x1b[3~';
+    default: return k.length === 1 ? k : null;                          // a printable char, else ignore
+  }
+}
+
+// Point the (freshly rendered) <pre> at the live session: repaint the buffer,
+// stream new bytes into it, and forward keystrokes/paste straight to the PTY.
+function bindTermScreen(out) {
+  if (!term || !out) return;
+  out.classList.remove('hidden');
+  out.textContent = term.screen.render();
+  out.scrollTop = out.scrollHeight;
+  const ws = term.ws;
+  ws.onmessage = (m) => {
+    try {
+      const msg = JSON.parse(m.data);
+      if (msg.type === 'data') { term.screen.write(msg.data); out.textContent = term.screen.render(); out.scrollTop = out.scrollHeight; }
+    } catch {}
+  };
+  const send = (data) => { if (term && term.ws && term.ws.readyState === 1) term.ws.send(JSON.stringify({ type: 'input', data })); };
+  out.onkeydown = (e) => {
+    const bytes = keyToPtyBytes(e);
+    if (bytes == null) return;                                          // leave copy/paste, F-keys, etc. to the browser
+    e.preventDefault();
+    send(bytes);
+  };
+  out.onpaste = (e) => {
+    const text = (e.clipboardData || window.clipboardData)?.getData('text');
+    if (!text) return;
+    e.preventDefault();
+    send(text);
+  };
+}
+
+function openTerminal(taskId) {
+  if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}`);
+  term = { taskId, ws, screen: makeTermScreen() };
+  ws.onclose = () => {
+    if (!term || term.ws !== ws) return;                               // superseded by a newer session
+    term.screen.write('\r\n[terminal closed]\r\n');
+    const out = document.getElementById('term-out');
+    if (out) out.textContent = term.screen.render();
+    term = null;
+    syncTermButton();
+  };
+  bindTermScreen(document.getElementById('term-out'));
+  const out = document.getElementById('term-out');
+  if (out) out.focus();
+  syncTermButton();
+}
+
+// Killing the terminal is just closing the socket: the gateway's ws-close handler
+// kills the PTY's whole session — the shell AND every process running in it (see
+// killPtySession in src/gateway/server.ts).
+function killTerminal() {
+  if (term && term.ws) { try { term.ws.close(); } catch {} }
+}
+
+function syncTermButton() {
+  const btn = document.getElementById('term-open');
+  if (!btn) return;
+  const live = !!(term && term.ws && term.ws.readyState <= 1);
+  const hasWorld = btn.dataset.hasWorld === '1';
+  if (live) {
+    btn.textContent = 'Kill terminal';
+    btn.classList.add('danger');
+    btn.disabled = false;
+  } else {
+    btn.classList.remove('danger');
+    btn.textContent = hasWorld ? 'Open terminal' : 'No world yet';
+    btn.disabled = !hasWorld;
+  }
+}
+
 function wireTerminal(taskId) {
   const btn = document.getElementById('term-open');
   if (!btn) return;
+  btn.dataset.hasWorld = btn.disabled ? '0' : '1';                     // capture world presence before we mutate the label
+  if (termIsOpenFor(taskId)) bindTermScreen(document.getElementById('term-out'));  // reattach a session that outlived the re-render
+  else if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; } // switched tasks → drop the old shell
+  syncTermButton();
   btn.addEventListener('click', () => {
-    const out = document.getElementById('term-out');
-    const inp = document.getElementById('term-in');
-    out.classList.remove('hidden');
-    inp.classList.remove('hidden');
-    inp.focus();
-    if (termWs) { try { termWs.close(); } catch {} }
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}`);
-    termWs = ws;
-    ws.onmessage = (m) => {
-      try { const msg = JSON.parse(m.data); if (msg.type === 'data') { out.textContent += stripAnsi(msg.data); out.scrollTop = out.scrollHeight; } } catch {}
-    };
-    ws.onclose = () => { out.textContent += '\n[terminal closed]\n'; };
-    inp.onkeydown = (e) => {
-      if (e.key === 'Enter') { ws.send(JSON.stringify({ type: 'input', data: inp.value + '\r' })); inp.value = ''; }
-    };
+    if (termIsOpenFor(taskId)) killTerminal();
+    else openTerminal(taskId);
   });
+}
+
+// ── review actions: click-to-verify buttons (run in the world / open artifacts) ──
+function reviewActionBtn(a, i) {
+  const isRun = a.kind === 'run';
+  const icon = isRun ? (a.server ? '▶' : '⚡') : '↗';
+  const label = `${icon} ${esc(a.label || (isRun ? 'Run' : 'Open'))}`;
+  const title = isRun ? esc(a.command || '') : esc(a.target || '');
+  return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
+}
+
+let reviewActionWs = null;
+async function openArtifact(url, external) {
+  if (external) { window.open(url, '_blank', 'noopener'); return; }
+  // Artifact endpoints need the auth header, so fetch as a blob then open it.
+  try {
+    const res = await fetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
+    if (!res.ok) { toast('could not open artifact', true); return; }
+    const obj = URL.createObjectURL(await res.blob());
+    window.open(obj, '_blank', 'noopener');
+    setTimeout(() => URL.revokeObjectURL(obj), 60_000);
+  } catch (e) { toast(e.message, true); }
+}
+function wireReviewActions(v) {
+  const wrap = document.getElementById('review-actions');
+  if (!wrap) return;
+  const out = document.getElementById('review-action-out');
+  wrap.querySelectorAll('.review-action').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = Number(btn.getAttribute('data-idx'));
+      const kind = btn.getAttribute('data-kind');
+      try {
+        const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
+        if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        // kind === 'run': stream output; open follow-up URLs; offer Stop.
+        if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
+        if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}`);
+        reviewActionWs = ws;
+        ws.onmessage = (m) => {
+          try {
+            const msg = JSON.parse(m.data);
+            if (!out) return;
+            if (msg.type === 'data') { out.textContent += stripAnsi(msg.data); out.scrollTop = out.scrollHeight; }
+            else if (msg.type === 'exit') { out.textContent += `\n[exited: code ${msg.code}]\n`; setStopBtn(false); }
+          } catch {}
+        };
+        ws.onclose = () => setStopBtn(false);
+        setStopBtn(true, r.procId, v.taskId);
+        // A server keeps running — open its pages once it's had a moment to boot.
+        if (r.server && Array.isArray(r.openUrls)) {
+          setTimeout(() => r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
+        } else if (Array.isArray(r.openUrls) && r.openUrls.length) {
+          r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener'));
+        }
+      } catch (e) { toast(e.message, true); }
+    });
+  });
+}
+function setStopBtn(running, procId, taskId) {
+  const wrap = document.getElementById('review-actions');
+  if (!wrap) return;
+  let stop = document.getElementById('review-action-stop');
+  if (!running) { if (stop) stop.remove(); return; }
+  if (!stop) {
+    stop = document.createElement('button');
+    stop.id = 'review-action-stop';
+    stop.className = 'btn sm danger';
+    stop.textContent = '■ Stop';
+    wrap.appendChild(stop);
+  }
+  stop.onclick = async () => {
+    try { await api(`/api/tasks/${taskId}/review-action/${procId}/stop`, { method: 'POST' }); } catch (e) { toast(e.message, true); }
+  };
 }
 
 function drawerBody(v) {
@@ -2135,11 +2388,14 @@ function drawerBody(v) {
       </details>`;
     })
     .join('');
+  const caption = v.reviewInfo?.caption || v.reviewInfo?.summary;
   const review = v.reviewInfo
     ? `<div class="section-h">Review</div>
        <div class="review">
-         ${v.reviewInfo.summary ? `<div class="summary">${esc(v.reviewInfo.summary)}</div>` : ''}
-         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin-bottom:8px">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
+         ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
+         ${v.reviewInfo.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
+         <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
+         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin:8px 0">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
        </div>`
@@ -2151,6 +2407,21 @@ function drawerBody(v) {
   const subtasks = v.subTasks?.length
     ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
     : '';
+  // Terminal — a top-level section (like an agent conversation), NOT buried in
+  // Advanced. It stays fully visible (no collapse) so the shell is one click away.
+  // Open a real PTY in the task's world; type straight into it (Ctrl-C and friends
+  // land in the shell). "Open terminal" flips to "Kill terminal" while a session is
+  // live — that button closes the socket, which kills the shell and every process
+  // running in it.
+  const terminalSection = `
+    <div class="terminal-section">
+      <div class="section-h">Ephemeral Terminal</div>
+      <div class="task-sub" style="gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      </div>
+      <pre class="raw hidden term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell" style="height:240px;outline:none"></pre>
+    </div>`;
   return `
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
@@ -2162,20 +2433,14 @@ function drawerBody(v) {
     ${renderWidgetGroups(S.widgets)}
     ${subtasks}
     ${conversations}
+    ${terminalSection}
     <details class="advanced">
       <summary>Credentials — precedence &amp; enable/disable for this task</summary>
       <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the global/project order + enablement, just for this task. Drag to reorder; toggle On/Off. (This is the running-task form — the new-task form has the same control.)</p>
       <div id="cred-editor-task">Loading…</div>
     </details>
     <details class="advanced">
-      <summary>Advanced — terminal, live event log, structured state</summary>
-      <div class="section-h">Terminal — open a shell in the world (ephemeral)</div>
-      <div class="task-sub" style="gap:6px;flex-wrap:wrap">
-        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
-        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      </div>
-      <pre class="raw hidden" id="term-out" style="height:200px"></pre>
-      <input id="term-in" class="title-in hidden" style="width:100%;margin-top:6px;padding:8px 10px" placeholder="command + Enter" />
+      <summary>Advanced — live event log, structured state</summary>
       <div class="section-h">Live events</div>
       <div class="events" id="drawer-events"></div>
       <div class="section-h">Structured state (the view-model floor)</div>
@@ -2684,39 +2949,155 @@ function summarize(p) {
 }
 
 // ── queue ────────────────────────────────────────────────────────────────────
+// Fetch the coordinator's authoritative queue order for every domain currently in
+// the merge stage, so the view reflects reorders immediately (the per-task polled
+// position lags up to a workflow poll interval). Re-renders the queue tab on arrival.
+async function seedQueue() {
+  const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
+  const domains = [...new Set(inMerge.map((t) => t.lastView?.state?.mergeDomain).filter(Boolean))];
+  const orders = {};
+  await Promise.all(
+    domains.map(async (d) => {
+      try {
+        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}`);
+        orders[d] = { queue: v.queue || [], current: v.current };
+      } catch {}
+    }),
+  );
+  S.queueOrders = orders;
+  if (S.tab === 'queue') renderMain();
+}
+
+// Rank a task within its domain: the leased (merging) task pins to the top, then the
+// coordinator's queue order when known, else the task's last-published position.
+function queueRank(t) {
+  const v = t.lastView || {};
+  if (v.state?.mergeGranted) return -1;
+  const ord = S.queueOrders[v.state?.mergeDomain];
+  if (ord) { const i = ord.queue.indexOf(t.id); return i < 0 ? 1e6 : i; }
+  const p = v.mergeQueue?.position;
+  return p > 0 ? p : 1e6 - 1;
+}
+
 function queueView() {
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
   if (!inMerge.length) return `<div class="empty"><div class="big">Merge queue is empty</div>Tasks appear here when they reach the merge stage.</div>`;
-  inMerge.sort((a, b) => (a.lastView?.mergeQueue?.position ?? 99) - (b.lastView?.mergeQueue?.position ?? 99));
-  return inMerge
-    .map((t) => {
-      const v = t.lastView || {};
-      const pos = v.mergeQueue?.position;
-      // Holds the slot (merge agent running) only when granted — not merely at
-      // position 0 in a queue whose slot is still held by someone else.
-      const merging = !!v.state?.mergeGranted;
-      return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" tabindex="0">
+  // Group by merge domain — reordering is only meaningful within a single serialization
+  // domain. With one domain (the common case) this renders as a single list.
+  const groups = new Map();
+  for (const t of inMerge) {
+    const d = t.lastView?.state?.mergeDomain || '';
+    if (!groups.has(d)) groups.set(d, []);
+    groups.get(d).push(t);
+  }
+  const multi = groups.size > 1;
+  return [...groups.entries()]
+    .map(([domain, tasks]) => {
+      tasks.sort((a, b) => queueRank(a) - queueRank(b));
+      const rows = tasks
+        .map((t) => {
+          const v = t.lastView || {};
+          const pos = v.mergeQueue?.position;
+          const merging = !!v.state?.mergeGranted;
+          const canMove = !merging && !!v.state?.mergeDomain;
+          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
+        ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
         <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
         <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
-        ${!merging && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
+        ${canMove ? `<div class="queue-actions"><button class="btn sm" data-move="top" data-id="${t.id}" data-domain="${esc(domain)}">Move to top</button><button class="btn sm" data-move="bottom" data-id="${t.id}" data-domain="${esc(domain)}">Move to bottom</button></div>` : ''}
       </div>`;
+        })
+        .join('');
+      const label = multi && domain ? `<div class="queue-domain">${esc(domain)}</div>` : '';
+      return `${label}<div class="queue-list" data-domain="${esc(domain)}">${rows}</div>`;
     })
     .join('');
 }
+
+// Optimistically mutate the cached order for a domain so the reorder shows instantly,
+// before the coordinator signal round-trips. Missing orders are seeded from the
+// current DOM/rank so a move still animates while the first fetch is in flight.
+function localQueue(domain) {
+  const ord = S.queueOrders[domain];
+  if (ord) return ord;
+  const ids = S.tasks
+    .filter((t) => (t.lastView?.state?.mergeDomain || '') === domain && !t.lastView?.state?.mergeGranted && ['merge', 'pr'].includes(t.lastView?.stage))
+    .sort((a, b) => queueRank(a) - queueRank(b))
+    .map((t) => t.id);
+  const seeded = { queue: ids };
+  S.queueOrders[domain] = seeded;
+  return seeded;
+}
+
 function wireQueueView() {
-  $('#main').querySelectorAll('.queue-item').forEach((e) => e.addEventListener('click', (ev) => { if (!ev.target.dataset.prio) goToTask(e.dataset.id); }));
-  $('#main').querySelectorAll('[data-prio]').forEach((b) =>
+  $('#main').querySelectorAll('.queue-item').forEach((e) =>
+    e.addEventListener('click', (ev) => { if (!ev.target.closest('[data-move]') && !ev.target.closest('.drag-handle')) goToTask(e.dataset.id); }),
+  );
+  $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
+      const { domain, id } = b.dataset;
+      const q = localQueue(domain);
+      const rest = q.queue.filter((t) => t !== id);
+      q.queue = b.dataset.move === 'top' ? [id, ...rest] : [...rest, id];
+      renderMain();
       try {
-        await api('/api/queue/prioritize', { method: 'POST', body: JSON.stringify({ domain: b.dataset.domain, taskId: b.dataset.prio }) });
-        toast('Prioritized'); setTimeout(refreshTasks, 300);
-      } catch (e) { toast(e.message, true); }
+        if (b.dataset.move === 'top') {
+          await api('/api/queue/prioritize', { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
+        } else {
+          await api('/api/queue/move', { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
+        }
+        toast(b.dataset.move === 'top' ? 'Moved to top' : 'Moved to bottom');
+        setTimeout(seedQueue, 300);
+      } catch (e) { toast(e.message, true); seedQueue(); }
     }),
   );
+  $('#main').querySelectorAll('.queue-list').forEach(wireQueueDrag);
   applyCursor();
   $('#main').querySelectorAll('.queue-item').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
+}
+
+// HTML5 drag-and-drop reordering within one domain's queue list. On drop we send the
+// single moved task with the id it now sits before (or none → bottom).
+function wireQueueDrag(list) {
+  if (!list) return;
+  const domain = list.dataset.domain;
+  let dragging = null;
+  list.querySelectorAll('.queue-item[draggable="true"]').forEach((row) => {
+    row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', row.dataset.id); } catch {} });
+    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+  });
+  list.addEventListener('dragover', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    // Insert before the nearest movable row whose vertical center is below the cursor;
+    // past the last one → append. The merging row (not draggable) stays pinned on top.
+    let best = null, bestDist = Infinity;
+    for (const el of list.querySelectorAll('.queue-item[draggable="true"]:not(.dragging)')) {
+      const b = el.getBoundingClientRect();
+      const cy = b.top + b.height / 2;
+      if (cy < e.clientY) continue;
+      const d = cy - e.clientY;
+      if (d < bestDist) { bestDist = d; best = el; }
+    }
+    best ? list.insertBefore(dragging, best) : list.appendChild(dragging);
+  });
+  list.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    if (!dragging) return;
+    const id = dragging.dataset.id;
+    const rows = [...list.querySelectorAll('.queue-item[draggable="true"]')];
+    const order = rows.map((r) => r.dataset.id);
+    const q = localQueue(domain);
+    q.queue = order;
+    const at = order.indexOf(id);
+    const beforeTaskId = at >= 0 && at < order.length - 1 ? order[at + 1] : '';
+    try {
+      await api('/api/queue/move', { method: 'POST', body: JSON.stringify({ domain, taskId: id, beforeTaskId }) });
+      setTimeout(seedQueue, 300);
+    } catch (err) { toast(err.message, true); seedQueue(); }
+  });
 }
 
 // ── activity ─────────────────────────────────────────────────────────────────
@@ -2771,6 +3152,109 @@ async function refreshHostDiag() {
   if (S.tab === 'dashboard') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
 }
 
+// ── processes (task manager) ─────────────────────────────────────────────────
+// GET /api/processes: every process karmax is responsible for — agent
+// subprocesses (and the scripts they run), embedded-terminal PTYs (and what's
+// typed into them), the Temporal server, git/exec helpers — grouped by owning
+// entity with live CPU% / RSS. Kill via POST /api/processes/kill (SIGTERM;
+// shift-click for SIGKILL). Protected infrastructure gets no kill button.
+const PROC_KIND_LABEL = { agent: 'agent', terminal: 'terminal', temporal: 'infra', login: 'login', probe: 'probe', app: 'karmax', untracked: 'misc' };
+
+function fmtDur(sec) {
+  if (!sec || sec < 0) return '—';
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`;
+  return `${Math.floor(sec / 86400)}d${Math.floor((sec % 86400) / 3600)}h`;
+}
+
+function procPanelHtml(sample) {
+  if (!sample) return `<div class="card" style="color:var(--ink-3)">Process list unavailable.</div>`;
+  if (!sample.supported) return `<div class="card" style="color:var(--ink-3)">Process accounting needs Linux procfs — not available on this host.</div>`;
+  const t = sample.totals || {};
+  // A row is either killable (button) or protected (visible lock, so the kill
+  // affordance is discoverable even on an idle instance where only protected
+  // infrastructure — karmax itself + Temporal — is running).
+  const LOCK = `<span class="proc-lock" title="Protected — karmax can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
+  const killBtn = (pid, label, killable) =>
+    killable
+      ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
+      : LOCK;
+  const rows = (sample.groups || [])
+    .map((g) => {
+      const kindChip = `<span class="chip">${esc(PROC_KIND_LABEL[g.kind] || g.kind)}</span>`;
+      const taskChip = g.taskId
+        ? `<button class="chip proc-task" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</button>`
+        : '';
+      // A group is killable at the root when it's a registered entity (agents,
+      // terminals, logins, probes) — its registered killer escalates properly.
+      const rootKillable = !g.protected && g.kind !== 'app' && g.kind !== 'untracked';
+      const head = `<tr class="proc-group">
+        <td class="cmd">${esc(g.label)} ${kindChip}${taskChip}</td>
+        <td class="mono num">${g.procs.length}</td>
+        <td class="mono num">${g.cpuPct.toFixed(1)}%</td>
+        <td class="mono num">${g.rssMb >= 1024 ? (g.rssMb / 1024).toFixed(2) + 'G' : g.rssMb.toFixed(0) + 'M'}</td>
+        <td class="num">${rootKillable ? killBtn(g.key, g.label, true) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
+      </tr>`;
+      const body = g.procs
+        .map((r) => {
+          // Never offer to kill karmax itself (the 'app' group's only row); any
+          // other row — including a registered root's own line — is fair game.
+          const killable = g.kind !== 'app' && !(g.protected && String(r.pid) === g.key);
+          return `<tr>
+            <td class="cmd mono" title="${esc(r.cmd)}">${esc(r.cmd)}</td>
+            <td class="mono num">${r.pid}<span class="proc-age"> · ${fmtDur(r.ageSec)}</span></td>
+            <td class="mono num">${r.cpuPct.toFixed(1)}%</td>
+            <td class="mono num">${r.rssMb >= 1024 ? (r.rssMb / 1024).toFixed(2) + 'G' : r.rssMb.toFixed(0) + 'M'}</td>
+            <td class="num">${killBtn(r.pid, r.cmd.slice(0, 60), killable)}</td>
+          </tr>`;
+        })
+        .join('');
+      return head + body;
+    })
+    .join('');
+  return `<div class="card" style="padding:0;overflow:auto">
+    <table class="proc-table">
+      <thead><tr><th>process</th><th class="num">pid · age</th><th class="num">cpu</th><th class="num">mem</th><th class="num"></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (karmax core &amp; Temporal); everything else gets a ✕ kill button</div>
+  </div>`;
+}
+
+function wireProcPanel(el) {
+  el.querySelectorAll('.proc-task').forEach((b) => b.addEventListener('click', () => goToTask(b.dataset.task)));
+  el.querySelectorAll('.proc-kill').forEach((b) =>
+    b.addEventListener('click', async (ev) => {
+      const pid = Number(b.dataset.kill);
+      const signal = ev.shiftKey ? 'SIGKILL' : 'SIGTERM';
+      if (!confirm(`Send ${signal} to pid ${pid}?\n\n${b.dataset.label}`)) return;
+      b.disabled = true;
+      try {
+        await api('/api/processes/kill', { method: 'POST', body: JSON.stringify({ pid, signal }) });
+        toast(`${signal} sent to ${pid}`);
+      } catch (e) { toast(e.message, true); }
+      refreshProcPanel(true);
+    }),
+  );
+}
+
+// Live-refresh the processes panel every 5s while the Dashboard is open; same
+// self-terminating pattern as refreshHostDiag. CPU% is a delta between samples,
+// so the very first paint shows 0% and settles from the second sample on.
+async function refreshProcPanel(now = false) {
+  if (S.tab !== 'dashboard' || !$('#proc-panel')) return;
+  clearTimeout(S.procTimer);
+  let sample = null;
+  try { sample = await api('/api/processes'); } catch {}
+  const el = $('#proc-panel');
+  if (el && S.tab === 'dashboard') {
+    el.innerHTML = procPanelHtml(sample);
+    wireProcPanel(el);
+  }
+  if (S.tab === 'dashboard') { clearTimeout(S.procTimer); S.procTimer = setTimeout(refreshProcPanel, now ? 1200 : 5000); }
+}
+
 async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
@@ -2792,6 +3276,8 @@ async function renderDashboard() {
       </div>
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
+      <div class="section-h">Processes — everything karmax is running</div>
+      <div id="proc-panel"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
         <span>Agent accounts (login availability &amp; quota)</span>
         ${pollable.size ? `<button class="btn sm usage-recheck-all">↻ Re-check usage</button>` : ''}
@@ -2858,6 +3344,7 @@ async function renderDashboard() {
     // accounts section; single pending timer (cleared here and inside the loop).
     clearTimeout(S.hostDiagTimer);
     S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
+    refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 
