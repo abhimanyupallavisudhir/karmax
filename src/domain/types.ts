@@ -5,6 +5,9 @@
 
 // ─── Identity ────────────────────────────────────────────────────────────────
 
+import type { TaskTrigger, TriggerState } from './triggers.js';
+export type { TaskTrigger, TriggerState } from './triggers.js';
+
 export type Provider = 'claude' | 'codex' | 'mock';
 
 export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | (string & {});
@@ -71,6 +74,13 @@ export interface TaskRecord {
    * they want here; it has no effect on workflow execution.
    */
   notes?: string;
+  /**
+   * Tag ids applied to this task (task organization — labels + topics). Persisted in
+   * the `task_tags` join table and hydrated onto the record by the store; the tag
+   * definitions (name/parent/colour) live in the `tags` table. Purely organizational
+   * — never assembled into any agent prompt.
+   */
+  tags?: string[];
   /** Last view snapshot, refreshed opportunistically so terminal/parked tasks list cheaply. */
   lastView?: TaskView;
 }
@@ -88,7 +98,113 @@ export interface TaskParams {
   /** UI lifecycle: stored-not-queued (draft) / hidden from the default list (archived). */
   draft?: boolean;
   archived?: boolean;
+  /**
+   * Triggers (generic, workflow-agnostic): gate *when* this task's workflow
+   * starts — on other tasks completing, on a schedule, or on any karmax event.
+   * A task with triggers is stored-not-started and armed; the dispatcher starts
+   * it when a trigger is satisfied (see src/domain/triggers.ts). Kept here (not
+   * in a workflow manifest) because a trigger is orthogonal to what the workflow
+   * does — the same tier as `draft`.
+   */
+  triggers?: TaskTrigger[];
+  /** Set by the dispatcher: `armed` = waiting on a trigger, `fired` = already started. */
+  triggerState?: TriggerState;
+  /**
+   * Repeatable "series" (Model A — template + runs). A repeatable task never runs
+   * its own workflow; it spawns independent **run** records (each a normal task
+   * with its own history) on each trigger fire or "Run again". A cron trigger
+   * forces this on. Off (default) = a one-off task that runs exactly once.
+   */
+  repeatable?: boolean;
+  /** Set on a run: the id of the series (repeatable template) it was spawned from. */
+  runOf?: string;
+  /**
+   * Human-assigned importance for organization/sorting (task search & views). A small
+   * ordinal, 0=none … 4=urgent (see PRIORITIES). Purely organizational — never sent to
+   * any agent. Stored on params (not a dedicated column) so the schema stays stable and
+   * it re-resolves at queue time like every other param.
+   */
+  priority?: number;
   [k: string]: unknown;
+}
+
+// ─── Task organization: tags, search queries, saved views (PLAN-search-views) ─
+// A view IS a saved query (the Linear/Jira model): every list surface is the result
+// of evaluating a `TaskQuery` (filter + full-text + sort + group). The searchable-field
+// registry in `src/domain/search.ts` is the single source of truth that the query
+// parser, the evaluator, and the UI filter menu all derive from ("declare, don't guess").
+
+/** Ordinal priority levels, low→high. Index is the stored `params.priority` value. */
+export const PRIORITIES = ['none', 'low', 'medium', 'high', 'urgent'] as const;
+export type PriorityName = (typeof PRIORITIES)[number];
+
+/**
+ * A tag: a label ("bug", "feature-request") or a topic ("frontend", "auth"), scoped to
+ * a project. Tags are hierarchical via `parentId` — selecting a parent in search matches
+ * every descendant (Linear label-groups). `kind` separates the two conceptual axes so the
+ * UI can present them differently: `type` = what-kind-of-work, `topic` = what-area.
+ */
+export interface Tag {
+  id: string;
+  projectId: string;
+  /** Leaf name (unique among siblings within the project). */
+  name: string;
+  /** Parent tag id for hierarchy; absent ⇒ a root tag. */
+  parentId?: string;
+  /** Presentation colour (hex or a named swatch key); optional. */
+  color?: string;
+  /** Which conceptual axis this tag belongs to. */
+  kind?: 'type' | 'topic';
+  createdAt: number;
+}
+
+/** How a filter clause compares the field value(s) to the requested value(s). */
+export type FilterOp = 'is' | 'contains' | 'gt' | 'gte' | 'lt' | 'lte';
+
+/**
+ * One filter condition. Clauses are AND-ed together; `values` within a clause are OR-ed
+ * (`status:active,waiting`). `negate` flips the whole clause (`-tag:bug`). For number/date
+ * fields a comparison op (`gt`/`lt`/…) is used with a single value; for enum/tag/text
+ * fields `is`/`contains` with one-or-more values.
+ */
+export interface FilterClause {
+  field: string;
+  op: FilterOp;
+  values: string[];
+  negate?: boolean;
+}
+
+/** A sort directive: a searchable-field key + direction. Applied left-to-right (stable). */
+export interface SortClause {
+  field: string;
+  dir: 'asc' | 'desc';
+}
+
+/**
+ * The complete description of a task list surface: free text + structured filters + sort +
+ * group. Search and views are the same thing — a view is just a persisted `TaskQuery`.
+ */
+export interface TaskQuery {
+  /** Free-text match (title / notes / #num). */
+  text?: string;
+  /** Structured filter clauses, AND-ed. */
+  filters?: FilterClause[];
+  /** Sort order (first clause primary). Absent ⇒ default (created desc). */
+  sort?: SortClause[];
+  /** Field key to group rows by (e.g. status, priority, tag, workflow). Absent ⇒ flat. */
+  group?: string;
+}
+
+/** A named, saved query — the user's custom "view" of a project's tasks. */
+export interface SavedView {
+  id: string;
+  projectId: string;
+  name: string;
+  query: TaskQuery;
+  /** Optional icon/emoji shown in the views sidebar. */
+  icon?: string;
+  order: number;
+  createdAt: number;
 }
 
 // ─── The view-model (SPEC §10.2 — the mandatory typed projection) ─────────────

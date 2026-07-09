@@ -22,6 +22,7 @@ import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
 import { remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
+import { registerAppInstance } from './util/instance.js';
 
 const VERSION = '1.0.0';
 
@@ -30,6 +31,21 @@ async function main() {
   const { provider, reason } = defaultProvider();
 
   console.log('\n  karmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
+
+  // Duplicate app-instance guard (karmax#4): the July-5 OOM had 14 `src/main.ts`
+  // running against one KARMAX_HOME — each with its own worker fanning out agent
+  // turns, multiplying RAM pressure for no gain (one app serves the whole list).
+  // Advisory, not a lock: a fast Ctrl-C→restart is intentional, so we warn loudly
+  // and let the operator decide rather than refusing to boot.
+  const instance = registerAppInstance();
+  if (instance.others.length) {
+    console.warn(
+      `\n  ⚠  ${instance.others.length} other karmax app instance(s) already running against ${p.home}` +
+        ` (pids ${instance.others.join(', ')}).\n` +
+        `     Each runs its own worker + agent fan-out and competes for the same RAM —\n` +
+        `     the exact condition behind the July-5 OOM (karmax#4). Stop the extras unless this is deliberate.\n`,
+    );
+  }
   if (provider === 'mock') {
     console.log('  ⚠  NO AGENT CREDENTIALS DETECTED — running with the MOCK agent (no real work).');
     console.log('     Set OPENAI_API_KEY or ANTHROPIC_API_KEY, or log in to Claude Code, then restart.\n');
@@ -131,6 +147,21 @@ async function main() {
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows });
 
+  // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
+  // dependency completes, a schedule fires, or a matching event occurs. Runs
+  // in-process off the same bus as the self-heal loop; the store is the durable
+  // source of truth, so it re-arms every armed task on boot.
+  const { TriggerScheduler } = await import('./platform/trigger-scheduler.js');
+  const triggerToken = tokens.mintPrincipal('system:triggers', ['*']).token;
+  const triggerScheduler = new TriggerScheduler({
+    store,
+    bus,
+    fire: (taskId, mode) => api.fireTriggeredTask(triggerToken, taskId, mode),
+    log: (m) => console.log('  • ' + m),
+  });
+  api.setTriggerArmer(triggerScheduler);
+  triggerScheduler.start();
+
   // Self-healing loop (SPEC §4.4): when a workflow-edit PR merges (its merge-only
   // task reaches done), reload the edited workflow from its repo so new tasks pick
   // up the published version. Runs in this process (not inside a workflow), so
@@ -203,6 +234,8 @@ async function main() {
     // worker itself resolves within ~3s (shutdownGraceTime/shutdownForceTime).
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
+    instance.release(); // drop our live-instance pidfile
+    triggerScheduler.stop();
     await step(closeGateway());
     await step(workerManager.stop());
     await step(closeClient());

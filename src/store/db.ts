@@ -15,8 +15,18 @@ import {
   AgentProfile,
   TaskView,
   KarmaxEvent,
+  Tag,
+  SavedView,
+  TaskQuery,
 } from '../domain/types.js';
 import { newId } from '../util/id.js';
+
+/**
+ * Terminal statuses that auto-archive a task when it first reaches one (see
+ * `Store.saveView`). Only fully-resolved outcomes — a failed task stays visible
+ * because it usually needs attention.
+ */
+const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
 
 /**
  * The metadata index. Temporal holds the authoritative live workflow state;
@@ -89,8 +99,22 @@ export class Store {
         scopeId TEXT, label TEXT NOT NULL, cap INTEGER NOT NULL,
         available INTEGER NOT NULL, merchantLock TEXT, createdAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS tags (
+        id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
+        parentId TEXT, color TEXT, kind TEXT, createdAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS task_tags (
+        taskId TEXT NOT NULL, tagId TEXT NOT NULL, PRIMARY KEY (taskId, tagId)
+      );
+      CREATE TABLE IF NOT EXISTS saved_views (
+        id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
+        query TEXT NOT NULL, icon TEXT, ord INTEGER NOT NULL, createdAt INTEGER NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
+      CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
+      CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
+      CREATE INDEX IF NOT EXISTS idx_saved_views_project ON saved_views(projectId);
     `);
     // Free-form human notes, added after the initial schema. Guarded so existing
     // installs pick it up without a re-create.
@@ -166,8 +190,14 @@ export class Store {
   }
 
   deleteProject(id: string) {
+    // Clear the tag join rows for this project's tasks before the tasks vanish.
+    this.db
+      .prepare('DELETE FROM task_tags WHERE taskId IN (SELECT id FROM tasks WHERE projectId = ?)')
+      .run(id);
     this.db.prepare('DELETE FROM tasks WHERE projectId = ?').run(id);
     this.db.prepare('DELETE FROM task_lists WHERE projectId = ?').run(id);
+    this.db.prepare('DELETE FROM tags WHERE projectId = ?').run(id);
+    this.db.prepare('DELETE FROM saved_views WHERE projectId = ?').run(id);
     this.db.prepare('DELETE FROM projects WHERE id = ?').run(id);
   }
 
@@ -248,31 +278,82 @@ export class Store {
 
   getTask(id: string): TaskRecord | undefined {
     const r = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as any;
-    return r ? rowToTask(r) : undefined;
+    if (!r) return undefined;
+    const t = rowToTask(r);
+    const tags = this.tagsFor(id);
+    if (tags.length) t.tags = tags;
+    return t;
   }
 
   /** Resolve a task by its per-project sequential number (SPEC §10.6). */
   getTaskByNum(projectId: string, num: number): TaskRecord | undefined {
     const r = this.db.prepare('SELECT * FROM tasks WHERE projectId = ? AND num = ?').get(projectId, num) as any;
-    return r ? rowToTask(r) : undefined;
+    return r ? this.getTask(r.id) : undefined;
   }
 
   listTasks(projectId: string): TaskRecord[] {
-    return (
+    const tasks = (
       this.db
         .prepare('SELECT * FROM tasks WHERE projectId = ? ORDER BY ord, createdAt')
         .all(projectId) as any[]
     ).map(rowToTask);
+    return this.attachTags(projectId, tasks);
+  }
+
+  /** Tasks currently armed on a trigger (stored-not-started), across all projects.
+   *  The durable source of truth the dispatcher re-arms from on boot (SPEC §3.3). */
+  listArmedTasks(): TaskRecord[] {
+    return (this.db.prepare('SELECT * FROM tasks ORDER BY createdAt').all() as any[])
+      .map(rowToTask)
+      .filter((t) => t.params?.triggerState === 'armed');
+  }
+
+  /** Runs spawned from a series (repeatable template), newest first. */
+  runsOf(seriesId: string): TaskRecord[] {
+    return (this.db.prepare('SELECT * FROM tasks ORDER BY createdAt DESC').all() as any[])
+      .map(rowToTask)
+      .filter((t) => t.params?.runOf === seriesId);
   }
 
   childTasks(parentTaskId: string): TaskRecord[] {
-    return (
+    const tasks = (
       this.db.prepare('SELECT * FROM tasks WHERE parentTaskId = ? ORDER BY createdAt').all(parentTaskId) as any[]
     ).map(rowToTask);
+    for (const t of tasks) {
+      const tags = this.tagsFor(t.id);
+      if (tags.length) t.tags = tags;
+    }
+    return tasks;
+  }
+
+  /** Hydrate `tags` onto a batch of a project's tasks with a single join query (no N+1). */
+  private attachTags(projectId: string, tasks: TaskRecord[]): TaskRecord[] {
+    if (!tasks.length) return tasks;
+    const rows = this.db
+      .prepare('SELECT tt.taskId AS taskId, tt.tagId AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.taskId WHERE t.projectId = ?')
+      .all(projectId) as any[];
+    if (!rows.length) return tasks;
+    const byTask = new Map<string, string[]>();
+    for (const r of rows) (byTask.get(r.taskId) ?? byTask.set(r.taskId, []).get(r.taskId)!).push(r.tagId);
+    for (const t of tasks) { const ids = byTask.get(t.id); if (ids?.length) t.tags = ids; }
+    return tasks;
   }
 
   saveView(taskId: string, view: TaskView) {
+    // Auto-archive on resolution: the moment a task reaches a terminal, no-further-
+    // action status (done or cancelled) it drops out of the default active list
+    // without a manual archive step — the same effect the /archive endpoint has, but
+    // automatic. Failed tasks are deliberately left visible (they usually need a look).
+    // Fire only on the *transition* into that status (previous snapshot wasn't
+    // already done/cancelled) so a later view re-save can't override a user who
+    // deliberately un-archived a finished task.
+    const prev = this.getTask(taskId);
     this.db.prepare('UPDATE tasks SET lastView = ? WHERE id = ?').run(JSON.stringify(view), taskId);
+    const resolvedNow =
+      AUTO_ARCHIVE_STATUS.has(view.status) && !AUTO_ARCHIVE_STATUS.has(prev?.lastView?.status ?? '');
+    if (prev && resolvedNow && !prev.params?.archived) {
+      this.updateTaskParams(taskId, { ...prev.params, archived: true });
+    }
   }
 
   reorderTask(taskId: string, ord: number) {
@@ -283,9 +364,27 @@ export class Store {
     this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId);
   }
 
+  /** Update a task's display title (e.g. to track an edited prompt). */
+  setTaskTitle(taskId: string, title: string) {
+    if (title) this.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run(title, taskId);
+  }
+
   /** Set the human notes on a task (cosmetic, UI-only; empty string clears them). */
   setTaskNotes(taskId: string, notes: string) {
     this.db.prepare('UPDATE tasks SET notes = ? WHERE id = ?').run(notes === '' ? null : notes, taskId);
+  }
+
+  /**
+   * Set the organizational priority (0–4) on a task's stored params. Purely for
+   * search/sort/grouping — never sent to any agent, so it's editable at any point in
+   * the lifecycle (unlike workflow params, which freeze at queue time). Writes the
+   * record directly; the running workflow neither reads nor cares about it.
+   */
+  setTaskPriority(taskId: string, priority: number) {
+    const t = this.getTask(taskId);
+    if (!t) return;
+    const p = Math.max(0, Math.min(4, Math.round(priority)));
+    this.updateTaskParams(taskId, { ...t.params, priority: p });
   }
 
   /** Mark a draft task as queued (clear its draft flag). */
@@ -298,7 +397,186 @@ export class Store {
   /** Hard-delete a task row + its events (used for drafts, which never ran). */
   deleteTask(taskId: string) {
     this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId);
+    this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId);
     this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+  }
+
+  // ─── Tags (task organization — labels + topics, hierarchical) ────────────────
+
+  listTags(projectId: string): Tag[] {
+    return (
+      this.db.prepare('SELECT * FROM tags WHERE projectId = ? ORDER BY name').all(projectId) as any[]
+    ).map(rowToTag);
+  }
+
+  getTag(id: string): Tag | undefined {
+    const r = this.db.prepare('SELECT * FROM tags WHERE id = ?').get(id) as any;
+    return r ? rowToTag(r) : undefined;
+  }
+
+  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Tag {
+    const raw = input.name.trim();
+    if (!raw) throw new Error('tag name required');
+    // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
+    // level under the previous, so the UI never needs a parent picker — the user just
+    // types the path. `color`/`kind` apply to the leaf; ancestors created bare.
+    const segments = raw.split('/').map((s) => s.trim()).filter(Boolean);
+    if (segments.length > 1) {
+      let parentId = input.parentId;
+      let leaf: Tag | undefined;
+      for (let i = 0; i < segments.length; i++) {
+        const isLeaf = i === segments.length - 1;
+        leaf = this.createOneTag({
+          projectId: input.projectId,
+          name: segments[i]!,
+          parentId,
+          ...(isLeaf ? { color: input.color, kind: input.kind } : {}),
+        });
+        parentId = leaf.id;
+      }
+      return leaf!;
+    }
+    return this.createOneTag({ ...input, name: raw });
+  }
+
+  /** Create-or-reuse a single tag under an explicit parent (no path parsing). */
+  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Tag {
+    const name = input.name.trim();
+    if (!name) throw new Error('tag name required');
+    // Reuse an existing sibling with the same (case-insensitive) name rather than
+    // minting a duplicate — tag catalogues should stay small and canonical.
+    const existing = this.db
+      .prepare("SELECT * FROM tags WHERE projectId = ? AND lower(name) = lower(?) AND IFNULL(parentId, '') = IFNULL(?, '')")
+      .get(input.projectId, name, input.parentId ?? null) as any;
+    if (existing) return rowToTag(existing);
+    const t: Tag = {
+      id: newId('tag'),
+      projectId: input.projectId,
+      name,
+      parentId: input.parentId,
+      color: input.color,
+      kind: input.kind,
+      createdAt: Date.now(),
+    };
+    this.db
+      .prepare('INSERT INTO tags (id, projectId, name, parentId, color, kind, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(t.id, t.projectId, t.name, t.parentId ?? null, t.color ?? null, t.kind ?? null, t.createdAt);
+    return t;
+  }
+
+  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null }): Tag | undefined {
+    const cur = this.getTag(id);
+    if (!cur) return undefined;
+    // Guard against a cycle: a tag can't be reparented under itself or a descendant.
+    if (patch.parentId) {
+      const all = this.listTags(cur.projectId);
+      const byId = new Map(all.map((t) => [t.id, t]));
+      let p: string | undefined = patch.parentId;
+      const seen = new Set<string>();
+      while (p) {
+        if (p === id || seen.has(p)) throw new Error('tag cannot be its own ancestor');
+        seen.add(p);
+        p = byId.get(p)?.parentId;
+      }
+    }
+    const next: Tag = {
+      ...cur,
+      name: patch.name?.trim() || cur.name,
+      parentId: patch.parentId === null ? undefined : patch.parentId ?? cur.parentId,
+      color: patch.color === null ? undefined : patch.color ?? cur.color,
+      kind: patch.kind === null ? undefined : patch.kind ?? cur.kind,
+    };
+    this.db
+      .prepare('UPDATE tags SET name = ?, parentId = ?, color = ?, kind = ? WHERE id = ?')
+      .run(next.name, next.parentId ?? null, next.color ?? null, next.kind ?? null, id);
+    return next;
+  }
+
+  /** Delete a tag: promote its children to its own parent, and drop its task assignments. */
+  deleteTag(id: string) {
+    const cur = this.getTag(id);
+    if (!cur) return;
+    this.db.prepare('UPDATE tags SET parentId = ? WHERE parentId = ?').run(cur.parentId ?? null, id);
+    this.db.prepare('DELETE FROM task_tags WHERE tagId = ?').run(id);
+    this.db.prepare('DELETE FROM tags WHERE id = ?').run(id);
+  }
+
+  tagsFor(taskId: string): string[] {
+    return (this.db.prepare('SELECT tagId FROM task_tags WHERE taskId = ?').all(taskId) as any[]).map((r) => r.tagId);
+  }
+
+  /** Replace the full tag set on a task (ignores unknown/foreign tag ids). */
+  setTaskTags(taskId: string, tagIds: string[]) {
+    const t = this.getTask(taskId);
+    if (!t) return;
+    const valid = new Set(this.listTags(t.projectId).map((x) => x.id));
+    this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId);
+    const ins = this.db.prepare('INSERT OR IGNORE INTO task_tags (taskId, tagId) VALUES (?, ?)');
+    for (const id of new Set(tagIds)) if (valid.has(id)) ins.run(taskId, id);
+  }
+
+  addTaskTag(taskId: string, tagId: string) {
+    const cur = new Set(this.tagsFor(taskId));
+    cur.add(tagId);
+    this.setTaskTags(taskId, [...cur]);
+  }
+
+  removeTaskTag(taskId: string, tagId: string) {
+    this.db.prepare('DELETE FROM task_tags WHERE taskId = ? AND tagId = ?').run(taskId, tagId);
+  }
+
+  // ─── Saved views (a view is a saved query — PLAN-search-views) ───────────────
+
+  listViews(projectId: string): SavedView[] {
+    return (
+      this.db.prepare('SELECT * FROM saved_views WHERE projectId = ? ORDER BY ord, createdAt').all(projectId) as any[]
+    ).map(rowToView);
+  }
+
+  getView(id: string): SavedView | undefined {
+    const r = this.db.prepare('SELECT * FROM saved_views WHERE id = ?').get(id) as any;
+    return r ? rowToView(r) : undefined;
+  }
+
+  createView(input: { projectId: string; name: string; query: TaskQuery; icon?: string }): SavedView {
+    const ord =
+      (this.db.prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM saved_views WHERE projectId = ?').get(input.projectId) as any).m + 1;
+    const v: SavedView = {
+      id: newId('view'),
+      projectId: input.projectId,
+      name: input.name.trim() || 'Untitled view',
+      query: input.query ?? {},
+      icon: input.icon,
+      order: ord,
+      createdAt: Date.now(),
+    };
+    this.db
+      .prepare('INSERT INTO saved_views (id, projectId, name, query, icon, ord, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(v.id, v.projectId, v.name, JSON.stringify(v.query), v.icon ?? null, v.order, v.createdAt);
+    return v;
+  }
+
+  updateView(id: string, patch: { name?: string; query?: TaskQuery; icon?: string | null }): SavedView | undefined {
+    const cur = this.getView(id);
+    if (!cur) return undefined;
+    const next: SavedView = {
+      ...cur,
+      name: patch.name?.trim() || cur.name,
+      query: patch.query ?? cur.query,
+      icon: patch.icon === null ? undefined : patch.icon ?? cur.icon,
+    };
+    this.db
+      .prepare('UPDATE saved_views SET name = ?, query = ?, icon = ? WHERE id = ?')
+      .run(next.name, JSON.stringify(next.query), next.icon ?? null, id);
+    return next;
+  }
+
+  reorderView(id: string, ord: number) {
+    this.db.prepare('UPDATE saved_views SET ord = ? WHERE id = ?').run(ord, id);
+  }
+
+  deleteView(id: string) {
+    this.db.prepare('DELETE FROM saved_views WHERE id = ?').run(id);
   }
 
   // ─── Profiles ──────────────────────────────────────────────────────────────
@@ -439,6 +717,28 @@ function cardRow(r: any) {
 
 function rowToProject(r: any): Project {
   return { id: r.id, name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config) };
+}
+function rowToTag(r: any): Tag {
+  return {
+    id: r.id,
+    projectId: r.projectId,
+    name: r.name,
+    parentId: r.parentId ?? undefined,
+    color: r.color ?? undefined,
+    kind: r.kind ?? undefined,
+    createdAt: r.createdAt,
+  };
+}
+function rowToView(r: any): SavedView {
+  return {
+    id: r.id,
+    projectId: r.projectId,
+    name: r.name,
+    query: JSON.parse(r.query),
+    icon: r.icon ?? undefined,
+    order: r.ord,
+    createdAt: r.createdAt,
+  };
 }
 function rowToList(r: any): TaskList {
   return { id: r.id, projectId: r.projectId, name: r.name, createdAt: r.createdAt, order: r.ord };

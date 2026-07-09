@@ -53,10 +53,46 @@ const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const freeMemMb = () => os.freemem() / (1024 * 1024);
 const coreCount = () => os.cpus().length || 1;
 
+/**
+ * Pure admission decision from a host snapshot + thresholds — the single source
+ * of truth the live gates below delegate to, exposed so the memory-gate decision
+ * is unit-testable without racing `os.freemem()` (karmax#4). A threshold of 0
+ * disables its check. `backpressure` is true while EITHER gate would hold a new
+ * agent turn back.
+ */
+export function admissionDecision(
+  host: { freeMemMb: number; loadavg1: number; cores: number },
+  thresholds: { minFreeMb: number; maxLoadFactor: number },
+): { memoryTight: boolean; loadHigh: boolean; backpressure: boolean } {
+  const memoryTight = thresholds.minFreeMb > 0 && host.freeMemMb < thresholds.minFreeMb;
+  const loadHigh = thresholds.maxLoadFactor > 0 && host.loadavg1 > host.cores * thresholds.maxLoadFactor;
+  return { memoryTight, loadHigh, backpressure: memoryTight || loadHigh };
+}
+
+/** Live pressure snapshot using the configured thresholds. */
+const pressure = () =>
+  admissionDecision(
+    { freeMemMb: freeMemMb(), loadavg1: os.loadavg()[0]!, cores: coreCount() },
+    { minFreeMb: MIN_FREE_MB, maxLoadFactor: MAX_LOAD_FACTOR },
+  );
+
 /** True while free memory sits below the floor (and the check is enabled). */
-const memoryTight = () => MIN_FREE_MB > 0 && freeMemMb() < MIN_FREE_MB;
+const memoryTight = () => pressure().memoryTight;
 /** True while the 1-minute load average exceeds `cores × factor` (check enabled). */
-const loadHigh = () => MAX_LOAD_FACTOR > 0 && os.loadavg()[0]! > coreCount() * MAX_LOAD_FACTOR;
+const loadHigh = () => pressure().loadHigh;
+
+/**
+ * Is the host genuinely memory-tight RIGHT NOW? Exposed so the turn-error
+ * classifier can tell a real OOM kill apart from a SIGKILL with a different sender
+ * (e.g. karmax's own reapOrphans() reload sweep) and not mislabel one as the other
+ * (karmax#4). Uses the configured floor, or — if the floor check is disabled — a
+ * conservative 5%-of-total fallback so the signal is still meaningful.
+ */
+export function hostMemoryTight(): boolean {
+  if (MIN_FREE_MB > 0) return memoryTight();
+  const total = os.totalmem() / (1024 * 1024);
+  return freeMemMb() < total * 0.05;
+}
 
 /**
  * Point-in-time host diagnostics (loadavg, free/total memory, cores). Pure

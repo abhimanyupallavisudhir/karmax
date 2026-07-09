@@ -177,6 +177,42 @@ describe('Store', () => {
     expect(store.getTask(t.id)!.lastView!.stage).toBe('done');
   });
 
+  it('auto-archives a task when it resolves to done or cancelled', () => {
+    const p = store.createProject('Acme');
+    const mk = (title: string) =>
+      store.createTask({ projectId: p.id, title, workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const view = (id: string, status: string) => ({
+      taskId: id, title: 't', workflow: 'software-dev', stage: status as any, status: status as any,
+      messages: [], actions: [], state: {}, updatedAt: 1,
+    });
+
+    const done = mk('done one');
+    store.saveView(done.id, view(done.id, 'active'));
+    expect(store.getTask(done.id)!.params.archived).toBeFalsy(); // still running → visible
+    store.saveView(done.id, view(done.id, 'done'));
+    expect(store.getTask(done.id)!.params.archived).toBe(true); // resolved → archived
+
+    const cancelled = mk('cancelled one');
+    store.saveView(cancelled.id, view(cancelled.id, 'cancelled'));
+    expect(store.getTask(cancelled.id)!.params.archived).toBe(true);
+
+    const failed = mk('failed one');
+    store.saveView(failed.id, view(failed.id, 'failed'));
+    expect(store.getTask(failed.id)!.params.archived).toBeFalsy(); // failed stays visible
+  });
+
+  it('does not re-archive a finished task the user un-archived', () => {
+    const p = store.createProject('Acme');
+    const t = store.createTask({ projectId: p.id, title: 'X', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const view = { taskId: t.id, title: 'X', workflow: 'software-dev', stage: 'done' as const, status: 'done' as const, messages: [], actions: [], state: {}, updatedAt: 1 };
+    store.saveView(t.id, view);
+    expect(store.getTask(t.id)!.params.archived).toBe(true);
+    // user un-archives to keep it in view, then the view is refreshed again
+    store.updateTaskParams(t.id, { ...store.getTask(t.id)!.params, archived: false });
+    store.saveView(t.id, { ...view, updatedAt: 2 });
+    expect(store.getTask(t.id)!.params.archived).toBe(false); // respected — no re-archive on same terminal status
+  });
+
   it('appends and reads events incrementally', () => {
     const p = store.createProject('Acme');
     const t = store.createTask({
