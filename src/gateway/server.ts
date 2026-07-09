@@ -169,8 +169,21 @@ export class Gateway {
       cwd,
       env: { ...process.env, PS1: 'karmax:\\W$ ' },
     });
+    // Task-manager registry: the PTY (and anything the user runs in it) shows up
+    // in the dashboard Processes panel under its task, and can be killed there.
+    const { trackProcess } = await import('../util/processes.js');
+    const untrack = term.pid
+      ? trackProcess({
+          pid: term.pid,
+          kind: 'terminal',
+          label: 'task terminal (bash)',
+          taskId,
+          startedAt: Date.now(),
+          kill: () => { try { term.kill(); } catch { /* already gone */ } },
+        })
+      : () => {};
     term.onData((d: string) => { try { ws.send(JSON.stringify({ type: 'data', data: d })); } catch {} });
-    term.onExit(() => { try { ws.close(); } catch {} });
+    term.onExit(() => { untrack(); try { ws.close(); } catch {} });
     ws.on('message', (raw) => {
       let msg: any;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -282,6 +295,22 @@ export class Gateway {
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
         return this.json(res, 200, { host: hostStats(), agentSlots: agentSlotStats(), ts: Date.now() });
+      }
+
+      // Task manager (dashboard Processes panel): every process karmax is
+      // responsible for — agent subprocesses and their tool children, embedded-
+      // terminal PTYs and what runs in them, the Temporal server, git/exec
+      // helpers — grouped by owning entity with live CPU/RSS. See
+      // src/util/processes.ts for the coverage model.
+      if (p === '/api/processes' && method === 'GET') {
+        const { sampleProcesses } = await import('../util/processes.js');
+        return this.json(res, 200, sampleProcesses());
+      }
+      if (p === '/api/processes/kill' && method === 'POST') {
+        const b = await this.body(req);
+        const { killTracked } = await import('../util/processes.js');
+        const out = await killTracked(Number(b.pid), b.signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM');
+        return this.json(res, out.ok ? 200 : 400, out);
       }
 
       // image attachments (image prompts). The ONLY endpoints that handle raw

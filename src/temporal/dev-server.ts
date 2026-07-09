@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import { Connection } from '@temporalio/client';
 import { findFreePortFrom, findFreePorts, isPortFree, waitForPort } from '../util/ports.js';
 import { withTimeout } from '../util/timeout.js';
+import { trackProcess } from '../util/processes.js';
 
 const execFileP = promisify(execFileCb);
 
@@ -290,6 +291,7 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
     if (existing && pidAlive(existing.pid)) {
       if (await serverHealthy(existing.address, existing.namespace ?? namespace)) {
         if (existing.unit || !(await systemdUsable())) {
+          trackTemporal(existing.pid, existing.address);
           return { ...existing, namespace: existing.namespace ?? namespace, reused: true, async stop() {} };
         }
         // Healthy but not unit-managed (pre-unit record): still living in the
@@ -336,6 +338,14 @@ async function choosePorts(pin?: Partial<PortTriple>): Promise<PortTriple> {
     pin?.uiPort && (await isPortFree(pin.uiPort)) ? pin.uiPort : await findFreePortFrom(DEFAULT_UI_PORT, { avoid: [grpcPort] });
   const metricsPort = await findFreePortFrom(DEFAULT_METRICS_PORT, { avoid: [grpcPort, uiPort] });
   return { grpcPort, uiPort, metricsPort };
+}
+
+/** Surface the (possibly adopted) server in the dashboard task manager. Marked
+ *  protected — killing it from the UI would wedge every workflow; `npm run
+ *  reset` is the supported teardown. Re-registering the same pid is idempotent
+ *  (the registry is keyed by pid) and dead pids are pruned on each sample. */
+function trackTemporal(pid: number, address: string): void {
+  trackProcess({ pid, kind: 'temporal', label: `Temporal dev server (${address})`, startedAt: Date.now(), protected: true });
 }
 
 async function spawnPersistent(
@@ -398,6 +408,7 @@ async function spawnPersistent(
   } catch {
     /* best effort */
   }
+  trackTemporal(pid, address);
 
   return {
     address,

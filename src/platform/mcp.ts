@@ -33,13 +33,29 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
   };
 }
 
-/** HTTP ops that forward to the gateway with a bearer token (stdio subprocess). */
-export function httpOps(baseUrl: string, token: string): PlatformOps {
-  const req = async (path: string, init: RequestInit = {}) => {
+/**
+ * HTTP ops that forward to the gateway with a bearer token (stdio subprocess).
+ *
+ * `token` may be a fixed string or a resolver. A resolver lets a CLI-launched
+ * bridge acquire a gateway session lazily (see `src/mcp/stdio.ts`) and, on a 401,
+ * re-acquire one — the gateway holds sessions in memory, so a gateway restart
+ * would otherwise 401 every subsequent call for the life of the agent.
+ */
+export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>)): PlatformOps {
+  const resolve = typeof token === 'string' ? async () => token : token;
+  let cached: string | undefined = typeof token === 'string' ? token : undefined;
+  const req = async (path: string, init: RequestInit = {}, reauth = true): Promise<unknown> => {
+    if (cached === undefined) cached = await resolve();
     const res = await fetch(`${baseUrl}${path}`, {
       ...init,
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}`, ...(init.headers ?? {}) },
+      headers: { 'content-type': 'application/json', ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
     });
+    // Session expired or the gateway restarted since we last authed — drop the
+    // stale token, re-acquire once, and retry before surfacing an error.
+    if (res.status === 401 && reauth && typeof token !== 'string') {
+      cached = await resolve();
+      if (cached) return req(path, init, false);
+    }
     const body = res.headers.get('content-type')?.includes('json') ? await res.json() : await res.text();
     if (!res.ok) throw new Error((body as any)?.error || `HTTP ${res.status}`);
     return body;

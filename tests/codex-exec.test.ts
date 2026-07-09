@@ -60,9 +60,13 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     fs.writeFileSync(stubPath, STUB);
     fs.chmodSync(stubPath, 0o755);
     process.env.KARMAX_CODEX_EXEC_CMD = stubPath;
+    // This suite validates the legacy one-shot `codex exec` rail; force it (the
+    // subscription default is now the app-server — see codex.ts runSubscription).
+    process.env.KARMAX_CODEX_USE_EXEC = '1';
   });
   afterAll(() => {
     delete process.env.KARMAX_CODEX_EXEC_CMD;
+    delete process.env.KARMAX_CODEX_USE_EXEC;
     delete process.env.STUB_MODE;
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });

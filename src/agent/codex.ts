@@ -9,16 +9,22 @@ import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
-import { registerAgent, unregisterAgent, killAgent } from './custody.js';
+import { registerAgent, unregisterAgent, killAgent, killProcessGroup } from './custody.js';
+import { trackProcess } from '../util/processes.js';
+import { CodexAppServerClient } from './codex-app-server-client.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
  *   - **API key** → the OpenAI **Responses API** (metered, pay-per-token). The
  *     session id we store/resume is the provider's `response.id`.
- *   - **Subscription** (ChatGPT sign-in) → the **`codex` CLI** driven headlessly
- *     (`codex exec --json`) with `CODEX_HOME` = the leased config home, so the turn
- *     runs on the user's ChatGPT plan (5-hour + weekly windows) — the analogue of
- *     Claude's Agent-SDK path. Rollouts under `$CODEX_HOME/sessions/` power resume.
+ *   - **Subscription** (ChatGPT sign-in) → the **`codex app-server`**, a long-lived
+ *     JSON-RPC process driven over stdio with `CODEX_HOME` = the leased config home,
+ *     so the turn runs on the user's ChatGPT plan (5-hour + weekly windows) — the
+ *     analogue of Claude's Agent-SDK path. Unlike one-shot `codex exec`, the
+ *     app-server keeps a live thread we can **steer mid-turn** (`turn/steer`), which
+ *     is what gives the subscription path in-flight follow-up injection (SPEC §5.6).
+ *     Threads persist under `$CODEX_HOME` and power resume. The old `codex exec` path
+ *     is kept as a fallback (`KARMAX_CODEX_USE_EXEC=1`, or older CLIs without app-server).
  */
 export class CodexAdapter implements AgentAdapter {
   readonly provider = 'codex' as const;
@@ -44,10 +50,17 @@ export class CodexAdapter implements AgentAdapter {
     // config home → the Codex CLI on a subscription. Only with no explicit profile
     // auth do we fall back to the ambient environment.
     if (auth?.apiKey) return this.runResponsesApi(input, ctx);
-    if (auth?.configHome) return this.runCodexExec(input, ctx);
+    if (auth?.configHome) return this.runSubscription(input, ctx);
     if (process.env.OPENAI_API_KEY) return this.runResponsesApi(input, ctx);
-    if (CodexAdapter.hasAmbientSubscription()) return this.runCodexExec(input, ctx);
+    if (CodexAdapter.hasAmbientSubscription()) return this.runSubscription(input, ctx);
     throw new Error('CodexAdapter: no OPENAI_API_KEY and no Codex login found');
+  }
+
+  /** The ChatGPT-subscription rail: the app-server (live, steerable) by default, or
+   *  the legacy one-shot `codex exec` when forced via `KARMAX_CODEX_USE_EXEC`. */
+  private runSubscription(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    if (process.env.KARMAX_CODEX_USE_EXEC === '1') return this.runCodexExec(input, ctx);
+    return this.runCodexAppServer(input, ctx);
   }
 
   // ─── OpenAI Responses API (API key, metered) ────────────────────────────────
@@ -74,6 +87,21 @@ export class CodexAdapter implements AgentAdapter {
     // only, so a pathological infinite tool-loop can't burn unbounded spend).
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
+    // How many `input.messages` this turn has consumed (the initial delta covers up to
+    // the schedule snapshot); follow-ups that land mid-turn are folded in at the idle
+    // boundary as fresh user input on the resumed response chain (SPEC §5.6).
+    let deliveredIndex = input.messages.length;
+    const injectFollowUps = async (): Promise<any[]> => {
+      if (!ctx.pullFollowUps) return [];
+      const add: any[] = [];
+      try {
+        for (const m of await ctx.pullFollowUps(deliveredIndex)) {
+          if (m.role !== 'system' && m.role !== 'agent') add.push({ role: 'user', content: openaiUserContent(m) });
+          deliveredIndex++;
+        }
+      } catch { /* a failed poll must never break the turn */ }
+      return add;
+    };
 
     for (let i = 0; i < maxIters; i++) {
       if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
@@ -105,7 +133,13 @@ export class CodexAdapter implements AgentAdapter {
         finalText = text;
         ctx.emit(text);
       }
-      if (calls.length === 0) break;
+      if (calls.length === 0) {
+        // Idle. Fold in any follow-up that landed mid-turn and keep going on the same
+        // response chain (previous_response_id carries the history); else finish.
+        const more = await injectFollowUps();
+        if (more.length) { nextInput = more; continue; }
+        break;
+      }
 
       const toolOutputs: any[] = [];
       let completed = false;
@@ -125,7 +159,240 @@ export class CodexAdapter implements AgentAdapter {
       if (completed) break;
     }
 
-    return { session: respId, output: finalText };
+    return { session: respId, output: finalText, delivered: deliveredIndex };
+  }
+
+  // ─── Codex app-server on a ChatGPT subscription (live JSON-RPC thread) ────────
+  private async runCodexAppServer(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
+    const model = input.profile.model ?? undefined;
+    const effort = codexReasoningEffort(model ?? 'gpt-5.5', input.profile.effort);
+    const cwd = input.world.handle.root;
+    // CODEX_HOME = the leased config home (its auth.json holds the subscription
+    // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
+    const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome });
+
+    // Detached ⇒ its own process group, so killAgent(-pid) reaps codex's descendants.
+    const child = spawn(cmd, ['app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, startedAt: Date.now() });
+    const client = new CodexAppServerClient(child.stdin!, child.stdout!);
+    let stderr = '';
+    child.stderr?.on('data', (d) => { stderr += d.toString(); });
+
+    const cleanups: Array<() => void> = [];
+    const hb = ctx.heartbeat ? setInterval(() => { try { ctx.heartbeat!(); } catch { /* ignore */ } }, 10_000) : undefined;
+    // Materialize a set of messages' image attachments to real files → `localImage`
+    // input items (the app-server takes paths, like `codex exec -i`). Cleaned in finally.
+    const imageItems = (msgs: any[]): any[] => {
+      const { files, cleanup } = materializeImageFiles(msgs);
+      cleanups.push(cleanup);
+      return files.map((p) => ({ type: 'localImage', path: p }));
+    };
+
+    // Headless posture (SPEC §7.3): the world (worktree/container) IS the sandbox
+    // boundary, so run with approvals off and full access — the app-server analogue
+    // of `codex exec --dangerously-bypass-approvals-and-sandbox`. Any approval the
+    // server still requests is auto-granted below.
+    client.onServerRequest((method) => (/approval/i.test(method) ? { decision: 'approved_for_session' } : {}));
+
+    let threadId: string | undefined = input.session;
+    let currentTurnId: string | undefined;
+    let turnActive = false;
+    let finalText = '';
+    let limit: { resetInSeconds?: number } | undefined;
+    let turnError: string | undefined;
+    // How many `input.messages` this turn has consumed — the initial delta up to the
+    // schedule snapshot, then one more per in-flight follow-up steered/started below.
+    let deliveredIndex = input.messages.length;
+
+    // Turn-completion signalling: each turn/start awaits the next terminal event
+    // (turn/completed, or a non-retried error).
+    let settleTurn: (() => void) | undefined;
+    const awaitTurnSettled = () => new Promise<void>((resolve) => { settleTurn = resolve; });
+
+    // If the subprocess dies (bad spawn, an app-server-less older CLI, a crash), don't
+    // hang waiting on a response that will never come: record it and settle the turn so
+    // the awaited handshake/turn rejects promptly and the workflow can resolve/retry.
+    child.once('error', (e) => { turnError = turnError ?? `codex app-server spawn error: ${String(e)}`; turnActive = false; client.close(); settleTurn?.(); });
+    child.once('close', (code) => {
+      if (!finalText && !turnError) turnError = `codex app-server exited (code ${code ?? -1})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
+      turnActive = false;
+      client.close();
+      settleTurn?.();
+    });
+
+    const noteLimit = (blob: string) => {
+      if (!/usage.?limit|rate.?limit|quota|UsageLimitReached/i.test(blob)) return;
+      const m = blob.match(/"?(?:resets_in_seconds|resetInSeconds|retry_after|retryAfter)"?\s*[:=]\s*(\d+)/);
+      limit = { resetInSeconds: m ? Number(m[1]) : undefined };
+    };
+
+    client.onNotification((method, params) => {
+      switch (method) {
+        case 'turn/started':
+          currentTurnId = params?.turn?.id ?? currentTurnId;
+          turnActive = true;
+          break;
+        case 'item/started':
+          // Surface a command as it begins, mirroring the exec/SDK live terminal feed.
+          if (params?.item?.type === 'commandExecution' && typeof params.item.command === 'string') ctx.emit(`$ ${params.item.command}`);
+          break;
+        case 'item/completed':
+          if (params?.item?.type === 'agentMessage' && typeof params.item.text === 'string' && params.item.text) {
+            finalText = params.item.text;
+            ctx.emit(finalText);
+          }
+          break;
+        case 'turn/completed':
+          if (params?.turn?.status === 'failed' && params.turn.error) {
+            turnError = params.turn.error.message ?? JSON.stringify(params.turn.error);
+            // A usage limit can surface on a failed turn (not only an `error` notif) —
+            // classify it here too so the workflow re-leases the login rather than
+            // burning a Resolve turn (parity with the codex-exec blob scan).
+            noteLimit(JSON.stringify(params.turn.error));
+          }
+          turnActive = false;
+          settleTurn?.();
+          break;
+        case 'error': {
+          const blob = JSON.stringify(params ?? {});
+          noteLimit(blob);
+          turnError = params?.error?.message ?? blob;
+          // A retryable error is handled internally by the server; only a terminal one
+          // (or a usage limit) ends the turn from our side.
+          if (limit || params?.willRetry === false) {
+            turnActive = false;
+            settleTurn?.();
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    });
+
+    // Mid-turn cancel (SPEC §5.6): interrupt the active turn, then reap the group.
+    const onAbort = () => {
+      if (threadId && currentTurnId) client.request('turn/interrupt', { threadId, turnId: currentTurnId }).catch(() => undefined);
+      void killAgent(child.pid);
+      settleTurn?.();
+    };
+    if (ctx.signal?.aborted) onAbort();
+    ctx.signal?.addEventListener?.('abort', onAbort, { once: true });
+
+    // Pull + steer follow-ups into the LIVE turn (`turn/steer`) — the subscription
+    // path's in-flight injection (SPEC §5.6). Serialized so the poller and the
+    // between-turns drain can't double-count. A steer that races a just-finished turn
+    // fails harmlessly; we leave that message for the next turn (index not advanced).
+    let pollLock = false;
+    const steerFollowUps = async (): Promise<void> => {
+      if (!ctx.pullFollowUps || !turnActive || pollLock) return;
+      pollLock = true;
+      try {
+        const news = await ctx.pullFollowUps(deliveredIndex);
+        for (const m of news) {
+          if (!turnActive) break; // turn ended mid-drain → leave the rest for next turn
+          if (m.role !== 'system' && m.role !== 'agent') {
+            try {
+              await client.request('turn/steer', { threadId, expectedTurnId: currentTurnId, input: [{ type: 'text', text: m.text, text_elements: [] }, ...imageItems([m])] });
+            } catch {
+              break; // steer rejected (turn no longer active) → don't advance past it
+            }
+          }
+          deliveredIndex++;
+        }
+      } finally {
+        pollLock = false;
+      }
+    };
+    const followPoll = ctx.pullFollowUps ? setInterval(() => { void steerFollowUps(); }, 1200) : undefined;
+
+    try {
+      // ── Handshake ──
+      await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' }, capabilities: null });
+      client.notify('initialized');
+
+      // ── Thread: resume the prior one, or start fresh (systemPrompt → developer
+      //    instructions; the thread carries them so resumes don't re-send them). ──
+      const resuming = !!input.session;
+      if (resuming) {
+        await client.request('thread/resume', { threadId: input.session, cwd, ...(model ? { model } : {}) });
+      } else {
+        const started = await client.request<any>('thread/start', {
+          cwd,
+          sandbox: 'danger-full-access',
+          approvalPolicy: 'never',
+          developerInstructions: input.systemPrompt,
+          ...(model ? { model } : {}),
+        });
+        threadId = started?.thread?.id ?? threadId;
+      }
+      if (threadId) ctx.onSession?.(threadId);
+      if (!threadId) throw new Error('codex app-server: no thread id after start/resume');
+
+      // ── Initial input (the delta; agent turns attributed so a fresh-thread replay
+      //    never folds the agent's own prior replies back in as user input). ──
+      const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
+      const initialText = conversationToPromptText(convo) || (resuming ? 'Continue.' : 'Begin the task described in the developer instructions. Call signal_completion when done.');
+      let nextInput: any[] = [{ type: 'text', text: initialText, text_elements: [] }, ...imageItems(convo)];
+
+      // ── Turn loop (Model-B): run a turn; follow-ups arriving DURING it are steered
+      //    in-flight; any that land after it start a follow-on turn in this same
+      //    activity, until the agent is idle with nothing pending. ──
+      for (;;) {
+        if (ctx.signal?.aborted) break;
+        turnError = undefined;
+        const settled = awaitTurnSettled();
+        const started = await client.request<any>('turn/start', {
+          threadId,
+          input: nextInput,
+          ...(model ? { model } : {}),
+          ...(effort ? { effort } : {}),
+        });
+        currentTurnId = started?.turn?.id ?? currentTurnId;
+        await settled;
+        if (ctx.signal?.aborted) break;
+        if (limit) break; // usage limit → throw below so the workflow rotates the login
+
+        // Collect follow-ups that weren't steered in (arrived after the last poll /
+        // after completion) → drive a follow-on turn; else the turn is done.
+        nextInput = [];
+        if (ctx.pullFollowUps) {
+          for (const m of await ctx.pullFollowUps(deliveredIndex)) {
+            if (m.role !== 'system' && m.role !== 'agent') nextInput.push({ type: 'text', text: m.text, text_elements: [] }, ...imageItems([m]));
+            deliveredIndex++;
+          }
+        }
+        if (!nextInput.length) break;
+      }
+    } catch (e) {
+      // A rejected request (handshake/turn) — including a rate-limited one — lands here.
+      // Record it (unless we're cancelling, where a rejection is expected) so the checks
+      // below classify a limit and rotate the login, or surface a partial result instead
+      // of discarding output already produced (mirrors the exec/SDK error tolerance).
+      if (!ctx.signal?.aborted) turnError = turnError ?? String((e as Error)?.message ?? e);
+    } finally {
+      if (hb) clearInterval(hb);
+      if (followPoll) clearInterval(followPoll);
+      try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
+      client.close();
+      void killAgent(child.pid);
+      unregisterAgent(child.pid);
+      for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
+    }
+
+    // A limit can also arrive as a rejected request (handshake/turn) or a subprocess
+    // death recorded in `turnError` — scan it so those paths rotate the login too.
+    if (turnError && !limit) noteLimit(turnError);
+    if (limit) {
+      // Same shape as the exec path so limits.ts computes the refresh instant and the
+      // workflow rotates to another login (RESOLVE-PLAN §2.4).
+      throw new Error(`Codex usage limit reached${limit.resetInSeconds != null ? ` · resets in ${limit.resetInSeconds}s` : ''}`);
+    }
+    if (turnError && !finalText) {
+      throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${stderr.slice(0, 300)}` : ''}`);
+    }
+    return { session: threadId, output: finalText, delivered: deliveredIndex };
   }
 
   // ─── Codex CLI on a ChatGPT subscription (`codex exec --json`) ───────────────
@@ -179,7 +446,20 @@ export class CodexAdapter implements AgentAdapter {
     // Process-tree custody (src/agent/custody.ts): record the root pid so a
     // boot-time sweep can reap this group if karmax is SIGKILLed mid-turn
     // (systemd-oomd / crash), and drop the record when the turn ends normally.
-    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, startedAt: Date.now() });
+    // Also surface it in the live task-manager registry (dashboard Processes
+    // panel) under its task.
+    let untrack = () => {};
+    if (child.pid) {
+      registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });
+      untrack = trackProcess({
+        pid: child.pid,
+        kind: 'agent',
+        label: `codex agent (${input.role})`,
+        taskId: input.world.handle.id,
+        startedAt: Date.now(),
+        kill: (sig) => (sig === 'SIGKILL' ? killProcessGroup(child.pid, 'SIGKILL') : void killAgent(child.pid)),
+      });
+    }
 
     // Mid-turn cancel (SPEC §5.6): kill the whole process GROUP when the workflow
     // cancels — SIGTERM, escalating to SIGKILL after a grace window.
@@ -245,6 +525,7 @@ export class CodexAdapter implements AgentAdapter {
     if (hb) clearInterval(hb);
     cleanupImages(); // remove the temp image files now the child has consumed them
     unregisterAgent(child.pid); // child has exited — clear its custody record
+    untrack();
     try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
 
     // Prefer the -o final-message file (authoritative) over the streamed text.
@@ -265,6 +546,10 @@ export class CodexAdapter implements AgentAdapter {
     if (code !== 0 && !finalText) {
       throw new Error(`codex exec failed (exit ${code}): ${stderr.slice(0, 500) || '(no output)'}`);
     }
-    return { session: threadId, output: finalText };
+    // `codex exec` is a one-shot subprocess — no way to inject mid-run, so it delivers
+    // exactly the schedule snapshot; a follow-up that landed mid-turn reaches the agent
+    // on the next turn (the workflow keeps it after the boundary). `delivered` reflects
+    // that: everything up to `input.messages.length`.
+    return { session: threadId, output: finalText, delivered: input.messages.length };
   }
 }

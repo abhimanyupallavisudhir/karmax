@@ -45,6 +45,30 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(onMain.code).not.toBe(0);
   });
 
+  it('just-do: injects a follow-up sent mid-turn into the live turn (SPEC §5.6)', async () => {
+    const repo = await h.makeRepo('jd-mid');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('justDo', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // A ~3s turn — a window to send a follow-up while the single Do turn runs.
+      args: [baseInput(taskId, repo, { title: 'mid', prompt: '@sleep 3000\n@write base.txt :: base' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await new Promise((r) => setTimeout(r, 700));
+    await handle.signal('followUp', { id: 'm1', role: 'user', text: '@write injected.txt :: from a live follow-up', ts: 0 });
+    // The follow-up is executed in the SAME turn (in-flight), so the turn reaches Review
+    // with BOTH files written and no second Do turn.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('confirm');
+    const res = await handle.result();
+    expect(res.stage).toBe('done');
+    const injected = await git(repo, ['show', `karmax/${taskId}:injected.txt`]);
+    expect(injected.stdout).toContain('from a live follow-up');
+    const base = await git(repo, ['show', `karmax/${taskId}:base.txt`]);
+    expect(base.stdout).toContain('base');
+  });
+
   it('script-exec: runs a command and captures its output', async () => {
     const repo = await h.makeRepo('se');
     const taskId = newId('task');
