@@ -1003,8 +1003,11 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       const auto = await core.buildReview(world as any, base).catch(() => undefined);
       if (auto) {
         reviewInfo = {
+          // Prefer the agent's terse caption; fall back to the git-derived summary.
+          caption: reviewInfo?.caption,
           summary: reviewInfo?.summary ?? auto.summary,
           changedFiles: auto.changedFiles,
+          ...(reviewInfo?.actions ? { actions: reviewInfo.actions } : {}),
           ...(reviewInfo?.links ? { links: reviewInfo.links } : {}),
           ...(reviewInfo?.html ? { html: reviewInfo.html } : {}),
         };
