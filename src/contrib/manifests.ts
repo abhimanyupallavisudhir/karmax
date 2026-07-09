@@ -427,6 +427,34 @@ export function manifest(name: string): WorkflowManifest | undefined {
   return MANIFESTS.find((m) => m.name === name);
 }
 
+/**
+ * Core platform events (not owned by any one workflow) that a task can trigger
+ * on, with the payload keys a filter can match. These are the generally-useful,
+ * stable events emitted by the activity layer (src/activities/core.ts) — a
+ * curated subset, not every internal event, so the event-trigger picker offers
+ * meaningful choices rather than raw noise.
+ */
+export const PLATFORM_EVENTS: EventSchemaDecl[] = [
+  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled' } },
+  { type: 'pr.opened', description: 'A pull request was opened for a task.', fields: { number: 'number', url: 'string' } },
+  { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
+  { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },
+  { type: 'world.created', description: "A task's world (worktree/container) was provisioned.", fields: {} },
+  { type: 'world.destroyed', description: "A task's world was torn down.", fields: {} },
+  { type: 'spend.requested', description: 'An agent requested spend above the auto-approve threshold.', fields: { status: 'string', reason: 'string' } },
+];
+
+/** The full event catalog: every workflow's declared events + the platform events,
+ *  tagged with their source, deduped by type (first wins). Drives the event-trigger
+ *  picker + payload-filter builder (SPEC §5). */
+export function eventCatalog(manifests: WorkflowManifest[] = MANIFESTS): (EventSchemaDecl & { source: string })[] {
+  const out: (EventSchemaDecl & { source: string })[] = [];
+  const seen = new Set<string>();
+  for (const m of manifests) for (const e of m.events) if (!seen.has(e.type)) { seen.add(e.type); out.push({ ...e, source: m.name }); }
+  for (const e of PLATFORM_EVENTS) if (!seen.has(e.type)) { seen.add(e.type); out.push({ ...e, source: 'platform' }); }
+  return out;
+}
+
 /** A declared role plus which workflow(s) declare it (for the profiles UI). */
 export interface RoleWithSource extends WorkflowRole {
   workflows: string[];
