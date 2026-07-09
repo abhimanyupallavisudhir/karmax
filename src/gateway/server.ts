@@ -298,6 +298,102 @@ export class Gateway {
         return this.json(res, 200, await this.activateWorkflow(token, projectId, b.workflow));
       }
 
+      // ── search / organization (a view is a saved query — PLAN-search-views) ──
+      // The searchable-field registry the UI reads to build its filter/sort/group menus.
+      if (p === '/api/search/fields' && method === 'GET') return this.json(res, 200, api.searchFields(token));
+
+      // Evaluate a query against a project: `?q=<query string>` (Linear-style token
+      // syntax) → { tasks, groups, total }. Every list surface — the default list
+      // included — is just an evaluation of one of these.
+      const searchMatch = p.match(/^\/api\/projects\/([^/]+)\/search$/);
+      if (searchMatch && method === 'GET') {
+        const q = url.searchParams.get('q') ?? '';
+        const r = await api.searchTasks(token, searchMatch[1]!, q);
+        return this.json(res, 200, r);
+      }
+
+      // Tags (labels + topics, hierarchical) — project-scoped catalogue.
+      const tagsMatch = p.match(/^\/api\/projects\/([^/]+)\/tags$/);
+      if (tagsMatch) {
+        const projectId = tagsMatch[1]!;
+        if (method === 'GET') return this.json(res, 200, await api.listTags(token, projectId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.createTag(token, { projectId, name: b.name, parentId: b.parentId, color: b.color, kind: b.kind }));
+        }
+      }
+      const tagMatch = p.match(/^\/api\/tags\/([^/]+)$/);
+      if (tagMatch) {
+        const id = tagMatch[1]!;
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, await api.updateTag(token, id, b));
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        if (method === 'DELETE') {
+          await api.deleteTag(token, id);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+
+      // Saved views — named, persisted queries shown in the project's view switcher.
+      const viewsMatch = p.match(/^\/api\/projects\/([^/]+)\/views$/);
+      if (viewsMatch) {
+        const projectId = viewsMatch[1]!;
+        if (method === 'GET') return this.json(res, 200, await api.listViews(token, projectId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.createView(token, { projectId, name: b.name, query: b.query ?? {}, icon: b.icon }));
+        }
+      }
+      const savedViewMatch = p.match(/^\/api\/views\/([^/]+)$/);
+      if (savedViewMatch) {
+        const id = savedViewMatch[1]!;
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.updateView(token, id, b));
+        }
+        if (method === 'DELETE') {
+          await api.deleteView(token, id);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const viewReorderMatch = p.match(/^\/api\/views\/([^/]+)\/reorder$/);
+      if (viewReorderMatch && method === 'POST') {
+        const b = await this.body(req);
+        await api.reorderView(token, viewReorderMatch[1]!, Number(b.ord ?? 0));
+        return this.json(res, 200, { ok: true });
+      }
+
+      // Per-task organization: tag set + priority (both purely organizational —
+      // never assembled into any agent prompt, so editable at any lifecycle stage).
+      const taskTagsMatch = p.match(/^\/api\/tasks\/([^/]+)\/tags$/);
+      if (taskTagsMatch && method === 'PUT') {
+        const b = await this.body(req);
+        const tags = await api.setTaskTags(token, taskTagsMatch[1]!, Array.isArray(b.tagIds) ? b.tagIds : []);
+        return this.json(res, 200, { tags });
+      }
+      // Agent-facing add/remove by tag name or path (used by the platform MCP).
+      const tagEditMatch = p.match(/^\/api\/tasks\/([^/]+)\/tag$/);
+      if (tagEditMatch && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          const out = await api.tagTask(token, tagEditMatch[1]!, { add: b.add, remove: b.remove });
+          return this.json(res, 200, out);
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const priorityMatch = p.match(/^\/api\/tasks\/([^/]+)\/priority$/);
+      if (priorityMatch && method === 'PUT') {
+        const b = await this.body(req);
+        await api.setTaskPriority(token, priorityMatch[1]!, Number(b.priority ?? 0));
+        return this.json(res, 200, { ok: true });
+      }
+
       // tasks
       // Resolve a per-project sequential number (SPEC §10.6) → its canonical id, so a
       // `/projects/<name>/tasks/<num>` permalink can be opened even when the task
@@ -341,10 +437,11 @@ export class Gateway {
         if (t.params?.draft) {
           // Replace the workflow-field overrides wholesale (b.params is the form's
           // full set of own overrides) so a field reset to its default is actually
-          // removed — a merge would leave the stale override behind. Lifecycle meta
-          // (draft/archived/profiles) is preserved across the edit.
-          const { draft, archived, profiles } = t.params;
-          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}) };
+          // removed — a merge would leave the stale override behind. Lifecycle +
+          // organizational meta (draft/archived/profiles/priority) is preserved across
+          // the edit — priority is set via its own endpoint and must survive a form save.
+          const { draft, archived, profiles, priority } = t.params;
+          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}), ...(priority !== undefined ? { priority } : {}) };
           const replace = b.replace === true;
           store.updateTaskParams(id, replace ? { ...meta, ...b.params } : { ...t.params, ...b.params });
           return this.json(res, 200, store.getTask(id) ?? null);

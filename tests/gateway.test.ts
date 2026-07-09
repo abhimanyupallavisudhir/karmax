@@ -323,4 +323,74 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(login.path).toBeUndefined(); // listing also hides the path
     expect(typeof login.loggedIn).toBe('boolean');
   });
+
+  it('drives tags, saved views, and query search over HTTP (a view is a saved query)', async () => {
+    const post = (path: string, body: unknown) =>
+      fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
+    const get = (path: string) => fetch(`${base}${path}`, { headers: auth() }).then((r) => r.json());
+
+    const project: any = await post('/api/projects', { name: 'Org', config: { defaultBase: 'main' } });
+
+    // The searchable-field registry drives the UI menus.
+    const fields: any = await get('/api/search/fields');
+    expect(fields.find((f: any) => f.key === 'status').groupable).toBe(true);
+    expect(fields.find((f: any) => f.key === 'tag')).toBeTruthy();
+
+    // Hierarchical tags: frontend/web + a bug label.
+    const front: any = await post(`/api/projects/${project.id}/tags`, { name: 'frontend', kind: 'topic' });
+    const web: any = await post(`/api/projects/${project.id}/tags`, { name: 'web', parentId: front.id, kind: 'topic' });
+    const bug: any = await post(`/api/projects/${project.id}/tags`, { name: 'bug', kind: 'type' });
+    expect(web.parentId).toBe(front.id);
+
+    // Two draft tasks (no workflow needed) to organize.
+    const mk = (title: string) =>
+      post(`/api/projects/${project.id}/tasks`, { title, prompt: title, workflow: 'software-dev', draft: true });
+    const t1: any = await mk('Fix web bug');
+    const t2: any = await mk('Write docs');
+
+    // Assign tags + priority (organization only — editable while draft).
+    await fetch(`${base}/api/tasks/${t1.id}/tags`, { method: 'PUT', headers: auth(), body: JSON.stringify({ tagIds: [web.id, bug.id] }) });
+    await fetch(`${base}/api/tasks/${t1.id}/priority`, { method: 'PUT', headers: auth(), body: JSON.stringify({ priority: 4 }) });
+
+    // Search by a parent tag matches the child-tagged task (hierarchy expansion).
+    const byParent: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('tag:frontend')}`);
+    expect(byParent.tasks.map((t: any) => t.id)).toEqual([t1.id]);
+
+    // Search by label + priority, grouped by tag.
+    const byBug: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('tag:bug priority:>=3 group:tag')}`);
+    expect(byBug.total).toBe(1);
+    expect(byBug.groups.some((g: any) => g.key === bug.id)).toBe(true);
+
+    // A negated/free-text query finds the other task.
+    const docs: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('docs -tag:bug')}`);
+    expect(docs.tasks.map((t: any) => t.id)).toEqual([t2.id]);
+
+    // Slash path creates (and reuses) a hierarchy in one call — no parent picker.
+    const checkout: any = await post(`/api/projects/${project.id}/tags`, { name: 'frontend/web/checkout' });
+    expect(checkout.name).toBe('checkout');
+    const allTags = (await get(`/api/projects/${project.id}/tags`)) as any[];
+    const webParent: any = allTags.find((t: any) => t.id === checkout.parentId);
+    expect(webParent.name).toBe('web'); // reused the existing frontend/web, not duplicated
+    expect(allTags.filter((t: any) => t.name === 'web')).toHaveLength(1);
+
+    // Workflow params are searchable via param.<key>: both drafts carry prompt=title.
+    const byParam: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('param.prompt:docs')}`);
+    expect(byParam.tasks.map((t: any) => t.id)).toEqual([t2.id]);
+
+    // The agent-facing add/remove-by-name endpoint (what the platform MCP forwards to).
+    const added: any = await post(`/api/tasks/${t2.id}/tag`, { add: ['frontend/web', 'chore'] });
+    expect(added.tags.sort()).toEqual(['chore', 'frontend/web']);
+    const removed: any = await post(`/api/tasks/${t2.id}/tag`, { remove: ['chore'] });
+    expect(removed.tags).toEqual(['frontend/web']);
+
+    // Saved view = persisted query; it round-trips and lists back.
+    const view: any = await post(`/api/projects/${project.id}/views`, {
+      name: 'Urgent frontend',
+      query: { filters: [{ field: 'tag', op: 'is', values: ['frontend'] }], sort: [{ field: 'priority', dir: 'desc' }] },
+      icon: '🔥',
+    });
+    const views: any = await get(`/api/projects/${project.id}/views`);
+    expect(views.map((v: any) => v.name)).toContain('Urgent frontend');
+    expect(views.find((v: any) => v.id === view.id).query.filters[0].field).toBe('tag');
+  });
 });

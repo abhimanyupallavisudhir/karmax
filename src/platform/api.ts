@@ -7,7 +7,9 @@ import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, ImageRef } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, ImageRef, Tag, SavedView, TaskQuery } from '../domain/types.js';
+import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
+import { parseQuery } from '../domain/query-language.js';
 import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
@@ -329,6 +331,127 @@ export class KarmaxApi {
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks');
     return this.deps.store.listTasks(projectId);
+  }
+
+  // ─── Search & organization (task search / views — PLAN-search-views) ─────────
+  // A *view* is a saved *query*: every list surface (including the default one) is the
+  // result of evaluating a `TaskQuery` — free text + structured filters + sort + group —
+  // against the project's tasks. The evaluator is pure (src/domain/search.ts); it runs
+  // in-memory over the store's `listTasks` (cheap at todo-list scale), whose records
+  // already carry the cached `lastView` (status/stage/pr) and hydrated `tags`.
+
+  /**
+   * Evaluate a query against a project's tasks. `query` may be a raw query string
+   * (the search box / a saved view's serialized form) or an already-structured
+   * `TaskQuery`. Returns the filtered+sorted list, optional groups, and total.
+   */
+  async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
+    this.require(token, 'search_tasks');
+    const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
+    const tasks = this.deps.store.listTasks(projectId);
+    const tags = this.deps.store.listTags(projectId);
+    return evaluateQuery(tasks, q, { now, tags });
+  }
+
+  /** The searchable-field registry the UI reads to build its filter/sort/group menus. */
+  searchFields(token: string) {
+    this.require(token, 'search_fields');
+    return fieldCatalogue();
+  }
+
+  // ─── Tags ────────────────────────────────────────────────────────────────────
+  async listTags(token: string, projectId: string): Promise<Tag[]> {
+    this.require(token, 'list_tags');
+    return this.deps.store.listTags(projectId);
+  }
+
+  async createTag(token: string, input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Promise<Tag> {
+    this.require(token, 'manage_tag');
+    return this.deps.store.createTag(input);
+  }
+
+  async updateTag(token: string, id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null }): Promise<Tag | undefined> {
+    this.require(token, 'manage_tag');
+    return this.deps.store.updateTag(id, patch);
+  }
+
+  async deleteTag(token: string, id: string): Promise<void> {
+    this.require(token, 'manage_tag');
+    this.deps.store.deleteTag(id);
+  }
+
+  /** Replace the full tag set on a task (organization only — never reaches the agent). */
+  async setTaskTags(token: string, taskId: string, tagIds: string[]): Promise<string[]> {
+    this.require(token, 'set_task_tags');
+    this.deps.store.setTaskTags(taskId, tagIds);
+    return this.deps.store.tagsFor(taskId);
+  }
+
+  /**
+   * Agent-friendly tagging: add/remove tags on a task **by name or `a/b` path** rather
+   * than opaque ids. An `add` name that doesn't exist is created (slash paths build the
+   * hierarchy); a `remove` name that isn't present is ignored. Returns the resulting tag
+   * paths. This is what the platform MCP exposes so agents can label tasks they touch.
+   */
+  async tagTask(token: string, taskId: string, patch: { add?: string[]; remove?: string[] }): Promise<{ tags: string[] }> {
+    this.require(token, 'set_task_tags');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no such task ${taskId}`);
+    const resolve = () => {
+      const tags = this.deps.store.listTags(task.projectId);
+      const byId = new Map(tags.map((t) => [t.id, t]));
+      const find = (s: string) => {
+        const v = s.trim().toLowerCase();
+        return tags.find((t) => t.name.toLowerCase() === v || tagPath(t, byId).toLowerCase() === v);
+      };
+      return { tags, byId, find };
+    };
+    const cur = new Set(this.deps.store.tagsFor(taskId));
+    for (const name of patch.add ?? []) {
+      if (!name.trim()) continue;
+      const found = resolve().find(name);
+      const id = found ? found.id : this.deps.store.createTag({ projectId: task.projectId, name }).id;
+      cur.add(id);
+    }
+    for (const name of patch.remove ?? []) {
+      const found = resolve().find(name);
+      if (found) cur.delete(found.id);
+    }
+    this.deps.store.setTaskTags(taskId, [...cur]);
+    const { byId } = resolve();
+    return { tags: this.deps.store.tagsFor(taskId).map((id) => (byId.get(id) ? tagPath(byId.get(id)!, byId) : id)) };
+  }
+
+  /** Set the organizational priority (0–4) — editable at any lifecycle stage. */
+  async setTaskPriority(token: string, taskId: string, priority: number): Promise<void> {
+    this.require(token, 'set_task_priority');
+    this.deps.store.setTaskPriority(taskId, priority);
+  }
+
+  // ─── Saved views (a view is a saved query) ───────────────────────────────────
+  async listViews(token: string, projectId: string): Promise<SavedView[]> {
+    this.require(token, 'list_views');
+    return this.deps.store.listViews(projectId);
+  }
+
+  async createView(token: string, input: { projectId: string; name: string; query: TaskQuery; icon?: string }): Promise<SavedView> {
+    this.require(token, 'manage_view');
+    return this.deps.store.createView(input);
+  }
+
+  async updateView(token: string, id: string, patch: { name?: string; query?: TaskQuery; icon?: string | null }): Promise<SavedView | undefined> {
+    this.require(token, 'manage_view');
+    return this.deps.store.updateView(id, patch);
+  }
+
+  async reorderView(token: string, id: string, ord: number): Promise<void> {
+    this.require(token, 'manage_view');
+    this.deps.store.reorderView(id, ord);
+  }
+
+  async deleteView(token: string, id: string): Promise<void> {
+    this.require(token, 'manage_view');
+    this.deps.store.deleteView(id);
   }
 
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
