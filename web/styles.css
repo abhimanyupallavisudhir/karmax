@@ -160,6 +160,9 @@ a { color: var(--accent); text-decoration: none; }
 .rail .grow { flex: 1; }
 .rail .nav-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 7px; cursor: pointer; color: var(--ink-2); }
 .rail .nav-item:hover { background: var(--surface-2); color: var(--ink); }
+/* rail keyboard focus (g p → j/k/↵, Esc leaves). Plain :focus, not :focus-visible —
+   moveRail() focuses programmatically and must stay visibly highlighted. */
+.rail .proj:focus, .rail .nav-item:focus { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--surface-2); }
 
 /* ── main ───────────────────────────────────────────────────── */
 .main { overflow-y: auto; padding: 0; }
@@ -401,7 +404,20 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
 .palette input { width: 100%; padding: 14px 16px; border: 0; border-bottom: 1px solid var(--line); outline: none; background: transparent; font-size: 15px; }
 .palette .opt { padding: 10px 16px; cursor: pointer; display: flex; align-items: center; gap: 10px; }
 .palette .opt.active { background: var(--accent-weak); }
-.palette .opt .key { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+.palette .opt.danger { color: var(--danger); }
+.palette .opt .key { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; white-space: nowrap; }
+#pal-list { max-height: 46vh; overflow: auto; }
+.pal-group { padding: 8px 16px 2px; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+.pal-sub { margin-left: 8px; font-size: 11px; color: var(--ink-3); }
+.pal-empty { padding: 14px 16px; color: var(--ink-3); font-size: 13px; }
+
+/* keyboard navigation: list cursor, digit hints on action buttons, "?" help */
+.task-row.cursor, .queue-item.cursor { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.task-row:focus-visible, .queue-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.kbd { margin-left: 7px; font-family: var(--font-mono); font-size: 10px; line-height: 1.5; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.btn.primary .kbd, .btn.danger .kbd { color: inherit; border-color: currentColor; opacity: .7; }
+.help-row { display: flex; gap: 12px; padding: 4px 0; font-size: 13px; align-items: baseline; }
+.help-row .key { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; min-width: 34px; text-align: center; white-space: nowrap; }
 
 /* login */
 .login-wrap { display: grid; place-items: center; height: 100vh; }
