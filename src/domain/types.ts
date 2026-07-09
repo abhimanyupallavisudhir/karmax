@@ -10,7 +10,7 @@ export type { TaskTrigger, TriggerState } from './triggers.js';
 
 export type Provider = 'claude' | 'codex' | 'mock';
 
-export type AgentRole = 'do' | 'merge' | 'resolve' | (string & {});
+export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | (string & {});
 
 // ─── Project / list / task records (the metadata index) ──────────────────────
 
@@ -51,6 +51,14 @@ export interface TaskList {
 /** The persisted index record for a task. The live view comes from the workflow query. */
 export interface TaskRecord {
   id: string;
+  /**
+   * Simple, human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
+   * project's tasks run #1, #2, …, assigned at creation. The UI displays `#num` and
+   * the URL scheme uses it (`/projects/<name>/tasks/<num>`); the opaque `id` above
+   * stays the canonical key (it is the Temporal workflowId, event key, and session
+   * key, so it must never change).
+   */
+  num?: number;
   projectId: string;
   listId: string;
   title: string;
@@ -66,12 +74,21 @@ export interface TaskRecord {
    * they want here; it has no effect on workflow execution.
    */
   notes?: string;
+  /**
+   * Tag ids applied to this task (task organization — labels + topics). Persisted in
+   * the `task_tags` join table and hydrated onto the record by the store; the tag
+   * definitions (name/parent/colour) live in the `tags` table. Purely organizational
+   * — never assembled into any agent prompt.
+   */
+  tags?: string[];
   /** Last view snapshot, refreshed opportunistically so terminal/parked tasks list cheaply. */
   lastView?: TaskView;
 }
 
 export interface TaskParams {
   prompt: string;
+  /** Images attached to the initial prompt (references, never inline bytes). */
+  images?: ImageRef[];
   base?: string;
   target?: string;
   /** role -> profile id overrides. */
@@ -101,7 +118,93 @@ export interface TaskParams {
   repeatable?: boolean;
   /** Set on a run: the id of the series (repeatable template) it was spawned from. */
   runOf?: string;
+  /**
+   * Human-assigned importance for organization/sorting (task search & views). A small
+   * ordinal, 0=none … 4=urgent (see PRIORITIES). Purely organizational — never sent to
+   * any agent. Stored on params (not a dedicated column) so the schema stays stable and
+   * it re-resolves at queue time like every other param.
+   */
+  priority?: number;
   [k: string]: unknown;
+}
+
+// ─── Task organization: tags, search queries, saved views (PLAN-search-views) ─
+// A view IS a saved query (the Linear/Jira model): every list surface is the result
+// of evaluating a `TaskQuery` (filter + full-text + sort + group). The searchable-field
+// registry in `src/domain/search.ts` is the single source of truth that the query
+// parser, the evaluator, and the UI filter menu all derive from ("declare, don't guess").
+
+/** Ordinal priority levels, low→high. Index is the stored `params.priority` value. */
+export const PRIORITIES = ['none', 'low', 'medium', 'high', 'urgent'] as const;
+export type PriorityName = (typeof PRIORITIES)[number];
+
+/**
+ * A tag: a label ("bug", "feature-request") or a topic ("frontend", "auth"), scoped to
+ * a project. Tags are hierarchical via `parentId` — selecting a parent in search matches
+ * every descendant (Linear label-groups). `kind` separates the two conceptual axes so the
+ * UI can present them differently: `type` = what-kind-of-work, `topic` = what-area.
+ */
+export interface Tag {
+  id: string;
+  projectId: string;
+  /** Leaf name (unique among siblings within the project). */
+  name: string;
+  /** Parent tag id for hierarchy; absent ⇒ a root tag. */
+  parentId?: string;
+  /** Presentation colour (hex or a named swatch key); optional. */
+  color?: string;
+  /** Which conceptual axis this tag belongs to. */
+  kind?: 'type' | 'topic';
+  createdAt: number;
+}
+
+/** How a filter clause compares the field value(s) to the requested value(s). */
+export type FilterOp = 'is' | 'contains' | 'gt' | 'gte' | 'lt' | 'lte';
+
+/**
+ * One filter condition. Clauses are AND-ed together; `values` within a clause are OR-ed
+ * (`status:active,waiting`). `negate` flips the whole clause (`-tag:bug`). For number/date
+ * fields a comparison op (`gt`/`lt`/…) is used with a single value; for enum/tag/text
+ * fields `is`/`contains` with one-or-more values.
+ */
+export interface FilterClause {
+  field: string;
+  op: FilterOp;
+  values: string[];
+  negate?: boolean;
+}
+
+/** A sort directive: a searchable-field key + direction. Applied left-to-right (stable). */
+export interface SortClause {
+  field: string;
+  dir: 'asc' | 'desc';
+}
+
+/**
+ * The complete description of a task list surface: free text + structured filters + sort +
+ * group. Search and views are the same thing — a view is just a persisted `TaskQuery`.
+ */
+export interface TaskQuery {
+  /** Free-text match (title / notes / #num). */
+  text?: string;
+  /** Structured filter clauses, AND-ed. */
+  filters?: FilterClause[];
+  /** Sort order (first clause primary). Absent ⇒ default (created desc). */
+  sort?: SortClause[];
+  /** Field key to group rows by (e.g. status, priority, tag, workflow). Absent ⇒ flat. */
+  group?: string;
+}
+
+/** A named, saved query — the user's custom "view" of a project's tasks. */
+export interface SavedView {
+  id: string;
+  projectId: string;
+  name: string;
+  query: TaskQuery;
+  /** Optional icon/emoji shown in the views sidebar. */
+  icon?: string;
+  order: number;
+  createdAt: number;
 }
 
 // ─── The view-model (SPEC §10.2 — the mandatory typed projection) ─────────────
@@ -120,14 +223,64 @@ export type Stage =
 
 export type TaskStatus = 'active' | 'waiting' | 'blocked' | 'done' | 'failed' | 'cancelled';
 
+/**
+ * A reference to a user-attached image, stored content-addressed on disk under
+ * `$KARMAX_HOME/attachments/<id>` (SPEC — image prompts; PLAN_IMAGE_PROMPTS.md).
+ * Deliberately carries NO bytes: only this lightweight handle flows through
+ * Temporal workflow input/signals/history. Bytes are resolved back to base64
+ * (Claude/OpenAI APIs) or temp files (Codex CLI) at the activity boundary.
+ */
+export interface ImageRef {
+  /** Content hash (sha256, hex) — also the storage filename stem. */
+  id: string;
+  mediaType: string; // 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  bytes: number;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'agent' | 'system';
   text: string;
   ts: number;
+  /** User-attached images (references, never inline bytes). Absent ⇒ text-only. */
+  images?: ImageRef[];
+}
+
+/**
+ * A single click-to-verify affordance the reviewer can act on. Review info is a
+ * list of these — NOT a prose changelog (that belongs in the conversation). Two
+ * primitives:
+ *  - `run`  — a shell command executed IN THE TASK'S WORLD (start a server, run an
+ *             app or script). A long-lived one (`server: true`) streams logs and can
+ *             be stopped; `openUrls` are opened once it's up.
+ *  - `open` — open a produced artifact: a world-relative file (PDF, notebook, image,
+ *             video) or an absolute URL. No command runs.
+ */
+export type ReviewActionKind = 'run' | 'open';
+
+export interface ReviewAction {
+  kind: ReviewActionKind;
+  /** Short button label, e.g. "Start dev server", "Open coverage report". */
+  label: string;
+  /** `run` only: the exact shell command executed in the task's world. */
+  command?: string;
+  /** `run` only: the command is a long-lived server/watcher (stream logs + Stop). */
+  server?: boolean;
+  /** `run` only: URLs to open once the command is up (e.g. a dev server page). */
+  openUrls?: string[];
+  /** `open` only: world-relative file path OR an absolute URL to open. */
+  target?: string;
 }
 
 export interface ReviewInfo {
+  /**
+   * Terse orientation — WHAT to verify, not a narrative of what was done. One line.
+   * Prose about the work belongs in the conversation/messages, not here.
+   */
+  caption?: string;
+  /** Click-to-verify affordances (SPEC §5.5): the primary review payload. */
+  actions?: ReviewAction[];
+  /** @deprecated Legacy free-form summary; kept for back-compat rendering only. */
   summary?: string;
   links?: { label: string; url: string }[];
   diff?: string;
@@ -150,11 +303,11 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer';
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
-export type FieldBind = 'prompt' | 'top' | 'project' | 'profile';
+export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm';
 /**
  * When a param may be edited after the task is queued (SPEC §4.5/§5.5). This is
  * the single declaration that drives in-flight edits: the workflow validator
@@ -181,7 +334,8 @@ export interface FieldSpec {
   placeholder?: string;
   scopes: FieldScope[];
   bind: FieldBind;
-  /** For agent fields / bind:'profile' — the role this configures (do/merge/resolve). */
+  /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures
+   *  (do/merge/resolve/confirm). */
   role?: string;
   /** In-flight editability window (SPEC §4.5/§5.5). Omitted ⇒ `queue`. */
   mutable?: FieldMutable;
@@ -197,6 +351,27 @@ export interface AgentSpec {
   resumeFrom?: { taskId?: string; role?: string; sessionId?: string };
 }
 
+/**
+ * Who drives the Review gate (SPEC §5.2/§5.3). `human` waits for a person to click
+ * Confirm (the default, back-compat behaviour). `auto` confirms the moment Review is
+ * reached. `agent` runs a Confirm-agent turn that reviews the work and returns a
+ * structured verdict (confirm / revise / reject) — the same three transitions a human
+ * drives. When `mode === 'agent'` the remaining `AgentSpec` fields configure that
+ * agent exactly like the Do/Merge/Resolve agent fields (including `resumeFrom`).
+ */
+export type ConfirmMode = 'human' | 'auto' | 'agent';
+export interface ConfirmConfig extends Partial<AgentSpec> {
+  mode: ConfirmMode;
+}
+
+/** The Confirm agent's structured verdict at the Review gate. `confirm` proceeds,
+ *  `revise` sends the task back to Do (with an optional comment), `reject` cancels. */
+export type ConfirmAction = 'confirm' | 'revise' | 'reject';
+export interface ConfirmDecision {
+  action: ConfirmAction;
+  text?: string;
+}
+
 /** A declared action the workflow exposes; auto-rendered as a button/form (§10.2 tier 1). */
 export interface DeclaredAction {
   name: string;
@@ -210,6 +385,12 @@ export interface DeclaredAction {
 /** The typed projection of a task's state + allowed actions the UI renders. */
 export interface TaskView {
   taskId: string;
+  /**
+   * Human-facing sequential id (SPEC §10.6), mirrored onto the view from the task
+   * record by the gateway so the UI can show `#num` and build permalinks. Not
+   * produced by the workflow (which only knows the opaque `taskId`).
+   */
+  num?: number;
   title: string;
   workflow: string;
   stage: Stage;
@@ -246,7 +427,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'parent'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right
@@ -302,6 +483,8 @@ export interface TaskInput {
   workflow?: string;
   title: string;
   prompt: string;
+  /** Images attached to the initial prompt (references, never inline bytes). */
+  images?: ImageRef[];
   base?: string;
   target?: string;
   /** Existing branch to merge (merge-only workflow). */
@@ -312,6 +495,9 @@ export interface TaskInput {
   profiles?: Record<string, string>;
   /** Per-role agent overrides (provider/model/effort/resume) from the task form (§10.5). */
   agents?: Record<string, AgentSpec>;
+  /** Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent.
+   *  Absent ⇒ human (or `auto` when the legacy `autoConfirm` flag is set). */
+  confirm?: ConfirmConfig;
   /** A snapshot of project config, captured at creation. */
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */

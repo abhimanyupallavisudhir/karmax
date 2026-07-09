@@ -13,6 +13,8 @@ const S = {
   projects: [],
   projectId: null,
   tasks: [],
+  deleted: new Set(), // ids of drafts deleted this session — tombstones so a stale
+  // in-flight list refresh (issued before the DELETE landed) can't resurrect them.
   tab: 'tasks',
   selected: null, // taskId
   view: null, // selected task view
@@ -20,13 +22,143 @@ const S = {
   liveOutput: '',
   drawerSeq: 0,
   activity: [],
-  search: '',
+  search: '', // the working query string (Linear-style tokens + free text)
+  // Task organization (PLAN-search-views): a view IS a saved query.
+  tags: [], // project tag catalogue (labels + topics, hierarchical)
+  views: [], // saved views (named queries)
+  fields: [], // searchable-field registry (drives the filter/sort/group menus)
+  activeView: null, // id of the selected saved view, or null for the ad-hoc/default view
+  searchResult: null, // { tasks, groups, total } from the last server evaluation
+  orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
   paramDefaults: {},
   sessions: {}, // role -> provider session id, for the "fork in CLI" copy command
   ws: null,
   hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
+  procTimer: null, // live-refresh handle for the dashboard processes (task manager) panel
+  cursorId: null, // the list cursor (roving selection) on the tasks/queue views
+  returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
+  queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
 };
+
+// ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
+// Every page is a host-owned route; the browser URL is the single source of truth
+// for {project, tab, open task}. Workflows/coordinators never own a URL — a page
+// like the merge queue is a first-party route that projects coordinator/task state.
+// Projects are addressed by a slug of their name; tasks are numbered per project.
+// Scheme:
+//   /                                    → home (redirects to a project's tasks)
+//   /dashboard                           → global dashboard
+//   /settings                            → global settings
+//   /projects/:name/tasks                → task list (also /queue, /activity, /settings)
+//   /projects/:name/tasks/:num           → task list with task #num open (permalink)
+function slugify(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+}
+function projectSlug(p) { return p ? slugify(p.name) : ''; }
+function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
+// Resolve a URL slug back to a project. Matches the slugified name (the common,
+// human case), falling back to a raw project id for safety. On a slug collision
+// the first-created project wins (names are expected distinct).
+function projectBySlug(slug) {
+  const s = slugify(slug);
+  return (S.projects || []).find((p) => slugify(p.name) === s) || (S.projects || []).find((p) => p.id === slug);
+}
+
+function parseRoute(pathname) {
+  const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
+  if (!seg.length) return { name: 'home' };
+  if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard' };
+  if (seg[0] === 'settings') return { name: 'global', tab: 'global' };
+  if (seg[0] === 'projects' && seg[1]) {
+    const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
+    return { name: 'project', slug: seg[1], tab, taskKey };
+  }
+  return { name: 'home' };
+}
+
+// The list/tab route for a project (by id), addressed by name-slug.
+function projectRoute(pid, tab = 'tasks') {
+  const p = projectById(pid);
+  return p ? `/projects/${projectSlug(p)}/${tab}` : '/dashboard';
+}
+
+// Navigate: update the URL then reconcile app state to it. `replace` swaps the
+// current history entry instead of pushing a new one.
+function go(path, opts = {}) {
+  if (path !== location.pathname) {
+    history[opts.replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', path);
+  }
+  return applyRoute();
+}
+
+// Resolve a per-project task URL key (a numeric #num, or a raw task id) → task id.
+async function resolveProjectTaskKey(projectId, key) {
+  if (/^\d+$/.test(key)) {
+    const local = (S.tasks || []).find((t) => t.projectId === projectId && String(t.num) === key);
+    if (local) return local.id;
+    const r = await api(`/api/projects/${projectId}/tasks/by-num/${key}`).catch(() => null);
+    return r?.id ?? null;
+  }
+  const local = (S.tasks || []).find((t) => t.id === key);
+  return local ? local.id : key; // raw-id fallback
+}
+
+async function applyRoute() {
+  const r = parseRoute(location.pathname);
+  if (r.name === 'home') {
+    const pid = S.projectId || S.projects[0]?.id;
+    return go(pid ? projectRoute(pid) : '/dashboard', { replace: true });
+  }
+  if (r.name === 'global') {
+    closeDrawerDom();
+    S.tab = r.tab;
+    renderRail();
+    renderMain();
+    if (r.tab === 'dashboard') renderDashboard();
+    return;
+  }
+  // project / task routes → resolve the project (by name-slug) + optional open task
+  const proj = projectBySlug(r.slug);
+  if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
+  const pid = proj.id;
+  const tab = r.tab || 'tasks';
+  if (pid !== S.projectId) { S.projectId = pid; await loadTasks().catch(() => {}); }
+  else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
+  await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
+  if (tab === 'tasks') await runSearch().catch(() => {});
+  S.tab = tab;
+  renderRail();
+  renderMain();
+  if (tab === 'activity') seedActivity();
+  if (tab === 'queue') seedQueue();
+  if (tab === 'dashboard') renderDashboard();
+  // reconcile the open task from the URL (loaded tasks are in hand now)
+  let taskId = null;
+  if (r.taskKey) {
+    taskId = await resolveProjectTaskKey(pid, r.taskKey);
+    if (!taskId) toast(`Task #${r.taskKey} not found`, true);
+  }
+  if (taskId) { if (S.selected !== taskId) await openDrawer(taskId); else highlightRow(); }
+  else closeDrawerDom();
+}
+
+// Push a task permalink (/projects/:name/tasks/:num) and remember where to return
+// on close (so closing lands back on the list/queue we opened from).
+function goToTask(id) {
+  const rec = (S.tasks || []).find((t) => t.id === id);
+  const p = projectById(rec?.projectId || S.projectId);
+  const keyPart = rec && rec.num != null ? String(rec.num) : id;
+  S.returnRoute = location.pathname;
+  return go(p ? `/projects/${projectSlug(p)}/tasks/${keyPart}` : location.pathname);
+}
+
+// A short human label for a task id: `#num` when known, else a short id.
+function numLabel(taskId) {
+  const t = (S.tasks || []).find((x) => x.id === taskId);
+  return t && t.num != null ? `#${t.num}` : String(taskId || '').slice(0, 8);
+}
 
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
@@ -108,13 +240,20 @@ const fieldLabel = (f) =>
   `<div class="label-row"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${f.required ? '' : resetBtn(f.name)}</div>` +
   (f.help ? `<div style="font-size:11px;color:var(--ink-3);margin:-2px 0 4px">${esc(f.help)}</div>` : '');
 
-function renderField(f, own, inherited) {
+function renderField(f, own, inherited, withChips) {
   const v = eff(own, inherited) ?? '';
   const label = fieldLabel(f);
   const attrs = `data-field="${esc(f.name)}" data-ftype="${f.type}" ${inhAttr(inherited)}`;
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
-  if (f.type === 'text')
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea></div>`;
+  if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited)}</div>`;
+  if (f.type === 'text') {
+    const ta = `<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea>`;
+    // For the prompt field, pasted images render inside the box (below the text),
+    // growing it as needed — rather than in a separate "Images" section.
+    if (withChips)
+      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div></div></div>`;
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
+  }
   if (f.type === 'boolean')
     return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${resetBtn(f.name)}</div></div>`;
   if (f.type === 'select')
@@ -152,6 +291,21 @@ function renderAgentField(f, spec, inherited) {
   </div>`;
 }
 
+// The confirmer field: a mode selector (human / auto / agent) plus the SAME agent
+// sub-form as Do/Merge/Resolve, shown only when the mode is "agent". Reuses
+// renderAgentField for the agent controls (so provider/model/effort + "Fork a
+// previous agent" all work identically), and carries the mode alongside.
+const CONFIRM_MODE_LABELS = { human: 'Human (you confirm)', auto: 'Auto-confirm', agent: 'Agent confirms' };
+function renderConfirmerField(f, own, inherited) {
+  const inh = inherited || {};
+  const e = own || inh;
+  const mode = e.mode || inh.mode || 'human';
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'>
+    <select class="cf-mode">${['human', 'auto', 'agent'].map((m) => `<option value="${m}" ${m === mode ? 'selected' : ''}>${esc(CONFIRM_MODE_LABELS[m])}</option>`).join('')}</select>
+    <div class="cf-agent" style="margin-top:8px;${mode === 'agent' ? '' : 'display:none'}">${renderAgentField(f, own, inherited)}</div>
+  </div>`;
+}
+
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
 
@@ -176,6 +330,33 @@ function collectForm(root, fields) {
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       // include only if the agent differs from inherited OR a resume was chosen
       if (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))) out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'confirmer') {
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+      const mode = box.querySelector('.cf-mode').value;
+      const spec = { mode };
+      let resumeFrom;
+      if (mode === 'agent') {
+        const ab = box.querySelector('.agent-field');
+        spec.provider = ab.querySelector('.af-provider').value;
+        const model = ab.querySelector('.af-model').value.trim();
+        const effort = ab.querySelector('.af-effort').value;
+        if (model) spec.model = model;
+        if (effort) spec.effort = effort;
+        const sessionId = ab.querySelector('.af-resume-session').value.trim();
+        const chosen = ab.querySelector('.af-resume-chosen').textContent.trim();
+        if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
+        if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+        if (resumeFrom) spec.resumeFrom = resumeFrom;
+      }
+      // Store only when it differs from the inherited default: a different mode, or (in
+      // agent mode) a different agent config or a chosen fork.
+      const inhMode = inh?.mode || 'human';
+      const changed = mode !== inhMode || (mode === 'agent' && (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))));
+      if (f.required || changed) out[f.name] = spec;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -245,6 +426,14 @@ function wireAgentFields(root) {
     const results = box.querySelector('.af-resume-results');
     search?.addEventListener('input', () => resumeSearch(box, search.value, results));
   });
+  // Confirmer fields: show the agent sub-form only when mode is "agent".
+  root.querySelectorAll('.confirmer-field').forEach((box) => {
+    const mode = box.querySelector('.cf-mode');
+    const agentBox = box.querySelector('.cf-agent');
+    mode?.addEventListener('change', () => {
+      if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
+    });
+  });
 }
 
 // Wire per-field "Reset to default" buttons: show the button whenever the field
@@ -262,6 +451,12 @@ function wireFieldResets(root, fields) {
       box.addEventListener('input', sync);
       box.addEventListener('change', sync);
       btn.addEventListener('click', () => { resetAgentField(box); sync(); });
+    } else if (f.type === 'confirmer') {
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      box.addEventListener('input', sync);
+      box.addEventListener('change', sync);
+      btn.addEventListener('click', () => { resetConfirmerField(box); sync(); });
     } else {
       const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
       if (!el) continue;
@@ -282,6 +477,21 @@ function fieldOverridden(root, f) {
     const spec = { provider: box.querySelector('.af-provider').value };
     const model = box.querySelector('.af-model').value.trim();
     const effort = box.querySelector('.af-effort').value;
+    if (model) spec.model = model;
+    if (effort) spec.effort = effort;
+    return !sameJson(normSpec(spec), normSpec(inh));
+  }
+  if (f.type === 'confirmer') {
+    const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+    if (!box) return false;
+    const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
+    const mode = box.querySelector('.cf-mode').value;
+    if (mode !== (inh?.mode || 'human')) return true;
+    if (mode !== 'agent') return false;
+    const ab = box.querySelector('.agent-field');
+    const spec = { provider: ab.querySelector('.af-provider').value };
+    const model = ab.querySelector('.af-model').value.trim();
+    const effort = ab.querySelector('.af-effort').value;
     if (model) spec.model = model;
     if (effort) spec.effort = effort;
     return !sameJson(normSpec(spec), normSpec(inh));
@@ -317,19 +527,47 @@ function resetAgentField(box) {
   if (eff && inh.effort) eff.value = inh.effort;
 }
 
+function resetConfirmerField(box) {
+  const inh = JSON.parse(box.getAttribute('data-inherit') || 'null') || {};
+  const mode = box.querySelector('.cf-mode');
+  mode.value = inh.mode || 'human';
+  const agentBox = box.querySelector('.cf-agent');
+  if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
+  const ab = box.querySelector('.agent-field');
+  if (ab) resetAgentField(ab);
+}
+
+// Full task list (incl. archived) for the fork picker, cached per project.
+// Archived tasks are the completed ones you most often want to fork from, so the
+// fork search must see them regardless of the "Show archived" toggle. Cached to
+// avoid re-fetching (and re-enriching) the whole list on every keystroke;
+// loadTasks() clears the cache so newly created/updated tasks show up.
+async function forkTaskPool() {
+  if (!S.projectId) return S.tasks;
+  if (S.forkPool?.projectId === S.projectId) return S.forkPool.tasks;
+  const tasks = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
+  S.forkPool = { projectId: S.projectId, tasks };
+  return tasks;
+}
+
 // Fork search: find tasks by title, then list their per-role agent sessions.
 async function resumeSearch(box, q, results) {
   const ql = q.toLowerCase().trim();
   if (!ql) { results.innerHTML = ''; return; }
-  const matches = S.tasks.filter((t) => !t.params?.draft && t.title.toLowerCase().includes(ql)).slice(0, 6);
+  // The pool includes archived tasks (the ones most often forked from); match by
+  // title OR by their `#num` (SPEC §10.6).
+  let pool = S.tasks;
+  try { pool = await forkTaskPool(); } catch {}
+  const matches = pool.filter((t) => !t.params?.draft && taskMatches(t, ql)).slice(0, 6);
   const rows = await Promise.all(
     matches.map(async (t) => {
       let sessions = {};
       try { sessions = await api(`/api/tasks/${t.id}/sessions`); } catch {}
       const roles = Object.keys(sessions);
       if (!roles.length) return '';
+      const numTag = t.num != null ? `<span class="task-num">#${t.num}</span> ` : '';
       return roles
-        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
+        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${numTag}${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
         .join('');
     }),
   );
@@ -359,6 +597,90 @@ async function api(path, opts = {}) {
   const body = ct.includes('json') ? await res.json() : await res.text();
   if (!res.ok) throw new Error(body?.error || `HTTP ${res.status}`);
   return body;
+}
+
+// ─── Image attachments (paste / drag-drop an image into a prompt field) ───────
+// Bytes are uploaded to the content-addressed store immediately, so the task /
+// follow-up payloads carry only the returned lightweight { id, mediaType, bytes }
+// reference. Thumbnails are served back via /api/attachments/:id?token=… (an
+// <img> can't send a Bearer header, so the session token rides in the query).
+async function uploadImage(file) {
+  const res = await fetch('/api/attachments', {
+    method: 'POST',
+    headers: { 'content-type': file.type || 'application/octet-stream', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
+    body: file,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
+  return body; // ImageRef
+}
+
+function attachmentUrl(id) {
+  return `/api/attachments/${encodeURIComponent(id)}?token=${encodeURIComponent(S.token || '')}`;
+}
+
+function renderImageChips(container, store, onChange) {
+  if (!container) return;
+  container.innerHTML = (store || [])
+    .map(
+      (ref, i) =>
+        `<span class="img-chip" title="${esc(ref.mediaType)} · ${Math.round((ref.bytes || 0) / 1024)} KB"><img src="${attachmentUrl(ref.id)}" alt="attachment"/><button class="img-chip-x" data-i="${i}" title="Remove">✕</button></span>`,
+    )
+    .join('');
+  container.style.display = (store || []).length ? 'flex' : 'none';
+  container.querySelectorAll('.img-chip-x').forEach((b) =>
+    b.addEventListener('click', () => {
+      store.splice(Number(b.dataset.i), 1);
+      renderImageChips(container, store, onChange);
+      if (onChange) onChange();
+    }),
+  );
+}
+
+// Wire paste + drag-drop image capture onto a text input. `getStore` returns the
+// live ImageRef array; `onChange` re-renders the chips. Idempotent per element.
+function wireImagePaste(inputEl, getStore, onChange) {
+  if (!inputEl || inputEl._imgWired) return;
+  inputEl._imgWired = true;
+  const ingest = async (files) => {
+    const imgs = [...files].filter((f) => f && f.type && f.type.startsWith('image/'));
+    if (!imgs.length) return false;
+    for (const file of imgs) {
+      try {
+        const ref = await uploadImage(file);
+        getStore().push(ref);
+        onChange();
+      } catch (e) {
+        toast(e.message, true);
+      }
+    }
+    return true;
+  };
+  inputEl.addEventListener('paste', (e) => {
+    const items = [...(e.clipboardData?.items || [])];
+    const files = items.filter((i) => i.kind === 'file' && i.type.startsWith('image/')).map((i) => i.getAsFile());
+    if (!files.length) return; // let normal text paste through
+    e.preventDefault();
+    ingest(files);
+  });
+  inputEl.addEventListener('dragover', (e) => {
+    if ([...(e.dataTransfer?.items || [])].some((i) => i.type && i.type.startsWith('image/'))) e.preventDefault();
+  });
+  inputEl.addEventListener('drop', (e) => {
+    const files = [...(e.dataTransfer?.files || [])];
+    if (files.some((f) => f.type && f.type.startsWith('image/'))) {
+      e.preventDefault();
+      ingest(files);
+    }
+  });
+}
+
+// Render read-only image thumbnails for a message that carried attachments.
+function renderMessageImages(images) {
+  if (!images || !images.length) return '';
+  return `<div class="msg-images">${images
+    .map((ref) => `<a href="${attachmentUrl(ref.id)}" target="_blank" rel="noopener"><img src="${attachmentUrl(ref.id)}" alt="attachment"/></a>`)
+    .join('')}</div>`;
 }
 
 function toast(msg, err = false, action) {
@@ -395,6 +717,8 @@ async function boot() {
   connectWs();
   renderShell();
   bindKeys();
+  window.addEventListener('popstate', () => applyRoute());
+  await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
 
 async function loadProjects() {
@@ -404,7 +728,107 @@ async function loadProjects() {
 
 async function loadTasks() {
   if (!S.projectId) return;
-  S.tasks = await api(`/api/projects/${S.projectId}/tasks${S.showArchived ? '?includeArchived=1' : ''}`);
+  S.forkPool = null; // let the fork picker re-fetch its archived-inclusive pool
+  // Always fetch the full set incl. archived; the task list decides visibility via the
+  // query (default -is:archived). S.tasks is the shared pool for the drawer, counts, etc.
+  const fetched = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
+  // Drop any draft we just deleted: a list request issued before the DELETE landed
+  // can still return it and clobber the optimistic removal. Once a fresh fetch no
+  // longer contains a tombstoned id, the server has caught up — retire it so the
+  // set can't grow without bound (task ids are never reused).
+  for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
+  S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
+}
+
+// ── task organization: tags, saved views, query search ──────────────────────
+// A view IS a saved query: `S.search` holds the working query string (Linear-style
+// tokens + free text), which the server evaluates via /search into `S.searchResult`.
+// The field registry (`S.fields`) drives the filter/sort/group menus.
+async function loadOrg() {
+  if (!S.projectId) return;
+  const pid = S.projectId;
+  const [tags, views, fields] = await Promise.all([
+    api(`/api/projects/${pid}/tags`).catch(() => []),
+    api(`/api/projects/${pid}/views`).catch(() => []),
+    S.fields.length ? Promise.resolve(S.fields) : api(`/api/search/fields`).catch(() => []),
+  ]);
+  S.tags = tags || [];
+  S.views = views || [];
+  S.fields = fields || [];
+  S.orgProjectId = pid;
+}
+
+// The map id→tag for quick lookups + hierarchy path rendering.
+function tagById(id) { return S.tags.find((t) => t.id === id); }
+function tagPathStr(id) {
+  const parts = [];
+  const seen = new Set();
+  let cur = tagById(id);
+  while (cur && !seen.has(cur.id)) { seen.add(cur.id); parts.unshift(cur.name); cur = cur.parentId ? tagById(cur.parentId) : null; }
+  return parts.join('/');
+}
+const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
+
+// Evaluate the working query on the server and stash the result. The default list
+// (empty query) is just an evaluation too. We overlay each result's freshest live
+// `lastView` from S.tasks so status chips reflect the latest transition.
+async function runSearch() {
+  if (!S.projectId) return;
+  const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
+  try {
+    const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(q)}`);
+    const live = new Map(S.tasks.map((t) => [t.id, t]));
+    const overlay = (t) => ({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
+    r.tasks = (r.tasks || []).map(overlay);
+    if (r.groups) r.groups = r.groups.map((g) => ({ ...g, tasks: (g.tasks || []).map(overlay) }));
+    S.searchResult = r;
+  } catch { S.searchResult = null; }
+}
+
+let searchDebounce = null;
+function scheduleSearch() {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(async () => { await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
+}
+
+// Programmatically set the working query (view selection, filter/sort/group menus).
+// Updates the topbar box (which renderMain doesn't own), re-evaluates, re-renders.
+async function setQuery(q) {
+  S.search = q || '';
+  const box = $('#task-search');
+  if (box) box.value = S.search;
+  await runSearch();
+  if (S.tab === 'tasks') renderMain();
+}
+
+// Replace a directive token (group:/sort:) in the query string, or remove it when
+// `value` is empty. Keeps everything else intact so it composes with typed tokens.
+function setDirective(q, key, value) {
+  const re = new RegExp(`(?:^|\\s)${key}:\\S+`, 'g');
+  let out = (q || '').replace(re, '').replace(/\s+/g, ' ').trim();
+  if (value) out = (out + ` ${key}:${value}`).trim();
+  return out;
+}
+// Append a filter clause `field:value` (value may already carry an op prefix).
+function addClause(q, field, value) {
+  const tok = value.includes(' ') ? `${field}:"${value}"` : `${field}:${value}`;
+  return ((q || '') + ' ' + tok).trim();
+}
+
+// Browser-side query stringifier — mirrors src/domain/query-language.ts so a saved
+// view's structured query round-trips into the one search box.
+function stringifyQuery(q) {
+  const parts = [];
+  for (const c of q.filters || []) {
+    const prefix = c.negate ? '-' : '';
+    const op = c.op === 'gt' ? '>' : c.op === 'gte' ? '>=' : c.op === 'lt' ? '<' : c.op === 'lte' ? '<=' : '';
+    const vals = (c.values || []).map((v) => (String(v).includes(' ') ? `"${v}"` : v)).join(',');
+    parts.push(`${prefix}${c.field}:${op}${vals}`);
+  }
+  for (const s of q.sort || []) parts.push(`sort:${s.field}-${s.dir}`);
+  if (q.group) parts.push(`group:${q.group}`);
+  if (q.text) parts.push(String(q.text).includes(' ') ? `"${q.text}"` : q.text);
+  return parts.join(' ');
 }
 
 // ── websocket live stream ──────────────────────────────────────────────────
@@ -439,7 +863,13 @@ function connectWs() {
 }
 
 async function refreshTasks() {
-  try { await loadTasks(); if (S.tab === 'tasks' || S.tab === 'queue') renderMain(); renderRail(); } catch {}
+  try {
+    await loadTasks();
+    if (S.tab === 'tasks') await runSearch();
+    if (S.tab === 'tasks' || S.tab === 'queue') renderMain();
+    renderRail();
+    if (S.tab === 'queue') seedQueue();
+  } catch {}
 }
 
 // ── shell ────────────────────────────────────────────────────────────────────
@@ -448,8 +878,8 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <div class="brand"><span class="mark">◇</span> karmax</div>
-      <div class="search"><span>⌕</span><input id="search" placeholder="Search tasks…  ( / )" /></div>
       <div class="spacer"></div>
+      <button class="icon-btn" id="topbar-palette" title="Search everything ( ${esc(fmtKeys('meta+k'))} )">⌕</button>
       <button class="icon-btn has-badge" id="bell" title="Needs attention">🔔<span class="badge hidden" id="bell-badge">0</span></button>
       <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
     </div>
@@ -457,12 +887,13 @@ function renderShell() {
       <div class="rail" id="rail"></div>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>`;
-  $('#search').addEventListener('input', (e) => { S.search = e.target.value; if (S.tab === 'tasks') renderMain(); });
+  // Task search now lives at the top of the task list (see tasksView); the topbar
+  // glass icon opens the global command palette (commands, tasks, projects).
+  $('#topbar-palette').addEventListener('click', openPalette);
   $('#theme').addEventListener('click', toggleTheme);
   $('#bell').addEventListener('click', toggleNotifications);
-  renderRail();
-  renderMain();
-  refreshTasks();
+  // The rail/main are painted by applyRoute() (boot calls it right after), so the
+  // shell reflects the initial URL instead of a default view.
 }
 
 function renderRail() {
@@ -472,29 +903,30 @@ function renderRail() {
     <div class="label">Projects</div>
     ${S.projects
       .map(
-        (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}">
+        (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" tabindex="0">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
         </div>`,
       )
       .join('')}
-    <div class="proj add" id="new-project"><span>+</span> <span>New project</span></div>
+    <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
     <div class="label">Global</div>
-    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard">▦ Dashboard</div>
-    <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global">⚙ Global settings</div>`;
+    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
+    <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
+    <div class="nav-item" id="rail-palette" tabindex="0" title="Every command, task, and project — searchable">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
   rail.querySelectorAll('.proj[data-id]').forEach((e) =>
-    e.addEventListener('click', () => { S.projectId = e.dataset.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); }),
+    e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
+  $('#rail-palette')?.addEventListener('click', openPalette);
 }
 
 function switchTab(tab) {
-  S.tab = tab;
-  renderRail();
-  renderMain();
-  if (tab === 'activity') seedActivity();
-  if (tab === 'dashboard') renderDashboard();
+  if (tab === 'dashboard') return go('/dashboard');
+  if (tab === 'global') return go('/settings');
+  const pid = S.projectId || S.projects[0]?.id;
+  return go(pid ? projectRoute(pid, tab) : '/dashboard');
 }
 
 // Preserve the focused field (value + caret) across a renderMain() innerHTML
@@ -503,6 +935,9 @@ function captureFocus(root) {
   const el = document.activeElement;
   if (!el || !el.id || !root.contains(el)) return null;
   const tag = el.tagName;
+  // The terminal screen is a focusable <pre> the user types straight into —
+  // keep it focused across re-renders so keystrokes keep reaching the shell.
+  if (tag === 'PRE' && el.classList.contains('term-screen')) return { id: el.id, tag };
   if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return null;
   const st = { id: el.id, tag, value: el.value };
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
@@ -516,6 +951,7 @@ function restoreFocus(root, st) {
   if (!st) return;
   const el = root.querySelector(`#${window.CSS && CSS.escape ? CSS.escape(st.id) : st.id}`);
   if (!el || el.tagName !== st.tag) return;
+  if (st.tag === 'PRE') { el.focus(); return; } // terminal screen: just re-focus (no value to restore)
   // Only carry over the in-progress value for free-text fields; a fresh empty
   // composer input would otherwise be reset by the re-render.
   if (st.tag !== 'SELECT') el.value = st.value;
@@ -565,32 +1001,180 @@ function renderMain() {
 }
 
 // ── tasks ────────────────────────────────────────────────────────────────────
+// Client-side twin of the authoritative `matchText` in src/domain/search.ts — used as
+// the pre-server fallback AND by the fork-from picker (resumeSearch). Keep the two in
+// sync: token-AND over title / notes / #num, so "login fix" matches "fix login".
+function taskMatches(t, q) {
+  const s = (q || '').toLowerCase().trim();
+  if (!s) return true;
+  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
+  return s.split(/\s+/).every((term) => !term || hay.includes(term));
+}
+
+// "Show archived" is not a separate toggle — it's just the `is:archived` facet in the
+// query. The default search hides archived tasks by transparently appending `-is:archived`
+// (Linear/Jira behaviour); the moment the user's query mentions archived-ness (adds
+// `is:archived`, `-is:archived`, or groups by it), we leave it alone. The clean `S.search`
+// stays in the box; only the evaluated query carries the default.
+function queryMentionsArchived(q) { return /(^|\s)-?(is|has):[^\s]*archived/i.test(q || ''); }
+function effectiveQuery(q) {
+  const s = (q || '').trim();
+  if (queryMentionsArchived(s)) return s;
+  return s ? `${s} -is:archived` : '-is:archived';
+}
+
+// The saved-views switcher — every chip is a query. "All" is the built-in default;
+// each saved view carries a ✕ to delete it (confirmed in wireOrgControls).
+function viewsBar() {
+  const saved = S.views
+    .map(
+      (v) => `<div class="view-chip ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
+    )
+    .join('');
+  return `<div class="views-bar">
+    <div class="view-chip ${!S.activeView ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
+    ${saved}
+    <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
+  </div>`;
+}
+
+// Workflow params are searchable/organizable too, via synthetic fields the server
+// resolves on demand (src/domain/search.ts — keep this list of skipped types in step
+// with what fieldByKey understands). Scalar params become `param.<name>`; agent/confirmer
+// params expand into three model sub-fields each — `agent_<role>.agent` (provider),
+// `.model`, `.effort` — so you can filter/group/sort by the model an agent ran on.
+const PARAM_SCALAR_SKIP = new Set(['agent', 'confirmer', 'prompt', 'list']);
+const PARAM_NAME_SKIP = new Set(['repos', 'prompt']);
+const AGENT_SUBFIELDS = [
+  { sub: 'agent', label: 'agent' },
+  { sub: 'model', label: 'model' },
+  { sub: 'effort', label: 'effort' },
+];
+function paramMenuFields() {
+  const seen = new Map();
+  for (const s of S.schema || []) {
+    for (const p of s.params || []) {
+      if (PARAM_NAME_SKIP.has(p.name)) continue;
+      if (p.type === 'agent' || p.type === 'confirmer') {
+        for (const { sub, label } of AGENT_SUBFIELDS) {
+          const key = `agent_${p.name}.${sub}`;
+          if (!seen.has(key)) seen.set(key, { key, label: `${p.label || p.name} · ${label}`, type: 'text', param: true });
+        }
+        continue;
+      }
+      if (PARAM_SCALAR_SKIP.has(p.type) || seen.has(p.name)) continue;
+      seen.set(p.name, {
+        key: 'param.' + p.name,
+        label: p.label || p.name,
+        type: 'text',
+        param: true,
+        options: p.type === 'select' && p.options ? p.options.map((o) => ({ value: o, label: o })) : undefined,
+      });
+    }
+  }
+  return [...seen.values()];
+}
+// The base registry + the project's param fields — what all the menus draw from.
+function allMenuFields() { return [...(S.fields || []), ...paramMenuFields()]; }
+function menuFieldByKey(key) { return allMenuFields().find((f) => f.key === key); }
+
+// The query toolbar: the field-driven quick filters + group + sort selectors. It
+// reads the searchable-field registry (+ workflow params) so it never drifts from the parser.
+function queryToolbar() {
+  const q = S.search || '';
+  const fields = allMenuFields();
+  const params = paramMenuFields();
+  // Filter menu: everything with discrete-ish values (skip free-text title/notes),
+  // but always include param fields even though they're text-typed.
+  const filterFields = fields.filter((f) => f.type !== 'text' && !f.param);
+  const grpFields = fields.filter((f) => f.groupable || f.param);
+  const sortFields = fields.filter((f) => f.sortable || f.param);
+  const curGroup = (q.match(/(?:^|\s)group:(\S+)/) || [])[1] || '';
+  const curSort = (q.match(/(?:^|\s)sort:(\S+)/) || [])[1] || '';
+  const opt = (v, label, sel) => `<option value="${esc(v)}" ${sel ? 'selected' : ''}>${esc(label)}</option>`;
+  const grp = (label, inner) => (inner ? `<optgroup label="${esc(label)}">${inner}</optgroup>` : '');
+  return `<div class="query-bar">
+    <select id="q-filter-field" class="q-sel" title="Add a filter"><option value="">＋ Filter…</option>
+      ${filterFields.map((f) => opt(f.key, f.label)).join('')}
+      ${grp('Workflow params', params.map((f) => opt(f.key, f.label)).join(''))}</select>
+    <select id="q-group" class="q-sel" title="Group by">
+      ${opt('', 'No grouping', !curGroup)}${grpFields.filter((f) => !f.param).map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join('')}
+      ${grp('Workflow params', params.map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join(''))}</select>
+    <select id="q-sort" class="q-sel" title="Sort by">
+      ${opt('', 'Sort: default', !curSort)}${sortFields.filter((f) => !f.param).map((f) => opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc') + opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc')).join('')}
+      ${grp('Workflow params', params.map((f) => opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc') + opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc')).join(''))}</select>
+    <div class="q-spacer"></div>
+    <button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>
+  </div>`;
+}
+
 function tasksView() {
+  const r = S.searchResult;
   // Runs (spawned from a repeatable series) are grouped under their series row,
-  // not shown at the top level. Build the lookup once for taskRow/seriesRow.
+  // not shown at the top level. Build the lookup once for taskRow/seriesRow, and
+  // hide runs from every list surface (flat + grouped) below.
   S._runsBySeries = {};
   for (const t of S.tasks) if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
-  const filtered = S.tasks.filter(
-    (t) => !t.params?.runOf && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())),
-  );
-  const rows = filtered
-    .slice()
-    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-    .map(taskRow)
-    .join('');
-  const archivedCount = S.tasks.filter((t) => t.params?.archived).length;
+  const notRun = (t) => !t.params?.runOf;
+  // The server already applied the query (incl. the default -is:archived from effectiveQuery).
+  // Fallback (before the first result lands) filters client-side and drops archived to match.
+  const flat = (r
+    ? r.tasks
+    : S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+  ).filter(notRun);
+  const groups = r && r.groups ? r.groups : null;
+  const count = flat.length;
+  const archivedShown = queryMentionsArchived(S.search);
+  let body;
+  if (groups) {
+    body = groups
+      .map((g) => {
+        const gt = g.tasks.filter(notRun);
+        return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
+      })
+      .join('');
+  } else {
+    body = flat.map(taskRow).join('');
+  }
+  const empty = S.search
+    ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
+    : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
     <div class="composer">
-      <input class="title-in" id="new-task" placeholder="Describe a task and press Enter…  ( n )" />
+      <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
-      <button class="btn" id="expand-task" title="Full task form">⋯ More</button>
-      <button class="btn primary" id="add-task">Add</button>
+      <button class="btn" id="expand-task" title="Full task form ( N or ↵ )">⋯ More</button>
+      <button class="btn primary" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )">Add</button>
     </div>
-    <div class="switch" style="justify-content:flex-end;margin:4px 0">
-      <input type="checkbox" id="show-archived" ${S.showArchived ? 'checked' : ''} />
-      <label for="show-archived" style="font-size:12px;color:var(--ink-3)">Show archived${S.showArchived && archivedCount ? ` (${archivedCount})` : ''}</label>
+    <div class="img-chips" id="new-task-chips" style="display:none"></div>
+    <div class="organizer">
+      <div class="search-box">
+        <span class="search-ic">⌕</span>
+        <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
+          placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
+        ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
+      </div>
+      ${viewsBar()}
+      ${queryToolbar()}
     </div>
-    ${rows || `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`}`;
+    <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
+      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
+      <span style="font-size:12px;color:var(--ink-3)">${archivedShown ? '<a href="#" id="arch-toggle">← back to active</a>' : '<a href="#" id="arch-toggle">show archived</a>'}</span>
+    </div>
+    ${body || empty}`;
+}
+
+// Small colored tag chip + priority flag shown on a task row.
+function tagChips(t) {
+  if (!t.tags || !t.tags.length) return '';
+  return t.tags
+    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<span class="tag-chip ${tag.kind || ''}"${c}>${esc(tagPathStr(id))}</span>`; })
+    .join('');
+}
+function priorityFlag(t) {
+  const p = Number(t.params?.priority || 0);
+  if (!p) return '';
+  return `<span class="prio p${p}" title="Priority: ${PRIORITY_NAMES[p]}">${'▲'}${p >= 3 ? '' : ''} ${PRIORITY_NAMES[p]}</span>`;
 }
 
 // A one-line human summary of a task's triggers (armed-row subtitle).
@@ -670,11 +1254,11 @@ function taskRow(t) {
   }
   if (isDraft) {
     return `
-    <div class="task-row" data-draft="${t.id}">
+    <div class="task-row" data-draft="${t.id}" tabindex="0">
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span></div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${tagChips(t)}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Queue</button>
@@ -694,18 +1278,39 @@ function taskRow(t) {
       ? `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`
       : '';
   return `
-    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}">
+    <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
           <span class="wf">${esc(t.workflow)}</span>
-          ${v.branch ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          <span class="chip ${status}">${esc(stage)}</span>
+          ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
+          <span class="chip ${status}">${esc(stageLabel(v))}</span>
+          ${priorityFlag(t)}${tagChips(t)}
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
     </div>`;
+}
+
+// Every task gets an isolated worktree on an auto-generated `karmax/<taskId>`
+// branch — the taskId is a noisy random slug, so echoing it in the byline just
+// clutters the list/drawer (it's still reachable via the drawer's terminal +
+// fork commands, which carry the world path). Only surface the branch when it's
+// a *custom* one the human would recognize — e.g. an existing branch checked out
+// by a merge-only workflow.
+function customBranch(v, taskId) {
+  return v.branch && v.branch !== `karmax/${taskId}`;
+}
+
+// Human-facing stage label. In the `merge` stage a task is either waiting for
+// its merge-queue slot or actively merging — the merge agent only runs once the
+// slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
+// "merge queued" for the wait, which the raw `stage` alone hides.
+function stageLabel(v) {
+  const stage = v.stage || 'setup';
+  if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
+  return stage;
 }
 
 // The workflow's declared stages (SPEC §5), or the software-dev default.
@@ -761,8 +1366,200 @@ function pipelineLarge(v) {
   }).join('')}</div>`;
 }
 
+// ── task-organization control wiring (views bar + query toolbar + modals) ─────
+function wireOrgControls() {
+  const main = $('#main');
+  // Saved-view chips: each selects a query; "All" is the default (empty) view.
+  main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
+    el.addEventListener('click', (ev) => {
+      if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
+      const id = el.dataset.view;
+      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      const v = S.views.find((x) => x.id === id);
+      if (!v) return;
+      S.activeView = id;
+      setQuery(stringifyQuery(v.query || {}));
+    }),
+  );
+  // Delete a saved view (with confirmation) — the API/gateway already support it.
+  main.querySelectorAll('[data-delview]').forEach((x) =>
+    x.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const id = x.dataset.delview;
+      const v = S.views.find((y) => y.id === id);
+      if (!confirm(`Delete the view “${v?.name || 'this view'}”? This can't be undone.`)) return;
+      try {
+        await api(`/api/views/${id}`, { method: 'DELETE' });
+        S.views = S.views.filter((y) => y.id !== id);
+        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
+        toast('View deleted');
+      } catch (e) { toast(e.message, true); }
+    }),
+  );
+  $('#save-view')?.addEventListener('click', saveCurrentView);
+  $('#manage-tags')?.addEventListener('click', openTagsManager);
+  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
+  // Show-archived is just the `is:archived` facet — toggle it on/off the current query.
+  $('#arch-toggle')?.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    S.activeView = null;
+    const q = (S.search || '').replace(/(^|\s)-?(is|has):archived\b/gi, ' ').replace(/\s+/g, ' ').trim();
+    setQuery(queryMentionsArchived(S.search) ? q : `${q} is:archived`.trim());
+  });
+
+  // The in-list search box drives the working query. Debounced re-evaluation keeps
+  // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
+  const search = $('#task-search');
+  if (search) {
+    search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
+  }
+
+  $('#q-group')?.addEventListener('change', (e) => { S.activeView = null; setQuery(setDirective(S.search, 'group', e.target.value)); });
+  $('#q-sort')?.addEventListener('change', (e) => { S.activeView = null; setQuery(setDirective(S.search, 'sort', e.target.value)); });
+  $('#q-filter-field')?.addEventListener('change', (e) => {
+    const key = e.target.value;
+    e.target.value = '';
+    if (key) openFilterPicker(key);
+  });
+}
+
+// Persist the current working query as a named view (Save-view button).
+async function saveCurrentView() {
+  const name = prompt('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
+  if (!name) return;
+  try {
+    // The API persists a structured TaskQuery, so parse the working string into one
+    // (parseQueryClient mirrors the server grammar; it round-trips back through it).
+    const v = await api(`/api/projects/${S.projectId}/views`, {
+      method: 'POST',
+      body: JSON.stringify({ name, query: parseQueryClient(S.search) }),
+    });
+    S.views.push(v);
+    S.activeView = v.id;
+    renderMain();
+    toast(`Saved view “${name}”`);
+  } catch (err) { toast(err.message, true); }
+}
+
+// A minimal browser-side parser sufficient to persist a saved view's structured
+// query (the authoritative parser is server-side; this mirrors its token grammar so
+// what we store round-trips through it). Unknown tokens fold into free text.
+function parseQueryClient(input) {
+  const q = { filters: [], sort: [] };
+  const text = [];
+  const re = /"([^"]*)"|(\S+)/g; let m;
+  const OPS = [['>=', 'gte'], ['<=', 'lte'], ['>', 'gt'], ['<', 'lt'], ['=', 'is']];
+  while ((m = re.exec(input))) {
+    const quoted = m[1] !== undefined;
+    const tok = quoted ? m[1] : m[2];
+    const colon = quoted ? -1 : tok.indexOf(':');
+    if (colon < 0) { if (tok) text.push(tok); continue; }
+    let key = tok.slice(0, colon); let rest = tok.slice(colon + 1); let negate = false;
+    if (key[0] === '-' || key[0] === '!') { negate = true; key = key.slice(1); }
+    if (key === 'sort') { let dir = 'asc'; let k = rest; if (k[0] === '-') { dir = 'desc'; k = k.slice(1); } const dm = k.match(/^(.*)[-:](asc|desc)$/i); if (dm) { k = dm[1]; dir = dm[2].toLowerCase(); } q.sort.push({ field: k, dir }); continue; }
+    if (key === 'group') { q.group = rest; continue; }
+    // `param.<key>` / `p.<key>` are synthetic workflow-param fields (text-typed).
+    // `param.<key>` / `p.<key>` and `agent_<role>.<sub>` are synthetic (text) fields.
+    const isParam = /^(param|p)\.[^.\s]+$/i.test(key) || /^agent_[a-z0-9]+\.(agent|model|effort)$/i.test(key);
+    const fld = isParam ? { key, type: 'text' } : S.fields.find((f) => f.key === key || (f.aliases || []).includes(key));
+    if (!fld) { text.push(tok); continue; }
+    let op = fld.type === 'text' ? 'contains' : 'is';
+    for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
+    const values = rest.split(',').map((s) => s.trim()).filter(Boolean);
+    if (values.length) q.filters.push(negate ? { field: fld.key, op, values, negate: true } : { field: fld.key, op, values });
+  }
+  if (!q.filters.length) delete q.filters;
+  if (!q.sort.length) delete q.sort;
+  const t = text.join(' ').trim(); if (t) q.text = t;
+  return q;
+}
+
+// A value picker for the chosen filter field — options for enum/facet/tag, a typed
+// value (with comparison ops) for number/date/text.
+function openFilterPicker(fieldKey) {
+  const field = menuFieldByKey(fieldKey);
+  if (!field) return;
+  const root = $('#modal-root');
+  const apply = (value, negate) => { root.innerHTML = ''; if (value === '' || value == null) return; S.activeView = null; setQuery(addClause(S.search, (negate ? '-' : '') + field.key, value)); };
+
+  let inner = '';
+  if (field.type === 'tag') {
+    // Show the hierarchy as indented paths; picking one adds tag:<path>.
+    const rows = S.tags.length
+      ? S.tags.map((t) => `<div class="opt" data-val="${esc(tagPathStr(t.id))}">${esc(tagPathStr(t.id))}${t.kind ? ` <span class="pal-sub">${esc(t.kind)}</span>` : ''}</div>`).join('')
+      : `<div class="pal-empty">No tags yet — add some via 🏷 Tags.</div>`;
+    inner = rows;
+  } else if (field.options) {
+    inner = field.options.map((o) => `<div class="opt" data-val="${esc(o.value)}">${esc(o.label)}</div>`).join('');
+  } else {
+    const ops = field.type === 'number' || field.type === 'date'
+      ? `<select id="fp-op" class="q-sel"><option value="">is</option><option value=">=">≥</option><option value="<=">≤</option><option value=">">&gt;</option><option value="<">&lt;</option></select>`
+      : '';
+    const ph = field.type === 'date' ? 'e.g. 7d, today, 2026-01-01' : 'value';
+    inner = `<div class="fp-row">${ops}<input id="fp-val" class="title-in" placeholder="${ph}" /></div><button class="btn primary" id="fp-add">Add filter</button>`;
+  }
+  root.innerHTML = `<div class="palette-scrim" id="fp-scrim"><div class="palette fp">
+    <div class="fp-head">Filter by ${esc(field.label)} <label class="fp-neg"><input type="checkbox" id="fp-negate" /> exclude</label></div>
+    <div id="fp-list">${inner}</div>
+  </div></div>`;
+  const neg = () => $('#fp-negate')?.checked;
+  $('#fp-scrim').addEventListener('click', (e) => { if (e.target.id === 'fp-scrim') root.innerHTML = ''; });
+  root.querySelectorAll('.opt[data-val]').forEach((o) => o.addEventListener('click', () => apply(o.dataset.val, neg())));
+  $('#fp-add')?.addEventListener('click', () => { const op = $('#fp-op')?.value || ''; const val = $('#fp-val')?.value.trim(); if (val) apply(op + val, neg()); });
+  $('#fp-val')?.focus();
+  $('#fp-val')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const op = $('#fp-op')?.value || ''; const val = e.target.value.trim(); if (val) apply(op + val, neg()); } });
+}
+
+// Project tag catalogue manager — create/rename/recolor/reparent/delete tags.
+function openTagsManager() {
+  const root = $('#modal-root');
+  const draw = () => {
+    const rows = S.tags.length
+      ? S.tags.map((t) => `<div class="tagm-row">
+          <span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''}>${esc(tagPathStr(t.id))}</span>
+          <span class="pal-sub">${esc(t.kind || '')}</span>
+          <span class="q-spacer"></span>
+          <button class="btn sm" data-rename="${t.id}">Rename</button>
+          <button class="btn sm danger" data-deltag="${t.id}">Delete</button>
+        </div>`).join('')
+      : `<div class="pal-empty">No tags yet.</div>`;
+    root.innerHTML = `<div class="palette-scrim" id="tagm-scrim"><div class="palette tagm">
+      <div class="fp-head">Tags</div>
+      <div id="tagm-list">${rows}</div>
+      <div class="tagm-new">
+        <input id="tagm-name" class="title-in" placeholder="new tag  ·  use / for nesting (e.g. frontend/web)" />
+        <select id="tagm-kind" class="q-sel"><option value="topic">topic</option><option value="type">type</option></select>
+        <input id="tagm-color" type="color" value="#6b7fd7" title="color" />
+        <button class="btn primary" id="tagm-add">Add tag</button>
+      </div>
+      <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth).</div>
+    </div></div>`;
+    $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') root.innerHTML = ''; });
+    const addTag = async () => {
+      const name = $('#tagm-name').value.trim(); if (!name) return;
+      try {
+        await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({ name, kind: $('#tagm-kind').value, color: $('#tagm-color').value }) });
+        await loadOrg(); draw();
+      } catch (e) { toast(e.message, true); }
+    };
+    $('#tagm-add').addEventListener('click', addTag);
+    $('#tagm-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') addTag(); });
+    root.querySelectorAll('[data-rename]').forEach((b) => b.addEventListener('click', async () => {
+      const t = tagById(b.dataset.rename); const name = prompt('Rename tag:', t?.name); if (!name) return;
+      try { await api(`/api/tags/${b.dataset.rename}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await loadOrg(); draw(); if (S.tab === 'tasks') renderMain(); } catch (e) { toast(e.message, true); }
+    }));
+    root.querySelectorAll('[data-deltag]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Delete this tag? Its children are promoted to its parent and it is removed from all tasks.')) return;
+      try { await api(`/api/tags/${b.dataset.deltag}`, { method: 'DELETE' }); await loadOrg(); draw(); if (S.tab === 'tasks') { await runSearch(); renderMain(); } } catch (e) { toast(e.message, true); }
+    }));
+  };
+  draw();
+}
+
 function wireTasksView() {
-  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.id)));
+  wireOrgControls();
+  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.id)));
   $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
   );
@@ -770,7 +1567,14 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Queued'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); await deleteDraft(b.dataset.deldraft); toast('Draft removed'); }),
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      // Deleting a draft is a hard delete with no undo, so confirm first.
+      const title = S.tasks.find((t) => t.id === b.dataset.deldraft)?.title || 'this draft';
+      if (!confirm(`Delete draft "${title}"? This cannot be undone.`)) return;
+      await deleteDraft(b.dataset.deldraft);
+      toast('Draft removed');
+    }),
   );
   $('#main').querySelectorAll('[data-runnow]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.runnow}/run-now`, { method: 'POST', body: '{}' }); toast('Started'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
@@ -812,18 +1616,26 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-unarchive]').forEach((b) =>
     b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.unarchive, false); }),
   );
-  $('#show-archived')?.addEventListener('change', (e) => { S.showArchived = e.target.checked; refreshTasks(); });
   const add = async () => {
     const input = $('#new-task');
     const title = input.value.trim();
-    if (!title) return;
+    const images = S.newTaskImages || [];
+    if (!title && !images.length) return;
     const workflow = $('#new-wf').value;
     input.value = '';
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify({ title: firstLine(title), prompt: title, command: workflow === 'script-exec' ? title : undefined, workflow }),
+        body: JSON.stringify({
+          title: firstLine(title || 'Image task'),
+          prompt: title,
+          command: workflow === 'script-exec' ? title : undefined,
+          workflow,
+          ...(images.length ? { images } : {}),
+        }),
       });
+      S.newTaskImages = [];
+      renderImageChips($('#new-task-chips'), S.newTaskImages);
       toast('Task created');
       await refreshTasks();
     } catch (e) {
@@ -831,10 +1643,24 @@ function wireTasksView() {
     }
   };
   $('#add-task')?.addEventListener('click', add);
-  $('#new-task')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+  // Enter opens the FULL form (carrying the typed text into its prompt field) so
+  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly.
+  $('#new-task')?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    if (e.metaKey || e.ctrlKey) add();
+    else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
+  });
+  // Paste / drag-drop an image into the quick-add box to attach it (SPEC — image prompts).
+  if (!S.newTaskImages) S.newTaskImages = [];
+  wireImagePaste($('#new-task'), () => S.newTaskImages, () => renderImageChips($('#new-task-chips'), S.newTaskImages));
+  renderImageChips($('#new-task-chips'), S.newTaskImages);
   // Opening the full form via "More" carries over whatever was typed in the
   // quick-add box into the field that consumes it (Prompt, Command, …).
   $('#expand-task')?.addEventListener('click', () => openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim()));
+  // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
+  applyCursor();
+  $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
 
@@ -851,7 +1677,11 @@ function consumingField(fields) {
 
 async function deleteDraft(id) {
   // Drafts never started a workflow, so the record is hard-deleted server-side.
-  try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch (e) { return toast(e.message, true); }
+  // A 404 means it's already gone (e.g. a racing double-delete) — treat that as
+  // success rather than surfacing a confusing "no such task" error.
+  try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); }
+  catch (e) { if (!/no such task|HTTP 404/i.test(e.message || '')) return toast(e.message, true); }
+  S.deleted.add(id); // tombstone before a debounced refresh can re-fetch the stale list
   S.tasks = S.tasks.filter((t) => t.id !== id);
   renderMain();
 }
@@ -1072,6 +1902,10 @@ function wireDepPicker(values, selfId) {
 async function openTaskForm(workflow, draft, seedText) {
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
+  // The prompt/consuming field (a textarea) hosts pasted-image chips inside its
+  // own box; only fall back to a standalone "Images" section if there isn't one.
+  const cf = consumingField(fields);
+  const promptField = cf && cf.type === 'text' ? cf : null;
   const values = draft ? { ...draft.params } : {};
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = !!draft?.params?.repeatable; // a repeatable template
@@ -1079,7 +1913,6 @@ async function openTaskForm(workflow, draft, seedText) {
   // Carry over the quick-add text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
-    const cf = consumingField(fields);
     if (cf && !values[cf.name]) values[cf.name] = seedText;
   }
   let inherited = {};
@@ -1093,11 +1926,21 @@ async function openTaskForm(workflow, draft, seedText) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
+        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name], f === promptField)).join('')}
+          ${promptField ? '' : `<div class="form-row" data-row="__images">
+            <div class="label-row"><label>Images</label></div>
+            <div class="img-chips" id="tf-chips" style="display:none"></div>
+            <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
+          </div>`}
           <div class="form-row" data-row="__notes">
             <div class="label-row"><label>Notes</label></div>
             <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
             <span style="color:var(--ink-3);font-size:12px">Only you see this — never sent to the agent.</span>
+          </div>
+          <div class="form-row" data-row="__org">
+            <div class="label-row"><label>Priority &amp; tags</label></div>
+            ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
+            <span style="color:var(--ink-3);font-size:12px">For search / organization only — never sent to the agent. Use / for nested tags.</span>
           </div>
           <details class="advanced" style="margin-top:10px">
             <summary>Credentials — precedence &amp; enable/disable for this task</summary>
@@ -1113,61 +1956,169 @@ async function openTaskForm(workflow, draft, seedText) {
         </div>
       </div>
     </div>`;
-  $('#tf-wf')?.addEventListener('change', () => {
+  // Reassigned below once auto-save is wired; flushes pending edits before closing.
+  let closeForm = () => (root.innerHTML = '');
+  $('#tf-wf')?.addEventListener('change', async () => {
     // Re-render for the new workflow, preserving text typed into the current
     // consuming field so it moves to the new workflow's consuming field.
     const cf = consumingField(fields);
     const carried = cf ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`)?.value : '';
+    // Drop any draft auto-created for the previous workflow — its params won't
+    // map onto the new workflow's schema, and reopening starts fresh anyway.
+    clearTimeout(saveTimer);
+    if (localCred && draftId) { const id = draftId; draftId = null; try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch {} }
     openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
-  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') root.innerHTML = ''; });
-  $('#tf-close').addEventListener('click', () => (root.innerHTML = ''));
+  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') closeForm(); });
+  $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
+  // Image attachments for the full task form: pasting/dropping an image into any
+  // text field attaches it to the prompt. State is local to this form instance.
+  const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
+  // Repaint chips and (unless first paint) auto-save — pasting an image fires no
+  // 'input' event, so the debounced auto-save wouldn't otherwise pick it up.
+  // `autoSaveSoon` is a hoisted declaration further down this same scope.
+  const paintFormChips = (save) => { renderImageChips($('#tf-chips'), formImages, () => autoSaveSoon()); if (save) autoSaveSoon(); };
+  $('#tf-body')
+    .querySelectorAll('textarea, input[type="text"], input:not([type])')
+    .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
+  paintFormChips();
+  // Focus the consuming field (prompt/command) with the caret at the end, so
+  // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
+  // (the consuming field) is resolved once at the top of this function.
+  const cfEl = cf && $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`);
+  if (cfEl) {
+    cfEl.focus();
+    const end = cfEl.value?.length ?? 0;
+    if (typeof cfEl.setSelectionRange === 'function') { try { cfEl.setSelectionRange(end, end); } catch {} }
+  }
   // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
   // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the
   // running-task drawer (renderDrawer's #cred-editor-task). Change one → check the other.
   // A draft has an id → edit its policy directly. A brand-new task has none, so the
   // editor runs in `local` mode: changes are held here and applied on create (below).
   let taskCredPolicy = {};
+  const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
-  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; } });
+  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
   wireEventBuilder(values);
-  const submit = async (draftMode) => {
+
+  // The priority+tags editor is wired further down, once `draftId`/`ensureDraft` exist
+  // (a brand-new task needs a draft persisted before tags/priority can attach).
+
+  // The id of the draft this form is editing. Starts as the passed-in draft; a
+  // brand-new task gets one lazily the first time auto-save persists real content.
+  let draftId = draft?.id || null;
+  const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
+  // Prompt image attachments ride inside `params` (references only), so they flow
+  // through auto-save, draft, and queue the same way the prompt text does.
+  const formState = () => {
     const body = collectForm($('#tf-body'), fields);
-    // Triggers are a generic (workflow-agnostic) param, not part of the manifest
-    // schema, so they're collected separately and merged onto params.
+    if (formImages.length) body.images = [...formImages];
+    // Triggers + repeatable are generic (workflow-agnostic) params, not part of the
+    // manifest schema, so they're collected separately and merged onto params —
+    // this way they ride through auto-save, draft, and queue like the prompt does.
+    // (Critical: formState feeds the `replace:true` auto-save, so omitting them here
+    // would silently drop an armed/series task's triggers mid-edit.)
     const triggers = collectTriggers();
     if (triggers.length) body.triggers = triggers;
-    if ($('#trig-repeatable')?.checked) body.repeatable = true; // generic param, like triggers
-    // Cosmetic human notes — kept separate from `params` so they never reach the
-    // agent, and editable at any stage (here, pre-queue, in the full form).
-    const notes = $('#tf-notes')?.value ?? '';
-    const payload = { workflow: wf, params: body, notes, draft: draftMode };
+    if ($('#trig-repeatable')?.checked) body.repeatable = true;
+    return { body, notes: $('#tf-notes')?.value ?? '' };
+  };
+  // Whether the user has actually put something worth keeping into a NEW task —
+  // guards against spawning empty drafts just from opening the form.
+  const hasContent = ({ body, notes }) =>
+    notes.trim() !== '' ||
+    hasPolicy() ||
+    formImages.length > 0 ||
+    Object.values(body).some((v) =>
+      Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
+
+  // Persist the current form as a draft without leaving the form. Silent by
+  // design — auto-save shouldn't nag; the explicit buttons surface errors.
+  let lastSaved = null;
+  async function persistDraft(st = formState()) {
+    if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+    const sig = JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
+    if (sig === lastSaved) return; // no change since last write
+    try {
+      if (!draftId) {
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        draftId = created.id;
+      } else {
+        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+      }
+      if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+      lastSaved = sig;
+      refreshTasks();
+    } catch { /* keep the form open; a later save or explicit button will retry */ }
+  }
+
+  // Debounced auto-save while typing.
+  let saveTimer = null;
+  function autoSaveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(() => persistDraft(), 800); }
+  $('#tf-body').addEventListener('input', autoSaveSoon);
+  $('#tf-body').addEventListener('change', autoSaveSoon);
+
+  // ── Priority + tags editor (organization; never sent to the agent) ──────────
+  // IMPORTANT: this is ONE of TWO places the tag/priority editor lives — here in the full
+  // task form (new + draft), and in the running-task drawer (renderDrawer → drawerOrg).
+  // Both go through orgEditorHtml/wireOrgEditor. If you change one, check the other.
+  // Tags/priority need a taskId to attach to; a brand-new task has none until it's saved,
+  // so `ensureDraft` persists (or force-creates) a draft on the first tag/priority edit.
+  async function ensureDraft() {
+    if (draftId) return draftId;
+    await persistDraft();
+    if (draftId) return draftId;
+    // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
+    const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: formState().body, draft: true }) });
+    draftId = created.id;
+    refreshTasks();
+    return draftId;
+  }
+  const orgRec = draft
+    ? { id: draft.id, params: { priority: draft.params?.priority || 0 }, tags: (draft.tags || []).slice() }
+    : { id: null, params: {}, tags: [] };
+  const refreshOrg = () => {
+    const box = root.querySelector('[data-row="__org"] .drawer-org');
+    if (box) { box.outerHTML = orgEditorHtml(orgRec); wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg }); }
+    if (S.tab === 'tasks') renderMain();
+  };
+  wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg });
+
+  // Flush any pending edits when the form is dismissed, so closing without
+  // clicking a button still keeps the draft.
+  closeForm = () => { clearTimeout(saveTimer); const st = formState(); root.innerHTML = ''; persistDraft(st); };
+
+  const submit = async (draftMode) => {
+    clearTimeout(saveTimer);
+    const st = formState();
     try {
       if (editInPlace) {
-        // A waiting task or a repeatable series edits in place (incl. its triggers).
-        // "Save" re-arms / keeps the series; "Save as draft" (draftMode) disarms it.
-        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true, keepArmed: !draftMode }) });
-        if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
-      } else if (draft) {
-        // edit existing draft, then optionally queue
-        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true }) });
-        if ((draft.notes || '') !== notes) await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
-        if (!draftMode) await api(`/api/tasks/${draft.id}/queue`, { method: 'POST', body: '{}' });
+        // A waiting (armed) task or a repeatable series edits in place (incl. its
+        // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
+        // the series; "Save as draft" (draftMode) disarms it back to a draft.
+        await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
+        await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+      } else if (draftId) {
+        // Auto-save (or a prior edit) already materialised the draft — update it in place.
+        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        if (!draftMode) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+      } else if (hasPolicy()) {
+        // Custom per-task credential order/enablement: create as a draft first so the
+        // override is persisted BEFORE the workflow starts leasing, then queue.
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        draftId = created.id;
+        await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
+        if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
       } else {
-        const hasPol = !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length);
-        if (hasPol) {
-          // Custom per-task credential order/enablement: create as a draft first so the
-          // override is persisted BEFORE the workflow starts leasing, then queue.
-          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...payload, draft: true }) });
-          await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
-          if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
-        } else {
-          await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify(payload) });
-        }
+        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode }) });
       }
       root.innerHTML = '';
       toast(editInPlace ? (draftMode ? 'Moved to drafts' : 'Saved') : draftMode ? 'Draft saved' : 'Task created');
@@ -1276,6 +2227,23 @@ async function openDrawer(taskId) {
   }
   S.selected = taskId;
   S.drawerEvents = [];
+  // Reset the live-output accumulator on task switch. It's only cleared by a
+  // turn.result/view.updated event for the *selected* task (see the WS handler),
+  // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
+  // "let me merge master into this branch") bleeds into THIS drawer's live bubble
+  // until the next event arrives — a stale cross-task render, never in the store/.jsonl.
+  S.liveOutput = '';
+  // Drop the previous task's view + per-task derived state up front. `S.view` is
+  // re-fetched first below, but the siblings (sessions/widgets/paramDefaults) are
+  // fetched a few awaits later — so a render firing in that gap (a WS event, a
+  // background refresh) would pair the NEW view with the OLD task's fork command /
+  // widgets / param defaults. renderDrawer no-ops while `S.view` is null, and empty
+  // siblings render as "no command / no widgets / (default)" — both corrected a beat
+  // later by the awaited fetches. Never show another task's data, even for one frame.
+  S.view = null;
+  S.sessions = {};
+  S.widgets = [];
+  S.paramDefaults = {};
   highlightRow();
   try {
     S.view = await api(`/api/tasks/${taskId}`);
@@ -1299,15 +2267,155 @@ async function refreshDrawer() {
   } catch {}
   renderDrawer();
 }
+// Close the drawer by navigating back to the underlying list/queue; applyRoute()
+// then tears the drawer DOM down. Kept as a navigation so the URL + history stay
+// in sync (the ✕ button, the scrim, Esc and the palette all route through here).
 function closeDrawer() {
+  const pid = (S.view && S.tasks.find((t) => t.id === S.view.taskId)?.projectId) || S.projectId;
+  const back = S.returnRoute || (pid ? projectRoute(pid) : '/dashboard');
+  S.returnRoute = null;
+  return go(back, { replace: true });
+}
+// Tear down the drawer DOM without navigating (called by applyRoute()).
+function closeDrawerDom() {
+  if (!S.selected && !S.view) return;
   S.selected = null;
   S.view = null;
-  if (termWs) { try { termWs.close(); } catch {} termWs = null; }
+  S.liveOutput = ''; // drop any streamed live text so it can't reappear in the next drawer
+  S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next drawer
+  if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // closing the drawer kills the check-in shell
   $('#drawer-root').innerHTML = '';
   highlightRow();
 }
 function highlightRow() {
   document.querySelectorAll('.task-row').forEach((r) => r.classList.toggle('sel', r.dataset.id === S.selected));
+}
+
+// A task's organizational metadata (priority + tags). Both are purely for
+// search/organization and never reach the agent, so they're editable at any
+// lifecycle stage (draft included) — unlike workflow params. Shared by the drawer
+// (running tasks) and the task form (drafts).
+function orgEditorHtml(rec) {
+  const prio = Number(rec?.params?.priority || 0);
+  const tags = (rec?.tags || []).map((id) => { const t = tagById(id); if (!t) return ''; return `<span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} data-untag="${id}" title="Remove">${esc(tagPathStr(id))} ✕</span>`; }).join('');
+  const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? '▲ ' : ''}${n[0].toUpperCase() + n.slice(1)}</option>`).join('');
+  return `<div class="drawer-org">
+    <label class="org-prio">Priority
+      <select class="q-sel org-priority">${prioOpts}</select>
+    </label>
+    <div class="org-tags">${tags || '<span class="pal-sub">no tags</span>'}
+      <button class="btn sm org-add-tag" title="Add a tag">＋ tag</button>
+    </div>
+  </div>`;
+}
+
+// Wire the priority/tags editor rooted at `rootEl` over a mutable `rec` ({id, params, tags}).
+// `opts.ensureId()` resolves the task id (drawer/existing draft: identity; NEW task form:
+// persists a draft first so tags/priority have somewhere to attach), and `opts.afterChange`
+// re-renders the surrounding surface. There is exactly one `.drawer-org` per surface.
+// Callers: renderDrawer (running tasks) and openTaskForm (new + draft) — keep both in mind.
+function wireOrgEditor(rootEl, rec, opts) {
+  const box = rootEl.querySelector('.drawer-org');
+  if (!box) return;
+  const ensureId = opts.ensureId || (async () => rec.id);
+  const afterChange = opts.afterChange || (() => {});
+  box.querySelector('.org-priority')?.addEventListener('change', async (e) => {
+    const priority = Number(e.target.value);
+    try {
+      const id = await ensureId(); if (!id) return;
+      rec.id = id;
+      await api(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) });
+      rec.params = { ...(rec.params || {}), priority };
+      if (S.tab === 'tasks') await runSearch();
+      afterChange();
+      toast('Priority updated');
+    } catch (err) { toast(err.message, true); }
+  });
+  const setTags = async (ids) => {
+    const id = await ensureId(); if (!id) return;
+    rec.id = id;
+    const r = await api(`/api/tasks/${id}/tags`, { method: 'PUT', body: JSON.stringify({ tagIds: ids }) });
+    rec.tags = r.tags;
+    if (S.tab === 'tasks') await runSearch();
+    afterChange();
+  };
+  box.querySelectorAll('[data-untag]').forEach((el) => el.addEventListener('click', () => {
+    setTags((rec.tags || []).filter((id) => id !== el.dataset.untag)).catch((e) => toast(e.message, true));
+  }));
+  box.querySelector('.org-add-tag')?.addEventListener('click', () => openTagPicker(rec, setTags));
+}
+
+// Drawer's copy of the priority/tags editor. NOTE: the task FORM (openTaskForm) has the
+// other copy — both share orgEditorHtml/wireOrgEditor; change one, check the other.
+function drawerOrg(v) {
+  const rec = S.tasks.find((t) => t.id === v.taskId);
+  return rec ? orgEditorHtml(rec) : '';
+}
+function wireDrawerOrg(v) {
+  const rec = S.tasks.find((t) => t.id === v.taskId);
+  if (!rec) return;
+  wireOrgEditor($('#drawer-root'), rec, { ensureId: async () => v.taskId, afterChange: () => { renderDrawer(); if (S.tab === 'tasks') renderMain(); } });
+}
+
+// Type-to-add tag combobox: filter existing tags as you type; a non-matching entry
+// offers "Create …". Supports slash paths (frontend/web) — the server builds the
+// hierarchy. Arrow keys navigate, Enter picks the highlighted row.
+function openTagPicker(rec, setTags) {
+  const root = $('#modal-root');
+  const current = new Set(rec?.tags || []);
+  let items = [];
+  let active = 0;
+  root.innerHTML = `<div class="palette-scrim" id="tp-scrim"><div class="palette fp">
+    <input id="tp-in" placeholder="Type a tag…  use / for nesting (e.g. frontend/web)" autocomplete="off" spellcheck="false" />
+    <div id="tp-list"></div>
+  </div></div>`;
+  const input = $('#tp-in');
+  const list = $('#tp-list');
+  const close = () => (root.innerHTML = '');
+  const add = async (item) => {
+    if (!item) return;
+    try {
+      let id = item.id;
+      if (item.create) {
+        const t = await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({ name: item.name }) });
+        await loadOrg();
+        id = t.id;
+      }
+      close();
+      await setTags([...(rec?.tags || []), id]);
+    } catch (e) { toast(e.message, true); }
+  };
+  const build = () => {
+    const q = input.value.trim();
+    const ql = q.toLowerCase();
+    const avail = S.tags.filter((t) => !current.has(t.id));
+    items = avail
+      .map((t) => ({ id: t.id, name: t.name, path: tagPathStr(t.id), kind: t.kind }))
+      .filter((it) => !ql || it.path.toLowerCase().includes(ql))
+      .sort((a, b) => a.path.localeCompare(b.path));
+    // Offer creation when the typed text doesn't already exist verbatim as a path.
+    const exists = q && S.tags.some((t) => tagPathStr(t.id).toLowerCase() === ql);
+    if (q && !exists) items.unshift({ create: true, name: q, path: q });
+    active = 0;
+    draw();
+  };
+  const draw = () => {
+    list.innerHTML = items.length
+      ? items.map((it, i) => `<div class="opt ${i === active ? 'active' : ''}" data-i="${i}">${it.create ? `＋ Create <b>${esc(it.path)}</b>` : esc(it.path)}${!it.create && it.kind ? ` <span class="pal-sub">${esc(it.kind)}</span>` : ''}</div>`).join('')
+      : `<div class="pal-empty">Start typing to create a tag.</div>`;
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  $('#tp-scrim').addEventListener('click', (e) => { if (e.target.id === 'tp-scrim') close(); });
+  input.addEventListener('input', build);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(items.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); add(items[active]); }
+  });
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) add(items[Number(o.dataset.i)]); });
+  build();
+  input.focus();
 }
 
 function renderDrawer() {
@@ -1331,16 +2439,18 @@ function renderDrawer() {
     <aside class="drawer open">
       <div class="drawer-head">
         <div class="row1">
+          ${v.num != null ? `<span class="task-num" title="Task #${v.num}${(() => { const p = projectById(S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId); return p ? ` — permalink /projects/${projectSlug(p)}/tasks/${v.num}` : ''; })()}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
-          <span class="chip ${v.status}">${esc(v.stage)}</span>
+          <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
           <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
           <span>${esc(v.workflow)}${(() => { const rec = S.tasks.find((t) => t.id === v.taskId); return rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''; })()}</span>
-          ${v.branch ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
+          ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
         </div>
+        ${drawerOrg(v)}
       </div>
       <div class="drawer-body" id="drawer-body">${drawerBody(v)}</div>
       <div class="drawer-foot" id="drawer-foot">${drawerActions(v)}</div>
@@ -1351,7 +2461,9 @@ function renderDrawer() {
   wireFollowups(v);
   wireParams(v);
   wireNotes(v);
+  wireDrawerOrg(v);
   wireTerminal(v.taskId);
+  wireReviewActions(v);
   wireCopyButtons();
   renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId, taskId: v.taskId });
   renderDrawerEvents();
@@ -1390,31 +2502,275 @@ function restoreFollowupFocus(root, st) {
   }
 }
 
-let termWs = null;
 function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/\r/g, '');
 }
+
+// ── check-in terminal: a real PTY streamed over a WebSocket ──────────────────
+// The session outlives drawer re-renders (which rebuild the DOM on every event),
+// so it lives in module state and rebinds to the freshly-rendered <pre> each
+// time. `makeTermScreen` is a tiny terminal emulator that turns the PTY byte
+// stream — echo, backspace, cursor moves, line erases — into displayable text,
+// so the user can type STRAIGHT into the terminal (Ctrl-C and friends included)
+// without pulling in a heavyweight emulator like xterm.js (which would break the
+// no-build-step, offline console this app is built around).
+let term = null; // { taskId, ws, screen } while a session is live; null otherwise
+
+function termIsOpenFor(taskId) {
+  return !!(term && term.taskId === taskId && term.ws && term.ws.readyState <= 1);
+}
+
+// Minimal line-oriented emulator: enough to render an interactive shell's echo,
+// backspace, history recall and Ctrl-C cleanly. Full-screen TUIs (vim, htop) use
+// absolute cursor positioning we intentionally ignore — those genuinely need a
+// full emulator; a line-mode check-in terminal doesn't.
+function makeTermScreen(maxLines = 2000) {
+  let lines = [''];
+  let row = 0, col = 0;
+  const ensureRow = () => { while (lines.length <= row) lines.push(''); };
+  const put = (i, ch) => {
+    let line = lines[row];
+    if (line.length < i) line += ' '.repeat(i - line.length);
+    lines[row] = line.slice(0, i) + ch + line.slice(i + 1);
+  };
+  function csi(final, params) {
+    const n = parseInt(params, 10);
+    const num = Number.isNaN(n) ? (final === 'K' || final === 'J' ? 0 : 1) : n;
+    ensureRow();
+    const line = lines[row];
+    switch (final) {
+      case 'C': col += num; break;                                      // cursor right
+      case 'D': col = Math.max(0, col - num); break;                    // cursor left
+      case 'G': col = Math.max(0, num - 1); break;                      // cursor to column
+      case 'K':                                                          // erase in line
+        lines[row] = num === 1 ? ' '.repeat(col) + line.slice(col) : num === 2 ? '' : line.slice(0, col);
+        break;
+      case 'P': lines[row] = line.slice(0, col) + line.slice(col + num); break; // delete chars
+      case 'J':                                                          // erase display
+        if (num >= 2) { lines = ['']; row = 0; col = 0; }
+        else { lines[row] = line.slice(0, col); lines = lines.slice(0, row + 1); }
+        break;
+      default: break;                                                    // ignore the rest (cursor up/down, SGR colors, …)
+    }
+  }
+  function write(data) {
+    for (let k = 0; k < data.length; k++) {
+      const ch = data[k];
+      if (ch === '\x1b') {
+        if (data[k + 1] === '[') {                                       // CSI — read params until the final byte
+          let j = k + 2, params = '';
+          while (j < data.length && !(data.charCodeAt(j) >= 0x40 && data.charCodeAt(j) <= 0x7e)) params += data[j++];
+          csi(data[j], params);
+          k = j;
+        } else if (data[k + 1] === ']') {                               // OSC — skip to BEL or ST
+          let j = k + 2;
+          while (j < data.length && data[j] !== '\x07' && !(data[j] === '\x1b' && data[j + 1] === '\\')) j++;
+          k = data[j] === '\x1b' ? j + 1 : j;
+        } else { k++; }                                                  // 2-char escape — skip the pair
+        continue;
+      }
+      if (ch === '\r') { col = 0; continue; }
+      if (ch === '\n') { row++; ensureRow(); continue; }
+      if (ch === '\b') { if (col > 0) col--; continue; }
+      const code = data.charCodeAt(k);
+      if (code < 32 || code === 127) continue;                          // drop other control chars (bell, etc.)
+      ensureRow();
+      put(col, ch);
+      col++;
+    }
+    if (lines.length > maxLines) {                                       // bound scrollback memory
+      const drop = lines.length - maxLines;
+      lines.splice(0, drop);
+      row = Math.max(0, row - drop);
+    }
+  }
+  return { write, render: () => lines.join('\n') };
+}
+
+// Translate a browser keydown into the bytes a PTY expects. Returns null to let
+// the browser keep the event (copy/paste shortcuts, unhandled combos).
+function keyToPtyBytes(e) {
+  if (e.altKey || e.metaKey) return null;
+  const k = e.key;
+  if (e.ctrlKey) {
+    if (e.shiftKey) return null;                                        // Ctrl+Shift+C/V → let the browser copy/paste
+    if (/^[a-zA-Z]$/.test(k)) return String.fromCharCode(k.toLowerCase().charCodeAt(0) - 96); // ^A..^Z, incl. Ctrl-C (^C = \x03)
+    if (k === ' ') return '\x00';
+    return null;
+  }
+  switch (k) {
+    case 'Enter': return '\r';
+    case 'Backspace': return '\x7f';
+    case 'Tab': return '\t';
+    case 'Escape': return '\x1b';
+    case 'ArrowUp': return '\x1b[A';
+    case 'ArrowDown': return '\x1b[B';
+    case 'ArrowRight': return '\x1b[C';
+    case 'ArrowLeft': return '\x1b[D';
+    case 'Home': return '\x1b[H';
+    case 'End': return '\x1b[F';
+    case 'Delete': return '\x1b[3~';
+    default: return k.length === 1 ? k : null;                          // a printable char, else ignore
+  }
+}
+
+// Point the (freshly rendered) <pre> at the live session: repaint the buffer,
+// stream new bytes into it, and forward keystrokes/paste straight to the PTY.
+function bindTermScreen(out) {
+  if (!term || !out) return;
+  out.classList.remove('hidden');
+  out.textContent = term.screen.render();
+  out.scrollTop = out.scrollHeight;
+  const ws = term.ws;
+  ws.onmessage = (m) => {
+    try {
+      const msg = JSON.parse(m.data);
+      if (msg.type === 'data') { term.screen.write(msg.data); out.textContent = term.screen.render(); out.scrollTop = out.scrollHeight; }
+    } catch {}
+  };
+  const send = (data) => { if (term && term.ws && term.ws.readyState === 1) term.ws.send(JSON.stringify({ type: 'input', data })); };
+  out.onkeydown = (e) => {
+    const bytes = keyToPtyBytes(e);
+    if (bytes == null) return;                                          // leave copy/paste, F-keys, etc. to the browser
+    e.preventDefault();
+    send(bytes);
+  };
+  out.onpaste = (e) => {
+    const text = (e.clipboardData || window.clipboardData)?.getData('text');
+    if (!text) return;
+    e.preventDefault();
+    send(text);
+  };
+}
+
+function openTerminal(taskId) {
+  if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}`);
+  term = { taskId, ws, screen: makeTermScreen() };
+  ws.onclose = () => {
+    if (!term || term.ws !== ws) return;                               // superseded by a newer session
+    term.screen.write('\r\n[terminal closed]\r\n');
+    const out = document.getElementById('term-out');
+    if (out) out.textContent = term.screen.render();
+    term = null;
+    syncTermButton();
+  };
+  bindTermScreen(document.getElementById('term-out'));
+  const out = document.getElementById('term-out');
+  if (out) out.focus();
+  syncTermButton();
+}
+
+// Killing the terminal is just closing the socket: the gateway's ws-close handler
+// kills the PTY's whole session — the shell AND every process running in it (see
+// killPtySession in src/gateway/server.ts).
+function killTerminal() {
+  if (term && term.ws) { try { term.ws.close(); } catch {} }
+}
+
+function syncTermButton() {
+  const btn = document.getElementById('term-open');
+  if (!btn) return;
+  const live = !!(term && term.ws && term.ws.readyState <= 1);
+  const hasWorld = btn.dataset.hasWorld === '1';
+  if (live) {
+    btn.textContent = 'Kill terminal';
+    btn.classList.add('danger');
+    btn.disabled = false;
+  } else {
+    btn.classList.remove('danger');
+    btn.textContent = hasWorld ? 'Open terminal' : 'No world yet';
+    btn.disabled = !hasWorld;
+  }
+}
+
 function wireTerminal(taskId) {
   const btn = document.getElementById('term-open');
   if (!btn) return;
+  btn.dataset.hasWorld = btn.disabled ? '0' : '1';                     // capture world presence before we mutate the label
+  if (termIsOpenFor(taskId)) bindTermScreen(document.getElementById('term-out'));  // reattach a session that outlived the re-render
+  else if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; } // switched tasks → drop the old shell
+  syncTermButton();
   btn.addEventListener('click', () => {
-    const out = document.getElementById('term-out');
-    const inp = document.getElementById('term-in');
-    out.classList.remove('hidden');
-    inp.classList.remove('hidden');
-    inp.focus();
-    if (termWs) { try { termWs.close(); } catch {} }
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}`);
-    termWs = ws;
-    ws.onmessage = (m) => {
-      try { const msg = JSON.parse(m.data); if (msg.type === 'data') { out.textContent += stripAnsi(msg.data); out.scrollTop = out.scrollHeight; } } catch {}
-    };
-    ws.onclose = () => { out.textContent += '\n[terminal closed]\n'; };
-    inp.onkeydown = (e) => {
-      if (e.key === 'Enter') { ws.send(JSON.stringify({ type: 'input', data: inp.value + '\r' })); inp.value = ''; }
-    };
+    if (termIsOpenFor(taskId)) killTerminal();
+    else openTerminal(taskId);
   });
+}
+
+// ── review actions: click-to-verify buttons (run in the world / open artifacts) ──
+function reviewActionBtn(a, i) {
+  const isRun = a.kind === 'run';
+  const icon = isRun ? (a.server ? '▶' : '⚡') : '↗';
+  const label = `${icon} ${esc(a.label || (isRun ? 'Run' : 'Open'))}`;
+  const title = isRun ? esc(a.command || '') : esc(a.target || '');
+  return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
+}
+
+let reviewActionWs = null;
+async function openArtifact(url, external) {
+  if (external) { window.open(url, '_blank', 'noopener'); return; }
+  // Artifact endpoints need the auth header, so fetch as a blob then open it.
+  try {
+    const res = await fetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
+    if (!res.ok) { toast('could not open artifact', true); return; }
+    const obj = URL.createObjectURL(await res.blob());
+    window.open(obj, '_blank', 'noopener');
+    setTimeout(() => URL.revokeObjectURL(obj), 60_000);
+  } catch (e) { toast(e.message, true); }
+}
+function wireReviewActions(v) {
+  const wrap = document.getElementById('review-actions');
+  if (!wrap) return;
+  const out = document.getElementById('review-action-out');
+  wrap.querySelectorAll('.review-action').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = Number(btn.getAttribute('data-idx'));
+      const kind = btn.getAttribute('data-kind');
+      try {
+        const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
+        if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        // kind === 'run': stream output; open follow-up URLs; offer Stop.
+        if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
+        if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}`);
+        reviewActionWs = ws;
+        ws.onmessage = (m) => {
+          try {
+            const msg = JSON.parse(m.data);
+            if (!out) return;
+            if (msg.type === 'data') { out.textContent += stripAnsi(msg.data); out.scrollTop = out.scrollHeight; }
+            else if (msg.type === 'exit') { out.textContent += `\n[exited: code ${msg.code}]\n`; setStopBtn(false); }
+          } catch {}
+        };
+        ws.onclose = () => setStopBtn(false);
+        setStopBtn(true, r.procId, v.taskId);
+        // A server keeps running — open its pages once it's had a moment to boot.
+        if (r.server && Array.isArray(r.openUrls)) {
+          setTimeout(() => r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener')), 1500);
+        } else if (Array.isArray(r.openUrls) && r.openUrls.length) {
+          r.openUrls.forEach((u) => window.open(u, '_blank', 'noopener'));
+        }
+      } catch (e) { toast(e.message, true); }
+    });
+  });
+}
+function setStopBtn(running, procId, taskId) {
+  const wrap = document.getElementById('review-actions');
+  if (!wrap) return;
+  let stop = document.getElementById('review-action-stop');
+  if (!running) { if (stop) stop.remove(); return; }
+  if (!stop) {
+    stop = document.createElement('button');
+    stop.id = 'review-action-stop';
+    stop.className = 'btn sm danger';
+    stop.textContent = '■ Stop';
+    wrap.appendChild(stop);
+  }
+  stop.onclick = async () => {
+    try { await api(`/api/tasks/${taskId}/review-action/${procId}/stop`, { method: 'POST' }); } catch (e) { toast(e.message, true); }
+  };
 }
 
 function drawerBody(v) {
@@ -1434,7 +2790,7 @@ function drawerBody(v) {
   const conversations = transcripts
     .map((t) => {
       const body = (t.messages || [])
-        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}</div>`)
+        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}${renderMessageImages(m.images)}</div>`)
         .join('') || '<div class="msg system">No messages yet</div>';
       // Only the active role gets the #live-bubble (one per drawer, updated by the WS stream).
       const live = t.role === liveRole
@@ -1454,7 +2810,10 @@ function drawerBody(v) {
       const agentName = esc(t.label || t.role);
       const fu = followUp
         ? `<div class="followup-box" data-role="${esc(t.role)}">
-            <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…" ${followUp.enabled ? '' : 'disabled'}></textarea>
+            <div class="prompt-field">
+              <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}></textarea>
+              <div class="img-chips followup-chips" style="display:none"></div>
+            </div>
             <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
           </div>`
         : '';
@@ -1467,11 +2826,14 @@ function drawerBody(v) {
       </details>`;
     })
     .join('');
+  const caption = v.reviewInfo?.caption || v.reviewInfo?.summary;
   const review = v.reviewInfo
     ? `<div class="section-h">Review</div>
        <div class="review">
-         ${v.reviewInfo.summary ? `<div class="summary">${esc(v.reviewInfo.summary)}</div>` : ''}
-         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin-bottom:8px">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
+         ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
+         ${v.reviewInfo.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
+         <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
+         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin:8px 0">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
        </div>`
@@ -1481,8 +2843,23 @@ function drawerBody(v) {
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
     : '';
   const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(id)}</span></div>`).join('')}`
+    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
     : '';
+  // Terminal — a top-level section (like an agent conversation), NOT buried in
+  // Advanced. It stays fully visible (no collapse) so the shell is one click away.
+  // Open a real PTY in the task's world; type straight into it (Ctrl-C and friends
+  // land in the shell). "Open terminal" flips to "Kill terminal" while a session is
+  // live — that button closes the socket, which kills the shell and every process
+  // running in it.
+  const terminalSection = `
+    <div class="terminal-section">
+      <div class="section-h">Ephemeral Terminal</div>
+      <div class="task-sub" style="gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      </div>
+      <pre class="raw hidden term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell" style="height:240px;outline:none"></pre>
+    </div>`;
   return `
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
@@ -1494,20 +2871,14 @@ function drawerBody(v) {
     ${renderWidgetGroups(S.widgets)}
     ${subtasks}
     ${conversations}
+    ${terminalSection}
     <details class="advanced">
       <summary>Credentials — precedence &amp; enable/disable for this task</summary>
       <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the global/project order + enablement, just for this task. Drag to reorder; toggle On/Off. (This is the running-task form — the new-task form has the same control.)</p>
       <div id="cred-editor-task">Loading…</div>
     </details>
     <details class="advanced">
-      <summary>Advanced — terminal, live event log, structured state</summary>
-      <div class="section-h">Terminal — open a shell in the world (ephemeral)</div>
-      <div class="task-sub" style="gap:6px;flex-wrap:wrap">
-        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
-        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      </div>
-      <pre class="raw hidden" id="term-out" style="height:200px"></pre>
-      <input id="term-in" class="title-in hidden" style="width:100%;margin-top:6px;padding:8px 10px" placeholder="command + Enter" />
+      <summary>Advanced — live event log, structured state</summary>
       <div class="section-h">Live events</div>
       <div class="events" id="drawer-events"></div>
       <div class="section-h">Structured state (the view-model floor)</div>
@@ -1530,7 +2901,9 @@ function waitingLabel(w) {
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
+    case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'parent': return 'the parent task to respond';
+    case 'confirm': return 'the confirm agent to review';
     default: return w.detail || w.kind;
   }
 }
@@ -1921,9 +3294,11 @@ function drawerActions(v) {
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
+  let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' ? 'primary' : a.danger ? 'danger' : '';
-    html += `<button class="btn ${cls}" data-act="${a.name}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}</button>`;
+    const kbd = a.enabled && slot < 9 ? `<span class="kbd">${++slot}</span>` : '';
+    html += `<button class="btn ${cls}" data-act="${a.name}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}${kbd}</button>`;
   }
   // Target-branch editing now lives in the Parameters form (drawerParams), which
   // renders it editable/frozen per the workflow's window — no separate input here.
@@ -1946,23 +3321,37 @@ function wireActions(v) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => openDrawer(e.dataset.open)));
+  $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.open)));
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
 // agent role it addresses, so a follow-up is delivered to the right agent.
 function wireFollowups(v) {
+  if (!S.followupImages) S.followupImages = {};
   $('#drawer-body').querySelectorAll('.followup-box').forEach((box) => {
     const role = box.dataset.role;
     const ta = box.querySelector('.followup-input');
     const btn = box.querySelector('.followup-send');
     if (!ta || !btn) return;
+    // Per-(task,role) image store, so pasted attachments survive the drawer's
+    // frequent WS-driven re-renders (like the textarea text is preserved).
+    const key = `${v.taskId}/${role}`;
+    const store = (S.followupImages[key] ||= []);
+    const chips = box.querySelector('.followup-chips');
+    const paint = () => renderImageChips(chips, store);
+    wireImagePaste(ta, () => store, paint);
+    paint();
     const send = async () => {
       const text = ta.value.trim();
-      if (!text) return;
+      if (!text && !store.length) return;
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: 'followUp', text, role }) });
+        await api(`/api/tasks/${v.taskId}/signal`, {
+          method: 'POST',
+          body: JSON.stringify({ signal: 'followUp', text, role, ...(store.length ? { images: [...store] } : {}) }),
+        });
         ta.value = '';
+        store.length = 0;
+        paint();
         toast('Follow-up sent');
         setTimeout(refreshDrawer, 250);
         setTimeout(refreshTasks, 400);
@@ -1998,35 +3387,155 @@ function summarize(p) {
 }
 
 // ── queue ────────────────────────────────────────────────────────────────────
+// Fetch the coordinator's authoritative queue order for every domain currently in
+// the merge stage, so the view reflects reorders immediately (the per-task polled
+// position lags up to a workflow poll interval). Re-renders the queue tab on arrival.
+async function seedQueue() {
+  const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
+  const domains = [...new Set(inMerge.map((t) => t.lastView?.state?.mergeDomain).filter(Boolean))];
+  const orders = {};
+  await Promise.all(
+    domains.map(async (d) => {
+      try {
+        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}`);
+        orders[d] = { queue: v.queue || [], current: v.current };
+      } catch {}
+    }),
+  );
+  S.queueOrders = orders;
+  if (S.tab === 'queue') renderMain();
+}
+
+// Rank a task within its domain: the leased (merging) task pins to the top, then the
+// coordinator's queue order when known, else the task's last-published position.
+function queueRank(t) {
+  const v = t.lastView || {};
+  if (v.state?.mergeGranted) return -1;
+  const ord = S.queueOrders[v.state?.mergeDomain];
+  if (ord) { const i = ord.queue.indexOf(t.id); return i < 0 ? 1e6 : i; }
+  const p = v.mergeQueue?.position;
+  return p > 0 ? p : 1e6 - 1;
+}
+
 function queueView() {
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
   if (!inMerge.length) return `<div class="empty"><div class="big">Merge queue is empty</div>Tasks appear here when they reach the merge stage.</div>`;
-  inMerge.sort((a, b) => (a.lastView?.mergeQueue?.position ?? 99) - (b.lastView?.mergeQueue?.position ?? 99));
-  return inMerge
-    .map((t) => {
-      const v = t.lastView || {};
-      const pos = v.mergeQueue?.position;
-      const current = pos === 0;
-      return `<div class="queue-item ${current ? 'current' : ''}" data-id="${t.id}">
-        <span class="pos">${pos === 0 ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
-        <div style="flex:1"><div class="task-title">${esc(t.title)}</div>
+  // Group by merge domain — reordering is only meaningful within a single serialization
+  // domain. With one domain (the common case) this renders as a single list.
+  const groups = new Map();
+  for (const t of inMerge) {
+    const d = t.lastView?.state?.mergeDomain || '';
+    if (!groups.has(d)) groups.set(d, []);
+    groups.get(d).push(t);
+  }
+  const multi = groups.size > 1;
+  return [...groups.entries()]
+    .map(([domain, tasks]) => {
+      tasks.sort((a, b) => queueRank(a) - queueRank(b));
+      const rows = tasks
+        .map((t) => {
+          const v = t.lastView || {};
+          const pos = v.mergeQueue?.position;
+          const merging = !!v.state?.mergeGranted;
+          const canMove = !merging && !!v.state?.mergeDomain;
+          return `<div class="queue-item ${merging ? 'current' : ''}" data-id="${t.id}" data-domain="${esc(domain)}" tabindex="0" ${canMove ? 'draggable="true"' : ''}>
+        ${canMove ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
+        <span class="pos">${merging ? '▶' : pos > 0 ? `#${pos}` : '–'}</span>
+        <div style="flex:1"><div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">${merging ? 'merging' : 'queued'}</span></div>
           <div class="task-sub"><span class="branch">${esc(v.branch || '')}</span> → <span class="branch">${esc(v.targetBranch || '')}</span></div></div>
-        ${!current && v.state?.mergeDomain ? `<button class="btn sm" data-prio="${t.id}" data-domain="${esc(v.state.mergeDomain)}">Prioritize</button>` : ''}
+        ${canMove ? `<div class="queue-actions"><button class="btn sm" data-move="top" data-id="${t.id}" data-domain="${esc(domain)}">Move to top</button><button class="btn sm" data-move="bottom" data-id="${t.id}" data-domain="${esc(domain)}">Move to bottom</button></div>` : ''}
       </div>`;
+        })
+        .join('');
+      const label = multi && domain ? `<div class="queue-domain">${esc(domain)}</div>` : '';
+      return `${label}<div class="queue-list" data-domain="${esc(domain)}">${rows}</div>`;
     })
     .join('');
 }
+
+// Optimistically mutate the cached order for a domain so the reorder shows instantly,
+// before the coordinator signal round-trips. Missing orders are seeded from the
+// current DOM/rank so a move still animates while the first fetch is in flight.
+function localQueue(domain) {
+  const ord = S.queueOrders[domain];
+  if (ord) return ord;
+  const ids = S.tasks
+    .filter((t) => (t.lastView?.state?.mergeDomain || '') === domain && !t.lastView?.state?.mergeGranted && ['merge', 'pr'].includes(t.lastView?.stage))
+    .sort((a, b) => queueRank(a) - queueRank(b))
+    .map((t) => t.id);
+  const seeded = { queue: ids };
+  S.queueOrders[domain] = seeded;
+  return seeded;
+}
+
 function wireQueueView() {
-  $('#main').querySelectorAll('.queue-item').forEach((e) => e.addEventListener('click', (ev) => { if (!ev.target.dataset.prio) openDrawer(e.dataset.id); }));
-  $('#main').querySelectorAll('[data-prio]').forEach((b) =>
+  $('#main').querySelectorAll('.queue-item').forEach((e) =>
+    e.addEventListener('click', (ev) => { if (!ev.target.closest('[data-move]') && !ev.target.closest('.drag-handle')) goToTask(e.dataset.id); }),
+  );
+  $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
+      const { domain, id } = b.dataset;
+      const q = localQueue(domain);
+      const rest = q.queue.filter((t) => t !== id);
+      q.queue = b.dataset.move === 'top' ? [id, ...rest] : [...rest, id];
+      renderMain();
       try {
-        await api('/api/queue/prioritize', { method: 'POST', body: JSON.stringify({ domain: b.dataset.domain, taskId: b.dataset.prio }) });
-        toast('Prioritized'); setTimeout(refreshTasks, 300);
-      } catch (e) { toast(e.message, true); }
+        if (b.dataset.move === 'top') {
+          await api('/api/queue/prioritize', { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
+        } else {
+          await api('/api/queue/move', { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
+        }
+        toast(b.dataset.move === 'top' ? 'Moved to top' : 'Moved to bottom');
+        setTimeout(seedQueue, 300);
+      } catch (e) { toast(e.message, true); seedQueue(); }
     }),
   );
+  $('#main').querySelectorAll('.queue-list').forEach(wireQueueDrag);
+  applyCursor();
+  $('#main').querySelectorAll('.queue-item').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
+}
+
+// HTML5 drag-and-drop reordering within one domain's queue list. On drop we send the
+// single moved task with the id it now sits before (or none → bottom).
+function wireQueueDrag(list) {
+  if (!list) return;
+  const domain = list.dataset.domain;
+  let dragging = null;
+  list.querySelectorAll('.queue-item[draggable="true"]').forEach((row) => {
+    row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', row.dataset.id); } catch {} });
+    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+  });
+  list.addEventListener('dragover', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    // Insert before the nearest movable row whose vertical center is below the cursor;
+    // past the last one → append. The merging row (not draggable) stays pinned on top.
+    let best = null, bestDist = Infinity;
+    for (const el of list.querySelectorAll('.queue-item[draggable="true"]:not(.dragging)')) {
+      const b = el.getBoundingClientRect();
+      const cy = b.top + b.height / 2;
+      if (cy < e.clientY) continue;
+      const d = cy - e.clientY;
+      if (d < bestDist) { bestDist = d; best = el; }
+    }
+    best ? list.insertBefore(dragging, best) : list.appendChild(dragging);
+  });
+  list.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    if (!dragging) return;
+    const id = dragging.dataset.id;
+    const rows = [...list.querySelectorAll('.queue-item[draggable="true"]')];
+    const order = rows.map((r) => r.dataset.id);
+    const q = localQueue(domain);
+    q.queue = order;
+    const at = order.indexOf(id);
+    const beforeTaskId = at >= 0 && at < order.length - 1 ? order[at + 1] : '';
+    try {
+      await api('/api/queue/move', { method: 'POST', body: JSON.stringify({ domain, taskId: id, beforeTaskId }) });
+      setTimeout(seedQueue, 300);
+    } catch (err) { toast(err.message, true); seedQueue(); }
+  });
 }
 
 // ── activity ─────────────────────────────────────────────────────────────────
@@ -2037,7 +3546,7 @@ function activityView() {
   if (!S.activity.length) return `<div class="empty"><div class="big">No activity yet</div>Events stream here as agents work.</div>`;
   return `<div class="card"><div class="events" style="max-height:none">${S.activity
     .slice(0, 300)
-    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span style="color:var(--ink-3)">${esc(e.taskId?.slice(0, 14))}</span><span>${esc(summarize(e.payload))}</span></div>`)
+    .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span class="mono" style="color:var(--ink-3)">${esc(numLabel(e.taskId))}</span><span>${esc(summarize(e.payload))}</span></div>`)
     .join('')}</div></div>`;
 }
 
@@ -2081,6 +3590,109 @@ async function refreshHostDiag() {
   if (S.tab === 'dashboard') { clearTimeout(S.hostDiagTimer); S.hostDiagTimer = setTimeout(refreshHostDiag, 5000); }
 }
 
+// ── processes (task manager) ─────────────────────────────────────────────────
+// GET /api/processes: every process karmax is responsible for — agent
+// subprocesses (and the scripts they run), embedded-terminal PTYs (and what's
+// typed into them), the Temporal server, git/exec helpers — grouped by owning
+// entity with live CPU% / RSS. Kill via POST /api/processes/kill (SIGTERM;
+// shift-click for SIGKILL). Protected infrastructure gets no kill button.
+const PROC_KIND_LABEL = { agent: 'agent', terminal: 'terminal', temporal: 'infra', login: 'login', probe: 'probe', app: 'karmax', untracked: 'misc' };
+
+function fmtDur(sec) {
+  if (!sec || sec < 0) return '—';
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`;
+  return `${Math.floor(sec / 86400)}d${Math.floor((sec % 86400) / 3600)}h`;
+}
+
+function procPanelHtml(sample) {
+  if (!sample) return `<div class="card" style="color:var(--ink-3)">Process list unavailable.</div>`;
+  if (!sample.supported) return `<div class="card" style="color:var(--ink-3)">Process accounting needs Linux procfs — not available on this host.</div>`;
+  const t = sample.totals || {};
+  // A row is either killable (button) or protected (visible lock, so the kill
+  // affordance is discoverable even on an idle instance where only protected
+  // infrastructure — karmax itself + Temporal — is running).
+  const LOCK = `<span class="proc-lock" title="Protected — karmax can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
+  const killBtn = (pid, label, killable) =>
+    killable
+      ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" title="click: SIGTERM · shift-click: SIGKILL">✕ kill</button>`
+      : LOCK;
+  const rows = (sample.groups || [])
+    .map((g) => {
+      const kindChip = `<span class="chip">${esc(PROC_KIND_LABEL[g.kind] || g.kind)}</span>`;
+      const taskChip = g.taskId
+        ? `<button class="chip proc-task" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</button>`
+        : '';
+      // A group is killable at the root when it's a registered entity (agents,
+      // terminals, logins, probes) — its registered killer escalates properly.
+      const rootKillable = !g.protected && g.kind !== 'app' && g.kind !== 'untracked';
+      const head = `<tr class="proc-group">
+        <td class="cmd">${esc(g.label)} ${kindChip}${taskChip}</td>
+        <td class="mono num">${g.procs.length}</td>
+        <td class="mono num">${g.cpuPct.toFixed(1)}%</td>
+        <td class="mono num">${g.rssMb >= 1024 ? (g.rssMb / 1024).toFixed(2) + 'G' : g.rssMb.toFixed(0) + 'M'}</td>
+        <td class="num">${rootKillable ? killBtn(g.key, g.label, true) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
+      </tr>`;
+      const body = g.procs
+        .map((r) => {
+          // Never offer to kill karmax itself (the 'app' group's only row); any
+          // other row — including a registered root's own line — is fair game.
+          const killable = g.kind !== 'app' && !(g.protected && String(r.pid) === g.key);
+          return `<tr>
+            <td class="cmd mono" title="${esc(r.cmd)}">${esc(r.cmd)}</td>
+            <td class="mono num">${r.pid}<span class="proc-age"> · ${fmtDur(r.ageSec)}</span></td>
+            <td class="mono num">${r.cpuPct.toFixed(1)}%</td>
+            <td class="mono num">${r.rssMb >= 1024 ? (r.rssMb / 1024).toFixed(2) + 'G' : r.rssMb.toFixed(0) + 'M'}</td>
+            <td class="num">${killBtn(r.pid, r.cmd.slice(0, 60), killable)}</td>
+          </tr>`;
+        })
+        .join('');
+      return head + body;
+    })
+    .join('');
+  return `<div class="card" style="padding:0;overflow:auto">
+    <table class="proc-table">
+      <thead><tr><th>process</th><th class="num">pid · age</th><th class="num">cpu</th><th class="num">mem</th><th class="num"></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()} · 🔒 protected (karmax core &amp; Temporal); everything else gets a ✕ kill button</div>
+  </div>`;
+}
+
+function wireProcPanel(el) {
+  el.querySelectorAll('.proc-task').forEach((b) => b.addEventListener('click', () => goToTask(b.dataset.task)));
+  el.querySelectorAll('.proc-kill').forEach((b) =>
+    b.addEventListener('click', async (ev) => {
+      const pid = Number(b.dataset.kill);
+      const signal = ev.shiftKey ? 'SIGKILL' : 'SIGTERM';
+      if (!confirm(`Send ${signal} to pid ${pid}?\n\n${b.dataset.label}`)) return;
+      b.disabled = true;
+      try {
+        await api('/api/processes/kill', { method: 'POST', body: JSON.stringify({ pid, signal }) });
+        toast(`${signal} sent to ${pid}`);
+      } catch (e) { toast(e.message, true); }
+      refreshProcPanel(true);
+    }),
+  );
+}
+
+// Live-refresh the processes panel every 5s while the Dashboard is open; same
+// self-terminating pattern as refreshHostDiag. CPU% is a delta between samples,
+// so the very first paint shows 0% and settles from the second sample on.
+async function refreshProcPanel(now = false) {
+  if (S.tab !== 'dashboard' || !$('#proc-panel')) return;
+  clearTimeout(S.procTimer);
+  let sample = null;
+  try { sample = await api('/api/processes'); } catch {}
+  const el = $('#proc-panel');
+  if (el && S.tab === 'dashboard') {
+    el.innerHTML = procPanelHtml(sample);
+    wireProcPanel(el);
+  }
+  if (S.tab === 'dashboard') { clearTimeout(S.procTimer); S.procTimer = setTimeout(refreshProcPanel, now ? 1200 : 5000); }
+}
+
 async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
@@ -2102,6 +3714,8 @@ async function renderDashboard() {
       </div>
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
+      <div class="section-h">Processes — everything karmax is running</div>
+      <div id="proc-panel"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
         <span>Agent accounts (login availability &amp; quota)</span>
         ${pollable.size ? `<button class="btn sm usage-recheck-all">↻ Re-check usage</button>` : ''}
@@ -2168,6 +3782,7 @@ async function renderDashboard() {
     // accounts section; single pending timer (cleared here and inside the loop).
     clearTimeout(S.hostDiagTimer);
     S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
+    refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 
@@ -2727,10 +4342,10 @@ function toggleNotifications() {
   pop.className = 'popover';
   pop.id = 'notif-pop';
   pop.innerHTML = `<div class="ph">Needs attention (${items.length})</div>${
-    items.length ? items.map((t) => `<div class="pi" data-id="${t.id}"><b>${esc(t.title)}</b><div class="task-sub"><span class="chip ${t.lastView.status}">${esc(t.lastView.stage)}</span></div></div>`).join('') : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'
+    items.length ? items.map((t) => `<div class="pi" data-id="${t.id}"><b>${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</b><div class="task-sub"><span class="chip ${t.lastView.status}">${esc(t.lastView.stage)}</span></div></div>`).join('') : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'
   }`;
   $('#overlay-root').appendChild(pop);
-  pop.querySelectorAll('.pi[data-id]').forEach((e) => e.addEventListener('click', () => { pop.remove(); openDrawer(e.dataset.id); }));
+  pop.querySelectorAll('.pi[data-id]').forEach((e) => e.addEventListener('click', () => { pop.remove(); goToTask(e.dataset.id); }));
   setTimeout(() => document.addEventListener('click', function h(ev) { if (!pop.contains(ev.target) && ev.target.id !== 'bell') { pop.remove(); document.removeEventListener('click', h); } }), 10);
 }
 
@@ -2764,66 +4379,412 @@ async function newProject() {
   } catch (e) { toast(e.message, true); }
 }
 
-// ── keyboard navigation / command palette (SPEC §10.1 command registry) ──────
-function bindKeys() {
-  document.addEventListener('keydown', (e) => {
-    if (e.target.matches('input, textarea')) {
-      if (e.key === 'Escape') e.target.blur();
-      return;
+// ── keyboard navigation / command registry (SPEC §10.1) ─────────────────────
+// ONE registry feeds three views: key dispatch, the ⌘K palette, and the "?"
+// help overlay — so they can never drift apart. Commands come from three tiers:
+//   1. host commands — the console's own navigation + interaction grammar;
+//   2. server-declared commands (GET /api/contributions): workflow packages
+//      contribute `task.<action>` commands with default keybindings, and the
+//      host maps them GENERICALLY onto the selected task's declared actions —
+//      the host never hardcodes a workflow's action vocabulary;
+//   3. the declared actions themselves (the auto-render floor, SPEC §10.2): every
+//      enabled action of the selected task is a palette entry, and digits 1–9
+//      press the drawer's action buttons — so a workflow that declares no
+//      keybindings at all is still fully keyboard-operable.
+
+// -- keybinding strings ('meta+k', 'g t', '?', 'J') → step sequences ----------
+const KEY_NAMES = { esc: 'escape', return: 'enter', up: 'arrowup', down: 'arrowdown', left: 'arrowleft', right: 'arrowright', cmd: 'meta', mod: 'meta' };
+function parseKeybinding(binding) {
+  return String(binding || '').trim().split(/\s+/).filter(Boolean).map((step) => {
+    const parts = step.split('+').filter(Boolean);
+    const raw = parts.pop() || '+'; // 'meta++' → the '+' key
+    // single chars stay case-sensitive ('J' means shift+j); named keys normalize
+    const key = raw.length === 1 ? raw : (KEY_NAMES[raw.toLowerCase()] || raw.toLowerCase());
+    const out = { key };
+    for (const p of parts) {
+      const m = KEY_NAMES[p.toLowerCase()] || p.toLowerCase();
+      if (m === 'meta') out.meta = true;
+      else if (m === 'ctrl') out.ctrl = true;
+      else if (m === 'alt') out.alt = true;
+      else if (m === 'shift') out.shift = true;
     }
-    if ((e.metaKey || e.ctrlKey) && e.key === 'k') { e.preventDefault(); return openPalette(); }
-    if (e.key === 'Escape') return S.selected ? closeDrawer() : $('#notif-pop')?.remove();
-    // Single-key shortcuts must not fire while a modifier is held — otherwise
-    // Ctrl+C (copy) would trigger 'confirm', Ctrl+X (cut) would trigger 'cancel', etc.
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (e.key === 'n') { e.preventDefault(); switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); }
-    if (e.key === '/') { e.preventDefault(); $('#search')?.focus(); }
-    if (e.key === 'g') { S._g = true; setTimeout(() => (S._g = false), 600); return; }
-    if (S._g) {
-      const map = { t: 'tasks', q: 'queue', d: 'dashboard', s: 'settings', a: 'activity' };
-      if (map[e.key]) { switchTab(map[e.key]); S._g = false; }
-    }
-    if (S.selected) {
-      if (e.key === 'c') trigger('confirm');
-      if (e.key === 'x') trigger('cancel');
-      if (e.key === 'f') { e.preventDefault(); focusFollowup(); }
-    }
+    return out;
   });
 }
-function trigger(act) {
-  $(`#drawer-foot [data-act="${act}"]`)?.click();
+// Does a keydown (or a stored snapshot of one) match a binding step? 'meta'
+// accepts Ctrl too (Linux/Windows); bare steps refuse held modifiers so Ctrl+C
+// (copy) can never trigger a plain-'c' command.
+function stepMatches(step, e) {
+  const key = e.key.length === 1 ? e.key : e.key.toLowerCase();
+  if (key !== step.key) return false;
+  if (!!step.alt !== !!e.altKey) return false;
+  if (step.meta) return !!(e.metaKey || e.ctrlKey);
+  if (step.ctrl) return !!e.ctrlKey && !e.metaKey;
+  return !e.metaKey && !e.ctrlKey;
 }
+// Which commands could still match after `pending` steps, given keystroke `snap`?
+// Pure (unit-tested in web/keynav.test.cjs); `cmds` carry parsed `keys`.
+function chordCandidates(cmds, pending, snap) {
+  return cmds.filter((c) => {
+    if (!c.keys || c.keys.length <= pending.length) return false;
+    if (!pending.every((p, i) => stepMatches(c.keys[i], p))) return false;
+    return stepMatches(c.keys[pending.length], snap);
+  });
+}
+// Human-readable keybinding for chips ('meta+k' → ⌘K / Ctrl+K).
+function fmtKeys(binding) {
+  const mac = /Mac|iP/.test((typeof navigator !== 'undefined' && navigator.platform) || '');
+  const NAME = { escape: 'Esc', enter: '↵', arrowup: '↑', arrowdown: '↓', arrowleft: '←', arrowright: '→', ' ': 'Space' };
+  return parseKeybinding(binding)
+    .map((s) => `${s.ctrl ? 'Ctrl+' : ''}${s.alt ? (mac ? '⌥' : 'Alt+') : ''}${s.meta ? (mac ? '⌘' : 'Ctrl+') : ''}${s.shift ? '⇧' : ''}${NAME[s.key] || s.key}`)
+    .join(' ');
+}
+// Subsequence fuzzy match: score (higher = better), or -1 for no match.
+function fuzzyScore(q, s) {
+  if (!q) return 0;
+  const hay = String(s).toLowerCase();
+  let score = 0, at = 0, run = 0;
+  for (const ch of String(q).toLowerCase()) {
+    const idx = hay.indexOf(ch, at);
+    if (idx < 0) return -1;
+    run = idx === at && at > 0 ? run + 1 : 1;
+    score += run * 2 + (idx === 0 || /[\s\-_./:]/.test(hay[idx - 1]) ? 3 : 0) - Math.min(idx - at, 6) * 0.5;
+    at = idx + 1;
+  }
+  return score;
+}
+
+// -- the assembled registry ---------------------------------------------------
+// Host commands. `key` is only the fallback — the binding of record comes from
+// the server's command registry (S.contributions), so packages can rebind ids.
+const HOST_COMMANDS = [
+  { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', run: () => openPalette() },
+  { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
+  { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
+  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm($('#new-wf')?.value, undefined, $('#new-task')?.value.trim()); } },
+  { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
+  { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
+  { id: 'nav.queue', title: 'Go to merge queue', key: 'g q', run: () => switchTab('queue') },
+  { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
+  { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g d', run: () => switchTab('dashboard') },
+  { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
+  { id: 'nav.global', title: 'Go to global settings', key: 'g g', run: () => switchTab('global') },
+  { id: 'nav.projects', title: 'Go to projects', key: 'g p', run: () => focusRail() },
+  { id: 'nav.notifications', title: 'Go to notifications', key: 'g n', run: () => toggleNotifications() },
+  { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
+];
+
+function allCommands() {
+  const declared = new Map((S.contributions?.commands || []).map((c) => [c.id, c]));
+  const out = [];
+  const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
+  for (const h of HOST_COMMANDS) {
+    const d = declared.get(h.id);
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', run: h.run });
+  }
+  // Interaction grammar (host-owned, not server-declared): a list cursor on the
+  // tasks/queue views; with a drawer open the same keys walk between tasks. When
+  // focus sits in the projects rail (g p), the same keys walk the rail instead.
+  const rail = inRail();
+  const listy = ['tasks', 'queue'].includes(S.tab) && !rail;
+  add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
+  add({ id: 'list.prev', title: 'Previous task / row', keybinding: 'k', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(-1) : moveCursor(-1)) });
+  add({ id: 'list.next.arrow', title: 'Next task / row', keybinding: 'ArrowDown', group: 'List', palette: false, help: false, available: listy && !S.selected, run: () => moveCursor(1) });
+  add({ id: 'list.prev.arrow', title: 'Previous task / row', keybinding: 'ArrowUp', group: 'List', palette: false, help: false, available: listy && !S.selected, run: () => moveCursor(-1) });
+  add({ id: 'list.open', title: 'Open selected row', keybinding: 'o', group: 'List', palette: false, available: listy && !S.selected && !!S.cursorId, run: openCursorRow });
+  add({ id: 'list.open.enter', title: 'Open selected row', keybinding: 'Enter', group: 'List', palette: false, help: false, available: listy && !S.selected && !!S.cursorId, run: openCursorRow });
+  add({ id: 'list.archive', title: 'Archive / unarchive selected row', keybinding: 'e', group: 'List', palette: false, available: listy && !S.selected && !!S.cursorId, run: archiveCursorRow });
+  // Projects rail (after g p): j/k walk projects + global entries, ↵ selects,
+  // Esc returns. Same keys as the list — the two contexts are exclusive.
+  add({ id: 'rail.next', title: 'Next project', keybinding: 'j', group: 'Projects', palette: false, available: rail, run: () => moveRail(1) });
+  add({ id: 'rail.prev', title: 'Previous project', keybinding: 'k', group: 'Projects', palette: false, available: rail, run: () => moveRail(-1) });
+  add({ id: 'rail.next.arrow', title: 'Next project', keybinding: 'ArrowDown', group: 'Projects', palette: false, help: false, available: rail, run: () => moveRail(1) });
+  add({ id: 'rail.prev.arrow', title: 'Previous project', keybinding: 'ArrowUp', group: 'Projects', palette: false, help: false, available: rail, run: () => moveRail(-1) });
+  add({ id: 'rail.open', title: 'Switch to project / open entry', keybinding: 'Enter', group: 'Projects', palette: false, available: rail, run: () => document.activeElement?.click() });
+  add({ id: 'rail.open.o', title: 'Switch to project / open entry', keybinding: 'o', group: 'Projects', palette: false, help: false, available: rail, run: () => document.activeElement?.click() });
+  // Workflow-contributed task commands: `task.<action>` binds to the selected
+  // task's DECLARED action of that name — available only when the selected
+  // task runs the contributing workflow and the action is currently enabled.
+  const covered = new Set();
+  for (const c of S.contributions?.commands || []) {
+    if (c.workflow === 'core' || !c.id.startsWith('task.')) continue;
+    const name = c.id.slice(5);
+    covered.add(`${c.workflow}:${name}`);
+    const action = S.view && S.view.workflow === c.workflow ? (S.view.actions || []).find((a) => a.name === name) : null;
+    add({
+      id: c.id, title: c.title, keybinding: c.keybinding, group: 'Task', workflow: c.workflow,
+      available: !!(S.selected && action && action.enabled), danger: action?.danger,
+      run: () => action && runDeclaredAction(action),
+    });
+  }
+  // The declared-actions floor: any enabled action of the selected task not
+  // already reachable through a contributed command still gets a palette entry.
+  if (S.selected && S.view) {
+    for (const a of S.view.actions || []) {
+      if (covered.has(`${S.view.workflow}:${a.name}`)) continue;
+      add({ id: `task.action.${a.name}`, title: a.label || a.name, group: 'Task', workflow: S.view.workflow, available: !!a.enabled, danger: a.danger, run: () => runDeclaredAction(a) });
+    }
+    // digits 1–9 press the Nth enabled action button in the drawer footer
+    const btns = [...document.querySelectorAll('#drawer-foot [data-act]:not([disabled])')].slice(0, 9);
+    btns.forEach((b, i) => add({ id: `task.slot.${i + 1}`, title: `Press “${b.textContent.replace(/\d+$/, '').trim()}”`, keybinding: String(i + 1), group: 'Task', palette: false, help: false, run: () => b.click() }));
+  }
+  return out;
+}
+
+// Run a workflow-declared action generically: plain actions signal straight
+// through the generic endpoint; the followUp action's affordance is its compose
+// box; any other action with declared args gets an auto-rendered form (§10.2).
+async function runDeclaredAction(a) {
+  if (!S.selected) return;
+  if (a.name === 'followUp') return focusFollowup();
+  if (a.args && a.args.length) return openActionForm(a);
+  try {
+    await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
+    toast(`${a.label || a.name} sent`);
+    setTimeout(refreshDrawer, 250);
+    setTimeout(refreshTasks, 400);
+  } catch (e) { toast(e.message, true); }
+}
+
+// Auto-rendered argument form for a declared action (ActionArg[] → controls).
+function openActionForm(a) {
+  const root = $('#overlay-root');
+  const control = (arg) => {
+    const label = `<div class="label-row"><label>${esc(arg.label || arg.name)}${arg.required ? ' *' : ''}</label></div>`;
+    if (arg.type === 'text') return `<div class="form-row">${label}<textarea data-arg="${esc(arg.name)}" rows="3">${esc(arg.default ?? '')}</textarea></div>`;
+    if (arg.type === 'boolean') return `<div class="form-row"><div class="switch"><input type="checkbox" data-arg="${esc(arg.name)}" ${arg.default ? 'checked' : ''} /><label>${esc(arg.label || arg.name)}</label></div></div>`;
+    if (arg.type === 'select') return `<div class="form-row">${label}<select data-arg="${esc(arg.name)}">${(arg.options || []).map((o) => `<option ${o === arg.default ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+    return `<div class="form-row">${label}<input data-arg="${esc(arg.name)}" type="${arg.type === 'number' ? 'number' : 'text'}" value="${esc(arg.default ?? '')}" /></div>`;
+  };
+  root.innerHTML = `<div class="palette-scrim" id="act-scrim"><div class="palette" style="width:min(480px,92vw)">
+    <div style="padding:14px 16px;border-bottom:1px solid var(--line)"><b>${esc(a.label || a.name)}</b></div>
+    <div style="padding:14px 16px">${(a.args || []).map(control).join('')}</div>
+    <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
+      <button class="btn" id="act-cancel">Cancel</button>
+      <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send">${esc(a.label || a.name)}</button>
+    </div></div></div>`;
+  const close = () => (root.innerHTML = '');
+  $('#act-scrim').addEventListener('click', (e) => { if (e.target.id === 'act-scrim') close(); });
+  $('#act-cancel').addEventListener('click', close);
+  root.querySelector('[data-arg]')?.focus();
+  $('#act-send').addEventListener('click', async () => {
+    const body = { signal: a.name };
+    for (const arg of a.args || []) {
+      const el = root.querySelector(`[data-arg="${CSS.escape(arg.name)}"]`);
+      if (!el) continue;
+      const val = arg.type === 'boolean' ? el.checked : arg.type === 'number' ? (el.value === '' ? undefined : Number(el.value)) : el.value;
+      if (arg.required && (val === undefined || val === '')) { el.focus(); return toast(`${arg.label || arg.name} is required`, true); }
+      if (val !== undefined && val !== '') body[arg.name] = val;
+    }
+    try {
+      await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify(body) });
+      close();
+      toast(`${a.label || a.name} sent`);
+      setTimeout(refreshDrawer, 250);
+      setTimeout(refreshTasks, 400);
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
 // Focus the follow-up box of the open (active) conversation, falling back to the
-// first available one — the box now lives per-agent inside each conversation.
+// first available one — the box lives per-agent inside each conversation.
 function focusFollowup() {
   const ta = document.querySelector('.conversation[open] .followup-input:not([disabled])')
     || document.querySelector('.followup-input:not([disabled])');
   if (ta) { ta.closest('details')?.setAttribute('open', ''); ta.focus(); }
 }
-function openPalette() {
-  const cmds = S.contributions?.commands || [];
-  const root = $('#overlay-root');
-  root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
-    <input id="pal-in" placeholder="Type a command…" />
-    <div id="pal-list">${cmds.map((c, i) => `<div class="opt ${i === 0 ? 'active' : ''}" data-id="${c.id}">${esc(c.title)}${c.keybinding ? `<span class="key">${esc(c.keybinding)}</span>` : ''}</div>`).join('')}</div>
-  </div></div>`;
-  const input = $('#pal-in');
-  input.focus();
-  const run = (id) => { root.innerHTML = ''; runCommand(id); };
-  $('#pal-scrim').addEventListener('click', (e) => { if (e.target.id === 'pal-scrim') root.innerHTML = ''; });
-  $('#pal-list').querySelectorAll('.opt').forEach((o) => o.addEventListener('click', () => run(o.dataset.id)));
-  input.addEventListener('input', () => {
-    const q = input.value.toLowerCase();
-    $('#pal-list').querySelectorAll('.opt').forEach((o) => (o.style.display = o.textContent.toLowerCase().includes(q) ? '' : 'none'));
-  });
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') root.innerHTML = '';
-    if (e.key === 'Enter') { const first = $('#pal-list .opt:not([style*="none"])'); if (first) run(first.dataset.id); }
+
+// -- list cursor (roving selection on the tasks / merge-queue views) ----------
+function cursorRows() {
+  return [...document.querySelectorAll('#main .task-row, #main .queue-item')];
+}
+function rowKey(r) { return r.dataset.id || r.dataset.draft; }
+function applyCursor() {
+  cursorRows().forEach((r) => r.classList.toggle('cursor', rowKey(r) === S.cursorId));
+}
+function moveCursor(delta) {
+  const rows = cursorRows();
+  if (!rows.length) return;
+  let i = rows.findIndex((r) => rowKey(r) === S.cursorId);
+  i = i < 0 ? (delta > 0 ? 0 : rows.length - 1) : Math.min(rows.length - 1, Math.max(0, i + delta));
+  S.cursorId = rowKey(rows[i]);
+  applyCursor();
+  rows[i].scrollIntoView({ block: 'nearest' });
+  rows[i].focus?.(); // rows carry tabindex=0, so the cursor and Tab order agree
+}
+function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId); }
+function openCursorRow() { cursorRow()?.click(); }
+function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
+// With the drawer open, j/k walk the same task order the list shows.
+function taskOrder() {
+  return S.tasks
+    .filter((t) => !t.params?.draft && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())))
+    .slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .map((t) => t.id);
+}
+function openAdjacentTask(delta) {
+  const order = taskOrder();
+  const i = order.indexOf(S.selected);
+  const next = order[i < 0 ? 0 : i + delta];
+  if (next) { S.cursorId = next; goToTask(next); }
+}
+
+// -- projects rail focus (g p): walk projects + global entries by keyboard ----
+function railRows() { return [...document.querySelectorAll('#rail .proj, #rail .nav-item')]; }
+function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
+function focusRail() {
+  const rows = railRows();
+  (rows.find((r) => r.dataset.id === S.projectId) || rows[0])?.focus();
+}
+function moveRail(delta) {
+  const rows = railRows();
+  if (!rows.length) return;
+  let i = rows.indexOf(document.activeElement);
+  i = i < 0 ? 0 : Math.min(rows.length - 1, Math.max(0, i + delta));
+  rows[i].focus();
+  rows[i].scrollIntoView({ block: 'nearest' });
+}
+
+// -- Escape layering: pop the topmost surface ---------------------------------
+function closeTopOverlay() {
+  const pop = $('#notif-pop');
+  if (pop) return pop.remove();
+  // Secondary modals (filter picker, tags manager, tag picker) stack above the
+  // form/drawer in #modal-root — pop them first.
+  if ($('#modal-root').firstElementChild) return ($('#modal-root').innerHTML = '');
+  const overlay = $('#overlay-root').firstElementChild;
+  if (overlay) {
+    if (overlay.id === 'tf-scrim') return overlay.click(); // task form: its scrim-close flushes the draft
+    return ($('#overlay-root').innerHTML = '');
+  }
+  if (S.selected) return closeDrawer();
+}
+
+// -- the dispatcher ------------------------------------------------------------
+const CHORD = { pending: [], timer: 0 };
+function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
+function dispatchKey(e) {
+  const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
+  const cmds = allCommands().filter((c) => c.keys && c.available);
+  const candidates = chordCandidates(cmds, CHORD.pending, snap);
+  if (!candidates.length) { resetChord(); return false; }
+  e.preventDefault();
+  const exact = candidates.find((c) => c.keys.length === CHORD.pending.length + 1);
+  const longer = candidates.some((c) => c.keys.length > CHORD.pending.length + 1);
+  if (exact && !longer) { resetChord(); exact.run(); return true; }
+  CHORD.pending.push(snap); // a chord prefix ('g' …) — wait briefly for the rest
+  clearTimeout(CHORD.timer);
+  CHORD.timer = setTimeout(resetChord, 900);
+  return true;
+}
+function bindKeys() {
+  document.addEventListener('keydown', (e) => {
+    const t = e.target;
+    const typing = t && t.matches && (t.matches('input, textarea, select') || t.isContentEditable);
+    const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
+    if (typing) {
+      if (e.key === 'Escape') { t.blur(); resetChord(); }
+      // modifier-bearing bindings (⌘K) still work while typing outside overlays
+      else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
+      return;
+    }
+    if (overlayOpen) { // an overlay owns the keyboard; Esc pops it
+      if (e.key === 'Escape') closeTopOverlay();
+      return;
+    }
+    if (e.key === 'Escape') {
+      resetChord();
+      if (inRail()) return document.activeElement.blur(); // leave the rail, don't close panels
+      return closeTopOverlay();
+    }
+    // Enter on a focused button/link is native activation, not the list cursor.
+    if (e.key === 'Enter' && t && t.closest && t.closest('button, a, summary, [role="button"]')) return;
+    dispatchKey(e);
   });
 }
-function runCommand(id) {
-  const map = { 'nav.newTask': () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); }, 'nav.search': () => $('#search')?.focus(), 'nav.tasks': () => switchTab('tasks'), 'nav.queue': () => switchTab('queue'), 'nav.dashboard': () => switchTab('dashboard'), 'nav.settings': () => switchTab('settings'), 'nav.close': closeDrawer, 'task.confirm': () => trigger('confirm'), 'task.cancel': () => trigger('cancel'), 'task.followUp': () => focusFollowup() };
-  map[id]?.();
+
+// -- the ⌘K palette: fuzzy over the registry + jump-to-task/project -----------
+function openPalette() {
+  const root = $('#overlay-root');
+  root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
+    <input id="pal-in" placeholder="Type a command, task, or project…" autocomplete="off" />
+    <div id="pal-list"></div>
+  </div></div>`;
+  const input = $('#pal-in');
+  const list = $('#pal-list');
+  const close = () => (root.innerHTML = '');
+  let items = [];
+  let active = 0;
+  const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2, Tasks: 3, Projects: 4 };
+  const build = () => {
+    const q = input.value.trim();
+    items = [];
+    for (const c of allCommands()) {
+      if (c.palette === false || !c.available) continue;
+      const score = fuzzyScore(q, c.title);
+      if (score < 0) continue;
+      items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.workflow, danger: c.danger, score, run: c.run });
+    }
+    if (q) { // jump-to entries only once there's a query — the empty palette is the command list
+      for (const t of S.tasks) {
+        if (t.params?.archived) continue;
+        const score = fuzzyScore(q, t.title);
+        if (score >= 0) items.push({ group: 'Tasks', title: t.title, sub: `${t.workflow}${t.params?.draft ? ' · draft' : t.lastView?.stage ? ` · ${t.lastView.stage}` : ''}`, score, run: () => (t.params?.draft ? openTaskForm(undefined, t) : goToTask(t.id)) });
+      }
+      for (const p of S.projects) {
+        const score = fuzzyScore(q, p.name);
+        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => { S.projectId = p.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); } });
+      }
+    }
+    items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
+    items = items.slice(0, 14);
+    active = 0;
+    draw();
+  };
+  const draw = () => {
+    let lastGroup = null;
+    list.innerHTML = items.map((it, i) => {
+      const head = it.group !== lastGroup ? `<div class="pal-group">${esc(it.group)}</div>` : '';
+      lastGroup = it.group;
+      return `${head}<div class="opt ${i === active ? 'active' : ''}${it.danger ? ' danger' : ''}" data-i="${i}">${esc(it.title)}${it.sub ? `<span class="pal-sub">${esc(it.sub)}</span>` : ''}${it.kbd ? `<span class="key">${esc(fmtKeys(it.kbd))}</span>` : ''}</div>`;
+    }).join('') || `<div class="pal-empty">No matches</div>`;
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  const run = (i) => { const it = items[i]; if (!it) return; close(); it.run(); };
+  input.addEventListener('input', build);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(items.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); run(active); }
+  });
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) run(Number(o.dataset.i)); });
+  list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
+  $('#pal-scrim').addEventListener('click', (e) => { if (e.target.id === 'pal-scrim') close(); });
+  build();
+  input.focus();
+}
+
+// -- "?" help: the same registry, grouped — includes every workflow's commands -
+function openHelp() {
+  const root = $('#overlay-root');
+  const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
+  const groups = [...new Set(cmds.map((c) => c.group))];
+  const row = (k, title, sub) => `<div class="help-row"><span class="key">${k}</span><span>${title}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
+  root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette" style="width:min(560px,92vw);max-height:80vh;overflow:auto">
+    <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center"><b>Keyboard shortcuts</b><span style="flex:1"></span><button class="icon-btn" id="help-close">✕</button></div>
+    <div style="padding:6px 16px 16px">
+      ${groups.map((g) => `<div class="section-h">${esc(g)}</div>${cmds.filter((c) => c.group === g).map((c) => row(esc(fmtKeys(c.keybinding)), esc(c.title), c.workflow)).join('')}`).join('')}
+      <div class="section-h">In the task drawer</div>
+      ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
+      ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
+      ${row('Esc', 'Close the topmost panel / leave a text field')}
+      <div class="section-h">Quick add</div>
+      ${row('↵', 'Open the full task form with what you typed')}
+      ${row(esc(fmtKeys('meta+Enter')), 'Add the task directly')}
+    </div></div></div>`;
+  $('#help-close').addEventListener('click', () => (root.innerHTML = ''));
+  $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.innerHTML = ''; });
 }
 
 // ── login ────────────────────────────────────────────────────────────────────

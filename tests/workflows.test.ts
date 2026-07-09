@@ -45,6 +45,30 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(onMain.code).not.toBe(0);
   });
 
+  it('just-do: injects a follow-up sent mid-turn into the live turn (SPEC §5.6)', async () => {
+    const repo = await h.makeRepo('jd-mid');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('justDo', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // A ~3s turn — a window to send a follow-up while the single Do turn runs.
+      args: [baseInput(taskId, repo, { title: 'mid', prompt: '@sleep 3000\n@write base.txt :: base' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await new Promise((r) => setTimeout(r, 700));
+    await handle.signal('followUp', { id: 'm1', role: 'user', text: '@write injected.txt :: from a live follow-up', ts: 0 });
+    // The follow-up is executed in the SAME turn (in-flight), so the turn reaches Review
+    // with BOTH files written and no second Do turn.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('confirm');
+    const res = await handle.result();
+    expect(res.stage).toBe('done');
+    const injected = await git(repo, ['show', `karmax/${taskId}:injected.txt`]);
+    expect(injected.stdout).toContain('from a live follow-up');
+    const base = await git(repo, ['show', `karmax/${taskId}:base.txt`]);
+    expect(base.stdout).toContain('base');
+  });
+
   it('script-exec: runs a command and captures its output', async () => {
     const repo = await h.makeRepo('se');
     const taskId = newId('task');
@@ -154,5 +178,36 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(acct.status).toBe('available');
     await expect.poll(async () => ((await coord.query('accounts')) as any).accounts[0].inUse, { timeout: 10_000 }).toBe(0);
     await coord.terminate('test done');
+  });
+
+  it('merge queue reorders: prioritize (top), move-to-bottom, and drag (insert-before)', async () => {
+    const { mergeQueueId } = await import('../src/coordinators/names.js');
+    const domain = 'repo:main';
+    // Seed with a held slot so the coordinator parks instead of draining the queue.
+    const wf = await h.client.workflow.start('mergeQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: mergeQueueId(domain),
+      args: [{ domain, state: { domain, queue: ['t1', 't2', 't3'], current: 'held', processed: 0 } }],
+    });
+    const q = async () => ((await wf.query('queue')) as any).queue as string[];
+    expect(await q()).toEqual(['t1', 't2', 't3']);
+
+    // Move to top (the old "Prioritize").
+    await wf.signal('prioritize', { taskId: 't3' });
+    await expect.poll(q, { timeout: 10_000 }).toEqual(['t3', 't1', 't2']);
+
+    // Move to bottom (reorder with no anchor).
+    await wf.signal('reorderQueue', { taskId: 't3' });
+    await expect.poll(q, { timeout: 10_000 }).toEqual(['t1', 't2', 't3']);
+
+    // Drag: place t1 immediately before t3.
+    await wf.signal('reorderQueue', { taskId: 't1', beforeTaskId: 't3' });
+    await expect.poll(q, { timeout: 10_000 }).toEqual(['t2', 't1', 't3']);
+
+    // Unknown anchor → falls to the bottom.
+    await wf.signal('reorderQueue', { taskId: 't2', beforeTaskId: 'gone' });
+    await expect.poll(q, { timeout: 10_000 }).toEqual(['t1', 't3', 't2']);
+
+    await wf.terminate('test done');
   });
 });

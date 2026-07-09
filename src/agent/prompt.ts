@@ -1,5 +1,5 @@
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
-import { WorldHandle } from '../world/types.js';
+import { WorldHandle, worldRepos } from '../world/types.js';
 import { roleDef, manifest } from '../contrib/manifests.js';
 
 /**
@@ -13,7 +13,7 @@ import { roleDef, manifest } from '../contrib/manifests.js';
 
 const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
 - create_sub_task(title, prompt): spawn a child task the parent awaits.
-- create_review_info(summary, links?, diff?, html?): attach polished review output for the human/parent at the Review stage.
+- create_review_info(caption?, actions?): attach click-to-verify affordances for the Review stage — the exact commands/artifacts a human clicks to check your work, NOT a prose summary (that goes in your messages). Each action is a "run" (a shell command run in this world — e.g. start a server/app; set server:true + openUrls for a long-lived one) or an "open" (a produced file or URL to open). The changed-files list is added automatically.
 - save_skill(name, content): persist a reusable skill for future tasks.
 - signal_completion(summary?): structured signal that your turn's work is complete. Call this exactly when you are done — do not write a "done" sentence instead.
 Do real work directly in the working directory (create/edit files, run commands). When finished, call signal_completion.`;
@@ -28,6 +28,7 @@ const FALLBACK_TEMPLATE = `{{toolsPreamble}}
 
 # World
 Working directory: {{worldPath}} (branch {{branch}} off {{base}}).
+{{worldRepos}}
 
 {{instructions}}`;
 
@@ -55,6 +56,7 @@ export function assemblePrompt(args: AssembleArgs): string {
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: args.world.root,
+    worldRepos: describeRepos(args.world),
     branch: args.world.branch,
     base: args.world.base,
     target: args.task.target ?? args.world.target ?? args.world.base,
@@ -67,4 +69,19 @@ export function assemblePrompt(args: AssembleArgs): string {
     ...(args.bindings ?? {}),
   };
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
+}
+
+/**
+ * A `{{worldRepos}}` block describing a multi-repo world's layout so the agent
+ * knows each repo lives in its own subdirectory of the working directory. Empty
+ * for a single-repo (or scratch) world, where the working directory IS the repo.
+ */
+function describeRepos(world: WorldHandle): string {
+  const repos = worldRepos(world);
+  if (repos.length <= 1) return '';
+  const lines = repos.map((r) => `- ${r.name}/ — checkout of ${r.repo}`).join('\n');
+  return (
+    `This world spans ${repos.length} repositories, each checked out in its own subdirectory of the working directory ` +
+    `(all on branch ${world.branch}). \`cd\` into a subdirectory to run git/build commands for that repo:\n${lines}`
+  );
 }

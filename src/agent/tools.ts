@@ -51,10 +51,28 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'create_review_info',
-    description: 'Attach polished review output (summary, links, diff, html) shown at the Review stage.',
+    description:
+      "Attach click-to-verify affordances for the Review stage — the exact things a human clicks to check your work, NOT a prose summary of what you did (that belongs in your messages). Provide `actions`: each is either a `run` (a shell command executed in the task's world — e.g. start a server or app; set `server: true` for a long-lived process and list `openUrls` to open once it's up) or an `open` (a produced artifact to open: a world-relative file path — PDF, notebook, image, video — or an absolute URL, in `target`). Add a one-line `caption` saying what to verify. The changed-files list is added automatically.",
     parameters: {
       type: 'object',
       properties: {
+        caption: { type: 'string', description: 'One line: WHAT to verify (not a narrative of what you did).' },
+        actions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', enum: ['run', 'open'] },
+              label: { type: 'string', description: 'Short button label.' },
+              command: { type: 'string', description: 'run: the shell command executed in the world.' },
+              server: { type: 'boolean', description: 'run: command is a long-lived server/watcher (stream logs + Stop).' },
+              openUrls: { type: 'array', items: { type: 'string' }, description: 'run: URLs to open once it is up.' },
+              target: { type: 'string', description: 'open: a world-relative file path or an absolute URL.' },
+            },
+            required: ['kind', 'label'],
+          },
+        },
+        // Legacy free-form fields, still accepted for back-compat.
         summary: { type: 'string' },
         links: { type: 'array', items: { type: 'object', properties: { label: { type: 'string' }, url: { type: 'string' } } } },
         diff: { type: 'string' },
@@ -151,6 +169,19 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       required: ['action'],
     },
   },
+  {
+    name: 'confirm_decision',
+    description:
+      'Confirm agents ONLY. You are the reviewer at the Review gate — decide whether the work is acceptable, do NOT keep building it. action: "confirm" (accept the work; it proceeds to PR/merge), "revise" (send it back to the Do agent with specific feedback in `text`), or "reject" (the work is unsalvageable; cancel the task, say why in `text`). Calling this ends your turn.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['confirm', 'revise', 'reject'] },
+        text: { type: 'string', description: 'For revise: the feedback the Do agent should act on. For reject: why the work is being cancelled.' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 /** The world file/shell tools the Claude Agent SDK provides natively (Read/Write/Bash),
@@ -191,6 +222,8 @@ export function platformToolHandlers(
     },
     async create_review_info(args) {
       ctx.createReviewInfo({
+        caption: args?.caption,
+        actions: Array.isArray(args?.actions) ? args.actions : undefined,
         summary: args?.summary,
         links: args?.links,
         diff: args?.diff,
@@ -245,6 +278,12 @@ export function platformToolHandlers(
       if (!t) return 'invalid resolve decision — use action: resume | retryStage | gotoStage | parkUntil | escalate';
       ctx.resolveDecision(t);
       return `resolution recorded: ${t.do}`;
+    },
+    async confirm_decision(args) {
+      const action = String(args?.action ?? '');
+      if (!['confirm', 'revise', 'reject'].includes(action)) return 'invalid confirm decision — use action: confirm | revise | reject';
+      ctx.confirmDecision({ action: action as 'confirm' | 'revise' | 'reject', text: args?.text ? String(args.text) : undefined });
+      return `confirm decision recorded: ${action}`;
     },
   };
 }

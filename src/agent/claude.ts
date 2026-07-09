@@ -4,7 +4,14 @@ import path from 'node:path';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
+import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
+import { messagesToDeliver, conversationToPromptText } from './history.js';
+import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
+import { newSubagentTracker, trackTaskMessage, pendingSubagentCount } from './subagents.js';
+import { spawn } from 'node:child_process';
+import { registerAgent, unregisterAgent, killAgent } from './custody.js';
+import { trackProcess } from '../util/processes.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -55,7 +62,10 @@ export class ClaudeAdapter implements AgentAdapter {
     const userMsgs = input.messages.filter((m) => m.role !== 'system');
     if (userMsgs.length) {
       for (const m of userMsgs) {
-        messages.push({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text });
+        messages.push({
+          role: m.role === 'agent' ? 'assistant' : 'user',
+          content: m.role === 'agent' ? m.text : anthropicUserContent(m),
+        });
       }
     } else {
       messages.push({ role: 'user', content: 'Begin the task. Call signal_completion when done.' });
@@ -63,6 +73,27 @@ export class ClaudeAdapter implements AgentAdapter {
 
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
+    // How many `input.messages` this turn has consumed. This path rebuilds the full
+    // history each call (stateless), so it starts having delivered them all; follow-ups
+    // that land mid-turn are folded in at the idle boundary below (SPEC §5.6).
+    let deliveredIndex = input.messages.length;
+    // Fold any follow-ups queued at/after `deliveredIndex` into the running exchange
+    // as fresh user turns — same-activity injection so the agent keeps working instead
+    // of ending the turn and re-running from scratch. Returns how many were added.
+    const injectFollowUps = async (): Promise<number> => {
+      if (!ctx.pullFollowUps) return 0;
+      let added = 0;
+      try {
+        for (const m of await ctx.pullFollowUps(deliveredIndex)) {
+          if (m.role !== 'system' && m.role !== 'agent') {
+            messages.push({ role: 'user', content: anthropicUserContent(m) });
+            added++;
+          }
+          deliveredIndex++;
+        }
+      } catch { /* a failed poll must never break the turn */ }
+      return added;
+    };
 
     for (let i = 0; i < maxIters; i++) {
       if (ctx.signal?.aborted) break; // cancelled mid-turn (SPEC §5.6)
@@ -76,7 +107,10 @@ export class ClaudeAdapter implements AgentAdapter {
         },
         body: JSON.stringify({
           model,
-          max_tokens: 4096,
+          // A whole coding response (a rewritten file, a long explanation + tool call)
+          // can exceed 4096 output tokens; too low a cap truncates mid-response, which
+          // the loop below then has to recover from. 8192 keeps most turns single-shot.
+          max_tokens: 8192,
           system: input.systemPrompt,
           messages,
           tools,
@@ -94,7 +128,22 @@ export class ClaudeAdapter implements AgentAdapter {
         finalText = text;
         ctx.emit(text);
       }
-      if (toolUses.length === 0) break;
+      if (toolUses.length === 0) {
+        // A `max_tokens` cut-off is a TRUNCATED response, not a finished turn — the
+        // model ran out of output budget mid-thought (often right after narrating an
+        // action, before emitting its tool_use). Breaking here treats that chopped-off
+        // preamble as completion, which surfaces the task at Review having done nothing
+        // — the metered-path twin of the "agent just stopped" bug. Ask it to continue
+        // instead; the enclosing maxIters loop bounds this so it can't spin forever.
+        if (data.stop_reason === 'max_tokens') {
+          messages.push({ role: 'user', content: 'Continue.' });
+          continue;
+        }
+        // The agent is idle. If a follow-up landed mid-turn, fold it in and keep going
+        // in this same activity rather than ending the turn (SPEC §5.6); else finish.
+        if (await injectFollowUps()) continue;
+        break;
+      }
 
       const toolResults: any[] = [];
       let completed = false;
@@ -111,7 +160,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // The Messages API is stateless — there is no provider conversation id to
     // resume by, so we don't fabricate one (SPEC §10.5). Use the Agent SDK path
     // (ambient Claude Code login) for resumable sessions.
-    return { session: input.session, output: finalText };
+    return { session: input.session, output: finalText, delivered: deliveredIndex };
   }
 
   // ─── Claude Agent SDK (ambient Claude Code login) ───────────────────────────
@@ -138,8 +187,68 @@ export class ClaudeAdapter implements AgentAdapter {
       tools: buildSdkTools(tool, zod, handlers),
     });
 
-    const userText = input.messages.filter((m) => m.role !== 'system').map((m) => m.text).join('\n\n') ||
-      'Begin the task described in the system prompt. Call signal_completion when done.';
+    // Only the messages new since the resumed session last advanced (the whole
+    // conversation on a fresh session) — the session already holds the rest, so
+    // re-sending it would replay the agent's own past replies back at it (§7.2).
+    const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
+    // Attribute agent turns (`assistant:`) so a replayed full transcript — a fork, or
+    // a resume whose provider session couldn't be reattached — never folds the agent's
+    // OWN prior replies back in as fresh user input (§7.2). The initial delta collapses
+    // to one user turn (text concatenated, images appended); later follow-ups arrive as
+    // their own user messages via in-flight injection below.
+    const userText = conversationToPromptText(convo) ||
+      (input.session ? 'Continue from the latest instruction.' : 'Begin the task described in the system prompt. Call signal_completion when done.');
+    const imageBlocks = collectAnthropicImageBlocks(convo);
+    const initialContent: string | any[] = imageBlocks.length
+      ? [...(userText ? [{ type: 'text', text: userText }] : []), ...imageBlocks]
+      : userText;
+
+    // Streaming-input mode (SPEC §5.6): the SDK's `prompt` is a live async iterable.
+    // We yield the initial delta, keep the stream open, and inject follow-ups that land
+    // in the workflow WHILE the turn runs — the SDK delivers each to the live agent at
+    // its next turn boundary, exactly like a human typing mid-run in the CLI. With no
+    // live channel (a resumed retry, or a unit test), we close right after the initial
+    // message, collapsing to the old single-shot behaviour.
+    //
+    // `deliveredIndex` tracks how many `input.messages` this turn has consumed (the
+    // initial delta covers everything up to the schedule snapshot); each injected
+    // follow-up advances it, and it is reported back so the workflow positions the
+    // agent's reply and advances its boundary past exactly what was delivered.
+    let deliveredIndex = input.messages.length;
+    const injector = createFollowUpInjector([toSdkUserMessage(initialContent)]);
+    const promptArg: any = injector.stream;
+
+    // Fetch + inject any follow-ups queued at/after `deliveredIndex`. Serialized by
+    // `pollLock` so the interval poller and the idle-boundary poll can't double-count.
+    let pollLock = false;
+    const drainFollowUps = async (): Promise<number> => {
+      if (!ctx.pullFollowUps || injector.closed || pollLock) return 0;
+      pollLock = true;
+      try {
+        const news = await ctx.pullFollowUps(deliveredIndex);
+        let injected = 0;
+        for (const m of news) {
+          // If the turn ended (injector closed) between the poll and here, leave the
+          // rest for the NEXT turn — do NOT advance `deliveredIndex` past a message we
+          // couldn't inject, or it would be marked delivered yet never reach the agent.
+          if (injector.closed) break;
+          // Mid-turn appends are follow-ups (user) or child-event notices (system).
+          // Inject user messages into the live session; skip system (the real adapters
+          // never send conversation system messages) — but count both so the index
+          // stays aligned with the workflow's `msgs` array.
+          if (m.role !== 'system' && m.role !== 'agent') {
+            injector.push(toSdkUserMessage(followUpContent(m)));
+            injected++;
+          }
+          deliveredIndex++;
+        }
+        return injected;
+      } catch {
+        return 0; // a failed poll must never break the turn
+      } finally {
+        pollLock = false;
+      }
+    };
 
     // Scrubbed, config-home-isolated env (SPEC §7.3).
     const { scrubbedEnv } = await import('../autonomy/config-homes.js');
@@ -166,10 +275,23 @@ export class ClaudeAdapter implements AgentAdapter {
     // and codex paths already heartbeat) — the subprocess would run to completion.
     const hb = ctx.heartbeat ? setInterval(() => { try { ctx.heartbeat!(); } catch { /* ignore */ } }, 10_000) : undefined;
 
+    // Poll the workflow for mid-turn follow-ups and inject them into the live session
+    // (SPEC §5.6). With no live channel there's nothing to poll — close the input
+    // stream now so this turn is a single-shot on the initial message (old behaviour).
+    let followPoll: ReturnType<typeof setInterval> | undefined;
+    if (ctx.pullFollowUps) followPoll = setInterval(() => { void drainFollowUps(); }, 1200);
+    else injector.close();
+
     let finalText = '';
     let session = input.session;
+    let completionSeen = false; // agent called signal_completion → stop injecting, end the turn
+    // Track in-harness sub-agents (the Task tool). Claude Code auto-backgrounds long
+    // sub-agents, so the main `result` can arrive — completion already signalled —
+    // while a sub-agent is still running. We fold every task-lifecycle message in and
+    // report the residual count so the workflow won't advance Do→Review mid-flight.
+    const subagents = newSubagentTracker();
     const iterator = query({
-      prompt: userText,
+      prompt: promptArg,
       options: {
         abortController,
         cwd: input.world.handle.root,
@@ -200,7 +322,18 @@ export class ClaudeAdapter implements AgentAdapter {
           if (tool === 'Bash' && typeof toolInput?.command === 'string') ctx.emit(`$ ${toolInput.command}`);
           return { behavior: 'allow' as const, updatedInput: toolInput };
         },
-        systemPrompt: input.systemPrompt,
+        // Run on TOP of Claude Code's own system prompt, not instead of it. A bare
+        // string here is a *custom* prompt that REPLACES the default (SDK docs:
+        // "string - Use a custom system prompt"), stripping the claude_code harness
+        // scaffolding — the persistence/anti-preamble conditioning that makes the CLI
+        // keep working through "I'll apply the edit now."-style narration instead of
+        // ending the turn. Without it the model reverts to conversational-assistant
+        // behavior: it narrates intent, emits no tool call, and the SDK query ends —
+        // which karmax records as a finished turn with completed:false → needsInput →
+        // Review with an empty diff (the "agent just stopped" reports, only in karmax
+        // and never in the CLI, because the CLI always runs this preset). We keep
+        // karmax's own task/tooling instructions by APPENDING them to the preset.
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: input.systemPrompt },
         ...(input.profile.model ? { model: input.profile.model } : {}),
         // Reasoning effort (SPEC §10.5); the SDK silently downgrades for models
         // that don't support the level, so no gating is needed here.
@@ -211,6 +344,39 @@ export class ClaudeAdapter implements AgentAdapter {
         // The platform MCP (in-process) + any MCP servers the workflow declares (§7.5).
         mcpServers: { karmax: platform, ...agentMcpToConfig(input.agentMcp) },
         env,
+        // Spawn the agent harness ourselves (same call the SDK makes internally:
+        // stdio ['pipe','pipe','ignore'], the SDK's forwarded abort signal) so the
+        // subprocess pid is visible to karmax. That buys the two things the SDK's
+        // opaque default spawn couldn't give us:
+        //  - custody (src/agent/custody.ts): a pidfile + detached process group,
+        //    so a SIGKILLed karmax can reap this agent's whole tool subtree at
+        //    next boot — parity with the codex adapter;
+        //  - the live task-manager registry (dashboard Processes panel), with the
+        //    task attribution and an escalating kill.
+        spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
+          const child = spawn(o.command, o.args, {
+            cwd: o.cwd,
+            env: o.env,
+            signal: o.signal,
+            stdio: ['pipe', 'pipe', 'ignore'],
+            windowsHide: true,
+            detached: true, // own process group ⇒ group kills reap tool subprocesses too
+          });
+          if (child.pid) {
+            const pid = child.pid;
+            registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });
+            const untrack = trackProcess({
+              pid,
+              kind: 'agent',
+              label: `claude agent (${input.role})`,
+              taskId: input.world.handle.id,
+              startedAt: Date.now(),
+              kill: () => killAgent(pid),
+            });
+            child.once('exit', () => { untrack(); unregisterAgent(pid); });
+          }
+          return child;
+        },
       },
     });
     let publishedSession = false;
@@ -221,8 +387,13 @@ export class ClaudeAdapter implements AgentAdapter {
         // it — so the drawer shows a live "fork this agent" command mid-turn (#3).
         const sid: string | undefined = (message as any).session_id;
         if (sid && !publishedSession) { session = sid; publishedSession = true; ctx.onSession?.(sid); }
+        // Fold sub-agent (Task tool) lifecycle events into the outstanding set. Draining
+        // the stream to its end lets any in-turn settlements clear before we report —
+        // only genuinely still-running sub-agents remain (see subagents.ts).
+        trackTaskMessage(subagents, message);
         if (message.type === 'assistant') {
-          const text = (message.message?.content ?? [])
+          const content = (message.message?.content ?? []) as any[];
+          const text = content
             .filter((b: any) => b.type === 'text')
             .map((b: any) => b.text)
             .join('\n');
@@ -230,8 +401,25 @@ export class ClaudeAdapter implements AgentAdapter {
             finalText = text;
             ctx.emit(text);
           }
+          // The agent's explicit "I'm done" — a signal_completion tool call (the MCP
+          // tool name is namespaced, e.g. `mcp__karmax__signal_completion`). Once seen,
+          // stop injecting: the agent decided the turn is over, so a follow-up arriving
+          // now belongs to the NEXT turn / Review, not crammed into this one.
+          if (content.some((b: any) => b.type === 'tool_use' && /signal_completion$/.test(String(b.name ?? '')))) {
+            completionSeen = true;
+          }
         } else if (message.type === 'result') {
           session = message.session_id ?? session;
+          // The agent went idle (finished responding to its current input). End the
+          // turn — UNLESS a follow-up landed in the meantime and the agent hasn't
+          // declared completion, in which case inject it and let the session continue
+          // in-place rather than tearing down and resuming on a fresh turn.
+          if (completionSeen) {
+            injector.close();
+          } else {
+            const injected = await drainFollowUps();
+            if (!injected) injector.close();
+          }
         }
       }
     } catch (e) {
@@ -241,12 +429,17 @@ export class ClaudeAdapter implements AgentAdapter {
       if (!ctx.signal?.aborted) throw e;
     } finally {
       if (hb) clearInterval(hb);
+      if (followPoll) clearInterval(followPoll);
+      injector.close(); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
     }
     // The Agent SDK harness completes its own loop; treat a finished query as a
     // turn boundary. If the agent didn't call signal_completion explicitly, the
-    // runtime surfaces the output at Review.
-    return { session, output: finalText };
+    // runtime surfaces the output at Review. `delivered` = every message this turn
+    // consumed (initial delta + in-flight injections) so the workflow advances its
+    // boundary past exactly them.
+    const pending = pendingSubagentCount(subagents);
+    return { session, output: finalText, delivered: deliveredIndex, ...(pending ? { pendingSubagents: pending } : {}) };
   }
 }
 

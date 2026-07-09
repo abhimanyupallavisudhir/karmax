@@ -30,6 +30,7 @@ const ctx = (): PlatformToolContext => ({
   waitForSubtasks() {},
   saveSkill() {},
   resolveDecision() {},
+  confirmDecision() {},
   async requestSpend() { return { status: 'denied' as const }; },
   emit() {},
 });
@@ -100,8 +101,8 @@ describe.skipIf(!codexKey)('LIVE Codex — API key (Responses API)', () => {
   }, 120_000);
 });
 
-describe.skipIf(!codexSub)('LIVE Codex — subscription (codex exec)', () => {
-  it('runs a headless `codex exec` turn on the subscription and returns text', async () => {
+describe.skipIf(!codexSub)('LIVE Codex — subscription (app-server)', () => {
+  it('runs a headless app-server turn on the subscription and returns text', async () => {
     const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
     const r = await new CodexAdapter().runTurn(
       { profile: profile({ provider: 'codex', model: 'gpt-5.5' }), world: await makeWorld(), messages: [{ id: 'm', role: 'user', text: 'Reply with exactly the word READY and do not modify any files.', ts: 0 }], systemPrompt: SYS, role: 'do', resolvedAuth: { configHome: codexHome } } as any,
@@ -109,6 +110,30 @@ describe.skipIf(!codexSub)('LIVE Codex — subscription (codex exec)', () => {
     );
     expect(r.output.length).toBeGreaterThan(0);
     expect(r.session).toBeTruthy(); // a thread id we can resume
+  }, 180_000);
+
+  it('delivers a follow-up that lands mid-turn into the LIVE thread (turn/steer, SPEC §5.6)', async () => {
+    const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+    let injected = false;
+    const steerCtx: PlatformToolContext = {
+      ...ctx(),
+      // Deliver ONE follow-up on the first poll (index ≥ 1). While the turn runs the
+      // adapter steers it into the live thread; if the window is missed it drives a
+      // follow-on turn — either way the turn must report both messages delivered.
+      async pullFollowUps(fromIndex: number) {
+        if (!injected && fromIndex >= 1) { injected = true; return [{ id: 'f1', role: 'user', text: 'Acknowledge with the word GOT_IT.', ts: 1 }] as any; }
+        return [];
+      },
+    };
+    const r = await new CodexAdapter().runTurn(
+      // A single long-running shell command gives a reliable in-flight window.
+      { profile: profile({ provider: 'codex', model: 'gpt-5.5', effort: 'low' }), world: await makeWorld(), messages: [{ id: 'm', role: 'user', text: 'Run exactly the shell command `sleep 8` and nothing else, then reply DONE.', ts: 0 }], systemPrompt: SYS, role: 'do', resolvedAuth: { configHome: codexHome } } as any,
+      steerCtx,
+    );
+    // The adapter consumed both the initial message and the mid-turn follow-up — proving
+    // the app-server steer/inject path end-to-end against the live server.
+    expect(r.delivered).toBe(2);
+    expect(r.session).toBeTruthy();
   }, 180_000);
 });
 

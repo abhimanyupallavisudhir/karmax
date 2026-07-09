@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ConfigHomeManager, scrubbedEnv, isLoggedIn, isFullyAuthed, KARMAX_TOKEN_FILE } from './config-homes.js';
 import { Provider } from '../domain/types.js';
+import { trackProcess } from '../util/processes.js';
 
 /**
  * Provider account login (SPEC §7.6, §7.3). Mints an isolated config home per
@@ -65,6 +66,11 @@ export class LoginManager {
     // write the native credential (`.credentials.json` / `auth.json`) directly, so
     // the account reads as signed-in. If someone overrides back to `setup-token`
     // (which PRINTS a token instead), persist that too so the SDK can use it.
+    if (child.pid) {
+      // Task-manager registry (dashboard Processes panel): the login CLI runs
+      // unsupervised until the user finishes OAuth — visible there, killable if stuck.
+      child.once('exit', trackProcess({ pid: child.pid, kind: 'login', label: `${provider} login (${account})`, startedAt: Date.now() }));
+    }
     persistTokenWhenPrinted(child, configHome);
     const url = await captureUrl(child, opts.urlTimeoutMs ?? 8000);
     child.unref(); // let it keep running while the user completes OAuth

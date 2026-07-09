@@ -80,6 +80,8 @@ export interface CoreActivityDeps {
 export interface CreateWorldArgs {
   taskId: string;
   repo?: string;
+  /** Source repos for a multi-repo world; takes precedence over `repo`. */
+  repos?: string[];
   base: string;
   target?: string;
   branch?: string;
@@ -93,6 +95,9 @@ export interface RunAgentTurnArgs {
   worldHandle: WorldHandle;
   messages: Message[];
   session?: string;
+  /** How many leading `messages` the resumed `session` already holds — forwarded to
+   *  the adapter so a resumed turn sends only the delta, not the whole transcript. */
+  deliveredMessages?: number;
   task: TaskInput;
   bindings?: Record<string, string>;
   explicitProfileId?: string;
@@ -137,6 +142,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await worlds.create(args.kind, {
         taskId: args.taskId,
         repo: args.repo,
+        repos: args.repos,
         base: args.base,
         target: args.target,
         branch: args.branch,
@@ -183,6 +189,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // materializing the source session needs this turn's config home + world path.
       let session = args.session;
       let messages = args.messages; // may be augmented by the replay fallback
+      let deliveredMessages = args.deliveredMessages; // leading messages already in `session`
       let fork = false; // true → the adapter branches a NEW session id from `session`
 
       // Temporal wiring: cancellation aborts the in-flight turn (SPEC §5.6), and
@@ -192,16 +199,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let signal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
       let hbSession: string | undefined; // set once real progress exists (onSession)
+      // Live in-flight-injection channel: a streaming adapter polls the workflow for
+      // follow-ups queued WHILE this turn runs and injects them into the live session
+      // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
+      // continuation notice, so the workflow's msgs-index boundary no longer applies.
+      let liveChannel = true;
       try {
         const actx = activityContext.current();
         signal = actx.cancellationSignal;
         heartbeat = () => actx.heartbeat(hbSession ? { session: hbSession } : undefined);
         const prior = (actx.info.heartbeatDetails as { session?: string } | undefined)?.session;
         if (actx.info.attempt > 1 && prior) {
+          liveChannel = false;
           // The interrupted attempt's session already holds the original prompt and
           // any partial work — continue it rather than re-sending the turn input.
           session = prior;
           hbSession = prior;
+          // `messages` is replaced by the single continuation notice below, so the
+          // delivered-boundary from the workflow no longer applies — send all of it.
+          deliveredMessages = 0;
           messages = [
             {
               id: `retry-${actx.info.attempt}`,
@@ -332,6 +348,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Snapshot the journaled turn input (SPEC §5.4).
       record(args.taskId, 'turn.prompt', { role: args.role, profile: profile.id, provider: profile.provider });
 
+      // Live follow-up poller (SPEC §5.6): a streaming adapter calls this mid-turn to
+      // fetch follow-ups queued in the workflow at/after a `msgs` index and inject them
+      // into the running session. Backed by the workflow's `pendingMessages` query;
+      // absent when there's no client (unit tests) or the workflow doesn't define it
+      // (the query throws → treated as "no new messages").
+      const pullFollowUps: ((fromIndex: number) => Promise<Message[]>) | undefined =
+        deps.client && liveChannel
+          ? async (fromIndex: number) => {
+              try {
+                const handle = deps.client!.workflow.getHandle(args.taskId);
+                const out = (await handle.query('pendingMessages', args.role, fromIndex)) as Message[] | undefined;
+                return Array.isArray(out) ? out : [];
+              } catch {
+                return []; // query not registered / workflow gone / transient — no injection
+              }
+            }
+          : undefined;
+
       // Host-wide agent-turn admission (SPEC §12): cap concurrent model
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
@@ -345,6 +379,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           world,
           messages,
           session,
+          deliveredMessages,
           fork,
           systemPrompt,
           role: args.role,
@@ -357,6 +392,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           adapters: deps.adapters,
           signal,
           heartbeat,
+          pullFollowUps,
           // Coalesce the live-output stream: adapters re-emit the growing *cumulative*
           // message text, so consecutive identical/prefix emits carry no new info.
           // Dropping them cuts the single biggest events-table growth driver

@@ -160,6 +160,9 @@ a { color: var(--accent); text-decoration: none; }
 .rail .grow { flex: 1; }
 .rail .nav-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 7px; cursor: pointer; color: var(--ink-2); }
 .rail .nav-item:hover { background: var(--surface-2); color: var(--ink); }
+/* rail keyboard focus (g p → j/k/↵, Esc leaves). Plain :focus, not :focus-visible —
+   moveRail() focuses programmatically and must stay visibly highlighted. */
+.rail .proj:focus, .rail .nav-item:focus { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--surface-2); }
 
 /* ── main ───────────────────────────────────────────────────── */
 .main { overflow-y: auto; padding: 0; }
@@ -203,6 +206,9 @@ a { color: var(--accent); text-decoration: none; }
 .status-dot.cancelled { background: var(--ink-3); }
 .task-main { min-width: 0; }
 .task-title { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Human-facing sequential task id (SPEC §10.6): a quiet monospace tag before the title. */
+.task-num { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); font-weight: 500; }
+.drawer-head .row1 .task-num { font-size: 13px; align-self: center; }
 .task-sub { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-3); margin-top: 3px; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
@@ -308,6 +314,10 @@ a { color: var(--accent); text-decoration: none; }
 .review { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; background: var(--surface-2); }
 .review .summary { margin-bottom: 10px; }
 .review .links { display: flex; flex-wrap: wrap; gap: 8px; }
+.review .review-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
+.review .review-actions .btn.review-action { font-family: var(--font-mono); }
+.btn.danger { border-color: var(--danger); color: var(--danger); }
+#review-action-out { margin-top: 8px; }
 .review iframe { width: 100%; min-height: 220px; border: 1px solid var(--line); border-radius: var(--r-sm); background: #fff; }
 .diff { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; white-space: pre; }
 .diff .add { color: var(--merged); }
@@ -321,8 +331,8 @@ a { color: var(--accent); text-decoration: none; }
 /* action forms (the generic auto-render floor) */
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .followup-box { display: flex; gap: 8px; margin-top: 10px; align-items: flex-end; }
-.followup-box textarea { flex: 1; resize: vertical; min-height: 38px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); outline: none; }
-.followup-box textarea:focus { border-color: var(--accent); }
+.followup-box .prompt-field { flex: 1; }
+.followup-box textarea { min-height: 38px; }
 /* The follow-up box now lives inside each conversation — set it apart from the thread above it. */
 .conversation .followup-box { margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
 
@@ -335,12 +345,22 @@ a { color: var(--accent); text-decoration: none; }
 details.advanced { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 12px; }
 details.advanced summary { cursor: pointer; color: var(--ink-3); font-size: 12px; user-select: none; }
 pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 10px; overflow-x: auto; max-height: 260px; }
+/* The check-in terminal: a focusable screen the user types straight into. */
+pre.term-screen { overflow-y: auto; white-space: pre-wrap; word-break: break-word; cursor: text; }
+pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-weak); }
 
 /* ── queue / dashboard / settings ──────────────────────────── */
 .card { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); padding: 16px; margin-bottom: 12px; }
 .queue-item { display: flex; align-items: center; gap: 12px; padding: 11px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); margin-bottom: 8px; }
 .queue-item .pos { font-family: var(--font-mono); font-weight: 700; color: var(--accent); width: 28px; }
 .queue-item.current { border-color: var(--merged); background: var(--merged-weak); }
+.queue-item.dragging { opacity: 0.4; }
+.queue-item[draggable="true"] { cursor: grab; }
+.queue-item .drag-handle { color: var(--ink-3); cursor: grab; width: 14px; text-align: center; user-select: none; }
+.queue-item .drag-handle.placeholder { cursor: default; }
+.queue-actions { display: flex; gap: 6px; }
+.queue-domain { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); margin: 14px 0 6px; }
+.queue-domain:first-child { margin-top: 0; }
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
 .stat { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; background: var(--surface); }
 .stat .n { font-size: 26px; font-weight: 700; font-family: var(--font-mono); letter-spacing: -0.02em; }
@@ -401,7 +421,20 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
 .palette input { width: 100%; padding: 14px 16px; border: 0; border-bottom: 1px solid var(--line); outline: none; background: transparent; font-size: 15px; }
 .palette .opt { padding: 10px 16px; cursor: pointer; display: flex; align-items: center; gap: 10px; }
 .palette .opt.active { background: var(--accent-weak); }
-.palette .opt .key { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+.palette .opt.danger { color: var(--danger); }
+.palette .opt .key { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; white-space: nowrap; }
+#pal-list { max-height: 46vh; overflow: auto; }
+.pal-group { padding: 8px 16px 2px; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+.pal-sub { margin-left: 8px; font-size: 11px; color: var(--ink-3); }
+.pal-empty { padding: 14px 16px; color: var(--ink-3); font-size: 13px; }
+
+/* keyboard navigation: list cursor, digit hints on action buttons, "?" help */
+.task-row.cursor, .queue-item.cursor { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.task-row:focus-visible, .queue-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.kbd { margin-left: 7px; font-family: var(--font-mono); font-size: 10px; line-height: 1.5; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.btn.primary .kbd, .btn.danger .kbd { color: inherit; border-color: currentColor; opacity: .7; }
+.help-row { display: flex; gap: 12px; padding: 4px 0; font-size: 13px; align-items: baseline; }
+.help-row .key { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; min-width: 34px; text-align: center; white-space: nowrap; }
 
 /* login */
 .login-wrap { display: grid; place-items: center; height: 100vh; }
@@ -543,3 +576,133 @@ pre.raw { font-family: var(--font-mono); font-size: 11px; background: var(--surf
 .run-drawer-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: var(--r-sm); cursor: pointer; }
 .run-drawer-row:hover { background: var(--surface-2); }
 .run-drawer-row .run-when { margin-left: auto; color: var(--ink-3); font-size: 12px; }
+/* ── Image attachments (paste/drag an image into a prompt field) ── */
+/* A prompt box whose pasted-image chips sit inside it (below the text), so the
+   whole field grows to fit them rather than shrinking the textarea or spilling
+   into a separate section. The wrapper carries the border; the textarea is bare. */
+.prompt-field { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.prompt-field:focus-within { border-color: var(--accent); }
+.prompt-field > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
+.prompt-field > .img-chips { margin: 0; padding: 0 10px 9px; }
+.form-row .prompt-field { background: var(--surface-2); }
+.img-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.img-chip { position: relative; display: inline-flex; }
+.img-chip img {
+  width: 52px; height: 52px; object-fit: cover;
+  border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2);
+}
+.img-chip-x {
+  position: absolute; top: -6px; right: -6px; width: 18px; height: 18px;
+  border-radius: 50%; border: 1px solid var(--line-strong); background: var(--surface);
+  color: var(--ink-3); font-size: 11px; line-height: 1; cursor: pointer; padding: 0;
+}
+.img-chip-x:hover { color: var(--accent); border-color: var(--accent); }
+.msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.msg-images img {
+  max-width: 180px; max-height: 180px; object-fit: contain;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2);
+}
+
+/* ── task search & organization (views bar, query toolbar, tags) ───────────── */
+/* The task-list "organizer" panel: search box + saved views + query toolbar, grouped
+   into one integrated surface at the top of the list. */
+.organizer {
+  margin: 10px 0 2px; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--surface-2);
+}
+.search-box { display: flex; align-items: center; gap: 8px; padding: 2px 4px; }
+.search-box .search-ic { color: var(--ink-3); font-size: 15px; }
+.task-search {
+  flex: 1; border: 0; outline: none; background: transparent; color: var(--ink);
+  font-size: 14px; font-family: var(--font-ui); padding: 4px 0;
+}
+.task-search::placeholder { color: var(--ink-3); }
+.search-box .search-x {
+  border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 13px;
+  padding: 2px 6px; border-radius: 6px;
+}
+.search-box .search-x:hover { background: var(--surface); color: var(--ink); }
+.organizer .views-bar { margin: 6px 0 2px; border-top: 1px solid var(--line); padding-top: 8px; }
+.organizer .query-bar { margin: 6px 0 0; }
+
+.views-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 4px; }
+.view-chip {
+  font-size: 12px; padding: 4px 11px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
+  user-select: none; white-space: nowrap;
+}
+.view-chip { display: inline-flex; align-items: center; gap: 6px; }
+.view-chip:hover { border-color: var(--line-strong); color: var(--ink); }
+.view-chip.active { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
+.view-chip.add { color: var(--ink-3); border-style: dashed; }
+.view-x { opacity: 0; font-size: 10px; color: var(--ink-3); cursor: pointer; margin-left: -1px; transition: opacity .1s; }
+.view-chip:hover .view-x { opacity: .65; }
+.view-x:hover { opacity: 1; color: var(--danger); }
+
+.query-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0 2px; }
+.q-sel {
+  font-size: 12px; padding: 4px 8px; border-radius: 7px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
+  font-family: var(--font-ui); max-width: 220px;
+}
+.q-sel:hover { border-color: var(--line-strong); }
+.q-spacer { flex: 1; }
+
+.group-h {
+  display: flex; align-items: center; gap: 8px; margin: 14px 0 4px;
+  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-3);
+}
+.group-h .pill { font-family: var(--font-mono); font-weight: 400; }
+
+/* Tag chips + priority flag on task rows and in the drawer. */
+.tag-chip {
+  --tag: var(--accent);
+  font-size: 11px; padding: 1px 8px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid color-mix(in srgb, var(--tag) 35%, var(--line));
+  background: color-mix(in srgb, var(--tag) 12%, transparent);
+  color: color-mix(in srgb, var(--tag) 72%, var(--ink));
+}
+.tag-chip.type { border-radius: 5px; }  /* labels (bug/feature) squared; topics rounded */
+.org-tags [data-untag] { cursor: pointer; }
+.org-tags [data-untag]:hover { filter: brightness(1.1); }
+
+.prio { font-size: 11px; font-weight: 600; padding: 0 5px; border-radius: 5px; white-space: nowrap; }
+.prio.p1 { color: var(--ink-3); }
+.prio.p2 { color: var(--merged); }
+.prio.p3 { color: var(--working); }
+.prio.p4 { color: var(--danger); background: var(--danger-weak); }
+
+/* Drawer organization row (priority + tags). */
+.drawer-org { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; }
+.drawer-org .org-prio { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); }
+.drawer-org .org-tags { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+
+/* Filter picker + tags manager modals (reuse .palette shell). */
+.palette.fp, .palette.tagm { width: min(460px, 92vw); }
+.palette .fp-head { padding: 12px 16px; font-weight: 600; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
+.palette .fp-neg { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--ink-3); display: inline-flex; align-items: center; gap: 4px; }
+.palette #fp-list, .palette #tp-list, .palette #tagm-list { max-height: 46vh; overflow: auto; }
+.fp-row { display: flex; gap: 6px; padding: 10px 16px 0; }
+.palette .fp input[type="checkbox"], .palette .tagm input[type="checkbox"] { width: auto; padding: 0; border: 0; }
+.palette .fp input.title-in, .palette .tagm input.title-in { border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font-size: 13px; }
+.palette .fp #fp-add, .palette .fp #tp-add { margin: 10px 16px 14px; }
+.tagm-row { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
+.tagm-new { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 12px 16px; }
+.tagm-new input[type="color"] { width: 30px; height: 30px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: none; }
+.tagm-new input.title-in { flex: 1; min-width: 160px; }
+.tagm-hint { padding: 0 16px 14px; font-size: 11px; color: var(--ink-3); line-height: 1.5; }
+
+/* ── dashboard processes (task manager) ── */
+.proc-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.proc-table th, .proc-table td { text-align: left; padding: 5px 12px; border-bottom: 1px solid var(--line); }
+.proc-table th { color: var(--ink-3); font-weight: 600; }
+.proc-table th.num, .proc-table td.num { text-align: right; white-space: nowrap; }
+.proc-table td.cmd { max-width: 0; width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proc-table tr.proc-group td { background: var(--surface-2); font-weight: 600; }
+.proc-table tr.proc-group td.cmd { font-family: var(--font-ui); }
+.proc-table .proc-age { color: var(--ink-3); font-weight: 400; }
+.proc-table .proc-kill { padding: 0 7px; line-height: 18px; }
+.proc-table .proc-task { cursor: pointer; }
+.proc-table .proc-task:hover { color: var(--accent); border-color: var(--accent); }
+.proc-table .proc-lock { opacity: .55; cursor: help; font-size: 11px; }
+.proc-table .proc-kill { white-space: nowrap; }

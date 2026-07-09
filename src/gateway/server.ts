@@ -2,10 +2,12 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
 import { Store } from '../store/db.js';
+import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { ContributionRegistry } from '../contrib/registry.js';
@@ -20,6 +22,7 @@ import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
+import { ReviewActionRunner } from './review-actions.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -55,6 +58,25 @@ const MIME: Record<string, string> = {
   '.ico': 'image/x-icon',
 };
 
+/** Content types for review "open" artifacts (a superset of the static MIME map). */
+const ARTIFACT_MIME: Record<string, string> = {
+  ...MIME,
+  '.pdf': 'application/pdf',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/plain; charset=utf-8',
+  '.log': 'text/plain; charset=utf-8',
+  '.csv': 'text/csv; charset=utf-8',
+  '.ipynb': 'application/json; charset=utf-8',
+};
+
 interface Session {
   user: string;
   apiToken: string;
@@ -64,6 +86,9 @@ export class Gateway {
   private sessions = new Map<string, Session>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
+  /** Runs review "run" actions (dev servers, scripts) in the task's world. */
+  private reviewActions = new ReviewActionRunner();
+  private attachments = new AttachmentStore();
 
   constructor(private deps: GatewayDeps) {}
 
@@ -85,10 +110,12 @@ export class Gateway {
     //  /ws/terminal — a PTY against the task's world (cheap check-in, SPEC §5.5).
     const wssEvents = new WebSocketServer({ noServer: true });
     const wssTerm = new WebSocketServer({ noServer: true });
+    const wssAction = new WebSocketServer({ noServer: true });
     server.on('upgrade', (req, socket, head) => {
       const { pathname } = new URL(req.url ?? '/', 'http://localhost');
       if (pathname === '/ws') wssEvents.handleUpgrade(req, socket, head, (ws) => wssEvents.emit('connection', ws, req));
       else if (pathname === '/ws/terminal') wssTerm.handleUpgrade(req, socket, head, (ws) => wssTerm.emit('connection', ws, req));
+      else if (pathname === '/ws/review-action') wssAction.handleUpgrade(req, socket, head, (ws) => wssAction.emit('connection', ws, req));
       else socket.destroy();
     });
     wssEvents.on('connection', (ws) => {
@@ -99,6 +126,7 @@ export class Gateway {
       ws.on('error', off);
     });
     wssTerm.on('connection', (ws, req) => this.terminal(ws, req));
+    wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
 
     await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', () => resolve()));
     return {
@@ -106,8 +134,10 @@ export class Gateway {
       port,
       close: () =>
         new Promise<void>((resolve) => {
+          this.reviewActions.stopAll();
           wssEvents.close();
           wssTerm.close();
+          wssAction.close();
           server.close(() => resolve());
         }),
     };
@@ -139,15 +169,62 @@ export class Gateway {
       cwd,
       env: { ...process.env, PS1: 'karmax:\\W$ ' },
     });
+    // Task-manager registry: the PTY (and anything the user runs in it) shows up
+    // in the dashboard Processes panel under its task, and can be killed there.
+    const { trackProcess } = await import('../util/processes.js');
+    const untrack = term.pid
+      ? trackProcess({
+          pid: term.pid,
+          kind: 'terminal',
+          label: 'task terminal (bash)',
+          taskId,
+          startedAt: Date.now(),
+          kill: () => { try { term.kill(); } catch { /* already gone */ } },
+        })
+      : () => {};
     term.onData((d: string) => { try { ws.send(JSON.stringify({ type: 'data', data: d })); } catch {} });
-    term.onExit(() => { try { ws.close(); } catch {} });
+    term.onExit(() => { untrack(); try { ws.close(); } catch {} });
     ws.on('message', (raw) => {
       let msg: any;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'input') term.write(msg.data);
       else if (msg.type === 'resize') term.resize(msg.cols || 80, msg.rows || 24);
     });
-    ws.on('close', () => { try { term.kill(); } catch {} });
+    // Closing the socket (navigating away OR the user hitting "Kill terminal")
+    // tears the whole thing down — not just the shell, but every process it
+    // spawned. node-pty runs the shell as a session leader (its pid == the
+    // session id), so we kill the entire session: `pkill -s` reaps foreground
+    // AND background jobs, which a bare process-group kill would miss (bash job
+    // control puts each pipeline in its own group). The group kill + term.kill()
+    // are belt-and-suspenders fallbacks.
+    ws.on('close', () => killPtySession(term));
+  }
+
+  /** Stream a running review action's output to the UI. `procId` names a process
+   *  the client already started via POST /review-action. We replay the buffered
+   *  output first, then push the live tail until it exits or the socket closes. */
+  private reviewActionStream(ws: import('ws').WebSocket, req: http.IncomingMessage) {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const procId = url.searchParams.get('procId') ?? '';
+    const rec = this.reviewActions.get(procId);
+    if (!rec) {
+      try { ws.send(JSON.stringify({ type: 'exit', code: -1, data: 'No such action process.\n' })); } catch {}
+      ws.close();
+      return;
+    }
+    const send = (obj: unknown) => { try { ws.send(JSON.stringify(obj)); } catch {} };
+    if (rec.output) send({ type: 'data', data: rec.output });
+    if (!rec.running) {
+      send({ type: 'exit', code: rec.exitCode });
+      ws.close();
+      return;
+    }
+    const off = this.reviewActions.attach(procId, (chunk, done, code) => {
+      if (chunk) send({ type: 'data', data: chunk });
+      if (done) { send({ type: 'exit', code }); try { ws.close(); } catch {} }
+    });
+    ws.on('close', off);
+    ws.on('error', off);
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
@@ -188,6 +265,22 @@ export class Gateway {
       });
     }
 
+    // Serve an image attachment. Auth via `?token=` (session id) because a plain
+    // <img src> can't set an Authorization header; the token is the same session
+    // secret used everywhere else, so this is no weaker than the Bearer path.
+    const attGet = p.match(/^\/api\/attachments\/([^/]+)$/);
+    if (attGet && method === 'GET') {
+      const sid = url.searchParams.get('token') ?? '';
+      if (!this.sessions.has(sid)) return this.json(res, 401, { error: 'unauthorized' });
+      const got = this.attachments.read(attGet[1]!);
+      if (!got) return void res.writeHead(404).end('not found');
+      res.writeHead(200, {
+        'content-type': got.mediaType,
+        'cache-control': 'private, max-age=31536000, immutable',
+      });
+      return void res.end(got.buf);
+    }
+
     // ── authenticated endpoints ──
     const session = this.auth(req);
     if (!session) return this.json(res, 401, { error: 'unauthorized' });
@@ -202,6 +295,44 @@ export class Gateway {
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
         return this.json(res, 200, { host: hostStats(), agentSlots: agentSlotStats(), ts: Date.now() });
+      }
+
+      // Task manager (dashboard Processes panel): every process karmax is
+      // responsible for — agent subprocesses and their tool children, embedded-
+      // terminal PTYs and what runs in them, the Temporal server, git/exec
+      // helpers — grouped by owning entity with live CPU/RSS. See
+      // src/util/processes.ts for the coverage model.
+      if (p === '/api/processes' && method === 'GET') {
+        const { sampleProcesses } = await import('../util/processes.js');
+        return this.json(res, 200, sampleProcesses());
+      }
+      if (p === '/api/processes/kill' && method === 'POST') {
+        const b = await this.body(req);
+        const { killTracked } = await import('../util/processes.js');
+        const out = await killTracked(Number(b.pid), b.signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM');
+        return this.json(res, out.ok ? 200 : 400, out);
+      }
+
+      // image attachments (image prompts). The ONLY endpoints that handle raw
+      // image bytes; everything downstream carries lightweight ImageRef handles.
+      if (p === '/api/attachments' && method === 'POST') {
+        const ctype = String(req.headers['content-type'] ?? '');
+        try {
+          let ref;
+          if (ctype.includes('application/json')) {
+            const b = await this.body(req);
+            if (typeof b.dataUrl !== 'string') return this.json(res, 400, { error: 'expected { dataUrl }' });
+            ref = this.attachments.putDataUrl(b.dataUrl);
+          } else {
+            // Raw binary upload — content-type is the image MIME.
+            const buf = await this.rawBody(req, MAX_IMAGE_BYTES);
+            ref = this.attachments.put(buf, ctype || undefined);
+          }
+          return this.json(res, 200, ref);
+        } catch (e) {
+          if (e instanceof AttachmentError) return this.json(res, 400, { error: e.message });
+          throw e;
+        }
       }
 
       // projects
@@ -258,10 +389,120 @@ export class Gateway {
         return this.json(res, 200, await this.activateWorkflow(token, projectId, b.workflow));
       }
 
+      // ── search / organization (a view is a saved query — PLAN-search-views) ──
+      // The searchable-field registry the UI reads to build its filter/sort/group menus.
+      if (p === '/api/search/fields' && method === 'GET') return this.json(res, 200, api.searchFields(token));
+
+      // Evaluate a query against a project: `?q=<query string>` (Linear-style token
+      // syntax) → { tasks, groups, total }. Every list surface — the default list
+      // included — is just an evaluation of one of these.
+      const searchMatch = p.match(/^\/api\/projects\/([^/]+)\/search$/);
+      if (searchMatch && method === 'GET') {
+        const q = url.searchParams.get('q') ?? '';
+        const r = await api.searchTasks(token, searchMatch[1]!, q);
+        return this.json(res, 200, r);
+      }
+
+      // Tags (labels + topics, hierarchical) — project-scoped catalogue.
+      const tagsMatch = p.match(/^\/api\/projects\/([^/]+)\/tags$/);
+      if (tagsMatch) {
+        const projectId = tagsMatch[1]!;
+        if (method === 'GET') return this.json(res, 200, await api.listTags(token, projectId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.createTag(token, { projectId, name: b.name, parentId: b.parentId, color: b.color, kind: b.kind }));
+        }
+      }
+      const tagMatch = p.match(/^\/api\/tags\/([^/]+)$/);
+      if (tagMatch) {
+        const id = tagMatch[1]!;
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, await api.updateTag(token, id, b));
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        if (method === 'DELETE') {
+          await api.deleteTag(token, id);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+
+      // Saved views — named, persisted queries shown in the project's view switcher.
+      const viewsMatch = p.match(/^\/api\/projects\/([^/]+)\/views$/);
+      if (viewsMatch) {
+        const projectId = viewsMatch[1]!;
+        if (method === 'GET') return this.json(res, 200, await api.listViews(token, projectId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.createView(token, { projectId, name: b.name, query: b.query ?? {}, icon: b.icon }));
+        }
+      }
+      const savedViewMatch = p.match(/^\/api\/views\/([^/]+)$/);
+      if (savedViewMatch) {
+        const id = savedViewMatch[1]!;
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.updateView(token, id, b));
+        }
+        if (method === 'DELETE') {
+          await api.deleteView(token, id);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const viewReorderMatch = p.match(/^\/api\/views\/([^/]+)\/reorder$/);
+      if (viewReorderMatch && method === 'POST') {
+        const b = await this.body(req);
+        await api.reorderView(token, viewReorderMatch[1]!, Number(b.ord ?? 0));
+        return this.json(res, 200, { ok: true });
+      }
+
+      // Per-task organization: tag set + priority (both purely organizational —
+      // never assembled into any agent prompt, so editable at any lifecycle stage).
+      const taskTagsMatch = p.match(/^\/api\/tasks\/([^/]+)\/tags$/);
+      if (taskTagsMatch && method === 'PUT') {
+        const b = await this.body(req);
+        const tags = await api.setTaskTags(token, taskTagsMatch[1]!, Array.isArray(b.tagIds) ? b.tagIds : []);
+        return this.json(res, 200, { tags });
+      }
+      // Agent-facing add/remove by tag name or path (used by the platform MCP).
+      const tagEditMatch = p.match(/^\/api\/tasks\/([^/]+)\/tag$/);
+      if (tagEditMatch && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          const out = await api.tagTask(token, tagEditMatch[1]!, { add: b.add, remove: b.remove });
+          return this.json(res, 200, out);
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const priorityMatch = p.match(/^\/api\/tasks\/([^/]+)\/priority$/);
+      if (priorityMatch && method === 'PUT') {
+        const b = await this.body(req);
+        await api.setTaskPriority(token, priorityMatch[1]!, Number(b.priority ?? 0));
+        return this.json(res, 200, { ok: true });
+      }
+
       // tasks
+      // Resolve a per-project sequential number (SPEC §10.6) → its canonical id, so a
+      // `/projects/<name>/tasks/<num>` permalink can be opened even when the task
+      // isn't in the client's loaded list (e.g. an archived task).
+      const byNumMatch = p.match(/^\/api\/projects\/([^/]+)\/tasks\/by-num\/(\d+)$/);
+      if (byNumMatch && method === 'GET') {
+        const rec = store.getTaskByNum(byNumMatch[1]!, Number(byNumMatch[2]!));
+        if (!rec) return this.json(res, 404, { error: 'no such task' });
+        return this.json(res, 200, { id: rec.id, num: rec.num, projectId: rec.projectId });
+      }
       const viewMatch = p.match(/^\/api\/tasks\/([^/]+)$/);
       if (viewMatch && method === 'GET') {
-        return this.json(res, 200, (await api.getTaskView(token, viewMatch[1]!)) ?? null);
+        const view = await api.getTaskView(token, viewMatch[1]!);
+        if (!view) return this.json(res, 200, null);
+        // Mirror the record's sequential number onto the view (the workflow only
+        // knows the opaque id) so the drawer can show `#num` + a permalink.
+        const rec = store.getTask(viewMatch[1]!);
+        return this.json(res, 200, rec?.num != null ? { ...view, num: rec.num } : view);
       }
       if (viewMatch && method === 'DELETE') {
         // Hard-delete is for drafts only (they never started a workflow). Running
@@ -298,10 +539,11 @@ export class Gateway {
         if (t.params?.draft) {
           // Replace the workflow-field overrides wholesale (b.params is the form's
           // full set of own overrides) so a field reset to its default is actually
-          // removed — a merge would leave the stale override behind. Lifecycle meta
-          // (draft/archived/profiles) is preserved across the edit.
-          const { draft, archived, profiles } = t.params;
-          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}) };
+          // removed — a merge would leave the stale override behind. Lifecycle +
+          // organizational meta (draft/archived/profiles/priority) is preserved across
+          // the edit — priority is set via its own endpoint and must survive a form save.
+          const { draft, archived, profiles, priority } = t.params;
+          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}), ...(priority !== undefined ? { priority } : {}) };
           const replace = b.replace === true;
           store.updateTaskParams(id, replace ? { ...meta, ...b.params } : { ...t.params, ...b.params });
           // Keep the title tracking the edited prompt (title was derived from it).
@@ -347,7 +589,7 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role);
+        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
         return this.json(res, 200, { ok: true });
       }
       const targetMatch = p.match(/^\/api\/tasks\/([^/]+)\/target$/);
@@ -370,6 +612,54 @@ export class Gateway {
       const runsMatch = p.match(/^\/api\/tasks\/([^/]+)\/runs$/);
       if (runsMatch && method === 'GET') {
         return this.json(res, 200, store.runsOf(runsMatch[1]!));
+      }
+      // ── review actions (SPEC §5.5): click-to-verify affordances ──
+      // Start a "run" action (or resolve an "open" one). The command is looked up
+      // from the task's stored review info by index — the client only sends the
+      // index, so it can never inject an arbitrary command.
+      const raStartMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action$/);
+      if (raStartMatch && method === 'POST') {
+        const taskId = raStartMatch[1]!;
+        const b = await this.body(req);
+        // Resolve the action from the AUTHORITATIVE live view (the stored lastView
+        // can lag the workflow), by index — the client never supplies the command,
+        // so only agent-authored actions are runnable.
+        const view = (await api.getTaskView(token, taskId).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        const action = view?.reviewInfo?.actions?.[Number(b.index)];
+        if (!action) return this.json(res, 404, { error: 'no such review action' });
+        const worldPath = view?.worldPath;
+        if (action.kind === 'open') {
+          const target = String(action.target ?? '');
+          if (/^https?:\/\//i.test(target)) return this.json(res, 200, { kind: 'open', url: target, external: true });
+          if (!target) return this.json(res, 400, { error: 'open action has no target' });
+          const url2 = `/api/tasks/${encodeURIComponent(taskId)}/artifact?path=${encodeURIComponent(target)}`;
+          return this.json(res, 200, { kind: 'open', url: url2, external: false });
+        }
+        // kind: 'run'
+        if (!action.command) return this.json(res, 400, { error: 'run action has no command' });
+        if (!worldPath) return this.json(res, 400, { error: 'no world for this task yet' });
+        const rec = this.reviewActions.start({
+          taskId,
+          cwd: worldPath,
+          label: action.label,
+          command: action.command,
+          server: action.server,
+          openUrls: action.openUrls,
+        });
+        return this.json(res, 200, { kind: 'run', procId: rec.procId, server: rec.server, openUrls: rec.openUrls });
+      }
+      const raStopMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action\/([^/]+)\/stop$/);
+      if (raStopMatch && method === 'POST') {
+        return this.json(res, 200, { ok: this.reviewActions.stop(raStopMatch[2]!) });
+      }
+      const raStatusMatch = p.match(/^\/api\/tasks\/([^/]+)\/review-action\/([^/]+)$/);
+      if (raStatusMatch && method === 'GET') {
+        const st = this.reviewActions.status(raStatusMatch[2]!);
+        return this.json(res, st ? 200 : 404, st ?? { error: 'no such action process' });
+      }
+      const artifactMatch = p.match(/^\/api\/tasks\/([^/]+)\/artifact$/);
+      if (artifactMatch && method === 'GET') {
+        return this.serveArtifact(res, artifactMatch[1]!, url.searchParams.get('path') ?? '');
       }
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
@@ -420,6 +710,11 @@ export class Gateway {
       if (p === '/api/queue/prioritize' && method === 'POST') {
         const b = await this.body(req);
         await api.reorderQueue(token, b.domain, b.taskId);
+        return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/queue/move' && method === 'POST') {
+        const b = await this.body(req);
+        await api.moveQueueItem(token, b.domain, b.taskId, b.beforeTaskId || undefined);
         return this.json(res, 200, { ok: true });
       }
       // platform API surface used by the MCP server (save skill / propose edit)
@@ -838,7 +1133,7 @@ export class Gateway {
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
     const out = { ...vals };
     for (const f of m.params) {
-      if (f.type !== 'agent' || !f.role) continue;
+      if ((f.type !== 'agent' && f.type !== 'confirmer') || !f.role) continue;
       const spec = (out[f.name] as any) || {};
       // The project's role-default overlay overrides the global one (SPEC §9), so a
       // per-project model/provider default flows through to new tasks' inherited value.
@@ -848,7 +1143,10 @@ export class Gateway {
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      out[f.name] = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      // A confirmer also carries a MODE (human/auto/agent) that inherits normally; the
+      // agent knobs above are the defaults shown once "agent" mode is selected.
+      out[f.name] = f.type === 'confirmer' ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) } : agent;
     }
     return out;
   }
@@ -886,6 +1184,30 @@ export class Gateway {
     }
   }
 
+  /** Serve a produced artifact (an `open` action's file target) from the task's
+   *  world, so the UI can open a PDF/image/video/notebook it generated. Path is
+   *  confined to the world root — no traversal outside it. */
+  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string) {
+    const worldPath = this.deps.store.getTask(taskId)?.lastView?.worldPath;
+    if (!worldPath) return this.json(res, 404, { error: 'no world for this task' });
+    if (!relPath) return this.json(res, 400, { error: 'missing path' });
+    const root = path.resolve(worldPath);
+    const file = path.resolve(root, relPath);
+    if (file !== root && !file.startsWith(root + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
+    try {
+      const stat = await fs.promises.stat(file);
+      if (stat.isDirectory()) return this.json(res, 400, { error: 'path is a directory' });
+      const data = await fs.promises.readFile(file);
+      res.writeHead(200, {
+        'content-type': ARTIFACT_MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
+        'content-length': String(data.length),
+      });
+      res.end(data);
+    } catch {
+      this.json(res, 404, { error: 'artifact not found' });
+    }
+  }
+
   // ── helpers ──
   private auth(req: http.IncomingMessage): Session | undefined {
     const h = req.headers['authorization'];
@@ -907,6 +1229,21 @@ export class Gateway {
       return {};
     }
   }
+  /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`
+   *  (the JSON `body()` reader is unbounded — binary uploads must be capped). */
+  private async rawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const c of req) {
+      total += (c as Buffer).length;
+      if (total > maxBytes) {
+        req.destroy();
+        throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
+      }
+      chunks.push(c as Buffer);
+    }
+    return Buffer.concat(chunks);
+  }
   private fail(res: http.ServerResponse, e: unknown) {
     try {
       this.json(res, 500, { error: String((e as Error)?.message ?? e) });
@@ -914,6 +1251,20 @@ export class Gateway {
       /* ignore */
     }
   }
+}
+
+/** Tear down a check-in PTY and everything running inside it. The interactive
+ *  shell node-pty spawned is a session leader (pid == session id), so killing
+ *  the whole session reaps its children — foreground and background jobs alike.
+ *  `pkill -s` is the thorough path; the process-group kill and `term.kill()` are
+ *  fallbacks for platforms without pkill or if the session id trick misses. */
+function killPtySession(term: { pid?: number; kill?: () => void }): void {
+  const pid = term?.pid;
+  if (typeof pid === 'number') {
+    try { spawn('pkill', ['-KILL', '-s', String(pid)], { stdio: 'ignore' }).on('error', () => {}); } catch { /* no pkill */ }
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+  }
+  try { term.kill?.(); } catch { /* already dead */ }
 }
 
 /** Expand ~ / $HOME in repo paths so a configured repo resolves to a real dir. */

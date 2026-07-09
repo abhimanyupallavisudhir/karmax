@@ -6,10 +6,12 @@ import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
-import { mergeQueueId, SIG_PRIORITIZE, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput } from '../domain/types.js';
+import { mergeQueueId, SIG_PRIORITIZE, SIG_REORDER, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
-import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, ValueMap } from './params.js';
+import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
+import { parseQuery } from '../domain/query-language.js';
+import { resolveParams, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { defaultBranch } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
@@ -104,10 +106,16 @@ export class KarmaxApi {
    * (the empty-repo footgun). Refuse the *run* early, with an actionable message,
    * rather than let a whole attempt burn against the wrong world.
    */
-  private assertRepoConfigured(manifest: WorkflowManifest, project: Project) {
+  private assertRepoConfigured(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
     if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
-    const configured = (project.config.repos ?? []).some((r) => !!r && r.trim().length > 0);
+    // Guard on the EFFECTIVE repo list the world will be built from (the resolved
+    // settings overlay, falling back to project config) — the same value that
+    // reaches createWorld — not project.config alone. Those two can diverge (an
+    // empty settings-overlay repos list resolving to nothing while config still
+    // holds a repo), and checking config-only let that case slip through into a
+    // silent scratch sandbox — the very footgun this guard exists to prevent.
+    const configured = effectiveRepos(resolved, project.config).length > 0;
     if (!configured) {
       throw new Error(
         `Workflow "${manifest.name}" works on a repository, but project "${project.name}" has no repository ` +
@@ -123,6 +131,8 @@ export class KarmaxApi {
       projectId: string;
       title?: string;
       prompt?: string;
+      /** Images attached to the initial prompt (references, never inline bytes). */
+      images?: ImageRef[];
       workflow?: string;
       base?: string;
       target?: string;
@@ -146,16 +156,20 @@ export class KarmaxApi {
     const { manifest, startType } = start;
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
-    // Refuse to *run* a repo-oriented workflow with no repository configured
-    // (drafts may still be saved without one, then checked again at queueTask).
-    if (!args.draft) this.assertRepoConfigured(manifest, project);
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
+    // Image attachments ride alongside the prompt but aren't a manifest param, so
+    // carry them explicitly (references only — bytes live in the attachment store).
+    if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides);
+    // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
+    // (drafts may still be saved without one, then checked again at queueTask).
+    // Checked after resolution so the guard sees the same repos the world will.
+    if (!args.draft) this.assertRepoConfigured(manifest, project, resolved);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
     // A repeatable "series" (Model A) — forced on by a cron/recurring trigger.
@@ -212,6 +226,8 @@ export class KarmaxApi {
     });
     input.workflow = workflow;
     if (args.profiles) input.profiles = args.profiles;
+    const initialImages = taskOverrides.images as ImageRef[] | undefined;
+    if (initialImages?.length) input.images = initialImages;
 
     // Pin the execution to the manifest version stamped on the task (§21b), so a
     // later version upgrade only affects new tasks, never this running one.
@@ -302,9 +318,13 @@ export class KarmaxApi {
     const start = this.resolveStart(task.workflow, task.workflowVersion);
     if (!project || !start) throw new Error(`cannot start task ${task.id}`);
     const { manifest, startType } = start;
-    this.assertRepoConfigured(manifest, project);
-    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, ...overrides } = task.params as Record<string, unknown>;
+    // Re-resolve against the CURRENT project/global defaults. The task stored only
+    // its own overrides, so a draft queued after a default change picks up the new
+    // default (SPEC §10.4). Meta fields (profiles/draft/archived/triggers) aren't overrides.
+    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
+    // Same guard as createTask, on the resolved effective repos, before we clear the draft.
+    this.assertRepoConfigured(manifest, project, resolved);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,
@@ -313,6 +333,7 @@ export class KarmaxApi {
     });
     input.workflow = task.workflow;
     if (profiles) input.profiles = profiles as Record<string, string>;
+    if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     return { startType, input };
   }
 
@@ -527,11 +548,138 @@ export class KarmaxApi {
     return this.deps.store.listTasks(projectId);
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string): Promise<void> {
+  // ─── Search & organization (task search / views — PLAN-search-views) ─────────
+  // A *view* is a saved *query*: every list surface (including the default one) is the
+  // result of evaluating a `TaskQuery` — free text + structured filters + sort + group —
+  // against the project's tasks. The evaluator is pure (src/domain/search.ts); it runs
+  // in-memory over the store's `listTasks` (cheap at todo-list scale), whose records
+  // already carry the cached `lastView` (status/stage/pr) and hydrated `tags`.
+
+  /**
+   * Evaluate a query against a project's tasks. `query` may be a raw query string
+   * (the search box / a saved view's serialized form) or an already-structured
+   * `TaskQuery`. Returns the filtered+sorted list, optional groups, and total.
+   */
+  async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
+    this.require(token, 'search_tasks');
+    const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
+    const tasks = this.deps.store.listTasks(projectId);
+    const tags = this.deps.store.listTags(projectId);
+    return evaluateQuery(tasks, q, { now, tags });
+  }
+
+  /** The searchable-field registry the UI reads to build its filter/sort/group menus. */
+  searchFields(token: string) {
+    this.require(token, 'search_fields');
+    return fieldCatalogue();
+  }
+
+  // ─── Tags ────────────────────────────────────────────────────────────────────
+  async listTags(token: string, projectId: string): Promise<Tag[]> {
+    this.require(token, 'list_tags');
+    return this.deps.store.listTags(projectId);
+  }
+
+  async createTag(token: string, input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Promise<Tag> {
+    this.require(token, 'manage_tag');
+    return this.deps.store.createTag(input);
+  }
+
+  async updateTag(token: string, id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null }): Promise<Tag | undefined> {
+    this.require(token, 'manage_tag');
+    return this.deps.store.updateTag(id, patch);
+  }
+
+  async deleteTag(token: string, id: string): Promise<void> {
+    this.require(token, 'manage_tag');
+    this.deps.store.deleteTag(id);
+  }
+
+  /** Replace the full tag set on a task (organization only — never reaches the agent). */
+  async setTaskTags(token: string, taskId: string, tagIds: string[]): Promise<string[]> {
+    this.require(token, 'set_task_tags');
+    this.deps.store.setTaskTags(taskId, tagIds);
+    return this.deps.store.tagsFor(taskId);
+  }
+
+  /**
+   * Agent-friendly tagging: add/remove tags on a task **by name or `a/b` path** rather
+   * than opaque ids. An `add` name that doesn't exist is created (slash paths build the
+   * hierarchy); a `remove` name that isn't present is ignored. Returns the resulting tag
+   * paths. This is what the platform MCP exposes so agents can label tasks they touch.
+   */
+  async tagTask(token: string, taskId: string, patch: { add?: string[]; remove?: string[] }): Promise<{ tags: string[] }> {
+    this.require(token, 'set_task_tags');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no such task ${taskId}`);
+    const resolve = () => {
+      const tags = this.deps.store.listTags(task.projectId);
+      const byId = new Map(tags.map((t) => [t.id, t]));
+      const find = (s: string) => {
+        const v = s.trim().toLowerCase();
+        return tags.find((t) => t.name.toLowerCase() === v || tagPath(t, byId).toLowerCase() === v);
+      };
+      return { tags, byId, find };
+    };
+    const cur = new Set(this.deps.store.tagsFor(taskId));
+    for (const name of patch.add ?? []) {
+      if (!name.trim()) continue;
+      const found = resolve().find(name);
+      const id = found ? found.id : this.deps.store.createTag({ projectId: task.projectId, name }).id;
+      cur.add(id);
+    }
+    for (const name of patch.remove ?? []) {
+      const found = resolve().find(name);
+      if (found) cur.delete(found.id);
+    }
+    this.deps.store.setTaskTags(taskId, [...cur]);
+    const { byId } = resolve();
+    return { tags: this.deps.store.tagsFor(taskId).map((id) => (byId.get(id) ? tagPath(byId.get(id)!, byId) : id)) };
+  }
+
+  /** Set the organizational priority (0–4) — editable at any lifecycle stage. */
+  async setTaskPriority(token: string, taskId: string, priority: number): Promise<void> {
+    this.require(token, 'set_task_priority');
+    this.deps.store.setTaskPriority(taskId, priority);
+  }
+
+  // ─── Saved views (a view is a saved query) ───────────────────────────────────
+  async listViews(token: string, projectId: string): Promise<SavedView[]> {
+    this.require(token, 'list_views');
+    return this.deps.store.listViews(projectId);
+  }
+
+  async createView(token: string, input: { projectId: string; name: string; query: TaskQuery; icon?: string }): Promise<SavedView> {
+    this.require(token, 'manage_view');
+    return this.deps.store.createView(input);
+  }
+
+  async updateView(token: string, id: string, patch: { name?: string; query?: TaskQuery; icon?: string | null }): Promise<SavedView | undefined> {
+    this.require(token, 'manage_view');
+    return this.deps.store.updateView(id, patch);
+  }
+
+  async reorderView(token: string, id: string, ord: number): Promise<void> {
+    this.require(token, 'manage_view');
+    this.deps.store.reorderView(id, ord);
+  }
+
+  async deleteView(token: string, id: string): Promise<void> {
+    this.require(token, 'manage_view');
+    this.deps.store.deleteView(id);
+  }
+
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
     this.require(token, 'signal_task');
     const handle = this.deps.client.workflow.getHandle(taskId);
     if (signal === SIG.followUp) {
-      const msg: Message = { id: `u${Date.now()}`, role: 'user', text: text ?? '', ts: 0 };
+      const msg: Message = {
+        id: `u${Date.now()}`,
+        role: 'user',
+        text: text ?? '',
+        ts: 0,
+        ...(images?.length ? { images } : {}),
+      };
       // `role` (the addressed agent) is optional — single-agent workflows ignore it
       // and route every follow-up to their sole conversation.
       await handle.signal(SIG.followUp, msg, role);
@@ -573,6 +721,21 @@ export class KarmaxApi {
       args: [{ domain }],
       signal: SIG_PRIORITIZE,
       signalArgs: [{ taskId }],
+    });
+  }
+
+  /**
+   * Reposition a queued task (drag-and-drop / move-to-bottom): place `taskId`
+   * immediately before `beforeTaskId`, or at the end when no anchor is given.
+   */
+  async moveQueueItem(token: string, domain: string, taskId: string, beforeTaskId?: string): Promise<void> {
+    this.require(token, 'reorder_queue');
+    await this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
+      workflowId: mergeQueueId(domain),
+      taskQueue: this.deps.taskQueue,
+      args: [{ domain }],
+      signal: SIG_REORDER,
+      signalArgs: [{ taskId, beforeTaskId }],
     });
   }
 
