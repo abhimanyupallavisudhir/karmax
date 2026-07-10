@@ -2306,10 +2306,21 @@ async function openDrawer(taskId) {
   S.paramDefaults = {};
   highlightRow();
   try {
-    S.view = await api(`/api/tasks/${taskId}`);
-    S.drawerEvents = await api(`/api/tasks/${taskId}/events?since=0`);
-    S.widgets = await api(`/api/tasks/${taskId}/widgets`).catch(() => []);
-    S.sessions = await api(`/api/tasks/${taskId}/sessions`).catch(() => ({}));
+    // Fetch the four independent resources in parallel — they used to be four serial
+    // round-trips, which stacked latency (each drawer open paid the sum, not the max).
+    // `renderDrawer` no-ops while `S.view` is null, so assigning them together (rather
+    // than one-at-a-time) also avoids rendering a half-populated drawer mid-fetch.
+    const [view, events, widgets, sessions] = await Promise.all([
+      api(`/api/tasks/${taskId}`),
+      api(`/api/tasks/${taskId}/events?since=0`),
+      api(`/api/tasks/${taskId}/widgets`).catch(() => []),
+      api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+    ]);
+    S.view = view;
+    S.drawerEvents = events;
+    S.widgets = widgets;
+    S.sessions = sessions;
+    // paramDefaults keys off the fetched view's workflow, so it follows the batch.
     S.paramDefaults = await loadParamDefaults(taskId);
   } catch (e) { toast(e.message, true); }
   renderDrawer();
@@ -2320,10 +2331,18 @@ async function refreshDrawer() {
   // would clobber in-progress edits); it re-renders only on open / explicit save.
   if (S.tasks.find((t) => t.id === S.selected)?.params?.repeatable) return;
   try {
-    S.view = await api(`/api/tasks/${S.selected}`);
-    S.widgets = await api(`/api/tasks/${S.selected}/widgets`).catch(() => S.widgets);
-    S.sessions = await api(`/api/tasks/${S.selected}/sessions`).catch(() => S.sessions);
-    S.paramDefaults = await loadParamDefaults(S.selected);
+    // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
+    // WS push for the open task, so keeping it to a single round-trip's latency matters.
+    const id = S.selected;
+    const [view, widgets, sessions] = await Promise.all([
+      api(`/api/tasks/${id}`),
+      api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
+      api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+    ]);
+    S.view = view;
+    S.widgets = widgets;
+    S.sessions = sessions;
+    S.paramDefaults = await loadParamDefaults(id);
   } catch {}
   renderDrawer();
 }
