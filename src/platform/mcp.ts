@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
+import { taskStatus } from '../domain/search.js';
 
 /**
  * The platform MCP server (SPEC §3.4) — the single API agents use to act on the
@@ -58,7 +59,7 @@ function compactSearch(result: any, tags: any[]): { total: number; tasks: Compac
     id: t.id,
     title: t.title,
     workflow: t.workflow,
-    status: t.lastView?.status ?? (t.params?.draft ? 'draft' : 'unknown'),
+    status: t.lastView?.status ?? (t.params?.draft ? 'draft' : taskStatus(t)),
     stage: t.lastView?.stage,
     priority: Number(t.params?.priority ?? 0),
     draft: !!t.params?.draft,
@@ -165,9 +166,12 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Search/organize a project\'s tasks with a Linear-style query and get back a compact list (num, title, status, priority, tags). ' +
         'Query grammar: `field:value` clauses AND together, commas = OR (`status:active,waiting`), `-` negates (`-tag:bug`), ' +
         'comparisons on numbers/dates (`priority:>=2`, `created:<7d`), quoted phrases, and bare words = full text. ' +
-        'Fields: status, stage, priority, tag (a/b path matches descendants), workflow, created, updated, num, is:<facet> ' +
-        '(open/draft/archived/pr/untagged/…), and any workflow param via `param.<key>` (e.g. `param.base:main`). ' +
-        'Add `sort:priority-desc` and `group:tag` to order/bucket. Empty query returns all tasks.',
+        'Fields: status (incl. `armed` for trigger-gated tasks), stage, priority, tag (a/b path matches descendants), ' +
+        'workflow, created, updated, num, is:<facet> (open/draft/archived/pr/untagged/armed/scheduled/recurring/blocked-on-deps/series/run/…), ' +
+        'trigger (dependency|schedule|event|none, groupable), schedule (cron text), nextRun (sortable date), ' +
+        'dependsOn:#N / blocks:#N (the dependency graph), and any workflow param via `param.<key>` / `agent_<role>.model`. ' +
+        'Add `sort:priority-desc` and `group:tag` to order/bucket. Empty query returns all tasks (runs of a series included — ' +
+        'add `-is:run` to hide them). E.g. `is:scheduled sort:nextRun-asc`, `dependsOn:#42`, `is:blocked-on-deps`.',
       inputSchema: { projectId: z.string(), query: z.string().default('') },
     },
     async (a) => wrap(() => ops.searchTasks(a.projectId, a.query ?? '')),

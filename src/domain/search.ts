@@ -14,9 +14,28 @@
  * (tests/search.test.ts) without booting Temporal.
  */
 import { TaskRecord, TaskQuery, FilterClause, Tag, SortClause, PRIORITIES } from './types.js';
+import { normalizeTriggers, isRecurring, nextCronFire, TaskTrigger } from './triggers.js';
 
 /** A task as seen by search: the stored record, whose `lastView`/`tags` are hydrated. */
 export type SearchTask = TaskRecord;
+
+/**
+ * Context threaded through the evaluator. Public callers pass `{ now, tags }`;
+ * `evaluateQuery` enriches it with cross-task indices (id→num, reverse dependency
+ * edges) so relational + time-based fields (`nextRun`, `dependsOn`, `blocks`) can
+ * resolve. `now` is passed in (not read from a clock) to keep this module pure.
+ */
+export interface EvalContext {
+  now: number;
+  /** Project tag catalogue, for hierarchy expansion + name/path resolution. */
+  tags?: Tag[];
+}
+export interface FieldContext extends EvalContext {
+  /** task id → per-project number, so deps can be shown/matched as `#num`. */
+  idToNum?: Map<string, number>;
+  /** dep-task-id → the tasks that depend on it (reverse edges, for `blocks:`). */
+  blockedBy?: Map<string, SearchTask[]>;
+}
 
 export type FieldType = 'text' | 'enum' | 'number' | 'date' | 'tag' | 'facet';
 
@@ -37,18 +56,31 @@ export interface FieldDef {
   groupable?: boolean;
   /** Can this field be sorted by? */
   sortable?: boolean;
-  /** Extract the comparable value(s) used for filtering + grouping. */
-  get(t: SearchTask): string | number | string[] | undefined;
+  /** Extract the comparable value(s) used for filtering + grouping. `ctx` carries `now`
+   *  + cross-task indices for time-based / relational fields; simple fields ignore it. */
+  get(t: SearchTask, ctx?: FieldContext): string | number | string[] | undefined;
   /** Extract a sort key (numbers sort numerically; strings lexically). */
-  sortKey?(t: SearchTask): number | string;
+  sortKey?(t: SearchTask, ctx?: FieldContext): number | string;
 }
 
 // ─── helpers to read live state off the cached view ──────────────────────────
-const status = (t: SearchTask) => t.lastView?.status ?? 'active';
+/**
+ * A task gated behind an as-yet-unfired trigger (scheduled/dependency/event) is
+ * *armed*: stored-not-started, so it has no `lastView` and would otherwise read as
+ * `active`. Surface it as its own `armed` state so search/organization sees it.
+ */
+const isArmed = (t: SearchTask): boolean =>
+  normalizeTriggers(t.params).length > 0 && t.params?.triggerState !== 'fired' && !t.lastView;
+const status = (t: SearchTask) => t.lastView?.status ?? (isArmed(t) ? 'armed' : 'active');
+/** The armed-aware status of a task (exported so compact projections agree with search). */
+export function taskStatus(t: SearchTask): string {
+  return status(t);
+}
 const stage = (t: SearchTask) => t.lastView?.stage ?? 'setup';
 const lc = (s: unknown) => String(s ?? '').toLowerCase();
 
 const STATUS_OPTIONS: FieldOption[] = [
+  { value: 'armed', label: 'Armed (waiting for trigger)' },
   { value: 'active', label: 'Active' },
   { value: 'waiting', label: 'Waiting' },
   { value: 'blocked', label: 'Blocked' },
@@ -78,6 +110,14 @@ export const FACET_OPTIONS: FieldOption[] = [
   { value: 'tagged', label: 'Tagged' },
   { value: 'untagged', label: 'Untagged' },
   { value: 'prioritized', label: 'Prioritized' },
+  // ── trigger / schedule / series facets (dependencies, cron, repeatable) ──
+  { value: 'triggered', label: 'Has a trigger' },
+  { value: 'armed', label: 'Armed (waiting for a trigger)' },
+  { value: 'scheduled', label: 'Scheduled (cron / one-shot)' },
+  { value: 'recurring', label: 'Recurring (cron or repeatable)' },
+  { value: 'blocked-on-deps', label: 'Waiting on a dependency' },
+  { value: 'series', label: 'Repeatable series (template)' },
+  { value: 'run', label: 'A run of a series' },
 ];
 
 function facetsOf(t: SearchTask): string[] {
@@ -93,8 +133,50 @@ function facetsOf(t: SearchTask): string[] {
   if (t.lastView?.pr) f.push('pr');
   f.push(t.tags?.length ? 'tagged' : 'untagged');
   if (typeof t.params?.priority === 'number' && t.params.priority > 0) f.push('prioritized');
+  // Trigger/series facets — read straight off params (already loaded on the record).
+  const triggers = normalizeTriggers(t.params);
+  if (triggers.length) f.push('triggered');
+  if (isArmed(t)) f.push('armed');
+  if (triggers.some((x) => x.kind === 'schedule')) f.push('scheduled');
+  if (triggers.some(isRecurring) || t.params?.repeatable) f.push('recurring');
+  if (isArmed(t) && triggers.some((x) => x.kind === 'dependency')) f.push('blocked-on-deps');
+  if (t.params?.repeatable) f.push('series');
+  if (t.params?.runOf) f.push('run');
   return f;
 }
+
+// ─── trigger / schedule / dependency reads (this feature) ────────────────────
+const TRIGGER_OPTIONS: FieldOption[] = [
+  { value: 'none', label: 'Immediate (no trigger)' },
+  { value: 'dependency', label: 'Dependency' },
+  { value: 'schedule', label: 'Schedule' },
+  { value: 'event', label: 'Event' },
+];
+/** The task's primary trigger kind — for grouping "by how it starts". */
+const primaryTriggerKind = (t: SearchTask): string => normalizeTriggers(t.params)[0]?.kind ?? 'none';
+/** The cron expression of the first scheduled trigger, if any (for `schedule:` text search). */
+const cronOf = (t: SearchTask): string | undefined => {
+  for (const tr of normalizeTriggers(t.params)) if (tr.kind === 'schedule' && tr.cron) return tr.cron;
+  return undefined;
+};
+/** Soonest upcoming fire time across this task's schedule triggers (epoch-ms), or undefined. */
+const nextRunOf = (t: SearchTask, now: number): number | undefined => {
+  let best: number | undefined;
+  for (const tr of normalizeTriggers(t.params)) {
+    if (tr.kind !== 'schedule') continue;
+    const n = tr.cron ? nextCronFire(tr.cron, now) : typeof tr.at === 'number' && tr.at > now ? tr.at : undefined;
+    if (n !== undefined && (best === undefined || n < best)) best = n;
+  }
+  return best;
+};
+/** Task ids this task depends on (across its dependency triggers). */
+const dependencyIds = (t: SearchTask): string[] =>
+  normalizeTriggers(t.params)
+    .filter((x): x is Extract<TaskTrigger, { kind: 'dependency' }> => x.kind === 'dependency')
+    .flatMap((x) => x.tasks ?? []);
+/** A searchable blob of task references (`<id> #<num>` per ref) so `#42` and ids both match. */
+const refBlob = (ids: string[], idToNum?: Map<string, number>): string =>
+  ids.map((id) => `${id} #${idToNum?.get(id) ?? ''}`).join(' ');
 
 // ─── the searchable-field registry ───────────────────────────────────────────
 export const FIELDS: FieldDef[] = [
@@ -111,6 +193,12 @@ export const FIELDS: FieldDef[] = [
   { key: 'branch', label: 'Branch', type: 'text', get: (t) => t.lastView?.branch },
   { key: 'target', label: 'Target', type: 'text', aliases: ['targetBranch'], get: (t) => t.lastView?.targetBranch },
   { key: 'parent', label: 'Parent', type: 'text', get: (t) => t.parentTaskId },
+  // ── trigger / schedule / dependency fields (this feature) ──
+  { key: 'trigger', label: 'Trigger', type: 'enum', options: TRIGGER_OPTIONS, get: primaryTriggerKind, groupable: true, sortable: true, sortKey: (t) => primaryTriggerKind(t) },
+  { key: 'schedule', label: 'Schedule', type: 'text', aliases: ['cron'], get: (t) => cronOf(t) },
+  { key: 'nextRun', label: 'Next run', type: 'date', aliases: ['next', 'nextrun'], get: (t, ctx) => nextRunOf(t, ctx?.now ?? 0), sortable: true, sortKey: (t, ctx) => nextRunOf(t, ctx?.now ?? 0) ?? Number.MAX_SAFE_INTEGER },
+  { key: 'dependsOn', label: 'Depends on', type: 'text', aliases: ['dependson', 'dep', 'after'], get: (t, ctx) => refBlob(dependencyIds(t), ctx?.idToNum) },
+  { key: 'blocks', label: 'Blocks', type: 'text', get: (t, ctx) => refBlob((ctx?.blockedBy?.get(t.id) ?? []).map((d) => d.id), ctx?.idToNum) },
   { key: 'is', label: 'Is', type: 'facet', aliases: ['has'], options: FACET_OPTIONS, get: facetsOf },
 ];
 
@@ -237,10 +325,10 @@ function parseDateValue(value: string, now: number): DateVal | undefined {
 }
 
 // ─── clause matching ─────────────────────────────────────────────────────────
-function matchClause(t: SearchTask, clause: FilterClause, ctx: EvalContext): boolean {
+function matchClause(t: SearchTask, clause: FilterClause, ctx: FieldContext): boolean {
   const field = fieldByKey(clause.field);
   if (!field) return true; // unknown field ⇒ inert (don't silently drop everything)
-  const raw = field.get(t);
+  const raw = field.get(t, ctx);
   let ok: boolean;
   switch (field.type) {
     case 'tag': {
@@ -335,12 +423,6 @@ function matchText(t: SearchTask, q: string): boolean {
 }
 
 // ─── the evaluator ───────────────────────────────────────────────────────────
-export interface EvalContext {
-  now: number;
-  /** Project tag catalogue, for hierarchy expansion + name/path resolution. */
-  tags?: Tag[];
-}
-
 export interface TaskGroup {
   key: string;
   label: string;
@@ -358,27 +440,46 @@ export interface EvalResult {
 
 const DEFAULT_SORT: SortClause[] = [{ field: 'created', dir: 'desc' }];
 
+/**
+ * Enrich the caller's `{ now, tags }` with cross-task indices so relational/time fields
+ * can resolve: id→num (render deps as `#num`) and the reverse dependency map (`blocks:`).
+ * O(n) over the candidate set — cheap at todo-list scale.
+ */
+function enrichContext(tasks: SearchTask[], ctx: EvalContext): FieldContext {
+  const idToNum = new Map<string, number>();
+  for (const t of tasks) if (t.num != null) idToNum.set(t.id, t.num);
+  const blockedBy = new Map<string, SearchTask[]>();
+  for (const t of tasks) {
+    for (const dep of dependencyIds(t)) {
+      const arr = blockedBy.get(dep) ?? blockedBy.set(dep, []).get(dep)!;
+      arr.push(t);
+    }
+  }
+  return { ...ctx, idToNum, blockedBy };
+}
+
 export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalContext): EvalResult {
+  const ectx = enrichContext(tasks, ctx);
   const filters = query.filters ?? [];
-  let out = tasks.filter((t) => matchText(t, query.text ?? '') && filters.every((c) => matchClause(t, c, ctx)));
+  let out = tasks.filter((t) => matchText(t, query.text ?? '') && filters.every((c) => matchClause(t, c, ectx)));
 
   const sort = query.sort?.length ? query.sort : DEFAULT_SORT;
-  out = sortTasks(out, sort);
+  out = sortTasks(out, sort, ectx);
 
   let groups: TaskGroup[] | undefined;
-  if (query.group) groups = groupTasks(out, query.group, ctx);
+  if (query.group) groups = groupTasks(out, query.group, ectx);
 
   return { tasks: out, groups, total: out.length };
 }
 
-function sortTasks(tasks: SearchTask[], sort: SortClause[]): SearchTask[] {
+function sortTasks(tasks: SearchTask[], sort: SortClause[], ctx: FieldContext): SearchTask[] {
   const withIdx = tasks.map((t, i) => ({ t, i }));
   withIdx.sort((A, B) => {
     for (const s of sort) {
       const f = fieldByKey(s.field);
       if (!f?.sortKey) continue;
-      const ka = f.sortKey(A.t);
-      const kb = f.sortKey(B.t);
+      const ka = f.sortKey(A.t, ctx);
+      const kb = f.sortKey(B.t, ctx);
       let c = ka < kb ? -1 : ka > kb ? 1 : 0;
       if (s.dir === 'desc') c = -c;
       if (c) return c;
@@ -388,7 +489,7 @@ function sortTasks(tasks: SearchTask[], sort: SortClause[]): SearchTask[] {
   return withIdx.map((x) => x.t);
 }
 
-function groupTasks(tasks: SearchTask[], groupKey: string, ctx: EvalContext): TaskGroup[] {
+function groupTasks(tasks: SearchTask[], groupKey: string, ctx: FieldContext): TaskGroup[] {
   const field = fieldByKey(groupKey);
   if (!field) return [{ key: '', label: 'All', count: tasks.length, tasks }];
   const byId = new Map((ctx.tags ?? []).map((t) => [t.id, t]));
@@ -400,11 +501,11 @@ function groupTasks(tasks: SearchTask[], groupKey: string, ctx: EvalContext): Ta
   };
   for (const t of tasks) {
     if (field.type === 'tag') {
-      const ids = (field.get(t) as string[]) ?? [];
+      const ids = (field.get(t, ctx) as string[]) ?? [];
       if (!ids.length) push('__untagged__', t);
       else for (const id of ids) push(id, t);
     } else {
-      const v = field.get(t);
+      const v = field.get(t, ctx);
       push(v === undefined || v === '' ? '__none__' : String(v), t);
     }
   }
