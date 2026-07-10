@@ -4,9 +4,13 @@ import path from 'node:path';
 import { manifest } from '../src/contrib/manifests.js';
 import {
   resolveParams,
+  resolveParamsLayers,
   assembleTaskInput,
   projectSettingsFor,
   globalSettingsFor,
+  quickGlobalSettingsFor,
+  quickProjectSettingsFor,
+  quickScopeKey,
   settingsToProjectConfig,
   effectiveRepos,
 } from '../src/platform/params.js';
@@ -114,6 +118,67 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
 
   it('globalSettingsFor returns {} when absent', () => {
     expect(globalSettingsFor(() => undefined, 'software-dev')).toEqual({});
+  });
+});
+
+describe('quick-task defaults (separate overlay for the quick-add box)', () => {
+  // The creation-time chain for a quick task in a project (highest → lowest):
+  // task → project-quick → global-quick → project-general → global-general → default.
+  const chain = (layers: {
+    task?: Record<string, unknown>;
+    projectQuick?: Record<string, unknown>;
+    globalQuick?: Record<string, unknown>;
+    project?: Record<string, unknown>;
+    global?: Record<string, unknown>;
+  }) => resolveParamsLayers(sd, [layers.task, layers.projectQuick, layers.globalQuick, layers.project, layers.global]);
+
+  it('scope keys are namespaced so they never collide with general settings', () => {
+    expect(quickScopeKey('global')).toBe('quick:global');
+    expect(quickScopeKey('p1')).toBe('quick:p1');
+    // A project id is never the literal string "global", so no ambiguity.
+    expect(quickScopeKey('p1')).not.toBe('global');
+  });
+
+  it('global-quick overrides the general defaults for a quick task', () => {
+    const r = chain({ globalQuick: { confirm: { mode: 'auto' } }, global: { confirm: { mode: 'human' } } });
+    expect(r.confirm).toEqual({ mode: 'auto' });
+  });
+
+  it('global-quick inherits (falls through) to the general global default when unset', () => {
+    const r = chain({ globalQuick: {}, global: { worldProvider: 'container' } });
+    expect(r.worldProvider).toBe('container');
+  });
+
+  it('project-quick overrides global-quick', () => {
+    const r = chain({ projectQuick: { confirm: { mode: 'human' } }, globalQuick: { confirm: { mode: 'auto' } } });
+    expect(r.confirm).toEqual({ mode: 'human' });
+  });
+
+  it('project-quick inherits from global-quick before the project general default', () => {
+    const r = chain({ globalQuick: { confirm: { mode: 'auto' } }, project: { confirm: { mode: 'human' } } });
+    expect(r.confirm).toEqual({ mode: 'auto' }); // global-quick wins over project-general
+  });
+
+  it('project-quick falls through to the project general default when neither quick layer sets it', () => {
+    const r = chain({ project: { target: 'prod' }, global: { target: 'main' } });
+    expect(r.target).toBe('prod');
+  });
+
+  it('a task override still beats every default layer', () => {
+    const r = chain({ task: { base: 'feature' }, projectQuick: { base: 'pq' }, globalQuick: { base: 'gq' }, project: { base: 'p' }, global: { base: 'g' } });
+    expect(r.base).toBe('feature');
+  });
+
+  it('quick*SettingsFor read the namespaced rows and default to {}', () => {
+    const rows: Record<string, Record<string, unknown>> = {
+      'quick:global::software-dev': { confirm: { mode: 'auto' } },
+      'quick:p1::software-dev': { base: 'qb' },
+    };
+    const get = (scopeKey: string, wf: string) => rows[`${scopeKey}::${wf}`];
+    expect(quickGlobalSettingsFor(get, 'software-dev')).toEqual({ confirm: { mode: 'auto' } });
+    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({ base: 'qb' });
+    expect(quickGlobalSettingsFor(() => undefined, 'software-dev')).toEqual({});
+    expect(quickProjectSettingsFor(() => undefined, 'p1', 'software-dev')).toEqual({});
   });
 });
 

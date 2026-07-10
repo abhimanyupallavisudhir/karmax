@@ -16,9 +16,22 @@ export function resolveParams(
   manifest: WorkflowManifest,
   layers: { task?: ValueMap; project?: ValueMap; global?: ValueMap },
 ): ValueMap {
+  return resolveParamsLayers(manifest, [layers.task, layers.project, layers.global]);
+}
+
+/**
+ * Resolve field values from an arbitrary ordered stack of overlays, highest
+ * precedence first (task → … → global), falling through empty layers to the
+ * field default. Generalizes the fixed task/project/global chain so the quick-task
+ * defaults layers (quick-project → quick-global) can be spliced above the general
+ * ones (SPEC §10.4 overlay).
+ */
+export function resolveParamsLayers(manifest: WorkflowManifest, layers: (ValueMap | undefined)[]): ValueMap {
   const out: ValueMap = {};
   for (const f of manifest.params) {
-    const v = pick(layers.task?.[f.name], pick(layers.project?.[f.name], pick(layers.global?.[f.name], f.default)));
+    let v: unknown = f.default;
+    // Fold from lowest precedence up: each non-empty higher layer wins.
+    for (let i = layers.length - 1; i >= 0; i--) v = pick(layers[i]?.[f.name], v);
     if (v !== undefined) out[f.name] = v;
   }
   return out;
@@ -160,6 +173,38 @@ export function globalSettingsFor(
   workflow: string,
 ): ValueMap {
   return getSettings('global', workflow) ?? {};
+}
+
+/**
+ * Quick-task defaults (SPEC §10.4) — a separate overlay that applies ONLY to tasks
+ * added from the quick-task box (not the full task form). Stored under a `quick:`
+ * namespaced scope key so it never collides with the general defaults, and starts
+ * empty (no legacy back-compat derivation): quick defaults are purely opt-in and
+ * inherit from the general defaults until a field is set.
+ *
+ * Effective value for a quick task in a project (highest → lowest precedence):
+ *   task override → project-quick → global-quick → project-general → global-general → field default.
+ * That chain realizes the two inheritances the settings UI exposes: global-quick
+ * inherits from global-general, and project-quick inherits from global-quick (its
+ * natural parent) with the project-general defaults as the alternative source.
+ */
+export function quickScopeKey(scope: 'global' | string): string {
+  return scope === 'global' ? 'quick:global' : `quick:${scope}`;
+}
+
+export function quickGlobalSettingsFor(
+  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
+  workflow: string,
+): ValueMap {
+  return getSettings(quickScopeKey('global'), workflow) ?? {};
+}
+
+export function quickProjectSettingsFor(
+  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
+  projectId: string,
+  workflow: string,
+): ValueMap {
+  return getSettings(quickScopeKey(projectId), workflow) ?? {};
 }
 
 /** When project settings are saved, mirror bound-project fields into ProjectConfig (back-compat). */
