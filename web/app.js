@@ -2922,7 +2922,11 @@ function renderDiff(d) {
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
-    case 'account': return `a ${w.provider || 'compatible'} login (quota refresh)`;
+    // Only claim "quota refresh" when a reset instant is actually known — this
+    // wait also covers plain lease contention (another task holds the login) and
+    // grant latency, where asserting a quota cause sends the user to check a
+    // dashboard that rightly shows nothing wrong.
+    case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to free up'}`;
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
