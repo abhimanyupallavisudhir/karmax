@@ -532,16 +532,32 @@ export class KarmaxApi {
     return this.deps.store.getTask(taskId)!;
   }
 
-  async getTaskView(token: string, taskId: string): Promise<TaskView | undefined> {
+  async getTaskView(
+    token: string,
+    taskId: string,
+    opts?: { live?: boolean },
+  ): Promise<TaskView | undefined> {
     this.require(token, 'get_task');
     const snapshot = () => this.deps.store.getTask(taskId)?.lastView;
     // Cosmetic human notes live on the record (never on the workflow), so mirror
     // them onto whichever view we return — the UI shows/edits them at any stage.
     const withNotes = (view: TaskView | undefined): TaskView | undefined =>
       view ? { ...view, notes: this.deps.store.getTask(taskId)?.notes } : view;
-    // Prefer the live workflow view, but bound it: a wedged workflow (e.g. stuck
-    // in a workflow-task-failure loop) makes a query hang without rejecting, which
-    // would otherwise freeze the whole task list / dashboard. Fall back fast.
+    // Snapshot-first (the default). The workflow persists `lastView` to the store on
+    // every change via the `publishView` activity AND pushes a `view.updated` event
+    // over the bus/WebSocket in the same call — so the stored snapshot is kept fresh
+    // push-style and any open UI refetches the instant it changes. Serving it directly
+    // avoids a live workflow `query('view')`, which on a sticky-cache miss forces the
+    // worker to replay the whole (never-trimmed) history — seconds of latency, paid on
+    // *every* drawer open and once per row on the task list. `opts.live` opts back into
+    // the authoritative query for the few callers that must not read a lagging snapshot
+    // (post-`updateParams` responses, review-action resolution). We also fall through to
+    // a live query when there is no snapshot yet (a brand-new task, pre-first-publish).
+    const snap = snapshot();
+    if (snap && !opts?.live) return withNotes(snap);
+    // Live path — bound it: a wedged workflow (e.g. stuck in a workflow-task-failure
+    // loop) makes a query hang without rejecting, which would otherwise freeze the
+    // caller. Fall back fast to whatever snapshot we have.
     try {
       const q = this.deps.client.workflow.getHandle(taskId).query('view') as Promise<TaskView>;
       q.catch(() => undefined); // swallow the late rejection if we time out first
