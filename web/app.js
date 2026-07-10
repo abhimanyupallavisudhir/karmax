@@ -1026,21 +1026,35 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// "Show archived" is not a separate toggle — it's just the `is:archived` facet in the
-// query. The default search hides archived tasks by transparently appending `-is:archived`
-// (Linear/Jira behaviour); the moment the user's query mentions archived-ness (adds
-// `is:archived`, `-is:archived`, or groups by it), we leave it alone. The clean `S.search`
-// stays in the box; only the evaluated query carries the default.
-function queryMentionsArchived(q) { return /(^|\s)-?(is|has):[^\s]*archived/i.test(q || ''); }
+// The default list transparently hides two kinds of noise unless the query opts in:
+// archived tasks (`-is:archived`) and the auto-spawned *runs* of a repeatable series
+// (`-is:run`), so a cron series doesn't flood the list — its template still shows, and
+// you drill into runs with `is:run` (or the Series view). "Show archived" / "show runs"
+// are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
+// evaluated query carries the defaults. If the query already mentions a facet, we leave it.
+function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
+function queryMentionsArchived(q) { return queryMentionsFacet(q, 'archived'); }
 function effectiveQuery(q) {
-  const s = (q || '').trim();
-  if (queryMentionsArchived(s)) return s;
-  return s ? `${s} -is:archived` : '-is:archived';
+  let s = (q || '').trim();
+  for (const facet of ['archived', 'run']) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
+  return s;
 }
 
-// The saved-views switcher — every chip is a query. "All" is the built-in default;
-// each saved view carries a ✕ to delete it (confirmed in wireOrgControls).
+// Built-in starter views that make the new task shapes (schedules, dependency-blocked,
+// repeatable series) first-class instead of buried. Each is just a query string; they
+// can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
+const BUILTIN_VIEWS = [
+  { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
+  { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
+  { id: 'builtin:series', name: 'Series', icon: '🔁', query: 'is:series' },
+];
+
+// The saved-views switcher — every chip is a query. "All" is the default; then the
+// built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
+  const builtins = BUILTIN_VIEWS
+    .map((v) => `<div class="view-chip builtin ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
+    .join('');
   const saved = S.views
     .map(
       (v) => `<div class="view-chip ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
@@ -1048,6 +1062,7 @@ function viewsBar() {
     .join('');
   return `<div class="views-bar">
     <div class="view-chip ${!S.activeView ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
+    ${builtins}
     ${saved}
     <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
   </div>`;
@@ -1390,6 +1405,8 @@ function wireOrgControls() {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
       if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
+      if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
       if (!v) return;
       S.activeView = id;
@@ -2057,22 +2074,36 @@ async function openTaskForm(workflow, draft, seedText) {
   // Persist the current form as a draft without leaving the form. Silent by
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
   let lastSaved = null;
-  async function persistDraft(st = formState()) {
-    if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+  // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
+  // if a debounced create is still in flight when the user types more or closes the
+  // form (which flushes), `draftId` is still null, so the next save POSTs a *second*
+  // draft instead of PATCHing the first — you end up with duplicate drafts, one
+  // holding only the pre-close text (looks like the last edit was dropped). Even for
+  // an existing draft, two in-flight PATCHes can land out of order and clobber the
+  // newer edit. Chaining guarantees each save sees the previous one's `draftId`/
+  // `lastSaved` and lands in order, so the most recent edit always wins.
+  let saveChain = Promise.resolve();
+  function persistDraft(st = formState()) {
+    // Snapshot the signature at CALL time (the DOM may be gone by the time this link
+    // in the chain runs — e.g. closeForm clears the form right after queuing the flush).
     const sig = JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
-    if (sig === lastSaved) return; // no change since last write
-    try {
-      if (!draftId) {
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
-        draftId = created.id;
-      } else {
-        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
-        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-      }
-      if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
-      lastSaved = sig;
-      refreshTasks();
-    } catch { /* keep the form open; a later save or explicit button will retry */ }
+    saveChain = saveChain.then(async () => {
+      if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+      if (sig === lastSaved) return; // no change since the last write landed
+      try {
+        if (!draftId) {
+          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+          draftId = created.id;
+        } else {
+          await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+          await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        }
+        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        lastSaved = sig;
+        refreshTasks();
+      } catch { /* keep the form open; a later save or explicit button will retry */ }
+    });
+    return saveChain;
   }
 
   // Debounced auto-save while typing.
@@ -2114,6 +2145,10 @@ async function openTaskForm(workflow, draft, seedText) {
   const submit = async (draftMode) => {
     clearTimeout(saveTimer);
     const st = formState();
+    // Drain any in-flight auto-save first: it may still be creating the draft (setting
+    // draftId) or PATCHing older text. Waiting lets the branches below see the right
+    // draftId and land last, so the explicit save/queue reflects the final form state.
+    await saveChain.catch(() => {});
     try {
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its

@@ -635,6 +635,8 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .view-chip:hover { border-color: var(--line-strong); color: var(--ink); }
 .view-chip.active { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
 .view-chip.add { color: var(--ink-3); border-style: dashed; }
+.view-chip.builtin { border-style: dotted; }
+.view-chip.builtin.active { border-style: solid; }
 .view-x { opacity: 0; font-size: 10px; color: var(--ink-3); cursor: pointer; margin-left: -1px; transition: opacity .1s; }
 .view-chip:hover .view-x { opacity: .65; }
 .view-x:hover { opacity: 1; color: var(--danger); }
