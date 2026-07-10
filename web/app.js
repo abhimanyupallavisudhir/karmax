@@ -2057,22 +2057,36 @@ async function openTaskForm(workflow, draft, seedText) {
   // Persist the current form as a draft without leaving the form. Silent by
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
   let lastSaved = null;
-  async function persistDraft(st = formState()) {
-    if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+  // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
+  // if a debounced create is still in flight when the user types more or closes the
+  // form (which flushes), `draftId` is still null, so the next save POSTs a *second*
+  // draft instead of PATCHing the first — you end up with duplicate drafts, one
+  // holding only the pre-close text (looks like the last edit was dropped). Even for
+  // an existing draft, two in-flight PATCHes can land out of order and clobber the
+  // newer edit. Chaining guarantees each save sees the previous one's `draftId`/
+  // `lastSaved` and lands in order, so the most recent edit always wins.
+  let saveChain = Promise.resolve();
+  function persistDraft(st = formState()) {
+    // Snapshot the signature at CALL time (the DOM may be gone by the time this link
+    // in the chain runs — e.g. closeForm clears the form right after queuing the flush).
     const sig = JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
-    if (sig === lastSaved) return; // no change since last write
-    try {
-      if (!draftId) {
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
-        draftId = created.id;
-      } else {
-        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
-        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-      }
-      if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
-      lastSaved = sig;
-      refreshTasks();
-    } catch { /* keep the form open; a later save or explicit button will retry */ }
+    saveChain = saveChain.then(async () => {
+      if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+      if (sig === lastSaved) return; // no change since the last write landed
+      try {
+        if (!draftId) {
+          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+          draftId = created.id;
+        } else {
+          await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+          await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        }
+        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        lastSaved = sig;
+        refreshTasks();
+      } catch { /* keep the form open; a later save or explicit button will retry */ }
+    });
+    return saveChain;
   }
 
   // Debounced auto-save while typing.
@@ -2114,6 +2128,10 @@ async function openTaskForm(workflow, draft, seedText) {
   const submit = async (draftMode) => {
     clearTimeout(saveTimer);
     const st = formState();
+    // Drain any in-flight auto-save first: it may still be creating the draft (setting
+    // draftId) or PATCHing older text. Waiting lets the branches below see the right
+    // draftId and land last, so the explicit save/queue reflects the final form state.
+    await saveChain.catch(() => {});
     try {
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
