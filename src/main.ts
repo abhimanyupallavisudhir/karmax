@@ -22,7 +22,7 @@ import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
 import { remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
-import { registerAppInstance } from './util/instance.js';
+import { registerAppInstance, isInsideDir } from './util/instance.js';
 
 const VERSION = '1.0.0';
 
@@ -31,6 +31,30 @@ async function main() {
   const { provider, reason } = defaultProvider();
 
   console.log('\n  karmax ' + VERSION + '  — an AI-era todo list on a durable substrate\n');
+
+  // World-rooted self-poisoning guard (karmax#3): an app booted from a checkout
+  // INSIDE this home's worlds/ dir is a task's dogfooding copy of karmax. Sharing
+  // the prod KARMAX_HOME means it joins the prod Temporal task queue and
+  // dual-polls with divergent code — and it keeps polling after its worktree is
+  // deleted post-merge, failing every agent turn it grabs with the misleading
+  // "Cannot find package '@anthropic-ai/claude-agent-sdk' imported from
+  // worlds/<task>/src/…" (the 2026-07-09 incident: a 3-hour orphan rooted in a
+  // deleted world). Unlike the duplicate-instance warning below, this case has no
+  // legitimate form, so refuse to boot rather than advise.
+  const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  if (isInsideDir(appRoot, p.worlds)) {
+    console.error(
+      `\n  ✗ Refusing to start: this karmax checkout lives inside a task world of the` +
+        ` KARMAX_HOME it would serve.\n` +
+        `      checkout:    ${appRoot}\n` +
+        `      KARMAX_HOME: ${p.home}\n` +
+        `    It would join the production Temporal task queue with divergent code and keep\n` +
+        `    poisoning it after this world is merged and deleted (karmax#3). To test karmax\n` +
+        `    from a world, run it against an isolated home, e.g.:\n` +
+        `      KARMAX_HOME=$(mktemp -d /tmp/kx-XXXXXX) npm start\n`,
+    );
+    process.exit(1);
+  }
 
   // Duplicate app-instance guard (karmax#4): the July-5 OOM had 14 `src/main.ts`
   // running against one KARMAX_HOME — each with its own worker fanning out agent
