@@ -2542,7 +2542,7 @@ function renderDrawer() {
         </div>
         ${drawerOrg(v)}
       </div>
-      <div class="drawer-body" id="drawer-body">${drawerBody(v)}</div>
+      <div class="drawer-body" id="drawer-body" tabindex="-1">${drawerBody(v)}</div>
       <div class="drawer-foot" id="drawer-foot">${drawerActions(v)}</div>
     </aside>`;
   $('#scrim').addEventListener('click', closeDrawer);
@@ -2563,6 +2563,24 @@ function renderDrawer() {
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
   restoreFocus(root, focusState);
   restoreFollowupFocus(root, fuState);
+  // The scrollable body is the drawer's own scroll container (the app shell is
+  // overflow:hidden), so PgUp/PgDn/Home/End/space/arrows only scroll it while it
+  // holds focus. Focus it on open — and keep it focused across the background
+  // re-renders — so the drawer is keyboard-scrollable the moment it appears.
+  const overlayOpen = $('#overlay-root')?.childElementCount > 0 || $('#modal-root')?.childElementCount > 0;
+  if (newBody && shouldFocusDrawerBody(root, document.activeElement, overlayOpen)) newBody.focus({ preventScroll: true });
+}
+
+// Whether renderDrawer should hand keyboard focus to the scrollable drawer body.
+// Yes on a fresh open (focus on <body> / nowhere) and to keep it across re-renders;
+// never steal it from a field the user is in (composer/notes/params/terminal) or
+// from an overlay/modal stacked above the drawer.
+function shouldFocusDrawerBody(root, active, overlayOpen) {
+  if (overlayOpen) return false;
+  if (!active || active === document.body) return true; // fresh open: nothing focused
+  if (!root.contains(active)) return false; // focus lives outside the drawer (e.g. an overlay)
+  if (active.matches?.('input, textarea, select') || active.isContentEditable || active.classList?.contains('term-screen')) return false;
+  return true; // focus is the drawer body itself (or a non-field) — keep/take it
 }
 
 // Follow-up textareas live one-per-agent-conversation and are keyed by the agent
