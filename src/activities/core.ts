@@ -324,18 +324,45 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // cross-provider jump.
       if (!session && spec?.resumeFrom) {
         const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
+        // The config home THIS turn runs under — where the source session must be
+        // visible for the provider to resolve it. Shared by both resume paths below.
+        const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), profile.provider === 'codex' ? '.codex' : '.claude');
         if (spec.resumeFrom.sessionId) {
           // A raw pasted provider session id = "continue THIS exact session" (resume,
-          // not fork). Best-effort: it must live in the home this turn runs under.
+          // not fork). Materialize it into this turn's (home × world) so the provider
+          // resolves it even when the id was minted under a DIFFERENT config home or
+          // world — Claude keys sessions by (home × cwd), Codex by id across homes, so
+          // a bare pass-through silently missed both. The copy is non-mutating, so the
+          // source is never disturbed; `fork` stays false to keep the same session id.
           session = spec.resumeFrom.sessionId;
-          record(args.taskId, 'session.resumed', { session });
+          // The mock provider is hermetic — it has no on-disk session, so materialize is
+          // meaningless; pass the id straight through. Real providers (claude/codex) key
+          // a session to a file; make it visible in this turn's (home × world) or fail.
+          const materialized =
+            profile.provider === 'mock'
+              ? true
+              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: world.handle.root });
+          if (!materialized) {
+            // The id resolves in NO config home for this provider. Fail loudly instead
+            // of handing an unknown id to the adapter, which would silently start a
+            // FRESH conversation — the user asked to continue a specific one, and would
+            // otherwise never learn it was lost. Permanent (nonRetryable): retrying can't
+            // conjure the session. Covers a typo, a cleaned session, or a cross-provider
+            // id (we run under this profile's provider).
+            record(args.taskId, 'session.resume-failed', { session, provider: profile.provider });
+            throw ApplicationFailure.create({
+              message: `Cannot resume session "${session}": no such ${profile.provider} conversation found in any connected config home. Check the id, or that it belongs to a ${profile.provider} login connected to karmax (cross-provider resume is unsupported).`,
+              type: 'agent-error',
+              nonRetryable: true,
+            });
+          }
+          record(args.taskId, 'session.resumed', { session, materialized });
         } else if (spec.resumeFrom.taskId) {
           const srcSession = store.kvGet(`session:${spec.resumeFrom.taskId}:${srcRole}`) || undefined;
           let srcHome: string | undefined;
           let srcProvider: string | undefined;
           const metaRaw = store.kvGet(`sessionmeta:${spec.resumeFrom.taskId}:${srcRole}`);
           if (metaRaw) { try { const m = JSON.parse(metaRaw); srcHome = m.home || undefined; srcProvider = m.provider || undefined; } catch { /* ignore */ } }
-          const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), profile.provider === 'codex' ? '.codex' : '.claude');
           let forked = false;
           if (srcSession && (!srcProvider || srcProvider === profile.provider)) {
             forked = materializeFork({ provider: profile.provider, session: srcSession, forkHome, worldPath: world.handle.root, srcHome });
