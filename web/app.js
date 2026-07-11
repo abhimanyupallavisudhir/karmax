@@ -124,7 +124,18 @@ async function applyRoute() {
   if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
   const pid = proj.id;
   const tab = r.tab || 'tasks';
-  if (pid !== S.projectId) { S.projectId = pid; await loadTasks().catch(() => {}); }
+  if (pid !== S.projectId) {
+    // Switching projects: drop the previous project's per-project view state so
+    // its query/selected-view/roving-cursor/search-result can't bleed into the
+    // new project (they'd otherwise re-run the old query against new data and
+    // highlight a view/cursor that doesn't exist here).
+    S.projectId = pid;
+    S.search = '';
+    S.activeView = null;
+    S.searchResult = null;
+    S.cursorId = null;
+    await loadTasks().catch(() => {});
+  }
   else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
   await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
   if (tab === 'tasks') await runSearch().catch(() => {});
@@ -1029,7 +1040,7 @@ function taskMatches(t, q) {
 // The default list transparently hides two kinds of noise unless the query opts in:
 // archived tasks (`-is:archived`) and the auto-spawned *runs* of a repeatable series
 // (`-is:run`), so a cron series doesn't flood the list — its template still shows, and
-// you drill into runs with `is:run` (or the Series/Archived views). Archived and runs
+// you drill into runs with `is:run` (or the Repeatable/Archived views). Archived and runs
 // are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
 // evaluated query carries the defaults. If the query already mentions a facet, we leave it.
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
@@ -1045,7 +1056,7 @@ function effectiveQuery(q) {
 const BUILTIN_VIEWS = [
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
-  { id: 'builtin:series', name: 'Series', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
@@ -2297,10 +2308,21 @@ async function openDrawer(taskId) {
   S.paramDefaults = {};
   highlightRow();
   try {
-    S.view = await api(`/api/tasks/${taskId}`);
-    S.drawerEvents = await api(`/api/tasks/${taskId}/events?since=0`);
-    S.widgets = await api(`/api/tasks/${taskId}/widgets`).catch(() => []);
-    S.sessions = await api(`/api/tasks/${taskId}/sessions`).catch(() => ({}));
+    // Fetch the four independent resources in parallel — they used to be four serial
+    // round-trips, which stacked latency (each drawer open paid the sum, not the max).
+    // `renderDrawer` no-ops while `S.view` is null, so assigning them together (rather
+    // than one-at-a-time) also avoids rendering a half-populated drawer mid-fetch.
+    const [view, events, widgets, sessions] = await Promise.all([
+      api(`/api/tasks/${taskId}`),
+      api(`/api/tasks/${taskId}/events?since=0`),
+      api(`/api/tasks/${taskId}/widgets`).catch(() => []),
+      api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+    ]);
+    S.view = view;
+    S.drawerEvents = events;
+    S.widgets = widgets;
+    S.sessions = sessions;
+    // paramDefaults keys off the fetched view's workflow, so it follows the batch.
     S.paramDefaults = await loadParamDefaults(taskId);
   } catch (e) { toast(e.message, true); }
   renderDrawer();
@@ -2311,10 +2333,18 @@ async function refreshDrawer() {
   // would clobber in-progress edits); it re-renders only on open / explicit save.
   if (S.tasks.find((t) => t.id === S.selected)?.params?.repeatable) return;
   try {
-    S.view = await api(`/api/tasks/${S.selected}`);
-    S.widgets = await api(`/api/tasks/${S.selected}/widgets`).catch(() => S.widgets);
-    S.sessions = await api(`/api/tasks/${S.selected}/sessions`).catch(() => S.sessions);
-    S.paramDefaults = await loadParamDefaults(S.selected);
+    // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
+    // WS push for the open task, so keeping it to a single round-trip's latency matters.
+    const id = S.selected;
+    const [view, widgets, sessions] = await Promise.all([
+      api(`/api/tasks/${id}`),
+      api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
+      api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+    ]);
+    S.view = view;
+    S.widgets = widgets;
+    S.sessions = sessions;
+    S.paramDefaults = await loadParamDefaults(id);
   } catch {}
   renderDrawer();
 }
@@ -2503,7 +2533,7 @@ function renderDrawer() {
         </div>
         ${drawerOrg(v)}
       </div>
-      <div class="drawer-body" id="drawer-body">${drawerBody(v)}</div>
+      <div class="drawer-body" id="drawer-body" tabindex="-1">${drawerBody(v)}</div>
       <div class="drawer-foot" id="drawer-foot">${drawerActions(v)}</div>
     </aside>`;
   $('#scrim').addEventListener('click', closeDrawer);
@@ -2524,6 +2554,24 @@ function renderDrawer() {
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
   restoreFocus(root, focusState);
   restoreFollowupFocus(root, fuState);
+  // The scrollable body is the drawer's own scroll container (the app shell is
+  // overflow:hidden), so PgUp/PgDn/Home/End/space/arrows only scroll it while it
+  // holds focus. Focus it on open — and keep it focused across the background
+  // re-renders — so the drawer is keyboard-scrollable the moment it appears.
+  const overlayOpen = $('#overlay-root')?.childElementCount > 0 || $('#modal-root')?.childElementCount > 0;
+  if (newBody && shouldFocusDrawerBody(root, document.activeElement, overlayOpen)) newBody.focus({ preventScroll: true });
+}
+
+// Whether renderDrawer should hand keyboard focus to the scrollable drawer body.
+// Yes on a fresh open (focus on <body> / nowhere) and to keep it across re-renders;
+// never steal it from a field the user is in (composer/notes/params/terminal) or
+// from an overlay/modal stacked above the drawer.
+function shouldFocusDrawerBody(root, active, overlayOpen) {
+  if (overlayOpen) return false;
+  if (!active || active === document.body) return true; // fresh open: nothing focused
+  if (!root.contains(active)) return false; // focus lives outside the drawer (e.g. an overlay)
+  if (active.matches?.('input, textarea, select') || active.isContentEditable || active.classList?.contains('term-screen')) return false;
+  return true; // focus is the drawer body itself (or a non-field) — keep/take it
 }
 
 // Follow-up textareas live one-per-agent-conversation and are keyed by the agent
@@ -2948,7 +2996,11 @@ function renderDiff(d) {
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
-    case 'account': return `a ${w.provider || 'compatible'} login (quota refresh)`;
+    // Only claim "quota refresh" when a reset instant is actually known — this
+    // wait also covers plain lease contention (another task holds the login) and
+    // grant latency, where asserting a quota cause sends the user to check a
+    // dashboard that rightly shows nothing wrong.
+    case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to free up'}`;
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
@@ -4089,10 +4141,19 @@ function wireSettingsView(proj) {
     try {
       await api(`/api/projects/${proj.id}`, { method: 'DELETE' });
       toast(`Deleted project "${proj.name}"`);
-      if (S.projectId === proj.id) S.projectId = null;
+      const wasCurrent = S.projectId === proj.id;
       await loadProjects();
-      S.tab = S.projectId ? 'tasks' : 'dashboard';
-      if (S.projectId) await loadTasks();
+      if (wasCurrent) {
+        // Route into the next remaining project (or the dashboard) so its
+        // tasks/tags/views/search all load fresh and the URL stops pointing at
+        // the now-deleted project. S.projectId still holds the deleted id here,
+        // which keeps applyRoute's switch-guard armed so the old project's view
+        // state (query/selected view/cursor) gets cleared.
+        const next = S.projects[0];
+        if (next) return go(projectRoute(next.id));
+        S.projectId = null;
+        return go('/dashboard');
+      }
       renderRail();
       renderMain();
     } catch (e) { toast(e.message, true); }
@@ -4494,9 +4555,10 @@ async function newProject() {
     // which is exactly the inheritance bug this avoids.
     const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: {} }) });
     await loadProjects();
-    S.projectId = p.id;
-    renderRail();
-    renderMain();
+    // Route into the new project so its tasks, tags, saved views and search all
+    // load fresh — setting S.projectId + re-rendering alone leaves the previous
+    // project's tasks/views on screen (applyRoute does the loading on switch).
+    await go(projectRoute(p.id));
   } catch (e) { toast(e.message, true); }
 }
 
@@ -4854,7 +4916,7 @@ function openPalette() {
       }
       for (const p of S.projects) {
         const score = fuzzyScore(q, p.name);
-        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => { S.projectId = p.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); } });
+        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => go(projectRoute(p.id)) });
       }
     }
     items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);

@@ -1,6 +1,7 @@
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
 import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
@@ -169,6 +170,21 @@ export class ClaudeAdapter implements AgentAdapter {
     try {
       sdk = await import('@anthropic-ai/claude-agent-sdk');
     } catch (e) {
+      // Distinguish "deps not installed" from the orphaned-instance signature
+      // (karmax#3): a karmax booted from a task world keeps running after that
+      // worktree is deleted post-merge, so this lazy import fails from a path
+      // that no longer exists even though every real install has the SDK. Name
+      // the actual problem — the 2026-07-09 incident burned a Resolve turn (and
+      // a human) chasing a phantom missing dependency.
+      const here = path.dirname(fileURLToPath(import.meta.url));
+      if (!fs.existsSync(here)) {
+        throw new Error(
+          `karmax is running from a deleted directory (${here}) — an orphaned app instance, ` +
+            `likely booted from a task world that has since merged and been removed (karmax#3). ` +
+            `Kill this process (pid ${process.pid}); it is poisoning the shared task queue. ` +
+            `Original error: ${String(e)}`,
+        );
+      }
       throw new Error(`Claude Agent SDK not installed: ${String(e)}`);
     }
     const { query, createSdkMcpServer, tool } = sdk;
