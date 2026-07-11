@@ -78,9 +78,19 @@ async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: 
     }
   }
 
-  // Files this attempt changed vs its base (for the landed-files report).
-  const changed = await git(root, ['diff', '--name-only', `${base}...HEAD`]);
+  // Files this attempt changed vs its base (for the landed-files report, and the
+  // input to the conflict-marker guard below). When the configured base is absent
+  // — world creation silently forks off HEAD instead (see worktree.ts) — the
+  // `${base}...HEAD` diff would error and leave an EMPTY list, which both blanks
+  // the landed-files report AND skips the marker scan (it early-returns on []).
+  // Fall back to every file tracked at HEAD: over-inclusive for the report, but it
+  // keeps the safety scan running rather than silently disabling it.
+  const baseResolvable = (await git(root, ['rev-parse', '--verify', base])).code === 0;
+  const changed = baseResolvable
+    ? await git(root, ['diff', '--name-only', `${base}...HEAD`])
+    : await git(root, ['ls-tree', '-r', '--name-only', 'HEAD']);
   const landedFiles = changed.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+  const baseNote = baseResolvable ? undefined : `base "${base}" not found — forked off HEAD; scanned all files at HEAD`;
 
   // 1b. Never land conflict markers as content: scan what this attempt changed.
   const marked = await conflictMarkerFiles(root, landedFiles);
@@ -162,7 +172,7 @@ async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: 
       return { merged: false, landedFiles, conflict: conflicts.stdout.trim() || land.stderr || land.stdout };
     }
     const sha = await headSha(dir);
-    return { merged: true, sha, landedFiles };
+    return { merged: true, sha, landedFiles, note: baseNote };
   } finally {
     await cleanup?.();
   }

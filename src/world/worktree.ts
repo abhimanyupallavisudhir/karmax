@@ -48,13 +48,14 @@ export class WorktreeProvider implements WorldProvider {
     }
 
     const repos: WorldRepo[] = [];
+    const warnings: string[] = [];
     if (resolvedSources.length === 0) {
       // No repo configured — a scratch sandbox (the world itself is the deliverable).
       const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
-      repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec));
+      repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings));
     } else if (resolvedSources.length === 1) {
       // Single repo: the worktree IS the world root (unchanged layout).
-      repos.push(await this.addWorktree(resolvedSources[0]!, root, repoName(resolvedSources[0]!), branch, spec));
+      repos.push(await this.addWorktree(resolvedSources[0]!, root, repoName(resolvedSources[0]!), branch, spec, warnings));
     } else {
       // Multi-repo: the world root is a parent dir holding one worktree per repo,
       // each in a subdirectory named after the repo (deduped on collision).
@@ -63,7 +64,7 @@ export class WorktreeProvider implements WorldProvider {
       const names = uniqueNames(resolvedSources.map(repoName));
       for (let i = 0; i < resolvedSources.length; i++) {
         const name = names[i]!;
-        repos.push(await this.addWorktree(resolvedSources[i]!, path.join(root, name), name, branch, spec));
+        repos.push(await this.addWorktree(resolvedSources[i]!, path.join(root, name), name, branch, spec, warnings));
       }
     }
 
@@ -76,6 +77,7 @@ export class WorktreeProvider implements WorldProvider {
       repo: repos[0]!.repo,
       target: spec.target,
       repos,
+      ...(warnings.length ? { warnings } : {}),
     };
     return new WorktreeWorld(handle);
   }
@@ -84,11 +86,17 @@ export class WorktreeProvider implements WorldProvider {
    * Add a `karmax/<taskId>` worktree for one repo at `wt`, off `spec.base`
    * (falling back to HEAD if that ref is absent). Returns the `WorldRepo` record.
    */
-  private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec): Promise<WorldRepo> {
+  private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec, warnings?: string[]): Promise<WorldRepo> {
     // Resolve a real base ref per repo; fall back to HEAD if the named base is absent.
     let baseRef = spec.base;
     const verify = await git(repo, ['rev-parse', '--verify', `${spec.base}`]);
-    if (verify.code !== 0) baseRef = await gitOrThrow(repo, ['rev-parse', 'HEAD']);
+    if (verify.code !== 0) {
+      baseRef = await gitOrThrow(repo, ['rev-parse', 'HEAD']);
+      // Don't fork off the wrong ref silently — surface that the configured base
+      // was ignored so the misconfiguration is visible (and merges downstream can
+      // no longer resolve `base` either; see finalizeMergeRepo).
+      warnings?.push(`repo "${name}": base branch "${spec.base}" not found — forked off HEAD instead`);
+    }
 
     // Clean any stale worktree at this path.
     if (fs.existsSync(wt)) {
