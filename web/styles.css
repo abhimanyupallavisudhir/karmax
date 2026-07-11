@@ -297,6 +297,8 @@ a { color: var(--accent); text-decoration: none; }
 .drawer-head h2 { font-size: 16px; margin: 0; flex: 1; letter-spacing: -0.01em; }
 .drawer-head .meta { display: flex; gap: 10px; align-items: center; margin-top: 8px; font-size: 12px; color: var(--ink-3); font-family: var(--font-mono); flex-wrap: wrap; }
 .drawer-body { flex: 1; overflow-y: auto; padding: 18px 20px; }
+/* Focused programmatically for keyboard scrolling — it's the whole active surface, not a control, so no outline. */
+.drawer-body:focus, .drawer-body:focus-visible { outline: none; }
 .drawer-foot { border-top: 1px solid var(--line); padding: 14px 20px; background: var(--surface-2); }
 
 .section-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin: 18px 0 8px; }
@@ -635,6 +637,8 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .view-chip:hover { border-color: var(--line-strong); color: var(--ink); }
 .view-chip.active { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
 .view-chip.add { color: var(--ink-3); border-style: dashed; }
+.view-chip.builtin { border-style: dotted; }
+.view-chip.builtin.active { border-style: solid; }
 .view-x { opacity: 0; font-size: 10px; color: var(--ink-3); cursor: pointer; margin-left: -1px; transition: opacity .1s; }
 .view-chip:hover .view-x { opacity: .65; }
 .view-x:hover { opacity: 1; color: var(--danger); }

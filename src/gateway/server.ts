@@ -557,7 +557,9 @@ export class Gateway {
         // no-op on the stored record (which the running workflow would ignore).
         try {
           const applied = await api.updateParams(token, id, b.params ?? {});
-          return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id) });
+          // Authoritative read: reflect the just-applied update, not a snapshot that
+          // may pre-date the workflow's next publish.
+          return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id, { live: true }) });
         } catch (e) {
           return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
         }
@@ -624,7 +626,7 @@ export class Gateway {
         // Resolve the action from the AUTHORITATIVE live view (the stored lastView
         // can lag the workflow), by index — the client never supplies the command,
         // so only agent-authored actions are runnable.
-        const view = (await api.getTaskView(token, taskId).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
         const worldPath = view?.worldPath;

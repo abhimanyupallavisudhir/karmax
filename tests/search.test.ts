@@ -236,6 +236,79 @@ describe('fieldCatalogue', () => {
     expect(status.options?.map((o) => o.value)).toContain('active');
     expect(cat.find((f) => f.key === 'title')!.sortable).toBe(true);
   });
+
+  it('surfaces the trigger fields + facets the UI/agents organize by', () => {
+    const cat = fieldCatalogue();
+    expect(cat.find((f) => f.key === 'trigger')!.groupable).toBe(true);
+    expect(cat.find((f) => f.key === 'nextRun')!.sortable).toBe(true);
+    expect(cat.find((f) => f.key === 'dependsOn')).toBeTruthy();
+    const facets = cat.find((f) => f.key === 'is')!.options!.map((o) => o.value);
+    expect(facets).toEqual(expect.arrayContaining(['armed', 'scheduled', 'recurring', 'blocked-on-deps', 'series', 'run']));
+    expect(cat.find((f) => f.key === 'status')!.options!.map((o) => o.value)).toContain('armed');
+  });
+});
+
+// ── trigger-aware search (dependencies, cron/schedules, repeatable series) ─────
+describe('evaluateQuery — triggers, schedules, series', () => {
+  const CRON = '0 9 * * *'; // 09:00 UTC daily
+  const ctx = { now: NOW, tags: [] as Tag[] };
+  const armedSchedule = (title: string, num: number) =>
+    task({ title, num, params: { prompt: 'x', triggers: [{ kind: 'schedule', cron: CRON }], triggerState: 'armed', repeatable: true } as any });
+
+  it('reports an armed (trigger-gated, never-started) task as status "armed", not "active"', () => {
+    const t = armedSchedule('nightly', 1);
+    expect(evaluateQuery([t], parseQuery('status:armed'), ctx).tasks.map((x) => x.num)).toEqual([1]);
+    expect(evaluateQuery([t], parseQuery('status:active'), ctx).total).toBe(0);
+    // …but once it has fired and started (has a lastView), its real status wins.
+    const started = task({ title: 'nightly', num: 1, lastView: view('active'), params: { prompt: 'x', triggers: [{ kind: 'schedule', cron: CRON }], triggerState: 'fired' } as any });
+    expect(evaluateQuery([started], parseQuery('status:active'), ctx).total).toBe(1);
+  });
+
+  it('matches trigger/series facets', () => {
+    const sched = armedSchedule('nightly', 1);
+    const dep = task({ title: 'after-A', num: 2, params: { prompt: 'x', triggers: [{ kind: 'dependency', tasks: ['task-a'] }], triggerState: 'armed' } as any });
+    const run = task({ title: 'run-7', num: 3, lastView: view('done'), params: { prompt: 'x', runOf: 'series-1' } as any });
+    const plain = task({ title: 'plain', num: 4, lastView: view('active') });
+    const all = [sched, dep, run, plain];
+    const nums = (q: string) => evaluateQuery(all, parseQuery(q), ctx).tasks.map((t) => t.num).sort();
+    expect(nums('is:scheduled')).toEqual([1]);
+    expect(nums('is:recurring')).toEqual([1]); // cron ⇒ recurring (also repeatable)
+    expect(nums('is:blocked-on-deps')).toEqual([2]);
+    expect(nums('is:armed')).toEqual([1, 2]);
+    expect(nums('is:triggered')).toEqual([1, 2]);
+    expect(nums('is:series')).toEqual([1]); // repeatable template
+    expect(nums('is:run')).toEqual([3]);
+    expect(nums('-is:triggered')).toEqual([3, 4]);
+  });
+
+  it('groups by trigger kind and searches the cron text', () => {
+    const sched = armedSchedule('nightly', 1);
+    const dep = task({ title: 'after-A', num: 2, params: { prompt: 'x', triggers: [{ kind: 'dependency', tasks: ['task-a'] }], triggerState: 'armed' } as any });
+    const plain = task({ title: 'plain', num: 3, lastView: view('active') });
+    const g = evaluateQuery([sched, dep, plain], parseQuery('group:trigger'), ctx);
+    expect(g.groups?.map((x) => x.key).sort()).toEqual(['dependency', 'none', 'schedule']);
+    // `schedule:` matches the cron text (only the cron task has one); `is:scheduled` is the facet.
+    expect(evaluateQuery([sched, dep, plain], parseQuery('schedule:9'), ctx).tasks.map((t) => t.num)).toEqual([1]);
+  });
+
+  it('computes + sorts by nextRun (soonest first with sort:nextRun-asc)', () => {
+    const morning = task({ title: 'morning', num: 1, params: { prompt: 'x', triggers: [{ kind: 'schedule', cron: '0 9 * * *' }], triggerState: 'armed' } as any });
+    const earlier = task({ title: 'earlier', num: 2, params: { prompt: 'x', triggers: [{ kind: 'schedule', cron: '0 6 * * *' }], triggerState: 'armed' } as any });
+    const r = evaluateQuery([morning, earlier], parseQuery('is:scheduled sort:nextRun-asc'), ctx);
+    expect(r.tasks.map((t) => t.num)).toEqual([2, 1]); // 06:00 fires before 09:00
+  });
+
+  it('makes the dependency graph queryable (dependsOn / blocks by #num)', () => {
+    const a = task({ title: 'build', num: 1, lastView: view('active') });
+    const b = task({ title: 'deploy', num: 2, params: { prompt: 'x', triggers: [{ kind: 'dependency', tasks: [a.id] }], triggerState: 'armed' } as any });
+    const all = [a, b];
+    // "what is waiting on #1?" → the deploy task depends on build
+    expect(evaluateQuery(all, parseQuery('dependsOn:#1'), ctx).tasks.map((t) => t.num)).toEqual([2]);
+    // "what blocks #2?" → the build task
+    expect(evaluateQuery(all, parseQuery('blocks:#2'), ctx).tasks.map((t) => t.num)).toEqual([1]);
+    // by raw id too
+    expect(evaluateQuery(all, parseQuery(`dependsOn:${a.id}`), ctx).tasks.map((t) => t.num)).toEqual([2]);
+  });
 });
 
 describe('evaluateQuery — workflow params (param.<key>)', () => {

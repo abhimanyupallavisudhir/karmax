@@ -31,6 +31,24 @@ const instancesDir = () => path.join(paths().state, 'instances');
 const pidFile = (dir: string, pid: number) => path.join(dir, `${pid}.pid`);
 
 /**
+ * Is `dir` located inside `parent`? Symlinks and relative segments are resolved
+ * (a world checkout may be reached through either its real or linked path), and
+ * a missing path falls back to plain resolution so the check still works for a
+ * directory that was deleted out from under a running process.
+ */
+export function isInsideDir(dir: string, parent: string): boolean {
+  const real = (q: string) => {
+    try {
+      return fs.realpathSync(q);
+    } catch {
+      return path.resolve(q);
+    }
+  };
+  const rel = path.relative(real(parent), real(dir));
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+/**
  * Scan `dir` for live OTHER app instances, pruning stale pidfiles as it goes.
  * Pure over its injected `isAlive` (tests pass a fake) — no process signals or
  * clock reads of its own beyond the probe.

@@ -86,6 +86,26 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(untagged.tags).toEqual(['frontend/web']);
   });
 
+  it('lets an agent find scheduled / dependency-blocked tasks via search_tasks', async () => {
+    const pid = store.createProject('Ops').id;
+    // A nightly cron series (armed) and a task blocked on a dependency.
+    const nightly = store.createTask({ projectId: pid, title: 'Nightly backup', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x', triggers: [{ kind: 'schedule', cron: '0 3 * * *' }], triggerState: 'armed', repeatable: true } as any });
+    const build = store.createTask({ projectId: pid, title: 'Build', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'y' } as any });
+    const deploy = store.createTask({ projectId: pid, title: 'Deploy', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'z', triggers: [{ kind: 'dependency', tasks: [build.id] }], triggerState: 'armed' } as any });
+    currentToken = tokens.mint({ taskId: 't1', profileId: 'do', principal: 'user:a', ceiling: ['read-task'], grantorCaps: ['read-task'] }).token;
+    const call = async (query: string) => {
+      const res: any = await client.callTool({ name: 'search_tasks', arguments: { projectId: pid, query } });
+      expect(res.isError, res.content?.[0]?.text).toBeFalsy();
+      return JSON.parse(res.content[0].text);
+    };
+    expect((await call('is:scheduled')).tasks.map((t: any) => t.id)).toEqual([nightly.id]);
+    // armed tasks project as status "armed" in the compact result
+    expect((await call('is:scheduled')).tasks[0].status).toBe('armed');
+    expect((await call('is:blocked-on-deps')).tasks.map((t: any) => t.id)).toEqual([deploy.id]);
+    expect((await call(`dependsOn:#${build.num}`)).tasks.map((t: any) => t.id)).toEqual([deploy.id]);
+    expect((await call('is:series')).tasks.map((t: any) => t.id)).toEqual([nightly.id]);
+  });
+
   it('denies search_tasks when the token lacks read-task', async () => {
     currentToken = tokens.mint({
       taskId: 't1', profileId: 'do', principal: 'user:a',
