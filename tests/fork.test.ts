@@ -81,4 +81,33 @@ describe('materializeFork — Codex (by id in the home)', () => {
       fs.rmSync(forkHome, { recursive: true, force: true });
     }
   });
+
+  it('finds a rollout by id in ANY config-home when no srcHome is given (raw pasted id)', () => {
+    // Simulates a raw pasted session id: the caller has no idea which home minted it,
+    // so materialize must sweep ~/.karmax/config-homes to resolve it.
+    const configHomes = path.join(os.homedir(), '.karmax', 'config-homes');
+    const owner = fs.mkdtempSync(path.join(configHomes, 'codex-test-owner-'));
+    const forkHome = tmp('karmax-cxfork3-');
+    const session = sid();
+    try {
+      const day = path.join(owner, 'sessions', '2026', '07', '05');
+      fs.mkdirSync(day, { recursive: true });
+      fs.writeFileSync(path.join(day, `rollout-2026-07-05T00-00-00-${session}.jsonl`), '{}\n');
+      // No srcHome passed — the sweep over config-homes must still find it.
+      expect(materializeFork({ provider: 'codex', session, forkHome, worldPath: '/tmp/w' })).toBe(true);
+      expect(fs.existsSync(path.join(forkHome, 'sessions', 'forked', `rollout-2026-07-05T00-00-00-${session}.jsonl`))).toBe(true);
+    } finally {
+      fs.rmSync(owner, { recursive: true, force: true });
+      fs.rmSync(forkHome, { recursive: true, force: true });
+    }
+  });
+
+  it('returns false when the rollout is in no home at all', () => {
+    const forkHome = tmp('karmax-cxfork4-');
+    try {
+      expect(materializeFork({ provider: 'codex', session: sid(), forkHome, worldPath: '/tmp/w' })).toBe(false);
+    } finally {
+      fs.rmSync(forkHome, { recursive: true, force: true });
+    }
+  });
 });
