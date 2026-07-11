@@ -2001,7 +2001,10 @@ async function openTaskForm(workflow, draft, seedText) {
     const carried = cf ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`)?.value : '';
     // Drop any draft auto-created for the previous workflow — its params won't
     // map onto the new workflow's schema, and reopening starts fresh anyway.
+    // Let any in-flight save settle first so a create still mid-flight can't
+    // materialise its draft AFTER this delete and orphan it.
     clearTimeout(saveTimer);
+    await saveChain;
     if (localCred && draftId) { const id = draftId; draftId = null; try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch {} }
     openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
