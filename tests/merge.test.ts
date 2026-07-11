@@ -129,4 +129,36 @@ describe('finalizeMerge (work must actually land)', () => {
     expect(onMain.stdout).not.toContain('<<<<<<<');
     await world.destroy();
   });
+
+  it('still lands work and reports files when the configured base branch does not exist', async () => {
+    const provider = new WorktreeProvider(home);
+    // base "develop" is not a ref — world creation forks off HEAD instead.
+    const world = await provider.create({ taskId: 'nobase1', repo, base: 'develop', target: 'main' });
+    await world.writeFile('factorial.js', 'export const f = (n) => (n <= 1 ? 1 : n * f(n - 1));\n');
+
+    const res = await finalizeMerge(world, 'main');
+    expect(res.merged).toBe(true);
+    // The landed-files report must not be silently blanked by a failed base diff.
+    expect(res.landedFiles).toContain('factorial.js');
+    // The misconfiguration is surfaced rather than swallowed.
+    expect(res.note).toMatch(/base "develop" not found/);
+    const onMain = await git(repo, ['show', 'main:factorial.js']);
+    expect(onMain.stdout).toContain('export const f');
+    await world.destroy();
+  });
+
+  it('still catches committed conflict markers when the configured base branch does not exist', async () => {
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({ taskId: 'nobase2', repo, base: 'develop', target: 'main' });
+    // an agent "resolved" a conflict by committing the markers as content
+    await world.writeFile('index.js', '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n');
+
+    const res = await finalizeMerge(world, 'main');
+    // The marker guard must still run even though the base ref is unresolvable.
+    expect(res.merged).toBe(false);
+    expect(res.conflict).toContain('index.js');
+    const onMain = await git(repo, ['show', 'main:index.js']);
+    expect(onMain.stdout).not.toContain('<<<<<<<');
+    await world.destroy();
+  });
 });

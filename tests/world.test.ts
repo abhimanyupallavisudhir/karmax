@@ -36,6 +36,25 @@ describe('WorktreeProvider (real git)', () => {
     expect((await git(repo, ['rev-parse', '--verify', 'karmax/abc'])).code).toBe(0);
   });
 
+  it('warns (but still forks off HEAD) when the configured base branch does not exist', async () => {
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({ taskId: 'nobase', repo, base: 'develop', target: 'main' });
+    // The world is still usable — it forked off HEAD.
+    expect(await currentBranch(world.handle.root)).toBe('karmax/nobase');
+    expect(await world.readFile('index.js')).toContain('console.log');
+    // …but the ignored base is surfaced, not swallowed.
+    expect(world.handle.warnings).toBeTruthy();
+    expect(world.handle.warnings!.join('\n')).toMatch(/base branch "develop" not found/);
+    await world.destroy();
+  });
+
+  it('does not warn when the configured base branch exists', async () => {
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({ taskId: 'okbase', repo, base: 'main', target: 'main' });
+    expect(world.handle.warnings).toBeUndefined();
+    await world.destroy();
+  });
+
   it('creates a scratch repo when no repo is given', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'scratch1', base: 'main' });

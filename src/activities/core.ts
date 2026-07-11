@@ -183,6 +183,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         copyGlobs: args.copyGlobs,
       });
       record(args.taskId, 'world.created', { handle: world.handle });
+      for (const warning of world.handle.warnings ?? []) {
+        record(args.taskId, 'world.warning', { warning });
+      }
       return world.handle;
     },
 

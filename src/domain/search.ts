@@ -116,8 +116,8 @@ export const FACET_OPTIONS: FieldOption[] = [
   { value: 'scheduled', label: 'Scheduled (cron / one-shot)' },
   { value: 'recurring', label: 'Recurring (cron or repeatable)' },
   { value: 'blocked-on-deps', label: 'Waiting on a dependency' },
-  { value: 'series', label: 'Repeatable series (template)' },
-  { value: 'run', label: 'A run of a series' },
+  { value: 'series', label: 'Repeatable (template)' },
+  { value: 'run', label: 'A run of a repeatable task' },
 ];
 
 function facetsOf(t: SearchTask): string[] {
