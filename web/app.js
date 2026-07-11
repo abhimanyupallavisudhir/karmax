@@ -124,7 +124,18 @@ async function applyRoute() {
   if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
   const pid = proj.id;
   const tab = r.tab || 'tasks';
-  if (pid !== S.projectId) { S.projectId = pid; await loadTasks().catch(() => {}); }
+  if (pid !== S.projectId) {
+    // Switching projects: drop the previous project's per-project view state so
+    // its query/selected-view/roving-cursor/search-result can't bleed into the
+    // new project (they'd otherwise re-run the old query against new data and
+    // highlight a view/cursor that doesn't exist here).
+    S.projectId = pid;
+    S.search = '';
+    S.activeView = null;
+    S.searchResult = null;
+    S.cursorId = null;
+    await loadTasks().catch(() => {});
+  }
   else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
   await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
   if (tab === 'tasks') await runSearch().catch(() => {});
@@ -1026,21 +1037,35 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// "Show archived" is not a separate toggle — it's just the `is:archived` facet in the
-// query. The default search hides archived tasks by transparently appending `-is:archived`
-// (Linear/Jira behaviour); the moment the user's query mentions archived-ness (adds
-// `is:archived`, `-is:archived`, or groups by it), we leave it alone. The clean `S.search`
-// stays in the box; only the evaluated query carries the default.
-function queryMentionsArchived(q) { return /(^|\s)-?(is|has):[^\s]*archived/i.test(q || ''); }
+// The default list transparently hides two kinds of noise unless the query opts in:
+// archived tasks (`-is:archived`) and the auto-spawned *runs* of a repeatable series
+// (`-is:run`), so a cron series doesn't flood the list — its template still shows, and
+// you drill into runs with `is:run` (or the Series view). "Show archived" / "show runs"
+// are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
+// evaluated query carries the defaults. If the query already mentions a facet, we leave it.
+function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
+function queryMentionsArchived(q) { return queryMentionsFacet(q, 'archived'); }
 function effectiveQuery(q) {
-  const s = (q || '').trim();
-  if (queryMentionsArchived(s)) return s;
-  return s ? `${s} -is:archived` : '-is:archived';
+  let s = (q || '').trim();
+  for (const facet of ['archived', 'run']) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
+  return s;
 }
 
-// The saved-views switcher — every chip is a query. "All" is the built-in default;
-// each saved view carries a ✕ to delete it (confirmed in wireOrgControls).
+// Built-in starter views that make the new task shapes (schedules, dependency-blocked,
+// repeatable series) first-class instead of buried. Each is just a query string; they
+// can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
+const BUILTIN_VIEWS = [
+  { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
+  { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
+  { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
+];
+
+// The saved-views switcher — every chip is a query. "All" is the default; then the
+// built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
+  const builtins = BUILTIN_VIEWS
+    .map((v) => `<div class="view-chip builtin ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
+    .join('');
   const saved = S.views
     .map(
       (v) => `<div class="view-chip ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
@@ -1048,6 +1073,7 @@ function viewsBar() {
     .join('');
   return `<div class="views-bar">
     <div class="view-chip ${!S.activeView ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
+    ${builtins}
     ${saved}
     <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
   </div>`;
@@ -1390,6 +1416,8 @@ function wireOrgControls() {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
       if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
+      if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
       if (!v) return;
       S.activeView = id;
@@ -2057,22 +2085,36 @@ async function openTaskForm(workflow, draft, seedText) {
   // Persist the current form as a draft without leaving the form. Silent by
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
   let lastSaved = null;
-  async function persistDraft(st = formState()) {
-    if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+  // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
+  // if a debounced create is still in flight when the user types more or closes the
+  // form (which flushes), `draftId` is still null, so the next save POSTs a *second*
+  // draft instead of PATCHing the first — you end up with duplicate drafts, one
+  // holding only the pre-close text (looks like the last edit was dropped). Even for
+  // an existing draft, two in-flight PATCHes can land out of order and clobber the
+  // newer edit. Chaining guarantees each save sees the previous one's `draftId`/
+  // `lastSaved` and lands in order, so the most recent edit always wins.
+  let saveChain = Promise.resolve();
+  function persistDraft(st = formState()) {
+    // Snapshot the signature at CALL time (the DOM may be gone by the time this link
+    // in the chain runs — e.g. closeForm clears the form right after queuing the flush).
     const sig = JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
-    if (sig === lastSaved) return; // no change since last write
-    try {
-      if (!draftId) {
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
-        draftId = created.id;
-      } else {
-        await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
-        await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-      }
-      if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
-      lastSaved = sig;
-      refreshTasks();
-    } catch { /* keep the form open; a later save or explicit button will retry */ }
+    saveChain = saveChain.then(async () => {
+      if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
+      if (sig === lastSaved) return; // no change since the last write landed
+      try {
+        if (!draftId) {
+          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+          draftId = created.id;
+        } else {
+          await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
+          await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        }
+        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        lastSaved = sig;
+        refreshTasks();
+      } catch { /* keep the form open; a later save or explicit button will retry */ }
+    });
+    return saveChain;
   }
 
   // Debounced auto-save while typing.
@@ -2114,6 +2156,10 @@ async function openTaskForm(workflow, draft, seedText) {
   const submit = async (draftMode) => {
     clearTimeout(saveTimer);
     const st = formState();
+    // Drain any in-flight auto-save first: it may still be creating the draft (setting
+    // draftId) or PATCHing older text. Waiting lets the branches below see the right
+    // draftId and land last, so the explicit save/queue reflects the final form state.
+    await saveChain.catch(() => {});
     try {
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
@@ -2271,10 +2317,21 @@ async function openDrawer(taskId) {
   S.paramDefaults = {};
   highlightRow();
   try {
-    S.view = await api(`/api/tasks/${taskId}`);
-    S.drawerEvents = await api(`/api/tasks/${taskId}/events?since=0`);
-    S.widgets = await api(`/api/tasks/${taskId}/widgets`).catch(() => []);
-    S.sessions = await api(`/api/tasks/${taskId}/sessions`).catch(() => ({}));
+    // Fetch the four independent resources in parallel — they used to be four serial
+    // round-trips, which stacked latency (each drawer open paid the sum, not the max).
+    // `renderDrawer` no-ops while `S.view` is null, so assigning them together (rather
+    // than one-at-a-time) also avoids rendering a half-populated drawer mid-fetch.
+    const [view, events, widgets, sessions] = await Promise.all([
+      api(`/api/tasks/${taskId}`),
+      api(`/api/tasks/${taskId}/events?since=0`),
+      api(`/api/tasks/${taskId}/widgets`).catch(() => []),
+      api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+    ]);
+    S.view = view;
+    S.drawerEvents = events;
+    S.widgets = widgets;
+    S.sessions = sessions;
+    // paramDefaults keys off the fetched view's workflow, so it follows the batch.
     S.paramDefaults = await loadParamDefaults(taskId);
   } catch (e) { toast(e.message, true); }
   renderDrawer();
@@ -2285,10 +2342,18 @@ async function refreshDrawer() {
   // would clobber in-progress edits); it re-renders only on open / explicit save.
   if (S.tasks.find((t) => t.id === S.selected)?.params?.repeatable) return;
   try {
-    S.view = await api(`/api/tasks/${S.selected}`);
-    S.widgets = await api(`/api/tasks/${S.selected}/widgets`).catch(() => S.widgets);
-    S.sessions = await api(`/api/tasks/${S.selected}/sessions`).catch(() => S.sessions);
-    S.paramDefaults = await loadParamDefaults(S.selected);
+    // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
+    // WS push for the open task, so keeping it to a single round-trip's latency matters.
+    const id = S.selected;
+    const [view, widgets, sessions] = await Promise.all([
+      api(`/api/tasks/${id}`),
+      api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
+      api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+    ]);
+    S.view = view;
+    S.widgets = widgets;
+    S.sessions = sessions;
+    S.paramDefaults = await loadParamDefaults(id);
   } catch {}
   renderDrawer();
 }
@@ -4067,10 +4132,19 @@ function wireSettingsView(proj) {
     try {
       await api(`/api/projects/${proj.id}`, { method: 'DELETE' });
       toast(`Deleted project "${proj.name}"`);
-      if (S.projectId === proj.id) S.projectId = null;
+      const wasCurrent = S.projectId === proj.id;
       await loadProjects();
-      S.tab = S.projectId ? 'tasks' : 'dashboard';
-      if (S.projectId) await loadTasks();
+      if (wasCurrent) {
+        // Route into the next remaining project (or the dashboard) so its
+        // tasks/tags/views/search all load fresh and the URL stops pointing at
+        // the now-deleted project. S.projectId still holds the deleted id here,
+        // which keeps applyRoute's switch-guard armed so the old project's view
+        // state (query/selected view/cursor) gets cleared.
+        const next = S.projects[0];
+        if (next) return go(projectRoute(next.id));
+        S.projectId = null;
+        return go('/dashboard');
+      }
       renderRail();
       renderMain();
     } catch (e) { toast(e.message, true); }
@@ -4472,9 +4546,10 @@ async function newProject() {
     // which is exactly the inheritance bug this avoids.
     const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: {} }) });
     await loadProjects();
-    S.projectId = p.id;
-    renderRail();
-    renderMain();
+    // Route into the new project so its tasks, tags, saved views and search all
+    // load fresh — setting S.projectId + re-rendering alone leaves the previous
+    // project's tasks/views on screen (applyRoute does the loading on switch).
+    await go(projectRoute(p.id));
   } catch (e) { toast(e.message, true); }
 }
 
@@ -4832,7 +4907,7 @@ function openPalette() {
       }
       for (const p of S.projects) {
         const score = fuzzyScore(q, p.name);
-        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => { S.projectId = p.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); } });
+        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => go(projectRoute(p.id)) });
       }
     }
     items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
