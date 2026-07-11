@@ -1057,7 +1057,7 @@ function effectiveQuery(q) {
 const BUILTIN_VIEWS = [
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
-  { id: 'builtin:series', name: 'Series', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
 ];
 
 // The saved-views switcher — every chip is a query. "All" is the default; then the
