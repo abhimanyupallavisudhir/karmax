@@ -554,7 +554,7 @@ function resetConfirmerField(box, attr = 'data-inherit') {
 
 // Full task list (incl. archived) for the fork picker, cached per project.
 // Archived tasks are the completed ones you most often want to fork from, so the
-// fork search must see them regardless of the "Show archived" toggle. Cached to
+// fork search must see them regardless of the Archived view / query. Cached to
 // avoid re-fetching (and re-enriching) the whole list on every keystroke;
 // loadTasks() clears the cache so newly created/updated tasks show up.
 async function forkTaskPool() {
@@ -1029,11 +1029,10 @@ function taskMatches(t, q) {
 // The default list transparently hides two kinds of noise unless the query opts in:
 // archived tasks (`-is:archived`) and the auto-spawned *runs* of a repeatable series
 // (`-is:run`), so a cron series doesn't flood the list — its template still shows, and
-// you drill into runs with `is:run` (or the Series view). "Show archived" / "show runs"
+// you drill into runs with `is:run` (or the Series/Archived views). Archived and runs
 // are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
 // evaluated query carries the defaults. If the query already mentions a facet, we leave it.
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
-function queryMentionsArchived(q) { return queryMentionsFacet(q, 'archived'); }
 function effectiveQuery(q) {
   let s = (q || '').trim();
   for (const facet of ['archived', 'run']) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
@@ -1047,6 +1046,7 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Series', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
 // The saved-views switcher — every chip is a query. "All" is the default; then the
@@ -1154,7 +1154,6 @@ function tasksView() {
   ).filter(notRun);
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
-  const archivedShown = queryMentionsArchived(S.search);
   let body;
   if (groups) {
     body = groups
@@ -1189,7 +1188,6 @@ function tasksView() {
     </div>
     <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
       <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
-      <span style="font-size:12px;color:var(--ink-3)">${archivedShown ? '<a href="#" id="arch-toggle">← back to active</a>' : '<a href="#" id="arch-toggle">show archived</a>'}</span>
     </div>
     ${body || empty}`;
 }
@@ -1431,13 +1429,6 @@ function wireOrgControls() {
   $('#save-view')?.addEventListener('click', saveCurrentView);
   $('#manage-tags')?.addEventListener('click', openTagsManager);
   $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
-  // Show-archived is just the `is:archived` facet — toggle it on/off the current query.
-  $('#arch-toggle')?.addEventListener('click', (ev) => {
-    ev.preventDefault();
-    S.activeView = null;
-    const q = (S.search || '').replace(/(^|\s)-?(is|has):archived\b/gi, ' ').replace(/\s+/g, ' ').trim();
-    setQuery(queryMentionsArchived(S.search) ? q : `${q} is:archived`.trim());
-  });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
