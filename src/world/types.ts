@@ -51,6 +51,10 @@ export interface WorldHandle {
   repos?: WorldRepo[];
   /** Provider-specific extra (container id, etc.). */
   meta?: Record<string, unknown>;
+  /** Non-fatal notices raised while building the world (e.g. a configured base
+   *  branch that didn't exist, so the worktree forked off HEAD instead). Surfaced
+   *  as `world.warning` events by the createWorld activity. */
+  warnings?: string[];
 }
 
 export interface WorldSpec {
