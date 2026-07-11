@@ -124,7 +124,18 @@ async function applyRoute() {
   if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
   const pid = proj.id;
   const tab = r.tab || 'tasks';
-  if (pid !== S.projectId) { S.projectId = pid; await loadTasks().catch(() => {}); }
+  if (pid !== S.projectId) {
+    // Switching projects: drop the previous project's per-project view state so
+    // its query/selected-view/roving-cursor/search-result can't bleed into the
+    // new project (they'd otherwise re-run the old query against new data and
+    // highlight a view/cursor that doesn't exist here).
+    S.projectId = pid;
+    S.search = '';
+    S.activeView = null;
+    S.searchResult = null;
+    S.cursorId = null;
+    await loadTasks().catch(() => {});
+  }
   else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
   await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
   if (tab === 'tasks') await runSearch().catch(() => {});
@@ -4117,10 +4128,19 @@ function wireSettingsView(proj) {
     try {
       await api(`/api/projects/${proj.id}`, { method: 'DELETE' });
       toast(`Deleted project "${proj.name}"`);
-      if (S.projectId === proj.id) S.projectId = null;
+      const wasCurrent = S.projectId === proj.id;
       await loadProjects();
-      S.tab = S.projectId ? 'tasks' : 'dashboard';
-      if (S.projectId) await loadTasks();
+      if (wasCurrent) {
+        // Route into the next remaining project (or the dashboard) so its
+        // tasks/tags/views/search all load fresh and the URL stops pointing at
+        // the now-deleted project. S.projectId still holds the deleted id here,
+        // which keeps applyRoute's switch-guard armed so the old project's view
+        // state (query/selected view/cursor) gets cleared.
+        const next = S.projects[0];
+        if (next) return go(projectRoute(next.id));
+        S.projectId = null;
+        return go('/dashboard');
+      }
       renderRail();
       renderMain();
     } catch (e) { toast(e.message, true); }
@@ -4522,9 +4542,10 @@ async function newProject() {
     // which is exactly the inheritance bug this avoids.
     const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: {} }) });
     await loadProjects();
-    S.projectId = p.id;
-    renderRail();
-    renderMain();
+    // Route into the new project so its tasks, tags, saved views and search all
+    // load fresh — setting S.projectId + re-rendering alone leaves the previous
+    // project's tasks/views on screen (applyRoute does the loading on switch).
+    await go(projectRoute(p.id));
   } catch (e) { toast(e.message, true); }
 }
 
@@ -4882,7 +4903,7 @@ function openPalette() {
       }
       for (const p of S.projects) {
         const score = fuzzyScore(q, p.name);
-        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => { S.projectId = p.id; S.tab = 'tasks'; refreshTasks(); renderRail(); renderMain(); } });
+        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => go(projectRoute(p.id)) });
       }
     }
     items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
