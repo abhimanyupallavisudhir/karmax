@@ -1935,7 +1935,13 @@ function wireDepPicker(values, selfId) {
 }
 
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
+// Identity of the task form currently mounted in the overlay. Opening a new form
+// bumps this, so a still-pending debounced auto-save from a PRIOR form instance can
+// tell it has been superseded and bail — otherwise its timer fires against the new
+// form's (possibly empty) DOM and `replace:true`-wipes the draft it was editing.
+let activeFormToken = null;
 async function openTaskForm(workflow, draft, seedText) {
+  const formToken = (activeFormToken = {});
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   // The prompt/consuming field (a textarea) hosts pasted-image chips inside its
@@ -2078,7 +2084,14 @@ async function openTaskForm(workflow, draft, seedText) {
 
   // Persist the current form as a draft without leaving the form. Silent by
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
-  let lastSaved = null;
+  const stateSig = (st) => JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
+  // Seed the baseline with the freshly-loaded form's own signature so simply OPENING
+  // and dismissing a draft never re-writes it. Without this `lastSaved` starts null,
+  // so an *untouched* form still flushes a full `replace:true` on close — and a passive
+  // copy left open in another karmax tab clobbers a newer edit made elsewhere, or a
+  // stale snapshot reverts it. That is the "saved draft contents disappear" bug: only a
+  // real change in THIS form (its signature diverging from the seed) now triggers a write.
+  let lastSaved = stateSig(formState());
   // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
   // if a debounced create is still in flight when the user types more or closes the
   // form (which flushes), `draftId` is still null, so the next save POSTs a *second*
@@ -2091,7 +2104,7 @@ async function openTaskForm(workflow, draft, seedText) {
   function persistDraft(st = formState()) {
     // Snapshot the signature at CALL time (the DOM may be gone by the time this link
     // in the chain runs — e.g. closeForm clears the form right after queuing the flush).
-    const sig = JSON.stringify(st) + (localCred ? JSON.stringify(taskCredPolicy) : '');
+    const sig = stateSig(st);
     saveChain = saveChain.then(async () => {
       if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
       if (sig === lastSaved) return; // no change since the last write landed
@@ -2113,7 +2126,7 @@ async function openTaskForm(workflow, draft, seedText) {
 
   // Debounced auto-save while typing.
   let saveTimer = null;
-  function autoSaveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(() => persistDraft(), 800); }
+  function autoSaveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(() => { if (activeFormToken !== formToken) return; persistDraft(); }, 800); }
   $('#tf-body').addEventListener('input', autoSaveSoon);
   $('#tf-body').addEventListener('change', autoSaveSoon);
 
