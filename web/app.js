@@ -2765,9 +2765,13 @@ function bindTermScreen(out) {
   };
   const send = (data) => { if (term && term.ws && term.ws.readyState === 1) term.ws.send(JSON.stringify({ type: 'input', data })); };
   out.onkeydown = (e) => {
+    // Esc leaves the terminal (blurs it) so app keyboard shortcuts work again —
+    // like tabbing out of a textarea. It is NOT forwarded to the shell.
+    if (e.key === 'Escape') { e.preventDefault(); out.blur(); return; }
     const bytes = keyToPtyBytes(e);
     if (bytes == null) return;                                          // leave copy/paste, F-keys, etc. to the browser
     e.preventDefault();
+    e.stopPropagation();                                                // consumed by the shell — never let it trigger an app shortcut
     send(bytes);
   };
   out.onpaste = (e) => {
@@ -4899,7 +4903,9 @@ function dispatchKey(e) {
 function bindKeys() {
   document.addEventListener('keydown', (e) => {
     const t = e.target;
-    const typing = t && t.matches && (t.matches('input, textarea, select') || t.isContentEditable);
+    // The check-in terminal is a focusable <pre> that behaves like a text field:
+    // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
+    const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
     const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
     if (typing) {
       if (e.key === 'Escape') { t.blur(); resetChord(); }
