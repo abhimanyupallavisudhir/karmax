@@ -570,11 +570,10 @@ export class Gateway {
         const t = store.getTask(archiveMatch[1]!);
         if (!t) return this.json(res, 404, { error: 'no such task' });
         const archived = b.archived !== false; // default: archive
-        // Archiving only hides; refuse to hide a task that's still progressing on
-        // its own (running) or awaiting review — it would vanish mid-flight. A
-        // stuck/terminal task (done/cancelled/blocked/failed) can be archived.
-        const live = t.lastView?.status === 'active' || t.lastView?.status === 'waiting';
-        if (archived && live) return this.json(res, 400, { error: 'cannot archive a running task; cancel or finish it first' });
+        // Archiving only hides from the default list; it never touches the task's
+        // execution. Any task can be archived/un-archived regardless of status —
+        // a running task keeps running while hidden, and the built-in `is:archived`
+        // view (or `includeArchived=1`) brings it back into view at any time.
         store.updateTaskParams(archiveMatch[1]!, { ...t.params, archived });
         return this.json(res, 200, { ok: true, archived });
       }
