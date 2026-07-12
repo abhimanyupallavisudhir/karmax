@@ -3028,9 +3028,20 @@ function drawerBody(v) {
     })
     .join('');
   const caption = v.reviewInfo?.caption || v.reviewInfo?.summary;
+  // How the agent's turn reached Review (set by the workflow): a `stalled` badge warns the
+  // reviewer the agent went quiet WITHOUT calling signal_completion, so the work may be
+  // partial. `signalled`/`raised` are reassuring and shown subtly. See ReviewInfo.completion.
+  const completionBadge = v.reviewInfo?.completion === 'stalled'
+    ? `<div class="summary" style="color:var(--warn,#c60);font-weight:600">⚠ Agent stopped without signalling completion — work may be incomplete; verify before confirming.</div>`
+    : v.reviewInfo?.completion === 'signalled'
+      ? `<div class="task-sub" style="color:var(--ink-3);margin:0 0 6px">✓ Agent signalled completion</div>`
+      : v.reviewInfo?.completion === 'raised'
+        ? `<div class="task-sub" style="color:var(--ink-3);margin:0 0 6px">↑ Agent raised for a decision</div>`
+        : '';
   const review = v.reviewInfo
     ? `<div class="section-h">Review</div>
        <div class="review">
+         ${completionBadge}
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
          ${v.reviewInfo.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}

@@ -1061,6 +1061,17 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       }
       // An explicit raise carries its own message; show it as the review summary.
       if (turn.raise?.detail) reviewInfo = { ...reviewInfo, summary: turn.raise.detail };
+      // Record HOW this turn reached Review so the confirmer can tell an asserted finish
+      // from a silent stall. `completed`/`needsInput` only change control flow in auto/goal
+      // modes (the `confirmMode==='auto'` guard below and the goal keep-going loop above);
+      // under a human/agent confirmer every path lands at the same gate, so this marker is
+      // the one thing that surfaces the distinction the runtime already computes. A stall
+      // means the agent went quiet WITHOUT calling signal_completion — the work may be
+      // partial — so the reviewer should scrutinise rather than rubber-stamp.
+      reviewInfo = {
+        ...reviewInfo,
+        completion: turn.completed ? 'signalled' : turn.raise ? 'raised' : 'stalled',
+      };
       // We stopped waiting on still-running sub-agents (budget spent) — prepend a note so
       // the reviewer knows this reached Review with delegated work possibly incomplete.
       if (gaveUpOnSubagents) {
