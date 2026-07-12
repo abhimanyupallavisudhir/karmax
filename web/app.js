@@ -1321,13 +1321,11 @@ function taskRow(t) {
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
   const archived = t.params?.archived;
-  // archivable when not progressing on its own / not awaiting review
-  const terminal = !['active', 'waiting'].includes(status);
+  // Any task can be archived/un-archived — archiving only hides it from the list,
+  // it never affects a running task's execution.
   const archiveBtn = archived
     ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
-    : terminal
-      ? `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`
-      : '';
+    : `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
     <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
@@ -4667,7 +4665,9 @@ async function newProject() {
     // Route into the new project so its tasks, tags, saved views and search all
     // load fresh — setting S.projectId + re-rendering alone leaves the previous
     // project's tasks/views on screen (applyRoute does the loading on switch).
-    await go(projectRoute(p.id));
+    // Land on Project settings: a freshly created project has no tasks yet, and
+    // configuring it (branches, agent, budget…) is the first thing to do.
+    await go(projectRoute(p.id, 'settings'));
   } catch (e) { toast(e.message, true); }
 }
 
