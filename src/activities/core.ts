@@ -53,17 +53,20 @@ function classifyTurnError(err: unknown): Error {
 
 /**
  * Turn an opaque SIGKILL into an operator-actionable line — WITHOUT asserting a
- * cause the evidence doesn't support. A signal-9 agent death has two very
- * different senders on this single-host deployment, and the message must not name
- * one when the other is true (karmax#4 diagnosis, 2026-07: the observed kills were
- * karmax's OWN reapOrphans() sweep after a tsx-watch reload — journalctl -k and
- * systemd-oomd logged zero kills — NOT the kernel OOM killer). So branch on LIVE
- * host memory:
+ * cause the evidence doesn't support. A signal-9 agent death has very different
+ * senders on this single-host deployment, and the message must not name one when
+ * another is true (karmax#4 diagnosis, 2026-07: the observed kills were karmax's
+ * OWN reapOrphans() sweep after a tsx-watch reload — journalctl -k and
+ * systemd-oomd logged zero kills — NOT the kernel OOM killer; 2026-07-12: a
+ * dogfooding karmax booted from a task world swept prod's LIVE agents — since
+ * fixed, reapOrphans now skips records whose owner process is alive). So branch
+ * on LIVE host memory:
  *   - memory genuinely tight → likely the OS OOM killer; the operator should
  *     reduce concurrency / free RAM (and the gated retry waits for RAM to recover).
- *   - memory healthy → NOT OOM; most likely a karmax restart/reload orphan-sweep
- *     (reapOrphans, src/agent/custody.ts) or an external kill. The retry admits
- *     immediately and resumes the session.
+ *   - memory healthy → NOT OOM; most likely a karmax restart/reload/redeploy
+ *     tearing down in-flight turns (orphan-sweep or shutdown escalation,
+ *     src/agent/custody.ts) or an external kill. The retry admits immediately
+ *     and resumes the session.
  * Either way the raw signal string is appended (truncated) for diagnostics.
  */
 function signalKillMessage(raw: string): string {
@@ -73,7 +76,7 @@ function signalKillMessage(raw: string): string {
     ? `host out of memory — the agent was likely killed by the OS OOM killer (${mem}). ` +
       `Reduce concurrency (lower KARMAX_MAX_AGENT_SLOTS / raise KARMAX_AGENT_MIN_FREE_MB) or free RAM.`
     : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a karmax ` +
-      `restart/reload orphan-sweep (reapOrphans after a tsx-watch reload or redeploy) or an external kill.`;
+      `restart/reload/redeploy tearing down in-flight turns (orphan-sweep or shutdown escalation) or an external kill.`;
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
 }
 

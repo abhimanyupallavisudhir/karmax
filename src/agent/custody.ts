@@ -26,6 +26,15 @@ import { paths } from '../config/paths.js';
  * still matches the recorded command before killing; where we can't verify
  * (no procfs), we clear the pidfile without killing. Better to leak a truly
  * dead record than to kill an innocent bystander.
+ *
+ * Live-owner guard (2026-07-12 incident): "anything recorded here is an orphan"
+ * is only true when this boot is the sole karmax app. With the world-rooted boot
+ * guard disabled (karmax#3), a task's agent can boot a dogfooding karmax from
+ * its worktree world against the same KARMAX_HOME — and that boot's sweep would
+ * SIGKILL the very agent running the task (plus every other live turn) because
+ * their pidfiles look like leftovers. An agent record whose `owner` process is
+ * still alive is NOT an orphan; the sweep must leave it (and its pidfile — the
+ * custody record must survive for when the owner does die) untouched.
  */
 
 export interface AgentRecord {
@@ -91,6 +100,22 @@ function cmdlineMatches(pid: number, cmd: string): boolean {
   }
 }
 
+/** Is the karmax process that spawned this agent still alive? A live owner means
+ *  the record is NOT an orphan — another running app instance is mid-turn on it.
+ *  PID-reuse guard: the owner's pid may have been recycled after a reboot, so on
+ *  Linux require its cmdline to still look like a Node process (karmax always
+ *  runs under node/tsx). Where we can't verify (no procfs), a live pid counts as
+ *  a live owner — better to leak a true orphan for one boot than to SIGKILL an
+ *  in-flight agent turn. */
+function ownerAlive(owner: number | undefined): boolean {
+  if (!owner || owner <= 1 || !alive(owner)) return false;
+  try {
+    return fs.readFileSync(`/proc/${owner}/cmdline`, 'utf8').includes('node');
+  } catch {
+    return true;
+  }
+}
+
 /**
  * Signal a whole process group, falling back to the bare pid if the target was
  * never a group leader. Negative pid = the group (SPEC: detached spawn makes the
@@ -126,17 +151,21 @@ export async function killAgent(pid: number | undefined, graceMs = 2500): Promis
 /**
  * Boot-time sweep: hard-kill any agent process groups a previous karmax
  * incarnation left running (systemd-oomd / crash / force-kill), then clear the
- * pidfiles. A fresh boot owns no agents yet, so anything recorded here is an
- * orphan. Returns how many groups were reaped and how many stale files cleared.
+ * pidfiles. Only records whose OWNER process is dead are orphans — an agent
+ * whose spawning karmax instance is still alive belongs to a concurrently
+ * running app (karmax#3 dogfooding boot) and is skipped, pidfile intact.
+ * Returns how many groups were reaped, stale files cleared, and live-owned
+ * records skipped.
  */
-export function reapOrphans(): { reaped: number; cleared: number } {
+export function reapOrphans(): { reaped: number; cleared: number; skipped: number } {
   let reaped = 0;
   let cleared = 0;
+  let skipped = 0;
   let entries: string[] = [];
   try {
     entries = fs.readdirSync(agentsDir());
   } catch {
-    return { reaped: 0, cleared: 0 }; // no dir yet → nothing to reap
+    return { reaped: 0, cleared: 0, skipped: 0 }; // no dir yet → nothing to reap
   }
   for (const name of entries) {
     if (!name.endsWith('.json')) continue;
@@ -146,6 +175,11 @@ export function reapOrphans(): { reaped: number; cleared: number } {
       rec = JSON.parse(fs.readFileSync(file, 'utf8')) as AgentRecord;
     } catch {
       /* corrupt/partial pidfile — just clear it below */
+    }
+    if (rec && ownerAlive(rec.owner)) {
+      // Not an orphan: the instance that spawned it is still running its turn.
+      skipped++;
+      continue;
     }
     const pid = rec?.pid ?? Number(name.slice(0, -5));
     if (Number.isFinite(pid) && pid > 1 && alive(pid) && rec && cmdlineMatches(pid, rec.cmd)) {
@@ -161,5 +195,5 @@ export function reapOrphans(): { reaped: number; cleared: number } {
       /* ignore */
     }
   }
-  return { reaped, cleared };
+  return { reaped, cleared, skipped };
 }

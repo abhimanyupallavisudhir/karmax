@@ -111,11 +111,15 @@ async function main() {
   // Process-tree custody (src/agent/custody.ts): reap any agent subprocess
   // groups a prior incarnation left running after a SIGKILL/crash (systemd-oomd
   // was the July-5 OOM killer — no graceful teardown ran, so its orphaned
-  // agents outlived the host). A fresh boot owns no agents, so anything recorded
-  // is an orphan.
+  // agents outlived the host). Only records whose owner process is dead are
+  // orphans — agents owned by a live concurrent instance (see the duplicate-
+  // instance warning above) are left untouched (2026-07-12: a world-rooted
+  // dogfooding boot's sweep SIGKILLed prod's in-flight agents, including the
+  // very agent that booted it).
   const { reapOrphans } = await import('./agent/custody.js');
   const orphans = reapOrphans();
   if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process group(s) from a prior run`);
+  if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live karmax instance untouched`);
 
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');

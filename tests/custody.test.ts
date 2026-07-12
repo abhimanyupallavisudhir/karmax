@@ -32,6 +32,15 @@ const waitDead = async (pid: number, ms = 4000) => {
   while (isAlive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
   return !isAlive(pid);
 };
+/** A pid that is certainly dead (spawn a no-op and wait for it to exit) — a
+ *  record with a dead owner is a true orphan. Fixed literals like 999999 can
+ *  collide with a real pid on hosts with a large pid_max. */
+const deadOwnerPid = async (): Promise<number> => {
+  const child = spawn('true', [], { stdio: 'ignore' });
+  const pid = child.pid!;
+  await new Promise((r) => child.once('exit', r));
+  return pid;
+};
 
 beforeAll(async () => {
   custody = await import('../src/agent/custody.js');
@@ -68,8 +77,8 @@ describe('process-tree custody', () => {
   it('reapOrphans hard-kills a surviving group from a prior run and clears the file', async () => {
     const pid = spawnDetachedSleep();
     // Simulate a prior incarnation that was SIGKILLed: its pidfile persists but
-    // its child kept running.
-    custody.registerAgent({ pid, cmd: 'sleep', owner: 999999, startedAt: Date.now() });
+    // its child kept running (owner dead ⇒ true orphan).
+    custody.registerAgent({ pid, cmd: 'sleep', owner: await deadOwnerPid(), startedAt: Date.now() });
 
     const result = custody.reapOrphans();
     expect(fs.existsSync(path.join(agentsDir(), `${pid}.json`))).toBe(false); // always cleared
@@ -83,10 +92,26 @@ describe('process-tree custody', () => {
     }
   });
 
+  it('reapOrphans spares an agent whose owner process is still alive (dual-instance boot)', async () => {
+    const pid = spawnDetachedSleep();
+    // Owner = this test process (a live node process): a concurrent karmax
+    // instance is mid-turn on this agent, so it is NOT an orphan (the 2026-07-12
+    // incident: a dogfooding boot from a task world SIGKILLed prod's live agents).
+    custody.registerAgent({ pid, cmd: 'sleep', owner: process.pid, startedAt: Date.now() });
+
+    const result = custody.reapOrphans();
+    expect(result.reaped).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(isAlive(pid)).toBe(true);
+    // The pidfile survives too — custody must persist for when the owner dies.
+    expect(fs.existsSync(path.join(agentsDir(), `${pid}.json`))).toBe(true);
+    custody.unregisterAgent(pid);
+  });
+
   it('reapOrphans does NOT kill when the recorded command no longer matches (PID reuse guard)', async () => {
     const pid = spawnDetachedSleep();
     // Record a DIFFERENT command than what the pid is actually running.
-    custody.registerAgent({ pid, cmd: 'definitely-not-sleep-xyz', owner: 999999, startedAt: Date.now() });
+    custody.registerAgent({ pid, cmd: 'definitely-not-sleep-xyz', owner: await deadOwnerPid(), startedAt: Date.now() });
 
     const result = custody.reapOrphans();
     expect(fs.existsSync(path.join(agentsDir(), `${pid}.json`))).toBe(false); // stale file cleared
@@ -96,7 +121,7 @@ describe('process-tree custody', () => {
 
   it('reapOrphans on an empty/absent dir is a harmless no-op', () => {
     const result = custody.reapOrphans();
-    expect(result).toEqual({ reaped: 0, cleared: 0 });
+    expect(result).toEqual({ reaped: 0, cleared: 0, skipped: 0 });
   });
 
   it('killProcessGroup tolerates a bogus pid without throwing', () => {
