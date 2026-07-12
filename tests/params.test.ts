@@ -92,6 +92,16 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
     expect(input.project.defaultTarget).toBe('release');
     expect(input.agents?.do).toEqual({ provider: 'codex', model: 'gpt-4.1', effort: 'high' });
   });
+
+  it('carries the confirmer mode + review-request prompt into input.confirm (agent knobs also land on agents.confirm)', () => {
+    const resolved = {
+      prompt: 'build X',
+      confirm: { mode: 'agent', provider: 'mock', prompt: 'Ensure X, Y and Z.\n{{response}}' },
+    };
+    const input = assembleTaskInput(sd, resolved, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
+    expect(input.confirm).toEqual({ mode: 'agent', provider: 'mock', prompt: 'Ensure X, Y and Z.\n{{response}}' });
+    expect(input.agents?.confirm).toEqual({ provider: 'mock' }); // prompt is not an AgentSpec knob
+  });
 });
 
 describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {

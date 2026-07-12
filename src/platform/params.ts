@@ -94,6 +94,9 @@ export function assembleTaskInput(
             ...(c.model ? { model: c.model } : {}),
             ...(c.effort ? { effort: c.effort } : {}),
             ...(c.resumeFrom ? { resumeFrom: c.resumeFrom } : {}),
+            // The per-Review request template (workflow falls back to the built-in
+            // default when unset) — a scalar, so it does NOT belong in agents[role].
+            ...(c.prompt?.trim() ? { prompt: c.prompt } : {}),
           };
           const role = f.role ?? 'confirm';
           if (mode === 'agent' && c.provider) {

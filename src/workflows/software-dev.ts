@@ -18,6 +18,7 @@ import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
+import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { classifyLimitError } from '../agent/limits.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import {
@@ -754,12 +755,28 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
    *  or undefined if the agent turn failed or declined to decide (caller falls back to
    *  the human gate so nothing is silently auto-confirmed). */
   async function confirmTurn(): Promise<import('./contract.js').ConfirmDecision | undefined> {
+    // Each Review appends a fresh review-request to the Confirm transcript — the task
+    // prompt + the Do agent's latest response, rendered from the (user-editable)
+    // confirm prompt template — so repeated Reviews read as ONE conversation:
+    // request, verdict, request with the new response, ad recursum.
+    const response =
+      [...msgs].reverse().find((m) => m.role === 'agent')?.text ?? reviewInfo?.summary ?? '(the agent produced no final message)';
+    const request = renderConfirmPrompt(input.confirm?.prompt, {
+      title: input.title,
+      prompt: input.prompt,
+      response,
+      reviewInfo: reviewInfo?.summary ?? '',
+      changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+      transcript: lastOutputs(msgs),
+    });
+    confirmMsgs.push({ id: `c-in-${confirmMsgs.length}`, role: 'user', text: request, ts: confirmMsgs.length });
     const ct = await withResolve('confirm', () =>
       leasedTurn('confirm', (accountConfigHome, accountApiKeyHandle) =>
-        // Each Review runs a FRESH confirm turn (session left unset): the reviewer must
-        // re-judge the CURRENT work, so it always gets an up-to-date system prompt
-        // (fresh reviewInfo / changed files) rather than resuming stale context. A
-        // mid-turn activity retry still resumes via heartbeat details inside runAgentTurn.
+        // Each Review runs a FRESH confirm turn (session left unset) so the reviewer
+        // always gets an up-to-date system prompt (fresh reviewInfo / changed files);
+        // continuity comes from `confirmMsgs`, replayed to the fresh session — prior
+        // requests and verdicts included. A mid-turn activity retry still resumes via
+        // heartbeat details inside runAgentTurn.
         turns.runAgentTurn({
           taskId,
           role: 'confirm',
@@ -781,6 +798,12 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       return undefined;
     });
     if (ct?.output?.trim()) confirmMsgs.push({ id: `c-out-${confirmMsgs.length}`, role: 'agent', text: ct.output, ts: confirmMsgs.length });
+    // Record the verdict itself in the transcript (the agent's prose may not state
+    // it). System role: shown to humans, stripped by adapters on later rounds.
+    if (ct?.confirmDecision) {
+      const d = ct.confirmDecision;
+      confirmMsgs.push({ id: `c-dec-${confirmMsgs.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.text ? ` — ${d.text}` : ''}`, ts: confirmMsgs.length });
+    }
     return ct?.confirmDecision;
   }
 

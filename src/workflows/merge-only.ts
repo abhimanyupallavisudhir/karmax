@@ -13,6 +13,7 @@ import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
+import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision } from './contract.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -111,12 +112,22 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   async function runConfirm(): Promise<ConfirmDecision | undefined> {
     try {
       // Fresh turn each Review so the reviewer judges the current branch; a mid-turn
-      // retry still resumes via runAgentTurn heartbeat details.
+      // retry still resumes via runAgentTurn heartbeat details. The review request
+      // (task prompt + what's under review, template user-editable via the confirmer
+      // field) is delivered as the conversation message, like software-dev's.
+      const request = renderConfirmPrompt(input.confirm?.prompt, {
+        title: input.title,
+        prompt: input.prompt,
+        response: reviewInfo?.summary ?? '(no summary)',
+        reviewInfo: reviewInfo?.summary ?? '',
+        changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+        transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
+      });
       const ct = await turns.runAgentTurn({
         taskId,
         role: 'confirm',
         worldHandle: world as any,
-        messages: [],
+        messages: [{ id: 'c-in-0', role: 'user', text: request, ts: 0 }],
         task: input,
         bindings: {
           reviewInfo: reviewInfo?.summary ?? '',
