@@ -103,7 +103,7 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(bad.status).toBe(400);
   });
 
-  it('archives terminal tasks (hidden by default, shown on demand) and refuses to archive a running one', async () => {
+  it('archives any task regardless of status (hidden by default, shown on demand) — including a live one', async () => {
     const task = await post(`/api/projects/${projectId}/tasks`, {
       title: 'Archive me',
       workflow: 'software-dev',
@@ -111,11 +111,14 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     });
     const atReview = await poll(task.id, 'review'); // awaiting review → status waiting
     expect(atReview.status).toBe('waiting');
-    // refuse to archive while live (running or awaiting review)
-    const refused = await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });
-    expect(refused.status).toBe(400);
-
-    // finish it, then archive
+    // archiving a live/awaiting-review task is allowed — it only hides, execution continues
+    const liveArchive = await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });
+    expect(liveArchive.status).toBe(200);
+    // hidden from the default list while still live
+    const hiddenWhileLive = await get(`/api/projects/${projectId}/tasks`);
+    expect(hiddenWhileLive.find((t: any) => t.id === task.id)).toBeUndefined();
+    // un-archive so we can finish it, then archive the finished task
+    await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: false }) });
     await post(`/api/tasks/${task.id}/signal`, { signal: 'confirm' });
     await poll(task.id, 'done');
     const ok = await fetch(`${base}/api/tasks/${task.id}/archive`, { method: 'POST', headers: auth(), body: JSON.stringify({ archived: true }) });

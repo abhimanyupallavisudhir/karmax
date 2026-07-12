@@ -53,6 +53,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // @review sets the terse caption; the git-derived summary/changedFiles are added automatically.
     expect(review.reviewInfo?.caption).toContain('factorial');
     expect(review.actions.map((a: any) => a.name)).toContain('confirm');
+    // The agent called signal_completion (mock default), so the gate marks it as an
+    // asserted finish rather than a silent stall.
+    expect(review.reviewInfo?.completion).toBe('signalled');
 
     await handle.signal('confirm');
     const result = await handle.result();
@@ -63,6 +66,32 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const onMain = await git(repo, ['show', 'main:factorial.js']);
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('export const f');
+  });
+
+  it('marks a Review reached without signal_completion as a stall, so the reviewer is warned', async () => {
+    const repo = await h.makeRepo('app');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        input({
+          taskId,
+          repo,
+          title: 'Half-finished change',
+          // The agent writes a file but does NOT signal completion (@incomplete) — it went
+          // quiet mid-task. It still surfaces at Review (needsInput), but flagged as a stall.
+          prompt: 'Start the work.\n@write half.js :: export const x = 1;\n@incomplete',
+        }),
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.reviewInfo?.completion).toBe('stalled');
+    // The distinction is real, not cosmetic: a stall is never auto-confirmed, so the task
+    // waits at the human gate rather than advancing.
+    expect(review.actions.map((a: any) => a.name)).toContain('confirm');
   });
 
   it('multi-repo: passes every configured repo to the agent and lands work in each', async () => {
