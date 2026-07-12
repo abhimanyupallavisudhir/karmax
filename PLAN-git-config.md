@@ -13,14 +13,14 @@ cloud install it is becoming. Design only; phases at the end.
   `user.name karmax` / `user.email karmax@localhost` **only when nothing else
   resolves** (no global/user identity) — on a normal dev machine it is a no-op.
 - **karmax already auto-commits — but only as a merge-time backstop.** If a
-  worktree is dirty when its merge runs, `finalizeMergeRepo` sweeps it up:
-  `git add -A && git commit -m "karmax: work for <id>"` (`src/world/merge.ts:73`).
-  Agents are *supposed* to commit deliberately; the sweep exists so uncommitted
-  work is never silently dropped at the finish line. `git add -A` respects
-  `.gitignore`, and the Review stage surfaces the full changed-file list, so a
-  stray un-ignored file is caught where every other unwanted change is caught:
-  at review. **Keep this.** The alternative (refuse to merge a dirty world)
-  turns a forgotten `git commit` into a wedged pipeline.
+  worktree is dirty when the authoritative merge runs, `finalizeMergeRepo`
+  sweeps it up: `git add -A && git commit -m "karmax: work for <id>"`
+  (`src/world/merge.ts:73`). The sweep runs *after* the best-effort
+  merge-agent turn ("Prepare branch for merge into <target>",
+  `src/workflows/software-dev.ts:1202` → `finalizeMergeActivity` at `:1223`),
+  so it fires only when that agent left the tree dirty — forgot to commit,
+  judged wrong, or its turn failed outright. §6 replaces the blind sweep with
+  a loop-back to the merge agent.
 - **karmax never pushes as a side effect of merging.** The only push in the
   codebase is the opt-in PR path (`openGithubPr` → `git push -u origin` +
   `gh pr create`, `src/activities/core.ts:589`), which silently skips when `gh`
@@ -46,8 +46,9 @@ cloud install it is becoming. Design only; phases at the end.
    - *Remote actions* (fetch over auth, push, PRs): explicit and opt-in, never
      a side effect, credentialed per project.
 2. **Committing is the agent's job.** Workflows cannot anticipate what needs
-   gitignoring; agents stage/commit deliberately (prompt guidance), and the
-   merge-time sweep stays as data-loss insurance only.
+   gitignoring; agents stage/commit deliberately (prompt guidance), and a tree
+   still dirty at merge time loops back to the merge agent (§6) rather than
+   being blind-swept by machinery.
 3. **One enforced setup, two credential sources.** Credentials are vault
    handles resolved JIT by the broker (the cloud mode); on a self-hosted box,
    an unconfigured profile falls through to the host environment (today's
@@ -85,7 +86,7 @@ interface GitProfile {
   that maps to "which of my accounts owns this repo"). Resolution:
   project profile → global default profile → **host fallback** (no injection;
   exactly today's behavior). Per-repo override inside a multi-repo project is
-  deliberately not modeled yet (see §7).
+  deliberately not modeled yet (see §8).
 - **Signing is SSH-only** (`gpg.format ssh`): one mechanism, same key type as
   auth, key storable in the vault. GPG is out of scope — anyone who needs it
   has host git config, which the host-fallback tier already honors.
@@ -143,7 +144,37 @@ right account automatic. karmax itself never pushes outside the declared
 policy. The Review stage remains the conceptual PR (SPEC §5.2); `pr` is for
 repos whose canonical review lives on GitHub.
 
-## 6. Onboarding & enforcement
+## 6. The merge-time sweep → a dirty-worktree loop-back
+
+The sweep predates this design's question: *who decides* what an uncommitted
+file is? `git add -A` exercises no judgment — commit-vs-gitignore is exactly
+an agent call. Worse, the merge agent's own work (running tests, resolving
+conflicts) can generate untracked artifacts *after* the Review gate approved
+the diff, and the sweep lands them unseen.
+
+Change: `finalizeMergeRepo` treats a dirty worktree as a **rejection**, the
+same shape as conflicts — return `{ merged: false, dirty: <file list> }` —
+and the workflow's existing rejection loop-back re-prompts the merge agent:
+
+> Uncommitted changes in: `<files>`. Stage and commit what belongs in this
+> change; gitignore (or delete) what doesn't. Then leave the tree clean.
+
+Bounded by the same `MAX_MERGE_ATTEMPTS`; exhaustion (or a merge-agent turn
+that fails outright with a dirty tree) escalates to the human/parent like any
+other merge failure — no silent sweep on the last attempt either, since that
+would blind-commit in exactly the cases nobody could look. The one special
+case that keeps auto-completing is the resolved-but-uncommitted merge
+(`MERGE_HEAD` present, everything staged, no unresolved paths — the existing
+`merge.ts:69` comment): completing that is mechanical, not judgment. The
+initial merge prompt also gains one line ("commit what should land; gitignore
+what shouldn't") so the loop-back is the exception, not the norm.
+
+This weakens finalize's guarantee from "work always lands" to "work lands or
+a human is asked" — the right trade: post-Review, silently committing files
+nobody saw is worse than pausing. Applies identically to `merge-only.ts`
+(same finalize activity).
+
+## 7. Onboarding & enforcement
 
 - A **Git accounts** card in global settings (same shape as the Workflows
   card): list profiles, add one (name/email + paste-a-PAT + import an SSH key
@@ -157,7 +188,7 @@ repos whose canonical review lives on GitHub.
   host-fallback tier is empty by construction, so "configure a git profile"
   becomes the single, enforced answer without any cloud-specific code path.
 
-## 7. Deliberately not built
+## 8. Deliberately not built
 
 - **Per-repo profile override in multi-repo projects.** A project = an account
   until proven otherwise; adding `repos: [{path, gitProfile}]` later is
@@ -170,8 +201,13 @@ repos whose canonical review lives on GitHub.
 - **GPG signing, .netrc, arbitrary credential helpers.** Host-fallback honors
   whatever the host has; karmax-managed profiles support exactly one setup.
 
-## 8. Phases
+## 9. Phases
 
+0. **Dirty-worktree loop-back (§6)** — independent of profiles, shippable
+   alone: `finalizeMergeRepo` rejects on dirty instead of sweeping; workflow
+   loop-back prompt; one-line addition to the initial merge prompt. Tests:
+   dirty world → merge agent re-prompted with the file list; exhaustion
+   escalates; resolved-but-uncommitted merge still auto-completes.
 1. **Profile registry + selection** — `GitProfile` type, Store persistence,
    global settings card, `ProjectConfig.gitProfile`, vault import helpers.
    No behavior change (nothing consumes it yet).
@@ -190,8 +226,10 @@ repos whose canonical review lives on GitHub.
 
 ---
 
-**Bottom line**: keep local plumbing config-free and the merge-time backstop
-commit; make identity and credentials a single named `GitProfile` (registry
+**Bottom line**: keep local plumbing config-free; turn the merge-time sweep
+into a dirty-worktree loop-back to the merge agent (commit-vs-gitignore is a
+judgment call, so it goes to an agent, then a human — never `git add -A`);
+make identity and credentials a single named `GitProfile` (registry
 global, selection per project, secrets as vault handles); materialize it
 statelessly — worktree-scoped git config for identity/signing, per-subprocess
 env (`GIT_SSH_COMMAND`, `GH_TOKEN`) for auth — and gate remotes behind an
