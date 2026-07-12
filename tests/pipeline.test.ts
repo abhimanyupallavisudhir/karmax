@@ -567,6 +567,52 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
   }, 60_000);
 
+  it('holds Do→Review while the agent left a run_in_background shell running (task 130)', async () => {
+    const repo = await h.makeRepo('app-shells');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // The agent did its work but ended the turn WITHOUT signalling completion, leaving a
+      // backgrounded shell (e.g. `npm test`) running — the exact task-130 shape. It must NOT
+      // fall straight through to Review: held in Do (waitingFor 'shell') until the shell drains.
+      args: [input({ taskId, repo, title: 'Shells', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@shells 2\n@incomplete', subagentWaitMs: 1500 })],
+    });
+
+    await expect
+      .poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind ?? '-'}`; }, { timeout: 20_000 })
+      .toBe('do/shell');
+    // nothing landed while it waits
+    expect((await git(repo, ['show', 'main:out.txt'])).code).not.toBe(0);
+
+    // Once the shell settles (count → 0) it advances to Review on its own.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
+
+  it('gives up on a long-lived background shell after a small budget, with a Review note', async () => {
+    const repo = await h.makeRepo('app-shells-devserver');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // 6 drains > MAX_SHELL_NUDGES (3): the shell is still reported running when the budget
+      // is spent (models a dev server left running on purpose). It must proceed to Review
+      // (never park forever) with a note that a background job's result may be missing.
+      args: [input({ taskId, repo, title: 'DevServer', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@shells 6\n@incomplete', subagentWaitMs: 300 })],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.reviewInfo?.summary).toContain('background job(s) still running');
+
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
+
   it('cancels running sub-task agents when the parent is cancelled (SPEC §5.6)', async () => {
     const repo = await h.makeRepo('app-sub-cancel');
     const taskId = newId('task');
