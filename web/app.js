@@ -303,12 +303,29 @@ function renderAgentField(f, spec, inherited) {
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
     <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Fork a previous agent</summary>
-      <input class="af-resume-search" placeholder="Search tasks to fork from…" style="width:100%;margin-top:6px;padding:7px 10px" />
-      <div class="af-resume-results" style="max-height:140px;overflow:auto"></div>
-      <div class="af-resume-chosen" style="font-size:12px;color:var(--accent);margin-top:4px">${spec?.resumeFrom ? esc(JSON.stringify(spec.resumeFrom)) : ''}</div>
+      <button type="button" class="btn sm af-resume-pick" style="margin-top:6px">⌕ Search tasks to fork from…</button>
+      <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
       <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
     </details>
   </div>`;
+}
+
+// The chosen fork source as a friendly chip (the {taskId, role} JSON rides in the
+// container's data-resume; collectForm/collectParamEdits read it via readResume).
+function resumeChosenInner(rf, task) {
+  const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
+  const label = `⑂ forking ${rf.role || 'do'} agent of ${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
+  return `${esc(label)}<button type="button" class="af-resume-clear" title="Clear">✕</button>`;
+}
+
+// Read an agent box's fork/resume choice back out: the picker's {taskId, role}
+// from data-resume, with a pasted provider session id merged on top.
+function readResume(box) {
+  let resumeFrom;
+  try { resumeFrom = JSON.parse(box.querySelector('.af-resume-chosen')?.dataset.resume || 'null') || undefined; } catch {}
+  const sessionId = box.querySelector('.af-resume-session')?.value.trim();
+  if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+  return resumeFrom;
 }
 
 // The confirmer field: a mode selector (human / auto / agent) plus the SAME agent
@@ -350,11 +367,7 @@ function collectForm(root, fields) {
       const effort = box.querySelector('.af-effort').value;
       if (model) spec.model = model;
       if (effort) spec.effort = effort;
-      const sessionId = box.querySelector('.af-resume-session').value.trim();
-      const chosen = box.querySelector('.af-resume-chosen').textContent.trim();
-      let resumeFrom;
-      if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
-      if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+      const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       // include only if the agent differs from inherited OR a resume was chosen
       if (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))) out[f.name] = spec;
@@ -375,10 +388,7 @@ function collectForm(root, fields) {
         const effort = ab.querySelector('.af-effort').value;
         if (model) spec.model = model;
         if (effort) spec.effort = effort;
-        const sessionId = ab.querySelector('.af-resume-session').value.trim();
-        const chosen = ab.querySelector('.af-resume-chosen').textContent.trim();
-        if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
-        if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+        resumeFrom = readResume(ab);
         if (resumeFrom) spec.resumeFrom = resumeFrom;
         // Store the review-request prompt only when it diverges from the inherited
         // template (a stored override or the built-in default); empty ⇒ inherit.
@@ -458,9 +468,25 @@ function wireAgentFields(root) {
       box.querySelector('.af-model').value = ''; // model choices are provider-specific
       refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
     });
-    const search = box.querySelector('.af-resume-search');
-    const results = box.querySelector('.af-resume-results');
-    search?.addEventListener('input', () => resumeSearch(box, search.value, results));
+    // Fork-from search: the full task-picker overlay in agent mode (archived tasks
+    // included — the completed ones are the ones you most often fork from).
+    const chosen = box.querySelector('.af-resume-chosen');
+    const setResume = (rf, task) => {
+      if (!chosen) return;
+      chosen.dataset.resume = JSON.stringify(rf ?? null);
+      chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
+      box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
+    };
+    chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
+    box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
+      openTaskPicker({
+        title: 'Fork a previous agent',
+        hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
+        mode: 'agent',
+        defaults: ['draft', 'series'],
+        onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
+      }),
+    );
   });
   // Confirmer fields: show the agent sub-form only when mode is "agent".
   root.querySelectorAll('.confirmer-field').forEach((box) => {
@@ -581,51 +607,6 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   if (ab) resetAgentField(ab, attr);
   const promptEl = box.querySelector('.cf-prompt');
   if (promptEl) promptEl.value = inh.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
-}
-
-// Full task list (incl. archived) for the fork picker, cached per project.
-// Archived tasks are the completed ones you most often want to fork from, so the
-// fork search must see them regardless of the Archived view / query. Cached to
-// avoid re-fetching (and re-enriching) the whole list on every keystroke;
-// loadTasks() clears the cache so newly created/updated tasks show up.
-async function forkTaskPool() {
-  if (!S.projectId) return S.tasks;
-  if (S.forkPool?.projectId === S.projectId) return S.forkPool.tasks;
-  const tasks = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
-  S.forkPool = { projectId: S.projectId, tasks };
-  return tasks;
-}
-
-// Fork search: find tasks by title, then list their per-role agent sessions.
-async function resumeSearch(box, q, results) {
-  const ql = q.toLowerCase().trim();
-  if (!ql) { results.innerHTML = ''; return; }
-  // The pool includes archived tasks (the ones most often forked from); match by
-  // title OR by their `#num` (SPEC §10.6).
-  let pool = S.tasks;
-  try { pool = await forkTaskPool(); } catch {}
-  const matches = pool.filter((t) => !t.params?.draft && taskMatches(t, ql)).slice(0, 6);
-  const rows = await Promise.all(
-    matches.map(async (t) => {
-      let sessions = {};
-      try { sessions = await api(`/api/tasks/${t.id}/sessions`); } catch {}
-      const roles = Object.keys(sessions);
-      if (!roles.length) return '';
-      const numTag = t.num != null ? `<span class="task-num">#${t.num}</span> ` : '';
-      return roles
-        .map((role) => `<div class="pi" data-tid="${t.id}" data-role="${role}" data-sid="${esc(sessions[role]?.id || '')}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--line)">${numTag}${esc(t.title)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${role}</span></div>`)
-        .join('');
-    }),
-  );
-  const html = rows.filter(Boolean).join('') || '<div style="padding:7px 10px;color:var(--ink-3);font-size:12px">No resumable agent sessions in matching tasks.</div>';
-  results.innerHTML = html;
-  results.querySelectorAll('[data-tid]').forEach((r) =>
-    r.addEventListener('click', () => {
-      box.querySelector('.af-resume-chosen').textContent = JSON.stringify({ taskId: r.dataset.tid, role: r.dataset.role });
-      box.querySelector('.af-resume-search').value = `${r.textContent}`;
-      results.innerHTML = '';
-    }),
-  );
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
@@ -757,7 +738,6 @@ async function boot() {
   try {
     S.contributions = await api('/api/contributions');
     S.schema = await api('/api/schema');
-    S.eventCatalog = await api('/api/events/catalog').catch(() => []);
   } catch {}
   await loadProjects();
   connectWs();
@@ -774,7 +754,6 @@ async function loadProjects() {
 
 async function loadTasks() {
   if (!S.projectId) return;
-  S.forkPool = null; // let the fork picker re-fetch its archived-inclusive pool
   // Always fetch the full set incl. archived; the task list decides visibility via the
   // query (default -is:archived). S.tasks is the shared pool for the drawer, counts, etc.
   const fetched = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
@@ -1047,8 +1026,8 @@ function renderMain() {
 }
 
 // ── tasks ────────────────────────────────────────────────────────────────────
-// Client-side twin of the authoritative `matchText` in src/domain/search.ts — used as
-// the pre-server fallback AND by the fork-from picker (resumeSearch). Keep the two in
+// Client-side twin of the authoritative `matchText` in src/domain/search.ts — the
+// pre-server fallback while the first evaluation is in flight. Keep the two in
 // sync: token-AND over title / notes / #num, so "login fix" matches "fix login".
 function taskMatches(t, q) {
   const s = (q || '').toLowerCase().trim();
@@ -1063,10 +1042,11 @@ function taskMatches(t, q) {
 // you drill into runs with `is:run` (or the Repeatable/Archived views). Archived and runs
 // are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
 // evaluated query carries the defaults. If the query already mentions a facet, we leave it.
+// The task-picker overlay passes its own facet list (e.g. the fork search keeps archived).
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
-function effectiveQuery(q) {
+function effectiveQuery(q, facets = ['archived', 'run']) {
   let s = (q || '').trim();
-  for (const facet of ['archived', 'run']) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
+  for (const facet of facets) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
   return s;
 }
 
@@ -1140,9 +1120,10 @@ function allMenuFields() { return [...(S.fields || []), ...paramMenuFields()]; }
 function menuFieldByKey(key) { return allMenuFields().find((f) => f.key === key); }
 
 // The query toolbar: the field-driven quick filters + group + sort selectors. It
-// reads the searchable-field registry (+ workflow params) so it never drifts from the parser.
-function queryToolbar() {
-  const q = S.search || '';
+// reads the searchable-field registry (+ workflow params) so it never drifts from
+// the parser. Shared by the task list (prefix 'q') and the task-picker overlay
+// (prefix 'pk') — each instance edits its own query via wireQueryToolbar.
+function queryToolbarHtml(q, prefix, trailing = '') {
   const fields = allMenuFields();
   const params = paramMenuFields();
   // Filter menu: everything with discrete-ish values (skip free-text title/notes),
@@ -1155,18 +1136,29 @@ function queryToolbar() {
   const opt = (v, label, sel) => `<option value="${esc(v)}" ${sel ? 'selected' : ''}>${esc(label)}</option>`;
   const grp = (label, inner) => (inner ? `<optgroup label="${esc(label)}">${inner}</optgroup>` : '');
   return `<div class="query-bar">
-    <select id="q-filter-field" class="q-sel" title="Add a filter"><option value="">＋ Filter…</option>
+    <select id="${prefix}-filter-field" class="q-sel" title="Add a filter"><option value="">＋ Filter…</option>
       ${filterFields.map((f) => opt(f.key, f.label)).join('')}
       ${grp('Workflow params', params.map((f) => opt(f.key, f.label)).join(''))}</select>
-    <select id="q-group" class="q-sel" title="Group by">
+    <select id="${prefix}-group" class="q-sel" title="Group by">
       ${opt('', 'No grouping', !curGroup)}${grpFields.filter((f) => !f.param).map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join('')}
       ${grp('Workflow params', params.map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join(''))}</select>
-    <select id="q-sort" class="q-sel" title="Sort by">
+    <select id="${prefix}-sort" class="q-sel" title="Sort by">
       ${opt('', 'Sort: default', !curSort)}${sortFields.filter((f) => !f.param).map((f) => opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc') + opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc')).join('')}
       ${grp('Workflow params', params.map((f) => opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc') + opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc')).join(''))}</select>
-    <div class="q-spacer"></div>
-    <button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>
+    ${trailing}
   </div>`;
+}
+
+// Wire a toolbar instance's group/sort/filter controls onto a query holder:
+// `get()` returns the instance's working query string, `set(q)` applies a new one.
+function wireQueryToolbar(root, prefix, { get, set }) {
+  $(`#${prefix}-group`, root)?.addEventListener('change', (e) => set(setDirective(get(), 'group', e.target.value)));
+  $(`#${prefix}-sort`, root)?.addEventListener('change', (e) => set(setDirective(get(), 'sort', e.target.value)));
+  $(`#${prefix}-filter-field`, root)?.addEventListener('change', (e) => {
+    const key = e.target.value;
+    e.target.value = '';
+    if (key) openFilterPicker(key, (fieldTok, value) => set(addClause(get(), fieldTok, value)));
+  });
 }
 
 function tasksView() {
@@ -1215,7 +1207,7 @@ function tasksView() {
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
       </div>
       ${viewsBar()}
-      ${queryToolbar()}
+      ${queryToolbarHtml(S.search || '', 'q', `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`)}
     </div>
     <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
       <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
@@ -1469,13 +1461,7 @@ function wireOrgControls() {
     search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
   }
 
-  $('#q-group')?.addEventListener('change', (e) => { S.activeView = null; setQuery(setDirective(S.search, 'group', e.target.value)); });
-  $('#q-sort')?.addEventListener('change', (e) => { S.activeView = null; setQuery(setDirective(S.search, 'sort', e.target.value)); });
-  $('#q-filter-field')?.addEventListener('change', (e) => {
-    const key = e.target.value;
-    e.target.value = '';
-    if (key) openFilterPicker(key);
-  });
+  wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => { S.activeView = null; setQuery(q); } });
 }
 
 // Persist the current working query as a named view (Save-view button).
@@ -1530,12 +1516,16 @@ function parseQueryClient(input) {
 }
 
 // A value picker for the chosen filter field — options for enum/facet/tag, a typed
-// value (with comparison ops) for number/date/text.
-function openFilterPicker(fieldKey) {
+// value (with comparison ops) for number/date/text. `onAdd(fieldTok, value)` appends
+// the clause to whichever query the caller owns (the task list's or the picker's).
+// Appended (not innerHTML-replaced) into #modal-root so it can stack on the
+// task-picker overlay, which also lives there.
+function openFilterPicker(fieldKey, onAdd) {
   const field = menuFieldByKey(fieldKey);
   if (!field) return;
-  const root = $('#modal-root');
-  const apply = (value, negate) => { root.innerHTML = ''; if (value === '' || value == null) return; S.activeView = null; setQuery(addClause(S.search, (negate ? '-' : '') + field.key, value)); };
+  const host = document.createElement('div');
+  $('#modal-root').appendChild(host);
+  const apply = (value, negate) => { host.remove(); if (value === '' || value == null) return; onAdd((negate ? '-' : '') + field.key, value); };
 
   let inner = '';
   if (field.type === 'tag') {
@@ -1553,16 +1543,177 @@ function openFilterPicker(fieldKey) {
     const ph = field.type === 'date' ? 'e.g. 7d, today, 2026-01-01' : 'value';
     inner = `<div class="fp-row">${ops}<input id="fp-val" class="title-in" placeholder="${ph}" /></div><button class="btn primary" id="fp-add">Add filter</button>`;
   }
-  root.innerHTML = `<div class="palette-scrim" id="fp-scrim"><div class="palette fp">
+  host.innerHTML = `<div class="palette-scrim" id="fp-scrim"><div class="palette fp">
     <div class="fp-head">Filter by ${esc(field.label)} <label class="fp-neg"><input type="checkbox" id="fp-negate" /> exclude</label></div>
     <div id="fp-list">${inner}</div>
   </div></div>`;
-  const neg = () => $('#fp-negate')?.checked;
-  $('#fp-scrim').addEventListener('click', (e) => { if (e.target.id === 'fp-scrim') root.innerHTML = ''; });
-  root.querySelectorAll('.opt[data-val]').forEach((o) => o.addEventListener('click', () => apply(o.dataset.val, neg())));
-  $('#fp-add')?.addEventListener('click', () => { const op = $('#fp-op')?.value || ''; const val = $('#fp-val')?.value.trim(); if (val) apply(op + val, neg()); });
-  $('#fp-val')?.focus();
-  $('#fp-val')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const op = $('#fp-op')?.value || ''; const val = e.target.value.trim(); if (val) apply(op + val, neg()); } });
+  const neg = () => $('#fp-negate', host)?.checked;
+  $('#fp-scrim', host).addEventListener('click', (e) => { if (e.target.id === 'fp-scrim') host.remove(); });
+  host.querySelectorAll('.opt[data-val]').forEach((o) => o.addEventListener('click', () => apply(o.dataset.val, neg())));
+  $('#fp-add', host)?.addEventListener('click', () => { const op = $('#fp-op', host)?.value || ''; const val = $('#fp-val', host)?.value.trim(); if (val) apply(op + val, neg()); });
+  $('#fp-val', host)?.focus();
+  $('#fp-val', host)?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const op = $('#fp-op', host)?.value || ''; const val = e.target.value.trim(); if (val) apply(op + val, neg()); } });
+}
+
+// ── overlay task picker (dependency search + fork-from search) ───────────────
+// One full-featured task finder shared by every "pick a task" control: the same
+// query language, view chips and filter/group/sort toolbar as the task list, in
+// a modal with its OWN query state (the list's search is untouched). mode 'task'
+// picks a task row; mode 'agent' expands a clicked task into its resumable
+// per-role agent sessions and picks one → onPick({ task, role, session }).
+// `defaults` are the facets hidden unless the query mentions them (the list's
+// transparent -is:archived -is:run treatment, parameterized per caller — the
+// fork search deliberately keeps archived tasks in).
+function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'run'], exclude, onPick }) {
+  const root = $('#modal-root');
+  const host = document.createElement('div');
+  root.appendChild(host);
+  host.innerHTML = `<div class="palette-scrim" id="pk-scrim"><div class="palette picker">
+    <div class="fp-head">${esc(title || 'Pick a task')}<span class="q-spacer"></span><button type="button" class="icon-btn" id="pk-close" title="Close (Esc)">✕</button></div>
+    <div class="organizer">
+      <div class="search-box">
+        <span class="search-ic">⌕</span>
+        <input id="pk-search" class="task-search" spellcheck="false" autocomplete="off"
+          placeholder="Search &amp; filter…  e.g.  status:done tag:frontend priority:>=2" />
+      </div>
+      <div class="views-bar" id="pk-views"></div>
+      <div id="pk-toolbar"></div>
+    </div>
+    ${hint ? `<div class="pk-hint">${esc(hint)}</div>` : ''}
+    <div id="pk-list"></div>
+  </div></div>`;
+  const search = $('#pk-search', host);
+  const list = $('#pk-list', host);
+  const close = () => host.remove();
+  let q = '';
+  let activeView = null;
+  let result = null; // last server evaluation
+  let hi = 0; // roving highlight over pickable rows
+  const sessions = new Map(); // taskId → role→session (agent mode, fetched on expand)
+  const expanded = new Set(); // taskIds whose sessions are shown
+
+  // View chips (All + built-ins + saved) and the toolbar re-render on every query
+  // change so their selected state tracks the picker's own query, not the list's.
+  const paintControls = () => {
+    $('#pk-views', host).innerHTML = [
+      `<div class="view-chip ${!activeView ? 'active' : ''}" data-pkview="__all__">≡ All</div>`,
+      ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`),
+      ...S.views.map((v) => `<div class="view-chip ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}</div>`),
+    ].join('');
+    host.querySelectorAll('[data-pkview]').forEach((el) =>
+      el.addEventListener('click', () => {
+        const id = el.dataset.pkview;
+        activeView = id === '__all__' ? null : id;
+        const bv = BUILTIN_VIEWS.find((x) => x.id === id);
+        const sv = S.views.find((x) => x.id === id);
+        setQ(id === '__all__' ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
+      }),
+    );
+    $('#pk-toolbar', host).innerHTML = queryToolbarHtml(q, 'pk');
+    wireQueryToolbar(host, 'pk', { get: () => q, set: (nq) => { activeView = null; setQ(nq); } });
+  };
+
+  let deb = null;
+  const setQ = (nq, typing) => {
+    q = nq || '';
+    if (search.value !== q) search.value = q;
+    paintControls();
+    clearTimeout(deb);
+    deb = setTimeout(run, typing ? 180 : 0); // keystrokes coalesce; clicks apply at once
+  };
+  async function run() {
+    try {
+      const r = await api(`/api/projects/${S.projectId}/search?q=${encodeURIComponent(effectiveQuery(q, defaults))}`);
+      result = r;
+    } catch { result = { tasks: [] }; }
+    hi = 0;
+    paintList();
+  }
+
+  const rowHtml = (t) => {
+    const v = t.lastView || {};
+    const status = v.status || (t.params?.draft ? 'cancelled' : t.params?.triggerState === 'armed' ? 'waiting' : 'active');
+    const chipLabel = t.params?.draft ? 'draft' : t.params?.triggerState === 'armed' ? 'waiting for trigger' : stageLabel(v);
+    const open = expanded.has(t.id);
+    return `<div class="pick-row" data-nav data-task="${t.id}">
+      <span class="status-dot ${status}"></span>
+      <div class="task-main">
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}</div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t)}</div>
+      </div>
+      ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
+    </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
+  };
+
+  const sessionsHtml = (t) => {
+    const s = sessions.get(t.id);
+    if (!s) return `<div class="pk-empty">Loading agent sessions…</div>`;
+    const roles = Object.keys(s);
+    if (!roles.length) return `<div class="pk-empty">No resumable agent sessions.</div>`;
+    return roles
+      .map((role) => `<div class="pick-row pk-session" data-nav data-task="${t.id}" data-role="${esc(role)}">
+        <span class="pk-fork">⑂</span>
+        <div class="task-main">
+          <div class="task-title">${esc(role)} agent</div>
+          <div class="task-sub">${s[role].provider ? `<span class="wf">${esc(s[role].provider)}</span>` : ''}<span class="mono">${esc(String(s[role].id || '').slice(0, 20))}…</span></div>
+        </div>
+      </div>`)
+      .join('');
+  };
+
+  const navRows = () => [...list.querySelectorAll('[data-nav]')];
+  const paintHi = () => navRows().forEach((el, i) => { el.classList.toggle('hi', i === hi); if (i === hi) el.scrollIntoView({ block: 'nearest' }); });
+
+  const paintList = () => {
+    if (!result) { list.innerHTML = `<div class="pk-empty">Searching…</div>`; return; }
+    const keep = (t) => !(exclude && exclude(t));
+    let body;
+    if (result.groups) {
+      body = result.groups
+        .map((g) => {
+          const gt = g.tasks.filter(keep);
+          return gt.length ? `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(rowHtml).join('')}` : '';
+        })
+        .join('');
+    } else {
+      body = (result.tasks || []).filter(keep).map(rowHtml).join('');
+    }
+    list.innerHTML = body || `<div class="pk-empty">No matching tasks${q ? ` for <code>${esc(q)}</code>` : ''}.</div>`;
+    list.querySelectorAll('.pick-row').forEach((el) => el.addEventListener('click', () => activate(el)));
+    paintHi();
+  };
+
+  const activate = async (el) => {
+    const tid = el.dataset.task;
+    const task = (result?.tasks || []).find((t) => t.id === tid);
+    if (el.dataset.role !== undefined) { // a session sub-row → the actual pick
+      onPick({ task, role: el.dataset.role, session: sessions.get(tid)?.[el.dataset.role] });
+      return close();
+    }
+    if (mode === 'task') { onPick(task); return close(); }
+    // agent mode: a task row toggles its session list (fetched once, then cached)
+    if (expanded.has(tid)) { expanded.delete(tid); return paintList(); }
+    expanded.add(tid);
+    if (!sessions.has(tid)) {
+      paintList(); // shows "Loading…" while the fetch is in flight
+      sessions.set(tid, await api(`/api/tasks/${tid}/sessions`).catch(() => ({})));
+    }
+    paintList();
+  };
+
+  search.addEventListener('input', () => { activeView = null; setQ(search.value, true); });
+  search.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hi + 1, navRows().length - 1); paintHi(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); hi = Math.max(hi - 1, 0); paintHi(); }
+    else if (e.key === 'Enter') { e.preventDefault(); const r = navRows()[hi]; if (r) activate(r); }
+  });
+  $('#pk-scrim', host).addEventListener('click', (e) => { if (e.target.id === 'pk-scrim') close(); });
+  $('#pk-close', host).addEventListener('click', close);
+
+  paintControls();
+  run();
+  search.focus();
 }
 
 // Project tag catalogue manager — create/rename/recolor/reparent/delete tags.
@@ -1774,9 +1925,8 @@ function triggersSection(values, selfId) {
         <div class="label-row"><label>Task dependencies</label></div>
         <div class="chip-input" id="dep-box">
           <span class="chips" id="dep-chips"></span>
-          <input id="dep-input" class="chip-text" placeholder="Type to search tasks…" autocomplete="off">
+          <button type="button" class="btn sm" id="dep-add">＋ Add a task…</button>
         </div>
-        <div class="dep-menu" id="dep-menu"></div>
       </div>
       <div class="form-row">
         <div class="label-row"><label>On a schedule <span class="hint" title="Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.">cron, UTC ⓘ</span></div>
@@ -1786,7 +1936,6 @@ function triggersSection(values, selfId) {
         <div class="label-row"><label>Or run once at</label></div>
         <input id="trig-at" type="datetime-local" value="${atVal}" style="width:100%">
       </div>
-      ${eventSection(existing)}
     </details>`;
 }
 
@@ -1825,8 +1974,10 @@ function selectedDepIds() {
 
 // Read the triggers section back into a TaskTrigger[] (empty ⇒ starts immediately).
 // Dependencies default to mode:'all' (AND) and on:'success' server-side, so we
-// only carry the task ids.
-function collectTriggers() {
+// only carry the task ids. `existing` is the task's stored triggers: event triggers
+// have no form UI (only agents create them, via the API), so any there are passed
+// through untouched — editing a task in the form must not silently drop them.
+function collectTriggers(existing) {
   const trigs = [];
   const deps = selectedDepIds();
   if (deps.length) trigs.push({ kind: 'dependency', tasks: deps });
@@ -1837,119 +1988,32 @@ function collectTriggers() {
     const ms = Date.parse(at);
     if (!isNaN(ms)) trigs.push({ kind: 'schedule', at: ms });
   }
-  const evType = $('#trig-event-type')?.value;
-  if (evType) {
-    const tr = { kind: 'event', type: evType };
-    const where = {};
-    document.querySelectorAll('#event-extra [data-wherekey]').forEach((inp) => {
-      const raw = inp.value.trim();
-      if (raw) where[inp.dataset.wherekey] = coerceScalar(raw);
-    });
-    if (Object.keys(where).length) tr.where = where;
-    const src = $('#ev-source')?.value;
-    if (src) tr.taskId = src;
-    trigs.push(tr);
-  }
+  for (const t of Array.isArray(existing) ? existing : []) if (t.kind === 'event') trigs.push(t);
   return trigs;
 }
 
-// Coerce a filter value string to the scalar the event payload likely holds, so
-// the server's strict `===` match works (numbers/booleans, else string).
-function coerceScalar(s) {
-  if (s === 'true') return true;
-  if (s === 'false') return false;
-  if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
-  return s;
-}
-
-// ── event trigger builder (schema-driven from the event catalog) ─────────────
-function eventSection(existing) {
-  const catalog = S.eventCatalog || [];
-  const cur = existing.find((t) => t.kind === 'event');
-  if (!catalog.length && !cur) return ''; // catalog not loaded and nothing to show
-  const bySource = {};
-  for (const e of catalog) (bySource[e.source || 'other'] ||= []).push(e);
-  const groups = Object.entries(bySource)
-    .map(([src, evs]) => `<optgroup label="${esc(src)}">${evs.map((e) => `<option value="${esc(e.type)}" ${cur?.type === e.type ? 'selected' : ''}>${esc(e.type)}</option>`).join('')}</optgroup>`)
-    .join('');
-  return `
-    <div class="form-row">
-      <div class="label-row"><label>On an event</label></div>
-      <select id="trig-event-type"><option value="">(none)</option>${groups}</select>
-      <div id="event-extra" class="event-extra"></div>
-    </div>`;
-}
-
-function eventExtraHtml(desc, cur) {
-  if (!desc) return '';
-  const fields = desc.fields || {};
-  const filters = Object.entries(fields)
-    .map(([k, ty]) => `<label class="ev-filter">${esc(k)} <small>${esc(String(ty))}</small><input data-wherekey="${esc(k)}" placeholder="any" value="${esc(cur?.where?.[k] ?? '')}"></label>`)
-    .join('');
-  const taskOpts = (S.tasks || [])
-    .filter((t) => !t.params?.runOf && !t.params?.repeatable)
-    .map((t) => `<option value="${t.id}" ${cur?.taskId === t.id ? 'selected' : ''}>${esc(t.title)}</option>`)
-    .join('');
-  return `
-    ${desc.description ? `<p class="task-sub" style="color:var(--ink-3);margin:2px 0">${esc(desc.description)}</p>` : ''}
-    ${filters ? `<div class="ev-filter-hint">Only when</div><div class="ev-filters">${filters}</div>` : ''}
-    <label class="ev-source">From task <select id="ev-source"><option value="">any</option>${taskOpts}</select></label>`;
-}
-
-function wireEventBuilder(values) {
-  const sel = $('#trig-event-type');
-  const extra = $('#event-extra');
-  if (!sel || !extra) return;
-  const cur = (Array.isArray(values.triggers) ? values.triggers : []).find((t) => t.kind === 'event');
-  const render = (preset) => {
-    const desc = (S.eventCatalog || []).find((e) => e.type === sel.value);
-    extra.innerHTML = sel.value ? eventExtraHtml(desc, preset) : '';
-  };
-  sel.addEventListener('change', () => render(null));
-  render(cur); // prefill filters/source for an existing event trigger
-}
-
-// Wire the dependency chip-input: search-as-you-type dropdown, click/Enter to add
-// a chip, ✕ or Backspace to remove. Seeded from an existing dependency trigger.
+// Wire the dependency chips: ✕ removes; "＋ Add a task…" opens the full task-picker
+// overlay (the task list's search surface). Seeded from an existing dependency trigger.
 function wireDepPicker(values, selfId) {
   const box = $('#dep-chips');
-  const input = $('#dep-input');
-  const menu = $('#dep-menu');
-  if (!box || !input || !menu) return;
-  const taskById = (id) => (S.tasks || []).find((t) => t.id === id) || { id, title: id };
+  const btn = $('#dep-add');
+  if (!box || !btn) return;
+  const known = new Map(); // tasks picked from the overlay that S.tasks may not hold yet
+  const taskById = (id) => known.get(id) || (S.tasks || []).find((t) => t.id === id) || { id, title: id };
   const chip = (t) => `<span class="dep-chip" data-depid="${t.id}">${esc(t.title)}<button type="button" class="dep-x" data-depx="${t.id}" title="Remove">✕</button></span>`;
-  const paint = (ids) => {
+  const paint = (ids, changed) => {
     box.innerHTML = ids.map((id) => chip(taskById(id))).join('');
-    box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx)); input.focus(); }));
+    box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx), true); }));
+    if (changed) box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
-  const add = (id) => { const ids = selectedDepIds(); if (!ids.includes(id)) paint([...ids, id]); input.value = ''; closeMenu(); input.focus(); };
-  const closeMenu = () => { menu.classList.remove('open'); menu.innerHTML = ''; };
-  let hi = 0;
-  const openMenu = (q) => {
-    const chosen = new Set(selectedDepIds());
-    const items = (S.tasks || [])
-      .filter((t) => t.id !== selfId && !chosen.has(t.id) && !t.params?.draft && !t.params?.runOf && !t.params?.repeatable && t.title.toLowerCase().includes(q.toLowerCase()))
-      .slice(0, 8);
-    if (!items.length) return closeMenu();
-    hi = 0;
-    menu.innerHTML = items
-      .map((t, i) => `<div class="dep-item ${i === 0 ? 'hi' : ''}" data-pick="${t.id}">${esc(t.title)}<span class="dep-item-wf">${esc(t.workflow)}</span></div>`)
-      .join('');
-    menu.classList.add('open');
-    menu.querySelectorAll('[data-pick]').forEach((el) => (el.onmousedown = (e) => { e.preventDefault(); add(el.dataset.pick); }));
-  };
-  const paintHi = () => menu.querySelectorAll('.dep-item').forEach((el, i) => el.classList.toggle('hi', i === hi));
-  input.addEventListener('input', (e) => openMenu(e.target.value));
-  input.addEventListener('focus', (e) => openMenu(e.target.value));
-  input.addEventListener('blur', () => setTimeout(closeMenu, 120));
-  input.addEventListener('keydown', (e) => {
-    const items = [...menu.querySelectorAll('[data-pick]')];
-    if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hi + 1, items.length - 1); paintHi(); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); hi = Math.max(hi - 1, 0); paintHi(); }
-    else if (e.key === 'Enter') { if (items[hi]) { e.preventDefault(); add(items[hi].dataset.pick); } }
-    else if (e.key === 'Backspace' && !e.target.value) { const ids = selectedDepIds(); if (ids.length) paint(ids.slice(0, -1)); }
-    else if (e.key === 'Escape') { closeMenu(); }
-  });
+  btn.addEventListener('click', () =>
+    openTaskPicker({
+      title: 'Add a dependency',
+      defaults: ['archived', 'run', 'series', 'draft'],
+      exclude: (t) => t.id === selfId || selectedDepIds().includes(t.id),
+      onPick: (t) => { known.set(t.id, t); paint([...selectedDepIds(), t.id], true); },
+    }),
+  );
   const existing = (Array.isArray(values.triggers) ? values.triggers : []).find((t) => t.kind === 'dependency');
   paint(existing?.tasks || []);
 }
@@ -2069,7 +2133,6 @@ async function openTaskForm(workflow, draft, seedText) {
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
-  wireEventBuilder(values);
 
   // The priority+tags editor is wired further down, once `draftId`/`ensureDraft` exist
   // (a brand-new task needs a draft persisted before tags/priority can attach).
@@ -2088,7 +2151,7 @@ async function openTaskForm(workflow, draft, seedText) {
     // this way they ride through auto-save, draft, and queue like the prompt does.
     // (Critical: formState feeds the `replace:true` auto-save, so omitting them here
     // would silently drop an armed/series task's triggers mid-edit.)
-    const triggers = collectTriggers();
+    const triggers = collectTriggers(values.triggers);
     if (triggers.length) body.triggers = triggers;
     if ($('#trig-repeatable')?.checked) body.repeatable = true;
     return { body, notes: $('#tf-notes')?.value ?? '' };
@@ -2286,7 +2349,6 @@ async function renderSeriesDrawer(rec) {
   renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: rec.projectId, taskId: rec.id });
   wireDepPicker(values, rec.id);
   wireScheduleBuilder(values);
-  wireEventBuilder(values);
   $('#drawer-body').querySelectorAll('[data-runopen]').forEach((el) => el.addEventListener('click', () => openDrawer(el.dataset.runopen)));
   $('#sd-runagain').addEventListener('click', async () => {
     try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeDrawer(); refreshTasks(); }
@@ -2294,7 +2356,7 @@ async function renderSeriesDrawer(rec) {
   });
   $('#sd-save').addEventListener('click', async () => {
     const body = collectForm($('#tf-body'), fields);
-    const triggers = collectTriggers();
+    const triggers = collectTriggers(values.triggers);
     if (triggers.length) body.triggers = triggers;
     body.repeatable = !!$('#trig-repeatable')?.checked;
     const notes = $('#tf-notes')?.value ?? '';
@@ -3386,11 +3448,7 @@ function collectParamEdits(root, fields) {
       const effort = box.querySelector('.af-effort')?.value;
       if (model) spec.model = model;
       if (effort) spec.effort = effort;
-      const sessionId = box.querySelector('.af-resume-session')?.value.trim();
-      const chosen = box.querySelector('.af-resume-chosen')?.textContent.trim();
-      let resumeFrom;
-      if (chosen) { try { resumeFrom = JSON.parse(chosen); } catch {} }
-      if (sessionId) resumeFrom = { ...(resumeFrom || {}), sessionId };
+      const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       out[f.name] = spec;
       continue;
@@ -4872,9 +4930,10 @@ function moveRail(delta) {
 function closeTopOverlay() {
   const pop = $('#notif-pop');
   if (pop) return pop.remove();
-  // Secondary modals (filter picker, tags manager, tag picker) stack above the
-  // form/drawer in #modal-root — pop them first.
-  if ($('#modal-root').firstElementChild) return ($('#modal-root').innerHTML = '');
+  // Secondary modals (task picker, filter picker, tags manager, tag picker) stack
+  // above the form/drawer in #modal-root — pop the topmost one first (a filter
+  // picker can itself sit on the task-picker overlay).
+  if ($('#modal-root').lastElementChild) return $('#modal-root').lastElementChild.remove();
   const overlay = $('#overlay-root').firstElementChild;
   if (overlay) {
     if (overlay.id === 'tf-scrim') return overlay.click(); // task form: its scrim-close flushes the draft
