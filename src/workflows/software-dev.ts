@@ -126,6 +126,12 @@ const MAX_SUBAGENT_NUDGES = 5;
  *  Avoids a hot re-prompt loop and gives the waiting state a visible dwell; a human
  *  follow-up wakes it early. Overridable via `input.subagentWaitMs`. */
 const DEFAULT_SUBAGENT_WAIT_MS = 10_000;
+/** A turn can also return while a `run_in_background` shell (e.g. `npm test &`) is
+ *  still running — the agent ends its turn meaning to fold in the result later (task
+ *  130). We nudge it to wait, but with a SMALLER budget than sub-agents: a shell may
+ *  be a dev server the task deliberately left running, so we must not park on it long.
+ *  After the budget we proceed to Review with a note. */
+const MAX_SHELL_NUDGES = 3;
 
 /**
  * The merge-queue serialization domains for a task — one `<repo>:<target>` per
@@ -185,6 +191,8 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // How many times we've re-prompted the agent to wait for its own in-harness
   // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
   let subagentNudges = 0;
+  // Same, for backgrounded shells the agent left running (bounded by MAX_SHELL_NUDGES).
+  let shellNudges = 0;
   const subTaskIds: string[] = [];
   // Sub-task hierarchy (SPEC §5.3). Children are managed, not blindly awaited: their
   // handles let us await completion, raised requests queue in `raises`, settlements in
@@ -1030,6 +1038,38 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const gaveUpOnSubagents = !!turn.pendingSubagents && subagentNudges >= MAX_SUBAGENT_NUDGES;
     subagentNudges = 0; // sub-agents settled (or nudge budget spent) → reset for next Do phase
 
+    // A `run_in_background` shell (e.g. a backgrounded `npm test`) may still be running
+    // when the turn returned — the agent ends its turn meaning to fold in the result
+    // later, and a returned Do turn otherwise falls straight through to Review (task 130).
+    // Hold in Do and re-prompt instead. Bounded SMALL and softer than the sub-agent case:
+    // the shell might be a dev server the task deliberately left running, so after the
+    // budget we proceed anyway (with the note below).
+    if (turn.pendingBackgroundShells && shellNudges < MAX_SHELL_NUDGES) {
+      shellNudges++;
+      status = 'waiting';
+      waitingFor = { kind: 'shell', detail: `${turn.pendingBackgroundShells} background job(s) still running` };
+      await publish();
+      // Back off before re-prompting, but stay redirectable: a human follow-up or a
+      // cancel wakes us early.
+      await condition(() => cancelled || msgs.length > seen, input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
+      if (cancelled) return await abort();
+      if (msgs.length === seen) {
+        msgs.push({
+          id: `sh-${msgs.length}`,
+          role: 'user',
+          text: 'A background job you started (a run_in_background shell) is still running. If you are waiting on its result — e.g. a test run — wait for it to finish, fold in the result, then call signal_completion. If you are deliberately leaving it running (e.g. a dev server), call signal_completion now to proceed to review.',
+          ts: msgs.length,
+        });
+      }
+      stage = 'do';
+      status = 'active';
+      continue;
+    }
+    // Fell through with a background shell still running ⇒ the nudge budget is spent
+    // (likely a long-lived process the agent means to leave running). Proceed, but note it.
+    const gaveUpOnShells = !!turn.pendingBackgroundShells && shellNudges >= MAX_SHELL_NUDGES;
+    shellNudges = 0; // shells settled (or nudge budget spent) → reset for next Do phase
+
     {
       // Goal mode: keep nudging the agent until it signals structured completion
       // (unless it's explicitly raising to its parent, which needs an answer).
@@ -1076,6 +1116,12 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       // the reviewer knows this reached Review with delegated work possibly incomplete.
       if (gaveUpOnSubagents) {
         const note = `⚠️ Proceeded to Review with ${turn.pendingSubagents} sub-agent(s) still reported running after ${MAX_SUBAGENT_NUDGES} waits — a sub-agent may be wedged and its output missing.`;
+        reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
+      }
+      // Same for a background shell we stopped waiting on (budget spent) — it may be a
+      // dev server left running on purpose, or a job whose result never got folded in.
+      if (gaveUpOnShells) {
+        const note = `⚠️ Proceeded to Review with ${turn.pendingBackgroundShells} background job(s) still running after ${MAX_SHELL_NUDGES} waits — if this was a test/build run, its result may not have been folded in.`;
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
       stage = 'review';

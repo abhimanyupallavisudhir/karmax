@@ -3116,6 +3116,7 @@ function waitingLabel(w) {
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
     case 'subagent': return w.detail || 'its sub-agents to finish';
+    case 'shell': return w.detail || 'a background job to finish';
     case 'parent': return 'the parent task to respond';
     case 'confirm': return 'the confirm agent to review';
     default: return w.detail || w.kind;
