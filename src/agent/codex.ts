@@ -170,7 +170,7 @@ export class CodexAdapter implements AgentAdapter {
     const cwd = input.world.handle.root;
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
-    const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome });
+    const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome, ...(input.extraEnv ? { extra: input.extraEnv } : {}) });
 
     // Detached ⇒ its own process group, so killAgent(-pid) reaps codex's descendants.
     const child = spawn(cmd, ['app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
@@ -403,7 +403,7 @@ export class CodexAdapter implements AgentAdapter {
     const cwd = input.world.handle.root;
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
-    const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome });
+    const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome, ...(input.extraEnv ? { extra: input.extraEnv } : {}) });
 
     const resuming = !!input.session;
     // The messages to actually send: the whole conversation on a fresh thread, only

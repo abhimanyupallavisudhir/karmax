@@ -34,6 +34,7 @@ import {
   ParentResponse,
   SubTaskResponse,
 } from './contract.js';
+import { remotePolicyOf } from './contract.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -938,7 +939,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // ── Setup ──
   await publish();
   world = (await withResolve('setup', () =>
-    core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, kind }),
+    core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
   )) as WorldHandleLike;
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
   accountPool = await coord.accountPoolSize().catch(() => 0);
@@ -1127,7 +1128,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   status = 'active';
   await publish();
   if (cancelled) return await abort();
-  if (input.project.openGithubPr) {
+  if (remotePolicyOf(input.project) === 'pr') {
     // Opening a PR binds it to `target`; close the edit window before we do (SPEC §2).
     targetLocked = true;
     await publish();
@@ -1146,6 +1147,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // knows what to fix — a human retry resets the attempt budget, not the context).
   let mergeAttempts = 0;
   let mergeConflict: string | undefined;
+  let mergeDirty: string | undefined;
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -1190,9 +1192,11 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const mergeIn: Message = {
       id: `m-in-${mergeMsgs.length}`,
       role: 'user',
-      text: mergeConflict
-        ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
-        : `Prepare branch for merge into ${target}.`,
+      text: mergeDirty
+        ? `The merge into ${target} was rejected — the worktree has uncommitted changes:\n${mergeDirty}\nStage and commit what belongs in this change; gitignore (or delete) what doesn't. Leave the worktree clean.`
+        : mergeConflict
+          ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
+          : `Prepare branch for merge into ${target}. Commit any work that should land; gitignore (or delete) anything that shouldn't — the merge is rejected if the worktree isn't clean.`,
       ts: mergeMsgs.length,
     };
     mergeMsgs.push(mergeIn);
@@ -1229,14 +1233,22 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     if (result.merged) {
       sha = result.sha;
       pointOfNoReturnPassed = true;
+      // Remote policy 'push'/'pr' (PLAN-git-config.md §5): the landed target leaves
+      // the machine — push it (and under 'pr', GitHub marks the PR merged).
+      // Best-effort: the merge IS the deliverable; a failed push is recorded, not fatal.
+      if (remotePolicyOf(input.project) !== 'none') {
+        await core.pushTarget(world as any, target).catch(() => undefined);
+      }
       break;
     }
-    // Merge rejected. Conflicts (including leftover markers) are the merge
-    // agent's job: loop straight back to it with the details, bounded, before
-    // bothering a human/parent (SPEC §5.2).
-    error = `merge failed: ${result.conflict ?? result.note ?? 'unknown'}`;
-    if (result.conflict) {
-      mergeConflict = `${result.note ? `${result.note}\n` : ''}${result.conflict}`;
+    // Merge rejected. Conflicts (including leftover markers) and dirty worktrees
+    // (commit-vs-gitignore is a judgment call — PLAN-git-config.md §6) are the
+    // merge agent's job: loop straight back to it with the details, bounded,
+    // before bothering a human/parent (SPEC §5.2).
+    error = `merge failed: ${result.conflict ?? result.dirty ?? result.note ?? 'unknown'}`;
+    if (result.conflict || result.dirty) {
+      mergeDirty = result.dirty;
+      mergeConflict = result.dirty ? undefined : `${result.note ? `${result.note}\n` : ''}${result.conflict}`;
       if (++mergeAttempts < MAX_MERGE_ATTEMPTS) {
         mergeMsgs.push({
           id: `m-sys-${mergeMsgs.length}`,

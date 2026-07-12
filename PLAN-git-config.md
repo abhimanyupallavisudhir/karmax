@@ -203,26 +203,49 @@ nobody saw is worse than pausing. Applies identically to `merge-only.ts`
 
 ## 9. Phases
 
-0. **Dirty-worktree loop-back (§6)** — independent of profiles, shippable
-   alone: `finalizeMergeRepo` rejects on dirty instead of sweeping; workflow
-   loop-back prompt; one-line addition to the initial merge prompt. Tests:
-   dirty world → merge agent re-prompted with the file list; exhaustion
-   escalates; resolved-but-uncommitted merge still auto-completes.
-1. **Profile registry + selection** — `GitProfile` type, Store persistence,
-   global settings card, `ProjectConfig.gitProfile`, vault import helpers.
-   No behavior change (nothing consumes it yet).
-2. **Identity materialization** — worktree-scoped identity + SSH signing at
-   world creation; uniform identity across agent/backstop/merge commits.
-   Tests: two concurrent worlds on different profiles commit under different
-   identities; user's checkout config untouched.
-3. **Credential injection + remote policy** — broker-resolved
-   `GIT_SSH_COMMAND`/`GH_TOKEN` in world exec, merge, and `openPr`;
-   `remote` enum supersedes `openGithubPr`. Tests against a local bare repo
-   over a constrained ssh stub; `gh` path behind the existing skip-if-absent
-   guard.
-4. **Preflight + cloud posture** — the doctor check; verify the no-host-state
-   path end-to-end (a container world with no `~/.ssh`, no gh login, profile
-   only).
+All implemented (tests in `tests/git-profiles.test.ts`, `tests/merge.test.ts`,
+`tests/multi-repo.test.ts`; the loop-back is exercised by the whole pipeline
+suite via the mock merge agent):
+
+0. **Dirty-worktree loop-back (§6)** ✅ — `finalizeMergeRepo` rejects on dirty
+   (`MergeResult.dirty`, paths repo-prefixed in multi-repo worlds) instead of
+   sweeping; the resolved-but-uncommitted merge (`MERGE_HEAD`, no unresolved
+   paths) still auto-completes. software-dev loops the rejection back to the
+   merge agent (same `MAX_MERGE_ATTEMPTS` budget as conflicts; exhaustion
+   escalates); the initial merge prompt says to commit/gitignore up front. The
+   mock agent answers the loop-back by committing — so every pipeline test
+   exercises the new path. merge-only has no merge agent: dirty ⇒ failed with
+   the file list (rare — nothing runs there but confirm turns).
+1. **Profile registry + selection** ✅ — `GitProfile` (`src/domain/types.ts`),
+   `GitProfiles` service (`src/autonomy/git-profiles.ts`; registry in the
+   store's kv, secrets in the vault under `git:<name>:{ssh,signing,token}`),
+   gateway endpoints (`/api/git-profiles` GET/POST/DELETE + `/default` +
+   `/preflight`), a **Git accounts** card in Global settings,
+   `ProjectConfig.gitProfile` + a project/global `gitProfile` FieldSpec.
+2. **Identity materialization** ✅ — `WorldSpec.gitIdentity`; the worktree
+   provider writes `git config --worktree` identity (+ `gpg.format ssh`,
+   `user.signingKey`, `commit.gpgsign`) via `extensions.worktreeConfig`;
+   `ensureIdentity`'s karmax@localhost fallback stays for profile-less worlds.
+   Merge commits land on the target (outside worktree config reach), so
+   `finalizeMerge` takes the identity and injects it per command with `-c`.
+3. **Credential injection + remote policy** ✅ — `GitProfiles.env()` resolves
+   JIT via the broker: ssh key → 0600 file + `GIT_SSH_COMMAND`; token →
+   `GH_TOKEN` + a `GIT_ASKPASS` shim for https remotes (the shim echoes
+   `$GH_TOKEN`; no secret in any file/argv). Injected into agent subprocesses
+   (`TurnInput.extraEnv` → `scrubbedEnv`), `openPr`, and the new `pushTarget`
+   activity. `remote: none|push|pr` supersedes `openGithubPr` (deprecated,
+   still honored via `remotePolicyOf`); 'push' and 'pr' push the target after
+   a merge lands (best-effort — the local merge is the deliverable).
+4. **Preflight** ✅ — `GitProfiles.preflight()`: resolved tier, identity,
+   signing, push auth, gh availability, per-repo origin reachability
+   (non-interactive); surfaced as a **Git setup** card in project settings.
+
+Implementation deviations from the sections above (all deliberate):
+- Key files are materialized **per profile** under `state/git-profiles/<name>/`
+  (0600, refreshed on every profile save), not per world — one file, no
+  per-world cleanup, same trust domain as the vault key itself.
+- Container worlds don't get worktree-scoped identity yet (worktree provider
+  only) — tracked with the other §8 non-goals.
 
 ---
 

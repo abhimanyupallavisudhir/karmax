@@ -271,8 +271,12 @@ export class ClaudeAdapter implements AgentAdapter {
     const env = scrubbedEnv({
       provider: 'claude',
       configHome: input.resolvedAuth?.configHome,
-      // A captured setup-token login: re-supply it (scrubbedEnv strips it by default).
-      ...(input.resolvedAuth?.oauthToken ? { extra: { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } } : {}),
+      // A captured setup-token login: re-supply it (scrubbedEnv strips it by default),
+      // plus any JIT-resolved subprocess env (git profile credentials, §4B).
+      extra: {
+        ...(input.extraEnv ?? {}),
+        ...(input.resolvedAuth?.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } : {}),
+      },
     });
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow

@@ -167,7 +167,9 @@ export function projectSettingsFor(
   if (c.repos?.length) derived.repos = c.repos;
   if (c.copyGlobs?.length) derived.copyGlobs = c.copyGlobs;
   if (c.worldProvider) derived.worldProvider = c.worldProvider;
-  if (c.openGithubPr !== undefined) derived.openGithubPr = c.openGithubPr;
+  // The deprecated openGithubPr flag surfaces as its successor (PLAN-git-config §5).
+  if (c.remote ?? c.openGithubPr) derived.remote = c.remote ?? 'pr';
+  if (c.gitProfile) derived.gitProfile = c.gitProfile;
   return derived;
 }
 

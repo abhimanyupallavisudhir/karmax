@@ -57,6 +57,15 @@ export interface WorldHandle {
   warnings?: string[];
 }
 
+/** Git identity a world's commits carry (PLAN-git-config.md §4A), materialized
+ *  from the project's git profile. `signingKeyPath` is an SSH key file already
+ *  written to disk by the profile service (never a secret in transit here). */
+export interface WorldGitIdentity {
+  name: string;
+  email: string;
+  signingKeyPath?: string;
+}
+
 export interface WorldSpec {
   taskId: string;
   /** Source repo (worktree). When absent (and `repos` is empty) a scratch repo is created. */
@@ -69,6 +78,9 @@ export interface WorldSpec {
   branch?: string;
   /** Gitignored files (globs) to copy into the world (SPEC §5.2). */
   copyGlobs?: string[];
+  /** Worktree-scoped identity/signing for every commit made in this world
+   *  (PLAN-git-config.md §4A). Absent ⇒ host identity, else karmax@localhost. */
+  gitIdentity?: WorldGitIdentity;
 }
 
 /**
