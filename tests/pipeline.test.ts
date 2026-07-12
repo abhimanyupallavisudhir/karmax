@@ -202,8 +202,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   it('confirm=agent: a Confirm agent reviews and confirms, no human in the loop', async () => {
     const repo = await h.makeRepo('confirmer');
     const taskId = newId('task');
-    // The Confirm-agent prompt embeds the original task prompt, so the mock confirm
-    // agent sees `@confirm confirm` on its own line and returns that verdict.
+    // The per-Review request message (rendered from the default confirm prompt
+    // template) embeds the original task prompt, so the mock confirm agent sees
+    // `@confirm confirm` on its own line and returns that verdict.
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
@@ -218,9 +219,35 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const result = await handle.result();
     expect(result.stage).toBe('done');
     expect((await git(repo, ['show', 'main:b.txt'])).stdout).toContain('reviewed');
-    // The Confirm agent's transcript is surfaced as its own role.
+    // The Confirm agent's transcript is surfaced as its own role, as a conversation:
+    // the review-request (user), the agent's reply, and the recorded verdict.
     const v = await view(handle).catch(() => undefined);
-    if (v?.transcripts) expect(v.transcripts.some((t: any) => t.role === 'confirm')).toBe(true);
+    const confirmT = v?.transcripts?.find((t: any) => t.role === 'confirm');
+    if (v?.transcripts) {
+      expect(confirmT).toBeTruthy();
+      expect(confirmT.messages.some((m: any) => m.role === 'user' && m.text.includes('Ship it.'))).toBe(true);
+      expect(confirmT.messages.some((m: any) => m.role === 'system' && m.text.includes('confirm_decision: confirm'))).toBe(true);
+    }
+  });
+
+  it('confirm=agent with a custom prompt: the per-task template reaches the Confirm agent', async () => {
+    const repo = await h.makeRepo('confirmer-prompt');
+    const taskId = newId('task');
+    // The task prompt carries NO @confirm directive — the verdict can only come from
+    // the custom review-request template, proving the override is what gets sent.
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'CustomConfirmPrompt', prompt: 'Ship it.\n@write c.txt :: custom\n@review please review' }),
+          confirm: { mode: 'agent', provider: 'mock', prompt: 'Ensure the work is complete.\n@confirm confirm' },
+        },
+      ],
+    });
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:c.txt'])).stdout).toContain('custom');
   });
 
   it('escalates with a clear error when the project repo is misconfigured (no silent scratch)', async () => {

@@ -331,16 +331,23 @@ function readResume(box) {
 // The confirmer field: a mode selector (human / auto / agent) plus the SAME agent
 // sub-form as Do/Merge/Resolve, shown only when the mode is "agent". Reuses
 // renderAgentField for the agent controls (so provider/model/effort + "Fork a
-// previous agent" all work identically), and carries the mode alongside.
+// previous agent" all work identically), and carries the mode alongside. Agent mode
+// also exposes the review-request prompt template — the message the Confirm agent
+// receives each time the task reaches Review — pre-filled with the built-in default
+// (f.promptDefault) and stored only when edited, so it keeps inheriting otherwise.
 const CONFIRM_MODE_LABELS = { human: 'Human (you confirm)', auto: 'Auto-confirm', agent: 'Agent confirms' };
 function renderConfirmerField(f, own, inherited, alt) {
   const inh = inherited || {};
   const e = own || inh;
   const mode = e.mode || inh.mode || 'human';
+  const promptVal = (own?.prompt ?? inh.prompt ?? f.promptDefault) || '';
   const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
-  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr}>
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}'>
     <select class="cf-mode">${['human', 'auto', 'agent'].map((m) => `<option value="${m}" ${m === mode ? 'selected' : ''}>${esc(CONFIRM_MODE_LABELS[m])}</option>`).join('')}</select>
-    <div class="cf-agent" style="margin-top:8px;${mode === 'agent' ? '' : 'display:none'}">${renderAgentField(f, own, inherited)}</div>
+    <div class="cf-agent" style="margin-top:8px;${mode === 'agent' ? '' : 'display:none'}">${renderAgentField(f, own, inherited)}
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Confirm agent prompt — sent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+      <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
+    </div>
   </div>`;
 }
 
@@ -373,6 +380,7 @@ function collectForm(root, fields) {
       const mode = box.querySelector('.cf-mode').value;
       const spec = { mode };
       let resumeFrom;
+      let promptChanged = false;
       if (mode === 'agent') {
         const ab = box.querySelector('.agent-field');
         spec.provider = ab.querySelector('.af-provider').value;
@@ -382,11 +390,18 @@ function collectForm(root, fields) {
         if (effort) spec.effort = effort;
         resumeFrom = readResume(ab);
         if (resumeFrom) spec.resumeFrom = resumeFrom;
+        // Store the review-request prompt only when it diverges from the inherited
+        // template (a stored override or the built-in default); empty ⇒ inherit.
+        const prompt = box.querySelector('.cf-prompt')?.value ?? '';
+        const inhPrompt = inh?.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
+        promptChanged = prompt.trim() !== '' && prompt !== inhPrompt;
+        if (promptChanged) spec.prompt = prompt;
+        else if (inh?.prompt) spec.prompt = inh.prompt; // keep an inherited override when re-storing
       }
       // Store only when it differs from the inherited default: a different mode, or (in
-      // agent mode) a different agent config or a chosen fork.
+      // agent mode) a different agent config, a chosen fork, or an edited prompt.
       const inhMode = inh?.mode || 'human';
-      const changed = mode !== inhMode || (mode === 'agent' && (resumeFrom || !sameJson(normSpec(spec), normSpec(inh))));
+      const changed = mode !== inhMode || (mode === 'agent' && (resumeFrom || promptChanged || !sameJson(normSpec(spec), normSpec(inh))));
       if (f.required || changed) out[f.name] = spec;
       continue;
     }
@@ -540,6 +555,9 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     const mode = box.querySelector('.cf-mode').value;
     if (mode !== (inh?.mode || 'human')) return true;
     if (mode !== 'agent') return false;
+    const prompt = box.querySelector('.cf-prompt')?.value ?? '';
+    const inhPrompt = inh?.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
+    if (prompt.trim() !== '' && prompt !== inhPrompt) return true;
     const ab = box.querySelector('.agent-field');
     const spec = { provider: ab.querySelector('.af-provider').value };
     const model = ab.querySelector('.af-model').value.trim();
@@ -587,6 +605,8 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
   const ab = box.querySelector('.agent-field');
   if (ab) resetAgentField(ab, attr);
+  const promptEl = box.querySelector('.cf-prompt');
+  if (promptEl) promptEl.value = inh.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────

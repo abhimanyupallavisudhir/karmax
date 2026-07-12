@@ -1,4 +1,5 @@
 import { FieldSpec } from '../domain/types.js';
+import { CONFIRM_PROMPT_DEFAULT } from '../domain/confirm-prompt.js';
 import { ResolveRuleDecl } from '../resolve/cases.js';
 
 /**
@@ -27,9 +28,11 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // The confirmer field selects WHO drives the Review gate — human / auto / an agent.
 // Unlike the agent fields it spans all scopes (task/project/global) so the mode has
 // the usual default-inheritance; when the mode is `agent` it carries the same agent
-// knobs (provider/model/effort/fork) as the Do/Merge/Resolve fields. Chosen at task
-// creation (queue-time), like the other agent selections.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm agent', help: 'Who confirms at the Review gate: a human, an agent, or auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { mode: 'human' } });
+// knobs (provider/model/effort/fork) as the Do/Merge/Resolve fields, PLUS the
+// review-request prompt template (pre-filled with `promptDefault`, editable per
+// task/project/global). Chosen at task creation (queue-time), like the other agent
+// selections.
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm agent', help: 'Who confirms at the Review gate: a human, an agent, or auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { mode: 'human' }, promptDefault: CONFIRM_PROMPT_DEFAULT });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
@@ -163,12 +166,13 @@ const CONFIRM_ROLE: WorkflowRole = {
   label: 'Confirm agent',
   capabilities: ['confirm-decision', 'signal-completion'],
   defaults: { effort: 'low' },
+  // The task recap + the Do agent's response arrive as a per-Review conversation
+  // message (domain/confirm-prompt.ts, template user-editable via the confirmer
+  // field), so repeated Reviews read as one transcript; this system prompt carries
+  // only the role and the current state of the world under review.
   promptTemplate: `{{toolsPreamble}}
 
-You are the CONFIRM (review) agent for task "{{title}}". The Do agent believes the work is finished and it has reached the Review gate. Your job is to decide whether to accept it — NOT to keep building it.
-
-# Original task
-{{prompt}}
+You are the CONFIRM (review) agent for task "{{title}}". The Do agent believes the work is finished and it has reached the Review gate. Your job is to decide whether to accept it — NOT to keep building it. Each time the task reaches Review you receive a message with the task and the agent's latest response; judge the CURRENT state of the work.
 
 # Work under review
 Worktree: {{worldPath}} (branch {{branch}} off {{base}}).

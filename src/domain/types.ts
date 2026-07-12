@@ -337,6 +337,9 @@ export interface FieldSpec {
   /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures
    *  (do/merge/resolve/confirm). */
   role?: string;
+  /** For confirmer fields — the default Confirm-agent prompt template the form
+   *  pre-fills (and inherits back to on reset) when no override is stored. */
+  promptDefault?: string;
   /** In-flight editability window (SPEC §4.5/§5.5). Omitted ⇒ `queue`. */
   mutable?: FieldMutable;
 }
@@ -362,6 +365,12 @@ export interface AgentSpec {
 export type ConfirmMode = 'human' | 'auto' | 'agent';
 export interface ConfirmConfig extends Partial<AgentSpec> {
   mode: ConfirmMode;
+  /** The review-request message template sent to the Confirm agent each time the
+   *  task reaches Review — optional instructions/guidance ("ensure X, Y and Z"),
+   *  with {{prompt}} / {{response}} placeholders for the task prompt and the Do
+   *  agent's latest response (see domain/confirm-prompt.ts). Empty ⇒ the built-in
+   *  default (CONFIRM_PROMPT_DEFAULT, pre-filled in the form). */
+  prompt?: string;
 }
 
 /** The Confirm agent's structured verdict at the Review gate. `confirm` proceeds,
