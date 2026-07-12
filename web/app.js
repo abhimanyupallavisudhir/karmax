@@ -4656,7 +4656,9 @@ async function newProject() {
     // Route into the new project so its tasks, tags, saved views and search all
     // load fresh — setting S.projectId + re-rendering alone leaves the previous
     // project's tasks/views on screen (applyRoute does the loading on switch).
-    await go(projectRoute(p.id));
+    // Land on Project settings: a freshly created project has no tasks yet, and
+    // configuring it (branches, agent, budget…) is the first thing to do.
+    await go(projectRoute(p.id, 'settings'));
   } catch (e) { toast(e.message, true); }
 }
 
