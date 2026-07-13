@@ -11,6 +11,7 @@ import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { registerAgent, unregisterAgent, killAgent, killProcessGroup } from './custody.js';
 import { trackProcess } from '../util/processes.js';
+import { classifyLimitError, providerErrorFromMessage, providerFailure, type ProviderFailureMetadata } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 
 /**
@@ -121,12 +122,16 @@ export class CodexAdapter implements AgentAdapter {
         body: JSON.stringify(body),
         signal: ctx.signal,
       });
-      if (!res.ok) throw new Error(`OpenAI Responses API ${res.status}: ${(await res.text()).slice(0, 500)}`);
+      if (!res.ok) {
+        const message = `OpenAI Responses API ${res.status}: ${(await res.text()).slice(0, 500)}`;
+        throw providerErrorFromMessage('codex', message, 'structured');
+      }
       const data = (await res.json()) as any;
       respId = data.id ?? respId;
       if (data.status !== 'completed') {
         const reason = data.incomplete_details?.reason ?? data.error?.message ?? data.error?.code ?? 'no reason supplied';
-        throw new Error(`OpenAI Responses turn did not complete successfully (status=${String(data.status ?? 'missing')}): ${String(reason)}`);
+        const message = `OpenAI Responses turn did not complete successfully (status=${String(data.status ?? 'missing')}): ${String(reason)}`;
+        throw providerErrorFromMessage('codex', message, 'structured');
       }
 
       const outputs: any[] = data.output ?? [];
@@ -221,7 +226,7 @@ export class CodexAdapter implements AgentAdapter {
     let currentTurnId: string | undefined;
     let turnActive = false;
     let finalText = '';
-    let limit: { resetInSeconds?: number } | undefined;
+    let limit: ProviderFailureMetadata | undefined;
     let turnError: string | undefined;
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
@@ -249,9 +254,19 @@ export class CodexAdapter implements AgentAdapter {
     });
 
     const noteLimit = (blob: string) => {
-      if (!/usage.?limit|rate.?limit|quota|UsageLimitReached/i.test(blob)) return;
+      const cls = classifyLimitError(blob, { providerOrigin: true });
+      if (!cls.limited) return;
       const m = blob.match(/"?(?:resets_in_seconds|resetInSeconds|retry_after|retryAfter)"?\s*[:=]\s*(\d+)/);
-      limit = { resetInSeconds: m ? Number(m[1]) : undefined };
+      const resetHint = m ? `in ${Number(m[1])}s` : cls.resetHint;
+      limit = {
+        kind: cls.kind ?? 'quota',
+        permanence: cls.hard ? 'hard' : 'transient',
+        provider: 'codex',
+        source: 'structured',
+        ...(cls.window ? { window: cls.window } : {}),
+        ...(resetHint ? { resetHint } : {}),
+        ...(cls.note ? { note: cls.note } : {}),
+      };
     };
 
     client.onNotification((method, params) => {
@@ -439,7 +454,10 @@ export class CodexAdapter implements AgentAdapter {
     if (limit) {
       // Same shape as the exec path so limits.ts computes the refresh instant and the
       // workflow rotates to another login (RESOLVE-PLAN §2.4).
-      throw new Error(`Codex usage limit reached${limit.resetInSeconds != null ? ` · resets in ${limit.resetInSeconds}s` : ''}`);
+      throw providerFailure(
+        `Codex usage limit reached${limit.resetHint ? ` · resets ${limit.resetHint}` : ''}`,
+        limit,
+      );
     }
     if (turnError) {
       throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${stderr.slice(0, 300)}` : ''}`);
@@ -531,7 +549,7 @@ export class CodexAdapter implements AgentAdapter {
 
     let threadId: string | undefined = input.session;
     let finalText = '';
-    let limit: { resetInSeconds?: number } | undefined;
+    let limit: ProviderFailureMetadata | undefined;
     let stderr = '';
     let buf = '';
     let sawCompleted = false;
@@ -563,9 +581,19 @@ export class CodexAdapter implements AgentAdapter {
       }
       // Usage/session-limit → capture the machine-readable reset (resets_in_seconds).
       const blob = JSON.stringify(ev);
-      if (/usage.?limit|rate.?limit|quota|UsageLimitReached/i.test(blob)) {
+      const cls = classifyLimitError(blob, { providerOrigin: true });
+      if (cls.limited) {
         const secs = ev.error?.resets_in_seconds ?? ev.resets_in_seconds ?? ev.error?.retry_after ?? ev.retry_after;
-        limit = { resetInSeconds: typeof secs === 'number' ? secs : undefined };
+        const resetHint = typeof secs === 'number' ? `in ${secs}s` : cls.resetHint;
+        limit = {
+          kind: cls.kind ?? 'quota',
+          permanence: cls.hard ? 'hard' : 'transient',
+          provider: 'codex',
+          source: 'structured',
+          ...(cls.window ? { window: cls.window } : {}),
+          ...(resetHint ? { resetHint } : {}),
+          ...(cls.note ? { note: cls.note } : {}),
+        };
       }
     };
 
@@ -605,7 +633,10 @@ export class CodexAdapter implements AgentAdapter {
       // Throw so the workflow's quota handling marks THIS login exhausted and
       // re-leases another (RESOLVE-PLAN §2.4). Encode the reset so limits.ts can
       // compute the refresh instant precisely.
-      throw new Error(`Codex usage limit reached${limit.resetInSeconds != null ? ` · resets in ${limit.resetInSeconds}s` : ''}`);
+      throw providerFailure(
+        `Codex usage limit reached${limit.resetHint ? ` · resets ${limit.resetHint}` : ''}`,
+        limit,
+      );
     }
     if (exited.spawnError) {
       throw new Error(`codex exec spawn failed: ${exited.spawnError}`);
