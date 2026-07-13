@@ -25,11 +25,17 @@ import { materializeFork } from '../agent/fork.js';
 import os from 'node:os';
 import path from 'node:path';
 import { manifest } from '../contrib/manifests.js';
-import { attenuate } from '../platform/capabilities.js';
+import { allows, attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
 
-const DEFAULT_GRANT = ['*'];
+// Old executions without a recorded grant retain the normal developer workflow
+// surface (but no administration). New tasks always carry a creator-attenuated
+// stored grant, so this compatibility path disappears as legacy runs finish.
+const DEFAULT_GRANT = [
+  'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
+  'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+];
 
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
@@ -314,7 +320,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const minted = deps.tokens.mint({
           taskId: args.taskId,
           profileId: profile.id,
-          principal: args.task.parentTaskId ? `task:${args.task.parentTaskId}` : 'user',
+          principal: args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
           projectId: args.task.projectId,
           ceiling: profile.capabilities,
           grantorCaps: grant,
@@ -489,7 +495,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(() => {
             const gitEnv = gitEnvFor(args.worldHandle, args.taskId);
-            return Object.keys(gitEnv).length ? { extraEnv: gitEnv } : {};
+            // The platform MCP subprocess inherits this short-lived workflow
+            // token. The gateway accepts it directly and enforces its project +
+            // capability grant; no full-power browser session is ever acquired.
+            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            return Object.keys(extraEnv).length ? { extraEnv } : {};
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
@@ -525,6 +535,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 budget: new BudgetService(store, deps.payments),
                 spendCtx: { projectId: args.task.projectId, taskId: args.taskId },
                 onSpend: (req: any, outcome: any) => record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }),
+              }
+            : {}),
+          ...(token
+            ? {
+                platformRequest: async (method: string, requestPath: string, body?: unknown) => {
+                  if (!requestPath.startsWith('/api/')) throw new Error('platform path must start with /api/');
+                  const base = process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505';
+                  const response = await fetch(`${base}${requestPath}`, {
+                    method,
+                    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+                    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+                  });
+                  const value = response.headers.get('content-type')?.includes('json') ? await response.json() : await response.text();
+                  if (!response.ok) throw new Error((value as any)?.error ?? `HTTP ${response.status}`);
+                  return value;
+                },
               }
             : {}),
         },
@@ -719,12 +745,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title });
       // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
       // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
-      // branch (which the parent owns and merges into) — never the broad merge-into:*.
+      // branch (which the parent owns and merges into). If no branch is known,
+      // the child gets no merge capability — never a broad fallback.
       const delegation = attenuate(
         ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
         args.parentGrant ?? DEFAULT_GRANT,
       );
-      const grant = [...delegation, args.parentBranch ? `merge-into:${args.parentBranch}` : 'merge-into:*'];
+      const mergeBack = args.parentBranch && allows(args.parentGrant ?? DEFAULT_GRANT, `merge-into:${args.parentBranch}`)
+        ? [`merge-into:${args.parentBranch}`]
+        : [];
+      const grant = [...delegation, ...mergeBack];
+      store.updateTaskParams(child.id, {
+        ...child.params,
+        _authorization: { profileId: 'inherited-child', principal: `task:${args.parentTaskId}`, capabilities: grant, attenuated: true },
+      });
       return {
         taskId: child.id,
         projectId: args.projectId,
@@ -736,6 +770,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         project: args.project,
         profiles: args.profiles,
         grant,
+        grantPrincipal: `task:${args.parentTaskId}`,
+        authorizationProfile: 'inherited-child',
       };
     },
 

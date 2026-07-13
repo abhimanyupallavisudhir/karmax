@@ -566,6 +566,9 @@ export interface TaskInput {
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */
   grant?: string[];
+  /** Principal and job-shaped profile from which `grant` was attenuated. */
+  grantPrincipal?: string;
+  authorizationProfile?: string;
   /**
    * Per-field in-flight editability windows (SPEC §4.5/§5.5), copied from the
    * workflow manifest at assembly time. Lets the deterministic workflow validate

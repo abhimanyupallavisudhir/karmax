@@ -110,8 +110,34 @@ export class Store {
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
         query TEXT NOT NULL, icon TEXT, ord INTEGER NOT NULL, createdAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS authorization_profiles (
+        scopeKey TEXT NOT NULL,
+        id TEXT NOT NULL,
+        json TEXT NOT NULL,
+        PRIMARY KEY(scopeKey, id)
+      );
+      CREATE TABLE IF NOT EXISTS principal_grants (
+        principalId TEXT NOT NULL,
+        scopeKey TEXT NOT NULL,
+        json TEXT NOT NULL,
+        PRIMARY KEY(principalId, scopeKey)
+      );
+      CREATE TABLE IF NOT EXISTS audit_log (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        principalId TEXT NOT NULL,
+        action TEXT NOT NULL,
+        scopeKey TEXT NOT NULL,
+        detail TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS attachment_scopes (
+        attachmentId TEXT NOT NULL,
+        projectId TEXT NOT NULL,
+        PRIMARY KEY(attachmentId, projectId)
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(projectId);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
+      CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts, seq);
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
       CREATE INDEX IF NOT EXISTS idx_saved_views_project ON saved_views(projectId);
@@ -598,6 +624,76 @@ export class Store {
 
   deleteProfile(id: string) {
     this.db.prepare('DELETE FROM profiles WHERE id = ?').run(id);
+  }
+
+  // ── identities are owned by Better Auth; these rows contain only karmax policy ──
+  listAuthorizationProfiles(scopeKey?: string): any[] {
+    const rows = scopeKey
+      ? (this.db.prepare('SELECT scopeKey, json FROM authorization_profiles WHERE scopeKey = ? ORDER BY id').all(scopeKey) as any[])
+      : (this.db.prepare('SELECT scopeKey, json FROM authorization_profiles ORDER BY scopeKey, id').all() as any[]);
+    return rows.map((r) => ({ ...JSON.parse(r.json), scopeKey: r.scopeKey }));
+  }
+
+  getAuthorizationProfile(scopeKey: string, id: string): any | undefined {
+    const r = this.db.prepare('SELECT json FROM authorization_profiles WHERE scopeKey = ? AND id = ?').get(scopeKey, id) as any;
+    return r ? { ...JSON.parse(r.json), scopeKey } : undefined;
+  }
+
+  setAuthorizationProfile(scopeKey: string, profile: { id: string; [key: string]: unknown }): void {
+    const { scopeKey: _scope, ...json } = profile as any;
+    this.db.prepare(
+      'INSERT INTO authorization_profiles (scopeKey, id, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, id) DO UPDATE SET json = excluded.json',
+    ).run(scopeKey, profile.id, JSON.stringify(json));
+  }
+
+  deleteAuthorizationProfile(scopeKey: string, id: string): void {
+    this.db.prepare('DELETE FROM authorization_profiles WHERE scopeKey = ? AND id = ?').run(scopeKey, id);
+  }
+
+  listPrincipalGrants(principalId?: string): any[] {
+    const rows = principalId
+      ? (this.db.prepare('SELECT principalId, scopeKey, json FROM principal_grants WHERE principalId = ? ORDER BY scopeKey').all(principalId) as any[])
+      : (this.db.prepare('SELECT principalId, scopeKey, json FROM principal_grants ORDER BY principalId, scopeKey').all() as any[]);
+    return rows.map((r) => ({ ...JSON.parse(r.json), principalId: r.principalId, scopeKey: r.scopeKey }));
+  }
+
+  getPrincipalGrant(principalId: string, scopeKey: string): any | undefined {
+    const r = this.db.prepare('SELECT json FROM principal_grants WHERE principalId = ? AND scopeKey = ?').get(principalId, scopeKey) as any;
+    return r ? { ...JSON.parse(r.json), principalId, scopeKey } : undefined;
+  }
+
+  setPrincipalGrant(principalId: string, scopeKey: string, grant: Record<string, unknown>): void {
+    const { principalId: _p, scopeKey: _s, ...json } = grant as any;
+    this.db.prepare(
+      'INSERT INTO principal_grants (principalId, scopeKey, json) VALUES (?, ?, ?) ON CONFLICT(principalId, scopeKey) DO UPDATE SET json = excluded.json',
+    ).run(principalId, scopeKey, JSON.stringify(json));
+  }
+
+  deletePrincipalGrant(principalId: string, scopeKey: string): void {
+    this.db.prepare('DELETE FROM principal_grants WHERE principalId = ? AND scopeKey = ?').run(principalId, scopeKey);
+  }
+
+  appendAudit(entry: { ts?: number; principalId: string; action: string; scopeKey?: string; detail?: Record<string, unknown> }): number {
+    const r = this.db.prepare('INSERT INTO audit_log (ts, principalId, action, scopeKey, detail) VALUES (?, ?, ?, ?, ?)')
+      .run(entry.ts ?? Date.now(), entry.principalId, entry.action, entry.scopeKey ?? 'global', JSON.stringify(entry.detail ?? {}));
+    return Number(r.lastInsertRowid);
+  }
+
+  auditSince(seq = 0, limit = 500): any[] {
+    return (this.db.prepare('SELECT * FROM audit_log WHERE seq > ? ORDER BY seq LIMIT ?').all(seq, Math.max(1, Math.min(limit, 2000))) as any[])
+      .map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
+  }
+
+  grantAttachment(attachmentId: string, projectId: string): void {
+    this.db.prepare('INSERT OR IGNORE INTO attachment_scopes (attachmentId, projectId) VALUES (?, ?)').run(attachmentId, projectId);
+  }
+
+  attachmentAllowed(attachmentId: string, projectId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM attachment_scopes WHERE attachmentId = ? AND projectId = ?').get(attachmentId, projectId);
+  }
+
+  attachmentIsScoped(attachmentId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM attachment_scopes WHERE attachmentId = ? LIMIT 1').get(attachmentId);
   }
 
   // ─── Event log (live stream) ─────────────────────────────────────────────────

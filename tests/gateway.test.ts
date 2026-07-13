@@ -31,6 +31,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);
+    const platform: any = await (await fetch(`${base}/api/platform`, { headers: auth() })).json();
+    expect(platform.conversations).toContain('GET /api/tasks/:taskId/agents');
+    expect(platform.administration).toContain('GET|POST /api/users');
   });
 
   it('rejects unauthenticated API calls', async () => {
@@ -228,6 +231,19 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(stored.params.worldProvider).toBeUndefined();
     expect(stored.params.openGithubPr).toBeUndefined();
     expect(stored.params.base).toBeUndefined();
+    expect((stored.params._authorization as any)?.profileId).toBe('caller');
+
+    // Form replacement cannot erase or forge platform authorization metadata,
+    // while the dedicated pre-start endpoint can safely re-attenuate it.
+    await fetch(`${base}/api/tasks/${draft.id}/params`, {
+      method: 'PATCH', headers: auth(),
+      body: JSON.stringify({ replace: true, params: { prompt: 'inherit me edited', _authorization: { profileId: 'forged', capabilities: ['*'] } } }),
+    });
+    expect((h.store.getTask(draft.id)!.params._authorization as any)?.profileId).toBe('caller');
+    await fetch(`${base}/api/tasks/${draft.id}/authorization`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({ profileId: 'developer' }),
+    });
+    expect((h.store.getTask(draft.id)!.params._authorization as any)?.profileId).toBe('developer');
 
     // Changing a project default now flows into the (still unqueued) task's
     // resolved defaults — the /api/defaults task scope reflects it immediately.
