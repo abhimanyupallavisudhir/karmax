@@ -40,22 +40,28 @@ export function qualifiedType(type: WorkflowName | string, version: string): str
  */
 export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.softwareDev, '1.0.0'),
+  qualifiedType(WF.softwareDev, '1.1.0'),
+  qualifiedType(WF.softwareDev, '1.2.0'),
   qualifiedType(WF.justDo, '1.0.0'),
+  qualifiedType(WF.justDo, '1.1.0'),
   qualifiedType(WF.scriptExec, '1.0.0'),
   qualifiedType(WF.goal, '1.0.0'),
+  qualifiedType(WF.goal, '1.1.0'),
+  qualifiedType(WF.goal, '1.2.0'),
   qualifiedType(WF.mergeOnly, '1.0.0'),
+  qualifiedType(WF.mergeOnly, '1.1.0'),
 ]);
 
 /**
  * The Temporal type to start a task with: the version-pinned type when that
- * version is registered, else the bare type. The fallback keeps starts working
- * if a manifest version ever lacks a matching qualified export — an unpinned
- * execution, not a failed one. Externally-loaded package versions (§21c) resolve
- * through their own path; this covers the bundled workflows.
+ * version is registered. Missing registrations fail closed: silently falling
+ * back to the mutable bare name would claim a task is pinned while recording an
+ * entirely different Temporal type in its history.
  */
 export function pinnedType(type: WorkflowName, version: string): string {
   const q = qualifiedType(type, version);
-  return BUNDLED_QUALIFIED.has(q) ? q : type;
+  if (!BUNDLED_QUALIFIED.has(q)) throw new Error(`bundled workflow type is not registered: ${q}`);
+  return q;
 }
 
 export const SIG = {
@@ -64,6 +70,9 @@ export const SIG = {
   cancel: 'cancel',
   retry: 'retry',
 } as const;
+
+/** Activity → owning workflow transition after host agent-slot admission. */
+export const SIG_AGENT_TURN_STATE = 'agentTurnState';
 
 export const QRY = { view: 'view' } as const;
 export const UPD = { setTarget: 'setTarget', updateParams: 'updateParams' } as const;

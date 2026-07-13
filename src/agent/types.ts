@@ -10,7 +10,7 @@ import { World } from '../world/types.js';
 
 /** Platform capabilities the agent reaches via the platform MCP, surfaced as tool calls. */
 export interface PlatformToolContext {
-  /** Structured, unspoofable completion signal (SPEC §5.2). */
+  /** Optional structured completion summary; provider terminal success is authoritative. */
   signalCompletion(summary?: string): void;
   /** Attach review info (links, diff, polished output) for the Review stage. */
   createReviewInfo(info: ReviewInfo): void;
@@ -102,6 +102,19 @@ export interface TurnInput {
 export const RUNAWAY_BACKSTOP = 1000;
 
 export interface AdapterTurn {
+  /**
+   * A provider adapter may return only after observing the provider's verified
+   * successful terminal event.  Interrupted, cancelled, failed, truncated, and
+   * transport-ended turns throw instead, even when they produced partial text.
+   * Keeping this explicit prevents "the iterator/process stopped" from being
+   * mistaken for "the provider completed the turn".
+   */
+  termination: {
+    kind: 'success';
+    /** Provider-native terminal status/reason, retained for diagnostics. */
+    status: string;
+    reason?: string;
+  };
   session?: string;
   output: string;
   /** How many leading `input.messages` this turn actually delivered to the agent —
@@ -130,6 +143,12 @@ export interface AgentAdapter {
 
 export interface TurnResult {
   session?: string;
+  /** The adapter observed a verified successful provider terminal event. New
+   * workflow versions use this as the turn boundary; `completed` remains the
+   * legacy optional signal_completion marker for replay compatibility. */
+  providerCompleted?: boolean;
+  /** Provider-native successful terminal status/reason. */
+  providerTermination?: AdapterTurn['termination'];
   completed: boolean;
   output: string;
   reviewInfo?: ReviewInfo;

@@ -1,6 +1,7 @@
 import { FieldSpec } from '../domain/types.js';
 import { CONFIRM_PROMPT_DEFAULT } from '../domain/confirm-prompt.js';
 import { ResolveRuleDecl } from '../resolve/cases.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 /**
  * Workflow manifests (SPEC §4.3). Data-only declarations the host reads to wire
@@ -23,16 +24,17 @@ const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Pr
 // resumed session), enforced by the workflow's update validator: the Do agent
 // holds a live resumable session from its first turn so its provider can't be
 // swapped mid-flight (retune model/effort, or send a follow-up to redirect it);
-// merge/resolve can still be fully swapped until their own turn runs.
+// merge can still be fully swapped until its own turn runs.
 const agentField = (role: string, label: string, mutable?: FieldSpec['mutable']): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role, ...(mutable ? { mutable } : {}) });
-// The confirmer field selects WHO drives the Review gate — human / auto / an agent.
-// Unlike the agent fields it spans all scopes (task/project/global) so the mode has
-// the usual default-inheritance; when the mode is `agent` it carries the same agent
-// knobs (provider/model/effort/fork) as the Do/Merge/Resolve fields, PLUS the
+// The confirmer field holds the ordered confirm LAYERS the Review gate plays —
+// each a human confirmation or a review agent; zero layers ⇒ auto-confirm.
+// Unlike the agent fields it spans all scopes (task/project/global) so the layer
+// list has the usual default-inheritance; an agent layer carries the same agent
+// knobs (provider/model/effort/fork) as the Do/Merge fields, PLUS the
 // review-request prompt template (pre-filled with `promptDefault`, editable per
 // task/project/global). Chosen at task creation (queue-time), like the other agent
 // selections.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm agent', help: 'Who confirms at the Review gate: a human, an agent, or auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { mode: 'human' }, promptDefault: CONFIRM_PROMPT_DEFAULT });
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm layers', help: 'Played in order at Review — each layer is a human confirmation or a review agent; every layer must approve. No layers ⇒ auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human' }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
@@ -102,7 +104,7 @@ export interface OnActivateDecl {
  * An agent role a workflow owns (SPEC §7.1). The workflow declares its roles here
  * — each with the system-prompt template, capability ceiling, and default agent
  * knobs — so prompt assembly, profile seeding, and the profiles UI derive from the
- * package instead of the platform hardcoding do/merge/resolve. Provider/model are
+ * package instead of the platform hardcoding role names. Provider/model are
  * resolved at seed time from the platform default, so they aren't declared here.
  */
 export interface WorkflowRole {
@@ -115,8 +117,7 @@ export interface WorkflowRole {
   defaults?: { effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; maxTurns?: number };
 }
 
-// The bundled roles, defined once and referenced by the workflows that use them
-// (do/merge/resolve are shared vocabulary — see PLAN-dynamic-repos.md §2b).
+// The bundled roles, defined once and referenced by the workflows that use them.
 // `{{toolsPreamble}}` and the other `{{...}}` are filled by assemblePrompt.
 const DO_ROLE: WorkflowRole = {
   name: 'do',
@@ -145,9 +146,12 @@ You are merging task "{{title}}". Its work is on branch {{branch}} in the worktr
 {{worldRepos}}
 Merge {{target}} into this branch, resolve any conflicts, ensure the build and tests pass, then the work will be merged into {{target}}.
 Review context: {{reviewInfo}}
-Call signal_completion when the branch is ready to merge.`,
+Finish the turn only when the branch is ready to merge. signal_completion is optional.`,
 };
-const RESOLVE_ROLE: WorkflowRole = {
+// Retained privately so version-pinned executions created before the global flag
+// was disabled can replay their already-recorded Resolve turns. It is deliberately
+// absent from current manifests, schemas, profiles, and every UI surface.
+const LEGACY_RESOLVE_ROLE: WorkflowRole = {
   name: 'resolve',
   label: 'Resolve agent',
   capabilities: ['signal-completion', 'save-skill', 'resolve-decision'],
@@ -213,7 +217,7 @@ Do not implement the task yourself. Decide, then call confirm_decision.`,
 // Lifecycle stages per bundled workflow (the pipeline the UI renders).
 const SOFTWARE_DEV_STAGES: StageDef[] = [
   { key: 'setup', label: 'Setup' },
-  { key: 'do', label: 'Do', aliases: ['resolve'] },
+  { key: 'do', label: 'Do', ...(RESOLVE_AGENT_ENABLED ? { aliases: ['resolve'] } : {}) },
   { key: 'review', label: 'Review' },
   { key: 'pr', label: 'PR' },
   { key: 'merge', label: 'Merge', ponr: true }, // 'escalated' is a blocked state, not a position — the UI flags it separately
@@ -282,8 +286,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.0.0',
-    description: 'Branch/world → do → review → PR → merge → end, with resolve and sub-tasks.',
+    version: '1.2.0',
+    description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -312,11 +316,11 @@ export const MANIFESTS: WorkflowManifest[] = [
       { id: 'task.followUp', title: 'Send follow-up', keybinding: 'f' },
       { id: 'task.cancel', title: 'Cancel task', keybinding: 'x' },
     ],
-    roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE, CONFIRM_ROLE],
+    roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
     params: [
       promptField(),
-      // `always`: the Do/Merge/Resolve agents' model + effort can be retuned
+      // `always`: the Do/Merge agents' model + effort can be retuned
       // in-flight up to the point of no return (SPEC §5.5); software-dev's update
       // validator still gates the IDENTITY swap (provider/session) per role.
       agentField('do', 'Do agent', 'always'),
@@ -328,7 +332,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       remoteField(),
       gitProfileField(),
       agentField('merge', 'Merge agent', 'always'),
-      agentField('resolve', 'Resolve agent', 'always'),
+      ...(RESOLVE_AGENT_ENABLED ? [agentField('resolve', 'Resolve agent', 'always')] : []),
       confirmerField(),
     ],
     onActivate: {
@@ -342,7 +346,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'just-do',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'A single straightforward agent call, no merge machinery.',
     requires: [],
     capabilities: ['create-review-info', 'signal-completion', 'save-skill'],
@@ -353,7 +357,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // No merge machinery: do → review → done.
     stages: [
       { key: 'setup', label: 'Setup' },
-      { key: 'do', label: 'Do', aliases: ['resolve'] },
+      { key: 'do', label: 'Do' },
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
@@ -382,21 +386,21 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.0.0',
-    description: 'Like software-dev, but auto-continues until structured completion.',
+    version: '1.2.0',
+    description: 'Like software-dev, but auto-confirms a verified successful provider turn.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
     ui: [{ slot: 'task-detail', tier: 1, title: 'Task' }],
     commands: [],
-    // goal delegates to softwareDev, so it runs merge/resolve too.
-    roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE, CONFIRM_ROLE],
+    // goal delegates to softwareDev, so it shares the Do/Merge/Review machinery.
+    roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
     params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), remoteField(), gitProfileField(), confirmerField()],
   },
   {
     name: 'merge-only',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'The review-and-merge half of software-dev (no Do). The dogfooded PR gate.',
     requires: ['merge-queue'],
     capabilities: ['create-review-info', 'signal-completion', 'merge-into:*'],
@@ -445,6 +449,16 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
 ];
 
+/** Bundled historical manifests whose workflow implementations must remain
+ * resolvable for existing version-pinned tasks. They are intentionally omitted
+ * from MANIFESTS so workflow pickers expose only the current release. */
+export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
+  .filter((m) => m.name === 'software-dev' || m.name === 'just-do' || m.name === 'goal' || m.name === 'merge-only')
+  .flatMap((m) => [
+    { ...m, version: '1.0.0' },
+    ...((m.name === 'software-dev' || m.name === 'goal') ? [{ ...m, version: '1.1.0' }] : []),
+  ]);
+
 export function manifest(name: string): WorkflowManifest | undefined {
   return MANIFESTS.find((m) => m.name === name);
 }
@@ -457,7 +471,7 @@ export function manifest(name: string): WorkflowManifest | undefined {
  * meaningful choices rather than raw noise.
  */
 export const PLATFORM_EVENTS: EventSchemaDecl[] = [
-  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled' } },
+  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', agentTurn: 'waiting-slot | running | null' } },
   { type: 'pr.opened', description: 'A pull request was opened for a task.', fields: { number: 'number', url: 'string' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },
@@ -503,6 +517,12 @@ export function allRoles(manifests: WorkflowManifest[] = MANIFESTS): RoleWithSou
 /** The declared role by name (or undefined if no active workflow declares it). */
 export function roleDef(name: string, manifests: WorkflowManifest[] = MANIFESTS): RoleWithSource | undefined {
   return allRoles(manifests).find((r) => r.name === name);
+}
+
+/** Prompt lookup for workflow execution. The disabled Resolve prompt remains
+ * available only so historical version-pinned executions can replay. */
+export function agentRoleDef(name: string, manifests: WorkflowManifest[] = MANIFESTS): RoleWithSource | undefined {
+  return roleDef(name, manifests) ?? (name === 'resolve' ? { ...LEGACY_RESOLVE_ROLE, workflows: [] } : undefined);
 }
 
 /** Resolve the transitive closure of `requires` for a set of workflows (SPEC §4.6). */

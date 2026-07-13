@@ -22,12 +22,14 @@ import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -205,20 +207,42 @@ export class Gateway {
       ws.on('close', off);
       ws.on('error', off);
     });
-    wssTerm.on('connection', (ws, req) => this.terminal(ws, req));
+    wssTerm.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
+    });
     wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
 
-    await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', () => resolve()));
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      server.once('error', onError);
+      server.listen(port, '127.0.0.1', () => {
+        server.off('error', onError);
+        // Keep an operational listener after the startup race; errors are exposed
+        // by endpoint-specific handling instead of becoming uncaught events.
+        server.on('error', () => {});
+        resolve();
+      });
+    });
     return {
       url: `http://127.0.0.1:${port}`,
       port,
       close: () =>
         new Promise<void>((resolve) => {
           this.reviewActions.stopAll();
+          // `WebSocketServer.close()` does not terminate existing upgraded
+          // sockets, and `http.Server.close()` waits for them forever. A stale
+          // browser/test connection therefore used to wedge shutdown and leave
+          // the Temporal worker/runtime installed. Close clients explicitly,
+          // then force any remaining HTTP keep-alive sockets to drain.
+          for (const wss of [wssEvents, wssTerm, wssAction]) {
+            for (const ws of wss.clients) ws.terminate();
+          }
           wssEvents.close();
           wssTerm.close();
           wssAction.close();
           server.close(() => resolve());
+          server.closeAllConnections();
         }),
     };
   }
@@ -396,6 +420,7 @@ export class Gateway {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
         safeMode: this.safeMode,
+        resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
       });
     }
 
@@ -725,11 +750,16 @@ export class Gateway {
       }
       const viewMatch = p.match(/^\/api\/tasks\/([^/]+)$/);
       if (viewMatch && method === 'GET') {
-        const view = await api.getTaskView(token, viewMatch[1]!);
+        const rec = store.getTask(viewMatch[1]!);
+        // Draft attempts have no Temporal execution, but are still selectable in
+        // the drawer. Keep that synthetic projection separate from getTaskView so
+        // list snapshots continue to truthfully report no execution view.
+        const view = rec?.params?.draft
+          ? api.getDraftView(token, viewMatch[1]!)
+          : await api.getTaskView(token, viewMatch[1]!);
         if (!view) return this.json(res, 200, null);
         // Mirror the record's sequential number onto the view (the workflow only
         // knows the opaque id) so the drawer can show `#num` + a permalink.
-        const rec = store.getTask(viewMatch[1]!);
         return this.json(res, 200, rec?.num != null ? { ...view, num: rec.num } : view);
       }
       if (viewMatch && method === 'DELETE') {
@@ -740,6 +770,17 @@ export class Gateway {
         if (!t.params?.draft) return this.json(res, 400, { error: 'only drafts can be deleted; cancel a running task instead' });
         store.deleteTask(viewMatch[1]!);
         return this.json(res, 200, { ok: true });
+      }
+      const attemptsMatch = p.match(/^\/api\/tasks\/([^/]+)\/attempts$/);
+      if (attemptsMatch && method === 'GET') {
+        return this.json(res, 200, api.attemptGroup(token, attemptsMatch[1]!) ?? null);
+      }
+      if (attemptsMatch && method === 'POST') {
+        try {
+          return this.json(res, 200, await api.addAttempt(token, attemptsMatch[1]!));
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
       const queueMatch = p.match(/^\/api\/tasks\/([^/]+)\/queue$/);
       if (queueMatch && method === 'POST') {
@@ -765,6 +806,14 @@ export class Gateway {
         // A draft has no running workflow — edit its stored params in place; they
         // re-resolve at queue time (SPEC §10.4).
         if (t.params?.draft) {
+          const confirmerField = manifest(t.workflow)?.params.find((f) => f.type === 'confirmer');
+          if (confirmerField && Object.prototype.hasOwnProperty.call(b.params ?? {}, confirmerField.name)) {
+            try {
+              store.setIntentConfirmer(t.intentId ?? t.id, confirmerField.name, b.params[confirmerField.name]);
+            } catch (e) {
+              return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+            }
+          }
           // Replace the workflow-field overrides wholesale (b.params is the form's
           // full set of own overrides) so a field reset to its default is actually
           // removed — a merge would leave the stale override behind. Lifecycle +
@@ -915,16 +964,18 @@ export class Gateway {
       const sessMatch = p.match(/^\/api\/tasks\/([^/]+)\/sessions$/);
       if (sessMatch && method === 'GET') {
         const id = sessMatch[1]!;
+        const t = store.getTask(id);
         // Each role → { id, home?, provider? } so the UI can build a CLI resume
         // command targeting the right CONFIG_DIR/CODEX_HOME (provider sessions are
         // home-bound). `home` is omitted for API-key/stateless sessions.
         const out: Record<string, { id: string; home?: string; provider?: string }> = {};
-        for (const role of ['do', 'merge', 'resolve', 'confirm']) {
-          const s = store.kvGet(`session:${id}:${role}`);
+        for (const role of ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm']) {
+          const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
+          const s = store.kvGet(`session:${sessionTaskId}:${role}`);
           if (!s) continue;
           let home: string | undefined;
           let provider: string | undefined;
-          const meta = store.kvGet(`sessionmeta:${id}:${role}`);
+          const meta = store.kvGet(`sessionmeta:${sessionTaskId}:${role}`);
           if (meta) { try { const m = JSON.parse(meta); home = m.home || undefined; provider = m.provider || undefined; } catch { /* ignore */ } }
           out[role] = { id: s, ...(home ? { home } : {}), ...(provider ? { provider } : {}) };
         }
@@ -1003,10 +1054,11 @@ export class Gateway {
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
         const { roleDef } = await import('../contrib/manifests.js');
         const withRole = (pr: any) => ({ ...pr, roleWorkflows: roleDef(pr.role)?.workflows ?? [] });
+        const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
-        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::')).map(withRole));
+        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr)).map(withRole));
         // effective per-role view: the project override if present, else global (inherited)
-        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::'));
+        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr));
         const view = globals.map((g) => {
           const proj = store.getProfile(`${pid}::${g.role}-default`);
           return withRole({ ...(proj ?? g), id: `${pid}::${g.role}-default`, role: g.role, scope: proj ? 'project' : 'inherited', inherited: g });
@@ -1022,6 +1074,8 @@ export class Gateway {
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
+        const { roleDef } = await import('../contrib/manifests.js');
+        if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
         const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
         if (!id) return this.json(res, 400, { error: 'profile needs id or projectId' });
         const { projectId: _pid, scope: _s, inherited: _i, ...rest } = b;
@@ -1540,12 +1594,22 @@ export class Gateway {
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
       const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
-      // A confirmer also carries a MODE (human/auto/agent) that inherits normally —
-      // plus its review-request prompt template, when one is stored at this scope
-      // (the form falls back to the field's promptDefault); the agent knobs above
-      // are the defaults shown once "agent" mode is selected.
+      // A confirmer carries the ordered confirm LAYERS (legacy {mode} values
+      // normalize). Each agent layer gets the role-default agent knobs filled in,
+      // same as a bare agent field; `agentDefault` rides along so the form can
+      // prefill a NEWLY added agent layer the same way (display-only — collectForm
+      // never stores it).
       out[f.name] = f.type === 'confirmer'
-        ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}), ...(spec.prompt ? { prompt: spec.prompt } : {}) }
+        ? {
+            layers: confirmLayersOf(Object.keys(spec).length ? spec : (f.default as any)).map((l) => {
+              if (l.kind !== 'agent') return { kind: l.kind };
+              const lprov = l.provider ?? prof?.provider ?? defaultProvider().provider;
+              const lmodel = l.model ?? prof?.model ?? defaultModel(lprov);
+              const leffort = l.effort ?? prof?.effort ?? defaultEffort(lprov);
+              return { ...l, provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
+            }),
+            agentDefault: agent,
+          }
         : agent;
     }
     return out;

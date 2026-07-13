@@ -303,6 +303,7 @@ export class MockAdapter implements AgentAdapter {
     if (outputs.length === 0) outputs.push('(mock agent: no directives; nothing to do)');
     if (complete) ctx.signalCompletion(outputs.join('; '));
     return {
+      termination: { kind: 'success', status: 'mock.completed' },
       session,
       output: outputs.join('\n'),
       delivered: deliveredIndex,

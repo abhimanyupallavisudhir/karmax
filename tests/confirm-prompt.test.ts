@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { CONFIRM_PROMPT_DEFAULT, renderConfirmPrompt } from '../src/domain/confirm-prompt.js';
+import { confirmLayersOf } from '../src/domain/confirm.js';
 import { manifest } from '../src/contrib/manifests.js';
 
 describe('renderConfirmPrompt (the per-Review request message)', () => {
@@ -30,6 +31,38 @@ describe('renderConfirmPrompt (the per-Review request message)', () => {
     for (const wf of ['software-dev', 'merge-only']) {
       const f = manifest(wf)?.params.find((p) => p.type === 'confirmer');
       expect(f?.promptDefault).toBe(CONFIRM_PROMPT_DEFAULT);
+    }
+  });
+});
+
+describe('confirmLayersOf (the Review-gate layer sequence)', () => {
+  it('passes an explicit layer list through, including [] (auto-confirm)', () => {
+    const layers = [{ kind: 'agent' as const, provider: 'mock' as const }, { kind: 'human' as const }];
+    expect(confirmLayersOf({ layers })).toBe(layers);
+    expect(confirmLayersOf({ layers: [] })).toEqual([]);
+    // Explicit layers win over a stale legacy mode riding alongside.
+    expect(confirmLayersOf({ layers: [], mode: 'human' })).toEqual([]);
+  });
+
+  it('normalizes the legacy single-gate modes', () => {
+    expect(confirmLayersOf(undefined)).toEqual([{ kind: 'human' }]);
+    expect(confirmLayersOf({ mode: 'human' })).toEqual([{ kind: 'human' }]);
+    expect(confirmLayersOf({ mode: 'auto' })).toEqual([]);
+    expect(confirmLayersOf({ mode: 'agent', provider: 'mock', model: 'm', prompt: 'Check.\n{{response}}' })).toEqual([
+      { kind: 'agent', provider: 'mock', model: 'm', prompt: 'Check.\n{{response}}' },
+    ]);
+  });
+
+  it('maps the legacy goal-task autoConfirm flag to zero layers, unless the config speaks', () => {
+    expect(confirmLayersOf(undefined, true)).toEqual([]);
+    expect(confirmLayersOf({ mode: 'human' }, true)).toEqual([{ kind: 'human' }]);
+    expect(confirmLayersOf({ layers: [{ kind: 'human' }] }, true)).toEqual([{ kind: 'human' }]);
+  });
+
+  it('the built-in confirmer fields default to one human layer', () => {
+    for (const wf of ['software-dev', 'merge-only', 'goal']) {
+      const f = manifest(wf)?.params.find((p) => p.type === 'confirmer');
+      expect(confirmLayersOf(f?.default as any)).toEqual([{ kind: 'human' }]);
     }
   });
 });

@@ -8,8 +8,11 @@ import {
   workflowInfo,
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
+import type { coordinatorActivities } from '../activities/coordinator.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision } from './contract.js';
+import { confirmLayersOf } from '../domain/confirm.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer } from './contract.js';
+import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 // Agent turns heartbeat every ~10s; a 2-minute gap = dead/slept worker → Temporal
@@ -20,6 +23,7 @@ const turns = proxyActivities<coreActivities>({
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
 });
+const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
 export const followUpSignal = defineSignal<[Message]>('followUp');
 export const confirmSignal = defineSignal('confirm');
@@ -34,6 +38,15 @@ export const pendingMessagesQuery = defineQuery<Message[], [string, number]>('pe
  * The work stays on the task's branch; it is not merged anywhere.
  */
 export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, true);
+}
+
+/** Immutable replay entry for executions pinned to justDo@1.0.0. */
+export async function justDoV1(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, false);
+}
+
+async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ stage: Stage }> {
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -45,12 +58,15 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   let world: WorldHandleLike | undefined;
   let session: string | undefined;
   let reviewInfo: ReviewInfo | undefined;
+  let waitingFor: TaskView['waitingFor'];
+  let agentTurn: TaskView['agentTurn'];
   let seen = 0;
   const base = input.base ?? input.project.defaultBase ?? 'main';
-  // Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent. A child
-  // routes to its parent (handled by the confirm signal from the parent), so this drives
-  // top-level tasks; back-compat with the legacy autoConfirm-less just-do → human.
-  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? 'human';
+  // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
+  // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
+  // normalize to their layer equivalents. A child routes to its parent (handled by
+  // the confirm signal from the parent), so this drives top-level tasks.
+  const confirmLayers = confirmLayersOf(input.confirm);
 
   function actions(): DeclaredAction[] {
     const followUp: DeclaredAction = { name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', required: true }] };
@@ -64,29 +80,49 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
       actions: actions(), state: { worldReady: !!world }, branch: world?.branch, base,
-      worldPath: world?.root, parentTaskId: input.parentTaskId, updatedAt: workflowInfo().historyLength,
+      worldPath: world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
   const publish = async () => core.publishView(taskId, view());
+  const leaser = managedTurns
+    ? createAgentTurnLeaser(core, coord, {
+        taskId,
+        projectId: input.projectId,
+        task: () => input,
+        status: () => status,
+        setStatus: (next) => { status = next; },
+        setWaitingFor: (next) => { waitingFor = next; },
+        setAgentTurn: (next) => { agentTurn = next; },
+        cancelled: () => cancelled,
+        publish,
+      })
+    : undefined;
 
   /** Run one Confirm-agent turn (SPEC §5.2): review the work, return a verdict, or
    *  undefined on failure so the caller falls back to the human gate. */
-  async function runConfirm(): Promise<ConfirmDecision | undefined> {
+  async function runConfirm(layer: ConfirmLayer): Promise<ConfirmDecision | undefined> {
     try {
+      // The layer's own agent spec drives this turn (each agent layer can run a
+      // different reviewer); a spec-less layer falls back to the confirm profile.
+      const { kind: _kind, prompt: _prompt, ...layerSpec } = layer;
+      const task = layerSpec.provider ? { ...input, agents: { ...(input.agents ?? {}), confirm: { ...layerSpec, provider: layerSpec.provider } } } : input;
       // A fresh turn each Review so the reviewer judges the current work (up-to-date
       // system prompt); a mid-turn retry still resumes via runAgentTurn heartbeat details.
-      const ct = await turns.runAgentTurn({
-        taskId,
-        role: 'confirm',
-        worldHandle: world as any,
-        messages: [],
-        task: input,
-        bindings: {
-          reviewInfo: reviewInfo?.summary ?? '',
-          changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
-          transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
-        },
-      });
+      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+        turns.runAgentTurn({
+          taskId,
+          role: 'confirm',
+          worldHandle: world as any,
+          messages: [],
+          task,
+          bindings: {
+            reviewInfo: reviewInfo?.summary ?? '',
+            changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+            transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
+          },
+          ...(lease ? lease : {}),
+        });
+      const ct = leaser ? await leaser.run('confirm', invoke) : await invoke();
       return ct.confirmDecision;
     } catch (err) {
       if (isCancellation(err)) throw err;
@@ -104,10 +140,12 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   });
   setHandler(cancelSignal, () => {
     cancelled = true;
+    leaser?.cancelActive();
   });
 
   await publish();
   world = (await core.createWorld({ taskId, repos: input.project.repos, base, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind: 'worktree' })) as WorldHandleLike;
+  if (leaser) await leaser.init();
 
   let infraRetries = 0;
   for (stage = 'do'; ; ) {
@@ -122,8 +160,11 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
     try {
       // On resume the session already holds the first `seen` messages, so send only
       // the delta after them (a follow-up), not the whole conversation again.
-      turn = await turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input });
+      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+        turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input, ...(lease ? lease : {}) });
+      turn = leaser ? await leaser.run('do', invoke) : await invoke();
     } catch (err) {
+      if (managedTurns && cancelled && (err instanceof AgentTurnCancelled || isCancellation(err))) break;
       // Infrastructure outage that outlived the activity retries: park with
       // backoff and re-run the turn (which resumes its session) rather than
       // failing the task. Anything else propagates as before.
@@ -140,29 +181,37 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     stage = 'review';
     status = 'waiting';
-    if (confirmMode === 'auto') {
-      confirmed = true;
-    } else if (confirmMode === 'agent') {
-      await publish();
-      const decision = await runConfirm();
-      if (cancelled) break;
-      if (decision?.action === 'confirm') {
-        confirmed = true;
-      } else if (decision?.action === 'reject') {
-        if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
-        cancelled = true;
-        break;
-      } else if (decision?.action === 'revise') {
-        msgs.push({ id: `cv${msgs.length}`, role: 'user', text: decision.text || 'Please revise per the reviewer feedback.', ts: msgs.length });
-        stage = 'do';
-        status = 'active';
-        continue;
+    // Play the confirm layers in order (SPEC §5.2): every layer must approve; a
+    // revise/follow-up returns to Do and the next Review replays from the first.
+    let backToDo = false;
+    for (let li = 0; li < confirmLayers.length && !backToDo && !cancelled; li++) {
+      const layer = confirmLayers[li]!;
+      if (layer.kind === 'agent') {
+        await publish();
+        const decision = await runConfirm(layer);
+        if (cancelled) break;
+        if (decision?.action === 'confirm') continue; // this layer approves → the next
+        if (decision?.action === 'reject') {
+          if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
+          cancelled = true;
+          break;
+        }
+        if (decision?.action === 'revise') {
+          msgs.push({ id: `cv${msgs.length}`, role: 'user', text: decision.text || 'Please revise per the reviewer feedback.', ts: msgs.length });
+          backToDo = true;
+          continue;
+        }
+        // no verdict → degrade this layer to the human gate below
       }
-      // no verdict → fall through to the human gate
+      // A human layer: one Confirm click passes ONE layer; a follow-up → back to Do.
+      await publish();
+      await condition(() => confirmed || cancelled || msgs.length > seen);
+      if (cancelled) break;
+      if (!confirmed) backToDo = true;
+      confirmed = false; // consumed by this layer
     }
-    await publish();
-    await condition(() => confirmed || cancelled || msgs.length > seen);
-    if (confirmed || cancelled) break;
+    if (cancelled) break;
+    if (!backToDo) break; // every layer approved (or none configured) → done
     stage = 'do';
     status = 'active';
   }

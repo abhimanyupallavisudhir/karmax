@@ -5,8 +5,10 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
+import { MockAdapter } from '../src/agent/mock.js';
+import type { AgentAdapter } from '../src/agent/types.js';
 
-function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any }) {
+function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any; resolveAgentEnabled?: boolean }) {
   return {
     taskId: over.taskId,
     projectId: 'p1',
@@ -17,6 +19,7 @@ function input(over: { taskId: string; repo: string; prompt: string; title?: str
     project: { repos: [over.repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
     ...(over.subtaskNagMs !== undefined ? { subtaskNagMs: over.subtaskNagMs } : {}),
     ...(over.subagentWaitMs !== undefined ? { subagentWaitMs: over.subagentWaitMs } : {}),
+    ...(over.resolveAgentEnabled !== undefined ? { resolveAgentEnabled: over.resolveAgentEnabled } : {}),
     ...(over.recovery ? { recovery: over.recovery } : {}),
   };
 }
@@ -25,7 +28,30 @@ const view = (h: any) => h.query('view') as Promise<any>;
 describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   let h: Harness;
   beforeAll(async () => {
-    h = await bootHarness('mock');
+    const mock = new MockAdapter();
+    const restartSession = 'restart-regression-session';
+    // Model the real Claude/Codex shutdown behaviour: provider cleanup consumes the
+    // AbortError and returns partial output. The runtime boundary must still reject
+    // that result so Temporal retries the activity after the worker comes back.
+    const adapter: AgentAdapter = {
+      provider: 'mock',
+      async runTurn(input, ctx) {
+        const restartCase = input.session === restartSession || input.messages.some((m) => m.text.includes('@restart-regression'));
+        if (!restartCase) return mock.runTurn(input, ctx);
+        if (input.session === restartSession) {
+          ctx.signalCompletion('resumed after restart');
+          return { termination: { kind: 'success', status: 'mock.completed' }, session: restartSession, output: 'resumed and completed' };
+        }
+        ctx.onSession?.(restartSession);
+        ctx.heartbeat?.();
+        await new Promise<void>((resolve) => {
+          if (ctx.signal?.aborted) return resolve();
+          ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return { termination: { kind: 'success', status: 'mock.completed' }, session: restartSession, output: 'partial output from interrupted turn' };
+      },
+    };
+    h = await bootHarness('mock', adapter);
   }, 60_000);
   afterAll(async () => {
     await h?.stop();
@@ -69,6 +95,32 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('export const f');
   });
 
+  it('restarts an interrupted turn in Do instead of accepting partial output as Review (Task 162)', async () => {
+    const repo = await h.makeRepo('restart-do-stage');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Restart in Do', prompt: '@restart-regression' })],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await expect.poll(() => h.store.kvGet(`session:${taskId}:do`), { timeout: 15_000 }).toBe('restart-regression-session');
+
+    await h.restartWorker();
+
+    // The swallowed provider abort is an interrupted activity, not a turn boundary.
+    // Durable replay therefore restores the originating stage until the retry runs.
+    expect((await view(handle)).stage).toBe('do');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const resumed = await view(handle);
+    expect(resumed.reviewInfo?.completion).toBe('signalled');
+    expect(resumed.messages.some((m: any) => m.text === 'partial output from interrupted turn')).toBe(false);
+
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+  });
+
   it('marks a Review reached without signal_completion as a stall, so the reviewer is warned', async () => {
     const repo = await h.makeRepo('app');
     const taskId = newId('task');
@@ -93,6 +145,30 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // The distinction is real, not cosmetic: a stall is never auto-confirmed, so the task
     // waits at the human gate rather than advancing.
     expect(review.actions.map((a: any) => a.name)).toContain('confirm');
+  });
+
+  it('v1.2 treats verified provider completion as finished without requiring signal_completion', async () => {
+    const repo = await h.makeRepo('provider-completion');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.2.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        input({
+          taskId,
+          repo,
+          title: 'Provider-completed change',
+          prompt: 'Implement the change.\n@write finished.js :: export const finished = true;\n@incomplete',
+        }),
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.reviewInfo?.completion).toBe('finished');
+    expect(review.reviewInfo?.completion).not.toBe('stalled');
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
   });
 
   it('multi-repo: passes every configured repo to the agent and lands work in each', async () => {
@@ -280,6 +356,50 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:c.txt'])).stdout).toContain('custom');
   });
 
+  it('confirm layers: an agent review layer, then a final human confirmation (SPEC §5.2)', async () => {
+    const repo = await h.makeRepo('confirm-layers');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'LayeredConfirm', prompt: 'Ship it.\n@write d.txt :: layered\n@review please review\n@confirm confirm' }),
+          confirm: { layers: [{ kind: 'agent', provider: 'mock' }, { kind: 'human' }] },
+        },
+      ],
+    });
+    // The agent layer approves (the @confirm directive), then the gate WAITS on the
+    // human layer — the agent's approval alone must not merge the work.
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 20_000 }).toBe('confirm layer 2/2');
+    const v = await view(handle);
+    expect(v.stage).toBe('review');
+    expect(v.transcripts?.find((t: any) => t.role === 'confirm')?.messages.some((m: any) => m.text.includes('confirm_decision: confirm'))).toBe(true);
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:d.txt'])).stdout).toContain('layered');
+  });
+
+  it('confirm layers: zero layers auto-confirm a completed turn', async () => {
+    const repo = await h.makeRepo('confirm-zero-layers');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'ZeroLayers', prompt: 'Ship it.\n@write z.txt :: hands-off\n@review done' }),
+          confirm: { layers: [] },
+        },
+      ],
+    });
+    // No signals at all — an empty layer list is auto-confirm.
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:z.txt'])).stdout).toContain('hands-off');
+  });
+
   it('escalates with a clear error when the project repo is misconfigured (no silent scratch)', async () => {
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
@@ -325,18 +445,20 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(Date.now() - t0).toBeLessThan(15_000);
   });
 
-  it('routes an unhandled error through Resolve to human escalation', async () => {
+  it('routes an unhandled error directly to human escalation when Resolve is disabled', async () => {
     const repo = await h.makeRepo('app-fail');
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
-      args: [input({ taskId, repo, title: 'Boom', prompt: '@fail boom goes the agent' })],
+      args: [input({ taskId, repo, title: 'Boom', prompt: '@fail boom goes the agent', resolveAgentEnabled: false })],
     });
-    // resolve attempts are exhausted (failure is not transient) → escalated
     await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
     const v = await view(handle);
     expect(v.status).toBe('blocked');
+    expect(v.error).toContain('boom goes the agent');
+    expect(h.store.eventsSince(taskId, 0).some((e) => e.type === 'resolve.auto')).toBe(true);
+    expect(v.transcripts?.some((t: any) => t.role === 'resolve')).toBe(false);
     expect(v.actions.map((a: any) => a.name)).toEqual(expect.arrayContaining(['retry', 'cancel']));
     // a human cancels the blocked task
     await handle.signal('cancel');

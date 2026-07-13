@@ -18,7 +18,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   else if (msg.method === 'turn/start') {
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
     send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done' } } });
-    send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
+    const mode = process.env.STUB_MODE || 'completed';
+    if (mode === 'exit') process.exit(0);
+    else if (mode === 'interrupted') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'interrupted', reason: 'server restart' } } });
+    else if (mode === 'failed') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'failed', error: { message: 'model execution failed' } } } });
+    else send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
   }
 });
 `;
@@ -30,11 +34,12 @@ describe('CodexAdapter app-server security policy', () => {
     delete process.env.KARMAX_CODEX_EXEC_CMD;
     delete process.env.KARMAX_CODEX_USE_EXEC;
     delete process.env.STUB_REQUESTS_OUT;
+    delete process.env.STUB_MODE;
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
     dir = undefined;
   });
 
-  async function run(session?: string): Promise<any[]> {
+  async function run(session?: string, mode?: string): Promise<any[]> {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-app-server-'));
     const stub = path.join(dir, 'codex-stub.cjs');
     const requests = path.join(dir, 'requests.jsonl');
@@ -42,6 +47,7 @@ describe('CodexAdapter app-server security policy', () => {
     fs.chmodSync(stub, 0o755);
     process.env.KARMAX_CODEX_EXEC_CMD = stub;
     process.env.STUB_REQUESTS_OUT = requests;
+    if (mode) process.env.STUB_MODE = mode;
 
     await new CodexAdapter().runTurn(
       {
@@ -81,5 +87,17 @@ describe('CodexAdapter app-server security policy', () => {
       sandboxPolicy: { type: 'dangerFullAccess' },
       approvalPolicy: 'never',
     });
+  });
+
+  it('rejects an interrupted terminal status even when partial assistant text exists', async () => {
+    await expect(run(undefined, 'interrupted')).rejects.toThrow(/interrupted before completion/i);
+  });
+
+  it('rejects a failed terminal status even when partial assistant text exists', async () => {
+    await expect(run(undefined, 'failed')).rejects.toThrow(/model execution failed/i);
+  });
+
+  it('rejects a process/transport end without a completed terminal event', async () => {
+    await expect(run(undefined, 'exit')).rejects.toThrow(/connection closed unexpectedly/i);
   });
 });

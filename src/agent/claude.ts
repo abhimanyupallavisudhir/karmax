@@ -69,11 +69,13 @@ export class ClaudeAdapter implements AgentAdapter {
         });
       }
     } else {
-      messages.push({ role: 'user', content: 'Begin the task. Call signal_completion when done.' });
+      messages.push({ role: 'user', content: 'Begin the task described in the instructions.' });
     }
 
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
+    let terminalStatus: string | undefined;
+    let terminalReason: string | undefined;
     // How many `input.messages` this turn has consumed. This path rebuilds the full
     // history each call (stateless), so it starts having delivered them all; follow-ups
     // that land mid-turn are folded in at the idle boundary below (SPEC §5.6).
@@ -140,9 +142,16 @@ export class ClaudeAdapter implements AgentAdapter {
           messages.push({ role: 'user', content: 'Continue.' });
           continue;
         }
+        if (data.stop_reason !== 'end_turn') {
+          throw new Error(
+            `Anthropic Messages turn did not complete successfully (stop_reason=${String(data.stop_reason ?? 'missing')})`,
+          );
+        }
         // The agent is idle. If a follow-up landed mid-turn, fold it in and keep going
         // in this same activity rather than ending the turn (SPEC §5.6); else finish.
         if (await injectFollowUps()) continue;
+        terminalStatus = 'end_turn';
+        terminalReason = data.stop_reason;
         break;
       }
 
@@ -155,13 +164,27 @@ export class ClaudeAdapter implements AgentAdapter {
         if (use.name === 'signal_completion') completed = true;
       }
       messages.push({ role: 'user', content: toolResults });
-      if (completed) break;
+      if (completed) {
+        terminalStatus = 'tool_use';
+        terminalReason = 'signal_completion';
+        break;
+      }
+    }
+
+    if (ctx.signal?.aborted) throw new Error('Anthropic Messages turn cancelled');
+    if (!terminalStatus) {
+      throw new Error(`Anthropic Messages turn exceeded its ${maxIters}-iteration backstop without a successful terminal response`);
     }
 
     // The Messages API is stateless — there is no provider conversation id to
     // resume by, so we don't fabricate one (SPEC §10.5). Use the Agent SDK path
     // (ambient Claude Code login) for resumable sessions.
-    return { session: input.session, output: finalText, delivered: deliveredIndex };
+    return {
+      termination: { kind: 'success', status: terminalStatus, ...(terminalReason ? { reason: terminalReason } : {}) },
+      session: input.session,
+      output: finalText,
+      delivered: deliveredIndex,
+    };
   }
 
   // ─── Claude Agent SDK (ambient Claude Code login) ───────────────────────────
@@ -213,7 +236,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // to one user turn (text concatenated, images appended); later follow-ups arrive as
     // their own user messages via in-flight injection below.
     const userText = conversationToPromptText(convo) ||
-      (input.session ? 'Continue from the latest instruction.' : 'Begin the task described in the system prompt. Call signal_completion when done.');
+      (input.session ? 'Continue from the latest instruction.' : 'Begin the task described in the system prompt.');
     const imageBlocks = collectAnthropicImageBlocks(convo);
     const initialContent: string | any[] = imageBlocks.length
       ? [...(userText ? [{ type: 'text', text: userText }] : []), ...imageBlocks]
@@ -305,6 +328,7 @@ export class ClaudeAdapter implements AgentAdapter {
     let finalText = '';
     let session = input.session;
     let completionSeen = false; // agent called signal_completion → stop injecting, end the turn
+    let successfulResult: any;
     // Track in-harness sub-agents (the Task tool). Claude Code auto-backgrounds long
     // sub-agents, so the main `result` can arrive — completion already signalled —
     // while a sub-agent is still running. We fold every task-lifecycle message in and
@@ -382,6 +406,10 @@ export class ClaudeAdapter implements AgentAdapter {
             windowsHide: true,
             detached: true, // own process group ⇒ group kills reap tool subprocesses too
           });
+          // The SDK attaches its own transport handling after this callback returns;
+          // cover the spawn→return edge so an asynchronous ENOENT never becomes an
+          // unhandled EventEmitter error in the host process.
+          child.on('error', () => {});
           if (child.pid) {
             const pid = child.pid;
             registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });
@@ -430,6 +458,14 @@ export class ClaudeAdapter implements AgentAdapter {
           }
         } else if (message.type === 'result') {
           session = message.session_id ?? session;
+          const result = message as any;
+          if (result.subtype !== 'success' || result.is_error === true) {
+            const detail = Array.isArray(result.errors) ? result.errors.join('; ') : result.error ?? result.terminal_reason ?? '';
+            throw new Error(
+              `Claude Agent SDK turn failed (${String(result.subtype ?? 'unknown')}): ${String(detail || 'provider reported an unsuccessful result')}`,
+            );
+          }
+          successfulResult = result;
           // The agent went idle (finished responding to its current input). End the
           // turn — UNLESS a follow-up landed in the meantime and the agent hasn't
           // declared completion, in which case inject it and let the session continue
@@ -453,14 +489,22 @@ export class ClaudeAdapter implements AgentAdapter {
       injector.close(); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
     }
-    // The Agent SDK harness completes its own loop; treat a finished query as a
-    // turn boundary. If the agent didn't call signal_completion explicitly, the
-    // runtime surfaces the output at Review. `delivered` = every message this turn
-    // consumed (initial delta + in-flight injections) so the workflow advances its
-    // boundary past exactly them.
+    if (ctx.signal?.aborted) throw new Error('Claude Agent SDK turn cancelled');
+    if (!successfulResult) {
+      throw new Error('Claude Agent SDK stream ended unexpectedly without a successful result event');
+    }
+    // Only a subtype=success result is a turn boundary. `delivered` = every message
+    // this turn consumed (initial delta + in-flight injections).
     const pending = pendingSubagentCount(subagents);
     const pendingShells = pendingBackgroundShellCount(subagents);
     return {
+      termination: {
+        kind: 'success',
+        status: 'success',
+        ...((successfulResult.terminal_reason ?? successfulResult.stop_reason)
+          ? { reason: String(successfulResult.terminal_reason ?? successfulResult.stop_reason) }
+          : {}),
+      },
       session,
       output: finalText,
       delivered: deliveredIndex,

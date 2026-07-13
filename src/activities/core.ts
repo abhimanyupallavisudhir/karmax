@@ -23,11 +23,14 @@ import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
 import os from 'node:os';
+import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
+import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 
 // Old executions without a recorded grant retain the normal developer workflow
 // surface (but no administration). New tasks always carry a creator-attenuated
@@ -36,6 +39,32 @@ const DEFAULT_GRANT = [
   'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
   'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
 ];
+
+// A confirmer belongs to a logical task, so sibling attempts must not review in
+// parallel against divergent copies of its conversation. The worker is the
+// single activity host in v1; this keyed FIFO serializes those turns while each
+// Temporal activity remains independently retryable.
+const confirmLocks = new Map<string, { held: boolean; waiters: Array<() => void> }>();
+async function acquireConfirmLock(key: string): Promise<() => void> {
+  let lock = confirmLocks.get(key);
+  if (!lock) {
+    lock = { held: false, waiters: [] };
+    confirmLocks.set(key, lock);
+  }
+  if (lock.held) await new Promise<void>((resolve) => lock!.waiters.push(resolve));
+  else lock.held = true;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = lock!.waiters.shift();
+    if (next) next();
+    else {
+      lock!.held = false;
+      confirmLocks.delete(key);
+    }
+  };
+}
 
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
@@ -156,6 +185,8 @@ export interface RunAgentTurnArgs {
    * credential); resolved JIT and overrides the auth. Env keys carry no handle —
    * they fall through to the adapter's env credential. */
   accountApiKeyHandle?: string;
+  /** Workflow-generated id used to correlate live admission/running signals. */
+  agentTurnId?: string;
 }
 
 export interface PrepareChildArgs {
@@ -167,6 +198,7 @@ export interface PrepareChildArgs {
   target?: string;
   project: TaskInput['project'];
   profiles?: Record<string, string>;
+  resolveAgentEnabled?: boolean;
   /** The parent's world branch — the child's merge cap is scoped to exactly this
    *  (SPEC §8.2). The parent owns this branch, so it may grant merge into it. */
   parentBranch?: string;
@@ -266,9 +298,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
       // materializing the source session needs this turn's config home + world path.
+      const conversationTaskId = args.role === 'confirm' ? (args.task.intentId ?? args.taskId) : args.taskId;
       let session = args.session;
-      let messages = args.messages; // may be augmented by the replay fallback
-      let deliveredMessages = args.deliveredMessages; // leading messages already in `session`
+      let messages = args.messages; // may be replaced by the shared confirmer transcript
+      let deliveredMessages = args.deliveredMessages;
       let fork = false; // true → the adapter branches a NEW session id from `session`
 
       // Temporal wiring: cancellation aborts the in-flight turn (SPEC §5.6), and
@@ -278,6 +311,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let signal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
       let hbSession: string | undefined; // set once real progress exists (onSession)
+      let legacyAgentTurnId: string | undefined;
+      let turnSessionKey: string | undefined;
+      let resumedActivityAttempt = false;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -287,8 +323,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const actx = activityContext.current();
         signal = actx.cancellationSignal;
         heartbeat = () => actx.heartbeat(hbSession ? { session: hbSession } : undefined);
-        const prior = (actx.info.heartbeatDetails as { session?: string } | undefined)?.session;
+        // v1 workflows cannot add the new agentTurnId argument without changing
+        // their recorded activity command. Derive a stable compatibility id from
+        // the existing activity execution instead, so the activity can repair the
+        // persisted view without changing workflow history.
+        if (!args.agentTurnId && actx.info.workflowExecution) {
+          legacyAgentTurnId = `legacy:${actx.info.workflowExecution.runId}:${actx.info.activityId}`;
+        }
+        const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
+        turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
+        // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
+        // SQLite key closes the small hard-kill window before a heartbeat reaches the
+        // service; unlike session:<task>:<role>, it cannot accidentally pick up a
+        // stale session from an earlier turn.
+        const prior =
+          (actx.info.heartbeatDetails as { session?: string } | undefined)?.session ??
+          (actx.info.attempt > 1 && turnSessionKey ? store.kvGet(turnSessionKey) : undefined);
         if (actx.info.attempt > 1 && prior) {
+          resumedActivityAttempt = true;
           liveChannel = false;
           // The interrupted attempt's session already holds the original prompt and
           // any partial work — continue it rather than re-sending the turn input.
@@ -301,7 +353,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             {
               id: `retry-${actx.info.attempt}`,
               role: 'user',
-              text: '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result and signal completion as usual.)',
+              text: '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result.)',
               ts: 0,
             },
           ];
@@ -472,13 +524,91 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           : undefined;
 
+      // Confirm turns for sibling attempts share one durable transcript and run
+      // serially. Fresh provider sessions replay that canonical transcript, which
+      // also works across account/config-home rotation (native sessions are home-bound).
+      const releaseConfirm = args.role === 'confirm' ? await acquireConfirmLock(conversationTaskId) : () => {};
+      let confirmTranscript: Message[] | undefined;
+      if (args.role === 'confirm') {
+        let shared: Message[];
+        try { shared = JSON.parse(store.kvGet(`confirm-transcript:${conversationTaskId}`) ?? '[]'); }
+        catch { shared = []; }
+        confirmTranscript = shared;
+        const request = [...args.messages].reverse().find((m) => m.role === 'user');
+        if (request) {
+          const id = `${args.taskId}:${request.id}`;
+          if (!shared.some((m) => m.id === id)) shared.push({ ...request, id, ts: shared.length });
+        }
+        // Sibling task attempts deliberately start a fresh provider session and replay
+        // the intent-wide transcript. A retry of THIS SAME Temporal activity is
+        // different: it must resume the interrupted provider session checkpointed
+        // above, otherwise a worker restart discards the in-flight confirmer turn.
+        if (!resumedActivityAttempt) {
+          messages = shared;
+          session = undefined;
+          deliveredMessages = 0;
+        }
+      }
+      /** Compatibility publisher for immutable v1 histories. Those workflows
+       * clear their in-memory account wait after a grant but cannot schedule a
+       * publish there without becoming nondeterministic. The activity is already
+       * a side-effect boundary, so it may keep the SQLite/UI snapshot truthful:
+       * account granted → waiting for host slot → running. A matching id prevents
+       * a late retry/cancellation from overwriting a newer turn's view. */
+      const publishLegacyAgentState = (state: 'waiting-slot' | 'running' | undefined) => {
+        if (!legacyAgentTurnId) return;
+        const taskRecord = store.getTask(args.taskId);
+        // A late retry from a terminated v1 execution must never overwrite the
+        // replacement run's v1.1+ snapshot. Workflow version is the stable guard;
+        // view shape alone is not (a review wait legitimately has no agentTurn).
+        if (taskRecord?.workflowVersion !== '1.0.0') return;
+        const prev = taskRecord.lastView;
+        if (!prev || prev.status === 'done' || prev.status === 'failed' || prev.status === 'cancelled') return;
+        if (state) {
+          if (prev.agentTurn && prev.agentTurn.turnId !== legacyAgentTurnId) return;
+        } else if (prev.agentTurn?.turnId !== legacyAgentTurnId) {
+          return;
+        }
+        const next: TaskView = state
+          ? {
+              ...prev,
+              status: state === 'running' ? 'active' : 'waiting',
+              waitingFor:
+                state === 'waiting-slot'
+                  ? { kind: 'agentSlot', provider: profile.provider, detail: 'Waiting for host capacity to run the agent' }
+                  : undefined,
+              agentTurn: { turnId: legacyAgentTurnId, role: args.role, provider: profile.provider, state },
+            }
+          : { ...prev, status: prev.status === 'waiting' ? 'active' : prev.status, waitingFor: undefined, agentTurn: undefined };
+        store.saveView(args.taskId, next);
+        record(args.taskId, 'view.updated', {
+          stage: next.stage,
+          status: next.status,
+          waitingFor: next.waitingFor?.kind ?? null,
+          agentTurn: next.agentTurn?.state ?? null,
+          agentRole: next.agentTurn?.role ?? null,
+          compatibility: 'legacy-agent-turn',
+        });
+      };
+
       // Host-wide agent-turn admission (SPEC §12): cap concurrent model
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
-      const releaseSlot = await acquireAgentSlot(heartbeat);
+      let releaseSlot = () => {};
       let lastEmit: string | undefined;
       let result;
       try {
+        publishLegacyAgentState('waiting-slot');
+        releaseSlot = await acquireAgentSlot(heartbeat, signal);
+        // The workflow publishes `waiting-slot` immediately after the account grant;
+        // only admission itself can truthfully report that the model is now running.
+        if (deps.client && args.agentTurnId) {
+          await deps.client.workflow
+            .getHandle(args.taskId)
+            .signal(SIG_AGENT_TURN_STATE, { turnId: args.agentTurnId, role: args.role, provider: profile.provider, state: 'running' })
+            .catch(() => undefined);
+        }
+        publishLegacyAgentState('running');
         result = await runTurn(
         {
           profile,
@@ -523,9 +653,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.
           onSession: (s) => {
             hbSession = s; // heartbeats now carry it → a retry resumes this session
-            store.kvSet(`session:${args.taskId}:${args.role}`, s);
+            if (turnSessionKey) store.kvSet(turnSessionKey, s);
+            // Do not wait for the 10-second liveness interval: checkpoint the newly
+            // minted provider session immediately so a restart on the next instruction
+            // still resumes this exact turn.
+            heartbeat?.();
+            store.kvSet(`session:${conversationTaskId}:${args.role}`, s);
             store.kvSet(
-              `sessionmeta:${args.taskId}:${args.role}`,
+              `sessionmeta:${conversationTaskId}:${args.role}`,
               JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
             );
             record(args.taskId, 'session.started', { role: args.role });
@@ -555,21 +690,38 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
         },
         );
+        // Defence in depth around the activity boundary. `runTurn` rejects an
+        // adapter return after abort, but cancellation can race the few synchronous
+        // instructions between that check and this await continuation. Never report
+        // a normal Temporal activity result once shutdown/cancellation is visible.
+        if (signal?.aborted) {
+          throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
+        }
+        if (confirmTranscript) {
+          if (result.output?.trim()) confirmTranscript.push({ id: `${args.taskId}:out:${confirmTranscript.length}`, role: 'agent', text: result.output, ts: confirmTranscript.length });
+          if (result.confirmDecision) {
+            const d = result.confirmDecision;
+            confirmTranscript.push({ id: `${args.taskId}:decision:${confirmTranscript.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
+          }
+          store.kvSet(`confirm-transcript:${conversationTaskId}`, JSON.stringify(confirmTranscript));
+        }
       } catch (err) {
         if (token) deps.tokens?.revoke(token);
         if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
         throw classifyTurnError(err);
       } finally {
         releaseSlot();
+        releaseConfirm();
+        publishLegacyAgentState(undefined);
       }
       if (token) deps.tokens?.revoke(token);
       // Persist the session id so other tasks can resume from this one (§10.5), plus
       // which config home + provider minted it — provider sessions are home-bound, so
       // the CLI resume-command needs the right CONFIG_DIR/CODEX_HOME (§2.5, #2/#3).
       if (result.session) {
-        store.kvSet(`session:${args.taskId}:${args.role}`, result.session);
+        store.kvSet(`session:${conversationTaskId}:${args.role}`, result.session);
         store.kvSet(
-          `sessionmeta:${args.taskId}:${args.role}`,
+          `sessionmeta:${conversationTaskId}:${args.role}`,
           JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
         );
       }
@@ -579,6 +731,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       record(args.taskId, 'turn.result', {
         completed: result.completed,
+        providerCompleted: result.providerCompleted,
+        providerTermination: result.providerTermination,
         subTasks: result.subTasks?.length ?? 0,
         hasReview: !!result.reviewInfo,
         output: result.output.slice(0, 2000),
@@ -642,7 +796,52 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const r = await world.exec('bash', ['-lc', 'npm test --silent 2>&1 | tail -40'], { timeoutMs: 10 * 60_000 });
       record(args.taskId, 'checks.done', { code: r.code });
-      return { passed: r.code === 0, detail: r.stdout.slice(-600) };
+      if (r.code !== 0) return { passed: false, detail: r.stdout.slice(-600) };
+
+      // SPEC §4.4's replay gate is literal: fetch every currently-running history
+      // and compare the candidate bundle with the bundle serving production now.
+      // Pre-existing incompatibilities are reported but do not make unrelated edits
+      // impossible; any history that regresses from baseline-pass to candidate-fail
+      // blocks the merge.
+      if (!deps.client) return { passed: false, detail: 'tests passed, but replay compatibility could not run: no Temporal client' };
+      const candidatePath = path.join(args.worldHandle.root, 'src', 'workflows', 'index.ts');
+      if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
+      try {
+        const histories: Array<{ workflowId: string; history: unknown }> = [];
+        for await (const execution of deps.client.workflow.list({ query: "ExecutionStatus='Running'" })) {
+          histories.push({ workflowId: execution.workflowId, history: await deps.client.workflow.getHandle(execution.workflowId, execution.runId).fetchHistory() });
+        }
+        const { Worker } = await import('@temporalio/worker');
+        const replay = async (workflowsPath: string) => {
+          const failures = new Map<string, string>();
+          for await (const result of Worker.runReplayHistories({ workflowsPath }, histories)) {
+            if (result.error) failures.set(result.workflowId, result.error.message);
+          }
+          return failures;
+        };
+        const baselinePath = fileURLToPath(new URL('../workflows/index.ts', import.meta.url));
+        const baselineFailures = await replay(baselinePath);
+        const candidateFailures = await replay(candidatePath);
+        const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
+        const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
+        const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));
+        record(args.taskId, 'checks.replay', {
+          histories: histories.length,
+          regressions: regressions.map(([id]) => id),
+          preExisting: existing,
+          fixed,
+        });
+        if (regressions.length) {
+          const detail = regressions.map(([id, error]) => `${id}: ${error}`).join('\n');
+          return { passed: false, detail: `tests passed; replay REGRESSED ${regressions.length}/${histories.length} active histories:\n${detail}`.slice(-4000) };
+        }
+        return {
+          passed: true,
+          detail: `tests + replay passed (${histories.length} active histories; ${existing.length} pre-existing incompatibilities${fixed.length ? `; ${fixed.length} repaired` : ''})`,
+        };
+      } catch (e) {
+        return { passed: false, detail: `tests passed, but replay compatibility failed to run: ${e instanceof Error ? e.message : String(e)}` };
+      }
     },
 
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
@@ -724,7 +923,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async publishView(taskId: string, view: TaskView): Promise<void> {
       store.saveView(taskId, view);
-      record(taskId, 'view.updated', { stage: view.stage, status: view.status });
+      // Entering Merge is the logical commitment boundary. The SQLite compare-and-
+      // set is the winner lease: exactly one attempt may get past this awaited
+      // activity and approach the global merge queue.
+      if (view.stage === 'merge') {
+        const claim = store.claimAttempt(taskId);
+        for (const siblingId of claim.cancel) {
+          const sibling = store.getTask(siblingId);
+          if (sibling?.params.draft) {
+            store.markDraftSuperseded(siblingId, taskId);
+            continue;
+          }
+          await deps.client?.workflow.getHandle(siblingId).signal('cancel').catch(() => undefined);
+        }
+      }
+      record(taskId, 'view.updated', {
+        stage: view.stage,
+        status: view.status,
+        waitingFor: view.waitingFor?.kind ?? null,
+        agentTurn: view.agentTurn?.state ?? null,
+        agentRole: view.agentTurn?.role ?? null,
+      });
     },
 
     async recordEvent(taskId: string, type: string, payload: Record<string, unknown>): Promise<void> {
@@ -769,6 +988,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         parentTaskId: args.parentTaskId,
         project: args.project,
         profiles: args.profiles,
+        resolveAgentEnabled: args.resolveAgentEnabled,
         grant,
         grantPrincipal: `task:${args.parentTaskId}`,
         authorizationProfile: 'inherited-child',

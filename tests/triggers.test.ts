@@ -230,6 +230,20 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(s.size).toBe(0); // disarmed after firing
   });
 
+  it('binds dependencies to the logical task, not a cancelled attempt', () => {
+    const first = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'first' } });
+    const second = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'second', draft: true }, intentId: first.intentId });
+    const dependent = armedTask([{ kind: 'dependency', tasks: [first.id], on: 'settled' }]);
+    const s = makeScheduler();
+    s.start();
+    store.saveView(first.id, { taskId: first.id, title: 'dep', workflow: 'just-do', stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: {}, updatedAt: 1 });
+    emitDone(first.id, 'cancelled');
+    expect(fired).toHaveLength(0); // second is now principal and still eligible
+    store.saveView(second.id, { taskId: second.id, title: 'dep', workflow: 'just-do', stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: 2 });
+    emitDone(second.id, 'done');
+    expect(fired).toEqual([[dependent.id, 'self']]);
+  });
+
   it('waits for all deps (mode all) but fires on the first for mode any', () => {
     const a = store.createTask({ projectId, title: 'a', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'a' } });
     const c = store.createTask({ projectId, title: 'c', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'c' } });

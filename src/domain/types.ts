@@ -94,6 +94,10 @@ export interface TaskList {
 /** The persisted index record for a task. The live view comes from the workflow query. */
 export interface TaskRecord {
   id: string;
+  /** Stable identity of the user's intent. Every alternate execution shares it. */
+  intentId?: string;
+  /** One-based creation order within the intent. */
+  attemptNumber?: number;
   /**
    * Simple, human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
    * project's tasks run #1, #2, …, assigned at creation. The UI displays `#num` and
@@ -335,14 +339,14 @@ export interface ReviewInfo {
    * How the Do turn that reached Review actually ended — set by the workflow (NOT the
    * agent), so a reviewer can tell an asserted finish from a silent stall:
    *   - `signalled`: the agent called `signal_completion` → it claims the work is done.
-   *   - `stalled`:   the turn ended with no completion signal and nothing else pending
-   *                  (`TurnResult.needsInput`) → the agent went quiet, work may be partial.
+   *   - `finished`:  the provider emitted its verified successful terminal event.
+   *   - `stalled`:   legacy v1.0/v1.1 turn ended without signal_completion.
    *   - `raised`:    the agent raised a decision/question to its confirmer.
    * Under a human confirmer all three route to the same gate (see software-dev's Review
    * block), so without this marker the distinction the runtime computes is discarded.
    * See the `signal_completion` note in src/agent/runtime.ts.
    */
-  completion?: 'signalled' | 'stalled' | 'raised';
+  completion?: 'finished' | 'signalled' | 'stalled' | 'raised';
 }
 
 export type ActionKind = 'signal' | 'update' | 'query';
@@ -369,9 +373,8 @@ export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm';
  * enforces it, and the UI/gateway derive which fields to expose as editable.
  * - `queue`    — frozen once the workflow starts (draft-only). The default.
  * - `untilUsed`— editable in-flight until the workflow *consumes* it: the target
- *                branch until a PR opens / the merge enqueue; the merge agent
- *                until the merge turn runs; the resolve agent until a resolve
- *                turn runs. Consumption points are workflow-specific.
+ *                branch until a PR opens / the merge enqueue; an auxiliary agent
+ *                until that role's turn runs. Consumption points are workflow-specific.
  * - `always`   — editable at any time (reserved; unused in v1).
  * An `untilUsed`/`always` field is only truly live if the workflow actually
  * re-reads it at consumption time; declaring it without re-reading it is a bug.
@@ -389,8 +392,7 @@ export interface FieldSpec {
   placeholder?: string;
   scopes: FieldScope[];
   bind: FieldBind;
-  /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures
-   *  (do/merge/resolve/confirm). */
+  /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures. */
   role?: string;
   /** For confirmer fields — the default Confirm-agent prompt template the form
    *  pre-fills (and inherits back to on reset) when no override is stored. */
@@ -410,21 +412,40 @@ export interface AgentSpec {
 }
 
 /**
- * Who drives the Review gate (SPEC §5.2/§5.3). `human` waits for a person to click
- * Confirm (the default, back-compat behaviour). `auto` confirms the moment Review is
- * reached. `agent` runs a Confirm-agent turn that reviews the work and returns a
- * structured verdict (confirm / revise / reject) — the same three transitions a human
- * drives. When `mode === 'agent'` the remaining `AgentSpec` fields configure that
- * agent exactly like the Do/Merge/Resolve agent fields (including `resumeFrom`).
+ * Who drives the Review gate (SPEC §5.2/§5.3): an ordered list of confirm LAYERS,
+ * played sequentially each time the task reaches Review. Every layer must approve
+ * for the task to proceed to PR/merge; a revise verdict or a follow-up sends the
+ * task back to Do, and the next Review replays the sequence from the first layer.
+ * Zero layers ⇒ auto-confirm (e.g. "agent review, then a final human confirmation"
+ * is `[{ kind: 'agent', … }, { kind: 'human' }]`; auto-confirm is `[]`).
+ *
+ * A `human` layer waits for a person to click Confirm. An `agent` layer runs a
+ * Confirm-agent turn that reviews the work and returns a structured verdict
+ * (confirm / revise / reject) — the same three transitions a human drives; its
+ * `AgentSpec` fields configure that agent exactly like the Do/Merge agent
+ * fields (including `resumeFrom`).
+ *
+ * The pre-layers single-gate shape ({ mode, …agent }) is still accepted anywhere a
+ * ConfirmConfig flows (old stored settings, old drafts, in-flight inputs) and is
+ * normalized via confirmLayersOf (domain/confirm.ts): auto ⇒ [], human ⇒ one human
+ * layer, agent ⇒ one agent layer.
  */
 export type ConfirmMode = 'human' | 'auto' | 'agent';
+export interface ConfirmLayer extends Partial<AgentSpec> {
+  kind: 'human' | 'agent';
+  /** Agent layers: the review-request message template sent each time the task
+   *  reaches Review — optional instructions/guidance ("ensure X, Y and Z"), with
+   *  {{prompt}} / {{response}} placeholders for the task prompt and the Do agent's
+   *  latest response (see domain/confirm-prompt.ts). Empty ⇒ the built-in default
+   *  (CONFIRM_PROMPT_DEFAULT, pre-filled in the form). */
+  prompt?: string;
+}
 export interface ConfirmConfig extends Partial<AgentSpec> {
-  mode: ConfirmMode;
-  /** The review-request message template sent to the Confirm agent each time the
-   *  task reaches Review — optional instructions/guidance ("ensure X, Y and Z"),
-   *  with {{prompt}} / {{response}} placeholders for the task prompt and the Do
-   *  agent's latest response (see domain/confirm-prompt.ts). Empty ⇒ the built-in
-   *  default (CONFIRM_PROMPT_DEFAULT, pre-filled in the form). */
+  /** The ordered Review gates. [] ⇒ auto-confirm. Wins over the legacy `mode`. */
+  layers?: ConfirmLayer[];
+  /** Legacy single-gate mode (pre-layers shape); read only when `layers` is absent. */
+  mode?: ConfirmMode;
+  /** Legacy: the single agent gate's review-request template. */
   prompt?: string;
 }
 
@@ -467,7 +488,7 @@ export interface TaskView {
   notes?: string;
   messages: Message[];
   /**
-   * Per-role conversation transcripts (Do / Merge / Resolve). `messages` above is
+   * Per-role conversation transcripts. `messages` above is
    * kept as the Do transcript for back-compat + the live bubble; this carries all
    * roles so the UI can show each — collapsed except the one owning the active
    * stage (SPEC §5.5). Roles with no turns yet are omitted.
@@ -491,7 +512,9 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
+  /** Live model-turn admission/execution state, separate from account leasing. */
+  agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right
@@ -542,6 +565,8 @@ export interface AgentProfile {
 
 export interface TaskInput {
   taskId: string;
+  /** Logical task identity shared by mutually-exclusive attempts. */
+  intentId?: string;
   projectId: string;
   /** The workflow this task runs (so activities can read its manifest — roles, agentMcp). */
   workflow?: string;
@@ -559,8 +584,9 @@ export interface TaskInput {
   profiles?: Record<string, string>;
   /** Per-role agent overrides (provider/model/effort/resume) from the task form (§10.5). */
   agents?: Record<string, AgentSpec>;
-  /** Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent.
-   *  Absent ⇒ human (or `auto` when the legacy `autoConfirm` flag is set). */
+  /** The Review-gate confirm layers (SPEC §5.2), played in order — each a human
+   *  confirmation or a Confirm-agent turn; [] ⇒ auto-confirm. Absent ⇒ one human
+   *  layer (or none when the legacy `autoConfirm` flag is set). */
   confirm?: ConfirmConfig;
   /** A snapshot of project config, captured at creation. */
   project: ProjectConfig;
@@ -569,6 +595,12 @@ export interface TaskInput {
   /** Principal and job-shaped profile from which `grant` was attenuated. */
   grantPrincipal?: string;
   authorizationProfile?: string;
+  /**
+   * Snapshot of the process-wide Resolve-agent flag. It is carried in workflow
+   * input so Temporal replay never depends on mutable process state. `undefined`
+   * means enabled for historical executions created before the flag existed.
+   */
+  resolveAgentEnabled?: boolean;
   /**
    * Per-field in-flight editability windows (SPEC §4.5/§5.5), copied from the
    * workflow manifest at assembly time. Lets the deterministic workflow validate

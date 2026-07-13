@@ -1,6 +1,8 @@
 import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ConfirmConfig, ProjectConfig, Project } from '../domain/types.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { expandPath } from '../util/expand.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 /**
  * Parameter resolution + assembly (SPEC §10.4). A single declared FieldSpec
@@ -38,16 +40,16 @@ export function resolveParamsLayers(manifest: WorkflowManifest, layers: (ValueMa
   return out;
 }
 
-const AGENT_GROUP_ROLES = ['do', 'merge', 'resolve'] as const;
+const AGENT_GROUP_ROLES: readonly string[] = ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : [])];
 
 /**
- * Do/Merge/Resolve have a compact, unified editor by default. The editor shape is
+ * Do/Merge have a compact, unified editor by default. The editor shape is
  * itself an inherited setting: a unified child inherits only its parent's Do
- * agent and applies that identity to all three roles; a separated child inherits
+ * agent and applies that identity to both roles; a separated child inherits
  * each corresponding parent role. Fork/session state is deliberately copied only
  * to Do when a unified value fans out.
  *
- * Older rows predate `separateAgents`; infer their old three-form shape when they
+ * Older rows predate `separateAgents`; infer their old separate form when they
  * contain any role override so existing settings retain their meaning.
  */
 function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undefined)[], out: ValueMap): void {
@@ -72,7 +74,7 @@ function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undef
     if (unified !== undefined) {
       resolved.do = unified;
       resolved.merge = withoutResume(unified);
-      resolved.resolve = withoutResume(unified);
+      if (RESOLVE_AGENT_ENABLED) resolved.resolve = withoutResume(unified);
     }
   }
   for (const role of AGENT_GROUP_ROLES) {
@@ -131,33 +133,27 @@ export function assembleTaskInput(
         if (f.role && v && typeof v === 'object' && (v as AgentSpec).provider) agents[f.role] = v as AgentSpec;
         break;
       case 'confirm': {
-        // The confirmer field carries a MODE (human/auto/agent) plus, when mode is
-        // `agent`, the same agent knobs as a bind:'profile' field. Land the mode on
-        // input.confirm; when it's an agent, ALSO register it under agents[role] so
-        // the existing per-role turn machinery (profile resolution + fork/resume)
-        // drives the Confirm-agent turn with zero extra plumbing.
+        // The confirmer field carries the ordered Review-gate LAYERS — each a human
+        // confirmation or a Confirm-agent turn (with the same agent knobs as a
+        // bind:'profile' field); [] ⇒ auto-confirm. Legacy single-gate {mode} values
+        // (old stored settings/drafts) normalize to their layer equivalents, so the
+        // workflow only ever sees layers. Each agent layer carries its own spec —
+        // the workflow lands it on agents[role] per layer at turn time, so nothing
+        // is registered here.
         if (v && typeof v === 'object') {
-          const c = v as ConfirmConfig;
-          const mode = c.mode ?? 'human';
-          input.confirm = {
-            mode,
-            ...(c.provider ? { provider: c.provider } : {}),
-            ...(c.model ? { model: c.model } : {}),
-            ...(c.effort ? { effort: c.effort } : {}),
-            ...(c.resumeFrom ? { resumeFrom: c.resumeFrom } : {}),
-            // The per-Review request template (workflow falls back to the built-in
-            // default when unset) — a scalar, so it does NOT belong in agents[role].
-            ...(c.prompt?.trim() ? { prompt: c.prompt } : {}),
-          };
-          const role = f.role ?? 'confirm';
-          if (mode === 'agent' && c.provider) {
-            agents[role] = {
-              provider: c.provider,
-              ...(c.model ? { model: c.model } : {}),
-              ...(c.effort ? { effort: c.effort } : {}),
-              ...(c.resumeFrom ? { resumeFrom: c.resumeFrom } : {}),
-            };
-          }
+          const layers = confirmLayersOf(v as ConfirmConfig).map((l) =>
+            l.kind === 'agent'
+              ? {
+                  kind: l.kind,
+                  ...(l.provider ? { provider: l.provider } : {}),
+                  ...(l.model ? { model: l.model } : {}),
+                  ...(l.effort ? { effort: l.effort } : {}),
+                  ...(l.resumeFrom ? { resumeFrom: l.resumeFrom } : {}),
+                  ...(l.prompt?.trim() ? { prompt: l.prompt } : {}),
+                }
+              : { kind: l.kind },
+          );
+          input.confirm = { layers };
         }
         break;
       }

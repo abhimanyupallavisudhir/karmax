@@ -35,7 +35,7 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
           taskId,
           projectId: 'p1',
           title: 'Park me',
-          prompt: 'Do the work.\n@write parked.txt :: hello\n@review done',
+          prompt: 'Do the work.\n@sleep 500\n@write parked.txt :: hello\n@review done',
           base: 'main',
           target: 'main',
           project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
@@ -51,8 +51,24 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
     expect(parked.waitingFor?.kind).toBe('account');
     expect((parked.messages || []).some((m: any) => m.role === 'agent')).toBe(false);
 
-    // Free the login → coordinator grants → task resumes, runs the Do turn, reaches Review.
+    // Capture every published transition after the grant. This remains reliable even
+    // when the mock turn is fast enough for a query to miss an intermediate view.
+    const transitions: any[] = [];
+    const stopListening = h.bus.onTask(taskId, (ev) => {
+      if (ev.type === 'view.updated') transitions.push(ev.payload);
+    });
+
+    // Free the login → the workflow must publish the distinct host-slot state
+    // immediately, then the activity reports running only after admission.
     await cw.signal('setAccountAvailability', { accountId: 'mock:only', status: 'available' });
+    await expect.poll(() => transitions.some((p) => p.waitingFor === 'agentSlot' && p.agentTurn === 'waiting-slot'), { timeout: 20_000 }).toBe(true);
+    await expect.poll(() => transitions.some((p) => p.waitingFor === null && p.agentTurn === 'running'), { timeout: 20_000 }).toBe(true);
+    const slotAt = transitions.findIndex((p) => p.agentTurn === 'waiting-slot');
+    const runningAt = transitions.findIndex((p) => p.agentTurn === 'running');
+    expect(slotAt).toBeGreaterThanOrEqual(0);
+    expect(runningAt).toBeGreaterThan(slotAt);
+    stopListening();
+
     await expect.poll(async () => (await view()).stage, { timeout: 30_000 }).toBe('review');
     expect((await view()).messages.some((m: any) => m.role === 'agent')).toBe(true);
 
