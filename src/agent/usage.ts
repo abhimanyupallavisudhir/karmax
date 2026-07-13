@@ -100,6 +100,25 @@ export function parseUsagePanel(text: string, now: number): UsageResult {
   };
 }
 
+// ── Staleness ──────────────────────────────────────────────────────────────────
+
+/** Snapshots older than this are re-probed before being trusted (display state only). */
+export const USAGE_TTL_MS = 15 * 60_000;
+
+/**
+ * A cached snapshot is stale when any window it reports has already reset (its %
+ * refers to a window that no longer exists — showing it as current is a lie), or
+ * when the probe itself is older than the TTL. A *fresh* failed probe is NOT stale
+ * (don't hammer a failing CLI); it becomes stale again once the TTL passes.
+ */
+export function isUsageStale(snap: UsageResult | undefined, now: number, ttlMs = USAGE_TTL_MS): boolean {
+  if (!snap) return true; // pollable but never probed
+  if (now - snap.at > ttlMs) return true;
+  if (!snap.ok) return false;
+  const wins = [snap.session, snap.week, ...(snap.models ?? [])].filter((w): w is UsageWindow => !!w);
+  return wins.some((w) => w.resetAt !== undefined && w.resetAt < now);
+}
+
 // ── Best-effort reset-instant math (display always uses the raw label) ─────────
 const MONTHS: Record<string, number> = {
   jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
