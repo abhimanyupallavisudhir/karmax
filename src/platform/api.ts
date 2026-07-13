@@ -1,4 +1,4 @@
-import type { Client } from '@temporalio/client';
+import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Store } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
@@ -697,19 +697,45 @@ export class KarmaxApi {
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
     this.require(token, 'signal_task');
     const handle = this.deps.client.workflow.getHandle(taskId);
-    if (signal === SIG.followUp) {
-      const msg: Message = {
-        id: `u${Date.now()}`,
-        role: 'user',
-        text: text ?? '',
-        ts: 0,
-        ...(images?.length ? { images } : {}),
-      };
-      // `role` (the addressed agent) is optional — single-agent workflows ignore it
-      // and route every follow-up to their sole conversation.
-      await handle.signal(SIG.followUp, msg, role);
-    } else {
-      await handle.signal(signal);
+    try {
+      if (signal === SIG.followUp) {
+        const msg: Message = {
+          id: `u${Date.now()}`,
+          role: 'user',
+          text: text ?? '',
+          ts: 0,
+          ...(images?.length ? { images } : {}),
+        };
+        // `role` (the addressed agent) is optional — single-agent workflows ignore it
+        // and route every follow-up to their sole conversation.
+        await handle.signal(SIG.followUp, msg, role);
+      } else {
+        await handle.signal(signal);
+      }
+    } catch (e) {
+      // Cancellation is idempotent at the task API boundary. The drawer can be
+      // acting on a view published immediately before the workflow closes, in
+      // which case Temporal reports the closed execution as "not found". Settle
+      // a stale non-terminal snapshot locally (the closed workflow can no longer
+      // publish one), but preserve an already-terminal result such as `done`.
+      // Other signals must still report stale/invalid actions.
+      if (signal === SIG.cancel && e instanceof WorkflowNotFoundError) {
+        const task = this.deps.store.getTask(taskId);
+        if (!task) throw e;
+        const view = task.lastView;
+        if (view && !['done', 'cancelled', 'failed'].includes(view.status)) {
+          this.deps.store.saveView(taskId, {
+            ...view,
+            stage: 'cancelled',
+            status: 'cancelled',
+            actions: [],
+            state: { ...view.state, cancelled: true },
+            waitingFor: undefined,
+          });
+        }
+        return;
+      }
+      throw e;
     }
   }
 
