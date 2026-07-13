@@ -167,25 +167,28 @@ class CredentialDenied extends Error {}
  */
 export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   const taskId = input.taskId;
-  let stage: Stage = 'setup';
+  const recovery = input.recovery;
+  let stage: Stage = recovery ? 'do' : 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = input.prompt || input.images?.length
-    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
-    : [];
-  let target = input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
+  const msgs: Message[] = recovery
+    ? recovery.messages.map((m) => ({ ...m }))
+    : input.prompt || input.images?.length
+      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+      : [];
+  let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let confirmed = false;
   let cancelled = false;
   let retryRequested = false;
-  let world: WorldHandleLike | undefined;
-  let session: string | undefined;
+  let world: WorldHandleLike | undefined = recovery?.world;
+  let session: string | undefined = recovery?.session;
   // The config home that minted `session`. Provider sessions are login-bound, so a
   // later turn leased a DIFFERENT home must NOT resume this session — we drop it and
   // let the turn start fresh (karmax's own `msgs` carries the conversation). §2.5.
-  let sessionHome: string | undefined;
+  let sessionHome: string | undefined = recovery?.sessionHome;
   // What a parked turn is waiting on (surfaced in the view; SPEC §6.2).
   let waitingFor: TaskView['waitingFor'];
-  let reviewInfo: ReviewInfo | undefined;
+  let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
   let error: string | undefined;
   let pr: { url: string; number: number } | undefined;
   let mergeQueuePos: { position: number; total: number } | undefined;
@@ -209,13 +212,15 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
   let targetLocked = false;
   let mergeGranted = false;
-  let seen = 0; // messages the Do agent has already processed
+  let seen = recovery?.seen ?? 0; // messages the Do agent has already processed
   // Per-role transcripts surfaced in the view-model (SPEC §5.5): the Do agent's
   // conversation is `msgs`; the merge/resolve agents run on their own message
   // arrays whose input+output we accumulate here so all three are inspectable.
-  const mergeMsgs: Message[] = [];
-  const resolveMsgs: Message[] = [];
-  const confirmMsgs: Message[] = [];
+  const recoveredTranscript = (role: string): Message[] =>
+    recovery?.transcripts?.find((t) => t.role === role)?.messages.map((m) => ({ ...m })) ?? [];
+  const mergeMsgs: Message[] = recoveredTranscript('merge');
+  const resolveMsgs: Message[] = recoveredTranscript('resolve');
+  const confirmMsgs: Message[] = recoveredTranscript('confirm');
   // Who drives the Review gate (SPEC §5.2). Explicit `input.confirm` wins; otherwise
   // fall back to the legacy `autoConfirm` flag (top-level goal tasks) → `auto`, else a
   // human. A child with a `parentTaskId` always routes Review to its parent regardless
@@ -408,6 +413,10 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         mergeGranted,
         targetLocked,
         mergeDomain: world ? mergeDomains(world, target, input.projectId)[0] : undefined,
+        // A failed Temporal execution is terminal. Persist the full handle needed
+        // for a replacement run to OPEN this world; reconstructing it through
+        // createWorld would force-remove the dirty worktree and lose work.
+        recoveryWorld: world,
       },
       branch: world?.branch,
       base,
@@ -564,20 +573,32 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
               ts: resolveMsgs.length,
             };
             resolveMsgs.push(rin);
-            const r = await leasedTurn('resolve', (accountConfigHome, accountApiKeyHandle) =>
-              turns.runAgentTurn({
-                taskId,
-                role: 'resolve',
-                worldHandle: world as any,
-                // Include the resolve agent's full transcript so a human follow-up
-                // addressed to it (SPEC §5.6) reaches it on this turn.
-                messages: resolveMsgs,
-                task: liveInput,
-                bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
-                accountConfigHome,
-                accountApiKeyHandle,
-              }),
-            );
+            let r;
+            try {
+              r = await leasedTurn('resolve', (accountConfigHome, accountApiKeyHandle) =>
+                turns.runAgentTurn({
+                  taskId,
+                  role: 'resolve',
+                  worldHandle: world as any,
+                  // Include the resolve agent's full transcript so a human follow-up
+                  // addressed to it (SPEC §5.6) reaches it on this turn.
+                  messages: resolveMsgs,
+                  task: liveInput,
+                  bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
+                  accountConfigHome,
+                  accountApiKeyHandle,
+                }),
+              );
+            } catch (resolveErr) {
+              // An exception thrown while handling a catch is NOT caught by that
+              // same catch. This missing boundary made a quota/error in the Resolve
+              // agent escape withResolve and terminally fail the Temporal execution
+              // (tasks #130/#133/#150). Resolution machinery exhausting itself is a
+              // human escalation, never an unhandled workflow failure.
+              lastError = `Resolve agent failed while handling the ${stageName} error: ${describeError(resolveErr)}`;
+              error = lastError;
+              break;
+            }
             if (r.output?.trim()) resolveMsgs.push({ id: `r-out-${resolveMsgs.length}`, role: 'agent', text: r.output, ts: resolveMsgs.length });
             // Consume the agent's structured verdict (SPEC §5.2, RESOLVE-PLAN §3.2)
             // instead of blindly retrying. This is the fix for "the resolve agent's
@@ -954,9 +975,11 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   try {
   // ── Setup ──
   await publish();
-  world = (await withResolve('setup', () =>
-    core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
-  )) as WorldHandleLike;
+  if (!world) {
+    world = (await withResolve('setup', () =>
+      core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
+    )) as WorldHandleLike;
+  }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
   accountPool = await coord.accountPoolSize().catch(() => 0);
 

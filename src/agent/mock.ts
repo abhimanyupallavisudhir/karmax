@@ -54,6 +54,13 @@ export class MockAdapter implements AgentAdapter {
     ctx.onSession?.(session);
     ctx.heartbeat?.();
 
+    // Hermetic regression hook for the Resolve boundary: the original Do failure
+    // is carried into the Resolve system prompt, letting a test prove that a
+    // failure OF the resolver escalates instead of terminally failing the workflow.
+    if (input.role === 'resolve' && input.systemPrompt.includes('resolve-agent-failure-test')) {
+      throw new Error('resolve agent itself failed');
+    }
+
     let complete = true;
     let pendingSubagents = 0;
     const outputs: string[] = [];

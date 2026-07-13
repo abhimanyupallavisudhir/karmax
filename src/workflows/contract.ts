@@ -5,6 +5,7 @@
  */
 export type {
   TaskInput,
+  TaskRecoveryCheckpoint,
   TaskView,
   Stage,
   TaskStatus,

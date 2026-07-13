@@ -573,6 +573,36 @@ export interface TaskInput {
    * Sparse — only non-`queue` fields are carried; a missing name means `queue`.
    */
   paramWindows?: Record<string, FieldMutable>;
+  /**
+   * Recovery checkpoint for restarting a failed software-dev execution. A failed
+   * Temporal run is terminal, so Retry starts a new run which opens this existing
+   * world instead of recreating it (and thereby deleting dirty work). Kept on the
+   * generic input for serialization; only software-dev consumes it.
+   */
+  recovery?: TaskRecoveryCheckpoint;
+}
+
+/** Plain serializable world handle + conversation state needed to resume a failed
+ * software-dev task. Mirrors world/types without importing Node-facing world code. */
+export interface TaskRecoveryCheckpoint {
+  world: {
+    kind: 'worktree' | 'container' | 'memory';
+    id: string;
+    root: string;
+    branch: string;
+    base: string;
+    repo?: string;
+    target?: string;
+    repos?: { name: string; repo: string; root: string; branch: string; base: string }[];
+    meta?: Record<string, unknown>;
+  };
+  messages: Message[];
+  transcripts?: { role: string; label: string; messages: Message[] }[];
+  reviewInfo?: ReviewInfo;
+  session?: string;
+  sessionHome?: string;
+  seen?: number;
+  target?: string;
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────
