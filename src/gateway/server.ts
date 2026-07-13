@@ -25,6 +25,7 @@ import { Provider, ProjectConfig } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -287,6 +288,7 @@ export class Gateway {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
         safeMode: this.safeMode,
+        resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
       });
     }
 
@@ -724,7 +726,7 @@ export class Gateway {
         // command targeting the right CONFIG_DIR/CODEX_HOME (provider sessions are
         // home-bound). `home` is omitted for API-key/stateless sessions.
         const out: Record<string, { id: string; home?: string; provider?: string }> = {};
-        for (const role of ['do', 'merge', 'resolve', 'confirm']) {
+        for (const role of ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm']) {
           const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
           const s = store.kvGet(`session:${sessionTaskId}:${role}`);
           if (!s) continue;
@@ -809,10 +811,11 @@ export class Gateway {
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
         const { roleDef } = await import('../contrib/manifests.js');
         const withRole = (pr: any) => ({ ...pr, roleWorkflows: roleDef(pr.role)?.workflows ?? [] });
+        const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
-        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::')).map(withRole));
+        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr)).map(withRole));
         // effective per-role view: the project override if present, else global (inherited)
-        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::'));
+        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr));
         const view = globals.map((g) => {
           const proj = store.getProfile(`${pid}::${g.role}-default`);
           return withRole({ ...(proj ?? g), id: `${pid}::${g.role}-default`, role: g.role, scope: proj ? 'project' : 'inherited', inherited: g });
@@ -828,6 +831,8 @@ export class Gateway {
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
+        const { roleDef } = await import('../contrib/manifests.js');
+        if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
         const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
         if (!id) return this.json(res, 400, { error: 'profile needs id or projectId' });
         const { projectId: _pid, scope: _s, inherited: _i, ...rest } = b;

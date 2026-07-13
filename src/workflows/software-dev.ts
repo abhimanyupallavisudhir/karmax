@@ -239,8 +239,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   let mergeGranted = false;
   let seen = recovery?.seen ?? 0; // messages the Do agent has already processed
   // Per-role transcripts surfaced in the view-model (SPEC §5.5): the Do agent's
-  // conversation is `msgs`; the merge/resolve agents run on their own message
-  // arrays whose input+output we accumulate here so all three are inspectable.
+  // conversation is `msgs`; auxiliary agents run on their own message arrays.
+  // `resolveMsgs` remains only for historical executions created before the
+  // process-wide Resolve-agent flag was disabled.
   const recoveredTranscript = (role: string): Message[] =>
     recovery?.transcripts?.find((t) => t.role === role)?.messages.map((m) => ({ ...m })) ?? [];
   const mergeMsgs: Message[] = recoveredTranscript('merge');
@@ -271,7 +272,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   // (e.g. a Do follow-up, a merge retry, or the next resolve attempt).
   const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
   // Params the workflow has already consumed (value now load-bearing). `target` is
-  // consumed once locked (PR open / merge enqueue); a merge/resolve agent's IDENTITY
+  // consumed once locked (PR open / merge enqueue); an auxiliary agent's IDENTITY
   // (provider/session) once its turn runs — its model/effort stay retunable after.
   const consumed = new Set<string>();
   const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
@@ -283,7 +284,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   const agentRoleOf = (name: string): string | undefined => (name.startsWith('agent:') ? name.slice('agent:'.length) : undefined);
   /** Whether a role's IDENTITY (provider / resumed session) may still be swapped now.
    *  The Do agent runs on a live resumable session from turn one, so its identity is
-   *  frozen in-flight; merge/resolve can be swapped until their own turn runs. Model
+   *  frozen in-flight; auxiliary agents can be swapped until their own turn runs. Model
    *  and effort are NOT gated here — they retune whenever `paramEditable` allows. */
   const agentIdentityEditable = (role: string): boolean =>
     role !== 'do' && paramEditable(`agent:${role}`) && !isConsumed(`agent:${role}`);
@@ -591,7 +592,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
           // then invoke autoResolve. The improved no-flicker order belongs to the
           // distinct v1.1 Temporal type and must never rewrite v1 replay.
           let auto;
-          if (behaviorVersion === '1.0.0') {
+          if (behaviorVersion === '1.0.0' && input.resolveAgentEnabled !== false) {
             stage = 'resolve';
             await publish();
             auto = await core.autoResolve({ taskId, stage: stageName, error });
@@ -602,6 +603,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
               error = undefined;
               continue;
             }
+            // Scripted recovery missed. With the process-wide Resolve-agent flag
+            // off, go directly to the existing parent/human escalation path.
+            if (input.resolveAgentEnabled === false) break;
             stage = 'resolve';
             await publish();
           }
@@ -992,6 +996,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
         target: world!.branch,
         project: input.project,
         profiles: input.profiles,
+        resolveAgentEnabled: input.resolveAgentEnabled,
         // Branch-scoped, least-privilege grant for the child (SPEC §8.2).
         parentBranch: world!.branch,
         parentGrant: input.grant,

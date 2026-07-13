@@ -24,6 +24,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const meta: any = await (await fetch(`${base}/api/meta`)).json();
     expect(meta.version).toBeTruthy();
     expect(meta.agent.provider).toBeTruthy();
+    expect(meta.resolveAgentEnabled).toBe(false);
   });
 
   it('exposes contributions (slots, commands, event schemas)', async () => {
@@ -31,6 +32,29 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);
+  });
+
+  it('omits the disabled Resolve agent from schemas and profiles', async () => {
+    const schemas = (await (await fetch(`${base}/api/schema`, { headers: auth() })).json()) as any[];
+    const softwareDev = schemas.find((s) => s.name === 'software-dev');
+    expect(softwareDev.params.some((f: any) => f.role === 'resolve' || f.name === 'agent:resolve')).toBe(false);
+    expect(softwareDev.stages.some((s: any) => s.key === 'resolve' || s.aliases?.includes('resolve'))).toBe(false);
+
+    const profiles = (await (await fetch(`${base}/api/profiles`, { headers: auth() })).json()) as any[];
+    expect(profiles.some((p) => p.role === 'resolve')).toBe(false);
+
+    const rejected = await fetch(`${base}/api/profiles`, {
+      method: 'PUT',
+      headers: auth(),
+      body: JSON.stringify({ id: 'resolve-default', role: 'resolve', name: 'Resolve agent', provider: 'mock' }),
+    });
+    expect(rejected.status).toBe(400);
+
+    // Historical session rows may remain in SQLite, but the disabled role must
+    // not leak back into the task UI's session payload.
+    h.store.kvSet('session:legacy-task:resolve', 'legacy-session');
+    const sessions: any = await (await fetch(`${base}/api/tasks/legacy-task/sessions`, { headers: auth() })).json();
+    expect(sessions.resolve).toBeUndefined();
   });
 
   it('rejects unauthenticated API calls', async () => {

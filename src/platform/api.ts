@@ -21,6 +21,7 @@ import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort } from '../agent/profiles.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -293,6 +294,7 @@ export class KarmaxApi {
       project: project.config,
     });
     input.workflow = workflow;
+    input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
     input.intentId = task.intentId ?? task.id;
     if (args.profiles) input.profiles = args.profiles;
     const initialImages = taskOverrides.images as ImageRef[] | undefined;
@@ -372,7 +374,7 @@ export class KarmaxApi {
     resolved['agent:do'] = spec;
     const { resumeFrom: _resumeFrom, ...shared } = spec;
     resolved['agent:merge'] = shared;
-    resolved['agent:resolve'] = shared;
+    if (RESOLVE_AGENT_ENABLED) resolved['agent:resolve'] = shared;
   }
 
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
@@ -436,6 +438,7 @@ export class KarmaxApi {
       project: project.config,
     });
     input.workflow = task.workflow;
+    input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
     input.intentId = task.intentId ?? task.id;
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];

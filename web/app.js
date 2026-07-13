@@ -336,25 +336,27 @@ function renderField(f, own, inherited, withChips, alt) {
   return `<div class="form-row" data-row="${esc(f.name)}">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
-const agentGroupFields = (fields) => ['do', 'merge', 'resolve'].map((role) => fields.find((f) => f.type === 'agent' && f.role === role));
-const inferredSeparateAgents = (values = {}) => values.separateAgents === true ||
-  (values.separateAgents === undefined && ['do', 'merge', 'resolve'].some((role) => values[`agent:${role}`] !== undefined));
+const agentGroupFields = (fields) => ['do', 'merge', ...(fields.some((f) => f.type === 'agent' && f.role === 'resolve') ? ['resolve'] : [])]
+  .map((role) => fields.find((f) => f.type === 'agent' && f.role === role));
+const inferredSeparateAgents = (values = {}, roles = ['do', 'merge']) => values.separateAgents === true ||
+  (values.separateAgents === undefined && roles.some((role) => values[`agent:${role}`] !== undefined));
 
-// Software-dev owns three operational roles, but most tasks want one identity for
-// all of them. Keep the manifest's role fields (the workflow still consumes those)
+// Software-dev's operational roles usually share one identity. Keep the
+// manifest's role fields (the workflow still consumes those)
 // while presenting a compact virtual `agent:unified` field by default.
 function renderAgentGroup(fields, own = {}, inherited = {}, altFor) {
-  const [doField, mergeField, resolveField] = agentGroupFields(fields);
-  if (!doField || !mergeField || !resolveField) return null;
-  const separate = inferredSeparateAgents(own);
+  const [doField, mergeField, ...optionalFields] = agentGroupFields(fields);
+  if (!doField || !mergeField) return null;
+  const roleFields = [doField, mergeField, ...optionalFields].filter(Boolean);
+  const separate = inferredSeparateAgents(own, roleFields.map((f) => f.role));
   const unifiedField = { ...doField, name: 'agent:unified', role: 'unified', label: 'Agent' };
   const unifiedOwn = own['agent:unified'] ?? (!separate ? own['agent:do'] : undefined);
   const unifiedInherited = inherited['agent:do'] ?? inherited['agent:unified'];
   return `<div class="agent-group" data-agent-group>
-    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate Do, Merge and Resolve agent configurations</label>
+    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate ${roleFields.map((f) => f.label.replace(/ agent$/, '')).join(', ').replace(/, ([^,]+)$/, ' and $1')} agent configurations</label>
     <div class="agent-unified-panel" ${separate ? 'hidden' : ''}>${renderField(unifiedField, unifiedOwn, unifiedInherited, false, altFor?.(doField))}</div>
     <div class="agent-separated-panel" ${separate ? '' : 'hidden'}>
-      ${[doField, mergeField, resolveField].map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
+      ${roleFields.map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
     </div>
   </div>`;
 }
@@ -504,7 +506,7 @@ function readConfirmerLayers(box) {
 function collectForm(root, fields) {
   const out = {};
   const group = root.querySelector('[data-agent-group]');
-  const groupedRoles = group ? new Set(['do', 'merge', 'resolve']) : new Set();
+  const groupedRoles = group ? new Set(agentGroupFields(fields).map((f) => f.role)) : new Set();
   if (group) {
     const separate = group.querySelector('.agent-separate').checked;
     out.separateAgents = separate;
@@ -3407,11 +3409,11 @@ function overviewTab(v) {
 }
 
 // Check-in: talking to the task — every agent's conversation (Do / Merge /
-// Resolve, SPEC §5.5/§5.6) plus the ephemeral terminal, behind a small sidebar.
+// Merge, SPEC §5.5/§5.6) plus the ephemeral terminal, behind a small sidebar.
 // Falls back to `messages` (Do) for workflows that predate per-role transcripts.
 function taskTranscripts(v) {
   return (v.transcripts && v.transcripts.length)
-    ? v.transcripts
+    ? v.transcripts.filter((t) => S.meta?.resolveAgentEnabled || t.role !== 'resolve')
     : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
 }
 // The conversation owning the active stage — it gets the live bubble and is the
@@ -3473,7 +3475,7 @@ function conversationPane(v, t) {
     ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
     : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
-  // so a human can address any agent — Do, Merge or Resolve — not just Do. It
+  // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
   // appears only when the workflow currently allows follow-ups.
   const agentName = esc(t.label || t.role);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
@@ -3712,7 +3714,7 @@ function wireCredDrag(list, onReorder) {
 
 // Which agent role "owns" a given stage — drives which transcript opens by default.
 function roleForStage(s) {
-  if (s === 'resolve') return 'resolve';
+  if (S.meta?.resolveAgentEnabled && s === 'resolve') return 'resolve';
   if (s === 'pr' || s === 'merge') return 'merge';
   return 'do';
 }

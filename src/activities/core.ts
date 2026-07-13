@@ -192,6 +192,7 @@ export interface PrepareChildArgs {
   target?: string;
   project: TaskInput['project'];
   profiles?: Record<string, string>;
+  resolveAgentEnabled?: boolean;
   /** The parent's world branch — the child's merge cap is scoped to exactly this
    *  (SPEC §8.2). The parent owns this branch, so it may grant merge into it. */
   parentBranch?: string;
@@ -953,6 +954,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         parentTaskId: args.parentTaskId,
         project: args.project,
         profiles: args.profiles,
+        resolveAgentEnabled: args.resolveAgentEnabled,
         grant,
       };
     },

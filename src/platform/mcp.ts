@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
 import { taskStatus } from '../domain/search.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 /**
  * The platform MCP server (SPEC §3.4) — the single API agents use to act on the
@@ -195,7 +196,15 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   );
   server.registerTool(
     'signal_task',
-    { description: 'Send a signal to a task (confirm, cancel, retry, or followUp with text). For a followUp, `role` optionally addresses a specific agent (do/merge/resolve); it defaults to the Do agent.', inputSchema: { taskId: z.string(), signal: z.enum(['confirm', 'cancel', 'retry', 'followUp']), text: z.string().optional(), role: z.enum(['do', 'merge', 'resolve']).optional() } },
+    {
+      description: `Send a signal to a task (confirm, cancel, retry, or followUp with text). For a followUp, \`role\` optionally addresses the ${RESOLVE_AGENT_ENABLED ? 'Do, Merge, or Resolve' : 'Do or Merge'} agent; it defaults to the Do agent.`,
+      inputSchema: {
+        taskId: z.string(),
+        signal: z.enum(['confirm', 'cancel', 'retry', 'followUp']),
+        text: z.string().optional(),
+        role: z.enum(RESOLVE_AGENT_ENABLED ? ['do', 'merge', 'resolve'] : ['do', 'merge']).optional(),
+      },
+    },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role); return 'signalled'; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
