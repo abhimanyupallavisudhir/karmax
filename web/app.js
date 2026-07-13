@@ -39,6 +39,7 @@ const S = {
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
   returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
+  modelCatalog: null, // provider-native model metadata loaded from the gateway
 };
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
@@ -193,11 +194,17 @@ const MODELS = {
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
   mock: ['mock'],
 };
+function modelOptions(provider) {
+  const live = S.modelCatalog?.[provider];
+  return live?.length ? live.map((m) => m.id) : (MODELS[provider] || MODELS.claude);
+}
 // Which reasoning-effort levels a given model actually accepts (mirrors the
 // server's src/agent/effort.ts gating). Empty = the model has no effort control.
 const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
 function effortLevelsFor(provider, model) {
   const m = (model || '').toLowerCase();
+  const advertised = S.modelCatalog?.[provider]?.find((x) => x.id === model)?.effort;
+  if (advertised) return advertised;
   if (provider === 'claude') {
     if (!/opus-4-(5|6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
     const ok = new Set(['low', 'medium', 'high']);
@@ -334,7 +341,6 @@ function renderAgentField(f, spec, inherited) {
   const inh = inherited || {};
   const e = spec || inh; // prefill with the effective spec
   const provider = e.provider || 'claude';
-  const models = MODELS[provider] || MODELS.claude;
   const role = f.role || f.name;
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -544,7 +550,7 @@ function wireAgentFields(root) {
   root.querySelectorAll('.agent-field').forEach((box) => {
     const combo = box.querySelector('.af-model-combo');
     const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
-    if (combo) wireCombo(combo, () => MODELS[providerOf()] || MODELS.claude, () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
+    if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
     box.querySelector('.af-provider')?.addEventListener('change', () => {
       box.querySelector('.af-model').value = ''; // model choices are provider-specific
       refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
@@ -819,6 +825,7 @@ async function boot() {
   try {
     S.contributions = await api('/api/contributions');
     S.schema = await api('/api/schema');
+    S.modelCatalog = (await api('/api/models')).providers;
   } catch {}
   await loadProjects();
   connectWs();
@@ -4657,7 +4664,7 @@ async function hydrateProfiles(scope, projectId) {
   list.querySelectorAll('[data-profile]').forEach((card) => {
     const combo = card.querySelector('.pf-model-combo');
     const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
-    if (combo) wireCombo(combo, () => MODELS[providerOf()] || MODELS.claude, () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
+    if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
     card.querySelector('.pf-provider')?.addEventListener('change', () => {
       card.querySelector('.pf-model').value = ''; // model choices are provider-specific
       refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
