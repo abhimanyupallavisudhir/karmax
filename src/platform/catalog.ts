@@ -1,0 +1,55 @@
+/** Agent-readable map of the first-party HTTP surface used by platform_request. */
+export const PLATFORM_API_CATALOG = {
+  note: 'Every route is authenticated and capability checked. Colon-prefixed names are path parameters.',
+  projects: [
+    'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
+    'POST /api/projects/:projectId/activate-workflow', 'GET|POST /api/projects/:projectId/workflow-pins',
+  ],
+  tasks: [
+    'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
+    'GET /api/projects/:projectId/search?q=', 'GET|POST /api/projects/:projectId/tags',
+    'PATCH|DELETE /api/tags/:id', 'GET|POST /api/projects/:projectId/views',
+    'PATCH|DELETE /api/views/:id', 'POST /api/views/:id/reorder',
+    'GET|DELETE /api/tasks/:taskId', 'POST /api/tasks/:taskId/queue',
+    'PATCH /api/tasks/:taskId/params|notes|authorization',
+    'PUT /api/tasks/:taskId/tags|priority', 'POST /api/tasks/:taskId/tag|archive|signal|target',
+    'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
+  ],
+  conversations: [
+    'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
+    'POST /api/tasks/:taskId/fork-agent', 'GET /api/tasks/:taskId/sessions',
+    'GET /api/tasks/:taskId/events?since=', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent)',
+  ],
+  review: [
+    'POST /api/tasks/:taskId/review-action', 'GET /api/tasks/:taskId/review-action/:procId',
+    'POST /api/tasks/:taskId/review-action/:procId/stop', 'GET /api/tasks/:taskId/artifact?path=',
+    'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
+  ],
+  automation: [
+    'GET /api/workflows', 'POST /api/workflows/install', 'POST /api/projects/:projectId/propose-workflow-edit',
+    'GET|PUT /api/profiles', 'DELETE /api/profiles/:id',
+    'GET /api/models|schema|events/catalog|contributions', 'GET /api/defaults/:projectId/:workflow',
+    'GET|PUT /api/settings/global/:workflow', 'GET|PUT /api/settings/project/:projectId/:workflow',
+    'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
+    'POST /api/skills', 'POST /api/safe-mode',
+  ],
+  credentials: [
+    'GET|POST /api/accounts', 'POST /api/accounts/connect', 'PATCH|DELETE /api/accounts/logins/:provider/:account',
+    'POST /api/accounts/availability|concurrency|usage/recheck', 'GET /api/accounts/usage',
+    'GET /api/credentials?projectId=&taskId=', 'POST /api/credentials/policy?projectId=|taskId=',
+    'GET|POST /api/git-profiles', 'GET|PATCH|DELETE /api/git-profiles/:id',
+    'GET /api/git-profiles/preflight?projectId=', 'POST /api/git-profiles/default',
+  ],
+  payments: ['GET /api/payments/providers', 'POST /api/payments/connect', 'GET|POST /api/cards', 'POST /api/cards/:id/fund'],
+  administration: [
+    'GET|POST /api/users', 'DELETE /api/users/:id',
+    'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',
+    'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',
+  ],
+  operations: [
+    'GET /api/activity?projectId=&since=', 'GET /api/dashboard', 'GET /api/diagnostics',
+    'GET /api/processes', 'POST /api/processes/kill',
+    'GET /api/queue?domain=&projectId=', 'POST /api/queue/prioritize|move?projectId=',
+    'POST /api/attachments (JSON dataUrl or image bytes)', 'WS /ws (authorized event stream)',
+  ],
+} as const;

@@ -21,6 +21,8 @@ import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { defaultModel, defaultEffort } from '../agent/profiles.js';
+import type { AuthorizationService } from './authorization.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -92,6 +94,9 @@ export interface KarmaxApiDeps {
    * when absent the API serves only the built-in workflows (unchanged behavior).
    */
   workflows?: WorkflowManager;
+  authorization?: AuthorizationService;
+  /** Provider selected by the host/harness; avoids re-detecting ambient creds. */
+  defaultAgentProvider?: Provider;
 }
 
 /**
@@ -109,9 +114,9 @@ export class KarmaxApi {
     this.armer = armer;
   }
 
-  private require(token: string, tool: string) {
+  private require(token: string, tool: string, scope?: { projectId?: string; taskId?: string }) {
     const cap = TOOL_CAPABILITY[tool] ?? tool;
-    const r = this.deps.tokens.check(token, cap);
+    const r = this.deps.tokens.check(token, cap, scope);
     if (!r.ok) throw new CapabilityError(r.reason ?? `denied: ${cap}`);
     return r.record!;
   }
@@ -166,11 +171,13 @@ export class KarmaxApi {
       /** Added from the quick-task box (not the full form): layer the quick-task
        *  defaults over the general defaults when resolving (SPEC §10.4). */
       quick?: boolean;
+      /** Job-shaped permission profile for every agent spawned by this workflow. */
+      authorizationProfile?: string;
       /** Total mutually-exclusive attempts to create and queue up front. */
       attempts?: number;
     },
   ): Promise<TaskRecord> {
-    this.require(token, 'create_task');
+    const caller = this.require(token, 'create_task', { projectId: args.projectId });
     const workflow = args.workflow ?? 'software-dev';
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
@@ -179,6 +186,9 @@ export class KarmaxApi {
     const { manifest, startType } = start;
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
+    const authorization = this.deps.authorization
+      ? this.deps.authorization.taskGrant(caller.principal, args.projectId, args.authorizationProfile, caller.caps)
+      : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
@@ -207,7 +217,14 @@ export class KarmaxApi {
       title,
       workflow,
       workflowVersion: manifest.version,
-      params: { ...taskOverrides, prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''), profiles: args.profiles, draft: !!args.draft, ...(repeatable ? { repeatable: true } : {}) },
+      params: {
+        ...taskOverrides,
+        prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''),
+        profiles: args.profiles,
+        draft: !!args.draft,
+        _authorization: { ...authorization, principal: caller.principal },
+        ...(repeatable ? { repeatable: true } : {}),
+      },
       confirmer: (() => {
         const field = manifest.params.find((f) => f.type === 'confirmer');
         return field ? resolved[field.name] : undefined;
@@ -293,6 +310,10 @@ export class KarmaxApi {
       project: project.config,
     });
     input.workflow = workflow;
+    input.grant = authorization.capabilities;
+    input.grantPrincipal = caller.principal;
+    input.authorizationProfile = authorization.profileId;
+    input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
     input.intentId = task.intentId ?? task.id;
     if (args.profiles) input.profiles = args.profiles;
     const initialImages = taskOverrides.images as ImageRef[] | undefined;
@@ -364,7 +385,7 @@ export class KarmaxApi {
     let spec = resolved['agent:do'] as AgentSpec | undefined;
     if (!spec?.provider) {
       const profile = this.deps.store.getProfile(`${projectId}::do-default`) ?? this.deps.store.getProfile('do-default');
-      const provider = (profile?.provider ?? defaultProvider().provider) as Provider;
+      const provider = (profile?.provider ?? this.deps.defaultAgentProvider ?? defaultProvider().provider) as Provider;
       const model = profile?.model ?? defaultModel(provider);
       const effort = profile?.effort ?? defaultEffort(provider);
       spec = { provider, ...(model ? { model } : {}), ...(effort ? { effort: effort as AgentSpec['effort'] } : {}) };
@@ -372,7 +393,7 @@ export class KarmaxApi {
     resolved['agent:do'] = spec;
     const { resumeFrom: _resumeFrom, ...shared } = spec;
     resolved['agent:merge'] = shared;
-    resolved['agent:resolve'] = shared;
+    if (RESOLVE_AGENT_ENABLED) resolved['agent:resolve'] = shared;
   }
 
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
@@ -420,7 +441,7 @@ export class KarmaxApi {
     // Re-resolve against the CURRENT project/global defaults. The task stored only
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived/triggers) aren't overrides.
-    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, ...overrides } = task.params as Record<string, unknown>;
+    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, _authorization, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it
     // once prevents attempts queued days apart from inheriting different reviewers.
@@ -436,6 +457,11 @@ export class KarmaxApi {
       project: project.config,
     });
     input.workflow = task.workflow;
+    const auth = _authorization as { capabilities?: string[]; principal?: string; profileId?: string } | undefined;
+    input.grant = auth?.capabilities ?? ['task:signal'];
+    input.grantPrincipal = auth?.principal ?? 'system:legacy-task';
+    input.authorizationProfile = auth?.profileId ?? 'legacy';
+    input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
     input.intentId = task.intentId ?? task.id;
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
@@ -460,9 +486,9 @@ export class KarmaxApi {
 
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
-    this.require(token, 'create_task');
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
+    this.require(token, 'create_task', { projectId: task.projectId, taskId });
     const group = this.deps.store.attemptGroup(taskId);
     if (group?.committedAttemptId && group.committedAttemptId !== taskId) {
       throw new Error('another attempt has entered Merge; this task is committed and no other attempt can be queued');
@@ -498,6 +524,25 @@ export class KarmaxApi {
           `It's still saved as a draft — check that Temporal is healthy and try again.`,
       );
     }
+    return this.deps.store.getTask(taskId)!;
+  }
+
+  /** Change the job-shaped grant on work that has not started yet. The selected
+   * profile is always re-attenuated against the immediate bearer, so an agent
+   * cannot use a human principal recorded on the draft as a confused deputy. */
+  setTaskAuthorization(token: string, taskId: string, profileId: string): TaskRecord {
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    if (!task.params?.draft && task.params?.triggerState !== 'armed' && !task.params?.repeatable)
+      throw new Error('authorization is frozen after a task starts');
+    const caller = this.require(token, 'create_task', { projectId: task.projectId, taskId });
+    const authorization = this.deps.authorization
+      ? this.deps.authorization.taskGrant(caller.principal, task.projectId, profileId, caller.caps)
+      : { profileId, capabilities: caller.caps, attenuated: false };
+    this.deps.store.updateTaskParams(taskId, {
+      ...task.params,
+      _authorization: { ...authorization, principal: caller.principal },
+    });
     return this.deps.store.getTask(taskId)!;
   }
 
@@ -605,13 +650,18 @@ export class KarmaxApi {
     this.require(token, 'edit_task');
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
+    const { profiles, _authorization } = task.params;
+    const meta = {
+      ...(profiles !== undefined ? { profiles } : {}),
+      ...(_authorization !== undefined ? { _authorization } : {}),
+    };
     const confirmerField = this.resolveStart(task.workflow, task.workflowVersion)?.manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField && Object.prototype.hasOwnProperty.call(params, confirmerField.name)) {
       this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, params[confirmerField.name]);
     }
-    const { profiles } = task.params;
-    const meta = profiles !== undefined ? { profiles } : {};
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
+    // Authorization is platform metadata, never a workflow-form field.
+    if (_authorization !== undefined) base._authorization = _authorization;
     delete base.triggerState; // lifecycle flags are managed below, never taken from the form
     delete base.draft;
     // Keep the display title tracking the (edited) prompt — the title was derived
@@ -641,7 +691,8 @@ export class KarmaxApi {
     taskId: string,
     opts?: { live?: boolean },
   ): Promise<TaskView | undefined> {
-    this.require(token, 'get_task');
+    const rec = this.deps.store.getTask(taskId);
+    this.require(token, 'get_task', { projectId: rec?.projectId, taskId });
     const snapshot = () => this.deps.store.getTask(taskId)?.lastView;
     // Cosmetic human notes live on the record (never on the workflow), so mirror
     // them onto whichever view we return — the UI shows/edits them at any stage.
@@ -711,7 +762,7 @@ export class KarmaxApi {
   }
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
-    this.require(token, 'list_tasks');
+    this.require(token, 'list_tasks', { projectId });
     return this.deps.store.listPrincipalTasks(projectId);
   }
 
@@ -746,8 +797,64 @@ export class KarmaxApi {
   }
 
   attemptGroup(token: string, taskId: string) {
-    this.require(token, 'get_task');
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'get_task', { projectId: task?.projectId, taskId });
     return this.deps.store.attemptGroup(taskId);
+  }
+
+  /** Resolve the human-facing project-local number (#100) without guessing ids. */
+  async findTask(token: string, projectId: string, num: number): Promise<TaskRecord | undefined> {
+    this.require(token, 'find_task', { projectId });
+    return this.deps.store.getTaskByNum(projectId, num);
+  }
+
+  /** Every durable agent conversation attached to a task, including sessions. */
+  async listTaskAgents(token: string, taskId: string): Promise<Array<{ role: string; label: string; session?: string; provider?: string; messageCount: number }>> {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'list_agents', { projectId: task?.projectId, taskId });
+    if (!task) throw new Error(`no task ${taskId}`);
+    const view = await this.getTaskView(token, taskId);
+    const transcripts = view?.transcripts?.length
+      ? view.transcripts
+      : [{ role: 'do', label: 'Do', messages: view?.messages ?? [] }];
+    return transcripts.map((t) => {
+      const session = this.deps.store.kvGet(`session:${taskId}:${t.role}`) || undefined;
+      let provider: string | undefined;
+      try { provider = JSON.parse(this.deps.store.kvGet(`sessionmeta:${taskId}:${t.role}`) ?? '{}').provider; } catch { /* legacy */ }
+      return { role: t.role, label: t.label, session, provider, messageCount: t.messages.length };
+    });
+  }
+
+  async taskConversation(token: string, taskId: string, role = 'do'): Promise<{ role: string; session?: string; messages: Message[] }> {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'get_conversation', { projectId: task?.projectId, taskId });
+    const view = await this.getTaskView(token, taskId);
+    if (!view) throw new Error(`task ${taskId} has no conversation yet`);
+    const transcript = role === 'do' ? undefined : view.transcripts?.find((t) => t.role === role);
+    return { role, session: this.deps.store.kvGet(`session:${taskId}:${role}`) || undefined, messages: (transcript?.messages ?? view.messages).map((m) => ({ ...m })) };
+  }
+
+  /** Branch a source agent into an independent task/session; the source is never mutated. */
+  async forkTaskAgent(token: string, args: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<TaskRecord> {
+    const source = this.deps.store.getTask(args.taskId);
+    this.require(token, 'fork_agent', { projectId: source?.projectId, taskId: args.taskId });
+    if (!source) throw new Error(`no task ${args.taskId}`);
+    const role = args.role ?? 'do';
+    if (!this.deps.store.kvGet(`session:${args.taskId}:${role}`) && !(await this.getTaskView(token, args.taskId))?.messages?.length)
+      throw new Error(`the ${role} agent has no conversation to fork`);
+    return this.createTask(token, {
+      projectId: source.projectId,
+      title: args.title ?? `Fork of #${source.num ?? source.id} ${role}`,
+      workflow: 'software-dev',
+      params: { prompt: args.message, 'agent:do': { resumeFrom: { taskId: args.taskId, role } } },
+      authorizationProfile: args.authorizationProfile,
+    });
+  }
+
+  async taskEvents(token: string, taskId: string, since = 0) {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'list_events', { projectId: task?.projectId, taskId });
+    return this.deps.store.eventsSince(taskId, since);
   }
 
   // ─── Search & organization (task search / views — PLAN-search-views) ─────────
@@ -763,7 +870,7 @@ export class KarmaxApi {
    * `TaskQuery`. Returns the filtered+sorted list, optional groups, and total.
    */
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
-    this.require(token, 'search_tasks');
+    this.require(token, 'search_tasks', { projectId });
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
     const tasks = this.deps.store.listPrincipalTasks(projectId);
     const tags = this.deps.store.listTags(projectId);
@@ -778,7 +885,7 @@ export class KarmaxApi {
 
   // ─── Tags ────────────────────────────────────────────────────────────────────
   async listTags(token: string, projectId: string): Promise<Tag[]> {
-    this.require(token, 'list_tags');
+    this.require(token, 'list_tags', { projectId });
     return this.deps.store.listTags(projectId);
   }
 
@@ -811,9 +918,9 @@ export class KarmaxApi {
    * paths. This is what the platform MCP exposes so agents can label tasks they touch.
    */
   async tagTask(token: string, taskId: string, patch: { add?: string[]; remove?: string[] }): Promise<{ tags: string[] }> {
-    this.require(token, 'set_task_tags');
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no such task ${taskId}`);
+    this.require(token, 'set_task_tags', { projectId: task.projectId, taskId });
     const resolve = () => {
       const tags = this.deps.store.listTags(task.projectId);
       const byId = new Map(tags.map((t) => [t.id, t]));
@@ -841,7 +948,8 @@ export class KarmaxApi {
 
   /** Set the organizational priority (0–4) — editable at any lifecycle stage. */
   async setTaskPriority(token: string, taskId: string, priority: number): Promise<void> {
-    this.require(token, 'set_task_priority');
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'set_task_priority', { projectId: task?.projectId, taskId });
     this.deps.store.setTaskPriority(taskId, priority);
   }
 
@@ -968,7 +1076,8 @@ export class KarmaxApi {
   }
 
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
-    this.require(token, 'signal_task');
+    const scopedTask = this.deps.store.getTask(taskId);
+    this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     const terminal = this.deps.store.getTask(taskId)?.lastView;
     if (terminal?.status === 'failed' && terminal.workflow === 'software-dev' && !terminal.pointOfNoReturnPassed) {
       if (signal === SIG.retry) return await this.recoverFailedTask(taskId);
@@ -1037,7 +1146,8 @@ export class KarmaxApi {
   }
 
   async setTarget(token: string, taskId: string, branch: string): Promise<boolean> {
-    this.require(token, 'edit_task');
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
     try {
       return (await this.deps.client.workflow.getHandle(taskId).executeUpdate('setTarget', { args: [branch] })) as boolean;
     } catch {
@@ -1053,7 +1163,8 @@ export class KarmaxApi {
    * re-derive the window.
    */
   async updateParams(token: string, taskId: string, patch: Record<string, unknown>): Promise<{ applied: string[] }> {
-    this.require(token, 'edit_task');
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
     try {
       return (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
     } catch (e) {
@@ -1062,7 +1173,10 @@ export class KarmaxApi {
   }
 
   async reorderQueue(token: string, domain: string, taskId: string): Promise<void> {
-    this.require(token, 'reorder_queue');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    this.require(token, 'reorder_queue', { projectId: task.projectId, taskId });
+    if (task.lastView?.state?.mergeDomain && task.lastView.state.mergeDomain !== domain) throw new Error('task is not in that merge queue domain');
     await this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
       workflowId: mergeQueueId(domain),
       taskQueue: this.deps.taskQueue,
@@ -1077,7 +1191,12 @@ export class KarmaxApi {
    * immediately before `beforeTaskId`, or at the end when no anchor is given.
    */
   async moveQueueItem(token: string, domain: string, taskId: string, beforeTaskId?: string): Promise<void> {
-    this.require(token, 'reorder_queue');
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    this.require(token, 'reorder_queue', { projectId: task.projectId, taskId });
+    if (task.lastView?.state?.mergeDomain && task.lastView.state.mergeDomain !== domain) throw new Error('task is not in that merge queue domain');
+    if (beforeTaskId && this.deps.store.getTask(beforeTaskId)?.projectId !== task.projectId)
+      throw new Error('cannot reorder across project authorization boundaries');
     await this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
       workflowId: mergeQueueId(domain),
       taskQueue: this.deps.taskQueue,
@@ -1087,10 +1206,13 @@ export class KarmaxApi {
     });
   }
 
-  async queueView(token: string, domain: string): Promise<{ queue: string[]; current?: string }> {
-    this.require(token, 'get_task');
+  async queueView(token: string, domain: string, projectId?: string): Promise<{ queue: string[]; current?: string }> {
+    this.require(token, 'get_task', projectId ? { projectId } : undefined);
     try {
-      return (await this.deps.client.workflow.getHandle(mergeQueueId(domain)).query('queue')) as { queue: string[]; current?: string };
+      const view = (await this.deps.client.workflow.getHandle(mergeQueueId(domain)).query('queue')) as { queue: string[]; current?: string };
+      if (!projectId) return view;
+      const belongs = (id: string | undefined) => !!id && this.deps.store.getTask(id)?.projectId === projectId;
+      return { queue: view.queue.filter((id) => belongs(id)), ...(belongs(view.current) ? { current: view.current } : {}) };
     } catch {
       return { queue: [] };
     }
@@ -1115,9 +1237,12 @@ export class KarmaxApi {
     token: string,
     args: { projectId: string; title: string; repo: string; branch: string; target: string },
   ): Promise<TaskRecord> {
-    this.require(token, 'edit_workflow');
+    const caller = this.require(token, 'edit_workflow', { projectId: args.projectId });
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
+    const authorization = this.deps.authorization
+      ? this.deps.authorization.taskGrant(caller.principal, args.projectId, undefined, caller.caps)
+      : { profileId: 'caller', capabilities: caller.caps, attenuated: false };
     const mergeOnlyVersion = MANIFESTS.find((m) => m.name === 'merge-only')?.version;
     if (!mergeOnlyVersion) throw new Error('bundled merge-only manifest is missing');
     const task = this.deps.store.createTask({
@@ -1127,7 +1252,10 @@ export class KarmaxApi {
       workflowVersion: mergeOnlyVersion,
       // Record the edit target so the self-healing loop can reload the workflow
       // from `repo@target` once this merge completes (§4.4).
-      params: { prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true },
+      params: {
+        prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true,
+        _authorization: { ...authorization, principal: caller.principal },
+      },
     });
     try {
       await withTimeout(
@@ -1144,6 +1272,9 @@ export class KarmaxApi {
               target: args.target,
               project: { ...project.config, repos: [args.repo] },
               workflowEdit: true,
+              grant: authorization.capabilities,
+              grantPrincipal: caller.principal,
+              authorizationProfile: authorization.profileId,
             },
           ],
         }),

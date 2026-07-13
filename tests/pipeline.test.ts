@@ -9,7 +9,7 @@ import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
 import { accountCoordinatorId } from '../src/coordinators/names.js';
 
-function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any }) {
+function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any; resolveAgentEnabled?: boolean }) {
   return {
     taskId: over.taskId,
     projectId: 'p1',
@@ -20,6 +20,7 @@ function input(over: { taskId: string; repo: string; prompt: string; title?: str
     project: { repos: [over.repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
     ...(over.subtaskNagMs !== undefined ? { subtaskNagMs: over.subtaskNagMs } : {}),
     ...(over.subagentWaitMs !== undefined ? { subagentWaitMs: over.subagentWaitMs } : {}),
+    ...(over.resolveAgentEnabled !== undefined ? { resolveAgentEnabled: over.resolveAgentEnabled } : {}),
     ...(over.recovery ? { recovery: over.recovery } : {}),
   };
 }
@@ -445,18 +446,20 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(Date.now() - t0).toBeLessThan(15_000);
   });
 
-  it('routes an unhandled error through Resolve to human escalation', async () => {
+  it('routes an unhandled error directly to human escalation when Resolve is disabled', async () => {
     const repo = await h.makeRepo('app-fail');
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
-      args: [input({ taskId, repo, title: 'Boom', prompt: '@fail boom goes the agent' })],
+      args: [input({ taskId, repo, title: 'Boom', prompt: '@fail boom goes the agent', resolveAgentEnabled: false })],
     });
-    // resolve attempts are exhausted (failure is not transient) → escalated
     await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
     const v = await view(handle);
     expect(v.status).toBe('blocked');
+    expect(v.error).toContain('boom goes the agent');
+    expect(h.store.eventsSince(taskId, 0).some((e) => e.type === 'resolve.auto')).toBe(true);
+    expect(v.transcripts?.some((t: any) => t.role === 'resolve')).toBe(false);
     expect(v.actions.map((a: any) => a.name)).toEqual(expect.arrayContaining(['retry', 'cancel']));
     // a human cancels the blocked task
     await handle.signal('cancel');

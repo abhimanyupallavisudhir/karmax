@@ -4,7 +4,7 @@ import { allRoles } from '../contrib/manifests.js';
 
 /**
  * The default per-role profiles, derived from the roles the active workflows
- * declare (SPEC §7.1) — not a hardcoded do/merge/resolve list. A workflow that
+ * declare (SPEC §7.1) — not a hardcoded role list. A workflow that
  * declares a new role automatically gets a seeded default + a profiles-UI entry.
  */
 export function makeDefaultProfiles(provider: Provider): AgentProfile[] {

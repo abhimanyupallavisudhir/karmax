@@ -274,7 +274,7 @@ describe('PTY terminal check-in (SPEC §5.5)', () => {
       if (v?.worldPath) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    const wsUrl = base.replace('http', 'ws') + `/ws/terminal?taskId=${task.id}`;
+    const wsUrl = base.replace('http', 'ws') + `/ws/terminal?taskId=${task.id}&token=${encodeURIComponent(token)}`;
     const got = await new Promise<string>((resolve) => {
       const ws = new WebSocket(wsUrl);
       let buf = '';

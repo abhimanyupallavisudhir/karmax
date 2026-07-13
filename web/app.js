@@ -336,25 +336,27 @@ function renderField(f, own, inherited, withChips, alt) {
   return `<div class="form-row" data-row="${esc(f.name)}">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
-const agentGroupFields = (fields) => ['do', 'merge', 'resolve'].map((role) => fields.find((f) => f.type === 'agent' && f.role === role));
-const inferredSeparateAgents = (values = {}) => values.separateAgents === true ||
-  (values.separateAgents === undefined && ['do', 'merge', 'resolve'].some((role) => values[`agent:${role}`] !== undefined));
+const agentGroupFields = (fields) => ['do', 'merge', ...(fields.some((f) => f.type === 'agent' && f.role === 'resolve') ? ['resolve'] : [])]
+  .map((role) => fields.find((f) => f.type === 'agent' && f.role === role));
+const inferredSeparateAgents = (values = {}, roles = ['do', 'merge']) => values.separateAgents === true ||
+  (values.separateAgents === undefined && roles.some((role) => values[`agent:${role}`] !== undefined));
 
-// Software-dev owns three operational roles, but most tasks want one identity for
-// all of them. Keep the manifest's role fields (the workflow still consumes those)
+// Software-dev's operational roles usually share one identity. Keep the
+// manifest's role fields (the workflow still consumes those)
 // while presenting a compact virtual `agent:unified` field by default.
 function renderAgentGroup(fields, own = {}, inherited = {}, altFor) {
-  const [doField, mergeField, resolveField] = agentGroupFields(fields);
-  if (!doField || !mergeField || !resolveField) return null;
-  const separate = inferredSeparateAgents(own);
+  const [doField, mergeField, ...optionalFields] = agentGroupFields(fields);
+  if (!doField || !mergeField) return null;
+  const roleFields = [doField, mergeField, ...optionalFields].filter(Boolean);
+  const separate = inferredSeparateAgents(own, roleFields.map((f) => f.role));
   const unifiedField = { ...doField, name: 'agent:unified', role: 'unified', label: 'Agent' };
   const unifiedOwn = own['agent:unified'] ?? (!separate ? own['agent:do'] : undefined);
   const unifiedInherited = inherited['agent:do'] ?? inherited['agent:unified'];
   return `<div class="agent-group" data-agent-group>
-    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate Do, Merge and Resolve agent configurations</label>
+    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate ${roleFields.map((f) => f.label.replace(/ agent$/, '')).join(', ').replace(/, ([^,]+)$/, ' and $1')} agent configurations</label>
     <div class="agent-unified-panel" ${separate ? 'hidden' : ''}>${renderField(unifiedField, unifiedOwn, unifiedInherited, false, altFor?.(doField))}</div>
     <div class="agent-separated-panel" ${separate ? '' : 'hidden'}>
-      ${[doField, mergeField, resolveField].map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
+      ${roleFields.map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
     </div>
   </div>`;
 }
@@ -504,7 +506,7 @@ function readConfirmerLayers(box) {
 function collectForm(root, fields) {
   const out = {};
   const group = root.querySelector('[data-agent-group]');
-  const groupedRoles = group ? new Set(['do', 'merge', 'resolve']) : new Set();
+  const groupedRoles = group ? new Set(agentGroupFields(fields).map((f) => f.role)) : new Set();
   if (group) {
     const separate = group.querySelector('.agent-separate').checked;
     out.separateAgents = separate;
@@ -822,7 +824,11 @@ async function api(path, opts = {}) {
   }
   const ct = res.headers.get('content-type') || '';
   const body = ct.includes('json') ? await res.json() : await res.text();
-  if (!res.ok) throw new Error(body?.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const error = new Error(body?.error || `HTTP ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
   return body;
 }
 
@@ -832,7 +838,7 @@ async function api(path, opts = {}) {
 // reference. Thumbnails are served back via /api/attachments/:id?token=… (an
 // <img> can't send a Bearer header, so the session token rides in the query).
 async function uploadImage(file) {
-  const res = await fetch('/api/attachments', {
+  const res = await fetch(`/api/attachments?projectId=${encodeURIComponent(S.projectId)}`, {
     method: 'POST',
     headers: { 'content-type': file.type || 'application/octet-stream', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
     body: file,
@@ -843,7 +849,7 @@ async function uploadImage(file) {
 }
 
 function attachmentUrl(id) {
-  return `/api/attachments/${encodeURIComponent(id)}?token=${encodeURIComponent(S.token || '')}`;
+  return `/api/attachments/${encodeURIComponent(id)}?projectId=${encodeURIComponent(S.projectId)}&token=${encodeURIComponent(S.token || '')}`;
 }
 
 function renderImageChips(container, store, onChange) {
@@ -932,15 +938,25 @@ function toast(msg, err = false, action) {
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   const session = await (await fetch('/api/session')).json();
-  if (session.authRequired && !session.token) return renderLogin();
-  S.token = session.token;
+  if (session.setupRequired) return renderSetup();
+  if (session.authRequired && !session.authenticated && !session.token) return renderLogin();
+  S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
+  S.user = session.user || null;
   S.meta = await api('/api/meta');
+  try { await loadProjects(); }
+  catch (e) {
+    // A self-registered identity is real but intentionally starts with no
+    // project grants. Give it an honest waiting room instead of a generic boot
+    // failure (and do not mistake authentication for project access).
+    if (e.status === 403) return renderAccessPending();
+    throw e;
+  }
+  const projectScope = S.projectId ? `?projectId=${encodeURIComponent(S.projectId)}` : '';
   try {
-    S.contributions = await api('/api/contributions');
-    S.schema = await api('/api/schema');
-    S.modelCatalog = (await api('/api/models')).providers;
+    S.contributions = await api(`/api/contributions${projectScope}`);
+    S.schema = await api(`/api/schema${projectScope}`);
+    S.modelCatalog = (await api(`/api/models${projectScope}`)).providers;
   } catch {}
-  await loadProjects();
   connectWs();
   renderShell();
   bindKeys();
@@ -976,7 +992,7 @@ async function loadOrg() {
   const [tags, views, fields] = await Promise.all([
     api(`/api/projects/${pid}/tags`).catch(() => []),
     api(`/api/projects/${pid}/views`).catch(() => []),
-    S.fields.length ? Promise.resolve(S.fields) : api(`/api/search/fields`).catch(() => []),
+    S.fields.length ? Promise.resolve(S.fields) : api(`/api/search/fields?projectId=${encodeURIComponent(pid)}`).catch(() => []),
   ]);
   S.tags = tags || [];
   S.views = views || [];
@@ -1061,7 +1077,7 @@ function stringifyQuery(q) {
 let refreshTimer = null;
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}`);
   S.ws = ws;
   ws.onmessage = (m) => {
     let ev;
@@ -1139,12 +1155,17 @@ function renderRail() {
     <div class="label">Global</div>
     <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
     <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
+    <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
     <div class="nav-item" id="rail-palette" tabindex="0" title="Every command, task, and project — searchable">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
   rail.querySelectorAll('.proj[data-id]').forEach((e) =>
     e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
+  $('#rail-logout')?.addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
+    location.reload();
+  });
   $('#rail-palette')?.addEventListener('click', openPalette);
 }
 
@@ -2252,6 +2273,11 @@ async function openTaskForm(workflow, draft, seedText) {
   }
   let inherited = {};
   try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
+  let authorization = { profiles: [], defaultProfile: 'developer' };
+  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(S.projectId)}`); } catch {}
+  const selectedAuthorization = draft?.params?._authorization?.profileId || authorization.defaultProfile;
+  const authorizationOptions = (authorization.profiles || []).map((p) =>
+    `<option value="${esc(p.id)}" ${p.id === selectedAuthorization ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
   // A draft can open directly from the list, without its task page having loaded
   // the intent. Fetch the group so the shared confirmer freezes after any sibling
   // queues, while remaining editable (and propagated) when every sibling is a draft.
@@ -2284,6 +2310,11 @@ async function openTaskForm(workflow, draft, seedText) {
             ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
             <span style="color:var(--ink-3);font-size:12px">For search / organization only — never sent to the agent. Use / for nested tags.</span>
           </div>
+          ${authorizationOptions ? `<div class="form-row" data-row="__authorization">
+            <div class="label-row"><label>Agent authorization</label></div>
+            <select id="tf-authorization">${authorizationOptions}</select>
+            <span style="color:var(--ink-3);font-size:12px">Applies to every agent and retry in this workflow, capped by your own permissions.</span>
+          </div>` : ''}
           <details class="advanced" style="margin-top:10px">
             <summary>Credentials — precedence &amp; enable/disable for this task</summary>
             <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
@@ -2381,7 +2412,7 @@ async function openTaskForm(workflow, draft, seedText) {
     const triggers = collectTriggers(values.triggers);
     if (triggers.length) body.triggers = triggers;
     if ($('#trig-repeatable')?.checked) body.repeatable = true;
-    return { body, notes: $('#tf-notes')?.value ?? '' };
+    return { body, notes: $('#tf-notes')?.value ?? '', authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
   // guards against spawning empty drafts just from opening the form.
@@ -2420,13 +2451,14 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
         }
-        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        if (localCred && hasPolicy()) await api(`/api/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
         refreshTasks();
       } catch { /* keep the form open; a later save or explicit button will retry */ }
@@ -2451,7 +2483,8 @@ async function openTaskForm(workflow, draft, seedText) {
     await persistDraft();
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
-    const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: formState().body, draft: true }) });
+    const state = formState();
+    const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -2487,10 +2520,12 @@ async function openTaskForm(workflow, draft, seedText) {
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
         await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
+        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
         if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
@@ -2500,13 +2535,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -2519,7 +2554,7 @@ async function openTaskForm(workflow, draft, seedText) {
         const group = await api(`/api/tasks/${primaryId}/attempts`);
         for (const attempt of group?.attempts || []) {
           if (attempt.params?.draft) await api(`/api/tasks/${attempt.id}/queue`, { method: 'POST', body: '{}' });
-        }
+      }
       }
       root.innerHTML = '';
       toast(editInPlace ? (draftMode ? 'Moved to drafts' : 'Saved') : draftMode ? 'Draft saved' : 'Task created');
@@ -3228,7 +3263,7 @@ function bindTermScreen(out) {
 function openTerminal(taskId) {
   if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
   term = { taskId, ws, screen: makeTermScreen() };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
@@ -3318,7 +3353,7 @@ function wireReviewActions(v) {
         if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
         if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}`);
+        const ws = new WebSocket(`${proto}://${location.host}/ws/review-action?procId=${encodeURIComponent(r.procId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
         reviewActionWs = ws;
         ws.onmessage = (m) => {
           try {
@@ -3407,11 +3442,11 @@ function overviewTab(v) {
 }
 
 // Check-in: talking to the task — every agent's conversation (Do / Merge /
-// Resolve, SPEC §5.5/§5.6) plus the ephemeral terminal, behind a small sidebar.
+// Merge, SPEC §5.5/§5.6) plus the ephemeral terminal, behind a small sidebar.
 // Falls back to `messages` (Do) for workflows that predate per-role transcripts.
 function taskTranscripts(v) {
   return (v.transcripts && v.transcripts.length)
-    ? v.transcripts
+    ? v.transcripts.filter((t) => S.meta?.resolveAgentEnabled || t.role !== 'resolve')
     : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
 }
 // The conversation owning the active stage — it gets the live bubble and is the
@@ -3473,7 +3508,7 @@ function conversationPane(v, t) {
     ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
     : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
-  // so a human can address any agent — Do, Merge or Resolve — not just Do. It
+  // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
   // appears only when the workflow currently allows follow-ups.
   const agentName = esc(t.label || t.role);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
@@ -3654,7 +3689,8 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     // Local mode: keep the change client-side (applied when the task is created); else
     // persist immediately, keyed by taskId/projectId scope.
     if (opts.local) { opts.onChange?.(policy); renderCredentialEditor(el, scope, { ...opts, policy }); return; }
-    try { await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
+    const authScope = opts.taskId ? `?taskId=${encodeURIComponent(opts.taskId)}` : opts.projectId ? `?projectId=${encodeURIComponent(opts.projectId)}` : '';
+    try { await api(`/api/credentials/policy${authScope}`, { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
     catch (e) { toast(e.message, true); }
     renderCredentialEditor(el, scope, opts);
   };
@@ -3712,7 +3748,7 @@ function wireCredDrag(list, onReorder) {
 
 // Which agent role "owns" a given stage — drives which transcript opens by default.
 function roleForStage(s) {
-  if (s === 'resolve') return 'resolve';
+  if (S.meta?.resolveAgentEnabled && s === 'resolve') return 'resolve';
   if (s === 'pr' || s === 'merge') return 'merge';
   return 'do';
 }
@@ -4075,7 +4111,7 @@ async function seedQueue() {
   await Promise.all(
     domains.map(async (d) => {
       try {
-        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}`);
+        const v = await api(`/api/queue?domain=${encodeURIComponent(d)}&projectId=${encodeURIComponent(S.projectId)}`);
         orders[d] = { queue: v.queue || [], current: v.current };
       } catch {}
     }),
@@ -4160,9 +4196,9 @@ function wireQueueView() {
       renderMain();
       try {
         if (b.dataset.move === 'top') {
-          await api('/api/queue/prioritize', { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
+          await api(`/api/queue/prioritize?projectId=${encodeURIComponent(S.projectId)}`, { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
         } else {
-          await api('/api/queue/move', { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
+          await api(`/api/queue/move?projectId=${encodeURIComponent(S.projectId)}`, { method: 'POST', body: JSON.stringify({ domain, taskId: id }) });
         }
         toast(b.dataset.move === 'top' ? 'Moved to top' : 'Moved to bottom');
         setTimeout(seedQueue, 300);
@@ -4210,7 +4246,7 @@ function wireQueueDrag(list) {
     const at = order.indexOf(id);
     const beforeTaskId = at >= 0 && at < order.length - 1 ? order[at + 1] : '';
     try {
-      await api('/api/queue/move', { method: 'POST', body: JSON.stringify({ domain, taskId: id, beforeTaskId }) });
+      await api(`/api/queue/move?projectId=${encodeURIComponent(S.projectId)}`, { method: 'POST', body: JSON.stringify({ domain, taskId: id, beforeTaskId }) });
       setTimeout(seedQueue, 300);
     } catch (err) { toast(err.message, true); seedQueue(); }
   });
@@ -4218,7 +4254,7 @@ function wireQueueDrag(list) {
 
 // ── activity ─────────────────────────────────────────────────────────────────
 async function seedActivity() {
-  try { S.activity = (await api('/api/activity?since=0')).reverse(); renderMain(); } catch {}
+  try { S.activity = (await api(`/api/activity?since=0&projectId=${encodeURIComponent(S.projectId)}`)).reverse(); renderMain(); } catch {}
 }
 function activityView() {
   if (!S.activity.length) return `<div class="empty"><div class="big">No activity yet</div>Events stream here as agents work.</div>`;
@@ -4665,6 +4701,7 @@ function settingsView(proj) {
       <div id="cred-editor-project">Loading…</div>
     </div>
     ${profilesCard('project')}
+    ${authorizationCard('project')}
     ${paymentsCard('project')}
     <div class="card" id="git-preflight-card">
       <div class="section-h">Git setup</div>
@@ -4718,6 +4755,7 @@ function wireSettingsView(proj) {
   wireQuickSettingsSave('project', proj.id);
   renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
+  hydrateAuthorization('project', proj.id);
   hydrateWorkflowPins(proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
@@ -4783,6 +4821,7 @@ function globalSettingsView() {
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from your general global defaults above (↺ Reset to default) until you set it here.`)}
     ${quickSettingsForms('global')}
     ${profilesCard('global')}
+    ${authorizationCard('global')}
     ${paymentsCard('global')}
     <div class="card" id="accounts-card">
       <div class="section-h">Accounts &amp; precedence</div>
@@ -5087,12 +5126,152 @@ function profilesCard(scope) {
   </div>`;
 }
 
+function authorizationCard(scope) {
+  return `<div class="card" id="authorization-card-${scope}">
+    <div class="section-h">Authorization</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Job-shaped permissions inherited by new task agents. A task can never receive more than its creator has.</p>
+    <div id="authorization-${scope}">Loading…</div>
+  </div>`;
+}
+
+function capabilityPatternAllows(pattern, capability) {
+  if (pattern === '*' || pattern === capability) return true;
+  if (pattern.endsWith(':*')) return capability.startsWith(pattern.slice(0, -1));
+  const p = pattern.split(':');
+  const c = capability.split(':');
+  return p.length === c.length && p.every((part, i) => part === '*' || part === c[i]);
+}
+
+function capabilityChecklist(profile, groups) {
+  const granted = profile.capabilities || [];
+  const has = (cap) => granted.some((pattern) => capabilityPatternAllows(pattern, cap));
+  const known = new Set(groups.flatMap((group) => group.capabilities.map((cap) => cap.id)));
+  // Concrete target-scoped grants cannot be enumerated in a finite checklist.
+  // Preserve those in a clearly secondary expert field; ordinary users only
+  // ever need the complete checklist above it.
+  const scoped = granted.filter((cap) => cap !== '*' && !known.has(cap) && !cap.endsWith(':*'));
+  return `<label class="authz-all"><input type="checkbox" class="authz-all-future" ${granted.includes('*') ? 'checked' : ''}> <span><b>All current and future capabilities</b><small>Administrator wildcard — automatically includes capabilities added in later releases.</small></span></label>
+    <div class="authz-checklist">${groups.map((group, index) => `<details class="authz-cap-group" ${index < 2 ? 'open' : ''}>
+      <summary><input type="checkbox" class="authz-group-toggle" tabindex="-1"> <span><b>${esc(group.label)}</b><small>${esc(group.description)}</small></span></summary>
+      <div class="authz-cap-items">${group.capabilities.map((cap) => `<label class="authz-cap-item"><input type="checkbox" class="authz-capability" value="${esc(cap.id)}" ${has(cap.id) ? 'checked' : ''}> <span><b>${esc(cap.label)}</b><code>${esc(cap.id)}</code><small>${esc(cap.description)}</small></span></label>`).join('')}</div>
+    </details>`).join('')}</div>
+    <details class="advanced authz-scoped"><summary>Advanced target-scoped capabilities</summary>
+      <p class="task-sub">Only capabilities tied to a concrete dynamic resource belong here. Most profiles should leave this empty.</p>
+      <textarea class="authz-scoped-capabilities mono" rows="2" placeholder="merge-into:/repo:branch">${esc(scoped.join('\n'))}</textarea>
+    </details>`;
+}
+
+function wireCapabilityChecklist(row) {
+  const all = row.querySelector('.authz-all-future');
+  const caps = [...row.querySelectorAll('.authz-capability')];
+  const syncGroup = (group) => {
+    const toggle = group.querySelector('.authz-group-toggle');
+    const members = [...group.querySelectorAll('.authz-capability')];
+    const n = members.filter((cap) => cap.checked).length;
+    toggle.checked = n === members.length;
+    toggle.indeterminate = n > 0 && n < members.length;
+  };
+  row.querySelectorAll('.authz-cap-group').forEach((group) => {
+    syncGroup(group);
+    const toggle = group.querySelector('.authz-group-toggle');
+    toggle.addEventListener('click', (event) => {
+      event.stopPropagation();
+      group.querySelectorAll('.authz-capability').forEach((cap) => { cap.checked = toggle.checked; });
+      all.checked = false;
+      syncGroup(group);
+    });
+  });
+  caps.forEach((cap) => cap.addEventListener('change', () => {
+    all.checked = false;
+    syncGroup(cap.closest('.authz-cap-group'));
+  }));
+  all.addEventListener('change', () => {
+    if (all.checked) caps.forEach((cap) => { cap.checked = true; });
+    row.querySelectorAll('.authz-cap-group').forEach(syncGroup);
+  });
+}
+
+async function hydrateAuthorization(scope, projectId) {
+  const box = $(`#authorization-${scope}`);
+  if (!box) return;
+  try {
+    const suffix = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+    const data = await api(`/api/authorization/profiles${suffix}`);
+    const options = data.profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === data.defaultProfile ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
+    box.innerHTML = `<div class="form-row"><label>Default for new tasks</label><select class="authz-default">${options}</select></div>
+      <div style="display:grid;gap:6px">${data.profiles.map((p) => `<details class="advanced authz-profile" data-profile-id="${esc(p.id)}">
+        <summary><b>${esc(p.name)}</b> — ${esc(p.description)}</summary>
+        <div class="form-row"><label>Description</label><input class="authz-description" value="${esc(p.description)}"></div>
+        ${capabilityChecklist(p, data.capabilityGroups || [])}
+        <button class="btn sm authz-save-profile">Save ${scope === 'project' ? 'project override' : 'profile'}</button>
+      </details>`).join('')}</div>
+      <div class="authz-accounts" style="margin-top:14px"><b>${scope === 'global' ? 'Human accounts' : 'Project access'}</b><div id="authz-users-${scope}" style="margin:6px 0">Loading…</div>
+        ${scope === 'global' ? `<div style="display:flex;gap:6px;flex-wrap:wrap"><input id="new-user-name" placeholder="Name"><input id="new-user-email" type="email" placeholder="Email"><input id="new-user-password" type="password" placeholder="Temporary password"><select id="new-user-profile">${options}</select><button class="btn sm" id="new-user-add">Add account</button></div>` : ''}</div>`;
+    box.querySelector('.authz-default')?.addEventListener('change', async (e) => {
+      await api('/api/authorization/default', { method: 'PUT', body: JSON.stringify({ profileId: e.target.value, ...(projectId ? { projectId } : {}) }) });
+      toast('Authorization default saved');
+    });
+    box.querySelectorAll('.authz-profile').forEach(wireCapabilityChecklist);
+    box.querySelectorAll('.authz-save-profile').forEach((button) => button.addEventListener('click', async () => {
+      const row = button.closest('.authz-profile');
+      const original = data.profiles.find((p) => p.id === row.dataset.profileId);
+      try {
+        const capabilities = row.querySelector('.authz-all-future').checked
+          ? ['*']
+          : [...row.querySelectorAll('.authz-capability:checked')].map((cap) => cap.value)
+              .concat(row.querySelector('.authz-scoped-capabilities').value.split(/[,\n]/).map((x) => x.trim()).filter(Boolean));
+        await api('/api/authorization/profiles', { method: 'PUT', body: JSON.stringify({
+          ...(projectId ? { projectId } : {}),
+          profile: {
+            ...original,
+            description: row.querySelector('.authz-description').value.trim(),
+            capabilities,
+          },
+        }) });
+        toast('Authorization profile saved');
+        hydrateAuthorization(scope, projectId);
+      } catch (e) { toast(e.message, true); }
+    }));
+    try {
+      const users = await api('/api/users');
+      const scopeKey = projectId ? `project:${projectId}` : 'global';
+      const usersBox = $(`#authz-users-${scope}`);
+      usersBox.innerHTML = users.map((u) => {
+        const current = (u.grants || []).find((grant) => grant.scopeKey === scopeKey);
+        const grantOptions = data.profiles.map((profile) => `<option value="${esc(profile.id)}" ${profile.id === (current?.profileId || data.defaultProfile) ? 'selected' : ''}>${esc(profile.name)}</option>`).join('');
+        return `<div class="queue-item"><div style="flex:1;min-width:180px"><b>${esc(u.name)}</b><div class="task-sub">${esc(u.email)} · ${current ? esc(current.profileId) : 'no access in this scope'}</div></div>
+          <select class="authz-user-profile" data-user-id="${esc(u.id)}">${grantOptions}</select><button class="btn sm authz-user-grant" data-user-id="${esc(u.id)}">${current ? 'Update' : 'Grant'} access</button></div>`;
+      }).join('') || 'No accounts.';
+      usersBox.querySelectorAll('.authz-user-grant').forEach((button) => button.addEventListener('click', async () => {
+        const principalId = `user:${button.dataset.userId}`;
+        const profileId = button.closest('.queue-item').querySelector('.authz-user-profile').value;
+        try {
+          await api('/api/authorization/grants', { method: 'PUT', body: JSON.stringify({ principalId, profileId, ...(projectId ? { projectId } : {}) }) });
+          toast('Account access saved');
+          hydrateAuthorization(scope, projectId);
+        } catch (e) { toast(e.message, true); }
+      }));
+    } catch (e) {
+      $(`#authz-users-${scope}`).innerHTML = `<span class="task-sub">Account grants require user and authorization administration access.</span>`;
+    }
+    if (scope === 'global') {
+      $('#new-user-add')?.addEventListener('click', async () => {
+        try {
+          await api('/api/users', { method: 'POST', body: JSON.stringify({ name: $('#new-user-name').value, email: $('#new-user-email').value, password: $('#new-user-password').value, profileId: $('#new-user-profile').value }) });
+          toast('Account created'); hydrateAuthorization('global');
+        } catch (e) { toast(e.message, true); }
+      });
+    }
+  } catch (e) { box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; }
+}
+
 function wireGlobalSettings() {
   hydrateSettingsForms('global');
   hydrateQuickSettingsForms('global');
   wireQuickSettingsSave('global');
   renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
   hydrateProfiles('global');
+  hydrateAuthorization('global');
   hydrateWorkflows();
   hydrateGitProfiles();
   wirePaymentsCard('global');
@@ -5670,18 +5849,79 @@ function openHelp() {
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:18px"><span class="mark">◇</span> karmax</div>
+    <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
+    <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
   const go = async () => {
     try {
-      const r = await (await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: $('#pw').value }) })).json();
-      if (r.token) { S.token = r.token; boot(); } else $('#login-err').textContent = 'Invalid password';
+      const res = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: $('#email').value, password: $('#pw').value }) });
+      if (res.ok) boot(); else $('#login-err').textContent = 'Invalid email or password';
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
+  $('#signup-open').addEventListener('click', renderSignup);
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+function renderSignup() {
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Create account</div>
+    <p class="task-sub">Your account starts with no project access. An administrator can grant the right profile after you join.</p>
+    <div class="form-row"><label>Name</label><input id="signup-name" autocomplete="name" /></div>
+    <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
+    <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
+    <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
+    <button class="btn" id="signup-back" style="width:100%;margin-top:8px">Back to sign in</button>
+    <div id="signup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
+  </div></div>`;
+  const go = async () => {
+    const res = await fetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      name: $('#signup-name').value, email: $('#signup-email').value, password: $('#signup-pw').value,
+    }) });
+    if (res.ok) boot();
+    else $('#signup-err').textContent = (await res.json().catch(() => ({}))).error || 'Could not create account';
+  };
+  $('#signup-btn').addEventListener('click', go);
+  $('#signup-back').addEventListener('click', renderLogin);
+  $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+function renderAccessPending() {
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Account created</div>
+    <p>Your identity is active, but it does not have access to a project yet.</p>
+    <p class="task-sub">Ask a karmax administrator to grant this account a global or project authorization profile. Signing in again will pick up the grant immediately.</p>
+    <button class="btn primary" id="pending-retry" style="width:100%">Check again</button>
+    <button class="btn" id="pending-logout" style="width:100%;margin-top:8px">Sign out</button>
+  </div></div>`;
+  $('#pending-retry').addEventListener('click', () => boot());
+  $('#pending-logout').addEventListener('click', async () => {
+    await fetch('/api/logout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
+    location.reload();
+  });
+}
+
+function renderSetup() {
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Set up karmax</div>
+    <p class="task-sub">Create the first administrator. Additional accounts are managed from Global settings.</p>
+    <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
+    <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>
+    <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="setup-pw" autocomplete="new-password" /></div>
+    <button class="btn primary" id="setup-btn" style="width:100%">Create administrator</button>
+    <div id="setup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
+  </div></div>`;
+  const go = async () => {
+    const res = await fetch('/api/setup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      name: $('#setup-name').value, email: $('#setup-email').value, password: $('#setup-pw').value,
+    }) });
+    if (res.ok) boot(); else $('#setup-err').textContent = (await res.json().catch(() => ({}))).error || 'Setup failed';
+  };
+  $('#setup-btn').addEventListener('click', go);
+  $('#setup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
 boot().catch((e) => { console.error(e); document.getElementById('app').innerHTML = `<div class="empty"><div class="big">Failed to load</div>${esc(e.message)}</div>`; });

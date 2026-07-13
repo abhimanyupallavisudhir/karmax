@@ -39,8 +39,14 @@ describe('platform MCP server (capability-checked tool calls)', () => {
       expect.arrayContaining([
         'create_task', 'save_skill', 'signal_task', 'reorder_queue', 'propose_workflow_edit',
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
+        'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent',
+        'list_events', 'describe_platform', 'platform_request',
       ]),
     );
+    const described: any = await client.callTool({ name: 'describe_platform', arguments: {} });
+    const catalog = JSON.parse(described.content[0].text);
+    expect(catalog.administration).toContain('GET|POST /api/users');
+    expect(catalog.payments).toContain('GET|POST /api/cards');
   });
 
   it('lets an agent tag, prioritize, and search tasks by attribute', async () => {
