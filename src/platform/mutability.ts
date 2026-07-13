@@ -9,7 +9,7 @@ import type { FieldMutable } from '../domain/types.js';
  *
  * A param declared `untilUsed` is editable until the workflow *consumes* it. The
  * per-param consumption point is workflow-specific (target → PR/merge enqueue;
- * merge/resolve agent → that role's turn), so the workflow decides `consumed`
+ * an auxiliary agent → that role's turn), so the workflow decides `consumed`
  * for each field and this predicate just applies the window uniformly.
  */
 export interface MutabilityFlags {

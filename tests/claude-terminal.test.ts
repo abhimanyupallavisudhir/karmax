@@ -11,6 +11,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 import { ClaudeAdapter } from '../src/agent/claude.js';
+import { ProviderFailure } from '../src/agent/limits.js';
 
 const input: any = {
   profile: { id: 'p', name: 'claude', provider: 'claude', role: 'do', capabilities: [] },
@@ -54,6 +55,20 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       { type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 's1', errors: ['stream disconnected'] },
     ];
     await expect(new ClaudeAdapter().runTurn(input, ctx)).rejects.toThrow(/error_during_execution.*stream disconnected/i);
+  });
+
+  it('types novel credit-exhaustion wording from an SDK error result', async () => {
+    sdkState.messages = [
+      {
+        type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 's1',
+        errors: ['Your prepaid balance has now been fully consumed.'],
+      },
+    ];
+    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderFailure);
+    expect(failure.metadata).toMatchObject({
+      kind: 'quota', permanence: 'hard', provider: 'claude', source: 'message',
+    });
   });
 
   it('rejects a stream that ends without any result event', async () => {

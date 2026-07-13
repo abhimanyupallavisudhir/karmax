@@ -30,6 +30,7 @@ export interface RunTurnDeps {
   /** Pull follow-up messages queued in the workflow at/after `fromIndex` so a
    *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
   pullFollowUps?: (fromIndex: number) => Promise<import('../domain/types.js').Message[]>;
+  platformRequest?: (method: string, path: string, body?: unknown) => Promise<unknown>;
 }
 
 /**
@@ -104,6 +105,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
         reviewInfo = { ...reviewInfo, summary: note };
       }
       return outcome;
+    },
+    async platformRequest(method, path, body) {
+      if (!deps.platformRequest) throw new Error('karmax gateway is unavailable to this turn');
+      return deps.platformRequest(method, path, body);
     },
     emit(text) {
       deps.onEmit?.(text);

@@ -159,17 +159,25 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     if (!req.provider) return true;
     return !!pickFor(req) || !accounts.some((a) => a.provider === req.provider);
   };
-  // A request that can NEVER be served — an allow-list whose every credential needs
+  // A request that can NEVER be served because every compatible credential needs
   // human action (needs-attention / manual-off / missing), with none available or
-  // auto-refreshing (exhausted). Such a request is DENIED so the task escalates to a
-  // human instead of parking forever (SPEC §5.2, #5).
-  const deniable = (req: Req): boolean =>
-    req.allowed !== undefined &&
-    req.allowed.length > 0 &&
-    !req.allowed.some((key) => {
-      const a = accounts.find((x) => x.id === key);
-      return a && (a.status === 'available' || a.status === 'exhausted');
-    });
+  // auto-refreshing (exhausted). Applies to both explicit policy allow-lists and the
+  // provider fallback used by mock/legacy adapters; otherwise a hard quota failure in
+  // fallback mode parks forever after correctly marking its only account bad.
+  const deniable = (req: Req): boolean => {
+    if (req.allowed !== undefined) {
+      return (
+        req.allowed.length > 0 &&
+        !req.allowed.some((key) => {
+          const a = accounts.find((x) => x.id === key);
+          return a && (a.status === 'available' || a.status === 'exhausted');
+        })
+      );
+    }
+    if (!req.provider) return false;
+    const compatible = accounts.filter((a) => a.provider === req.provider);
+    return compatible.length > 0 && compatible.every((a) => a.status === 'needs-attention' || a.status === 'manual-off');
+  };
 
   setHandler(registerAccountsSignal, ({ accounts: incoming }) => {
     for (const a of incoming) {

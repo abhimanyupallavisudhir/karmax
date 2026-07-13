@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { classifyLimitError, isTransportError, isResourceKill, resetAtFromHint } from '../src/agent/limits.js';
+import {
+  ProviderFailure,
+  classifyLimitError,
+  isTransportError,
+  isResourceKill,
+  providerErrorFromMessage,
+  providerFailure,
+  resetAtFromHint,
+} from '../src/agent/limits.js';
 
 describe('classifyLimitError', () => {
   it('classifies a Claude session-limit string + extracts the reset hint', () => {
@@ -38,6 +46,43 @@ describe('classifyLimitError', () => {
     const c = classifyLimitError('OpenAI Responses API 429: {"error":{"type":"insufficient_quota","message":"You exceeded your current quota, check your plan and billing"}}');
     expect(c.limited).toBe(true);
     expect(c.hard).toBe(true);
+  });
+
+  it('flags Claude Code usage-credit exhaustion as a HARD limit (task #151)', () => {
+    const c = classifyLimitError(
+      "Claude Code returned an error result: You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.",
+    );
+    expect(c.limited).toBe(true);
+    expect(c.hard).toBe(true);
+  });
+
+  it('generalizes novel provider wording by nearby state+noun phrase families', () => {
+    const hard = classifyLimitError('Your prepaid balance has now been fully consumed.', { providerOrigin: true });
+    expect(hard).toMatchObject({ limited: true, hard: true, kind: 'quota' });
+
+    const transient = classifyLimitError('Your monthly allowance is exhausted; resets tomorrow.', { providerOrigin: true });
+    expect(transient).toMatchObject({ limited: true, kind: 'quota' });
+    expect(transient.hard).toBeFalsy();
+  });
+
+  it('keeps semantic matching scoped to provider-originated failures', () => {
+    expect(classifyLimitError('tests failed: expected the credit balance depleted banner')).toEqual({ limited: false });
+    expect(classifyLimitError('git hook quota calculation failed')).toEqual({ limited: false });
+  });
+
+  it('preserves typed provider metadata and distinguishes structured signals from prose', () => {
+    const inferred = providerErrorFromMessage('claude', 'No credits remaining for this account.');
+    expect(inferred).toBeInstanceOf(ProviderFailure);
+    expect((inferred as ProviderFailure).metadata).toMatchObject({
+      kind: 'quota', permanence: 'hard', provider: 'claude', source: 'message',
+    });
+
+    const structured = providerFailure('provider event: UsageLimitReached', {
+      kind: 'quota', permanence: 'transient', provider: 'codex', resetHint: 'in 90s',
+    });
+    expect(structured.metadata).toMatchObject({
+      kind: 'quota', permanence: 'transient', provider: 'codex', source: 'structured', resetHint: 'in 90s',
+    });
   });
 
   it('a plain rate-limit is transient, not hard', () => {

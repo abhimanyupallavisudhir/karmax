@@ -1,7 +1,7 @@
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { classifyLimitError, isTransportError, isResourceKill } from '../agent/limits.js';
+import { classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -27,12 +27,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
-import { attenuate } from '../platform/capabilities.js';
+import { allows, attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 
-const DEFAULT_GRANT = ['*'];
+// Old executions without a recorded grant retain the normal developer workflow
+// surface (but no administration). New tasks always carry a creator-attenuated
+// stored grant, so this compatibility path disappears as legacy runs finish.
+const DEFAULT_GRANT = [
+  'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
+  'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+];
 
 // A confirmer belongs to a logical task, so sibling attempts must not review in
 // parallel against divergent copies of its conversation. The worker is the
@@ -63,14 +69,22 @@ async function acquireConfirmLock(key: string): Promise<() => void> {
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
  * workflows) — see src/workflows/failures.ts for the taxonomy. Original
- * messages are preserved verbatim: the workflow's account-leasing re-parses
- * them with classifyLimitError, and the Resolve prompt quotes them.
+ * messages are preserved verbatim for display, while provider failure metadata
+ * rides in ApplicationFailure.details for account rotation and auto-resolve.
  */
-function classifyTurnError(err: unknown): Error {
+function classifyTurnError(err: unknown, provider?: Provider): Error {
   const msg = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error ? err : undefined;
-  const cls = classifyLimitError(msg);
-  if (cls.limited || cls.hard) return ApplicationFailure.create({ message: msg, type: 'agent-limit', nonRetryable: true, cause });
+  const { classification: cls, metadata } = classifyProviderTurnError(err, provider);
+  if (cls.limited) {
+    return ApplicationFailure.create({
+      message: msg,
+      type: 'agent-limit',
+      nonRetryable: true,
+      cause,
+      ...(metadata ? { details: [metadata] } : {}),
+    });
+  }
   // A signal-9/SIGKILL agent death is environmental, not a code bug (karmax#4):
   // classify it as retryable 'agent-infra' with an ACTIONABLE message — the raw
   // "terminated by signal SIGKILL" tells an operator nothing. Temporal re-runs the
@@ -192,6 +206,7 @@ export interface PrepareChildArgs {
   target?: string;
   project: TaskInput['project'];
   profiles?: Record<string, string>;
+  resolveAgentEnabled?: boolean;
   /** The parent's world branch — the child's merge cap is scoped to exactly this
    *  (SPEC §8.2). The parent owns this branch, so it may grant merge into it. */
   parentBranch?: string;
@@ -365,7 +380,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const minted = deps.tokens.mint({
           taskId: args.taskId,
           profileId: profile.id,
-          principal: args.task.parentTaskId ? `task:${args.task.parentTaskId}` : 'user',
+          principal: args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
           projectId: args.task.projectId,
           ceiling: profile.capabilities,
           grantorCaps: grant,
@@ -618,7 +633,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(() => {
             const gitEnv = gitEnvFor(args.worldHandle, args.taskId);
-            return Object.keys(gitEnv).length ? { extraEnv: gitEnv } : {};
+            // The platform MCP subprocess inherits this short-lived workflow
+            // token. The gateway accepts it directly and enforces its project +
+            // capability grant; no full-power browser session is ever acquired.
+            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            return Object.keys(extraEnv).length ? { extraEnv } : {};
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
@@ -668,6 +687,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 onSpend: (req: any, outcome: any) => record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }),
               }
             : {}),
+          ...(token
+            ? {
+                platformRequest: async (method: string, requestPath: string, body?: unknown) => {
+                  if (!requestPath.startsWith('/api/')) throw new Error('platform path must start with /api/');
+                  const base = process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505';
+                  const response = await fetch(`${base}${requestPath}`, {
+                    method,
+                    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+                    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+                  });
+                  const value = response.headers.get('content-type')?.includes('json') ? await response.json() : await response.text();
+                  if (!response.ok) throw new Error((value as any)?.error ?? `HTTP ${response.status}`);
+                  return value;
+                },
+              }
+            : {}),
         },
         );
         // Defence in depth around the activity boundary. `runTurn` rejects an
@@ -688,7 +723,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (err) {
         if (token) deps.tokens?.revoke(token);
         if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
-        throw classifyTurnError(err);
+        throw classifyTurnError(err, profile.provider);
       } finally {
         releaseSlot();
         releaseConfirm();
@@ -944,12 +979,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title });
       // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
       // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
-      // branch (which the parent owns and merges into) — never the broad merge-into:*.
+      // branch (which the parent owns and merges into). If no branch is known,
+      // the child gets no merge capability — never a broad fallback.
       const delegation = attenuate(
         ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
         args.parentGrant ?? DEFAULT_GRANT,
       );
-      const grant = [...delegation, args.parentBranch ? `merge-into:${args.parentBranch}` : 'merge-into:*'];
+      const mergeBack = args.parentBranch && allows(args.parentGrant ?? DEFAULT_GRANT, `merge-into:${args.parentBranch}`)
+        ? [`merge-into:${args.parentBranch}`]
+        : [];
+      const grant = [...delegation, ...mergeBack];
+      store.updateTaskParams(child.id, {
+        ...child.params,
+        _authorization: { profileId: 'inherited-child', principal: `task:${args.parentTaskId}`, capabilities: grant, attenuated: true },
+      });
       return {
         taskId: child.id,
         projectId: args.projectId,
@@ -960,16 +1003,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         parentTaskId: args.parentTaskId,
         project: args.project,
         profiles: args.profiles,
+        resolveAgentEnabled: args.resolveAgentEnabled,
         grant,
+        grantPrincipal: `task:${args.parentTaskId}`,
+        authorizationProfile: 'inherited-child',
       };
     },
 
-    async autoResolve(args: { taskId: string; stage: string; error: string }): Promise<{ resolved: boolean; note?: string; action?: string }> {
+    async autoResolve(args: {
+      taskId: string;
+      stage: string;
+      error: string;
+      limit?: LimitClassification;
+    }): Promise<{ resolved: boolean; note?: string; action?: string }> {
       // Workflow-declared resolve rules (SPEC §5.2) take precedence over the defaults.
       const wf = store.getTask(args.taskId)?.workflow;
       const rules = wf ? manifest(wf)?.resolveRules : undefined;
-      const r = runAutoResolve(args.stage, args.error, rules);
-      record(args.taskId, 'resolve.auto', { stage: args.stage, resolved: r.resolved, action: r.action });
+      // A typed provider failure has already been classified at the adapter boundary;
+      // do not discard that ground truth and re-interpret provider prose here.
+      const r = args.limit?.limited
+        ? { resolved: true, action: 'retry' as const, note: 'provider account unavailable — retrying without a Resolve agent' }
+        : runAutoResolve(args.stage, args.error, rules);
+      record(args.taskId, 'resolve.auto', {
+        stage: args.stage,
+        resolved: r.resolved,
+        action: r.action,
+        source: args.limit?.limited ? 'provider-metadata' : 'message-rule',
+      });
       return r;
     },
 

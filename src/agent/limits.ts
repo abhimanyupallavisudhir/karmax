@@ -17,6 +17,8 @@
  *     ever thread them through); classification still works off the message.
  */
 export type LimitWindow = '5h' | 'weekly' | 'model';
+export type ProviderFailureKind = 'quota' | 'credential';
+export type ProviderFailureSource = 'structured' | 'message';
 
 export interface LimitClassification {
   limited: boolean;
@@ -29,6 +31,51 @@ export interface LimitClassification {
    *  or bad auth (typical of an API key out of funds). These escalate to a human
    *  (fund/fix the key) rather than parking for a refresh. */
   hard?: boolean;
+  /** Why this account is unavailable. Both categories use the same account-rotation
+   *  path, but credential failures always need human attention. */
+  kind?: ProviderFailureKind;
+}
+
+/** Serializable metadata carried through Temporal ApplicationFailure.details.
+ * Provider adapters produce this before human-readable wording is flattened. */
+export interface ProviderFailureMetadata {
+  kind: ProviderFailureKind;
+  permanence: 'hard' | 'transient';
+  provider?: 'claude' | 'codex' | 'mock';
+  source: ProviderFailureSource;
+  window?: LimitWindow;
+  resetHint?: string;
+  note?: string;
+}
+
+/** A provider-originated account failure. It remains a normal Error to adapters,
+ * but preserves routing metadata until the activity serializes it for Temporal. */
+export class ProviderFailure extends Error {
+  readonly metadata: ProviderFailureMetadata;
+
+  constructor(message: string, metadata: ProviderFailureMetadata) {
+    super(message);
+    this.name = 'ProviderFailure';
+    this.metadata = metadata;
+  }
+}
+
+export interface LimitClassifierOptions {
+  /** Enables semantic phrase-family matching. Use only at the provider adapter
+   * boundary; arbitrary build/git errors must remain on the Resolve path. */
+  providerOrigin?: boolean;
+}
+
+const words = (text: string): string[] => text.toLowerCase().match(/[a-z0-9_]+/g) ?? [];
+
+function termsNear(tokens: string[], left: Set<string>, right: Set<string>, distance = 5): boolean {
+  for (let i = 0; i < tokens.length; i++) {
+    if (!left.has(tokens[i]!)) continue;
+    const from = Math.max(0, i - distance);
+    const to = Math.min(tokens.length - 1, i + distance);
+    for (let j = from; j <= to; j++) if (right.has(tokens[j]!)) return true;
+  }
+  return false;
 }
 
 /**
@@ -81,17 +128,42 @@ export function isResourceKill(message: string): boolean {
 }
 
 /** Detect + classify a usage/session-limit error from its message. Pure. */
-export function classifyLimitError(message: string): LimitClassification {
+export function classifyLimitError(message: string, options: LimitClassifierOptions = {}): LimitClassification {
   const m = String(message ?? '');
   const lc = m.toLowerCase();
-  // Hard, non-recoverable: billing/credit exhaustion or bad auth (won't refresh on a
-  // timer — needs a human to fund/fix). Checked first because "insufficient_quota"
-  // also contains "quota".
-  const hard = /insufficient_quota|exceeded your current quota|billing|credit balance|payment required|invalid_api_key|invalid x-api-key|\b401\b|unauthorized|access denied/.test(lc);
-  const limited =
-    hard || /you'?ve hit your|usage limit|session limit|weekly limit|rate.?limit|too many requests|quota|\b429\b/.test(lc);
+  const tokens = words(lc);
+
+  // Machine codes and stable protocol statuses remain authoritative.
+  const credential = /invalid_api_key|invalid x-api-key|\b401\b|unauthorized|access denied/.test(lc);
+  const hardCode = /insufficient_quota|exceeded your current quota|payment required|\b402\b/.test(lc);
+
+  // Stable human phrases retained for compatibility with old workflow histories and
+  // with providers (notably subscription CLIs) that expose no machine error code.
+  const knownHardCredit = /out of (?:usage )?credits?|insufficient (?:usage )?credits?/.test(lc);
+  const knownLimit =
+    /you'?ve hit your|usage limit|usagelimitreached|session limit|weekly limit|rate.?limit|too many requests|\b429\b/.test(lc);
+
+  // Provider-scoped semantic fallback: combine a state word with an account/quota
+  // noun within a short window. This generalizes across wording changes without
+  // treating arbitrary project errors containing "quota" as provider failures.
+  const exhaustion = new Set(['out', 'exhausted', 'depleted', 'insufficient', 'empty', 'consumed', 'spent', 'exceeded']);
+  const quotaNouns = new Set(['quota', 'quotas', 'credit', 'credits', 'balance', 'allowance']);
+  const limitStates = new Set([...exhaustion, 'hit', 'reached', 'limited', 'remaining']);
+  const semanticLimit =
+    !!options.providerOrigin &&
+    (termsNear(tokens, limitStates, quotaNouns) ||
+      /(?:no|zero|0)\s+(?:credits?|quota|allowance)\s+(?:left|remaining|available)/.test(lc) ||
+      /(?:maximum|max)\s+(?:usage|requests?)\s+(?:reached|exceeded)/.test(lc));
+  const semanticHardCredit =
+    !!options.providerOrigin &&
+    (termsNear(tokens, exhaustion, new Set(['credit', 'credits', 'balance'])) ||
+      /(?:no|zero|0)\s+credits?\s+(?:left|remaining|available)/.test(lc) ||
+      /not enough\s+(?:usage\s+)?credits?/.test(lc));
+
+  const hard = credential || hardCode || knownHardCredit || semanticHardCredit;
+  const limited = hard || knownLimit || semanticLimit;
   if (!limited) return { limited: false };
-  if (hard) return { limited: true, hard: true };
+  if (hard) return { limited: true, hard: true, kind: credential ? 'credential' : 'quota' };
 
   let window: LimitWindow = '5h';
   let note: string | undefined;
@@ -108,7 +180,73 @@ export function classifyLimitError(message: string): LimitClassification {
   }
   const resetMatch = m.match(/resets?\s+([^\n."']+?)(?:\s*[.\n"']|$)/i);
   const resetHint = resetMatch ? resetMatch[1]!.trim() : undefined;
-  return { limited: true, window, ...(resetHint ? { resetHint } : {}), ...(note ? { note } : {}) };
+  return { limited: true, kind: 'quota', window, ...(resetHint ? { resetHint } : {}), ...(note ? { note } : {}) };
+}
+
+/** Convert a provider message into a typed failure when it is recognizable, while
+ * leaving unrelated provider errors alone. This is the human-wording fallback; a
+ * structured provider signal should call `providerFailure` directly. */
+export function providerErrorFromMessage(
+  provider: ProviderFailureMetadata['provider'],
+  message: string,
+  source: ProviderFailureSource = 'message',
+): Error {
+  const cls = classifyLimitError(message, { providerOrigin: true });
+  if (!cls.limited) return new Error(message);
+  return new ProviderFailure(message, {
+    kind: cls.kind ?? 'quota',
+    permanence: cls.hard ? 'hard' : 'transient',
+    provider,
+    source,
+    ...(cls.window ? { window: cls.window } : {}),
+    ...(cls.resetHint ? { resetHint: cls.resetHint } : {}),
+    ...(cls.note ? { note: cls.note } : {}),
+  });
+}
+
+/** Construct a typed failure from a provider-native quota/error event. */
+export function providerFailure(
+  message: string,
+  metadata: Omit<ProviderFailureMetadata, 'source'> & { source?: ProviderFailureSource },
+): ProviderFailure {
+  return new ProviderFailure(message, { ...metadata, source: metadata.source ?? 'structured' });
+}
+
+/** Prefer adapter metadata; fall back to semantic matching only because third-party
+ * adapters and older provider rails may still throw plain Errors. */
+export function classifyProviderTurnError(
+  err: unknown,
+  provider?: ProviderFailureMetadata['provider'],
+): { classification: LimitClassification; metadata?: ProviderFailureMetadata } {
+  if (err instanceof ProviderFailure) {
+    const m = err.metadata;
+    return {
+      classification: {
+        limited: true,
+        hard: m.permanence === 'hard' || undefined,
+        kind: m.kind,
+        window: m.window,
+        resetHint: m.resetHint,
+        note: m.note,
+      },
+      metadata: m,
+    };
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  const classification = classifyLimitError(message, { providerOrigin: true });
+  if (!classification.limited) return { classification };
+  return {
+    classification,
+    metadata: {
+      kind: classification.kind ?? 'quota',
+      permanence: classification.hard ? 'hard' : 'transient',
+      provider,
+      source: 'message',
+      ...(classification.window ? { window: classification.window } : {}),
+      ...(classification.resetHint ? { resetHint: classification.resetHint } : {}),
+      ...(classification.note ? { note: classification.note } : {}),
+    },
+  };
 }
 
 /**

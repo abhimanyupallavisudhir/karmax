@@ -511,6 +511,22 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .login-wrap { display: grid; place-items: center; height: 100vh; }
 .login-card { width: 320px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 28px; box-shadow: var(--shadow); }
 
+/* Authorization profiles: the finite capability surface is a discoverable
+   checklist. Dynamic resource scopes remain tucked under one expert control. */
+.authz-checklist { display: grid; gap: 6px; margin: 10px 0; }
+.authz-all, .authz-cap-item { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+.authz-all { padding: 10px; margin: 10px 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2, var(--surface)); }
+.authz-all span, .authz-cap-item span, .authz-cap-group summary span { display: grid; gap: 2px; min-width: 0; }
+.authz-all small, .authz-cap-item small, .authz-cap-group summary small { color: var(--ink-3); font-weight: 400; }
+.authz-cap-group { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.authz-cap-group > summary { display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px; cursor: pointer; list-style: none; }
+.authz-cap-group > summary::-webkit-details-marker { display: none; }
+.authz-cap-items { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1px; border-top: 1px solid var(--line); background: var(--line); }
+.authz-cap-item { padding: 9px 10px; background: var(--surface); }
+.authz-cap-item code { width: fit-content; font-size: 10px; color: var(--ink-2); }
+.authz-cap-item input, .authz-all input, .authz-cap-group summary input { margin-top: 2px; flex: none; }
+.authz-scoped { margin: 8px 0 12px; }
+
 /* popover */
 .popover { position: absolute; top: 50px; right: 12px; width: 320px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); z-index: 50; overflow: hidden; }
 .popover .ph { padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 600; }
