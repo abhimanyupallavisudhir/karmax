@@ -23,11 +23,14 @@ import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
 import os from 'node:os';
+import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
 import { attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
+import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 
 const DEFAULT_GRANT = ['*'];
 
@@ -150,6 +153,8 @@ export interface RunAgentTurnArgs {
    * credential); resolved JIT and overrides the auth. Env keys carry no handle —
    * they fall through to the adapter's env credential. */
   accountApiKeyHandle?: string;
+  /** Workflow-generated id used to correlate live admission/running signals. */
+  agentTurnId?: string;
 }
 
 export interface PrepareChildArgs {
@@ -272,6 +277,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let signal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
       let hbSession: string | undefined; // set once real progress exists (onSession)
+      let legacyAgentTurnId: string | undefined;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -281,6 +287,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const actx = activityContext.current();
         signal = actx.cancellationSignal;
         heartbeat = () => actx.heartbeat(hbSession ? { session: hbSession } : undefined);
+        // v1 workflows cannot add the new agentTurnId argument without changing
+        // their recorded activity command. Derive a stable compatibility id from
+        // the existing activity execution instead, so the activity can repair the
+        // persisted view without changing workflow history.
+        if (!args.agentTurnId && actx.info.workflowExecution) {
+          legacyAgentTurnId = `legacy:${actx.info.workflowExecution.runId}:${actx.info.activityId}`;
+        }
         const prior = (actx.info.heartbeatDetails as { session?: string } | undefined)?.session;
         if (actx.info.attempt > 1 && prior) {
           liveChannel = false;
@@ -466,10 +479,62 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           : undefined;
 
+      /** Compatibility publisher for immutable v1 histories. Those workflows
+       * clear their in-memory account wait after a grant but cannot schedule a
+       * publish there without becoming nondeterministic. The activity is already
+       * a side-effect boundary, so it may keep the SQLite/UI snapshot truthful:
+       * account granted → waiting for host slot → running. A matching id prevents
+       * a late retry/cancellation from overwriting a newer turn's view. */
+      const publishLegacyAgentState = (state: 'waiting-slot' | 'running' | undefined) => {
+        if (!legacyAgentTurnId) return;
+        const taskRecord = store.getTask(args.taskId);
+        // A late retry from a terminated v1 execution must never overwrite the
+        // replacement run's v1.1+ snapshot. Workflow version is the stable guard;
+        // view shape alone is not (a review wait legitimately has no agentTurn).
+        if (taskRecord?.workflowVersion !== '1.0.0') return;
+        const prev = taskRecord.lastView;
+        if (!prev || prev.status === 'done' || prev.status === 'failed' || prev.status === 'cancelled') return;
+        if (state) {
+          if (prev.agentTurn && prev.agentTurn.turnId !== legacyAgentTurnId) return;
+        } else if (prev.agentTurn?.turnId !== legacyAgentTurnId) {
+          return;
+        }
+        const next: TaskView = state
+          ? {
+              ...prev,
+              status: state === 'running' ? 'active' : 'waiting',
+              waitingFor:
+                state === 'waiting-slot'
+                  ? { kind: 'agentSlot', provider: profile.provider, detail: 'Waiting for host capacity to run the agent' }
+                  : undefined,
+              agentTurn: { turnId: legacyAgentTurnId, role: args.role, provider: profile.provider, state },
+            }
+          : { ...prev, status: prev.status === 'waiting' ? 'active' : prev.status, waitingFor: undefined, agentTurn: undefined };
+        store.saveView(args.taskId, next);
+        record(args.taskId, 'view.updated', {
+          stage: next.stage,
+          status: next.status,
+          waitingFor: next.waitingFor?.kind ?? null,
+          agentTurn: next.agentTurn?.state ?? null,
+          agentRole: next.agentTurn?.role ?? null,
+          compatibility: 'legacy-agent-turn',
+        });
+      };
+
       // Host-wide agent-turn admission (SPEC §12): cap concurrent model
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
-      const releaseSlot = await acquireAgentSlot(heartbeat);
+      publishLegacyAgentState('waiting-slot');
+      const releaseSlot = await acquireAgentSlot(heartbeat, signal);
+      // The workflow publishes `waiting-slot` immediately after the account grant;
+      // only admission itself can truthfully report that the model is now running.
+      if (deps.client && args.agentTurnId) {
+        await deps.client.workflow
+          .getHandle(args.taskId)
+          .signal(SIG_AGENT_TURN_STATE, { turnId: args.agentTurnId, role: args.role, provider: profile.provider, state: 'running' })
+          .catch(() => undefined);
+      }
+      publishLegacyAgentState('running');
       let lastEmit: string | undefined;
       let result;
       try {
@@ -535,6 +600,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw classifyTurnError(err);
       } finally {
         releaseSlot();
+        publishLegacyAgentState(undefined);
       }
       if (token) deps.tokens?.revoke(token);
       // Persist the session id so other tasks can resume from this one (§10.5), plus
@@ -616,7 +682,52 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const r = await world.exec('bash', ['-lc', 'npm test --silent 2>&1 | tail -40'], { timeoutMs: 10 * 60_000 });
       record(args.taskId, 'checks.done', { code: r.code });
-      return { passed: r.code === 0, detail: r.stdout.slice(-600) };
+      if (r.code !== 0) return { passed: false, detail: r.stdout.slice(-600) };
+
+      // SPEC §4.4's replay gate is literal: fetch every currently-running history
+      // and compare the candidate bundle with the bundle serving production now.
+      // Pre-existing incompatibilities are reported but do not make unrelated edits
+      // impossible; any history that regresses from baseline-pass to candidate-fail
+      // blocks the merge.
+      if (!deps.client) return { passed: false, detail: 'tests passed, but replay compatibility could not run: no Temporal client' };
+      const candidatePath = path.join(args.worldHandle.root, 'src', 'workflows', 'index.ts');
+      if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
+      try {
+        const histories: Array<{ workflowId: string; history: unknown }> = [];
+        for await (const execution of deps.client.workflow.list({ query: "ExecutionStatus='Running'" })) {
+          histories.push({ workflowId: execution.workflowId, history: await deps.client.workflow.getHandle(execution.workflowId, execution.runId).fetchHistory() });
+        }
+        const { Worker } = await import('@temporalio/worker');
+        const replay = async (workflowsPath: string) => {
+          const failures = new Map<string, string>();
+          for await (const result of Worker.runReplayHistories({ workflowsPath }, histories)) {
+            if (result.error) failures.set(result.workflowId, result.error.message);
+          }
+          return failures;
+        };
+        const baselinePath = fileURLToPath(new URL('../workflows/index.ts', import.meta.url));
+        const baselineFailures = await replay(baselinePath);
+        const candidateFailures = await replay(candidatePath);
+        const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
+        const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
+        const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));
+        record(args.taskId, 'checks.replay', {
+          histories: histories.length,
+          regressions: regressions.map(([id]) => id),
+          preExisting: existing,
+          fixed,
+        });
+        if (regressions.length) {
+          const detail = regressions.map(([id, error]) => `${id}: ${error}`).join('\n');
+          return { passed: false, detail: `tests passed; replay REGRESSED ${regressions.length}/${histories.length} active histories:\n${detail}`.slice(-4000) };
+        }
+        return {
+          passed: true,
+          detail: `tests + replay passed (${histories.length} active histories; ${existing.length} pre-existing incompatibilities${fixed.length ? `; ${fixed.length} repaired` : ''})`,
+        };
+      } catch (e) {
+        return { passed: false, detail: `tests passed, but replay compatibility failed to run: ${e instanceof Error ? e.message : String(e)}` };
+      }
     },
 
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
@@ -698,7 +809,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async publishView(taskId: string, view: TaskView): Promise<void> {
       store.saveView(taskId, view);
-      record(taskId, 'view.updated', { stage: view.stage, status: view.status });
+      record(taskId, 'view.updated', {
+        stage: view.stage,
+        status: view.status,
+        waitingFor: view.waitingFor?.kind ?? null,
+        agentTurn: view.agentTurn?.state ?? null,
+        agentRole: view.agentTurn?.role ?? null,
+      });
     },
 
     async recordEvent(taskId: string, type: string, payload: Record<string, unknown>): Promise<void> {

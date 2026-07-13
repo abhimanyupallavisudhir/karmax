@@ -51,6 +51,12 @@ interface ServerRecord {
   unit?: string;
 }
 
+interface EphemeralServerRecord {
+  pid: number;
+  ownerPid: number;
+  grpcPort: number;
+}
+
 /** The three ports a persistent server binds. grpc is the one clients/workers pin. */
 interface PortTriple {
   grpcPort: number;
@@ -62,6 +68,8 @@ const HEALTH_TIMEOUT_MS = 6000;
 
 const recordFile = (dbFilename: string) => path.join(path.dirname(dbFilename), 'dev-server.json');
 const logFilePath = (dbFilename: string) => path.join(path.dirname(dbFilename), 'dev-server.log');
+const EPHEMERAL_RECORD_DIR = path.join(os.tmpdir(), 'karmax-temporal-ephemeral');
+const ephemeralRecordFile = (pid: number) => path.join(EPHEMERAL_RECORD_DIR, `${pid}.json`);
 
 function readRecord(file: string): ServerRecord | undefined {
   try {
@@ -78,6 +86,50 @@ function pidAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/** Reap test-only Temporal children whose owning Node test process is gone. The
+ * record includes the random gRPC port and we verify it against /proc before
+ * signalling, so a recycled pid or the shared production server is never hit. */
+export function reapOrphanedEphemeralServers(): number {
+  let reaped = 0;
+  let files: string[] = [];
+  try {
+    files = fs.readdirSync(EPHEMERAL_RECORD_DIR);
+  } catch {
+    return 0;
+  }
+  for (const file of files) {
+    const full = path.join(EPHEMERAL_RECORD_DIR, file);
+    let rec: EphemeralServerRecord | undefined;
+    try {
+      rec = JSON.parse(fs.readFileSync(full, 'utf8')) as EphemeralServerRecord;
+    } catch {
+      try { fs.rmSync(full, { force: true }); } catch {}
+      continue;
+    }
+    if (!rec || pidAlive(rec.ownerPid)) continue;
+    if (!pidAlive(rec.pid)) {
+      try { fs.rmSync(full, { force: true }); } catch {}
+      continue;
+    }
+    let cmdline = '';
+    try {
+      cmdline = fs.readFileSync(`/proc/${rec.pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+    } catch {
+      // Without a verifiable command line, fail closed and leave the process alone.
+      continue;
+    }
+    if (!cmdline.includes('temporal server start-dev') || !cmdline.includes('--headless') || !cmdline.includes(`--port ${rec.grpcPort}`)) continue;
+    try {
+      process.kill(rec.pid, 'SIGKILL');
+      reaped++;
+      fs.rmSync(full, { force: true });
+    } catch {
+      /* raced process exit — the next sweep removes the stale record */
+    }
+  }
+  return reaped;
 }
 
 /**
@@ -228,9 +280,12 @@ function buildArgs(
 /** Race a freshly-spawned child's port coming up against it dying on startup. */
 async function awaitStartup(child: ChildProcess, grpcPort: number, onFail: () => string): Promise<void> {
   let onExit: (code: number | null) => void = () => {};
+  let onError: (error: Error) => void = () => {};
   const exited = new Promise<never>((_, reject) => {
     onExit = (code) => reject(new Error(`temporal dev server exited (code ${code}). ${onFail()}`));
+    onError = (error) => reject(new Error(`temporal dev server failed to spawn: ${error.message}. ${onFail()}`));
     child.once('exit', onExit);
+    child.once('error', onError);
   });
   try {
     await Promise.race([waitForPort(grpcPort, { timeoutMs: 30_000 }), exited]);
@@ -245,6 +300,10 @@ async function awaitStartup(child: ChildProcess, grpcPort: number, onFail: () =>
     // Drop the startup-only exit listener so a *later* crash of a detached server
     // doesn't reject an already-settled promise (→ unhandledRejection).
     child.off('exit', onExit);
+    child.off('error', onError);
+    // ChildProcess emits later operational failures asynchronously too. Keep a
+    // listener after startup so a failed kill/IPC operation cannot crash Node.
+    child.on('error', () => {});
     exited.catch(() => {});
   }
 }
@@ -323,6 +382,7 @@ export async function startDevServer(opts: DevServerOptions = {}): Promise<DevSe
     return spawnPersistent(opts, namespace, rec);
   }
 
+  reapOrphanedEphemeralServers();
   return spawnEphemeral(opts, namespace);
 }
 
@@ -425,6 +485,22 @@ async function spawnEphemeral(opts: DevServerOptions, namespace: string): Promis
   const [grpcPort, uiPort, metricsPort] = await findFreePorts(3);
   const args = buildArgs({ grpcPort: grpcPort!, uiPort: uiPort!, metricsPort: metricsPort! }, namespace, opts);
   const child: ChildProcess = spawn(TEMPORAL_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: false });
+  const record = child.pid ? ephemeralRecordFile(child.pid) : undefined;
+  if (child.pid && record) {
+    try {
+      fs.mkdirSync(EPHEMERAL_RECORD_DIR, { recursive: true });
+      fs.writeFileSync(record, JSON.stringify({ pid: child.pid, ownerPid: process.pid, grpcPort: grpcPort! } satisfies EphemeralServerRecord));
+    } catch {
+      /* best effort; process-exit custody below still handles ordinary interruption */
+    }
+  }
+  const cleanupRecord = () => { if (record) try { fs.rmSync(record, { force: true }); } catch {} };
+  const killOnOwnerExit = () => {
+    if (child.exitCode === null && child.pid) try { process.kill(child.pid, 'SIGKILL'); } catch {}
+    cleanupRecord();
+  };
+  process.once('exit', killOnOwnerExit);
+  child.once('exit', cleanupRecord);
   let stderrTail = '';
   child.stderr?.on('data', (b) => {
     stderrTail = (stderrTail + b.toString()).slice(-2000);
@@ -439,7 +515,11 @@ async function spawnEphemeral(opts: DevServerOptions, namespace: string): Promis
     namespace,
     reused: false,
     async stop() {
-      if (child.exitCode !== null) return;
+      if (child.exitCode !== null) {
+        process.off('exit', killOnOwnerExit);
+        cleanupRecord();
+        return;
+      }
       await new Promise<void>((resolve) => {
         child.once('exit', () => resolve());
         child.kill('SIGTERM');
@@ -449,6 +529,8 @@ async function spawnEphemeral(opts: DevServerOptions, namespace: string): Promis
           if (child.exitCode === null) child.kill('SIGKILL');
         }, 1200).unref();
       });
+      process.off('exit', killOnOwnerExit);
+      cleanupRecord();
     },
   };
 }
