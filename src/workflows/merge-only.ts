@@ -14,7 +14,7 @@ import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision } from './contract.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, remotePolicyOf } from './contract.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 const long = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', retry: { maximumAttempts: 1 } });
@@ -159,7 +159,7 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
 
   await publish();
   // Open a world on the EXISTING branch under review.
-  world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base: target, branch: input.branch, kind: 'worktree' })) as WorldHandleLike;
+  world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base: target, branch: input.branch, gitProfile: input.project.gitProfile, kind: 'worktree' })) as WorldHandleLike;
 
   // Workflow-repo edits must pass tests + replay-compat before they can merge.
   if (input.workflowEdit) {
@@ -197,7 +197,7 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
     return { stage };
   }
 
-  if (input.project.openGithubPr) {
+  if (remotePolicyOf(input.project) === 'pr') {
     targetLocked = true; // opening a PR binds it to `target` (SPEC §2)
     const opened = await core.openPr(world as any, target);
     if (opened) reviewInfo = { ...reviewInfo, links: [...(reviewInfo?.links ?? []), { label: 'PR', url: opened.url }] };
@@ -225,11 +225,16 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   if (!result.merged) {
     stage = 'failed';
     status = 'failed';
-    reviewInfo = { ...reviewInfo, summary: `Merge failed: ${result.conflict ?? result.note}` };
+    reviewInfo = { ...reviewInfo, summary: `Merge failed: ${result.dirty ? `uncommitted changes in the worktree:\n${result.dirty}` : (result.conflict ?? result.note)}` };
     await publish();
     return { stage };
   }
   pointOfNoReturnPassed = true;
+  // Remote policy 'push'/'pr' (PLAN-git-config.md §5): best-effort push of the
+  // landed target — the merge is the deliverable, a failed push is not fatal.
+  if (remotePolicyOf(input.project) !== 'none') {
+    await core.pushTarget(world as any, target).catch(() => undefined);
+  }
   stage = 'done';
   status = 'done';
   reviewInfo = { ...reviewInfo, summary: `Merged into ${target} as ${result.sha?.slice(0, 8)}.` };

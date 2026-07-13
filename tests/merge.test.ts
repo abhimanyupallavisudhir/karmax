@@ -23,16 +23,26 @@ describe('finalizeMerge (work must actually land)', () => {
     fs.rmSync(repo, { recursive: true, force: true });
   });
 
-  it('commits pending work and lands it on the target branch', async () => {
+  it('rejects uncommitted work back to the merge agent instead of sweeping it', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'land1', repo, base: 'main', target: 'main' });
     // agent writes a file but does NOT commit (mirrors the real failure mode)
     await world.writeFile('factorial.js', 'export const f = (n) => (n <= 1 ? 1 : n * f(n - 1));\n');
 
+    // Commit-vs-gitignore is the merge agent's call (PLAN-git-config.md §6):
+    // the dirty tree is rejected with the file list, and nothing lands.
     const res = await finalizeMerge(world, 'main');
-    expect(res.merged).toBe(true);
-    expect(res.sha).toMatch(/^[0-9a-f]{7,}/);
-    expect(res.landedFiles).toContain('factorial.js');
+    expect(res.merged).toBe(false);
+    expect(res.dirty).toContain('factorial.js');
+    expect((await git(repo, ['show', 'main:factorial.js'])).code).not.toBe(0);
+
+    // The loop-back contract: once the merge agent commits, the re-run lands it.
+    await git(world.handle.root, ['add', '-A']);
+    await git(world.handle.root, ['commit', '-q', '-m', 'work']);
+    const res2 = await finalizeMerge(world, 'main');
+    expect(res2.merged).toBe(true);
+    expect(res2.sha).toMatch(/^[0-9a-f]{7,}/);
+    expect(res2.landedFiles).toContain('factorial.js');
 
     // the file is really on main in the source repo
     const onMain = await git(repo, ['show', 'main:factorial.js']);
@@ -47,8 +57,10 @@ describe('finalizeMerge (work must actually land)', () => {
   it('reports a conflict instead of corrupting the target', async () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'conf1', repo, base: 'main', target: 'main' });
-    // change index.js in the attempt
+    // change index.js in the attempt (committed — dirtiness is tested elsewhere)
     await world.writeFile('index.js', 'console.log("attempt")\n');
+    await git(world.handle.root, ['add', '-A']);
+    await git(world.handle.root, ['commit', '-q', '-m', 'attempt']);
     // meanwhile main diverges on the same line
     fs.writeFileSync(path.join(repo, 'index.js'), 'console.log("mainline")\n');
     await git(repo, ['add', '-A']);
@@ -98,6 +110,8 @@ describe('finalizeMerge (work must actually land)', () => {
     const world = await provider.create({ taskId: 'markers1', repo, base: 'main', target: 'main' });
     // an agent "resolved" a conflict by committing the markers as content
     await world.writeFile('index.js', '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n');
+    await git(world.handle.root, ['add', '-A']);
+    await git(world.handle.root, ['commit', '-q', '-m', 'bad resolution']);
 
     const res = await finalizeMerge(world, 'main');
     expect(res.merged).toBe(false);
@@ -135,6 +149,8 @@ describe('finalizeMerge (work must actually land)', () => {
     // base "develop" is not a ref — world creation forks off HEAD instead.
     const world = await provider.create({ taskId: 'nobase1', repo, base: 'develop', target: 'main' });
     await world.writeFile('factorial.js', 'export const f = (n) => (n <= 1 ? 1 : n * f(n - 1));\n');
+    await git(world.handle.root, ['add', '-A']);
+    await git(world.handle.root, ['commit', '-q', '-m', 'work']);
 
     const res = await finalizeMerge(world, 'main');
     expect(res.merged).toBe(true);
@@ -152,6 +168,8 @@ describe('finalizeMerge (work must actually land)', () => {
     const world = await provider.create({ taskId: 'nobase2', repo, base: 'develop', target: 'main' });
     // an agent "resolved" a conflict by committing the markers as content
     await world.writeFile('index.js', '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n');
+    await git(world.handle.root, ['add', '-A']);
+    await git(world.handle.root, ['commit', '-q', '-m', 'bad resolution']);
 
     const res = await finalizeMerge(world, 'main');
     // The marker guard must still run even though the base ref is unresolvable.

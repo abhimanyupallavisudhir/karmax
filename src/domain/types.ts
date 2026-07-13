@@ -30,14 +30,57 @@ export interface ProjectConfig {
   defaultTarget?: string;
   /** Gitignored files copied into each world at setup (e.g. .env). */
   copyGlobs?: string[];
-  /** Open a real GitHub PR (gated by GitHub auth). The Review stage IS the PR conceptually. */
+  /** @deprecated Superseded by `remote: 'pr'` (PLAN-git-config.md §5); still honored. */
   openGithubPr?: boolean;
+  /**
+   * Remote policy (PLAN-git-config.md §5): what leaves the machine, and when.
+   * 'none' (default) — merges are local. 'push' — the target branch is pushed
+   * after a merge lands. 'pr' — the task branch is pushed and a GitHub PR opened
+   * at the PR stage, and the target pushed after merge. Anything beyond this
+   * happens only when a task explicitly asks its agent to push.
+   */
+  remote?: RemotePolicy;
+  /** Named git identity/credentials (a GitProfile, Global settings → Git accounts)
+   *  this project's worlds commit and push as. Absent ⇒ the global default
+   *  profile, else the host's own git setup (PLAN-git-config.md §3). */
+  gitProfile?: string;
   /** role -> agent profile id. */
   defaultProfiles?: Record<string, string>;
   /** World backend. */
   worldProvider?: 'worktree' | 'container';
   /** Snapshot-on-park resumable worlds (§11.3). */
   resumeWorlds?: boolean;
+}
+
+// ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────
+
+export type RemotePolicy = 'none' | 'push' | 'pr';
+
+/** The effective remote policy, honoring the deprecated `openGithubPr` flag. */
+export function remotePolicyOf(project: ProjectConfig | undefined): RemotePolicy {
+  return project?.remote ?? (project?.openGithubPr ? 'pr' : 'none');
+}
+
+/**
+ * A named bundle of git identity + credentials — the git analogue of an agent
+ * config-home account. The record itself carries NO secrets: the three key
+ * fields are true/false flags for whether a vault secret exists under the
+ * profile's handles (`git:<name>:ssh` / `git:<name>:signing` / `git:<name>:token`).
+ * Selection is per project (`ProjectConfig.gitProfile`) with a global default;
+ * an unconfigured project falls through to the host's own git setup.
+ */
+export interface GitProfile {
+  name: string;
+  /** git user.name commits are attributed to. */
+  userName: string;
+  /** git user.email. */
+  userEmail: string;
+  /** An SSH signing key is stored (worktree-scoped commit.gpgsign, gpg.format=ssh). */
+  signingKey?: boolean;
+  /** An SSH auth key is stored (injected as GIT_SSH_COMMAND for fetch/push). */
+  sshKey?: boolean;
+  /** A GitHub token is stored (injected as GH_TOKEN for gh + https pushes). */
+  githubToken?: boolean;
 }
 
 export interface TaskList {

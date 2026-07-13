@@ -53,7 +53,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   });
 
   await publish();
-  world = (await core.createWorld({ taskId, repos: input.project.repos, base, kind: 'worktree' })) as WorldHandleLike;
+  world = (await core.createWorld({ taskId, repos: input.project.repos, base, gitProfile: input.project.gitProfile, kind: 'worktree' })) as WorldHandleLike;
 
   stage = 'do';
   await publish();

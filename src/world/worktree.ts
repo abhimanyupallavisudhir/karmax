@@ -110,7 +110,7 @@ export class WorktreeProvider implements WorldProvider {
       ? ['worktree', 'add', wt, branch]
       : ['worktree', 'add', '-b', branch, wt, baseRef];
     await gitOrThrow(repo, addArgs);
-    await ensureIdentity(wt);
+    await this.applyIdentity(wt, spec.gitIdentity);
 
     // Make the checkout runnable: a git worktree does NOT inherit the origin
     // repo's `node_modules` (it's gitignored), so any Node project checked out
@@ -128,6 +128,29 @@ export class WorktreeProvider implements WorldProvider {
 
   async open(handle: WorldHandle): Promise<World> {
     return new WorktreeWorld(handle);
+  }
+
+  /**
+   * Give this worktree its git identity (PLAN-git-config.md §4A). With a profile
+   * identity, everything is WORKTREE-scoped (`extensions.worktreeConfig`): the
+   * user's own checkout and sibling worlds are untouched, and two concurrent
+   * worlds can commit as different accounts. Enabling the extension itself is the
+   * one (additive, idempotent) write to the shared repo config. Without a
+   * profile, keep the karmax@localhost fallback for identity-less hosts.
+   */
+  private async applyIdentity(wt: string, id?: WorldSpec['gitIdentity']) {
+    if (!id) {
+      await ensureIdentity(wt);
+      return;
+    }
+    await git(wt, ['config', 'extensions.worktreeConfig', 'true']);
+    await git(wt, ['config', '--worktree', 'user.name', id.name]);
+    await git(wt, ['config', '--worktree', 'user.email', id.email]);
+    if (id.signingKeyPath) {
+      await git(wt, ['config', '--worktree', 'gpg.format', 'ssh']);
+      await git(wt, ['config', '--worktree', 'user.signingKey', id.signingKeyPath]);
+      await git(wt, ['config', '--worktree', 'commit.gpgsign', 'true']);
+    }
   }
 
   private async makeScratchRepo(taskId: string, base: string): Promise<string> {
