@@ -13,10 +13,12 @@ const S = {
   projects: [],
   projectId: null,
   tasks: [],
+  attemptGroup: null, // logical-task group for the open task page
   deleted: new Set(), // ids of drafts deleted this session — tombstones so a stale
   // in-flight list refresh (issued before the DELETE landed) can't resurrect them.
   tab: 'tasks',
   selected: null, // taskId of the open task page (null when a list view is showing)
+  viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
   taskTab: null, // open tab on the task page ('overview'|'checkin'|'parameters'|'advanced'; null → auto)
   checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
@@ -43,6 +45,12 @@ const S = {
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   modelCatalog: null, // provider-native model metadata loaded from the gateway
 };
+
+// Non-principal attempts are intentionally absent from S.tasks because the list
+// has one row per logical task. Page lookups must also consult the loaded group.
+function taskRecord(id) {
+  return (S.attemptGroup?.attempts || []).find((t) => t.id === id) || (S.tasks || []).find((t) => t.id === id);
+}
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
 // Every page is a host-owned route; the browser URL is the single source of truth
@@ -168,7 +176,7 @@ async function applyRoute() {
 // The permalink for a task (/projects/:name/tasks/:num) — used for in-place
 // navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click).
 function taskUrl(id) {
-  const rec = (S.tasks || []).find((t) => t.id === id);
+  const rec = taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
   return p ? `/projects/${projectSlug(p)}/tasks/${keyPart}` : location.pathname;
@@ -1559,6 +1567,7 @@ function customBranch(v, taskId) {
 // slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
 // "merge queued" for the wait, which the raw `stage` alone hides.
 function stageLabel(v) {
+  if (v.state?.draft) return 'draft';
   const stage = v.stage || 'setup';
   if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
   return stage;
@@ -2243,6 +2252,13 @@ async function openTaskForm(workflow, draft, seedText) {
   }
   let inherited = {};
   try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
+  // A draft can open directly from the list, without its task page having loaded
+  // the intent. Fetch the group so the shared confirmer freezes after any sibling
+  // queues, while remaining editable (and propagated) when every sibling is a draft.
+  let formAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
+  if (draft?.id && !formAttemptGroup) {
+    try { formAttemptGroup = await api(`/api/tasks/${draft.id}/attempts`); } catch {}
+  }
   const root = $('#overlay-root');
   root.innerHTML = `
     <div class="palette-scrim" id="tf-scrim">
@@ -2275,6 +2291,7 @@ async function openTaskForm(workflow, draft, seedText) {
           </details>
           ${triggersSection(values, draft?.id)}
           ${repeatableToggleHtml(values)}
+          ${!draft ? `<div class="form-row"><div class="label-row"><label>Attempts</label></div><input id="tf-attempt-count" type="number" min="1" max="8" value="1"><span style="color:var(--ink-3);font-size:12px">Attempts created here are queued together. Attempts added later start as editable drafts.</span></div>` : ''}
         </div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
           <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
@@ -2302,6 +2319,16 @@ async function openTaskForm(workflow, draft, seedText) {
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
+  const confirmerFrozen = !!draft?.id
+    && !!formAttemptGroup?.attempts?.some((a) => !a.params?.draft);
+  if (confirmerFrozen) {
+    const confirmer = fields.find((f) => f.type === 'confirmer');
+    const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);
+    if (row) {
+      row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
+      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt and frozen once one is queued.</span>');
+    }
+  }
   // Image attachments for the full task form: pasting/dropping an image into any
   // text field attaches it to the prompt. State is local to this form instance.
   const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
@@ -2451,6 +2478,9 @@ async function openTaskForm(workflow, draft, seedText) {
     // draftId and land last, so the explicit save/queue reflects the final form state.
     await saveChain.catch(() => {});
     try {
+      let primaryId = draftId || draft?.id || null;
+      const attemptCount = Math.max(1, Math.min(8, Number($('#tf-attempt-count')?.value || 1)));
+      let createdWithAttempts = false;
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
@@ -2462,16 +2492,34 @@ async function openTaskForm(workflow, draft, seedText) {
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
         if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
-        if (!draftMode) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+        // An explicitly-opened later attempt queues only itself. A draft created
+        // while composing a brand-new task is queued as a group below, after all
+        // requested siblings have been materialised.
+        if (!draftMode && draft) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+        primaryId = draftId;
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true, attempts: attemptCount }) });
         draftId = created.id;
+        createdWithAttempts = true;
         await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
-        if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
+        primaryId = created.id;
       } else {
-        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode }) });
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode, attempts: attemptCount }) });
+        primaryId = created.id;
+        createdWithAttempts = true;
+      }
+      // Auto-save may have created the principal before Submit knew the count.
+      // Create every sibling before starting any of them.
+      if (!draft && primaryId && !createdWithAttempts) {
+        for (let i = 1; i < attemptCount; i++) await api(`/api/tasks/${primaryId}/attempts`, { method: 'POST', body: '{}' });
+      }
+      if (!draft && primaryId && !draftMode) {
+        const group = await api(`/api/tasks/${primaryId}/attempts`);
+        for (const attempt of group?.attempts || []) {
+          if (attempt.params?.draft) await api(`/api/tasks/${attempt.id}/queue`, { method: 'POST', body: '{}' });
+        }
       }
       root.innerHTML = '';
       toast(editInPlace ? (draftMode ? 'Moved to drafts' : 'Saved') : draftMode ? 'Draft saved' : 'Task created');
@@ -2598,7 +2646,44 @@ function runPageRow(r) {
   return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(v.stage || 'setup')}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
-async function openTask(taskId, wantTab) {
+// One compact selectable row per execution. The list remains one row per intent;
+// switching here replaces the entire task-page projection with that attempt.
+function taskAttempts(v) {
+  const g = S.attemptGroup;
+  if (!g?.attempts?.length) return '';
+  const rows = g.attempts.map((a) => {
+    const av = a.lastView || {};
+    const principal = a.id === g.principalAttemptId;
+    const committed = a.id === g.committedAttemptId;
+    const selected = a.id === v.taskId;
+    const status = av.status || (a.params?.draft ? 'waiting' : 'active');
+    return `<button type="button" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
+      <span class="attempt-check">${selected ? '✓' : ''}</span>
+      <span class="status-dot ${esc(status)}"></span>
+      <b>Attempt ${a.attemptNumber || 1}</b>
+      ${principal ? '<span class="chip">principal</span>' : ''}
+      ${committed ? '<span class="chip done">committed</span>' : ''}
+      <span class="attempt-stage">${esc(a.params?.draft ? 'draft' : stageLabel(av))}</span>
+    </button>`;
+  }).join('');
+  return `<div class="attempts"><div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span><button class="btn sm" id="add-attempt" ${g.committedAttemptId ? 'disabled title="An attempt has entered Merge"' : ''}>＋ New attempt</button></div>${rows}</div>`;
+}
+
+function wireAttempts(v) {
+  document.getElementById('add-attempt')?.addEventListener('click', async () => {
+    try {
+      const draft = await api(`/api/tasks/${v.taskId}/attempts`, { method: 'POST', body: '{}' });
+      await refreshTasks();
+      await openTask(draft.id, 'parameters', true);
+      openTaskForm(draft.workflow, draft);
+    } catch (e) { toast(e.message, true); }
+  });
+  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+  }));
+}
+
+async function openTask(taskId, wantTab, explicitAttempt = false) {
   // Leaving another task's page kills its check-in shell (same as closing does).
   if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; }
   // Per-task page state starts fresh: the tab comes from the URL when pinned
@@ -2608,7 +2693,7 @@ async function openTask(taskId, wantTab) {
   S.checkinSel = null;
   // A repeatable series has no running workflow — open the config page instead
   // (edit its parameters + triggers, see its runs, run again).
-  const rec = S.tasks.find((t) => t.id === taskId);
+  const rec = taskRecord(taskId);
   if (rec?.params?.repeatable) {
     S.selected = taskId;
     S.view = null;
@@ -2616,6 +2701,7 @@ async function openTask(taskId, wantTab) {
     return;
   }
   S.selected = taskId;
+  S.viewingAttempt = explicitAttempt ? taskId : null;
   S.taskEvents = [];
   // Reset the live-output accumulator on task switch. It's only cleared by a
   // turn.result/view.updated event for the *selected* task (see the WS handler),
@@ -2634,21 +2720,25 @@ async function openTask(taskId, wantTab) {
   S.sessions = {};
   S.widgets = [];
   S.paramDefaults = {};
+  S.attemptGroup = null;
   try {
     // Fetch the four independent resources in parallel — they used to be four serial
     // round-trips, which stacked latency (each page open paid the sum, not the max).
     // `renderTaskPage` no-ops while `S.view` is null, so assigning them together (rather
     // than one-at-a-time) also avoids rendering a half-populated page mid-fetch.
-    const [view, events, widgets, sessions] = await Promise.all([
+    const draft = !!rec?.params?.draft;
+    const [view, events, widgets, sessions, attempts] = await Promise.all([
       api(`/api/tasks/${taskId}`),
-      api(`/api/tasks/${taskId}/events?since=0`),
-      api(`/api/tasks/${taskId}/widgets`).catch(() => []),
-      api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0`),
+      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
+      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      api(`/api/tasks/${taskId}/attempts`).catch(() => null),
     ]);
     S.view = view;
     S.taskEvents = events;
     S.widgets = widgets;
     S.sessions = sessions;
+    S.attemptGroup = attempts;
     // paramDefaults keys off the fetched view's workflow, so it follows the batch.
     S.paramDefaults = await loadParamDefaults(taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
@@ -2662,19 +2752,25 @@ async function refreshTask() {
   if (!S.selected) return;
   // The series config page holds an editable form — don't live-refresh it (that
   // would clobber in-progress edits); it re-renders only on open / explicit save.
-  if (S.tasks.find((t) => t.id === S.selected)?.params?.repeatable) return;
+  if (taskRecord(S.selected)?.params?.repeatable) return;
   try {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
     const id = S.selected;
-    const [view, widgets, sessions] = await Promise.all([
+    const [view, widgets, sessions, attempts] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+      api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
     ]);
+    if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
+      await openTask(attempts.principalAttemptId, S.taskTab);
+      return;
+    }
     S.view = view;
     S.widgets = widgets;
     S.sessions = sessions;
+    S.attemptGroup = attempts;
     S.paramDefaults = await loadParamDefaults(id);
   } catch {}
   renderTaskPage();
@@ -2683,7 +2779,7 @@ async function refreshTask() {
 // then repaints the list. Kept as a navigation so the URL + history stay in sync
 // (the ← button, Esc and the palette all route through here).
 function closeTask() {
-  const pid = (S.view && S.tasks.find((t) => t.id === S.view.taskId)?.projectId) || S.projectId;
+  const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
   const back = S.returnRoute || (pid ? projectRoute(pid) : '/dashboard');
   S.returnRoute = null;
   return go(back, { replace: true });
@@ -2692,7 +2788,9 @@ function closeTask() {
 function closeTaskDom() {
   if (!S.selected && !S.view) return;
   S.selected = null;
+  S.viewingAttempt = null;
   S.view = null;
+  S.attemptGroup = null;
   S.taskTab = null;
   S.checkinSel = null;
   S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
@@ -2758,7 +2856,7 @@ function wireOrgEditor(rootEl, rec, opts) {
 // FORM (openTaskForm) has the other copy — both share orgEditorHtml/wireOrgEditor;
 // change one, check the other.
 function wireTaskOrg(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+  const rec = taskRecord(v.taskId);
   if (!rec) return;
   wireOrgEditor($('#main'), rec, { ensureId: async () => v.taskId, afterChange: renderTaskPage });
 }
@@ -2849,7 +2947,8 @@ function renderTaskPage() {
   // snapshot the active one by its agent role to re-focus the matching box after
   // the swap and carry over any half-typed follow-up.
   const fuState = captureFollowupFocus(main);
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+  const rec = taskRecord(v.taskId);
+  const currentAttempt = S.attemptGroup?.attempts?.find((a) => a.id === v.taskId);
   const base = taskUrl(v.taskId);
   main.innerHTML = `
     <div class="task-page">
@@ -2858,6 +2957,7 @@ function renderTaskPage() {
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
+          ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
           <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
         </div>
         <div class="meta">
@@ -2866,6 +2966,7 @@ function renderTaskPage() {
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
         </div>
+        ${taskAttempts(v)}
         <div class="tabs tp-tabs">
           ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}</a>`).join('')}
         </div>
@@ -2883,6 +2984,7 @@ function renderTaskPage() {
       setTaskTab(a.dataset.tasktab);
     }),
   );
+  wireAttempts(v);
   wireActions(v); // the footer action bar lives on every tab
   if (tab === 'overview') {
     wireNotes(v);
@@ -3430,7 +3532,7 @@ function wireCheckinSidebar(v) {
 // priority + tags (organization), the workflow's declared params (editable or
 // frozen per its lifecycle), and the per-task credential policy.
 function parametersTab(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+  const rec = taskRecord(v.taskId);
   return `
     <div class="section-h">Organization</div>
     ${rec ? orgEditorHtml(rec) : '<div class="task-sub" style="color:var(--ink-3)">Priority + tags load with the task list.</div>'}
@@ -3699,7 +3801,7 @@ const TERMINAL_STAGES = ['done', 'cancelled', 'failed'];
 // effective value (e.g. the actual Do-agent provider·model) not "(default)".
 async function loadParamDefaults(taskId) {
   const wf = S.view?.workflow;
-  const pid = S.tasks.find((t) => t.id === taskId)?.projectId || S.projectId;
+  const pid = taskRecord(taskId)?.projectId || S.projectId;
   if (!wf || !pid) return {};
   return api(`/api/defaults/${pid}/${wf}`).then((d) => d?.task?.inherited || {}).catch(() => ({}));
 }
@@ -3729,7 +3831,7 @@ function wireNotes(v) {
     try {
       await api(`/api/tasks/${v.taskId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
       v.notes = notes || undefined; // keep the in-memory view in sync
-      const rec = S.tasks.find((t) => t.id === v.taskId);
+      const rec = taskRecord(v.taskId);
       if (rec) rec.notes = notes || undefined;
       toast('Notes saved');
     } catch (e) {
@@ -3742,7 +3844,7 @@ function wireNotes(v) {
 }
 
 function paramsSection(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+  const rec = taskRecord(v.taskId);
   // Drafts are composed in the full task form (all fields editable pre-queue).
   if (rec?.params?.draft) {
     return `<div class="section-h">Parameters</div>
@@ -3836,7 +3938,7 @@ function collectParamEdits(root, fields) {
 function wireParams(v) {
   const editBtn = document.getElementById('edit-draft-params');
   if (editBtn) {
-    const rec = S.tasks.find((t) => t.id === v.taskId);
+    const rec = taskRecord(v.taskId);
     editBtn.addEventListener('click', () => openTaskForm(v.workflow, rec));
     return;
   }

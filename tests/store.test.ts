@@ -55,6 +55,35 @@ describe('Store', () => {
     expect(tasks[0]!.params.prompt).toBe('do a thing');
   });
 
+  it('groups alternate attempts behind one principal list row and re-elects on cancellation', () => {
+    const p = store.createProject('Acme');
+    const first = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'first' }, confirmer: { mode: 'agent' } });
+    const second = store.createTask({ projectId: p.id, listId: first.listId, title: first.title, workflow: first.workflow, workflowVersion: first.workflowVersion, params: { prompt: 'second', draft: true }, intentId: first.intentId });
+    expect(second.attemptNumber).toBe(2);
+    expect(second.num).toBeUndefined();
+    expect(store.listPrincipalTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    const cancelled = { taskId: first.id, title: first.title, workflow: first.workflow, stage: 'cancelled' as const, status: 'cancelled' as const, messages: [], actions: [], state: {}, updatedAt: 1 };
+    store.saveView(first.id, cancelled);
+    expect(store.attemptGroup(first.id)!.principalAttemptId).toBe(second.id);
+    expect(store.listPrincipalTasks(p.id).map((t) => t.id)).toEqual([second.id]);
+    expect(store.listPrincipalTasks(p.id)[0]!.num).toBe(first.num); // logical # is stable
+    expect(store.getTaskByNum(p.id, first.num!)!.id).toBe(second.id); // permalink follows principal
+    expect(store.attemptGroup(second.id)!.confirmer).toEqual({ mode: 'agent' });
+    expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'agent' })).not.toThrow();
+    expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'human' })).toThrow(/freezes/);
+  });
+
+  it('grants exactly one Merge commitment and makes the winner principal', () => {
+    const p = store.createProject('Acme');
+    const first = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'first' } });
+    const second = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'second' }, intentId: first.intentId });
+    expect(store.claimAttempt(second.id)).toEqual({ accepted: true, cancel: [first.id] });
+    expect(store.claimAttempt(first.id)).toEqual({ accepted: false, cancel: [first.id] });
+    const group = store.attemptGroup(first.id)!;
+    expect(group.committedAttemptId).toBe(second.id);
+    expect(group.principalAttemptId).toBe(second.id);
+  });
+
   it('numbers tasks per project, each starting at #1 (task 10.6)', () => {
     const a = store.createProject('Acme');
     const b = store.createProject('Beta');

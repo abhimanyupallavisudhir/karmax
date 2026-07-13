@@ -568,23 +568,25 @@ karmax serves its web UI on localhost; a mesh or tunnel makes it reachable. This
 
 ---
 
-## 13. v2 and deferred
+## 13. Evolved and deferred features
 
-Explicitly **out of v1**. Build the v1 seams so these arrive as additions, not rewrites.
+Features in this section began as post-v1 seams. Each subsection says whether it
+has since landed; the remaining items are still deferred.
 
-### 13.1 Substitutes (alternate attempts for a task)
+### 13.1 Multiple attempts (implemented)
 
-A **task** is the intent; it may own a set of **substitutes** — mutually exclusive alternate executions, of which at most one survives. Use cases: assigning several alternates up front; or, at any point before a winner passes the point of no return, adding another alternate (e.g. "I don't like this one; try again with a tweaked prompt or parameters" — same intent).
+A **task** is the intent; it owns one or more **attempts** — mutually exclusive alternate executions, of which at most one may commit. Attempts can be assigned up front or added at any time before commitment, including when every earlier attempt is cancelled. Attempts requested in the original creation form are materialized before execution and queued together. An attempt added later copies a chosen sibling's parameters into an editable draft and never starts implicitly, leaving the user free to change it before queueing.
 
 Mechanism (reuses existing primitives, no new machinery):
 
-- A substitute is a software-dev execution, spawned fresh or **forked** from a sibling's starting point (fork the prepared session/world and change the binding).
-- The task is a thin coordinator holding a **winner-lease of size 1** — the right to pass the point of no return — the same singleton-lease pattern as the merge queue, scoped to the task.
-- To merge, a substitute acquires the task winner-lease, then a global merge slot.
-- When the winner merges, the task signals every sibling to cancel; cancelling a child cancels its sub-tree, clearing speculative sub-tasks and dependents automatically.
-- Cancelled substitutes are **kept as historical record** (superseded), not deleted.
+- Each attempt is its own pinned Temporal execution and world, linked by a durable intent id. It may later be **forked** from a sibling's starting point; ordinary creation currently starts from copied parameters and a fresh world.
+- The intent holds a compare-and-set **winner lease of size 1**. Entry into Merge is the logical commitment boundary: the attempt must claim this lease before it can enqueue for a branch merge slot. The merge commit remains the physical point of no return. Claiming earlier than the commit closes the double-merge race.
+- A successful claim makes that attempt principal and immediately signals every running sibling to cancel; unqueued sibling drafts are marked superseded directly. The committed lease is monotonic, so no later attempt can be created or queued even if the eventual merge fails.
+- Cancelled and superseded attempts are historical records, never silently deleted.
+- The task list contains one row per intent. The detail panel shows the attempts as a compact selectable stack; clicking any row switches the whole panel to that attempt, and both the row and header identify the current attempt. The initial attempt stays principal while eligible; if it is cancelled or fails, the earliest remaining eligible attempt becomes principal. A committed attempt always becomes principal.
+- The confirmer is intent-scoped and snapshotted once. Every attempt uses the same human/auto/agent configuration. For an agent confirmer, all review requests enter one serialized, intent-scoped conversation (a durable shared transcript replayed into fresh provider sessions, so account-home rotation cannot split it).
 
-Invariants: dependents bind to the **task**, never to a specific substitute (so they fire when the task settles); the winner-lease is monotonic (once merged, no new substitutes are accepted). This is fork + child workflows + the lease pattern at a third scope.
+Invariants: dependents bind to the **task**, never to an attempt; at most one attempt can enter the irreversible path; a task has exactly one principal pointer; changing which attempt is principal never changes the task's number or intent identity; and confirmer identity never varies between attempts. This is the lease pattern at a third scope.
 
 ### 13.2 Other deferred items
 

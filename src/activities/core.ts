@@ -34,6 +34,32 @@ import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 
 const DEFAULT_GRANT = ['*'];
 
+// A confirmer belongs to a logical task, so sibling attempts must not review in
+// parallel against divergent copies of its conversation. The worker is the
+// single activity host in v1; this keyed FIFO serializes those turns while each
+// Temporal activity remains independently retryable.
+const confirmLocks = new Map<string, { held: boolean; waiters: Array<() => void> }>();
+async function acquireConfirmLock(key: string): Promise<() => void> {
+  let lock = confirmLocks.get(key);
+  if (!lock) {
+    lock = { held: false, waiters: [] };
+    confirmLocks.set(key, lock);
+  }
+  if (lock.held) await new Promise<void>((resolve) => lock!.waiters.push(resolve));
+  else lock.held = true;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = lock!.waiters.shift();
+    if (next) next();
+    else {
+      lock!.held = false;
+      confirmLocks.delete(key);
+    }
+  };
+}
+
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
  * workflows) — see src/workflows/failures.ts for the taxonomy. Original
@@ -265,9 +291,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
       // materializing the source session needs this turn's config home + world path.
+      const conversationTaskId = args.role === 'confirm' ? (args.task.intentId ?? args.taskId) : args.taskId;
       let session = args.session;
-      let messages = args.messages; // may be augmented by the replay fallback
-      let deliveredMessages = args.deliveredMessages; // leading messages already in `session`
+      let messages = args.messages; // may be replaced by the shared confirmer transcript
+      let deliveredMessages = args.deliveredMessages;
       let fork = false; // true → the adapter branches a NEW session id from `session`
 
       // Temporal wiring: cancellation aborts the in-flight turn (SPEC §5.6), and
@@ -479,6 +506,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           : undefined;
 
+      // Confirm turns for sibling attempts share one durable transcript and run
+      // serially. Fresh provider sessions replay that canonical transcript, which
+      // also works across account/config-home rotation (native sessions are home-bound).
+      const releaseConfirm = args.role === 'confirm' ? await acquireConfirmLock(conversationTaskId) : () => {};
+      let confirmTranscript: Message[] | undefined;
+      if (args.role === 'confirm') {
+        let shared: Message[];
+        try { shared = JSON.parse(store.kvGet(`confirm-transcript:${conversationTaskId}`) ?? '[]'); }
+        catch { shared = []; }
+        confirmTranscript = shared;
+        const request = [...args.messages].reverse().find((m) => m.role === 'user');
+        if (request) {
+          const id = `${args.taskId}:${request.id}`;
+          if (!shared.some((m) => m.id === id)) shared.push({ ...request, id, ts: shared.length });
+        }
+        messages = shared;
+        session = undefined;
+        deliveredMessages = 0;
+      }
       /** Compatibility publisher for immutable v1 histories. Those workflows
        * clear their in-memory account wait after a grant but cannot schedule a
        * publish there without becoming nondeterministic. The activity is already
@@ -524,20 +570,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Host-wide agent-turn admission (SPEC §12): cap concurrent model
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
-      publishLegacyAgentState('waiting-slot');
-      const releaseSlot = await acquireAgentSlot(heartbeat, signal);
-      // The workflow publishes `waiting-slot` immediately after the account grant;
-      // only admission itself can truthfully report that the model is now running.
-      if (deps.client && args.agentTurnId) {
-        await deps.client.workflow
-          .getHandle(args.taskId)
-          .signal(SIG_AGENT_TURN_STATE, { turnId: args.agentTurnId, role: args.role, provider: profile.provider, state: 'running' })
-          .catch(() => undefined);
-      }
-      publishLegacyAgentState('running');
+      let releaseSlot = () => {};
       let lastEmit: string | undefined;
       let result;
       try {
+        publishLegacyAgentState('waiting-slot');
+        releaseSlot = await acquireAgentSlot(heartbeat, signal);
+        // The workflow publishes `waiting-slot` immediately after the account grant;
+        // only admission itself can truthfully report that the model is now running.
+        if (deps.client && args.agentTurnId) {
+          await deps.client.workflow
+            .getHandle(args.taskId)
+            .signal(SIG_AGENT_TURN_STATE, { turnId: args.agentTurnId, role: args.role, provider: profile.provider, state: 'running' })
+            .catch(() => undefined);
+        }
+        publishLegacyAgentState('running');
         result = await runTurn(
         {
           profile,
@@ -578,9 +625,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.
           onSession: (s) => {
             hbSession = s; // heartbeats now carry it → a retry resumes this session
-            store.kvSet(`session:${args.taskId}:${args.role}`, s);
+            store.kvSet(`session:${conversationTaskId}:${args.role}`, s);
             store.kvSet(
-              `sessionmeta:${args.taskId}:${args.role}`,
+              `sessionmeta:${conversationTaskId}:${args.role}`,
               JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
             );
             record(args.taskId, 'session.started', { role: args.role });
@@ -601,12 +648,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
         }
+        if (confirmTranscript) {
+          if (result.output?.trim()) confirmTranscript.push({ id: `${args.taskId}:out:${confirmTranscript.length}`, role: 'agent', text: result.output, ts: confirmTranscript.length });
+          if (result.confirmDecision) {
+            const d = result.confirmDecision;
+            confirmTranscript.push({ id: `${args.taskId}:decision:${confirmTranscript.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
+          }
+          store.kvSet(`confirm-transcript:${conversationTaskId}`, JSON.stringify(confirmTranscript));
+        }
       } catch (err) {
         if (token) deps.tokens?.revoke(token);
         if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
         throw classifyTurnError(err);
       } finally {
         releaseSlot();
+        releaseConfirm();
         publishLegacyAgentState(undefined);
       }
       if (token) deps.tokens?.revoke(token);
@@ -614,9 +670,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // which config home + provider minted it — provider sessions are home-bound, so
       // the CLI resume-command needs the right CONFIG_DIR/CODEX_HOME (§2.5, #2/#3).
       if (result.session) {
-        store.kvSet(`session:${args.taskId}:${args.role}`, result.session);
+        store.kvSet(`session:${conversationTaskId}:${args.role}`, result.session);
         store.kvSet(
-          `sessionmeta:${args.taskId}:${args.role}`,
+          `sessionmeta:${conversationTaskId}:${args.role}`,
           JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
         );
       }
@@ -816,6 +872,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async publishView(taskId: string, view: TaskView): Promise<void> {
       store.saveView(taskId, view);
+      // Entering Merge is the logical commitment boundary. The SQLite compare-and-
+      // set is the winner lease: exactly one attempt may get past this awaited
+      // activity and approach the global merge queue.
+      if (view.stage === 'merge') {
+        const claim = store.claimAttempt(taskId);
+        for (const siblingId of claim.cancel) {
+          const sibling = store.getTask(siblingId);
+          if (sibling?.params.draft) {
+            store.markDraftSuperseded(siblingId, taskId);
+            continue;
+          }
+          await deps.client?.workflow.getHandle(siblingId).signal('cancel').catch(() => undefined);
+        }
+      }
       record(taskId, 'view.updated', {
         stage: view.stage,
         status: view.status,
