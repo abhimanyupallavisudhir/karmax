@@ -94,6 +94,10 @@ export interface TaskList {
 /** The persisted index record for a task. The live view comes from the workflow query. */
 export interface TaskRecord {
   id: string;
+  /** Stable identity of the user's intent. Every alternate execution shares it. */
+  intentId?: string;
+  /** One-based creation order within the intent. */
+  attemptNumber?: number;
   /**
    * Simple, human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
    * project's tasks run #1, #2, …, assigned at creation. The UI displays `#num` and
@@ -542,6 +546,8 @@ export interface AgentProfile {
 
 export interface TaskInput {
   taskId: string;
+  /** Logical task identity shared by mutually-exclusive attempts. */
+  intentId?: string;
   projectId: string;
   /** The workflow this task runs (so activities can read its manifest — roles, agentMcp). */
   workflow?: string;

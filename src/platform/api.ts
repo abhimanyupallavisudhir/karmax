@@ -150,6 +150,8 @@ export class KarmaxApi {
       /** Added from the quick-task box (not the full form): layer the quick-task
        *  defaults over the general defaults when resolving (SPEC §10.4). */
       quick?: boolean;
+      /** Total mutually-exclusive attempts to create and queue up front. */
+      attempts?: number;
     },
   ): Promise<TaskRecord> {
     this.require(token, 'create_task');
@@ -190,6 +192,10 @@ export class KarmaxApi {
       workflow,
       workflowVersion: manifest.version,
       params: { ...taskOverrides, prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''), profiles: args.profiles, draft: !!args.draft, ...(repeatable ? { repeatable: true } : {}) },
+      confirmer: (() => {
+        const field = manifest.params.find((f) => f.type === 'confirmer');
+        return field ? resolved[field.name] : undefined;
+      })(),
     });
     // Cosmetic human notes live in a dedicated column, never in `params`, so they
     // are structurally incapable of reaching the agent (SPEC §10). Persist them the
@@ -198,6 +204,46 @@ export class KarmaxApi {
       this.deps.store.setTaskNotes(task.id, args.notes);
       task.notes = args.notes || undefined;
     }
+    // Materialize up-front alternates before the first workflow can start. Draft
+    // creation keeps all of them editable; immediate creation queues all of them.
+    const createdAlternates: TaskRecord[] = [];
+    const attemptCount = Math.max(1, Math.min(8, Math.floor(args.attempts ?? 1)));
+    if (repeatable && attemptCount > 1) {
+      this.deps.store.deleteTask(task.id);
+      throw new Error('repeatable task templates cannot have alternate attempts; each spawned run is already a separate execution');
+    }
+    if (!repeatable) {
+      // Keep declarative triggers for up-front siblings: queueing a triggered
+      // attempt means arming it alongside the others, never starting it early.
+      const { triggerState: _triggerState, repeatable: _repeatable, runOf: _runOf,
+        archived: _archived, draft: _draft, ...copied } = task.params;
+      for (let n = 1; n < attemptCount; n++) {
+        const alt = this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
+          workflow: task.workflow, workflowVersion: task.workflowVersion, params: { ...copied, draft: true, archived: false },
+          parentTaskId: task.parentTaskId, intentId: task.intentId });
+        if (task.notes) this.deps.store.setTaskNotes(alt.id, task.notes);
+        createdAlternates.push(alt);
+      }
+    }
+    const undoCreation = () => {
+      for (const alt of [...createdAlternates].reverse()) this.deps.store.deleteTask(alt.id);
+      this.deps.store.deleteTask(task.id);
+    };
+    const queueCreatedAlternates = async () => Promise.all(createdAlternates.map(async (alternate) => {
+      try {
+        await this.queueTask(token, alternate.id);
+      } catch (e) {
+        // The principal is already durable and cannot be rolled back. Preserve a
+        // failed sibling as a draft and leave an actionable audit event instead of
+        // falsely reporting that the entire logical task was never created.
+        this.deps.store.appendEvent({
+          taskId: alternate.id,
+          type: 'attempt.queue-failed',
+          ts: Date.now(),
+          payload: { error: e instanceof Error ? e.message : String(e) },
+        });
+      }
+    }));
     if (args.draft) return task; // stored but not queued
 
     // A repeatable series never runs its own workflow — it spawns run records.
@@ -215,10 +261,11 @@ export class KarmaxApi {
     if (hasActiveTriggers(task.params)) {
       try {
         const armed = this.armStoredTask(task.id);
+        await queueCreatedAlternates();
         if (typeof args.notes === 'string') armed.notes = args.notes || undefined;
         return armed;
       } catch (e) {
-        this.deps.store.deleteTask(task.id); // undo the just-created row on an invalid trigger
+        undoCreation(); // undo the whole logical task on an invalid trigger
         throw e;
       }
     }
@@ -230,6 +277,7 @@ export class KarmaxApi {
       project: project.config,
     });
     input.workflow = workflow;
+    input.intentId = task.intentId ?? task.id;
     if (args.profiles) input.profiles = args.profiles;
     const initialImages = taskOverrides.images as ImageRef[] | undefined;
     if (initialImages?.length) input.images = initialImages;
@@ -245,12 +293,16 @@ export class KarmaxApi {
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      this.deps.store.deleteTask(task.id);
+      undoCreation();
       throw new Error(
         `Could not start "${title}": the durable engine didn't accept the task (${e instanceof Error ? e.message : String(e)}). ` +
           `Nothing was queued — check that Temporal is healthy and try again.`,
       );
     }
+    // These attempts were explicitly requested as part of creation, so start all
+    // of them. addAttempt() remains intentionally different: it creates one draft
+    // for inspection/editing and never queues it implicitly.
+    await queueCreatedAlternates();
     return task;
   }
 
@@ -354,6 +406,11 @@ export class KarmaxApi {
     // default (SPEC §10.4). Meta fields (profiles/draft/archived/triggers) aren't overrides.
     const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
+    // The confirmer belongs to the logical task, not an attempt. Snapshotting it
+    // once prevents attempts queued days apart from inheriting different reviewers.
+    const group = this.deps.store.attemptGroup(task.id);
+    const confirmerField = manifest.params.find((f) => f.type === 'confirmer');
+    if (confirmerField && group?.confirmer !== undefined) resolved[confirmerField.name] = group.confirmer;
     // Same guard as createTask, on the resolved effective repos, before we clear the draft.
     this.assertRepoConfigured(manifest, project, resolved);
     const input = assembleTaskInput(manifest, resolved, {
@@ -363,6 +420,7 @@ export class KarmaxApi {
       project: project.config,
     });
     input.workflow = task.workflow;
+    input.intentId = task.intentId ?? task.id;
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     return { startType, input };
@@ -389,6 +447,10 @@ export class KarmaxApi {
     this.require(token, 'create_task');
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
+    const group = this.deps.store.attemptGroup(taskId);
+    if (group?.committedAttemptId && group.committedAttemptId !== taskId) {
+      throw new Error('another attempt has entered Merge; this task is committed and no other attempt can be queued');
+    }
     // Queuing a task that carries triggers ARMS it (activates its triggers) rather
     // than starting now — otherwise a triggered draft would start immediately and
     // its triggers would be pointless. `fired` tasks have already started.
@@ -527,6 +589,10 @@ export class KarmaxApi {
     this.require(token, 'edit_task');
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
+    const confirmerField = this.resolveStart(task.workflow, task.workflowVersion)?.manifest.params.find((f) => f.type === 'confirmer');
+    if (confirmerField && Object.prototype.hasOwnProperty.call(params, confirmerField.name)) {
+      this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, params[confirmerField.name]);
+    }
     const { profiles } = task.params;
     const meta = profiles !== undefined ? { profiles } : {};
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
@@ -590,9 +656,65 @@ export class KarmaxApi {
     }
   }
 
+  /** Drawer-only projection for an unqueued attempt, which has no workflow view. */
+  getDraftView(token: string, taskId: string): TaskView | undefined {
+    this.require(token, 'get_task');
+    const record = this.deps.store.getTask(taskId);
+    if (!record?.params?.draft) return undefined;
+    return {
+      taskId: record.id,
+      title: record.title,
+      workflow: record.workflow,
+      stage: 'setup',
+      status: 'waiting',
+      notes: record.notes,
+      messages: record.params.prompt
+        ? [{ id: 'draft-prompt', role: 'user', text: String(record.params.prompt), ts: record.createdAt }]
+        : [],
+      actions: [],
+      state: { draft: true },
+      updatedAt: record.createdAt,
+    };
+  }
+
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks');
-    return this.deps.store.listTasks(projectId);
+    return this.deps.store.listPrincipalTasks(projectId);
+  }
+
+  /** Create an editable, unqueued alternate by cloning an existing attempt. */
+  async addAttempt(token: string, sourceTaskId: string): Promise<TaskRecord> {
+    this.require(token, 'create_task');
+    const source = this.deps.store.getTask(sourceTaskId);
+    if (!source) throw new Error(`no task ${sourceTaskId}`);
+    const group = this.deps.store.attemptGroup(sourceTaskId);
+    if (!group) throw new Error('task has no attempt group');
+    if (group.committedAttemptId) throw new Error('no more attempts can be added after an attempt enters Merge');
+    const { archived: _archived, draft: _draft, triggers: _triggers, triggerState: _triggerState,
+      repeatable: _repeatable, runOf: _runOf, ...workflowParams } = source.params;
+    const start = this.resolveStart(source.workflow, source.workflowVersion);
+    const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
+    if (confirmerField && group.confirmer !== undefined) workflowParams[confirmerField.name] = group.confirmer;
+    const attempt = this.deps.store.createTask({
+      projectId: source.projectId,
+      listId: source.listId,
+      title: source.title,
+      workflow: source.workflow,
+      workflowVersion: source.workflowVersion,
+      params: { ...workflowParams, draft: true, archived: false },
+      parentTaskId: source.parentTaskId,
+      intentId: group.intentId,
+    });
+    if (source.notes) this.deps.store.setTaskNotes(attempt.id, source.notes);
+    if (source.tags?.length) this.deps.store.setTaskTags(attempt.id, source.tags);
+    // If the former principal is cancelled/failed, the new draft naturally takes over.
+    this.deps.store.electPrincipal(group.intentId);
+    return this.deps.store.getTask(attempt.id)!;
+  }
+
+  attemptGroup(token: string, taskId: string) {
+    this.require(token, 'get_task');
+    return this.deps.store.attemptGroup(taskId);
   }
 
   // ─── Search & organization (task search / views — PLAN-search-views) ─────────
@@ -610,7 +732,7 @@ export class KarmaxApi {
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
     this.require(token, 'search_tasks');
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
-    const tasks = this.deps.store.listTasks(projectId);
+    const tasks = this.deps.store.listPrincipalTasks(projectId);
     const tags = this.deps.store.listTags(projectId);
     return evaluateQuery(tasks, q, { now, tags });
   }

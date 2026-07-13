@@ -108,7 +108,10 @@ export class TriggerScheduler {
     for (const trig of triggers) {
       if (trig.kind !== 'dependency') continue;
       for (const dep of trig.tasks ?? []) {
-        const status = this.deps.store.getTask(dep)?.lastView?.status;
+        const group = this.deps.store.attemptGroup(dep);
+        const status = group
+          ? group.attempts.find((a) => a.id === group.principalAttemptId)?.lastView?.status
+          : this.deps.store.getTask(dep)?.lastView?.status;
         if (status && statusSatisfiesDependency(trig.on, status)) entry.satisfiedDeps.add(dep);
       }
     }
@@ -153,13 +156,26 @@ export class TriggerScheduler {
   /** Update dependency satisfaction from a lifecycle event; returns true if it advanced. */
   private applyDependencyEvent(entry: ArmedEntry, trig: DependencyTrigger, ev: KarmaxEvent): boolean {
     if (ev.type !== LIFECYCLE_EVENT) return false;
-    if (!(trig.tasks ?? []).includes(ev.taskId)) return false;
-    const status = (ev.payload as { status?: string })?.status;
-    if (status && statusSatisfiesDependency(trig.on, status)) {
-      entry.satisfiedDeps.add(ev.taskId);
-      return true;
+    const eventTask = this.deps.store.getTask(ev.taskId);
+    const eventIntent = eventTask?.intentId ?? ev.taskId;
+    let advanced = false;
+    for (const dep of trig.tasks ?? []) {
+      const declared = this.deps.store.getTask(dep);
+      if ((declared?.intentId ?? dep) !== eventIntent) continue;
+      // Read the logical task's CURRENT principal after Store.saveView has run.
+      // Cancelling one attempt therefore cannot satisfy `settled` while another
+      // eligible attempt remains; the eventual winner's outcome can.
+      const group = this.deps.store.attemptGroup(eventIntent);
+      const principal = group?.attempts.find((a) => a.id === group.principalAttemptId);
+      const status = group
+        ? principal?.lastView?.status ?? (principal?.id === ev.taskId ? (ev.payload as { status?: string })?.status : undefined)
+        : (ev.payload as { status?: string })?.status;
+      if (status && statusSatisfiesDependency(trig.on, status)) {
+        entry.satisfiedDeps.add(dep); // dependencyMet keys by the declared id
+        advanced = true;
+      }
     }
-    return false;
+    return advanced;
   }
 
   // ─── Firing ────────────────────────────────────────────────────────────────

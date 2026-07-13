@@ -13,6 +13,7 @@ const S = {
   projects: [],
   projectId: null,
   tasks: [],
+  attemptGroup: null, // logical-task group for the open drawer
   deleted: new Set(), // ids of drafts deleted this session — tombstones so a stale
   // in-flight list refresh (issued before the DELETE landed) can't resurrect them.
   tab: 'tasks',
@@ -41,6 +42,12 @@ const S = {
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   modelCatalog: null, // provider-native model metadata loaded from the gateway
 };
+
+// Drawer lookups must include non-principal attempts: those are intentionally
+// absent from S.tasks (the list has one row per logical task).
+function taskRecord(id) {
+  return (S.attemptGroup?.attempts || []).find((t) => t.id === id) || (S.tasks || []).find((t) => t.id === id);
+}
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
 // Every page is a host-owned route; the browser URL is the single source of truth
@@ -1445,6 +1452,7 @@ function customBranch(v, taskId) {
 // slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
 // "merge queued" for the wait, which the raw `stage` alone hides.
 function stageLabel(v) {
+  if (v.state?.draft) return 'draft';
   const stage = v.stage || 'setup';
   if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
   return stage;
@@ -2129,6 +2137,13 @@ async function openTaskForm(workflow, draft, seedText) {
   }
   let inherited = {};
   try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
+  // Drafts can open directly from the list (without first opening their drawer),
+  // so load their intent group here too. The shared confirmer is editable only
+  // while every sibling is still a draft; after any attempt queues it is frozen.
+  let formAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
+  if (draft?.id && !formAttemptGroup) {
+    try { formAttemptGroup = await api(`/api/tasks/${draft.id}/attempts`); } catch {}
+  }
   const root = $('#overlay-root');
   root.innerHTML = `
     <div class="palette-scrim" id="tf-scrim">
@@ -2161,6 +2176,7 @@ async function openTaskForm(workflow, draft, seedText) {
           </details>
           ${triggersSection(values, draft?.id)}
           ${repeatableToggleHtml(values)}
+          ${!draft ? `<div class="form-row"><div class="label-row"><label>Attempts</label></div><input id="tf-attempt-count" type="number" min="1" max="8" value="1"><span style="color:var(--ink-3);font-size:12px">Attempts created here are queued together. Attempts added later start as editable drafts.</span></div>` : ''}
         </div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
           <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
@@ -2188,6 +2204,18 @@ async function openTaskForm(workflow, draft, seedText) {
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
+  // A confirmer is intent-scoped. Alternate drafts show the copied value but
+  // cannot diverge from the reviewer already used by their sibling execution.
+  const confirmerFrozen = !!draft?.id
+    && !!formAttemptGroup?.attempts?.some((a) => !a.params?.draft);
+  if (confirmerFrozen) {
+    const confirmer = fields.find((f) => f.type === 'confirmer');
+    const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);
+    if (row) {
+      row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
+      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt and frozen once one is queued.</span>');
+    }
+  }
   // Image attachments for the full task form: pasting/dropping an image into any
   // text field attaches it to the prompt. State is local to this form instance.
   const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
@@ -2337,6 +2365,9 @@ async function openTaskForm(workflow, draft, seedText) {
     // draftId and land last, so the explicit save/queue reflects the final form state.
     await saveChain.catch(() => {});
     try {
+      let primaryId = draftId || draft?.id || null;
+      const attemptCount = Math.max(1, Math.min(8, Number($('#tf-attempt-count')?.value || 1)));
+      let createdWithAttempts = false;
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
@@ -2348,16 +2379,38 @@ async function openTaskForm(workflow, draft, seedText) {
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
         if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
-        if (!draftMode) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+        // Editing an explicitly-opened attempt queues only that attempt. A draft
+        // auto-created while composing a brand-new task is handled as a group
+        // below, after all requested siblings have been materialised.
+        if (!draftMode && draft) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+        primaryId = draftId;
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true, attempts: attemptCount }) });
         draftId = created.id;
+        createdWithAttempts = true;
         await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
-        if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
+        primaryId = created.id;
       } else {
-        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode }) });
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode, attempts: attemptCount }) });
+        primaryId = created.id;
+        createdWithAttempts = true;
+      }
+      // Auto-save may have materialised the principal before Submit knew the
+      // requested count. Create every sibling before starting any of them so the
+      // whole up-front set has the same chance to run.
+      if (!draft && primaryId && !createdWithAttempts) {
+        for (let i = 1; i < attemptCount; i++) await api(`/api/tasks/${primaryId}/attempts`, { method: 'POST', body: '{}' });
+      }
+      // A newly-created logical task queues all of its up-front attempts. This is
+      // deliberately scoped to !draft: opening an attempt added later and pressing
+      // Queue must not unexpectedly start its other editable siblings.
+      if (!draft && primaryId && !draftMode) {
+        const group = await api(`/api/tasks/${primaryId}/attempts`);
+        for (const attempt of group?.attempts || []) {
+          if (attempt.params?.draft) await api(`/api/tasks/${attempt.id}/queue`, { method: 'POST', body: '{}' });
+        }
       }
       root.innerHTML = '';
       toast(editInPlace ? (draftMode ? 'Moved to drafts' : 'Saved') : draftMode ? 'Draft saved' : 'Task created');
@@ -2460,10 +2513,48 @@ function runDrawerRow(r) {
   return `<div class="run-drawer-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(v.stage || 'setup')}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
-async function openDrawer(taskId) {
+// Alternate executions are one logical task: the list shows only the principal,
+// while its drawer carries the complete, durable history in a compact stack.
+function drawerAttempts(v) {
+  const g = S.attemptGroup;
+  if (!g?.attempts?.length) return '';
+  const rows = g.attempts.map((a) => {
+    const av = a.lastView || {};
+    const principal = a.id === g.principalAttemptId;
+    const committed = a.id === g.committedAttemptId;
+    const selected = a.id === v.taskId;
+    const label = `Attempt ${a.attemptNumber || 1}`;
+    const status = av.status || (a.params?.draft ? 'waiting' : 'active');
+    return `<button type="button" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
+      <span class="attempt-check">${selected ? '✓' : ''}</span>
+      <span class="status-dot ${esc(status)}"></span>
+      <b>${label}</b>
+      ${principal ? '<span class="chip">principal</span>' : ''}
+      ${committed ? '<span class="chip done">committed</span>' : ''}
+      <span class="attempt-stage">${esc(a.params?.draft ? 'draft' : stageLabel(av))}</span>
+    </button>`;
+  }).join('');
+  return `<div class="attempts"><div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span><button class="btn sm" id="add-attempt" ${g.committedAttemptId ? 'disabled title="An attempt has entered Merge"' : ''}>＋ New attempt</button></div>${rows}</div>`;
+}
+
+function wireAttempts(v) {
+  document.getElementById('add-attempt')?.addEventListener('click', async () => {
+    try {
+      const draft = await api(`/api/tasks/${v.taskId}/attempts`, { method: 'POST', body: '{}' });
+      await refreshTasks();
+      await openDrawer(draft.id, true);
+      openTaskForm(draft.workflow, draft);
+    } catch (e) { toast(e.message, true); }
+  });
+  document.querySelectorAll('[data-attempt-select]').forEach((b) => b.addEventListener('click', () => {
+    if (b.dataset.attemptSelect !== v.taskId) openDrawer(b.dataset.attemptSelect, true);
+  }));
+}
+
+async function openDrawer(taskId, explicitAttempt = false) {
   // A repeatable series has no running workflow — open the config drawer instead
   // (edit its parameters + triggers, see its runs, run again).
-  const rec = S.tasks.find((t) => t.id === taskId);
+  const rec = taskRecord(taskId);
   if (rec?.params?.repeatable) {
     S.selected = taskId;
     S.view = null;
@@ -2472,6 +2563,7 @@ async function openDrawer(taskId) {
     return;
   }
   S.selected = taskId;
+  S.viewingAttempt = explicitAttempt ? taskId : null;
   S.drawerEvents = [];
   // Reset the live-output accumulator on task switch. It's only cleared by a
   // turn.result/view.updated event for the *selected* task (see the WS handler),
@@ -2490,22 +2582,26 @@ async function openDrawer(taskId) {
   S.sessions = {};
   S.widgets = [];
   S.paramDefaults = {};
+  S.attemptGroup = null;
   highlightRow();
   try {
     // Fetch the four independent resources in parallel — they used to be four serial
     // round-trips, which stacked latency (each drawer open paid the sum, not the max).
     // `renderDrawer` no-ops while `S.view` is null, so assigning them together (rather
     // than one-at-a-time) also avoids rendering a half-populated drawer mid-fetch.
-    const [view, events, widgets, sessions] = await Promise.all([
+    const draft = !!rec?.params?.draft;
+    const [view, events, widgets, sessions, attempts] = await Promise.all([
       api(`/api/tasks/${taskId}`),
-      api(`/api/tasks/${taskId}/events?since=0`),
-      api(`/api/tasks/${taskId}/widgets`).catch(() => []),
-      api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0`),
+      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
+      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      api(`/api/tasks/${taskId}/attempts`).catch(() => null),
     ]);
     S.view = view;
     S.drawerEvents = events;
     S.widgets = widgets;
     S.sessions = sessions;
+    S.attemptGroup = attempts;
     // paramDefaults keys off the fetched view's workflow, so it follows the batch.
     S.paramDefaults = await loadParamDefaults(taskId);
   } catch (e) { toast(e.message, true); }
@@ -2515,19 +2611,25 @@ async function refreshDrawer() {
   if (!S.selected) return;
   // The series config drawer holds an editable form — don't live-refresh it (that
   // would clobber in-progress edits); it re-renders only on open / explicit save.
-  if (S.tasks.find((t) => t.id === S.selected)?.params?.repeatable) return;
+  if (taskRecord(S.selected)?.params?.repeatable) return;
   try {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
     const id = S.selected;
-    const [view, widgets, sessions] = await Promise.all([
+    const [view, widgets, sessions, attempts] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+      api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
     ]);
+    if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
+      await openDrawer(attempts.principalAttemptId);
+      return;
+    }
     S.view = view;
     S.widgets = widgets;
     S.sessions = sessions;
+    S.attemptGroup = attempts;
     S.paramDefaults = await loadParamDefaults(id);
   } catch {}
   renderDrawer();
@@ -2536,7 +2638,7 @@ async function refreshDrawer() {
 // then tears the drawer DOM down. Kept as a navigation so the URL + history stay
 // in sync (the ✕ button, the scrim, Esc and the palette all route through here).
 function closeDrawer() {
-  const pid = (S.view && S.tasks.find((t) => t.id === S.view.taskId)?.projectId) || S.projectId;
+  const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
   const back = S.returnRoute || (pid ? projectRoute(pid) : '/dashboard');
   S.returnRoute = null;
   return go(back, { replace: true });
@@ -2545,7 +2647,9 @@ function closeDrawer() {
 function closeDrawerDom() {
   if (!S.selected && !S.view) return;
   S.selected = null;
+  S.viewingAttempt = null;
   S.view = null;
+  S.attemptGroup = null;
   S.liveOutput = ''; // drop any streamed live text so it can't reappear in the next drawer
   S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next drawer
   if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // closing the drawer kills the check-in shell
@@ -2613,11 +2717,11 @@ function wireOrgEditor(rootEl, rec, opts) {
 // Drawer's copy of the priority/tags editor. NOTE: the task FORM (openTaskForm) has the
 // other copy — both share orgEditorHtml/wireOrgEditor; change one, check the other.
 function drawerOrg(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+  const rec = taskRecord(v.taskId);
   return rec ? orgEditorHtml(rec) : '';
 }
 function wireDrawerOrg(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+  const rec = taskRecord(v.taskId);
   if (!rec) return;
   wireOrgEditor($('#drawer-root'), rec, { ensureId: async () => v.taskId, afterChange: () => { renderDrawer(); if (S.tab === 'tasks') renderMain(); } });
 }
@@ -2704,18 +2808,20 @@ function renderDrawer() {
     <aside class="drawer open">
       <div class="drawer-head">
         <div class="row1">
-          ${v.num != null ? `<span class="task-num" title="Task #${v.num}${(() => { const p = projectById(S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId); return p ? ` — permalink /projects/${projectSlug(p)}/tasks/${v.num}` : ''; })()}">#${v.num}</span>` : ''}
+          ${v.num != null ? `<span class="task-num" title="Task #${v.num}${(() => { const p = projectById(taskRecord(v.taskId)?.projectId || S.projectId); return p ? ` — permalink /projects/${projectSlug(p)}/tasks/${v.num}` : ''; })()}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
+          ${(() => { const a = S.attemptGroup?.attempts?.find((x) => x.id === v.taskId); return a ? `<span class="chip attempt-current">Attempt ${a.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''; })()}
           <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
           <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
-          <span>${esc(v.workflow)}${(() => { const rec = S.tasks.find((t) => t.id === v.taskId); return rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''; })()}</span>
+          <span>${esc(v.workflow)}${(() => { const rec = taskRecord(v.taskId); return rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''; })()}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
         </div>
         ${drawerOrg(v)}
+        ${drawerAttempts(v)}
       </div>
       <div class="drawer-body" id="drawer-body" tabindex="-1">${drawerBody(v)}</div>
       <div class="drawer-foot" id="drawer-foot">${drawerActions(v)}</div>
@@ -2727,10 +2833,11 @@ function renderDrawer() {
   wireParams(v);
   wireNotes(v);
   wireDrawerOrg(v);
+  wireAttempts(v);
   wireTerminal(v.taskId);
   wireReviewActions(v);
   wireCopyButtons();
-  renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId, taskId: v.taskId });
+  renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: taskRecord(v.taskId)?.projectId || S.projectId, taskId: v.taskId });
   renderDrawerEvents();
   // Restore the pre-render scroll offset + focus so the send-message box the user
   // was working in stays put instead of jumping to the top of the conversation.
@@ -3433,7 +3540,7 @@ const TERMINAL_STAGES = ['done', 'cancelled', 'failed'];
 // effective value (e.g. the actual Do-agent provider·model) not "(default)".
 async function loadParamDefaults(taskId) {
   const wf = S.view?.workflow;
-  const pid = S.tasks.find((t) => t.id === taskId)?.projectId || S.projectId;
+  const pid = taskRecord(taskId)?.projectId || S.projectId;
   if (!wf || !pid) return {};
   return api(`/api/defaults/${pid}/${wf}`).then((d) => d?.task?.inherited || {}).catch(() => ({}));
 }
@@ -3463,7 +3570,7 @@ function wireNotes(v) {
     try {
       await api(`/api/tasks/${v.taskId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
       v.notes = notes || undefined; // keep the in-memory view in sync
-      const rec = S.tasks.find((t) => t.id === v.taskId);
+      const rec = taskRecord(v.taskId);
       if (rec) rec.notes = notes || undefined;
       toast('Notes saved');
     } catch (e) {
@@ -3476,7 +3583,7 @@ function wireNotes(v) {
 }
 
 function drawerParams(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+  const rec = taskRecord(v.taskId);
   // Drafts are composed in the full task form (all fields editable pre-queue).
   if (rec?.params?.draft) {
     return `<div class="section-h">Parameters</div>
@@ -3565,7 +3672,7 @@ function collectParamEdits(root, fields) {
 function wireParams(v) {
   const editBtn = document.getElementById('edit-draft-params');
   if (editBtn) {
-    const rec = S.tasks.find((t) => t.id === v.taskId);
+    const rec = taskRecord(v.taskId);
     editBtn.addEventListener('click', () => openTaskForm(v.workflow, rec));
     return;
   }
