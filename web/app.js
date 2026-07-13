@@ -3131,7 +3131,6 @@ function drawerBody(v) {
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
          ${v.reviewInfo.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
-         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin:8px 0">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
        </div>`
