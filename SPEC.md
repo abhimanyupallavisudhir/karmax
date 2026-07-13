@@ -197,7 +197,7 @@ Merge is the point of no return.
 
 **Do.** Runs the assigned coding agent profile **one turn per activity** (`runAgentTurn`). Between turns only a session ID is stored; the agent process does not exist while the task waits (§7). During a turn the agent may, via the platform MCP: create review info, spawn sub-tasks, save skills, and **signal completion via a structured tool call** (not a parsed "promise" string — structured is unambiguous and unspoofable). On completion/idle/needs-input → Review.
 
-**Review.** The workflow's view-model exposes the allowed actions `[confirm]` and `[send follow-up]` plus review info. The **confirmer** is a human by default, or an AI; for a **sub-task the confirmer is the parent task's workflow**, which receives the child's review info and either confirms or sends a follow-up — the ordinary parent/child signal pattern. Confirm → PR. Follow-up → append to agent input, return to Do.
+**Review.** The workflow's view-model exposes the allowed actions `[confirm]` and `[send follow-up]` plus review info. The **confirmer** is an ordered list of **confirm layers**, played sequentially each time the task reaches Review — each layer is either a **human** confirmation (waits for the Confirm click) or a **Confirm agent** turn that reviews the work and returns a structured verdict (confirm / revise / reject — the same transitions a human drives). Every layer must approve for the task to advance; a revise/follow-up returns to Do and the next Review replays the sequence from the first layer. Zero layers ⇒ auto-confirm; the default is a single human layer; "agent review, then a final human confirmation" is two layers. Layer lists inherit like every other field (task → project → global defaults). For a **sub-task the confirmer is the parent task's workflow** regardless, which receives the child's review info and either confirms or sends a follow-up — the ordinary parent/child signal pattern. Confirm → PR. Follow-up → append to agent input, return to Do.
 
 **PR.** Opening a GitHub PR is **optional** — a project setting gated by GitHub authorization. The Review stage *is* the conceptual PR; a GitHub PR is just an optional integration output. Off → the merge agent merges branches locally under the queue. On → open a real PR.
 
@@ -618,7 +618,7 @@ Invariants: dependents bind to the **task**, never to a specific substitute (so 
 ## 15. Glossary
 
 - **World** — the environment a task's work happens in (worktree/container/sandbox).
-- **Review stage** — the gate where a confirmer (human, or AI/parent) confirms or sends a follow-up. (Formerly "Confirm.")
+- **Review stage** — the gate where the confirm layers (each a human or a Confirm agent; the parent, for sub-tasks) approve in order or send a follow-up. (Formerly "Confirm.")
 - **Point of no return** — the merge commit; cancellation is impossible after it.
 - **Lease** — a grant of a scarce resource handed out by a coordinator (merge slot, account capacity, budget).
 - **View-model** — the structured, typed projection of a task's (or coordinator's) state and allowed actions that the UI renders.

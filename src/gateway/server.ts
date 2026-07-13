@@ -22,6 +22,7 @@ import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
 
@@ -1317,12 +1318,22 @@ export class Gateway {
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
       const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
-      // A confirmer also carries a MODE (human/auto/agent) that inherits normally —
-      // plus its review-request prompt template, when one is stored at this scope
-      // (the form falls back to the field's promptDefault); the agent knobs above
-      // are the defaults shown once "agent" mode is selected.
+      // A confirmer carries the ordered confirm LAYERS (legacy {mode} values
+      // normalize). Each agent layer gets the role-default agent knobs filled in,
+      // same as a bare agent field; `agentDefault` rides along so the form can
+      // prefill a NEWLY added agent layer the same way (display-only — collectForm
+      // never stores it).
       out[f.name] = f.type === 'confirmer'
-        ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}), ...(spec.prompt ? { prompt: spec.prompt } : {}) }
+        ? {
+            layers: confirmLayersOf(Object.keys(spec).length ? spec : (f.default as any)).map((l) => {
+              if (l.kind !== 'agent') return { kind: l.kind };
+              const lprov = l.provider ?? prof?.provider ?? defaultProvider().provider;
+              const lmodel = l.model ?? prof?.model ?? defaultModel(lprov);
+              const leffort = l.effort ?? prof?.effort ?? defaultEffort(lprov);
+              return { ...l, provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
+            }),
+            agentDefault: agent,
+          }
         : agent;
     }
     return out;

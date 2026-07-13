@@ -10,7 +10,8 @@ import {
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision } from './contract.js';
+import { confirmLayersOf } from '../domain/confirm.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer } from './contract.js';
 import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -61,10 +62,11 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
   let agentTurn: TaskView['agentTurn'];
   let seen = 0;
   const base = input.base ?? input.project.defaultBase ?? 'main';
-  // Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent. A child
-  // routes to its parent (handled by the confirm signal from the parent), so this drives
-  // top-level tasks; back-compat with the legacy autoConfirm-less just-do → human.
-  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? 'human';
+  // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
+  // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
+  // normalize to their layer equivalents. A child routes to its parent (handled by
+  // the confirm signal from the parent), so this drives top-level tasks.
+  const confirmLayers = confirmLayersOf(input.confirm);
 
   function actions(): DeclaredAction[] {
     const followUp: DeclaredAction = { name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true, args: [{ name: 'text', type: 'text', required: true }] };
@@ -98,8 +100,12 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
 
   /** Run one Confirm-agent turn (SPEC §5.2): review the work, return a verdict, or
    *  undefined on failure so the caller falls back to the human gate. */
-  async function runConfirm(): Promise<ConfirmDecision | undefined> {
+  async function runConfirm(layer: ConfirmLayer): Promise<ConfirmDecision | undefined> {
     try {
+      // The layer's own agent spec drives this turn (each agent layer can run a
+      // different reviewer); a spec-less layer falls back to the confirm profile.
+      const { kind: _kind, prompt: _prompt, ...layerSpec } = layer;
+      const task = layerSpec.provider ? { ...input, agents: { ...(input.agents ?? {}), confirm: { ...layerSpec, provider: layerSpec.provider } } } : input;
       // A fresh turn each Review so the reviewer judges the current work (up-to-date
       // system prompt); a mid-turn retry still resumes via runAgentTurn heartbeat details.
       const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
@@ -108,7 +114,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
           role: 'confirm',
           worldHandle: world as any,
           messages: [],
-          task: input,
+          task,
           bindings: {
             reviewInfo: reviewInfo?.summary ?? '',
             changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
@@ -175,29 +181,37 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
     stage = 'review';
     status = 'waiting';
-    if (confirmMode === 'auto') {
-      confirmed = true;
-    } else if (confirmMode === 'agent') {
-      await publish();
-      const decision = await runConfirm();
-      if (cancelled) break;
-      if (decision?.action === 'confirm') {
-        confirmed = true;
-      } else if (decision?.action === 'reject') {
-        if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
-        cancelled = true;
-        break;
-      } else if (decision?.action === 'revise') {
-        msgs.push({ id: `cv${msgs.length}`, role: 'user', text: decision.text || 'Please revise per the reviewer feedback.', ts: msgs.length });
-        stage = 'do';
-        status = 'active';
-        continue;
+    // Play the confirm layers in order (SPEC §5.2): every layer must approve; a
+    // revise/follow-up returns to Do and the next Review replays from the first.
+    let backToDo = false;
+    for (let li = 0; li < confirmLayers.length && !backToDo && !cancelled; li++) {
+      const layer = confirmLayers[li]!;
+      if (layer.kind === 'agent') {
+        await publish();
+        const decision = await runConfirm(layer);
+        if (cancelled) break;
+        if (decision?.action === 'confirm') continue; // this layer approves → the next
+        if (decision?.action === 'reject') {
+          if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
+          cancelled = true;
+          break;
+        }
+        if (decision?.action === 'revise') {
+          msgs.push({ id: `cv${msgs.length}`, role: 'user', text: decision.text || 'Please revise per the reviewer feedback.', ts: msgs.length });
+          backToDo = true;
+          continue;
+        }
+        // no verdict → degrade this layer to the human gate below
       }
-      // no verdict → fall through to the human gate
+      // A human layer: one Confirm click passes ONE layer; a follow-up → back to Do.
+      await publish();
+      await condition(() => confirmed || cancelled || msgs.length > seen);
+      if (cancelled) break;
+      if (!confirmed) backToDo = true;
+      confirmed = false; // consumed by this layer
     }
-    await publish();
-    await condition(() => confirmed || cancelled || msgs.length > seen);
-    if (confirmed || cancelled) break;
+    if (cancelled) break;
+    if (!backToDo) break; // every layer approved (or none configured) → done
     stage = 'do';
     status = 'active';
   }
