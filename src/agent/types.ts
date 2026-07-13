@@ -1,4 +1,4 @@
-import { AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, AgentProfile, AgentRole, Message, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
@@ -48,6 +48,8 @@ export interface PlatformToolContext {
   platformRequest?(method: string, path: string, body?: unknown): Promise<unknown>;
   /** Stream incremental output to the task's live event log. */
   emit(text: string): void;
+  /** Publish a structured provider item for the durable conversation timeline. */
+  emitActivity(activity: AgentActivity): void;
   /** Called as soon as the provider session id is known (mid-turn), so the task can
    *  publish it immediately — the drawer then shows a live "fork this agent" command
    *  WHILE the turn runs, not only after it ends (RESOLVE-PLAN #3). Fire-once per id. */

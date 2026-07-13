@@ -294,6 +294,28 @@ export interface Message {
 }
 
 /**
+ * A provider-neutral item in an agent turn. Codex app-server and the Claude
+ * Agent SDK both expose work as typed, ordered events; keeping that shape lets
+ * clients render a faithful conversation instead of flattening commands, tool
+ * calls, edits, and progress into assistant prose.
+ *
+ * These items are written to the durable Karmax event log by the activity layer
+ * (with the event row's timestamp and task id), not into `Message[]`: provider
+ * actions are presentation/audit data and must never be replayed to the model as
+ * conversation input.
+ */
+export interface AgentActivity {
+  /** Provider item/tool id. Repeated updates with the same id replace in-place. */
+  id: string;
+  kind: 'message' | 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'subagent' | 'status' | 'turn' | 'error';
+  phase: 'started' | 'updated' | 'completed' | 'failed';
+  /** Compact human-facing label, e.g. "Read package.json" or "npm test". */
+  title: string;
+  /** Optional bounded detail (command output, tool arguments/result, progress). */
+  detail?: string;
+}
+
+/**
  * A single click-to-verify affordance the reviewer can act on. Review info is a
  * list of these — NOT a prose changelog (that belongs in the conversation). Two
  * primitives:
@@ -571,6 +593,8 @@ export interface TaskInput {
   /** The workflow this task runs (so activities can read its manifest — roles, agentMcp). */
   workflow?: string;
   title: string;
+  /** Epoch milliseconds of the task record; used for the initial chat timestamp. */
+  createdAt?: number;
   prompt: string;
   /** Images attached to the initial prompt (references, never inline bytes). */
   images?: ImageRef[];

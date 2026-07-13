@@ -656,6 +656,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             lastEmit = t;
             record(args.taskId, 'agent.output', { text: t });
           },
+          onActivity: (activity) => {
+            record(args.taskId, 'agent.activity', {
+              ...activity,
+              role: args.role,
+              ...(args.agentTurnId ? { turnId: args.agentTurnId } : {}),
+            });
+          },
           // Publish the session id + its home the moment the adapter knows it (mid-turn),
           // so the drawer's live "fork this agent" command appears WHILE the turn runs,
           // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.

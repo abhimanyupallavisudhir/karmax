@@ -13,6 +13,7 @@ import { registerAgent, unregisterAgent, killAgent, killProcessGroup } from './c
 import { trackProcess } from '../util/processes.js';
 import { classifyLimitError, providerErrorFromMessage, providerFailure, type ProviderFailureMetadata } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
+import { activityDetail, codexItemActivity } from './activity.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -46,6 +47,7 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    ctx.emitActivity ??= () => {};
     const auth = input.resolvedAuth;
     // Route on the PROFILE's resolved auth first: an API key → Responses API; a
     // config home → the Codex CLI on a subscription. Only with no explicit profile
@@ -143,6 +145,7 @@ export class CodexAdapter implements AgentAdapter {
       if (text) {
         finalText = text;
         ctx.emit(text);
+        ctx.emitActivity({ id: `response-${respId}-${i}`, kind: 'message', phase: 'completed', title: text });
       }
       if (calls.length === 0) {
         // Idle. Fold in any follow-up that landed mid-turn and keep going on the same
@@ -164,7 +167,21 @@ export class CodexAdapter implements AgentAdapter {
           /* leave empty */
         }
         const handler = handlers[call.name];
+        ctx.emitActivity({
+          id: String(call.call_id ?? `${call.name}-${i}`),
+          kind: 'tool',
+          phase: 'started',
+          title: String(call.name ?? 'Tool call'),
+          ...(activityDetail(args) ? { detail: activityDetail(args) } : {}),
+        });
         const result = handler ? await handler(args) : `unknown tool ${call.name}`;
+        ctx.emitActivity({
+          id: String(call.call_id ?? `${call.name}-${i}`),
+          kind: 'tool',
+          phase: 'completed',
+          title: String(call.name ?? 'Tool call'),
+          ...(activityDetail(result) ? { detail: activityDetail(result) } : {}),
+        });
         toolOutputs.push({ type: 'function_call_output', call_id: call.call_id, output: result });
         if (call.name === 'signal_completion') completed = true;
       }
@@ -278,12 +295,39 @@ export class CodexAdapter implements AgentAdapter {
         case 'item/started':
           // Surface a command as it begins, mirroring the exec/SDK live terminal feed.
           if (params?.item?.type === 'commandExecution' && typeof params.item.command === 'string') ctx.emit(`$ ${params.item.command}`);
+          {
+            const activity = codexItemActivity(params?.item, 'started');
+            if (activity) ctx.emitActivity(activity);
+          }
           break;
         case 'item/completed':
           if (params?.item?.type === 'agentMessage' && typeof params.item.text === 'string' && params.item.text) {
             finalText = params.item.text;
             ctx.emit(finalText);
           }
+          {
+            const activity = codexItemActivity(params?.item, 'completed');
+            if (activity) ctx.emitActivity(activity);
+          }
+          break;
+        case 'item/mcpToolCall/progress':
+          ctx.emitActivity({
+            id: String(params?.itemId ?? 'mcp-tool'),
+            kind: 'tool',
+            phase: 'updated',
+            title: 'Tool call',
+            ...(activityDetail(params?.message) ? { detail: activityDetail(params.message) } : {}),
+          });
+          break;
+        case 'warning':
+        case 'configWarning':
+          ctx.emitActivity({
+            id: `${method}-${String(params?.message ?? params?.title ?? 'warning').slice(0, 80)}`,
+            kind: 'status',
+            phase: 'updated',
+            title: String(params?.title ?? 'Warning'),
+            ...(activityDetail(params?.message) ? { detail: activityDetail(params.message) } : {}),
+          });
           break;
         case 'turn/completed':
           terminalStatus = String(params?.turn?.status ?? 'missing');
@@ -578,6 +622,20 @@ export class CodexAdapter implements AgentAdapter {
       if (/item\.completed|agent_message|turn\.completed/.test(t) && typeof text === 'string' && text) {
         finalText = text;
         ctx.emit(text);
+        ctx.emitActivity({ id: String(ev.item?.id ?? `exec-message-${Date.now()}`), kind: 'message', phase: 'completed', title: text });
+      }
+      if (t === 'item.started' && ev.item?.type === 'command_execution') {
+        ctx.emitActivity({ id: String(ev.item.id ?? ev.item.command), kind: 'command', phase: 'started', title: String(ev.item.command ?? 'Run command') });
+      }
+      if (t === 'item.completed' && ev.item?.type === 'command_execution') {
+        const failed = typeof ev.item.exit_code === 'number' && ev.item.exit_code !== 0;
+        ctx.emitActivity({
+          id: String(ev.item.id ?? ev.item.command),
+          kind: 'command',
+          phase: failed ? 'failed' : 'completed',
+          title: String(ev.item.command ?? 'Run command'),
+          ...(activityDetail(ev.item.aggregated_output ?? ev.item.output) ? { detail: activityDetail(ev.item.aggregated_output ?? ev.item.output) } : {}),
+        });
       }
       // Usage/session-limit → capture the machine-readable reset (resets_in_seconds).
       const blob = JSON.stringify(ev);

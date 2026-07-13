@@ -235,7 +235,7 @@ Assembled per role by an activity that fills the **role template** (owned by the
 The task UI is the view-model the workflow projects (§10). Always present: title, message history, stage indicator, and two **cheap check-in** affordances:
 
 - **Open a terminal in the world** — a PTY spawned on demand against the on-disk worktree / via the world provider's PTY. Ephemeral; nothing persistent.
-- **Open the conversation** — renders the *stored session transcript*. It does **not** resume the agent (the agent only runs during a turn). This is what keeps check-in cheap.
+- **Open the conversation** — renders the *stored session transcript*. It does **not** resume the agent (the agent only runs during a turn). This is what keeps check-in cheap. The transcript is an ordered, timestamped timeline: human/agent messages plus provider-native work items normalized into stable kinds (reasoning, command, file change, tool/search, sub-agent, and lifecycle status). Item updates retain their provider id so `started → completed/failed` renders as one evolving row. These presentation events never enter the model's `Message[]` input history.
 
 Stage-gated actions:
 

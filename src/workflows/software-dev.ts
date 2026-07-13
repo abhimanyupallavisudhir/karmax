@@ -195,7 +195,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   const msgs: Message[] = recovery
     ? recovery.messages.map((m) => ({ ...m }))
     : input.prompt || input.images?.length
-      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}) }]
       : [];
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';
@@ -494,7 +494,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     // next turn (each turn is fed its own accumulated transcript). A turn currently
     // running polls `pendingMessagesQuery` and injects it live (in-flight).
     const target = conversationFor(role);
-    target.push({ ...m, ts: target.length });
+    target.push({ ...m, ts: m.ts || target.length });
   });
   setHandler(confirmSignal, () => {
     confirmed = true;

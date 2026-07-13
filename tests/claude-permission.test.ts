@@ -88,6 +88,7 @@ describe.skipIf(!LIVE)('claude agent executes commands headless (permission seam
         confirmDecision: () => {},
         requestSpend: async () => ({ status: 'denied' }),
         emit: () => {},
+        emitActivity: () => {},
       };
 
       const input: TurnInput = {
@@ -219,6 +220,7 @@ describe.skipIf(!FRESH_LIVE)('claude agent writes files in a FRESH config home (
         confirmDecision: () => {},
         requestSpend: async () => ({ status: 'denied' }),
         emit: () => {},
+        emitActivity: () => {},
       };
 
       const input: TurnInput = {
