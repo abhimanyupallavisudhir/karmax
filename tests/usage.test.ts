@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { parseUsagePanel, labelToEpoch, probeClaudeUsage } from '../src/agent/usage.js';
+import { parseUsagePanel, labelToEpoch, probeClaudeUsage, isUsageStale, USAGE_TTL_MS } from '../src/agent/usage.js';
 
 /**
  * Hermetic verification of the proactive-quota parser + probe (#6). The panel text
@@ -88,6 +88,43 @@ describe('labelToEpoch', () => {
 
   it('returns undefined for an unparseable label', () => {
     expect(labelToEpoch('soon-ish', 'Europe/London', NOW)).toBeUndefined();
+  });
+});
+
+describe('isUsageStale', () => {
+  const fresh = () => {
+    const r = parseUsagePanel(FULL_PANEL, NOW);
+    if (!r.ok) throw new Error('fixture must parse');
+    return r;
+  };
+
+  it('a never-probed login is stale', () => {
+    expect(isUsageStale(undefined, NOW)).toBe(true);
+  });
+
+  it('a fresh snapshot with future resets is not stale', () => {
+    expect(isUsageStale(fresh(), NOW + 60_000)).toBe(false);
+  });
+
+  it('outliving the TTL makes it stale even with future resets', () => {
+    expect(isUsageStale(fresh(), NOW + USAGE_TTL_MS + 1)).toBe(true);
+  });
+
+  it('a window that already reset makes it stale within the TTL', () => {
+    // Session resets Jul 5 2:19am London (01:19 UTC); probe at NOW (Jul 4 18:00 UTC),
+    // look again just past the reset — well inside the TTL relative to nothing, but
+    // the % now describes a window that no longer exists.
+    const snap = { ...fresh(), at: NOW };
+    const justPastReset = snap.session!.resetAt! + 1;
+    // Re-stamp `at` so only the reset (not the TTL) can trip staleness.
+    snap.at = justPastReset - 60_000;
+    expect(isUsageStale(snap, justPastReset)).toBe(true);
+  });
+
+  it('a fresh failed probe is not stale (no hammering); an old one is', () => {
+    const fail = { ok: false as const, at: NOW, reason: 'probe-failed: boom' };
+    expect(isUsageStale(fail, NOW + 60_000)).toBe(false);
+    expect(isUsageStale(fail, NOW + USAGE_TTL_MS + 1)).toBe(true);
   });
 });
 
