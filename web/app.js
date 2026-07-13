@@ -3972,6 +3972,18 @@ async function renderDashboard() {
       catch (e) { toast(e.message, true); }
       btn.textContent = label; renderDashboard();
     };
+    // Auto-refresh stale usage: a snapshot whose window has already reset (server
+    // marks it `stale`) or a pollable login never probed. Without this the % froze
+    // at whenever ↻ was last clicked and a week-old 15% read as current. Guarded to
+    // one attempt a minute so a failing probe can't loop the dashboard.
+    if ([...pollable].some((id) => !usage[id] || usage[id].stale) && Date.now() - (S.usageAutoAt || 0) > 60_000) {
+      S.usageAutoAt = Date.now();
+      api('/api/accounts/usage/recheck', { method: 'POST', body: JSON.stringify({}) }).then(() => {
+        // Skip the re-render if the user is mid-edit in the panel (e.g. concurrency).
+        const el = document.activeElement;
+        if (S.tab === 'dashboard' && !(box.contains(el) && /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName || ''))) renderDashboard();
+      }).catch(() => {});
+    }
     box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
     box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
     box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
@@ -4010,7 +4022,7 @@ async function renderDashboard() {
 function usageBlock(id, snap, isPollable) {
   if (!snap) {
     return isPollable
-      ? `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">Usage not checked yet — click “↻ Re-check usage”.</div>`
+      ? `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">Usage not checked yet — checking…</div>`
       : '';
   }
   if (!snap.ok) {
@@ -4025,20 +4037,29 @@ function usageBlock(id, snap, isPollable) {
   if (snap.session) rows.push(usageRow('Session', snap.session));
   if (snap.week) rows.push(usageRow('Week', snap.week));
   for (const m of snap.models || []) rows.push(usageRow(m.name || 'model', m));
+  const freshness = snap.stale
+    ? `<span style="color:var(--warn,#f5a623)">stale — checked ${esc(fmtAgo(snap.at))}, re-checking…</span>`
+    : `checked ${esc(fmtAgo(snap.at))}`;
   return `<div style="margin-top:6px">${rows.join('')}
-    <div class="task-sub" style="color:var(--ink-3);font-size:11px">checked ${esc(fmtAgo(snap.at))}</div></div>`;
+    <div class="task-sub" style="color:var(--ink-3);font-size:11px">${freshness}</div></div>`;
 }
 
 function usageRow(label, win) {
   const pct = Math.max(0, Math.min(100, win.pct || 0));
-  const hue = pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
-  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px">
+  // A window whose reset instant has passed no longer exists — its % is history,
+  // not the current window. Dim it and say so rather than showing "resets … · now".
+  const expired = win.resetAt && win.resetAt < Date.now();
+  const hue = expired ? 'var(--ink-3)' : pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
+  const reset = expired
+    ? `window reset ${esc(win.resetLabel || '')}${win.tz ? ` (${esc(win.tz)})` : ''} — % is from the previous window`
+    : `resets ${esc(fmtUsageReset(win))}`;
+  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px${expired ? ';opacity:.55' : ''}">
     <span style="width:64px;color:var(--ink-2)">${esc(label)}</span>
     <span style="flex:1;height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:180px">
       <span style="display:block;height:100%;width:${pct}%;background:${hue}"></span>
     </span>
     <span class="mono" style="width:38px;text-align:right">${pct}%</span>
-    <span style="color:var(--ink-3)">resets ${esc(fmtUsageReset(win))}</span>
+    <span style="color:var(--ink-3)">${reset}</span>
   </div>`;
 }
 
@@ -4062,7 +4083,8 @@ function fmtAgo(epoch) {
   const ms = Date.now() - epoch;
   if (ms < 60_000) return 'just now';
   const m = Math.floor(ms / 60_000);
-  return m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
+  if (m < 60) return `${m}m ago`;
+  return m < 1440 ? `${Math.floor(m / 60)}h ago` : `${Math.floor(m / 1440)}d ago`;
 }
 
 // Format an absolute reset instant as a local time + relative countdown.
