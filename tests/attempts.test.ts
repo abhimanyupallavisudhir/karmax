@@ -108,7 +108,7 @@ describe('multiple task attempts', () => {
         await new Promise((r) => setTimeout(r, 15));
         ctx.confirmDecision({ action: 'confirm' });
         active--;
-        return { output: `reviewed ${seen.length}` };
+        return { termination: { kind: 'success' as const, status: 'mock.completed' }, output: `reviewed ${seen.length}` };
       },
     };
     const core = makeCoreActivities({ store, worlds, adapters: new Map([['mock', adapter]]), profiles: new ProfileResolver(store, 'mock') });

@@ -81,12 +81,14 @@ export class CodexAdapter implements AgentAdapter {
     const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
     let nextInput: any[] = convo.length
       ? convo.map((m) => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.role === 'agent' ? m.text : openaiUserContent(m) }))
-      : [{ role: 'user', content: respId ? 'Continue.' : 'Begin the task described in the instructions. Call signal_completion when done.' }];
+      : [{ role: 'user', content: respId ? 'Continue.' : 'Begin the task described in the instructions.' }];
 
     // Turn cap is optional: unset ⇒ effectively unlimited (a high runaway backstop
     // only, so a pathological infinite tool-loop can't burn unbounded spend).
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
+    let terminalStatus: string | undefined;
+    let terminalReason: string | undefined;
     // How many `input.messages` this turn has consumed (the initial delta covers up to
     // the schedule snapshot); follow-ups that land mid-turn are folded in at the idle
     // boundary as fresh user input on the resumed response chain (SPEC §5.6).
@@ -122,6 +124,10 @@ export class CodexAdapter implements AgentAdapter {
       if (!res.ok) throw new Error(`OpenAI Responses API ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const data = (await res.json()) as any;
       respId = data.id ?? respId;
+      if (data.status !== 'completed') {
+        const reason = data.incomplete_details?.reason ?? data.error?.message ?? data.error?.code ?? 'no reason supplied';
+        throw new Error(`OpenAI Responses turn did not complete successfully (status=${String(data.status ?? 'missing')}): ${String(reason)}`);
+      }
 
       const outputs: any[] = data.output ?? [];
       const calls = outputs.filter((o) => o.type === 'function_call');
@@ -138,6 +144,8 @@ export class CodexAdapter implements AgentAdapter {
         // response chain (previous_response_id carries the history); else finish.
         const more = await injectFollowUps();
         if (more.length) { nextInput = more; continue; }
+        terminalStatus = data.status;
+        terminalReason = data.incomplete_details?.reason;
         break;
       }
 
@@ -156,10 +164,24 @@ export class CodexAdapter implements AgentAdapter {
         if (call.name === 'signal_completion') completed = true;
       }
       nextInput = toolOutputs;
-      if (completed) break;
+      if (completed) {
+        terminalStatus = data.status;
+        terminalReason = 'signal_completion';
+        break;
+      }
     }
 
-    return { session: respId, output: finalText, delivered: deliveredIndex };
+    if (ctx.signal?.aborted) throw new Error('OpenAI Responses turn cancelled');
+    if (!terminalStatus) {
+      throw new Error(`OpenAI Responses turn exceeded its ${maxIters}-iteration backstop without a successful terminal response`);
+    }
+
+    return {
+      termination: { kind: 'success', status: terminalStatus, ...(terminalReason ? { reason: terminalReason } : {}) },
+      session: respId,
+      output: finalText,
+      delivered: deliveredIndex,
+    };
   }
 
   // ─── Codex app-server on a ChatGPT subscription (live JSON-RPC thread) ────────
@@ -201,6 +223,9 @@ export class CodexAdapter implements AgentAdapter {
     let finalText = '';
     let limit: { resetInSeconds?: number } | undefined;
     let turnError: string | undefined;
+    let terminalStatus: string | undefined;
+    let terminalReason: string | undefined;
+    let shuttingDown = false;
     // How many `input.messages` this turn has consumed — the initial delta up to the
     // schedule snapshot, then one more per in-flight follow-up steered/started below.
     let deliveredIndex = input.messages.length;
@@ -214,8 +239,10 @@ export class CodexAdapter implements AgentAdapter {
     // hang waiting on a response that will never come: record it and settle the turn so
     // the awaited handshake/turn rejects promptly and the workflow can resolve/retry.
     child.once('error', (e) => { turnError = turnError ?? `codex app-server spawn error: ${String(e)}`; turnActive = false; client.close(); settleTurn?.(); });
-    child.once('close', (code) => {
-      if (!finalText && !turnError) turnError = `codex app-server exited (code ${code ?? -1})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
+    child.once('close', (code, signal) => {
+      if (!shuttingDown && !turnError) {
+        turnError = `codex app-server connection closed unexpectedly (code ${code ?? -1}${signal ? `, signal ${signal}` : ''})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
+      }
       turnActive = false;
       client.close();
       settleTurn?.();
@@ -244,12 +271,17 @@ export class CodexAdapter implements AgentAdapter {
           }
           break;
         case 'turn/completed':
-          if (params?.turn?.status === 'failed' && params.turn.error) {
-            turnError = params.turn.error.message ?? JSON.stringify(params.turn.error);
+          terminalStatus = String(params?.turn?.status ?? 'missing');
+          terminalReason = params?.turn?.error?.message ?? params?.turn?.reason;
+          if (terminalStatus !== 'completed') {
+            const detail = terminalReason ?? JSON.stringify(params?.turn?.error ?? params?.turn ?? {});
+            turnError = terminalStatus === 'interrupted' || terminalStatus === 'cancelled'
+              ? `codex app-server turn interrupted before completion (${terminalStatus}): ${detail}`
+              : `codex app-server turn failed (${terminalStatus}): ${detail}`;
             // A usage limit can surface on a failed turn (not only an `error` notif) —
             // classify it here too so the workflow re-leases the login rather than
             // burning a Resolve turn (parity with the codex-exec blob scan).
-            noteLimit(JSON.stringify(params.turn.error));
+            noteLimit(JSON.stringify(params?.turn?.error ?? params?.turn ?? {}));
           }
           turnActive = false;
           settleTurn?.();
@@ -341,7 +373,7 @@ export class CodexAdapter implements AgentAdapter {
       // ── Initial input (the delta; agent turns attributed so a fresh-thread replay
       //    never folds the agent's own prior replies back in as user input). ──
       const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
-      const initialText = conversationToPromptText(convo) || (resuming ? 'Continue.' : 'Begin the task described in the developer instructions. Call signal_completion when done.');
+      const initialText = conversationToPromptText(convo) || (resuming ? 'Continue.' : 'Begin the task described in the developer instructions.');
       let nextInput: any[] = [{ type: 'text', text: initialText, text_elements: [] }, ...imageItems(convo)];
 
       // ── Turn loop (Model-B): run a turn; follow-ups arriving DURING it are steered
@@ -350,6 +382,8 @@ export class CodexAdapter implements AgentAdapter {
       for (;;) {
         if (ctx.signal?.aborted) break;
         turnError = undefined;
+        terminalStatus = undefined;
+        terminalReason = undefined;
         const settled = awaitTurnSettled();
         const started = await client.request<any>('turn/start', {
           threadId,
@@ -365,6 +399,11 @@ export class CodexAdapter implements AgentAdapter {
         await settled;
         if (ctx.signal?.aborted) break;
         if (limit) break; // usage limit → throw below so the workflow rotates the login
+        if (turnError) break;
+        if (terminalStatus !== 'completed') {
+          turnError = `codex app-server stream ended unexpectedly without a completed terminal event`;
+          break;
+        }
 
         // Collect follow-ups that weren't steered in (arrived after the last poll /
         // after completion) → drive a follow-on turn; else the turn is done.
@@ -384,6 +423,7 @@ export class CodexAdapter implements AgentAdapter {
       // of discarding output already produced (mirrors the exec/SDK error tolerance).
       if (!ctx.signal?.aborted) turnError = turnError ?? String((e as Error)?.message ?? e);
     } finally {
+      shuttingDown = true;
       if (hb) clearInterval(hb);
       if (followPoll) clearInterval(followPoll);
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
@@ -401,10 +441,18 @@ export class CodexAdapter implements AgentAdapter {
       // workflow rotates to another login (RESOLVE-PLAN §2.4).
       throw new Error(`Codex usage limit reached${limit.resetInSeconds != null ? ` · resets in ${limit.resetInSeconds}s` : ''}`);
     }
-    if (turnError && !finalText) {
+    if (turnError) {
       throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${stderr.slice(0, 300)}` : ''}`);
     }
-    return { session: threadId, output: finalText, delivered: deliveredIndex };
+    if (terminalStatus !== 'completed') {
+      throw new Error('codex app-server stream ended unexpectedly without a completed terminal event');
+    }
+    return {
+      termination: { kind: 'success', status: terminalStatus, ...(terminalReason ? { reason: terminalReason } : {}) },
+      session: threadId,
+      output: finalText,
+      delivered: deliveredIndex,
+    };
   }
 
   // ─── Codex CLI on a ChatGPT subscription (`codex exec --json`) ───────────────
@@ -486,6 +534,8 @@ export class CodexAdapter implements AgentAdapter {
     let limit: { resetInSeconds?: number } | undefined;
     let stderr = '';
     let buf = '';
+    let sawCompleted = false;
+    let turnFailure: string | undefined;
 
     const handleLine = (line: string) => {
       const s = line.trim();
@@ -497,6 +547,8 @@ export class CodexAdapter implements AgentAdapter {
         return; // non-JSON progress line
       }
       const t: string = ev.type ?? ev.msg?.type ?? '';
+      if (t === 'turn.completed') sawCompleted = true;
+      if (t === 'turn.failed') turnFailure = ev.error?.message ?? JSON.stringify(ev.error ?? ev);
       if (/thread\.(started|created)|session\.created/.test(t)) {
         const prev = threadId;
         threadId = ev.thread_id ?? ev.threadId ?? ev.session_id ?? ev.id ?? threadId;
@@ -529,9 +581,9 @@ export class CodexAdapter implements AgentAdapter {
       stderr += d.toString();
     });
 
-    const code: number = await new Promise((resolve) => {
-      child.once('error', () => resolve(-1));
-      child.once('close', (c) => resolve(c ?? -1));
+    const exited: { code: number; signal?: NodeJS.Signals; spawnError?: string } = await new Promise((resolve) => {
+      child.once('error', (e) => resolve({ code: -1, spawnError: String(e) }));
+      child.once('close', (c, signal) => resolve({ code: c ?? -1, ...(signal ? { signal } : {}) }));
     });
     if (buf.trim()) handleLine(buf); // flush a trailing partial line
     if (hb) clearInterval(hb);
@@ -555,13 +607,31 @@ export class CodexAdapter implements AgentAdapter {
       // compute the refresh instant precisely.
       throw new Error(`Codex usage limit reached${limit.resetInSeconds != null ? ` · resets in ${limit.resetInSeconds}s` : ''}`);
     }
-    if (code !== 0 && !finalText) {
-      throw new Error(`codex exec failed (exit ${code}): ${stderr.slice(0, 500) || '(no output)'}`);
+    if (exited.spawnError) {
+      throw new Error(`codex exec spawn failed: ${exited.spawnError}`);
+    }
+    if (exited.code !== 0) {
+      const why = exited.signal ? `signal ${exited.signal}` : `exit ${exited.code}`;
+      const diagnostic = (exited.spawnError ?? turnFailure ?? stderr.slice(0, 500)) || '(no diagnostic)';
+      throw new Error(
+        `codex exec connection terminated before successful completion (${why}): ${diagnostic}`,
+      );
+    }
+    if (turnFailure) {
+      throw new Error(`codex exec turn failed: ${turnFailure}`);
+    }
+    if (!sawCompleted) {
+      throw new Error('codex exec stream ended unexpectedly without a turn.completed event');
     }
     // `codex exec` is a one-shot subprocess — no way to inject mid-run, so it delivers
     // exactly the schedule snapshot; a follow-up that landed mid-turn reaches the agent
     // on the next turn (the workflow keeps it after the boundary). `delivered` reflects
     // that: everything up to `input.messages.length`.
-    return { session: threadId, output: finalText, delivered: input.messages.length };
+    return {
+      termination: { kind: 'success', status: 'turn.completed' },
+      session: threadId,
+      output: finalText,
+      delivered: input.messages.length,
+    };
   }
 }

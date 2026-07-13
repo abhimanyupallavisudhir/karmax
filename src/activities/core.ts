@@ -305,6 +305,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let heartbeat: (() => void) | undefined;
       let hbSession: string | undefined; // set once real progress exists (onSession)
       let legacyAgentTurnId: string | undefined;
+      let turnSessionKey: string | undefined;
+      let resumedActivityAttempt = false;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -321,8 +323,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (!args.agentTurnId && actx.info.workflowExecution) {
           legacyAgentTurnId = `legacy:${actx.info.workflowExecution.runId}:${actx.info.activityId}`;
         }
-        const prior = (actx.info.heartbeatDetails as { session?: string } | undefined)?.session;
+        const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
+        turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
+        // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
+        // SQLite key closes the small hard-kill window before a heartbeat reaches the
+        // service; unlike session:<task>:<role>, it cannot accidentally pick up a
+        // stale session from an earlier turn.
+        const prior =
+          (actx.info.heartbeatDetails as { session?: string } | undefined)?.session ??
+          (actx.info.attempt > 1 && turnSessionKey ? store.kvGet(turnSessionKey) : undefined);
         if (actx.info.attempt > 1 && prior) {
+          resumedActivityAttempt = true;
           liveChannel = false;
           // The interrupted attempt's session already holds the original prompt and
           // any partial work — continue it rather than re-sending the turn input.
@@ -335,7 +346,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             {
               id: `retry-${actx.info.attempt}`,
               role: 'user',
-              text: '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result and signal completion as usual.)',
+              text: '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result.)',
               ts: 0,
             },
           ];
@@ -521,9 +532,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const id = `${args.taskId}:${request.id}`;
           if (!shared.some((m) => m.id === id)) shared.push({ ...request, id, ts: shared.length });
         }
-        messages = shared;
-        session = undefined;
-        deliveredMessages = 0;
+        // Sibling task attempts deliberately start a fresh provider session and replay
+        // the intent-wide transcript. A retry of THIS SAME Temporal activity is
+        // different: it must resume the interrupted provider session checkpointed
+        // above, otherwise a worker restart discards the in-flight confirmer turn.
+        if (!resumedActivityAttempt) {
+          messages = shared;
+          session = undefined;
+          deliveredMessages = 0;
+        }
       }
       /** Compatibility publisher for immutable v1 histories. Those workflows
        * clear their in-memory account wait after a grant but cannot schedule a
@@ -625,6 +642,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.
           onSession: (s) => {
             hbSession = s; // heartbeats now carry it → a retry resumes this session
+            if (turnSessionKey) store.kvSet(turnSessionKey, s);
+            // Do not wait for the 10-second liveness interval: checkpoint the newly
+            // minted provider session immediately so a restart on the next instruction
+            // still resumes this exact turn.
+            heartbeat?.();
             store.kvSet(`session:${conversationTaskId}:${args.role}`, s);
             store.kvSet(
               `sessionmeta:${conversationTaskId}:${args.role}`,
@@ -682,6 +704,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       record(args.taskId, 'turn.result', {
         completed: result.completed,
+        providerCompleted: result.providerCompleted,
+        providerTermination: result.providerTermination,
         subTasks: result.subTasks?.length ?? 0,
         hasReview: !!result.reviewInfo,
         output: result.output.slice(0, 2000),

@@ -39,7 +39,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
         if (!restartCase) return mock.runTurn(input, ctx);
         if (input.session === restartSession) {
           ctx.signalCompletion('resumed after restart');
-          return { session: restartSession, output: 'resumed and completed' };
+          return { termination: { kind: 'success', status: 'mock.completed' }, session: restartSession, output: 'resumed and completed' };
         }
         ctx.onSession?.(restartSession);
         ctx.heartbeat?.();
@@ -47,7 +47,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
           if (ctx.signal?.aborted) return resolve();
           ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
         });
-        return { session: restartSession, output: 'partial output from interrupted turn' };
+        return { termination: { kind: 'success', status: 'mock.completed' }, session: restartSession, output: 'partial output from interrupted turn' };
       },
     };
     h = await bootHarness('mock', adapter);
@@ -144,6 +144,30 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // The distinction is real, not cosmetic: a stall is never auto-confirmed, so the task
     // waits at the human gate rather than advancing.
     expect(review.actions.map((a: any) => a.name)).toContain('confirm');
+  });
+
+  it('v1.2 treats verified provider completion as finished without requiring signal_completion', async () => {
+    const repo = await h.makeRepo('provider-completion');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.2.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        input({
+          taskId,
+          repo,
+          title: 'Provider-completed change',
+          prompt: 'Implement the change.\n@write finished.js :: export const finished = true;\n@incomplete',
+        }),
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.reviewInfo?.completion).toBe('finished');
+    expect(review.reviewInfo?.completion).not.toBe('stalled');
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
   });
 
   it('multi-repo: passes every configured repo to the agent and lands work in each', async () => {
