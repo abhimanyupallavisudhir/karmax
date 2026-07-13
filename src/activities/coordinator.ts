@@ -7,6 +7,7 @@ import {
   SIG_PRIORITIZE,
   SIG_CANCEL_MERGE,
   SIG_LEASE_ACCOUNT,
+  SIG_CANCEL_ACCOUNT,
   SIG_RETURN_ACCOUNT,
   SIG_REGISTER_ACCOUNTS,
   SIG_REPORT_EXHAUSTED,
@@ -121,6 +122,14 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signal: SIG_LEASE_ACCOUNT,
         signalArgs: [{ taskId, turnId, provider, allowed }],
       });
+    },
+    /** Remove a not-yet-granted account request when its task/turn is cancelled. */
+    async cancelAccount(taskId: string, turnId: string): Promise<void> {
+      try {
+        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_CANCEL_ACCOUNT, { taskId, turnId });
+      } catch {
+        /* coordinator gone — nothing to cancel */
+      }
     },
     async returnAccount(accountId: string): Promise<void> {
       try {

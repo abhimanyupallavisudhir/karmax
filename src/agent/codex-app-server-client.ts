@@ -26,6 +26,15 @@ export class CodexAppServerClient {
     stdout: Readable,
   ) {
     stdout.on('data', (d: Buffer | string) => this.onData(d.toString()));
+    // Writable failures are normally reported asynchronously through the stream's
+    // `error` event (a write to a child that just exited is the classic EPIPE).
+    // A try/catch around `.write()` cannot catch that event; without a listener,
+    // Node treats it as an uncaught exception and terminates the entire karmax
+    // gateway/worker process. Collapse every transport failure into the ordinary
+    // request-rejection path instead.
+    stdin.on('error', (e) => this.failTransport(e));
+    stdout.on('error', (e) => this.failTransport(e));
+    stdout.on('end', () => this.failTransport(new Error('codex app-server stdout ended')));
   }
 
   /** Register the streamed-event sink (turn/item lifecycle, deltas, errors). */
@@ -103,10 +112,25 @@ export class CodexAppServerClient {
   private writeLine(obj: unknown): void {
     if (this.closed) return;
     try {
-      this.stdin.write(JSON.stringify(obj) + '\n');
-    } catch {
-      /* stdin closed under us — the turn is ending anyway */
+      // The callback catches failures delivered by Writable implementations that
+      // don't emit `error`; the constructor listener catches the normal Socket
+      // path. `failTransport` is idempotent, so seeing both is harmless.
+      this.stdin.write(JSON.stringify(obj) + '\n', (err?: Error | null) => {
+        if (err) this.failTransport(err);
+      });
+    } catch (e) {
+      // Some synthetic/unit-test writables throw synchronously.
+      this.failTransport(e);
     }
+  }
+
+  private failTransport(cause: unknown): void {
+    if (this.closed) return;
+    this.closed = true;
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    const error = new Error(`codex app-server transport failed: ${detail}`);
+    for (const p of this.pending.values()) p.reject(error);
+    this.pending.clear();
   }
 
   /** Reject any in-flight requests and stop writing. Idempotent. */

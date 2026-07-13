@@ -9,7 +9,7 @@ import { TASK_QUEUE } from '../../src/temporal/config.js';
 import { Store } from '../../src/store/db.js';
 import { WorldRegistry } from '../../src/world/registry.js';
 import { buildAdapters } from '../../src/agent/adapters.js';
-import { ProfileResolver } from '../../src/agent/profiles.js';
+import { ProfileResolver, seedProfiles } from '../../src/agent/profiles.js';
 import { KarmaxBus } from '../../src/contrib/bus.js';
 import { git, gitOrThrow, ensureIdentity } from '../../src/world/git.js';
 import { Provider } from '../../src/domain/types.js';
@@ -46,6 +46,10 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
   const client = c.client;
 
   const store = new Store(':memory:');
+  // Production seeds role profiles before constructing the API. Do the same in
+  // the harness so API-created tasks honor the requested hermetic provider and
+  // never auto-detect a developer's real Claude/Codex login.
+  seedProfiles(store, provider);
   const worldsHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-worlds-'));
   const worlds = new WorldRegistry();
   // Point the worktree provider at a temp worlds home.

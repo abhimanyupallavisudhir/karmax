@@ -9,6 +9,7 @@ export type {
   TaskView,
   Stage,
   TaskStatus,
+  AgentRole,
   AgentSpec,
   ConfirmConfig,
   ConfirmMode,

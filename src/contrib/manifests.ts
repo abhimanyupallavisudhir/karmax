@@ -282,7 +282,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'Branch/world → do → review → PR → merge → end, with resolve and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -342,7 +342,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'just-do',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'A single straightforward agent call, no merge machinery.',
     requires: [],
     capabilities: ['create-review-info', 'signal-completion', 'save-skill'],
@@ -382,7 +382,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'Like software-dev, but auto-continues until structured completion.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -396,7 +396,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'merge-only',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'The review-and-merge half of software-dev (no Do). The dogfooded PR gate.',
     requires: ['merge-queue'],
     capabilities: ['create-review-info', 'signal-completion', 'merge-into:*'],
@@ -445,6 +445,13 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
 ];
 
+/** Bundled historical manifests whose workflow implementations must remain
+ * resolvable for existing version-pinned tasks. They are intentionally omitted
+ * from MANIFESTS so workflow pickers expose only the current release. */
+export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
+  .filter((m) => m.name === 'software-dev' || m.name === 'just-do' || m.name === 'goal' || m.name === 'merge-only')
+  .map((m) => ({ ...m, version: '1.0.0' }));
+
 export function manifest(name: string): WorkflowManifest | undefined {
   return MANIFESTS.find((m) => m.name === name);
 }
@@ -457,7 +464,7 @@ export function manifest(name: string): WorkflowManifest | undefined {
  * meaningful choices rather than raw noise.
  */
 export const PLATFORM_EVENTS: EventSchemaDecl[] = [
-  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled' } },
+  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', agentTurn: 'waiting-slot | running | null' } },
   { type: 'pr.opened', description: 'A pull request was opened for a task.', fields: { number: 'number', url: 'string' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },

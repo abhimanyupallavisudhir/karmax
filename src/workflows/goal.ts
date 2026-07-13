@@ -1,4 +1,4 @@
-import { softwareDev, SoftwareDevInput } from './software-dev.js';
+import { softwareDev, softwareDevV1, SoftwareDevInput } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
 
 /**
@@ -9,4 +9,9 @@ import { TaskInput, Stage } from './contract.js';
  */
 export async function goal(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDev({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Immutable replay entry for executions pinned to goal@1.0.0. */
+export async function goalV1(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }

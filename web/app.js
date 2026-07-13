@@ -3140,6 +3140,9 @@ function drawerBody(v) {
   const waiting = v.waitingFor
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
     : '';
+  const agentTurn = v.agentTurn
+    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
+    : '';
   const subtasks = v.subTasks?.length
     ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
     : '';
@@ -3163,6 +3166,7 @@ function drawerBody(v) {
     ${pipelineLarge(v)}
     ${error}
     ${waiting}
+    ${agentTurn}
     ${drawerNotes(v)}
     ${drawerParams(v)}
     ${review}
@@ -3180,7 +3184,7 @@ function drawerBody(v) {
       <div class="section-h">Live events</div>
       <div class="events" id="drawer-events"></div>
       <div class="section-h">Structured state (the view-model floor)</div>
-      <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>
+      <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>
     </details>`;
 }
 
@@ -3200,6 +3204,7 @@ function waitingLabel(w) {
     // grant latency, where asserting a quota cause sends the user to check a
     // dashboard that rightly shows nothing wrong.
     case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to free up'}`;
+    case 'agentSlot': return w.detail || 'a host agent slot';
     case 'mergeSlot': return 'a merge slot';
     case 'human': return 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
