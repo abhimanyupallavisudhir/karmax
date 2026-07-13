@@ -22,6 +22,7 @@ import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
 
@@ -521,11 +522,16 @@ export class Gateway {
       }
       const viewMatch = p.match(/^\/api\/tasks\/([^/]+)$/);
       if (viewMatch && method === 'GET') {
-        const view = await api.getTaskView(token, viewMatch[1]!);
+        const rec = store.getTask(viewMatch[1]!);
+        // Draft attempts have no Temporal execution, but are still selectable in
+        // the drawer. Keep that synthetic projection separate from getTaskView so
+        // list snapshots continue to truthfully report no execution view.
+        const view = rec?.params?.draft
+          ? api.getDraftView(token, viewMatch[1]!)
+          : await api.getTaskView(token, viewMatch[1]!);
         if (!view) return this.json(res, 200, null);
         // Mirror the record's sequential number onto the view (the workflow only
         // knows the opaque id) so the drawer can show `#num` + a permalink.
-        const rec = store.getTask(viewMatch[1]!);
         return this.json(res, 200, rec?.num != null ? { ...view, num: rec.num } : view);
       }
       if (viewMatch && method === 'DELETE') {
@@ -536,6 +542,17 @@ export class Gateway {
         if (!t.params?.draft) return this.json(res, 400, { error: 'only drafts can be deleted; cancel a running task instead' });
         store.deleteTask(viewMatch[1]!);
         return this.json(res, 200, { ok: true });
+      }
+      const attemptsMatch = p.match(/^\/api\/tasks\/([^/]+)\/attempts$/);
+      if (attemptsMatch && method === 'GET') {
+        return this.json(res, 200, api.attemptGroup(token, attemptsMatch[1]!) ?? null);
+      }
+      if (attemptsMatch && method === 'POST') {
+        try {
+          return this.json(res, 200, await api.addAttempt(token, attemptsMatch[1]!));
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
       const queueMatch = p.match(/^\/api\/tasks\/([^/]+)\/queue$/);
       if (queueMatch && method === 'POST') {
@@ -561,6 +578,14 @@ export class Gateway {
         // A draft has no running workflow — edit its stored params in place; they
         // re-resolve at queue time (SPEC §10.4).
         if (t.params?.draft) {
+          const confirmerField = manifest(t.workflow)?.params.find((f) => f.type === 'confirmer');
+          if (confirmerField && Object.prototype.hasOwnProperty.call(b.params ?? {}, confirmerField.name)) {
+            try {
+              store.setIntentConfirmer(t.intentId ?? t.id, confirmerField.name, b.params[confirmerField.name]);
+            } catch (e) {
+              return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+            }
+          }
           // Replace the workflow-field overrides wholesale (b.params is the form's
           // full set of own overrides) so a field reset to its default is actually
           // removed — a merge would leave the stale override behind. Lifecycle +
@@ -694,16 +719,18 @@ export class Gateway {
       const sessMatch = p.match(/^\/api\/tasks\/([^/]+)\/sessions$/);
       if (sessMatch && method === 'GET') {
         const id = sessMatch[1]!;
+        const t = store.getTask(id);
         // Each role → { id, home?, provider? } so the UI can build a CLI resume
         // command targeting the right CONFIG_DIR/CODEX_HOME (provider sessions are
         // home-bound). `home` is omitted for API-key/stateless sessions.
         const out: Record<string, { id: string; home?: string; provider?: string }> = {};
         for (const role of ['do', 'merge', 'resolve', 'confirm']) {
-          const s = store.kvGet(`session:${id}:${role}`);
+          const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
+          const s = store.kvGet(`session:${sessionTaskId}:${role}`);
           if (!s) continue;
           let home: string | undefined;
           let provider: string | undefined;
-          const meta = store.kvGet(`sessionmeta:${id}:${role}`);
+          const meta = store.kvGet(`sessionmeta:${sessionTaskId}:${role}`);
           if (meta) { try { const m = JSON.parse(meta); home = m.home || undefined; provider = m.provider || undefined; } catch { /* ignore */ } }
           out[role] = { id: s, ...(home ? { home } : {}), ...(provider ? { provider } : {}) };
         }
@@ -1317,12 +1344,22 @@ export class Gateway {
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
       const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
-      // A confirmer also carries a MODE (human/auto/agent) that inherits normally —
-      // plus its review-request prompt template, when one is stored at this scope
-      // (the form falls back to the field's promptDefault); the agent knobs above
-      // are the defaults shown once "agent" mode is selected.
+      // A confirmer carries the ordered confirm LAYERS (legacy {mode} values
+      // normalize). Each agent layer gets the role-default agent knobs filled in,
+      // same as a bare agent field; `agentDefault` rides along so the form can
+      // prefill a NEWLY added agent layer the same way (display-only — collectForm
+      // never stores it).
       out[f.name] = f.type === 'confirmer'
-        ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}), ...(spec.prompt ? { prompt: spec.prompt } : {}) }
+        ? {
+            layers: confirmLayersOf(Object.keys(spec).length ? spec : (f.default as any)).map((l) => {
+              if (l.kind !== 'agent') return { kind: l.kind };
+              const lprov = l.provider ?? prof?.provider ?? defaultProvider().provider;
+              const lmodel = l.model ?? prof?.model ?? defaultModel(lprov);
+              const leffort = l.effort ?? prof?.effort ?? defaultEffort(lprov);
+              return { ...l, provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
+            }),
+            agentDefault: agent,
+          }
         : agent;
     }
     return out;

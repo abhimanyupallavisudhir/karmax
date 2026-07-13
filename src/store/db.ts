@@ -80,6 +80,10 @@ export class Store {
         params TEXT NOT NULL, createdAt INTEGER NOT NULL, ord INTEGER NOT NULL,
         parentTaskId TEXT, lastView TEXT
       );
+      CREATE TABLE IF NOT EXISTS task_intents (
+        id TEXT PRIMARY KEY, principalAttemptId TEXT NOT NULL,
+        committedAttemptId TEXT, confirmer TEXT, createdAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS profiles (
         id TEXT PRIMARY KEY, json TEXT NOT NULL
       );
@@ -119,6 +123,16 @@ export class Store {
     // Free-form human notes, added after the initial schema. Guarded so existing
     // installs pick it up without a re-create.
     const cols = this.db.prepare('PRAGMA table_info(tasks)').all() as any[];
+    if (!cols.some((c) => c.name === 'intentId')) this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT');
+    if (!cols.some((c) => c.name === 'attemptNumber')) this.db.exec('ALTER TABLE tasks ADD COLUMN attemptNumber INTEGER');
+    // Existing rows become single-attempt intents. This is deliberately idempotent.
+    this.db.exec(`
+      UPDATE tasks SET intentId = id WHERE intentId IS NULL;
+      UPDATE tasks SET attemptNumber = 1 WHERE attemptNumber IS NULL;
+      INSERT OR IGNORE INTO task_intents (id, principalAttemptId, createdAt)
+        SELECT id, id, createdAt FROM tasks;
+      CREATE INDEX IF NOT EXISTS idx_tasks_intent ON tasks(intentId, attemptNumber);
+    `);
     if (!cols.some((c) => c.name === 'notes')) {
       this.db.exec('ALTER TABLE tasks ADD COLUMN notes TEXT');
     }
@@ -194,6 +208,7 @@ export class Store {
     this.db
       .prepare('DELETE FROM task_tags WHERE taskId IN (SELECT id FROM tasks WHERE projectId = ?)')
       .run(id);
+    this.db.prepare('DELETE FROM task_intents WHERE id IN (SELECT intentId FROM tasks WHERE projectId = ?)').run(id);
     this.db.prepare('DELETE FROM tasks WHERE projectId = ?').run(id);
     this.db.prepare('DELETE FROM task_lists WHERE projectId = ?').run(id);
     this.db.prepare('DELETE FROM tags WHERE projectId = ?').run(id);
@@ -233,6 +248,10 @@ export class Store {
     workflowVersion: string;
     params: TaskParams;
     parentTaskId?: string;
+    /** Existing logical task when creating an alternate attempt. */
+    intentId?: string;
+    /** Effective confirmer snapshot, recorded once for a new logical task. */
+    confirmer?: unknown;
   }): TaskRecord {
     const listId =
       input.listId ?? this.listLists(input.projectId)[0]?.id ?? this.createList(input.projectId, 'Tasks').id;
@@ -240,9 +259,16 @@ export class Store {
       (this.db
         .prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM tasks WHERE listId = ?')
         .get(listId) as any).m + 1;
+    const id = newId('task');
+    const intentId = input.intentId ?? id;
+    const attemptNumber = input.intentId
+      ? Number((this.db.prepare('SELECT COALESCE(MAX(attemptNumber), 0) AS n FROM tasks WHERE intentId = ?').get(intentId) as any).n) + 1
+      : 1;
     const t: TaskRecord = {
-      id: newId('task'),
-      num: this.nextTaskNum(input.projectId),
+      id,
+      intentId,
+      attemptNumber,
+      num: input.intentId ? undefined : this.nextTaskNum(input.projectId),
       projectId: input.projectId,
       listId,
       title: input.title,
@@ -255,8 +281,8 @@ export class Store {
     };
     this.db
       .prepare(
-        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
@@ -272,12 +298,86 @@ export class Store {
         t.parentTaskId ?? null,
         null,
         null,
+        intentId,
+        attemptNumber,
       );
+    if (!input.intentId) {
+      this.db.prepare('INSERT INTO task_intents (id, principalAttemptId, confirmer, createdAt) VALUES (?, ?, ?, ?)')
+        .run(intentId, id, input.confirmer === undefined ? null : JSON.stringify(input.confirmer), t.createdAt);
+    }
     return t;
   }
 
+  attemptsOf(taskOrIntentId: string): TaskRecord[] {
+    const t = this.getTask(taskOrIntentId);
+    const intentId = t?.intentId ?? taskOrIntentId;
+    return (this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
+      LEFT JOIN tasks root ON root.id=t.intentId WHERE t.intentId = ? ORDER BY t.attemptNumber`).all(intentId) as any[]).map(rowToTask);
+  }
+
+  attemptGroup(taskOrIntentId: string): { intentId: string; principalAttemptId: string; committedAttemptId?: string; confirmer?: unknown; attempts: TaskRecord[] } | undefined {
+    const t = this.getTask(taskOrIntentId);
+    const intentId = t?.intentId ?? taskOrIntentId;
+    const r = this.db.prepare('SELECT * FROM task_intents WHERE id = ?').get(intentId) as any;
+    if (!r) return undefined;
+    return { intentId, principalAttemptId: r.principalAttemptId, committedAttemptId: r.committedAttemptId ?? undefined,
+      confirmer: r.confirmer == null ? undefined : JSON.parse(r.confirmer), attempts: this.attemptsOf(intentId) };
+  }
+
+  /** One row per logical task: only the current principal appears in list/search. */
+  listPrincipalTasks(projectId: string): TaskRecord[] {
+    const rows = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
+      JOIN task_intents i ON i.principalAttemptId=t.id JOIN tasks root ON root.id=i.id
+      WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId) as any[];
+    return this.attachTags(projectId, rows.map(rowToTask));
+  }
+
+  /** Atomically reserve the logical task at Merge entry. Returns siblings to cancel. */
+  claimAttempt(taskId: string): { accepted: boolean; cancel: string[] } {
+    const t = this.getTask(taskId);
+    if (!t?.intentId) return { accepted: true, cancel: [] };
+    const info = this.db.prepare('UPDATE task_intents SET committedAttemptId=?, principalAttemptId=? WHERE id=? AND committedAttemptId IS NULL')
+      .run(taskId, taskId, t.intentId);
+    const group = this.attemptGroup(t.intentId)!;
+    if (!Number(info.changes) && group.committedAttemptId !== taskId) return { accepted: false, cancel: [taskId] };
+    return { accepted: true, cancel: group.attempts.filter((a) => a.id !== taskId && a.lastView?.status !== 'cancelled').map((a) => a.id) };
+  }
+
+  markDraftSuperseded(taskId: string, winnerId: string) {
+    const t = this.getTask(taskId);
+    if (!t?.params.draft) return;
+    const view: TaskView = {
+      taskId, title: t.title, workflow: t.workflow, stage: 'cancelled', status: 'cancelled',
+      messages: [], actions: [], state: { supersededBy: winnerId }, updatedAt: Date.now(),
+    };
+    this.updateTaskParams(taskId, { ...t.params, draft: false, archived: true });
+    this.saveView(taskId, view);
+  }
+
+  /** Re-elect after principal cancellation. Drafts and live attempts are eligible. */
+  electPrincipal(intentId: string) {
+    const g = this.attemptGroup(intentId);
+    if (!g || g.committedAttemptId) return;
+    const eligible = g.attempts.find((a) => a.lastView?.status !== 'cancelled' && a.lastView?.status !== 'failed');
+    if (eligible) this.db.prepare('UPDATE task_intents SET principalAttemptId=? WHERE id=?').run(eligible.id, intentId);
+  }
+
+  setIntentConfirmer(intentId: string, field: string, confirmer: unknown) {
+    const attempts = this.attemptsOf(intentId);
+    const group = this.attemptGroup(intentId);
+    if (attempts.some((a) => !a.params.draft)) {
+      // Full-form replacement includes disabled controls too. Re-sending the
+      // existing shared value is harmless; only an actual divergence is locked.
+      if (JSON.stringify(group?.confirmer) === JSON.stringify(confirmer)) return;
+      throw new Error('the confirmer is shared and freezes when any attempt is queued');
+    }
+    this.db.prepare('UPDATE task_intents SET confirmer=? WHERE id=?').run(JSON.stringify(confirmer), intentId);
+    for (const a of attempts) this.updateTaskParams(a.id, { ...a.params, [field]: confirmer });
+  }
+
   getTask(id: string): TaskRecord | undefined {
-    const r = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as any;
+    const r = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
+      LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id = ?`).get(id) as any;
     if (!r) return undefined;
     const t = rowToTask(r);
     const tags = this.tagsFor(id);
@@ -287,7 +387,8 @@ export class Store {
 
   /** Resolve a task by its per-project sequential number (SPEC §10.6). */
   getTaskByNum(projectId: string, num: number): TaskRecord | undefined {
-    const r = this.db.prepare('SELECT * FROM tasks WHERE projectId = ? AND num = ?').get(projectId, num) as any;
+    const r = this.db.prepare(`SELECT i.principalAttemptId AS id FROM tasks root
+      JOIN task_intents i ON i.id=root.intentId WHERE root.projectId=? AND root.num=?`).get(projectId, num) as any;
     return r ? this.getTask(r.id) : undefined;
   }
 
@@ -349,6 +450,10 @@ export class Store {
     // deliberately un-archived a finished task.
     const prev = this.getTask(taskId);
     this.db.prepare('UPDATE tasks SET lastView = ? WHERE id = ?').run(JSON.stringify(view), taskId);
+    if (view.status === 'cancelled' || view.status === 'failed') {
+      const t = this.getTask(taskId);
+      if (t?.intentId) this.electPrincipal(t.intentId);
+    }
     const resolvedNow =
       AUTO_ARCHIVE_STATUS.has(view.status) && !AUTO_ARCHIVE_STATUS.has(prev?.lastView?.status ?? '');
     if (prev && resolvedNow && !prev.params?.archived) {
@@ -402,9 +507,24 @@ export class Store {
 
   /** Hard-delete a task row + its events (used for drafts, which never ran). */
   deleteTask(taskId: string) {
+    const prior = this.getTask(taskId);
+    const siblings = prior?.intentId ? this.attemptsOf(prior.intentId) : [];
+    // The first attempt's id is also the permanent logical-task id/number. Once
+    // alternates exist, preserve that anchor as cancelled history instead of
+    // deleting it out from under the intent.
+    if (prior && prior.id === prior.intentId && siblings.length > 1) {
+      this.updateTaskParams(taskId, { ...prior.params, draft: false, archived: true });
+      this.saveView(taskId, { taskId, title: prior.title, workflow: prior.workflow, stage: 'cancelled', status: 'cancelled', messages: [], actions: [], state: { deletedDraft: true }, updatedAt: Date.now() });
+      return;
+    }
     this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId);
     this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId);
     this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+    if (prior?.intentId) {
+      const left = this.attemptsOf(prior.intentId);
+      if (!left.length) this.db.prepare('DELETE FROM task_intents WHERE id = ?').run(prior.intentId);
+      else this.electPrincipal(prior.intentId);
+    }
   }
 
   // ─── Tags (task organization — labels + topics, hierarchical) ────────────────
@@ -752,7 +872,9 @@ function rowToList(r: any): TaskList {
 function rowToTask(r: any): TaskRecord {
   return {
     id: r.id,
-    num: r.num ?? undefined,
+    intentId: r.intentId ?? r.id,
+    attemptNumber: r.attemptNumber ?? 1,
+    num: r.resolvedNum ?? r.num ?? undefined,
     projectId: r.projectId,
     listId: r.listId,
     title: r.title,

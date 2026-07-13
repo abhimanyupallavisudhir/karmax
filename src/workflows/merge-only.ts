@@ -14,7 +14,8 @@ import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, remotePolicyOf } from './contract.js';
+import { confirmLayersOf } from '../domain/confirm.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer, remotePolicyOf } from './contract.js';
 import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -72,9 +73,10 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
   let confirmed = false;
   let cancelled = false;
   let world: WorldHandleLike | undefined;
-  // Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent. The
-  // legacy `autoConfirm` flag maps to `auto`; explicit `input.confirm` wins.
-  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? (input.autoConfirm ? 'auto' : 'human');
+  // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
+  // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
+  // and the `autoConfirm` flag normalize to their layer equivalents.
+  const confirmLayers = confirmLayersOf(input.confirm, !!input.autoConfirm);
   let reviewInfo: ReviewInfo | undefined;
   let mergeGranted = false;
   let checks: { passed: boolean; detail?: string } | undefined;
@@ -135,13 +137,17 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
 
   /** Run one Confirm-agent turn (SPEC §5.2): review the branch, return a verdict, or
    *  undefined on failure so the caller leaves the gate to a human. */
-  async function runConfirm(): Promise<ConfirmDecision | undefined> {
+  async function runConfirm(layer: ConfirmLayer): Promise<ConfirmDecision | undefined> {
     try {
+      // The layer's own agent spec drives this turn (each agent layer can run a
+      // different reviewer); a spec-less layer falls back to the confirm profile.
+      const { kind: _kind, prompt: _prompt, ...layerSpec } = layer;
+      const task = layerSpec.provider ? { ...input, agents: { ...(input.agents ?? {}), confirm: { ...layerSpec, provider: layerSpec.provider } } } : input;
       // Fresh turn each Review so the reviewer judges the current branch; a mid-turn
       // retry still resumes via runAgentTurn heartbeat details. The review request
       // (task prompt + what's under review, template user-editable via the confirmer
       // field) is delivered as the conversation message, like software-dev's.
-      const request = renderConfirmPrompt(input.confirm?.prompt, {
+      const request = renderConfirmPrompt(layer.prompt ?? input.confirm?.prompt, {
         title: input.title,
         prompt: input.prompt,
         response: reviewInfo?.summary ?? '(no summary)',
@@ -155,7 +161,7 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
           role: 'confirm',
           worldHandle: world as any,
           messages: [{ id: 'c-in-0', role: 'user', text: request, ts: 0 }],
-          task: input,
+          task,
           bindings: {
             reviewInfo: reviewInfo?.summary ?? '',
             changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
@@ -208,17 +214,31 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
   status = 'waiting';
   // Never confirm a workflow-edit whose checks failed, whatever the confirmer says.
   const mayConfirm = !input.workflowEdit || (checks?.passed ?? true);
-  if (mayConfirm && confirmMode === 'auto') {
-    confirmed = true;
-  } else if (mayConfirm && confirmMode === 'agent') {
-    await publish();
-    const decision = await runConfirm();
-    if (decision?.action === 'confirm') confirmed = true;
-    else if (decision?.action === 'reject') {
-      if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
-      cancelled = true;
+  if (mayConfirm) {
+    // Play the confirm layers in order (SPEC §5.2); every layer must approve.
+    // [] ⇒ auto-confirm. There is no Do stage to send a `revise` back to, so a
+    // revise / no-verdict agent layer leaves the rest of the gate to a human.
+    let leftToHuman = false;
+    for (const layer of confirmLayers) {
+      if (cancelled || leftToHuman) break;
+      if (layer.kind === 'agent') {
+        await publish();
+        const decision = await runConfirm(layer);
+        if (decision?.action === 'confirm') continue;
+        if (decision?.action === 'reject') {
+          if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
+          cancelled = true;
+        } else {
+          leftToHuman = true;
+        }
+      } else {
+        // A human layer: one Approve click passes ONE layer.
+        await publish();
+        await condition(() => confirmed || cancelled);
+        confirmed = false; // consumed by this layer
+      }
     }
-    // `revise` / no verdict → leave it for a human (no Do stage to send it back to).
+    if (!cancelled && !leftToHuman) confirmed = true;
   }
   await publish();
   await condition(() => confirmed || cancelled);

@@ -49,12 +49,15 @@ ok(JSON.stringify(parseKeybinding('cmd+K')) === JSON.stringify([{ key: 'K', meta
 ok(JSON.stringify(parseKeybinding('Escape')) === JSON.stringify([{ key: 'escape' }]), 'named key normalizes');
 ok(JSON.stringify(parseKeybinding('ArrowDown')) === JSON.stringify([{ key: 'arrowdown' }]), 'arrow key normalizes');
 ok(JSON.stringify(parseKeybinding('?')) === JSON.stringify([{ key: '?' }]), 'shifted punctuation is its own key');
+ok(JSON.stringify(parseKeybinding('[')) === JSON.stringify([{ key: '[' }]), 'bracket binds as a plain key (task-page tab cycling)');
 ok(parseKeybinding('').length === 0, 'empty binding → no steps');
 
 // ── stepMatches ──
 ok(stepMatches({ key: 'c' }, ev('c')), 'plain key matches');
 ok(!stepMatches({ key: 'c' }, ev('c', { ctrlKey: true })), 'Ctrl+C must NOT match a plain c (copy stays copy)');
 ok(!stepMatches({ key: 'c' }, ev('c', { metaKey: true })), 'Cmd+C must NOT match a plain c');
+ok(stepMatches(parseKeybinding(']')[0], ev(']')), 'next-tab ] matches its keystroke');
+ok(!stepMatches(parseKeybinding('[')[0], ev('[', { ctrlKey: true })), 'Ctrl+[ must NOT match a plain [');
 ok(!stepMatches({ key: 'c' }, ev('C')), 'case-sensitive: C (shift) is not c');
 ok(stepMatches({ key: 'J' }, ev('J', { shiftKey: true })), 'uppercase binding matches shifted key');
 ok(stepMatches({ key: 'k', meta: true }, ev('k', { metaKey: true })), 'meta+k matches Cmd');

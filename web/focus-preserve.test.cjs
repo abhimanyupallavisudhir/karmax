@@ -1,7 +1,7 @@
 // Verifies captureFocus/restoreFocus (in app.js) preserve a mid-typed field's
 // value + caret across a renderMain() innerHTML swap, and that the follow-up
-// variants keep the drawer's send-message box focused/in-view across a
-// renderDrawer() re-render (instead of jumping to the top).
+// variants keep the task page's send-message box focused/in-view across a
+// renderTaskPage() re-render (instead of jumping away).
 // Run: node web/focus-preserve.test.cjs
 const fs = require('fs');
 const path = require('path');
@@ -96,7 +96,7 @@ ok(newSel._focused === true, 'select regains focus');
 
 // ── Follow-up box: refresh (after send) must keep the box focused, not jump to top ──
 // A textarea keyed by agent role, not an id, so captureFocus ignores it and the
-// dedicated follow-up helpers must carry focus/caret across the drawer re-render.
+// dedicated follow-up helpers must carry focus/caret across the page re-render.
 function makeFollowup(role, value) {
   const ta = {
     tagName: 'TEXTAREA', value, disabled: false, selectionStart: value.length, selectionEnd: value.length,

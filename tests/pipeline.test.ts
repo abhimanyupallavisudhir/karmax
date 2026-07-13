@@ -355,6 +355,50 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:c.txt'])).stdout).toContain('custom');
   });
 
+  it('confirm layers: an agent review layer, then a final human confirmation (SPEC §5.2)', async () => {
+    const repo = await h.makeRepo('confirm-layers');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'LayeredConfirm', prompt: 'Ship it.\n@write d.txt :: layered\n@review please review\n@confirm confirm' }),
+          confirm: { layers: [{ kind: 'agent', provider: 'mock' }, { kind: 'human' }] },
+        },
+      ],
+    });
+    // The agent layer approves (the @confirm directive), then the gate WAITS on the
+    // human layer — the agent's approval alone must not merge the work.
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 20_000 }).toBe('confirm layer 2/2');
+    const v = await view(handle);
+    expect(v.stage).toBe('review');
+    expect(v.transcripts?.find((t: any) => t.role === 'confirm')?.messages.some((m: any) => m.text.includes('confirm_decision: confirm'))).toBe(true);
+    await handle.signal('confirm');
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:d.txt'])).stdout).toContain('layered');
+  });
+
+  it('confirm layers: zero layers auto-confirm a completed turn', async () => {
+    const repo = await h.makeRepo('confirm-zero-layers');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          ...input({ taskId, repo, title: 'ZeroLayers', prompt: 'Ship it.\n@write z.txt :: hands-off\n@review done' }),
+          confirm: { layers: [] },
+        },
+      ],
+    });
+    // No signals at all — an empty layer list is auto-confirm.
+    const result = await handle.result();
+    expect(result.stage).toBe('done');
+    expect((await git(repo, ['show', 'main:z.txt'])).stdout).toContain('hands-off');
+  });
+
   it('escalates with a clear error when the project repo is misconfigured (no silent scratch)', async () => {
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {

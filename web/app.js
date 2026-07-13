@@ -13,14 +13,18 @@ const S = {
   projects: [],
   projectId: null,
   tasks: [],
+  attemptGroup: null, // logical-task group for the open task page
   deleted: new Set(), // ids of drafts deleted this session — tombstones so a stale
   // in-flight list refresh (issued before the DELETE landed) can't resurrect them.
   tab: 'tasks',
-  selected: null, // taskId
+  selected: null, // taskId of the open task page (null when a list view is showing)
+  viewingAttempt: null, // explicit attempt selection; prevents principal auto-redirection
   view: null, // selected task view
-  drawerEvents: [],
+  taskTab: null, // open tab on the task page ('overview'|'checkin'|'parameters'|'advanced'; null → auto)
+  checkinSel: null, // selected check-in pane: an agent role, or 'terminal' (null → the stage's agent)
+  taskEvents: [],
   liveOutput: '',
-  drawerSeq: 0,
+  followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
   search: '', // the working query string (Linear-style tokens + free text)
   // Task organization (PLAN-search-views): a view IS a saved query.
@@ -37,10 +41,16 @@ const S = {
   hostDiagTimer: null, // live-refresh handle for the dashboard host-diagnostics panel
   procTimer: null, // live-refresh handle for the dashboard processes (task manager) panel
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
-  returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
+  returnRoute: null, // where closing the task page returns to (the list/queue we opened from)
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   modelCatalog: null, // provider-native model metadata loaded from the gateway
 };
+
+// Non-principal attempts are intentionally absent from S.tasks because the list
+// has one row per logical task. Page lookups must also consult the loaded group.
+function taskRecord(id) {
+  return (S.attemptGroup?.attempts || []).find((t) => t.id === id) || (S.tasks || []).find((t) => t.id === id);
+}
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
 // Every page is a host-owned route; the browser URL is the single source of truth
@@ -52,7 +62,8 @@ const S = {
 //   /dashboard                           → global dashboard
 //   /settings                            → global settings
 //   /projects/:name/tasks                → task list (also /queue, /activity, /settings)
-//   /projects/:name/tasks/:num           → task list with task #num open (permalink)
+//   /projects/:name/tasks/:num           → the task's own page (permalink)
+//   /projects/:name/tasks/:num/:tab      → the task page pinned to one of its tabs
 function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
 }
@@ -74,7 +85,8 @@ function parseRoute(pathname) {
   if (seg[0] === 'projects' && seg[1]) {
     const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
-    return { name: 'project', slug: seg[1], tab, taskKey };
+    const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
+    return { name: 'project', slug: seg[1], tab, taskKey, taskTab };
   }
   return { name: 'home' };
 }
@@ -113,7 +125,7 @@ async function applyRoute() {
     return go(pid ? projectRoute(pid) : '/dashboard', { replace: true });
   }
   if (r.name === 'global') {
-    closeDrawerDom();
+    closeTaskDom();
     S.tab = r.tab;
     renderRail();
     renderMain();
@@ -139,31 +151,62 @@ async function applyRoute() {
   }
   else if (!S.tasks?.length) { await loadTasks().catch(() => {}); }
   await loadOrg().catch(() => {}); // tags / saved views / field registry for this project
-  if (tab === 'tasks') await runSearch().catch(() => {});
-  S.tab = tab;
-  renderRail();
-  renderMain();
-  if (tab === 'activity') seedActivity();
-  if (tab === 'queue') seedQueue();
-  if (tab === 'dashboard') renderDashboard();
-  // reconcile the open task from the URL (loaded tasks are in hand now)
+  // Resolve the open task from the URL BEFORE painting, so a permalink paints once
+  // (its task page), not the list with a page swapped in a beat later.
   let taskId = null;
   if (r.taskKey) {
     taskId = await resolveProjectTaskKey(pid, r.taskKey);
     if (!taskId) toast(`Task #${r.taskKey} not found`, true);
   }
-  if (taskId) { if (S.selected !== taskId) await openDrawer(taskId); else highlightRow(); }
-  else closeDrawerDom();
+  S.tab = tab;
+  if (!taskId) closeTaskDom();
+  if (tab === 'tasks' && !taskId) await runSearch().catch(() => {});
+  renderRail();
+  if (taskId) {
+    if (S.selected !== taskId) return openTask(taskId, r.taskTab);
+    if (r.taskTab) S.taskTab = r.taskTab;
+    return renderTaskPage();
+  }
+  renderMain();
+  if (tab === 'activity') seedActivity();
+  if (tab === 'queue') seedQueue();
+  if (tab === 'dashboard') renderDashboard();
 }
 
-// Push a task permalink (/projects/:name/tasks/:num) and remember where to return
-// on close (so closing lands back on the list/queue we opened from).
-function goToTask(id) {
-  const rec = (S.tasks || []).find((t) => t.id === id);
+// The permalink for a task (/projects/:name/tasks/:num) — used for in-place
+// navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click).
+function taskUrl(id) {
+  const rec = taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
-  S.returnRoute = location.pathname;
-  return go(p ? `/projects/${projectSlug(p)}/tasks/${keyPart}` : location.pathname);
+  return p ? `/projects/${projectSlug(p)}/tasks/${keyPart}` : location.pathname;
+}
+
+// Push a task permalink and remember where to return on close — but only when
+// coming FROM a list/queue, so j/k-walking between task pages keeps the original
+// list (not the previous task) as the place Esc returns to.
+function goToTask(id) {
+  if (!parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
+  return go(taskUrl(id));
+}
+
+// Make an element open a task like a link: plain click navigates in place;
+// Ctrl/⌘-click and middle-click open the task's permalink in a new browser tab.
+// `getId(ev)` returns the task id, or null to ignore the click (e.g. it landed
+// on an inner button); `open` overrides the in-place action (default goToTask).
+function wireTaskNav(el, getId, open = goToTask) {
+  el.addEventListener('click', (ev) => {
+    const id = getId(ev);
+    if (!id) return;
+    if (ev.ctrlKey || ev.metaKey) return void window.open(taskUrl(id), '_blank', 'noopener');
+    open(id);
+  });
+  el.addEventListener('auxclick', (ev) => {
+    const id = ev.button === 1 ? getId(ev) : null;
+    if (!id) return;
+    ev.preventDefault();
+    window.open(taskUrl(id), '_blank', 'noopener');
+  });
 }
 
 // A short human label for a task id: `#num` when known, else a short id.
@@ -378,31 +421,84 @@ function readResume(box) {
   return resumeFrom;
 }
 
-// The confirmer field: a mode selector (human / auto / agent) plus the SAME agent
-// sub-form as Do/Merge/Resolve, shown only when the mode is "agent". Reuses
-// renderAgentField for the agent controls (so provider/model/effort + "Fork a
-// previous agent" all work identically), and carries the mode alongside. Agent mode
-// also exposes the review-request prompt template — the message the Confirm agent
-// receives each time the task reaches Review — pre-filled with the built-in default
+// The confirmer field: an ordered LIST of confirm layers, played sequentially at
+// the Review gate — each layer is a human confirmation or a review agent; zero
+// layers ⇒ auto-confirm. Layers can be added, removed and reordered; an agent
+// layer reuses the SAME agent sub-form as Do/Merge/Resolve (renderAgentField, so
+// provider/model/effort + "Fork a previous agent" all work identically) plus the
+// review-request prompt template — pre-filled with the built-in default
 // (f.promptDefault) and stored only when edited, so it keeps inheriting otherwise.
-const CONFIRM_MODE_LABELS = { human: 'Human (you confirm)', auto: 'Auto-confirm', agent: 'Agent confirms' };
-function renderConfirmerField(f, own, inherited, alt) {
-  const inh = inherited || {};
-  const e = own || inh;
-  const mode = e.mode || inh.mode || 'human';
-  const promptVal = (own?.prompt ?? inh.prompt ?? f.promptDefault) || '';
-  const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
-  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}'>
-    <select class="cf-mode">${['human', 'auto', 'agent'].map((m) => `<option value="${m}" ${m === mode ? 'selected' : ''}>${esc(CONFIRM_MODE_LABELS[m])}</option>`).join('')}</select>
-    <div class="cf-agent" style="margin-top:8px;${mode === 'agent' ? '' : 'display:none'}">${renderAgentField(f, own, inherited)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Confirm agent prompt — sent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+// Legacy single-gate values ({mode:…}) are normalized to layers on read.
+function cfLayersOf(v) {
+  if (Array.isArray(v?.layers)) return v.layers;
+  const mode = v?.mode || 'human';
+  if (mode === 'auto') return [];
+  if (mode === 'agent') { const { mode: _m, layers: _l, agentDefault: _d, ...rest } = v || {}; return [{ kind: 'agent', ...rest }]; }
+  return [{ kind: 'human' }];
+}
+function cfLayerHtml(f, layer, agentDefault) {
+  const isAgent = layer.kind === 'agent';
+  const promptVal = (isAgent ? layer.prompt ?? f.promptDefault : f.promptDefault) || '';
+  return `<div class="cf-layer" data-kind="${esc(layer.kind)}">
+    <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
+      <span class="cf-layer-num" style="font-size:11px;color:var(--ink-3);min-width:14px;text-align:right"></span>
+      <select class="cf-kind">${[['human', 'Human confirms'], ['agent', 'Agent reviews']].map(([k, l]) => `<option value="${k}" ${k === layer.kind ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <span style="flex:1"></span>
+      <button type="button" class="btn sm cf-move" data-dir="-1" title="Move layer up">↑</button>
+      <button type="button" class="btn sm cf-move" data-dir="1" title="Move layer down">↓</button>
+      <button type="button" class="btn sm cf-del" title="Remove this layer">✕</button>
+    </div>
+    <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
+  </div>`;
+}
+function cfListHtml(f, layers, agentDefault) {
+  return layers.map((l) => cfLayerHtml(f, l, agentDefault)).join('');
+}
+function renderConfirmerField(f, own, inherited, alt) {
+  const inh = inherited || {};
+  const layers = cfLayersOf(own || inh);
+  const agentDefault = inh.agentDefault || {};
+  const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}' data-agent-default='${esc(JSON.stringify(agentDefault))}'>
+    <div class="cf-layers">${cfListHtml(f, layers, agentDefault)}</div>
+    <div class="cf-empty" style="font-size:12px;color:var(--ink-3);padding:2px 0;${layers.length ? 'display:none' : ''}">No layers — the task auto-confirms at Review.</div>
+    <button type="button" class="btn sm cf-add" style="margin-top:6px">+ Add layer</button>
   </div>`;
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
+// Canonical shape of a confirm layer for changed-vs-inherited comparison.
+const normLayers = (ls) =>
+  (ls || []).map((l) =>
+    l.kind === 'agent'
+      ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
+      : { kind: 'human' },
+  );
+
+// Read a confirmer box's layer list back out of the DOM (the stored value shape).
+function readConfirmerLayers(box) {
+  const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
+  return [...box.querySelectorAll('.cf-layer')].map((row) => {
+    if (row.querySelector('.cf-kind')?.value !== 'agent') return { kind: 'human' };
+    const ab = row.querySelector('.agent-field');
+    const spec = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
+    const model = ab.querySelector('.af-model').value.trim();
+    const effort = ab.querySelector('.af-effort').value;
+    if (model) spec.model = model;
+    if (effort) spec.effort = effort;
+    const resumeFrom = readResume(ab);
+    if (resumeFrom) spec.resumeFrom = resumeFrom;
+    // Store the review-request prompt only when it diverges from the built-in
+    // default; the pre-filled default itself is never persisted.
+    const prompt = row.querySelector('.cf-prompt')?.value ?? '';
+    if (prompt.trim() !== '' && prompt !== promptDefault) spec.prompt = prompt;
+    return spec;
+  });
+}
 
 // Read a form's values back out; only return fields CHANGED from inherited.
 function collectForm(root, fields) {
@@ -439,32 +535,10 @@ function collectForm(root, fields) {
       const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
       const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
-      const mode = box.querySelector('.cf-mode').value;
-      const spec = { mode };
-      let resumeFrom;
-      let promptChanged = false;
-      if (mode === 'agent') {
-        const ab = box.querySelector('.agent-field');
-        spec.provider = ab.querySelector('.af-provider').value;
-        const model = ab.querySelector('.af-model').value.trim();
-        const effort = ab.querySelector('.af-effort').value;
-        if (model) spec.model = model;
-        if (effort) spec.effort = effort;
-        resumeFrom = readResume(ab);
-        if (resumeFrom) spec.resumeFrom = resumeFrom;
-        // Store the review-request prompt only when it diverges from the inherited
-        // template (a stored override or the built-in default); empty ⇒ inherit.
-        const prompt = box.querySelector('.cf-prompt')?.value ?? '';
-        const inhPrompt = inh?.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
-        promptChanged = prompt.trim() !== '' && prompt !== inhPrompt;
-        if (promptChanged) spec.prompt = prompt;
-        else if (inh?.prompt) spec.prompt = inh.prompt; // keep an inherited override when re-storing
-      }
-      // Store only when it differs from the inherited default: a different mode, or (in
-      // agent mode) a different agent config, a chosen fork, or an edited prompt.
-      const inhMode = inh?.mode || 'human';
-      const changed = mode !== inhMode || (mode === 'agent' && (resumeFrom || promptChanged || !sameJson(normSpec(spec), normSpec(inh))));
-      if (f.required || changed) out[f.name] = spec;
+      const layers = readConfirmerLayers(box);
+      // Store only when the layer list differs from the inherited default (layers
+      // are stored atomically — inherited prompts/specs are carried by value).
+      if (f.required || !sameJson(normLayers(layers), normLayers(cfLayersOf(inh)))) out[f.name] = { layers };
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -520,7 +594,35 @@ function wireCombo(combo, getOptions, onChange) {
   });
 }
 
-// Wire agent-field controls: provider→model combobox + fork search (no toggle).
+// Wire one agent box's controls: provider→model combobox + fork search (no toggle).
+function wireAgentBox(box) {
+  const combo = box.querySelector('.af-model-combo');
+  const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
+  if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
+  box.querySelector('.af-provider')?.addEventListener('change', () => {
+    box.querySelector('.af-model').value = ''; // model choices are provider-specific
+    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+  });
+  // Fork-from search: the full task-picker overlay in agent mode (archived tasks
+  // included — the completed ones are the ones you most often fork from).
+  const chosen = box.querySelector('.af-resume-chosen');
+  const setResume = (rf, task) => {
+    if (!chosen) return;
+    chosen.dataset.resume = JSON.stringify(rf ?? null);
+    chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
+    box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
+  };
+  chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
+  box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
+    openTaskPicker({
+      title: 'Fork a previous agent',
+      hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
+      mode: 'agent',
+      defaults: ['draft', 'series'],
+      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
+    }),
+  );
+}
 function wireAgentFields(root) {
   root.querySelectorAll('[data-agent-group]').forEach((group) => {
     const toggle = group.querySelector('.agent-separate');
@@ -547,42 +649,65 @@ function wireAgentFields(root) {
       sync();
     }
   });
-  root.querySelectorAll('.agent-field').forEach((box) => {
-    const combo = box.querySelector('.af-model-combo');
-    const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
-    if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
-    box.querySelector('.af-provider')?.addEventListener('change', () => {
-      box.querySelector('.af-model').value = ''; // model choices are provider-specific
-      refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-    });
-    // Fork-from search: the full task-picker overlay in agent mode (archived tasks
-    // included — the completed ones are the ones you most often fork from).
-    const chosen = box.querySelector('.af-resume-chosen');
-    const setResume = (rf, task) => {
-      if (!chosen) return;
-      chosen.dataset.resume = JSON.stringify(rf ?? null);
-      chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
-      box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
-    };
-    chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
-    box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
-      openTaskPicker({
-        title: box.dataset.agent === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent',
-        hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
-        mode: 'agent',
-        defaults: ['draft', 'series'],
-        onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
-      }),
-    );
+  root.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  root.querySelectorAll('.confirmer-field').forEach(wireConfirmerField);
+}
+
+// Renumber the layer rows and toggle the "auto-confirm" empty state.
+function cfSync(box) {
+  const rows = [...box.querySelectorAll('.cf-layer')];
+  rows.forEach((r, i) => { const n = r.querySelector('.cf-layer-num'); if (n) n.textContent = `${i + 1}.`; });
+  const empty = box.querySelector('.cf-empty');
+  if (empty) empty.style.display = rows.length ? 'none' : '';
+}
+
+// Confirmer fields: an editable layer list. Row controls are delegated to the box
+// so a reset (which re-renders the rows) needs no re-wiring; only dynamically
+// added agent sub-forms are wired as they appear.
+function wireConfirmerField(box) {
+  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
+  const list = box.querySelector('.cf-layers');
+  const changed = () => box.dispatchEvent(new Event('change', { bubbles: true }));
+  box.addEventListener('click', (e) => {
+    const del = e.target.closest('.cf-del');
+    const move = e.target.closest('.cf-move');
+    const add = e.target.closest('.cf-add');
+    if (del) {
+      del.closest('.cf-layer').remove();
+      cfSync(box); changed();
+    } else if (move) {
+      const row = move.closest('.cf-layer');
+      const sib = Number(move.dataset.dir) < 0 ? row.previousElementSibling : row.nextElementSibling;
+      if (!sib) return;
+      if (Number(move.dataset.dir) < 0) list.insertBefore(row, sib);
+      else list.insertBefore(sib, row);
+      cfSync(box); changed();
+    } else if (add) {
+      // An empty list gets its human confirmation back; otherwise the added layer
+      // is an agent review, slotted BEFORE the first human layer (the common
+      // shape: agent review(s), then a final human confirmation).
+      const rows = [...list.querySelectorAll('.cf-layer')];
+      const firstHuman = rows.find((r) => r.getAttribute('data-kind') === 'human');
+      const kind = rows.length ? 'agent' : 'human';
+      const tpl = document.createElement('template');
+      tpl.innerHTML = cfLayerHtml(f, kind === 'agent' ? { kind, ...agentDefault } : { kind }, agentDefault);
+      const row = tpl.content.firstElementChild;
+      if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
+      else list.appendChild(row);
+      row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      cfSync(box); changed();
+    }
   });
-  // Confirmer fields: show the agent sub-form only when mode is "agent".
-  root.querySelectorAll('.confirmer-field').forEach((box) => {
-    const mode = box.querySelector('.cf-mode');
-    const agentBox = box.querySelector('.cf-agent');
-    mode?.addEventListener('change', () => {
-      if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
-    });
+  // Kind flip: show the agent sub-form only for agent layers.
+  box.addEventListener('change', (e) => {
+    if (!e.target.classList?.contains('cf-kind')) return;
+    const row = e.target.closest('.cf-layer');
+    row.setAttribute('data-kind', e.target.value);
+    const ab = row.querySelector('.cf-agent');
+    if (ab) ab.style.display = e.target.value === 'agent' ? '' : 'none';
   });
+  cfSync(box);
 }
 
 // Wire per-field "Reset to default" buttons: show the button whenever the field
@@ -639,19 +764,7 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
     if (!box) return false;
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
-    const mode = box.querySelector('.cf-mode').value;
-    if (mode !== (inh?.mode || 'human')) return true;
-    if (mode !== 'agent') return false;
-    const prompt = box.querySelector('.cf-prompt')?.value ?? '';
-    const inhPrompt = inh?.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
-    if (prompt.trim() !== '' && prompt !== inhPrompt) return true;
-    const ab = box.querySelector('.agent-field');
-    const spec = { provider: ab.querySelector('.af-provider').value };
-    const model = ab.querySelector('.af-model').value.trim();
-    const effort = ab.querySelector('.af-effort').value;
-    if (model) spec.model = model;
-    if (effort) spec.effort = effort;
-    return !sameJson(normSpec(spec), normSpec(inh));
+    return !sameJson(normLayers(readConfirmerLayers(box)), normLayers(cfLayersOf(inh)));
   }
   const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
   if (!el) return false;
@@ -686,14 +799,14 @@ function resetAgentField(box, attr = 'data-inherit') {
 
 function resetConfirmerField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
-  const mode = box.querySelector('.cf-mode');
-  mode.value = inh.mode || 'human';
-  const agentBox = box.querySelector('.cf-agent');
-  if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
-  const ab = box.querySelector('.agent-field');
-  if (ab) resetAgentField(ab, attr);
-  const promptEl = box.querySelector('.cf-prompt');
-  if (promptEl) promptEl.value = inh.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
+  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
+  const list = box.querySelector('.cf-layers');
+  // Re-render the rows from the inherited layers; row controls are delegated to
+  // the box, so only the fresh agent sub-forms need wiring.
+  list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
+  list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  cfSync(box);
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
@@ -843,7 +956,7 @@ async function loadProjects() {
 async function loadTasks() {
   if (!S.projectId) return;
   // Always fetch the full set incl. archived; the task list decides visibility via the
-  // query (default -is:archived). S.tasks is the shared pool for the drawer, counts, etc.
+  // query (default -is:archived). S.tasks is the shared pool for the task page, counts, etc.
   const fetched = await api(`/api/projects/${S.projectId}/tasks?includeArchived=1`);
   // Drop any draft we just deleted: a list request issued before the DELETE landed
   // can still return it and clobber the optimistic removal. Once a fresh fetch no
@@ -957,17 +1070,17 @@ function connectWs() {
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') renderMain();
     if (S.selected && ev.taskId === S.selected) {
-      S.drawerEvents.push(ev);
+      S.taskEvents.push(ev);
       if (ev.type === 'agent.output' && ev.payload?.text) {
         S.liveOutput += (S.liveOutput ? '\n' : '') + ev.payload.text;
         updateLiveBubble();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
         S.liveOutput = '';
-        refreshDrawer();
+        refreshTask();
       } else if (ev.type === 'session.started') {
-        refreshDrawer(); // the session id was just published mid-turn → show the live fork command
-      } else renderDrawerEvents();
+        refreshTask(); // the session id was just published mid-turn → show the live fork command
+      } else renderTaskEvents();
     }
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => { if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks(); }, 350);
@@ -978,10 +1091,10 @@ function connectWs() {
 async function refreshTasks() {
   try {
     await loadTasks();
-    if (S.tab === 'tasks') await runSearch();
+    if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
     if (S.tab === 'tasks' || S.tab === 'queue') renderMain();
     renderRail();
-    if (S.tab === 'queue') seedQueue();
+    if (S.tab === 'queue' && !S.selected) seedQueue();
   } catch {}
 }
 
@@ -1078,6 +1191,15 @@ function restoreFocus(root, st) {
 function renderMain() {
   const main = $('#main');
   if (!main) return;
+  // A task page owns #main while a task is open. Background list refreshes land
+  // here (WS-driven refreshTasks) — repaint the page from the freshest state
+  // instead of the list. S.view is null for a repeatable series (its config page
+  // holds an editable form and manages its own renders — never clobber it) and
+  // during the openTask fetch (the page paints when the fetch lands).
+  if (S.selected) {
+    if (S.view) renderTaskPage();
+    return;
+  }
   const proj = S.projects.find((p) => p.id === S.projectId);
   const tabs = ['tasks', 'queue', 'activity', 'settings'];
   const labels = { tasks: 'Tasks', queue: 'Merge queue', activity: 'Activity', settings: 'Project settings' };
@@ -1432,7 +1554,7 @@ function taskRow(t) {
 
 // Every task gets an isolated worktree on an auto-generated `karmax/<taskId>`
 // branch — the taskId is a noisy random slug, so echoing it in the byline just
-// clutters the list/drawer (it's still reachable via the drawer's terminal +
+// clutters the list/page (it's still reachable via the check-in terminal +
 // fork commands, which carry the world path). Only surface the branch when it's
 // a *custom* one the human would recognize — e.g. an existing branch checked out
 // by a merge-only workflow.
@@ -1445,6 +1567,7 @@ function customBranch(v, taskId) {
 // slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
 // "merge queued" for the wait, which the raw `stage` alone hides.
 function stageLabel(v) {
+  if (v.state?.draft) return 'draft';
   const stage = v.stage || 'setup';
   if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
   return stage;
@@ -1850,7 +1973,7 @@ function openTagsManager() {
 
 function wireTasksView() {
   wireOrgControls();
-  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.id)));
+  $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => wireTaskNav(e, () => e.dataset.id));
   $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
   );
@@ -1888,7 +2011,7 @@ function wireTasksView() {
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (!confirm('Delete this repeatable task? Its past runs are kept.')) return; try { await api(`/api/tasks/${b.dataset.delseries}`, { method: 'DELETE' }); toast('Repeatable task deleted'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
   $('#main').querySelectorAll('[data-series]').forEach((e) =>
-    e.addEventListener('click', (ev) => { if (!ev.target.closest('button')) openDrawer(e.dataset.series); }),
+    wireTaskNav(e, (ev) => (ev.target.closest('button') ? null : e.dataset.series)),
   );
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
@@ -2129,6 +2252,13 @@ async function openTaskForm(workflow, draft, seedText) {
   }
   let inherited = {};
   try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
+  // A draft can open directly from the list, without its task page having loaded
+  // the intent. Fetch the group so the shared confirmer freezes after any sibling
+  // queues, while remaining editable (and propagated) when every sibling is a draft.
+  let formAttemptGroup = draft?.id && S.attemptGroup?.intentId === draft.intentId ? S.attemptGroup : null;
+  if (draft?.id && !formAttemptGroup) {
+    try { formAttemptGroup = await api(`/api/tasks/${draft.id}/attempts`); } catch {}
+  }
   const root = $('#overlay-root');
   root.innerHTML = `
     <div class="palette-scrim" id="tf-scrim">
@@ -2161,6 +2291,7 @@ async function openTaskForm(workflow, draft, seedText) {
           </details>
           ${triggersSection(values, draft?.id)}
           ${repeatableToggleHtml(values)}
+          ${!draft ? `<div class="form-row"><div class="label-row"><label>Attempts</label></div><input id="tf-attempt-count" type="number" min="1" max="8" value="1"><span style="color:var(--ink-3);font-size:12px">Attempts created here are queued together. Attempts added later start as editable drafts.</span></div>` : ''}
         </div>
         <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
           <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
@@ -2188,6 +2319,16 @@ async function openTaskForm(workflow, draft, seedText) {
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
+  const confirmerFrozen = !!draft?.id
+    && !!formAttemptGroup?.attempts?.some((a) => !a.params?.draft);
+  if (confirmerFrozen) {
+    const confirmer = fields.find((f) => f.type === 'confirmer');
+    const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);
+    if (row) {
+      row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
+      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt and frozen once one is queued.</span>');
+    }
+  }
   // Image attachments for the full task form: pasting/dropping an image into any
   // text field attaches it to the prompt. State is local to this form instance.
   const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
@@ -2209,8 +2350,8 @@ async function openTaskForm(workflow, draft, seedText) {
     if (typeof cfEl.setSelectionRange === 'function') { try { cfEl.setSelectionRange(end, end); } catch {} }
   }
   // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
-  // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the
-  // running-task drawer (renderDrawer's #cred-editor-task). Change one → check the other.
+  // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the task
+  // page's Parameters tab (#cred-editor-task). Change one → check the other.
   // A draft has an id → edit its policy directly. A brand-new task has none, so the
   // editor runs in `local` mode: changes are held here and applied on create (below).
   let taskCredPolicy = {};
@@ -2301,7 +2442,7 @@ async function openTaskForm(workflow, draft, seedText) {
 
   // ── Priority + tags editor (organization; never sent to the agent) ──────────
   // IMPORTANT: this is ONE of TWO places the tag/priority editor lives — here in the full
-  // task form (new + draft), and in the running-task drawer (renderDrawer → drawerOrg).
+  // task form (new + draft), and on the task page's Parameters tab (wireTaskOrg).
   // Both go through orgEditorHtml/wireOrgEditor. If you change one, check the other.
   // Tags/priority need a taskId to attach to; a brand-new task has none until it's saved,
   // so `ensureDraft` persists (or force-creates) a draft on the first tag/priority edit.
@@ -2319,7 +2460,7 @@ async function openTaskForm(workflow, draft, seedText) {
     ? { id: draft.id, params: { priority: draft.params?.priority || 0 }, tags: (draft.tags || []).slice() }
     : { id: null, params: {}, tags: [] };
   const refreshOrg = () => {
-    const box = root.querySelector('[data-row="__org"] .drawer-org');
+    const box = root.querySelector('[data-row="__org"] .org-editor');
     if (box) { box.outerHTML = orgEditorHtml(orgRec); wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg }); }
     if (S.tab === 'tasks') renderMain();
   };
@@ -2337,6 +2478,9 @@ async function openTaskForm(workflow, draft, seedText) {
     // draftId and land last, so the explicit save/queue reflects the final form state.
     await saveChain.catch(() => {});
     try {
+      let primaryId = draftId || draft?.id || null;
+      const attemptCount = Math.max(1, Math.min(8, Number($('#tf-attempt-count')?.value || 1)));
+      let createdWithAttempts = false;
       if (editInPlace) {
         // A waiting (armed) task or a repeatable series edits in place (incl. its
         // triggers) — it has no running workflow to queue. "Save" re-arms / keeps
@@ -2348,16 +2492,34 @@ async function openTaskForm(workflow, draft, seedText) {
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
         if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
-        if (!draftMode) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+        // An explicitly-opened later attempt queues only itself. A draft created
+        // while composing a brand-new task is queued as a group below, after all
+        // requested siblings have been materialised.
+        if (!draftMode && draft) await api(`/api/tasks/${draftId}/queue`, { method: 'POST', body: '{}' });
+        primaryId = draftId;
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true }) });
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: true, attempts: attemptCount }) });
         draftId = created.id;
+        createdWithAttempts = true;
         await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
-        if (!draftMode) await api(`/api/tasks/${created.id}/queue`, { method: 'POST', body: '{}' });
+        primaryId = created.id;
       } else {
-        await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode }) });
+        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, draft: draftMode, attempts: attemptCount }) });
+        primaryId = created.id;
+        createdWithAttempts = true;
+      }
+      // Auto-save may have created the principal before Submit knew the count.
+      // Create every sibling before starting any of them.
+      if (!draft && primaryId && !createdWithAttempts) {
+        for (let i = 1; i < attemptCount; i++) await api(`/api/tasks/${primaryId}/attempts`, { method: 'POST', body: '{}' });
+      }
+      if (!draft && primaryId && !draftMode) {
+        const group = await api(`/api/tasks/${primaryId}/attempts`);
+        for (const attempt of group?.attempts || []) {
+          if (attempt.params?.draft) await api(`/api/tasks/${attempt.id}/queue`, { method: 'POST', body: '{}' });
+        }
       }
       root.innerHTML = '';
       toast(editInPlace ? (draftMode ? 'Moved to drafts' : 'Saved') : draftMode ? 'Draft saved' : 'Task created');
@@ -2376,26 +2538,51 @@ async function openTaskForm(workflow, draft, seedText) {
   });
 }
 
-// ── drawer ───────────────────────────────────────────────────────────────────
-// The config drawer for a repeatable series: edit its parameters + triggers in
-// the usual drawer, see its runs, and Run again. Saved via the same in-place path
-// as a waiting task (updateArmedParams) — the series never runs its own workflow.
-async function renderSeriesDrawer(rec) {
+// ── task page ─────────────────────────────────────────────────────────────────
+// A task opens as a PAGE of its own (route /projects/:name/tasks/:num), rendered
+// into #main with four tabs — Overview (pipeline, review, widgets, sub-tasks,
+// notes), Check-in (agent conversations + the ephemeral terminal), Parameters
+// (priority/tags, workflow params, credentials) and Advanced (event log,
+// structured state). The workflow still owns everything shown — actions, stages,
+// params, widgets and transcripts all come off the declared view; the host only
+// lays them out. Declared actions (Confirm/Cancel/…) live in a footer bar that
+// stays visible on every tab.
+const TASK_TABS = [
+  { key: 'overview', label: 'Overview' },
+  { key: 'checkin', label: 'Check-in' },
+  { key: 'parameters', label: 'Parameters' },
+  { key: 'advanced', label: 'Advanced' },
+];
+
+// The tab a task page opens on when the URL doesn't pin one: while the workflow
+// is asking the human to decide (an enabled `confirm` action — the Review gate),
+// the conversation that led here is the thing to read, so open Check-in on the
+// stage's agent. Otherwise Overview.
+function defaultTaskTab(v) {
+  return (v.actions || []).some((a) => a.name === 'confirm' && a.enabled) ? 'checkin' : 'overview';
+}
+
+// The config page for a repeatable series: edit its parameters + triggers, see
+// its runs, and Run again. Saved via the same in-place path as a waiting task
+// (updateArmedParams) — the series never runs its own workflow, so there is no
+// pipeline/conversation to tab through; it's a single editable form.
+async function renderSeriesPage(rec) {
   const wf = rec.workflow;
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   const values = { ...rec.params };
   let inherited = {};
   try { inherited = (await api(`/api/defaults/${rec.projectId}/${wf}`)).task.inherited; } catch {}
   const runs = await api(`/api/tasks/${rec.id}/runs`).catch(() => []);
-  const root = $('#drawer-root');
-  root.innerHTML = `
-    <div class="scrim open" id="scrim"></div>
-    <aside class="drawer open">
-      <div class="drawer-head">
+  const main = $('#main');
+  if (!main || S.selected !== rec.id) return; // navigated away while fetching
+  main.innerHTML = `
+    <div class="task-page">
+      <div class="tp-head">
         <div class="row1">
+          <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+          ${rec.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
           <h2>${esc(rec.title)}</h2>
           <span class="chip">repeatable</span>
-          <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
           <span>${esc(wf)}</span>
@@ -2403,7 +2590,7 @@ async function renderSeriesDrawer(rec) {
           <span>${runs.length} run${runs.length === 1 ? '' : 's'}</span>
         </div>
       </div>
-      <div class="drawer-body" id="drawer-body">
+      <div class="tp-body" id="tp-body" tabindex="-1"><div class="tp-content">
         <div id="tf-body">
           ${renderFields(fields, values, inherited)}
           <div class="form-row" data-row="__notes">
@@ -2419,25 +2606,24 @@ async function renderSeriesDrawer(rec) {
         </div>
         <div class="series-runs">
           <div class="series-runs-h">Runs</div>
-          ${runs.length ? runs.map(runDrawerRow).join('') : '<p class="task-sub" style="color:var(--ink-3);margin:2px 0">No runs yet.</p>'}
+          ${runs.length ? runs.map(runPageRow).join('') : '<p class="task-sub" style="color:var(--ink-3);margin:2px 0">No runs yet.</p>'}
         </div>
-      </div>
-      <div class="drawer-foot">
+      </div></div>
+      <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
         <button class="btn" id="sd-runagain">Run again</button>
         <span style="flex:1"></span>
         <button class="btn primary" id="sd-save">Save changes</button>
-      </div>
-    </aside>`;
-  $('#scrim').addEventListener('click', closeDrawer);
-  $('#drawer-close').addEventListener('click', closeDrawer);
+      </div></div>
+    </div>`;
+  $('#tp-back').addEventListener('click', closeTask);
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
   renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: rec.projectId, taskId: rec.id });
   wireDepPicker(values, rec.id);
   wireScheduleBuilder(values);
-  $('#drawer-body').querySelectorAll('[data-runopen]').forEach((el) => el.addEventListener('click', () => openDrawer(el.dataset.runopen)));
+  $('#tp-body').querySelectorAll('[data-runopen]').forEach((el) => wireTaskNav(el, () => el.dataset.runopen));
   $('#sd-runagain').addEventListener('click', async () => {
-    try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeDrawer(); refreshTasks(); }
+    try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeTask(); refreshTasks(); }
     catch (e) { toast(e.message, true); }
   });
   $('#sd-save').addEventListener('click', async () => {
@@ -2449,122 +2635,178 @@ async function renderSeriesDrawer(rec) {
     try {
       await api(`/api/tasks/${rec.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: body, replace: true, keepArmed: true }) });
       if ((rec.notes || '') !== notes) await api(`/api/tasks/${rec.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
-      toast('Saved'); closeDrawer(); refreshTasks();
+      toast('Saved'); closeTask(); refreshTasks();
     } catch (e) { toast(e.message, true); }
   });
 }
 
-function runDrawerRow(r) {
+function runPageRow(r) {
   const v = r.lastView || {};
   const status = v.status || 'active';
-  return `<div class="run-drawer-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(v.stage || 'setup')}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
+  return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(v.stage || 'setup')}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
-async function openDrawer(taskId) {
-  // A repeatable series has no running workflow — open the config drawer instead
+// One compact selectable row per execution. The list remains one row per intent;
+// switching here replaces the entire task-page projection with that attempt.
+function taskAttempts(v) {
+  const g = S.attemptGroup;
+  if (!g?.attempts?.length) return '';
+  const rows = g.attempts.map((a) => {
+    const av = a.lastView || {};
+    const principal = a.id === g.principalAttemptId;
+    const committed = a.id === g.committedAttemptId;
+    const selected = a.id === v.taskId;
+    const status = av.status || (a.params?.draft ? 'waiting' : 'active');
+    return `<button type="button" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
+      <span class="attempt-check">${selected ? '✓' : ''}</span>
+      <span class="status-dot ${esc(status)}"></span>
+      <b>Attempt ${a.attemptNumber || 1}</b>
+      ${principal ? '<span class="chip">principal</span>' : ''}
+      ${committed ? '<span class="chip done">committed</span>' : ''}
+      <span class="attempt-stage">${esc(a.params?.draft ? 'draft' : stageLabel(av))}</span>
+    </button>`;
+  }).join('');
+  return `<div class="attempts"><div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span><button class="btn sm" id="add-attempt" ${g.committedAttemptId ? 'disabled title="An attempt has entered Merge"' : ''}>＋ New attempt</button></div>${rows}</div>`;
+}
+
+function wireAttempts(v) {
+  document.getElementById('add-attempt')?.addEventListener('click', async () => {
+    try {
+      const draft = await api(`/api/tasks/${v.taskId}/attempts`, { method: 'POST', body: '{}' });
+      await refreshTasks();
+      await openTask(draft.id, 'parameters', true);
+      openTaskForm(draft.workflow, draft);
+    } catch (e) { toast(e.message, true); }
+  });
+  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+  }));
+}
+
+async function openTask(taskId, wantTab, explicitAttempt = false) {
+  // Leaving another task's page kills its check-in shell (same as closing does).
+  if (term && term.taskId !== taskId) { try { term.ws.close(); } catch {} term = null; }
+  // Per-task page state starts fresh: the tab comes from the URL when pinned
+  // there, else it's auto-picked from the fetched view (defaultTaskTab); the
+  // check-in pane re-resolves to the stage's agent.
+  S.taskTab = wantTab || null;
+  S.checkinSel = null;
+  // A repeatable series has no running workflow — open the config page instead
   // (edit its parameters + triggers, see its runs, run again).
-  const rec = S.tasks.find((t) => t.id === taskId);
+  const rec = taskRecord(taskId);
   if (rec?.params?.repeatable) {
     S.selected = taskId;
     S.view = null;
-    highlightRow();
-    await renderSeriesDrawer(rec);
+    await renderSeriesPage(rec);
     return;
   }
   S.selected = taskId;
-  S.drawerEvents = [];
+  S.viewingAttempt = explicitAttempt ? taskId : null;
+  S.taskEvents = [];
   // Reset the live-output accumulator on task switch. It's only cleared by a
   // turn.result/view.updated event for the *selected* task (see the WS handler),
   // so without this a still-streaming previous task's bubble (e.g. a Merge agent's
-  // "let me merge master into this branch") bleeds into THIS drawer's live bubble
+  // "let me merge master into this branch") bleeds into THIS page's live bubble
   // until the next event arrives — a stale cross-task render, never in the store/.jsonl.
   S.liveOutput = '';
   // Drop the previous task's view + per-task derived state up front. `S.view` is
   // re-fetched first below, but the siblings (sessions/widgets/paramDefaults) are
   // fetched a few awaits later — so a render firing in that gap (a WS event, a
   // background refresh) would pair the NEW view with the OLD task's fork command /
-  // widgets / param defaults. renderDrawer no-ops while `S.view` is null, and empty
+  // widgets / param defaults. renderTaskPage no-ops while `S.view` is null, and empty
   // siblings render as "no command / no widgets / (default)" — both corrected a beat
   // later by the awaited fetches. Never show another task's data, even for one frame.
   S.view = null;
   S.sessions = {};
   S.widgets = [];
   S.paramDefaults = {};
-  highlightRow();
+  S.attemptGroup = null;
   try {
     // Fetch the four independent resources in parallel — they used to be four serial
-    // round-trips, which stacked latency (each drawer open paid the sum, not the max).
-    // `renderDrawer` no-ops while `S.view` is null, so assigning them together (rather
-    // than one-at-a-time) also avoids rendering a half-populated drawer mid-fetch.
-    const [view, events, widgets, sessions] = await Promise.all([
+    // round-trips, which stacked latency (each page open paid the sum, not the max).
+    // `renderTaskPage` no-ops while `S.view` is null, so assigning them together (rather
+    // than one-at-a-time) also avoids rendering a half-populated page mid-fetch.
+    const draft = !!rec?.params?.draft;
+    const [view, events, widgets, sessions, attempts] = await Promise.all([
       api(`/api/tasks/${taskId}`),
-      api(`/api/tasks/${taskId}/events?since=0`),
-      api(`/api/tasks/${taskId}/widgets`).catch(() => []),
-      api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0`),
+      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
+      draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
+      api(`/api/tasks/${taskId}/attempts`).catch(() => null),
     ]);
     S.view = view;
-    S.drawerEvents = events;
+    S.taskEvents = events;
     S.widgets = widgets;
     S.sessions = sessions;
+    S.attemptGroup = attempts;
     // paramDefaults keys off the fetched view's workflow, so it follows the batch.
     S.paramDefaults = await loadParamDefaults(taskId);
+    // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
+    // Review gate that's Check-in (the conversation that led here is the thing to
+    // read); later refreshes never switch tabs under the user.
+    if (!S.taskTab) S.taskTab = defaultTaskTab(view);
   } catch (e) { toast(e.message, true); }
-  renderDrawer();
+  renderTaskPage();
 }
-async function refreshDrawer() {
+async function refreshTask() {
   if (!S.selected) return;
-  // The series config drawer holds an editable form — don't live-refresh it (that
+  // The series config page holds an editable form — don't live-refresh it (that
   // would clobber in-progress edits); it re-renders only on open / explicit save.
-  if (S.tasks.find((t) => t.id === S.selected)?.params?.repeatable) return;
+  if (taskRecord(S.selected)?.params?.repeatable) return;
   try {
     // Parallel refetch (was three serial round-trips). This runs on every `view.updated`
     // WS push for the open task, so keeping it to a single round-trip's latency matters.
     const id = S.selected;
-    const [view, widgets, sessions] = await Promise.all([
+    const [view, widgets, sessions, attempts] = await Promise.all([
       api(`/api/tasks/${id}`),
       api(`/api/tasks/${id}/widgets`).catch(() => S.widgets),
       api(`/api/tasks/${id}/sessions`).catch(() => S.sessions),
+      api(`/api/tasks/${id}/attempts`).catch(() => S.attemptGroup),
     ]);
+    if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
+      await openTask(attempts.principalAttemptId, S.taskTab);
+      return;
+    }
     S.view = view;
     S.widgets = widgets;
     S.sessions = sessions;
+    S.attemptGroup = attempts;
     S.paramDefaults = await loadParamDefaults(id);
   } catch {}
-  renderDrawer();
+  renderTaskPage();
 }
-// Close the drawer by navigating back to the underlying list/queue; applyRoute()
-// then tears the drawer DOM down. Kept as a navigation so the URL + history stay
-// in sync (the ✕ button, the scrim, Esc and the palette all route through here).
-function closeDrawer() {
-  const pid = (S.view && S.tasks.find((t) => t.id === S.view.taskId)?.projectId) || S.projectId;
+// Close the task page by navigating back to the underlying list/queue; applyRoute()
+// then repaints the list. Kept as a navigation so the URL + history stay in sync
+// (the ← button, Esc and the palette all route through here).
+function closeTask() {
+  const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
   const back = S.returnRoute || (pid ? projectRoute(pid) : '/dashboard');
   S.returnRoute = null;
   return go(back, { replace: true });
 }
-// Tear down the drawer DOM without navigating (called by applyRoute()).
-function closeDrawerDom() {
+// Drop the open task's page state without navigating (called by applyRoute()).
+function closeTaskDom() {
   if (!S.selected && !S.view) return;
   S.selected = null;
+  S.viewingAttempt = null;
   S.view = null;
-  S.liveOutput = ''; // drop any streamed live text so it can't reappear in the next drawer
-  S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next drawer
-  if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // closing the drawer kills the check-in shell
-  $('#drawer-root').innerHTML = '';
-  highlightRow();
-}
-function highlightRow() {
-  document.querySelectorAll('.task-row').forEach((r) => r.classList.toggle('sel', r.dataset.id === S.selected));
+  S.attemptGroup = null;
+  S.taskTab = null;
+  S.checkinSel = null;
+  S.liveOutput = ''; // drop any streamed live text so it can't reappear on the next task page
+  S.sessions = {}; S.widgets = []; S.paramDefaults = {}; // per-task derived state — don't carry into the next page
+  if (term && term.ws) { try { term.ws.close(); } catch {} term = null; } // leaving the page kills the check-in shell
 }
 
 // A task's organizational metadata (priority + tags). Both are purely for
 // search/organization and never reach the agent, so they're editable at any
-// lifecycle stage (draft included) — unlike workflow params. Shared by the drawer
-// (running tasks) and the task form (drafts).
+// lifecycle stage (draft included) — unlike workflow params. Shared by the task
+// page's Parameters tab (running tasks) and the task form (drafts).
 function orgEditorHtml(rec) {
   const prio = Number(rec?.params?.priority || 0);
   const tags = (rec?.tags || []).map((id) => { const t = tagById(id); if (!t) return ''; return `<span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} data-untag="${id}" title="Remove">${esc(tagPathStr(id))} ✕</span>`; }).join('');
   const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? '▲ ' : ''}${n[0].toUpperCase() + n.slice(1)}</option>`).join('');
-  return `<div class="drawer-org">
+  return `<div class="org-editor">
     <label class="org-prio">Priority
       <select class="q-sel org-priority">${prioOpts}</select>
     </label>
@@ -2575,12 +2817,12 @@ function orgEditorHtml(rec) {
 }
 
 // Wire the priority/tags editor rooted at `rootEl` over a mutable `rec` ({id, params, tags}).
-// `opts.ensureId()` resolves the task id (drawer/existing draft: identity; NEW task form:
+// `opts.ensureId()` resolves the task id (task page/existing draft: identity; NEW task form:
 // persists a draft first so tags/priority have somewhere to attach), and `opts.afterChange`
-// re-renders the surrounding surface. There is exactly one `.drawer-org` per surface.
-// Callers: renderDrawer (running tasks) and openTaskForm (new + draft) — keep both in mind.
+// re-renders the surrounding surface. There is exactly one `.org-editor` per surface.
+// Callers: renderTaskPage (running tasks) and openTaskForm (new + draft) — keep both in mind.
 function wireOrgEditor(rootEl, rec, opts) {
-  const box = rootEl.querySelector('.drawer-org');
+  const box = rootEl.querySelector('.org-editor');
   if (!box) return;
   const ensureId = opts.ensureId || (async () => rec.id);
   const afterChange = opts.afterChange || (() => {});
@@ -2610,16 +2852,13 @@ function wireOrgEditor(rootEl, rec, opts) {
   box.querySelector('.org-add-tag')?.addEventListener('click', () => openTagPicker(rec, setTags));
 }
 
-// Drawer's copy of the priority/tags editor. NOTE: the task FORM (openTaskForm) has the
-// other copy — both share orgEditorHtml/wireOrgEditor; change one, check the other.
-function drawerOrg(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
-  return rec ? orgEditorHtml(rec) : '';
-}
-function wireDrawerOrg(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+// The task page's copy of the priority/tags editor (Parameters tab). NOTE: the task
+// FORM (openTaskForm) has the other copy — both share orgEditorHtml/wireOrgEditor;
+// change one, check the other.
+function wireTaskOrg(v) {
+  const rec = taskRecord(v.taskId);
   if (!rec) return;
-  wireOrgEditor($('#drawer-root'), rec, { ensureId: async () => v.taskId, afterChange: () => { renderDrawer(); if (S.tab === 'tasks') renderMain(); } });
+  wireOrgEditor($('#main'), rec, { ensureId: async () => v.taskId, afterChange: renderTaskPage });
 }
 
 // Type-to-add tag combobox: filter existing tags as you type; a non-matching entry
@@ -2683,79 +2922,135 @@ function openTagPicker(rec, setTags) {
   input.focus();
 }
 
-function renderDrawer() {
+function renderTaskPage() {
   const v = S.view;
-  if (!v) return;
-  const root = $('#drawer-root');
-  // A background refresh (or a just-sent follow-up) re-renders the whole drawer,
-  // which would otherwise reset the conversation scroll to the top and drop the
-  // caret out of whatever follow-up box the user is composing in. Snapshot the
-  // scroll offset + focused field first, then restore them after the swap so the
-  // send-message box stays in view and in focus.
-  const prevBody = document.getElementById('drawer-body');
-  const prevScroll = prevBody ? prevBody.scrollTop : null;
-  const focusState = captureFocus(root);
+  const main = $('#main');
+  if (!v || !main) return;
+  if (!S.taskTab) S.taskTab = defaultTaskTab(v); // resolved once at open; never auto-switches under the user
+  const tab = S.taskTab;
+  // A background refresh (or a just-sent follow-up) re-renders the whole page,
+  // which would otherwise reset the scroll and drop the caret out of whatever
+  // follow-up box the user is composing in. Snapshot the scroll offsets + focused
+  // field first, then restore them after the swap — but only when the SAME tab is
+  // being repainted (switching tabs should land at a fresh top/bottom).
+  const prevBody = document.getElementById('tp-body');
+  const sameTab = !!(prevBody && prevBody.dataset.tab === tab);
+  const prevScroll = sameTab ? prevBody.scrollTop : null;
+  const prevThread = sameTab ? document.getElementById('ck-thread') : null;
+  // A conversation pins to the bottom (latest message) — keep it pinned across
+  // re-renders unless the user has scrolled up to read history.
+  const threadScroll = prevThread
+    ? { top: prevThread.scrollTop, atBottom: prevThread.scrollHeight - prevThread.scrollTop - prevThread.clientHeight < 40 }
+    : null;
+  const focusState = captureFocus(main);
   // The per-agent follow-up textareas carry no id (captureFocus skips them), so
   // snapshot the active one by its agent role to re-focus the matching box after
   // the swap and carry over any half-typed follow-up.
-  const fuState = captureFollowupFocus(root);
-  root.innerHTML = `
-    <div class="scrim open" id="scrim"></div>
-    <aside class="drawer open">
-      <div class="drawer-head">
+  const fuState = captureFollowupFocus(main);
+  const rec = taskRecord(v.taskId);
+  const currentAttempt = S.attemptGroup?.attempts?.find((a) => a.id === v.taskId);
+  const base = taskUrl(v.taskId);
+  main.innerHTML = `
+    <div class="task-page">
+      <div class="tp-head">
         <div class="row1">
-          ${v.num != null ? `<span class="task-num" title="Task #${v.num}${(() => { const p = projectById(S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId); return p ? ` — permalink /projects/${projectSlug(p)}/tasks/${v.num}` : ''; })()}">#${v.num}</span>` : ''}
+          <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
+          ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
+          ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
           <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
-          <button class="icon-btn" id="drawer-close" title="Close (Esc)">✕</button>
         </div>
         <div class="meta">
-          <span>${esc(v.workflow)}${(() => { const rec = S.tasks.find((t) => t.id === v.taskId); return rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''; })()}</span>
+          <span>${esc(v.workflow)}${rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
         </div>
-        ${drawerOrg(v)}
+        ${taskAttempts(v)}
+        <div class="tabs tp-tabs">
+          ${TASK_TABS.map((t) => `<a class="tab ${t.key === tab ? 'active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}">${t.label}</a>`).join('')}
+        </div>
       </div>
-      <div class="drawer-body" id="drawer-body" tabindex="-1">${drawerBody(v)}</div>
-      <div class="drawer-foot" id="drawer-foot">${drawerActions(v)}</div>
-    </aside>`;
-  $('#scrim').addEventListener('click', closeDrawer);
-  $('#drawer-close').addEventListener('click', closeDrawer);
-  wireActions(v);
-  wireFollowups(v);
-  wireParams(v);
-  wireNotes(v);
-  wireDrawerOrg(v);
-  wireTerminal(v.taskId);
-  wireReviewActions(v);
+      <div class="tp-body" id="tp-body" data-tab="${tab}" tabindex="-1"><div class="tp-content">${taskTabBody(v, tab)}</div></div>
+      <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">${taskActions(v)}</div></div>
+    </div>`;
+  $('#tp-back').addEventListener('click', closeTask);
+  // The tabs are real links (Ctrl/⌘-click or middle-click opens the pinned tab in
+  // a new browser tab); a plain click switches in place without a refetch.
+  main.querySelectorAll('[data-tasktab]').forEach((a) =>
+    a.addEventListener('click', (e) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey) return; // the browser handles new-tab/new-window opens
+      e.preventDefault();
+      setTaskTab(a.dataset.tasktab);
+    }),
+  );
+  wireAttempts(v);
+  wireActions(v); // the footer action bar lives on every tab
+  if (tab === 'overview') {
+    wireNotes(v);
+    wireReviewActions(v);
+  } else if (tab === 'checkin') {
+    wireCheckinSidebar(v);
+    wireFollowups(v);
+    wireTerminal(v.taskId);
+  } else if (tab === 'parameters') {
+    wireTaskOrg(v);
+    wireParams(v);
+    renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
+  } else if (tab === 'advanced') {
+    renderTaskEvents();
+  }
   wireCopyButtons();
-  renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: S.tasks.find((t) => t.id === v.taskId)?.projectId || S.projectId, taskId: v.taskId });
-  renderDrawerEvents();
-  // Restore the pre-render scroll offset + focus so the send-message box the user
-  // was working in stays put instead of jumping to the top of the conversation.
-  const newBody = document.getElementById('drawer-body');
+  // Restore the pre-render scroll offsets + focus so the box the user was working
+  // in stays put instead of jumping away.
+  const newBody = document.getElementById('tp-body');
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
-  restoreFocus(root, focusState);
-  restoreFollowupFocus(root, fuState);
-  // The scrollable body is the drawer's own scroll container (the app shell is
+  const thread = document.getElementById('ck-thread');
+  if (thread) thread.scrollTop = threadScroll && !threadScroll.atBottom ? threadScroll.top : thread.scrollHeight;
+  restoreFocus(main, focusState);
+  restoreFollowupFocus(main, fuState);
+  // The scrollable body is the page's own scroll container (the app shell is
   // overflow:hidden), so PgUp/PgDn/Home/End/space/arrows only scroll it while it
   // holds focus. Focus it on open — and keep it focused across the background
-  // re-renders — so the drawer is keyboard-scrollable the moment it appears.
+  // re-renders — so the page is keyboard-scrollable the moment it appears. On the
+  // Check-in tab the conversation thread is the scroller, not the (fixed) body.
+  const scroller = thread || newBody;
   const overlayOpen = $('#overlay-root')?.childElementCount > 0 || $('#modal-root')?.childElementCount > 0;
-  if (newBody && shouldFocusDrawerBody(root, document.activeElement, overlayOpen)) newBody.focus({ preventScroll: true });
+  if (scroller && shouldFocusTaskBody(main, document.activeElement, overlayOpen)) scroller.focus({ preventScroll: true });
 }
 
-// Whether renderDrawer should hand keyboard focus to the scrollable drawer body.
+// Switch the open task page to another of its tabs, pinning the tab in the URL
+// (replace, not push — Back should leave the task, not walk through its tabs).
+function setTaskTab(key) {
+  if (!TASK_TABS.some((t) => t.key === key) || S.taskTab === key) return;
+  S.taskTab = key;
+  if (S.selected) history.replaceState({}, '', `${taskUrl(S.selected)}/${key}`);
+  renderTaskPage();
+}
+
+// Cycle the open task page's tabs ([ and ]), wrapping at the ends.
+function cycleTaskTab(delta) {
+  const i = Math.max(0, TASK_TABS.findIndex((t) => t.key === S.taskTab));
+  setTaskTab(TASK_TABS[(i + delta + TASK_TABS.length) % TASK_TABS.length].key);
+}
+
+function taskTabBody(v, tab) {
+  if (tab === 'checkin') return checkinTab(v);
+  if (tab === 'parameters') return parametersTab(v);
+  if (tab === 'advanced') return advancedTab(v);
+  return overviewTab(v);
+}
+
+// Whether renderTaskPage should hand keyboard focus to the scrollable page body.
 // Yes on a fresh open (focus on <body> / nowhere) and to keep it across re-renders;
 // never steal it from a field the user is in (composer/notes/params/terminal) or
-// from an overlay/modal stacked above the drawer.
-function shouldFocusDrawerBody(root, active, overlayOpen) {
+// from an overlay/modal stacked above the page.
+function shouldFocusTaskBody(root, active, overlayOpen) {
   if (overlayOpen) return false;
   if (!active || active === document.body) return true; // fresh open: nothing focused
-  if (!root.contains(active)) return false; // focus lives outside the drawer (e.g. an overlay)
+  if (!root.contains(active)) return false; // focus lives outside the page (e.g. an overlay)
   if (active.matches?.('input, textarea, select') || active.isContentEditable || active.classList?.contains('term-screen')) return false;
-  return true; // focus is the drawer body itself (or a non-field) — keep/take it
+  return true; // focus is the page body itself (or a non-field) — keep/take it
 }
 
 // Follow-up textareas live one-per-agent-conversation and are keyed by the agent
@@ -2790,9 +3085,9 @@ function stripAnsi(s) {
 }
 
 // ── check-in terminal: a real PTY streamed over a WebSocket ──────────────────
-// The session outlives drawer re-renders (which rebuild the DOM on every event),
-// so it lives in module state and rebinds to the freshly-rendered <pre> each
-// time. `makeTermScreen` is a tiny terminal emulator that turns the PTY byte
+// The session outlives page re-renders and tab/pane switches (which rebuild the
+// DOM), so it lives in module state and rebinds to the freshly-rendered <pre>
+// each time. `makeTermScreen` is a tiny terminal emulator that turns the PTY byte
 // stream — echo, backspace, cursor moves, line erases — into displayable text,
 // so the user can type STRAIGHT into the terminal (Ctrl-C and friends included)
 // without pulling in a heavyweight emulator like xterm.js (which would break the
@@ -2957,9 +3252,11 @@ function killTerminal() {
 }
 
 function syncTermButton() {
+  const live = !!(term && term.ws && term.ws.readyState <= 1);
+  // The check-in sidebar's Terminal entry carries a live dot mirroring the session.
+  document.querySelector('#ck-term-item .ck-live')?.classList.toggle('hidden', !live);
   const btn = document.getElementById('term-open');
   if (!btn) return;
-  const live = !!(term && term.ws && term.ws.readyState <= 1);
   const hasWorld = btn.dataset.hasWorld === '1';
   if (live) {
     btn.textContent = 'Kill terminal';
@@ -2981,7 +3278,7 @@ function wireTerminal(taskId) {
   syncTermButton();
   btn.addEventListener('click', () => {
     if (termIsOpenFor(taskId)) killTerminal();
-    else openTerminal(taskId);
+    else { document.getElementById('ck-term-hint')?.remove(); openTerminal(taskId); }
   });
 }
 
@@ -3060,59 +3357,10 @@ function setStopBtn(running, procId, taskId) {
   };
 }
 
-function drawerBody(v) {
-  // Show every agent's conversation (Do / Merge / Resolve), collapsed except the
-  // one owning the active stage (SPEC §5.5). Falls back to `messages` (Do) for
-  // tasks whose workflow predates per-role transcripts.
-  const activeRole = roleForStage(v.stage);
-  // The follow-up affordance (SPEC §5.6) now lives INSIDE each agent's conversation
-  // rather than as one shared box at the bottom of the drawer — so a human can address
-  // any agent (Do / Merge / Resolve), not just Do. Enablement follows the workflow's
-  // declared `followUp` action.
-  const followUp = (v.actions || []).find((a) => a.name === 'followUp');
-  const transcripts = (v.transcripts && v.transcripts.length)
-    ? v.transcripts
-    : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
-  const liveRole = transcripts.some((t) => t.role === activeRole) ? activeRole : (transcripts[0] && transcripts[0].role);
-  const conversations = transcripts
-    .map((t) => {
-      const body = (t.messages || [])
-        .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}${renderMessageImages(m.images)}</div>`)
-        .join('') || '<div class="msg system">No messages yet</div>';
-      // Only the active role gets the #live-bubble (one per drawer, updated by the WS stream).
-      const live = t.role === liveRole
-        ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
-        : '';
-      // Only subscription/CLI sessions carry a config home; API-key / stateless
-      // sessions can't be forked from a terminal, so no command is shown. The session
-      // id is published mid-turn (#3), so this appears WHILE the agent runs.
-      const sess = S.sessions && S.sessions[t.role];
-      const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
-      const copy = forkCmd
-        ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
-        : '';
-      // The follow-up affordance lives INSIDE each agent's conversation (SPEC §5.6),
-      // so a human can address any agent — Do, Merge or Resolve — not just Do. It
-      // appears only when the workflow currently allows follow-ups.
-      const agentName = esc(t.label || t.role);
-      const fu = followUp
-        ? `<div class="followup-box" data-role="${esc(t.role)}">
-            <div class="prompt-field">
-              <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}></textarea>
-              <div class="img-chips followup-chips" style="display:none"></div>
-            </div>
-            <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
-          </div>`
-        : '';
-      return `<details class="conversation" ${t.role === liveRole ? 'open' : ''}>
-        <summary class="section-h" style="cursor:pointer;display:flex;align-items:center;gap:8px">
-          <span>${agentName} (${(t.messages || []).length})</span>${copy}
-        </summary>
-        <div class="thread">${body}${live}</div>
-        ${fu}
-      </details>`;
-    })
-    .join('');
+// ── the four task-page tabs ───────────────────────────────────────────────────
+// Overview: what the task IS and where it stands — pipeline, review, widgets,
+// sub-tasks, notes. Everything shown comes off the workflow's declared view.
+function overviewTab(v) {
   const caption = v.reviewInfo?.caption || v.reviewInfo?.summary;
   // How the agent's turn reached Review. Current workflows use `finished` only after a
   // verified successful provider terminal event. `stalled` remains for legacy histories.
@@ -3132,7 +3380,6 @@ function drawerBody(v) {
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
          ${v.reviewInfo.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
-         ${v.reviewInfo.changedFiles?.length ? `<div class="task-sub" style="flex-wrap:wrap;margin:8px 0">${v.reviewInfo.changedFiles.map((f) => `<span class="branch">${esc(f)}</span>`).join('')}</div>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
        </div>`
@@ -3147,46 +3394,162 @@ function drawerBody(v) {
   const subtasks = v.subTasks?.length
     ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
     : '';
-  // Terminal — a top-level section (like an agent conversation), NOT buried in
-  // Advanced. It stays fully visible (no collapse) so the shell is one click away.
-  // Open a real PTY in the task's world; type straight into it (Ctrl-C and friends
-  // land in the shell). "Open terminal" flips to "Kill terminal" while a session is
-  // live — that button closes the socket, which kills the shell and every process
-  // running in it.
-  const terminalSection = `
-    <div class="terminal-section">
-      <div class="section-h">Ephemeral Terminal</div>
-      <div class="task-sub" style="gap:6px;flex-wrap:wrap;margin-bottom:6px">
-        <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
-        ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      </div>
-      <pre class="raw hidden term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell" style="height:240px;outline:none"></pre>
-    </div>`;
   return `
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
     ${error}
     ${waiting}
     ${agentTurn}
-    ${drawerNotes(v)}
-    ${drawerParams(v)}
     ${review}
     ${renderWidgetGroups(S.widgets)}
     ${subtasks}
-    ${conversations}
-    ${terminalSection}
-    <details class="advanced">
-      <summary>Credentials — precedence &amp; enable/disable for this task</summary>
-      <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the global/project order + enablement, just for this task. Drag to reorder; toggle On/Off. (This is the running-task form — the new-task form has the same control.)</p>
-      <div id="cred-editor-task">Loading…</div>
-    </details>
-    <details class="advanced">
-      <summary>Advanced — live event log, structured state</summary>
-      <div class="section-h">Live events</div>
-      <div class="events" id="drawer-events"></div>
-      <div class="section-h">Structured state (the view-model floor)</div>
-      <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>
-    </details>`;
+    ${notesSection(v)}`;
+}
+
+// Check-in: talking to the task — every agent's conversation (Do / Merge /
+// Resolve, SPEC §5.5/§5.6) plus the ephemeral terminal, behind a small sidebar.
+// Falls back to `messages` (Do) for workflows that predate per-role transcripts.
+function taskTranscripts(v) {
+  return (v.transcripts && v.transcripts.length)
+    ? v.transcripts
+    : [{ role: 'do', label: 'Conversation', messages: v.messages || [] }];
+}
+// The conversation owning the active stage — it gets the live bubble and is the
+// default pane (in Review that's the agent whose work is being reviewed).
+function liveRoleFor(v) {
+  const transcripts = taskTranscripts(v);
+  const activeRole = roleForStage(v.stage);
+  return transcripts.some((t) => t.role === activeRole) ? activeRole : transcripts[0]?.role;
+}
+// The selected check-in pane: the user's explicit choice while it still exists,
+// else the stage's own conversation.
+function checkinSelection(v) {
+  if (S.checkinSel === 'terminal') return 'terminal';
+  if (S.checkinSel && taskTranscripts(v).some((t) => t.role === S.checkinSel)) return S.checkinSel;
+  return liveRoleFor(v);
+}
+
+function checkinTab(v) {
+  const transcripts = taskTranscripts(v);
+  const sel = checkinSelection(v);
+  const liveRole = liveRoleFor(v);
+  const items = transcripts
+    .map((t) => `<div class="ck-item ${sel === t.role ? 'sel' : ''}" data-checkin="${esc(t.role)}">
+        <span class="ck-name">${esc(t.label || t.role)}</span>
+        ${t.role === liveRole && v.status === 'active' ? '<span class="ck-live" title="agent working"></span>' : ''}
+        <span class="ck-count">${(t.messages || []).length}</span>
+      </div>`)
+    .join('');
+  return `<div class="ck-layout">
+    <div class="ck-side">
+      <div class="ck-side-h">Agents</div>
+      ${items}
+      <div class="ck-side-h">Shell</div>
+      <div class="ck-item ${sel === 'terminal' ? 'sel' : ''}" data-checkin="terminal" id="ck-term-item">
+        <span class="ck-name">Terminal</span>
+        <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
+      </div>
+    </div>
+    <div class="ck-pane">${sel === 'terminal' ? terminalPane(v) : conversationPane(v, transcripts.find((t) => t.role === sel))}</div>
+  </div>`;
+}
+
+function conversationPane(v, t) {
+  if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
+  const msgs = (t.messages || [])
+    .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}${renderMessageImages(m.images)}</div>`)
+    .join('') || '<div class="msg system">No messages yet</div>';
+  // Only the stage's own conversation gets the #live-bubble (one per page,
+  // updated by the WS stream).
+  const live = t.role === liveRoleFor(v)
+    ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
+    : '';
+  // Only subscription/CLI sessions carry a config home; API-key / stateless
+  // sessions can't be forked from a terminal, so no command is shown. The session
+  // id is published mid-turn (#3), so this appears WHILE the agent runs.
+  const sess = S.sessions && S.sessions[t.role];
+  const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
+  const copy = forkCmd
+    ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
+    : '';
+  // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
+  // so a human can address any agent — Do, Merge or Resolve — not just Do. It
+  // appears only when the workflow currently allows follow-ups.
+  const agentName = esc(t.label || t.role);
+  const followUp = (v.actions || []).find((a) => a.name === 'followUp');
+  const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
+  const fu = followUp
+    ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
+        <div class="prompt-field">
+          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <div class="img-chips followup-chips" style="display:none"></div>
+        </div>
+        <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
+      </div></div>`
+    : '';
+  return `
+    <div class="ck-pane-head">
+      <b>${agentName}</b>
+      <span class="pal-sub">${(t.messages || []).length} message${(t.messages || []).length === 1 ? '' : 's'}</span>
+      <span style="flex:1"></span>
+      ${copy}
+    </div>
+    <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
+    ${fu}`;
+}
+
+// The ephemeral terminal: a real PTY in the task's world; type straight into it
+// (Ctrl-C and friends land in the shell). "Open terminal" flips to "Kill
+// terminal" while a session is live — that closes the socket, which kills the
+// shell and every process running in it. The session survives tab/pane switches
+// (module state) and dies when you leave the task.
+function terminalPane(v) {
+  const open = termIsOpenFor(v.taskId);
+  return `
+    <div class="ck-pane-head">
+      <b>Ephemeral terminal</b>
+      <span class="pal-sub">a shell in the task's world — killed when you leave the task</span>
+      <span style="flex:1"></span>
+      ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
+      <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+    </div>
+    <div class="ck-term">
+      <pre class="raw ${open ? '' : 'hidden'} term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell"></pre>
+      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${v.worldPath ? '“Open terminal” starts one in the task\'s world.' : 'This task has no world yet.'}</div>`}
+    </div>`;
+}
+
+function wireCheckinSidebar(v) {
+  $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
+    el.addEventListener('click', () => {
+      if (el.dataset.checkin === checkinSelection(v)) return;
+      S.checkinSel = el.dataset.checkin;
+      renderTaskPage();
+    }),
+  );
+}
+
+// Parameters: everything the human configured on this task, in one place —
+// priority + tags (organization), the workflow's declared params (editable or
+// frozen per its lifecycle), and the per-task credential policy.
+function parametersTab(v) {
+  const rec = taskRecord(v.taskId);
+  return `
+    <div class="section-h">Organization</div>
+    ${rec ? orgEditorHtml(rec) : '<div class="task-sub" style="color:var(--ink-3)">Priority + tags load with the task list.</div>'}
+    ${paramsSection(v)}
+    <div class="section-h">Credentials</div>
+    <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the global/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
+    <div id="cred-editor-task">Loading…</div>`;
+}
+
+// Advanced: the raw feeds — the live event stream and the structured view-model.
+function advancedTab(v) {
+  return `
+    <div class="section-h">Live events</div>
+    <div class="events" id="tp-events"></div>
+    <div class="section-h">Structured state (the view-model floor)</div>
+    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>`;
 }
 
 function renderDiff(d) {
@@ -3207,12 +3570,12 @@ function waitingLabel(w) {
     case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to free up'}`;
     case 'agentSlot': return w.detail || 'a host agent slot';
     case 'mergeSlot': return 'a merge slot';
-    case 'human': return 'human input';
+    case 'human': return w.detail ? `human input (${w.detail})` : 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
     case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'shell': return w.detail || 'a background job to finish';
     case 'parent': return 'the parent task to respond';
-    case 'confirm': return 'the confirm agent to review';
+    case 'confirm': return w.detail ? `the confirm agent to review (${w.detail})` : 'the confirm agent to review';
     default: return w.detail || w.kind;
   }
 }
@@ -3439,7 +3802,7 @@ const TERMINAL_STAGES = ['done', 'cancelled', 'failed'];
 // effective value (e.g. the actual Do-agent provider·model) not "(default)".
 async function loadParamDefaults(taskId) {
   const wf = S.view?.workflow;
-  const pid = S.tasks.find((t) => t.id === taskId)?.projectId || S.projectId;
+  const pid = taskRecord(taskId)?.projectId || S.projectId;
   if (!wf || !pid) return {};
   return api(`/api/defaults/${pid}/${wf}`).then((d) => d?.task?.inherited || {}).catch(() => ({}));
 }
@@ -3447,10 +3810,10 @@ async function loadParamDefaults(taskId) {
 // at ANY stage (active, done, cancelled, failed, archived) — the endpoint has no
 // stage guard. The current value comes from the freshly-fetched view (`v.notes`),
 // so it's correct even for a task not in the loaded list.
-function drawerNotes(v) {
+function notesSection(v) {
   const notes = v.notes || '';
   return `<div class="section-h">Notes</div>
-    <div id="drawer-notes">
+    <div id="task-notes-box">
       <textarea id="task-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(notes)}</textarea>
       <div class="task-sub" style="margin-top:4px;justify-content:space-between">
         <span style="color:var(--ink-3)">Only you see this — never sent to the agent.</span>
@@ -3469,7 +3832,7 @@ function wireNotes(v) {
     try {
       await api(`/api/tasks/${v.taskId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes }) });
       v.notes = notes || undefined; // keep the in-memory view in sync
-      const rec = S.tasks.find((t) => t.id === v.taskId);
+      const rec = taskRecord(v.taskId);
       if (rec) rec.notes = notes || undefined;
       toast('Notes saved');
     } catch (e) {
@@ -3477,12 +3840,12 @@ function wireNotes(v) {
     }
   };
   btn.addEventListener('click', save);
-  // Save on blur too, so notes aren't lost when the drawer closes.
+  // Save on blur too, so notes aren't lost when the page closes.
   ta.addEventListener('blur', save);
 }
 
-function drawerParams(v) {
-  const rec = S.tasks.find((t) => t.id === v.taskId);
+function paramsSection(v) {
+  const rec = taskRecord(v.taskId);
   // Drafts are composed in the full task form (all fields editable pre-queue).
   if (rec?.params?.draft) {
     return `<div class="section-h">Parameters</div>
@@ -3518,7 +3881,7 @@ function drawerParams(v) {
   const footer = editable.size
     ? `<button class="btn sm primary" id="params-save">Save changes</button>`
     : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
-  return `<div class="section-h">Parameters</div><div id="drawer-params">${rows}${footer}</div>`;
+  return `<div class="section-h">Parameters</div><div id="tp-params">${rows}${footer}</div>`;
 }
 
 // Best-known current value of a param for a running task (the view carries a few;
@@ -3533,6 +3896,11 @@ function paramCurrentValue(f, v, rec) {
 function displayParam(f, val) {
   if (val === undefined || val === null || val === '') return '(default)';
   if (f.type === 'agent') return [val.provider, val.model].filter(Boolean).join(' · ') || '(default)';
+  if (f.type === 'confirmer') {
+    const layers = cfLayersOf(val);
+    if (!layers.length) return 'auto-confirm';
+    return layers.map((l) => (l.kind === 'agent' ? `agent (${[l.provider, l.model].filter(Boolean).join(' · ') || 'default'})` : 'human')).join(' → ');
+  }
   if (Array.isArray(val)) return val.join(', ') || '(none)';
   if (typeof val === 'boolean') return val ? 'on' : 'off';
   return String(val);
@@ -3571,11 +3939,11 @@ function collectParamEdits(root, fields) {
 function wireParams(v) {
   const editBtn = document.getElementById('edit-draft-params');
   if (editBtn) {
-    const rec = S.tasks.find((t) => t.id === v.taskId);
+    const rec = taskRecord(v.taskId);
     editBtn.addEventListener('click', () => openTaskForm(v.workflow, rec));
     return;
   }
-  const root = document.getElementById('drawer-params');
+  const root = document.getElementById('tp-params');
   if (root) wireAgentFields(root); // make editable agent controls (model combo, effort, resume) work
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
@@ -3586,7 +3954,7 @@ function wireParams(v) {
     try {
       await api(`/api/tasks/${v.taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params: patch }) });
       toast('Parameters updated');
-      setTimeout(refreshDrawer, 250);
+      setTimeout(refreshTask, 250);
       setTimeout(refreshTasks, 400);
     } catch (e) {
       toast(e.message, true);
@@ -3594,8 +3962,10 @@ function wireParams(v) {
   });
 }
 
-// the generic auto-render floor (SPEC §10.2 tier 1): render declared actions
-function drawerActions(v) {
+// the generic auto-render floor (SPEC §10.2 tier 1): render declared actions.
+// This is the footer bar that stays visible on every task-page tab, so
+// Confirm/Cancel are always one click (or one digit) away.
+function taskActions(v) {
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   let html = `<div class="actions">`;
@@ -3605,43 +3975,45 @@ function drawerActions(v) {
     const kbd = a.enabled && slot < 9 ? `<span class="kbd">${++slot}</span>` : '';
     html += `<button class="btn ${cls}" data-act="${a.name}" ${a.enabled ? '' : 'disabled'}>${esc(a.label)}${kbd}</button>`;
   }
-  // Target-branch editing now lives in the Parameters form (drawerParams), which
+  // Target-branch editing lives in the Parameters tab (paramsSection), which
   // renders it editable/frozen per the workflow's window — no separate input here.
-  // The follow-up box is no longer here either: it lives inside each agent's
-  // conversation (drawerBody), so a human can address any agent (SPEC §5.6).
+  // The follow-up box lives inside each agent's conversation on the Check-in tab,
+  // so a human can address any agent (SPEC §5.6).
   html += `</div>`;
   if (!acts.length) html = `<div style="color:var(--ink-3)">No actions available — task is ${esc(v.stage)}.</div>`;
   return html;
 }
 
 function wireActions(v) {
-  $('#drawer-foot').querySelectorAll('[data-act]').forEach((btn) =>
+  $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
       try {
         await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
         toast(`${act} sent`);
-        setTimeout(refreshDrawer, 250);
+        setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#drawer-body').querySelectorAll('[data-open]').forEach((e) => e.addEventListener('click', () => goToTask(e.dataset.open)));
+  $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
 // agent role it addresses, so a follow-up is delivered to the right agent.
 function wireFollowups(v) {
   if (!S.followupImages) S.followupImages = {};
-  $('#drawer-body').querySelectorAll('.followup-box').forEach((box) => {
+  $('#main').querySelectorAll('.followup-box').forEach((box) => {
     const role = box.dataset.role;
     const ta = box.querySelector('.followup-input');
     const btn = box.querySelector('.followup-send');
     if (!ta || !btn) return;
-    // Per-(task,role) image store, so pasted attachments survive the drawer's
-    // frequent WS-driven re-renders (like the textarea text is preserved).
+    // Per-(task,role) stores for pasted images AND half-typed text, so a draft
+    // follow-up survives the page's frequent WS-driven re-renders and switching
+    // between check-in panes (which destroys the textarea's DOM).
     const key = `${v.taskId}/${role}`;
     const store = (S.followupImages[key] ||= []);
+    ta.addEventListener('input', () => { S.followupDrafts[key] = ta.value; });
     const chips = box.querySelector('.followup-chips');
     const paint = () => renderImageChips(chips, store);
     wireImagePaste(ta, () => store, paint);
@@ -3655,10 +4027,11 @@ function wireFollowups(v) {
           body: JSON.stringify({ signal: 'followUp', text, role, ...(store.length ? { images: [...store] } : {}) }),
         });
         ta.value = '';
+        delete S.followupDrafts[key];
         store.length = 0;
         paint();
         toast('Follow-up sent');
-        setTimeout(refreshDrawer, 250);
+        setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
     };
@@ -3676,10 +4049,10 @@ function updateLiveBubble() {
   b.scrollIntoView({ block: 'nearest' });
 }
 
-function renderDrawerEvents() {
-  const box = document.getElementById('drawer-events');
+function renderTaskEvents() {
+  const box = document.getElementById('tp-events');
   if (!box) return;
-  box.innerHTML = S.drawerEvents
+  box.innerHTML = S.taskEvents
     .slice(-120)
     .map((e) => `<div class="ev"><span class="t">${esc(e.type)}</span><span>${esc(summarize(e.payload))}</span></div>`)
     .join('');
@@ -3775,7 +4148,7 @@ function localQueue(domain) {
 
 function wireQueueView() {
   $('#main').querySelectorAll('.queue-item').forEach((e) =>
-    e.addEventListener('click', (ev) => { if (!ev.target.closest('[data-move]') && !ev.target.closest('.drag-handle')) goToTask(e.dataset.id); }),
+    wireTaskNav(e, (ev) => (ev.target.closest('[data-move]') || ev.target.closest('.drag-handle') ? null : e.dataset.id)),
   );
   $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
@@ -4884,7 +5257,7 @@ async function newProject() {
 //      the host never hardcodes a workflow's action vocabulary;
 //   3. the declared actions themselves (the auto-render floor, SPEC §10.2): every
 //      enabled action of the selected task is a palette entry, and digits 1–9
-//      press the drawer's action buttons — so a workflow that declares no
+//      press the task page's action buttons — so a workflow that declares no
 //      keybindings at all is still fully keyboard-operable.
 
 // -- keybinding strings ('meta+k', 'g t', '?', 'J') → step sequences ----------
@@ -4978,7 +5351,7 @@ function allCommands() {
     add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', run: h.run });
   }
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
-  // tasks/queue views; with a drawer open the same keys walk between tasks. When
+  // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
   const rail = inRail();
   const listy = ['tasks', 'queue'].includes(S.tab) && !rail;
@@ -4997,6 +5370,13 @@ function allCommands() {
   add({ id: 'rail.prev.arrow', title: 'Previous project', keybinding: 'ArrowUp', group: 'Projects', palette: false, help: false, available: rail, run: () => moveRail(-1) });
   add({ id: 'rail.open', title: 'Switch to project / open entry', keybinding: 'Enter', group: 'Projects', palette: false, available: rail, run: () => document.activeElement?.click() });
   add({ id: 'rail.open.o', title: 'Switch to project / open entry', keybinding: 'o', group: 'Projects', palette: false, help: false, available: rail, run: () => document.activeElement?.click() });
+  // Task-page navigation (host grammar, like j/k): u goes back to the list
+  // (Gmail-style — Esc does too, once overlays are popped), [ / ] cycle the
+  // page's tabs. Documented in the help panel's static "On a task page" section
+  // (help: false here) so they're discoverable before a page is open.
+  add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
+  add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
+  add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
   // Workflow-contributed task commands: `task.<action>` binds to the selected
   // task's DECLARED action of that name — available only when the selected
   // task runs the contributing workflow and the action is currently enabled.
@@ -5019,8 +5399,8 @@ function allCommands() {
       if (covered.has(`${S.view.workflow}:${a.name}`)) continue;
       add({ id: `task.action.${a.name}`, title: a.label || a.name, group: 'Task', workflow: S.view.workflow, available: !!a.enabled, danger: a.danger, run: () => runDeclaredAction(a) });
     }
-    // digits 1–9 press the Nth enabled action button in the drawer footer
-    const btns = [...document.querySelectorAll('#drawer-foot [data-act]:not([disabled])')].slice(0, 9);
+    // digits 1–9 press the Nth enabled action button in the task page's footer
+    const btns = [...document.querySelectorAll('#tp-foot [data-act]:not([disabled])')].slice(0, 9);
     btns.forEach((b, i) => add({ id: `task.slot.${i + 1}`, title: `Press “${b.textContent.replace(/\d+$/, '').trim()}”`, keybinding: String(i + 1), group: 'Task', palette: false, help: false, run: () => b.click() }));
   }
   return out;
@@ -5036,7 +5416,7 @@ async function runDeclaredAction(a) {
   try {
     await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify({ signal: a.name }) });
     toast(`${a.label || a.name} sent`);
-    setTimeout(refreshDrawer, 250);
+    setTimeout(refreshTask, 250);
     setTimeout(refreshTasks, 400);
   } catch (e) { toast(e.message, true); }
 }
@@ -5075,18 +5455,17 @@ function openActionForm(a) {
       await api(`/api/tasks/${S.selected}/signal`, { method: 'POST', body: JSON.stringify(body) });
       close();
       toast(`${a.label || a.name} sent`);
-      setTimeout(refreshDrawer, 250);
+      setTimeout(refreshTask, 250);
       setTimeout(refreshTasks, 400);
     } catch (e) { toast(e.message, true); }
   });
 }
 
-// Focus the follow-up box of the open (active) conversation, falling back to the
-// first available one — the box lives per-agent inside each conversation.
+// Focus the selected conversation's follow-up box — the box lives per-agent on
+// the Check-in tab, so switch there first if another tab is showing.
 function focusFollowup() {
-  const ta = document.querySelector('.conversation[open] .followup-input:not([disabled])')
-    || document.querySelector('.followup-input:not([disabled])');
-  if (ta) { ta.closest('details')?.setAttribute('open', ''); ta.focus(); }
+  if (S.taskTab !== 'checkin') setTaskTab('checkin');
+  document.querySelector('.followup-input:not([disabled])')?.focus();
 }
 
 // -- list cursor (roving selection on the tasks / merge-queue views) ----------
@@ -5110,7 +5489,7 @@ function moveCursor(delta) {
 function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId); }
 function openCursorRow() { cursorRow()?.click(); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
-// With the drawer open, j/k walk the same task order the list shows.
+// With a task page open, j/k walk the same task order the list shows.
 function taskOrder() {
   return S.tasks
     .filter((t) => !t.params?.draft && (!S.search || t.title.toLowerCase().includes(S.search.toLowerCase())))
@@ -5145,7 +5524,7 @@ function closeTopOverlay() {
   const pop = $('#notif-pop');
   if (pop) return pop.remove();
   // Secondary modals (task picker, filter picker, tags manager, tag picker) stack
-  // above the form/drawer in #modal-root — pop the topmost one first (a filter
+  // above the form/page in #modal-root — pop the topmost one first (a filter
   // picker can itself sit on the task-picker overlay).
   if ($('#modal-root').lastElementChild) return $('#modal-root').lastElementChild.remove();
   const overlay = $('#overlay-root').firstElementChild;
@@ -5153,7 +5532,7 @@ function closeTopOverlay() {
     if (overlay.id === 'tf-scrim') return overlay.click(); // task form: its scrim-close flushes the draft
     return ($('#overlay-root').innerHTML = '');
   }
-  if (S.selected) return closeDrawer();
+  if (S.selected) return closeTask();
 }
 
 // -- the dispatcher ------------------------------------------------------------
@@ -5273,8 +5652,10 @@ function openHelp() {
     <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center"><b>Keyboard shortcuts</b><span style="flex:1"></span><button class="icon-btn" id="help-close">✕</button></div>
     <div style="padding:6px 16px 16px">
       ${groups.map((g) => `<div class="section-h">${esc(g)}</div>${cmds.filter((c) => c.group === g).map((c) => row(esc(fmtKeys(c.keybinding)), esc(c.title), c.workflow)).join('')}`).join('')}
-      <div class="section-h">In the task drawer</div>
+      <div class="section-h">On a task page</div>
       ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
+      ${row('[ / ]', 'Previous / next tab')}
+      ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
       ${row('Esc', 'Close the topmost panel / leave a text field')}
       <div class="section-h">Quick add</div>
