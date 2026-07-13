@@ -137,6 +137,18 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   let turn;
   try {
     turn = await adapter.runTurn(input, ctx);
+    // An adapter may deliberately swallow its provider's AbortError so it can clean
+    // up and return partial output (Claude SDK, Codex app-server/CLI). That partial
+    // result is NOT a completed turn when the enclosing activity was cancelled. In
+    // particular, Worker shutdown cancels in-flight activities; accepting the return
+    // here turns a server restart into `needsInput` and advances Do -> Review.
+    //
+    // Keep this invariant at the provider-independent boundary: no adapter return
+    // after cancellation can ever be interpreted as a successful turn, regardless
+    // of role (Do/Confirm/Resolve/Merge) or provider-specific cleanup behaviour.
+    if (deps.signal?.aborted) {
+      throw deps.signal.reason instanceof Error ? deps.signal.reason : new Error('agent turn cancelled');
+    }
   } finally {
     if (hb) clearInterval(hb);
   }

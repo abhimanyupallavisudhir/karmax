@@ -33,13 +33,14 @@ export interface Harness {
   worldsHome: string;
   tokens: TokenAuthority;
   api: KarmaxApi;
+  restartWorker(): Promise<void>;
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
   startGateway(opts?: { password?: string }): Promise<{ url: string; close: () => Promise<void> }>;
 }
 
 /** Boots a full karmax backend (Temporal + worker + deps) for integration tests. */
-export async function bootHarness(provider: Provider = 'mock'): Promise<Harness> {
+export async function bootHarness(provider: Provider = 'mock', adapterOverride?: import('../../src/agent/types.js').AgentAdapter): Promise<Harness> {
   const server = await startDevServer({ headless: true, logLevel: 'never' });
   const conn = { address: server.address, namespace: server.namespace };
   const c = await makeClient(conn);
@@ -52,6 +53,7 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
   const { WorktreeProvider } = await import('../../src/world/worktree.js');
   worlds.register(new WorktreeProvider(worldsHome));
   const adapters = buildAdapters();
+  if (adapterOverride) adapters.set(provider, adapterOverride);
   const profiles = new ProfileResolver(store, provider);
   const bus = new KarmaxBus();
 
@@ -60,7 +62,7 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
   const paymentRegistry = new PaymentRegistry();
   paymentRegistry.register(payments);
   paymentRegistry.register(new StripeIssuingProvider());
-  const worker: WorkerHandle = await makeWorker(conn, {
+  const activityDeps = {
     store,
     worlds,
     adapters,
@@ -70,8 +72,9 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
     tokens,
     payments,
     taskQueue: TASK_QUEUE,
-  });
-  const runPromise = worker.run();
+  };
+  let worker: WorkerHandle = await makeWorker(conn, activityDeps);
+  let runPromise = worker.run();
 
   const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir });
@@ -86,6 +89,12 @@ export async function bootHarness(provider: Provider = 'mock'): Promise<Harness>
     worldsHome,
     tokens,
     api,
+    async restartWorker() {
+      worker.shutdown();
+      await runPromise.catch(() => {});
+      worker = await makeWorker(conn, activityDeps);
+      runPromise = worker.run();
+    },
     async startGateway(opts) {
       const configHomes = new ConfigHomeManager(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-homes-')));
       // fake login command (no real CLI / OAuth): print a device URL then exit
