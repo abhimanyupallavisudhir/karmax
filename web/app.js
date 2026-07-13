@@ -308,7 +308,7 @@ function renderAgentGroup(fields, own = {}, inherited = {}, altFor) {
   const unifiedOwn = own['agent:unified'] ?? (!separate ? own['agent:do'] : undefined);
   const unifiedInherited = inherited['agent:do'] ?? inherited['agent:unified'];
   return `<div class="agent-group" data-agent-group>
-    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate Do, Merge and Resolve agents</label>
+    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate Do, Merge and Resolve agent configurations</label>
     <div class="agent-unified-panel" ${separate ? 'hidden' : ''}>${renderField(unifiedField, unifiedOwn, unifiedInherited, false, altFor?.(doField))}</div>
     <div class="agent-separated-panel" ${separate ? '' : 'hidden'}>
       ${[doField, mergeField, resolveField].map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
