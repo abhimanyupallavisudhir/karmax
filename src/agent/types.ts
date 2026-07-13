@@ -87,6 +87,10 @@ export interface TurnInput {
   maxTurns?: number;
   /** Credentials resolved JIT by the broker (never journaled); preferred over env. */
   resolvedAuth?: { apiKey?: string; configHome?: string; oauthToken?: string };
+  /** Extra env for the agent subprocess, resolved JIT (never journaled) — e.g. the
+   *  git profile's GIT_SSH_COMMAND / GH_TOKEN (PLAN-git-config.md §4B), so an agent
+   *  that pushes or runs `gh` does so as the project's git account. */
+  extraEnv?: Record<string, string>;
   /** MCP servers the workflow gives its agents, beyond the platform baseline (SPEC §7.5). */
   agentMcp?: import('../contrib/manifests.js').AgentMcpServer[];
 }
@@ -110,6 +114,10 @@ export interface AdapterTurn {
    *  later. The workflow holds in Do until this reaches 0 so a task is never
    *  reported "done" while the agent is still waiting on its sub-agents. */
   pendingSubagents?: number;
+  /** Backgrounded shells (a `run_in_background` Bash) still running when the turn's
+   *  main loop returned. The workflow nudges the agent to wait for them (bounded, so a
+   *  deliberately-left-running dev server can't wedge the task). */
+  pendingBackgroundShells?: number;
 }
 
 export interface AgentAdapter {
@@ -134,6 +142,10 @@ export interface TurnResult {
    *  returned. While > 0 the workflow keeps the agent in Do rather than advancing to
    *  Review — completion is "done AND not waiting on any sub-agents". */
   pendingSubagents?: number;
+  /** Backgrounded shells (a `run_in_background` Bash) still running when the turn
+   *  returned. The workflow nudges the agent to wait for them before Review, bounded so
+   *  a deliberately-left-running background process (e.g. a dev server) can't wedge it. */
+  pendingBackgroundShells?: number;
   skills?: { name: string; content: string }[];
   needsInput?: boolean;
   /** Absolute count of conversation messages the turn delivered (see AdapterTurn.delivered). */

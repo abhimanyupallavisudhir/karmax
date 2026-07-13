@@ -137,7 +137,7 @@ Each workflow lives in its own git repo under `~/.karmax/workflows/<name>/`:
 
 There are **two different artifacts with two different update models**:
 
-**Workflow code** is deterministic and replay-bound, so it is **version-pinned per execution**. A task records the workflow version at creation and runs that version to completion; new tasks pick up the newest version; running tasks are never hot-swapped. Editing is **a pull request, literally**:
+**Workflow code** is deterministic and replay-bound, so it is **version-pinned per execution**. A task records the workflow version at creation and runs that version to completion; new tasks pick up the newest version; running tasks are never hot-swapped. A published `type@version` export is immutable: changed command ordering or behavior is registered under a new version while the old implementation remains available for replay. Editing is **a pull request, literally**:
 
 1. An agent (or human) edits the workflow repo on a branch.
 2. The workflow's own test suite runs, plus a replay-compatibility check.
@@ -277,7 +277,7 @@ export async function softwareDev(task: TaskInput) {
         if (confirmed) break;                          // -> PR; else loop back to Do
       }
     }
-    stage = 'pr';    if (project.openGithubPr) await act.openPr(world, target);
+    stage = 'pr';    if (project.remote === 'pr') await act.openPr(world, target);
     stage = 'merge'; await mergeQueue.acquire(target);
                      await act.runAgentTurn(profiles.merge, world, null, session);
                      await mergeQueue.release(target);
@@ -328,6 +328,8 @@ A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capa
 ### 7.2 The per-turn execution model
 
 **The workflow is the long-lived (but cheap) thing; the agent runs one turn at a time inside an activity (expensive, but ephemeral).** `runAgentTurn`:
+
+The task view reports the turn's resource boundaries separately: `waitingFor: account` while credential capacity is being leased, `waitingFor: agentSlot` / `agentTurn: waiting-slot` after the account grant while host admission is pending, and `agentTurn: running` only after the activity has acquired the host slot. The workflow publishes the post-grant transition immediately; it must not leave the last account-wait snapshot visible for the duration of a running turn.
 
 1. Spins up / resumes the agent session (via session/thread ID stored in workflow state).
 2. Lets the agent work until a turn boundary (completion / idle / needs-input).

@@ -9,14 +9,16 @@ export interface GitResult {
   code: number;
 }
 
-/** Run a git command in `cwd`. Never throws on non-zero; returns the code. */
-export async function git(cwd: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<GitResult> {
+/** Run a git command in `cwd`. Never throws on non-zero; returns the code.
+ *  `opts.env` layers extra vars (e.g. a git profile's GIT_SSH_COMMAND) over the
+ *  process env; interactive prompts stay disabled regardless. */
+export async function git(cwd: string, args: string[], opts: { timeoutMs?: number; env?: Record<string, string> } = {}): Promise<GitResult> {
   try {
     const { stdout, stderr } = await pexec('git', args, {
       cwd,
       timeout: opts.timeoutMs ?? 120_000,
       maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      env: { ...process.env, ...(opts.env ?? {}), GIT_TERMINAL_PROMPT: '0' },
     });
     return { stdout, stderr, code: 0 };
   } catch (e: any) {

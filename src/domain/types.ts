@@ -30,14 +30,57 @@ export interface ProjectConfig {
   defaultTarget?: string;
   /** Gitignored files copied into each world at setup (e.g. .env). */
   copyGlobs?: string[];
-  /** Open a real GitHub PR (gated by GitHub auth). The Review stage IS the PR conceptually. */
+  /** @deprecated Superseded by `remote: 'pr'` (PLAN-git-config.md §5); still honored. */
   openGithubPr?: boolean;
+  /**
+   * Remote policy (PLAN-git-config.md §5): what leaves the machine, and when.
+   * 'none' (default) — merges are local. 'push' — the target branch is pushed
+   * after a merge lands. 'pr' — the task branch is pushed and a GitHub PR opened
+   * at the PR stage, and the target pushed after merge. Anything beyond this
+   * happens only when a task explicitly asks its agent to push.
+   */
+  remote?: RemotePolicy;
+  /** Named git identity/credentials (a GitProfile, Global settings → Git accounts)
+   *  this project's worlds commit and push as. Absent ⇒ the global default
+   *  profile, else the host's own git setup (PLAN-git-config.md §3). */
+  gitProfile?: string;
   /** role -> agent profile id. */
   defaultProfiles?: Record<string, string>;
   /** World backend. */
   worldProvider?: 'worktree' | 'container';
   /** Snapshot-on-park resumable worlds (§11.3). */
   resumeWorlds?: boolean;
+}
+
+// ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────
+
+export type RemotePolicy = 'none' | 'push' | 'pr';
+
+/** The effective remote policy, honoring the deprecated `openGithubPr` flag. */
+export function remotePolicyOf(project: ProjectConfig | undefined): RemotePolicy {
+  return project?.remote ?? (project?.openGithubPr ? 'pr' : 'none');
+}
+
+/**
+ * A named bundle of git identity + credentials — the git analogue of an agent
+ * config-home account. The record itself carries NO secrets: the three key
+ * fields are true/false flags for whether a vault secret exists under the
+ * profile's handles (`git:<name>:ssh` / `git:<name>:signing` / `git:<name>:token`).
+ * Selection is per project (`ProjectConfig.gitProfile`) with a global default;
+ * an unconfigured project falls through to the host's own git setup.
+ */
+export interface GitProfile {
+  name: string;
+  /** git user.name commits are attributed to. */
+  userName: string;
+  /** git user.email. */
+  userEmail: string;
+  /** An SSH signing key is stored (worktree-scoped commit.gpgsign, gpg.format=ssh). */
+  signingKey?: boolean;
+  /** An SSH auth key is stored (injected as GIT_SSH_COMMAND for fetch/push). */
+  sshKey?: boolean;
+  /** A GitHub token is stored (injected as GH_TOKEN for gh + https pushes). */
+  githubToken?: boolean;
 }
 
 export interface TaskList {
@@ -288,6 +331,18 @@ export interface ReviewInfo {
   changedFiles?: string[];
   /** Agent-authored rich HTML, rendered in a sandboxed iframe (§10.2 tier 4). */
   html?: string;
+  /**
+   * How the Do turn that reached Review actually ended — set by the workflow (NOT the
+   * agent), so a reviewer can tell an asserted finish from a silent stall:
+   *   - `signalled`: the agent called `signal_completion` → it claims the work is done.
+   *   - `stalled`:   the turn ended with no completion signal and nothing else pending
+   *                  (`TurnResult.needsInput`) → the agent went quiet, work may be partial.
+   *   - `raised`:    the agent raised a decision/question to its confirmer.
+   * Under a human confirmer all three route to the same gate (see software-dev's Review
+   * block), so without this marker the distinction the runtime computes is discarded.
+   * See the `signal_completion` note in src/agent/runtime.ts.
+   */
+  completion?: 'signalled' | 'stalled' | 'raised';
 }
 
 export type ActionKind = 'signal' | 'update' | 'query';
@@ -455,7 +510,9 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
+  /** Live model-turn admission/execution state, separate from account leasing. */
+  agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right
@@ -538,6 +595,36 @@ export interface TaskInput {
    * Sparse — only non-`queue` fields are carried; a missing name means `queue`.
    */
   paramWindows?: Record<string, FieldMutable>;
+  /**
+   * Recovery checkpoint for restarting a failed software-dev execution. A failed
+   * Temporal run is terminal, so Retry starts a new run which opens this existing
+   * world instead of recreating it (and thereby deleting dirty work). Kept on the
+   * generic input for serialization; only software-dev consumes it.
+   */
+  recovery?: TaskRecoveryCheckpoint;
+}
+
+/** Plain serializable world handle + conversation state needed to resume a failed
+ * software-dev task. Mirrors world/types without importing Node-facing world code. */
+export interface TaskRecoveryCheckpoint {
+  world: {
+    kind: 'worktree' | 'container' | 'memory';
+    id: string;
+    root: string;
+    branch: string;
+    base: string;
+    repo?: string;
+    target?: string;
+    repos?: { name: string; repo: string; root: string; branch: string; base: string }[];
+    meta?: Record<string, unknown>;
+  };
+  messages: Message[];
+  transcripts?: { role: string; label: string; messages: Message[] }[];
+  reviewInfo?: ReviewInfo;
+  session?: string;
+  sessionHome?: string;
+  seen?: number;
+  target?: string;
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────

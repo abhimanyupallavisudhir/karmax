@@ -1,15 +1,41 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { pathToFileURL } from 'node:url';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 // Configure the host-admission gate BEFORE the module captures env at import:
 // small capacity, both pressure gates disabled → a deterministic pure semaphore.
+const previousEnv = {
+  slots: process.env.KARMAX_MAX_AGENT_SLOTS,
+  memory: process.env.KARMAX_AGENT_MIN_FREE_MB,
+  load: process.env.KARMAX_AGENT_MAX_LOAD_FACTOR,
+  home: process.env.KARMAX_HOME,
+};
 process.env.KARMAX_MAX_AGENT_SLOTS = '2';
 process.env.KARMAX_AGENT_MIN_FREE_MB = '0';
 process.env.KARMAX_AGENT_MAX_LOAD_FACTOR = '0';
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-agent-slots-'));
+process.env.KARMAX_HOME = home;
 
 let slots: typeof import('../src/activities/agent-slots.js');
 
 beforeAll(async () => {
   slots = await import('../src/activities/agent-slots.js');
+});
+
+afterAll(() => {
+  fs.rmSync(home, { recursive: true, force: true });
+  const restore = (name: string, value: string | undefined) => {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  };
+  restore('KARMAX_MAX_AGENT_SLOTS', previousEnv.slots);
+  restore('KARMAX_AGENT_MIN_FREE_MB', previousEnv.memory);
+  restore('KARMAX_AGENT_MAX_LOAD_FACTOR', previousEnv.load);
+  restore('KARMAX_HOME', previousEnv.home);
 });
 
 describe('host diagnostics', () => {
@@ -67,6 +93,52 @@ describe('admissionDecision (memory-gate decision — karmax#4)', () => {
 });
 
 describe('agent-slot admission semaphore', () => {
+  it('shares the capacity across worker processes using the same KARMAX_HOME', async () => {
+    const first = await slots.acquireAgentSlot();
+    const moduleUrl = pathToFileURL(path.resolve('src/activities/agent-slots.ts')).href;
+    const child = spawn(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        '--input-type=module',
+        '--eval',
+        `const { acquireAgentSlot } = await import(${JSON.stringify(moduleUrl)}); const release = await acquireAgentSlot(); console.log('READY'); process.stdin.once('data', () => { release(); process.exit(0); }); setInterval(() => {}, 1000);`,
+      ],
+      { cwd: process.cwd(), env: { ...process.env, KARMAX_HOME: home }, stdio: ['pipe', 'pipe', 'inherit'] },
+    );
+    try {
+      let output = '';
+      await new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.stdout!.on('data', (chunk) => {
+          output += chunk.toString();
+          if (output.includes('READY')) resolve();
+        });
+        child.once('exit', (code) => reject(new Error(`slot-holder child exited before ready (${code})`)));
+      });
+      expect(slots.agentSlotStats().inUse).toBe(2);
+
+      let overflowGranted = false;
+      const overflow = slots.acquireAgentSlot().then((release) => {
+        overflowGranted = true;
+        return release;
+      });
+      await new Promise((r) => setTimeout(r, 150));
+      expect(overflowGranted).toBe(false);
+      expect(slots.agentSlotStats()).toMatchObject({ inUse: 2, waiting: 1 });
+
+      first();
+      const releaseOverflow = await overflow;
+      releaseOverflow();
+    } finally {
+      first();
+      child.stdin?.write('release\n');
+      if (child.exitCode === null) await once(child, 'exit');
+    }
+    expect(slots.agentSlotStats()).toMatchObject({ inUse: 0, waiting: 0 });
+  });
+
   it('admits up to capacity, parks the overflow, and hands the slot off on release', async () => {
     const r1 = await slots.acquireAgentSlot();
     const r2 = await slots.acquireAgentSlot();
@@ -101,5 +173,22 @@ describe('agent-slot admission semaphore', () => {
     rel();
     rel();
     expect(slots.agentSlotStats().inUse).toBe(0);
+  });
+
+  it('removes a cancelled waiter without consuming the next released slot', async () => {
+    const r1 = await slots.acquireAgentSlot();
+    const r2 = await slots.acquireAgentSlot();
+    const abort = new AbortController();
+    const parked = slots.acquireAgentSlot(undefined, abort.signal);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(slots.agentSlotStats().waiting).toBe(1);
+
+    abort.abort(new Error('turn cancelled'));
+    await expect(parked).rejects.toThrow('turn cancelled');
+    expect(slots.agentSlotStats()).toMatchObject({ inUse: 2, waiting: 0 });
+
+    r1();
+    r2();
+    expect(slots.agentSlotStats()).toMatchObject({ inUse: 0, waiting: 0 });
   });
 });

@@ -103,6 +103,29 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const onMain = await git(repo, ['show', 'main:http.txt']);
     expect(onMain.stdout).toContain('via the gateway');
 
+    // The task drawer can race the workflow's final close. Reproduce a stale
+    // non-terminal snapshot left behind after the execution has completed.
+    await h.client.workflow.getHandle(task.id).result();
+    h.store.saveView(task.id, {
+      ...h.store.getTask(task.id)!.lastView!,
+      stage: 'resolve',
+      status: 'waiting',
+      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
+    });
+    const lateCancel = await fetch(`${base}/api/tasks/${task.id}/signal`, {
+      method: 'POST',
+      headers: auth(),
+      body: JSON.stringify({ signal: 'cancel' }),
+    });
+    expect(lateCancel.status).toBe(200);
+    expect(await lateCancel.json()).toEqual({ ok: true });
+    expect(h.store.getTask(task.id)!.lastView).toMatchObject({
+      stage: 'cancelled',
+      status: 'cancelled',
+      actions: [],
+      state: { cancelled: true },
+    });
+
     // dashboard reflects the project + task
     const dash: any = await (await fetch(`${base}/api/dashboard`, { headers: auth() })).json();
     expect(dash.projects).toBeGreaterThanOrEqual(1);

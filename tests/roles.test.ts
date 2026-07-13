@@ -112,6 +112,10 @@ describe('workflow-declared resolve rules (SPEC §5.2)', () => {
   });
   it('falls through to the platform defaults, then to unresolved', () => {
     expect(autoResolve('do', 'HTTP 429 rate limit').resolved).toBe(true); // platform rate-limit case
+    expect(autoResolve('do', 'Codex usage limit reached · resets in 1800s').resolved).toBe(true);
+    expect(autoResolve('do', "You've hit your session limit · resets 3:45pm").resolved).toBe(true);
+    expect(autoResolve('do', "You've hit your weekly limit · resets Mon 12:00am").resolved).toBe(true);
+    expect(autoResolve('do', 'OpenAI insufficient_quota: check billing').resolved).toBe(true);
     expect(autoResolve('do', 'a totally novel error').resolved).toBe(false);
   });
   it('a bad regex in a declared rule never wedges resolve', () => {

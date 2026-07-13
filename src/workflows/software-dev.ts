@@ -26,6 +26,7 @@ import {
   TaskInput,
   TaskView,
   Stage,
+  AgentRole,
   AgentSpec,
   ConfirmLayer,
   Message,
@@ -36,6 +37,8 @@ import {
   ParentResponse,
   SubTaskResponse,
 } from './contract.js';
+import { remotePolicyOf } from './contract.js';
+import { SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
@@ -70,6 +73,7 @@ export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
+export const agentTurnStateSignal = defineSignal<[{ turnId: string; role: AgentRole; provider?: 'claude' | 'codex' | 'mock'; state: 'running' }]>(SIG_AGENT_TURN_STATE);
 /** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
@@ -128,6 +132,12 @@ const MAX_SUBAGENT_NUDGES = 5;
  *  Avoids a hot re-prompt loop and gives the waiting state a visible dwell; a human
  *  follow-up wakes it early. Overridable via `input.subagentWaitMs`. */
 const DEFAULT_SUBAGENT_WAIT_MS = 10_000;
+/** A turn can also return while a `run_in_background` shell (e.g. `npm test &`) is
+ *  still running — the agent ends its turn meaning to fold in the result later (task
+ *  130). We nudge it to wait, but with a SMALLER budget than sub-agents: a shell may
+ *  be a dev server the task deliberately left running, so we must not park on it long.
+ *  After the budget we proceed to Review with a note. */
+const MAX_SHELL_NUDGES = 3;
 
 /**
  * The merge-queue serialization domains for a task — one `<repo>:<target>` per
@@ -161,32 +171,50 @@ class CredentialDenied extends Error {}
  * no return.
  */
 export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.1.0');
+}
+
+/** Replay-compatible entry for executions already recorded as
+ * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
+export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.0.0');
+}
+
+async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0' | '1.1.0'): Promise<{ stage: Stage; sha?: string }> {
+  const liveAgentStates = behaviorVersion !== '1.0.0';
   const taskId = input.taskId;
-  let stage: Stage = 'setup';
+  const recovery = input.recovery;
+  let stage: Stage = recovery ? 'do' : 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = input.prompt || input.images?.length
-    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
-    : [];
-  let target = input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
+  const msgs: Message[] = recovery
+    ? recovery.messages.map((m) => ({ ...m }))
+    : input.prompt || input.images?.length
+      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+      : [];
+  let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let confirmed = false;
   let cancelled = false;
   let retryRequested = false;
-  let world: WorldHandleLike | undefined;
-  let session: string | undefined;
+  let world: WorldHandleLike | undefined = recovery?.world;
+  let session: string | undefined = recovery?.session;
   // The config home that minted `session`. Provider sessions are login-bound, so a
   // later turn leased a DIFFERENT home must NOT resume this session — we drop it and
   // let the turn start fresh (karmax's own `msgs` carries the conversation). §2.5.
-  let sessionHome: string | undefined;
+  let sessionHome: string | undefined = recovery?.sessionHome;
   // What a parked turn is waiting on (surfaced in the view; SPEC §6.2).
   let waitingFor: TaskView['waitingFor'];
-  let reviewInfo: ReviewInfo | undefined;
+  let agentTurn: TaskView['agentTurn'];
+  let agentTurnResumeStatus: TaskView['status'] = 'active';
+  let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
   let error: string | undefined;
   let pr: { url: string; number: number } | undefined;
   let mergeQueuePos: { position: number; total: number } | undefined;
   // How many times we've re-prompted the agent to wait for its own in-harness
   // sub-agents this Do phase (bounded by MAX_SUBAGENT_NUDGES).
   let subagentNudges = 0;
+  // Same, for backgrounded shells the agent left running (bounded by MAX_SHELL_NUDGES).
+  let shellNudges = 0;
   const subTaskIds: string[] = [];
   // Sub-task hierarchy (SPEC §5.3). Children are managed, not blindly awaited: their
   // handles let us await completion, raised requests queue in `raises`, settlements in
@@ -202,13 +230,15 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
   let targetLocked = false;
   let mergeGranted = false;
-  let seen = 0; // messages the Do agent has already processed
+  let seen = recovery?.seen ?? 0; // messages the Do agent has already processed
   // Per-role transcripts surfaced in the view-model (SPEC §5.5): the Do agent's
   // conversation is `msgs`; the merge/resolve agents run on their own message
   // arrays whose input+output we accumulate here so all three are inspectable.
-  const mergeMsgs: Message[] = [];
-  const resolveMsgs: Message[] = [];
-  const confirmMsgs: Message[] = [];
+  const recoveredTranscript = (role: string): Message[] =>
+    recovery?.transcripts?.find((t) => t.role === role)?.messages.map((m) => ({ ...m })) ?? [];
+  const mergeMsgs: Message[] = recoveredTranscript('merge');
+  const resolveMsgs: Message[] = recoveredTranscript('resolve');
+  const confirmMsgs: Message[] = recoveredTranscript('confirm');
   // Who drives the Review gate (SPEC §5.2): the ordered confirm layers, played
   // sequentially at each Review — every layer must approve; [] ⇒ auto-confirm.
   // Legacy shapes ({mode} configs, the goal-task `autoConfirm` flag) normalize to
@@ -403,6 +433,10 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
         mergeGranted,
         targetLocked,
         mergeDomain: world ? mergeDomains(world, target, input.projectId)[0] : undefined,
+        // A failed Temporal execution is terminal. Persist the full handle needed
+        // for a replacement run to OPEN this world; reconstructing it through
+        // createWorld would force-remove the dirty worktree and lose work.
+        recoveryWorld: world,
       },
       branch: world?.branch,
       base,
@@ -414,6 +448,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       parentTaskId: input.parentTaskId,
       error,
       waitingFor,
+      agentTurn,
       pointOfNoReturnPassed,
       // The task-scope params the UI may edit right now (SPEC §5.5): declared
       // `untilUsed` fields not yet consumed. `queue` fields never appear here.
@@ -431,6 +466,15 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   const conversationFor = (role?: string): Message[] =>
     role === 'merge' ? mergeMsgs : role === 'resolve' ? resolveMsgs : role === 'confirm' ? confirmMsgs : msgs;
   setHandler(viewQuery, buildView);
+  setHandler(agentTurnStateSignal, async (next) => {
+    // Ignore a late state signal from an activity that was cancelled/retried after
+    // a newer turn took ownership of the view.
+    if (!liveAgentStates || !agentTurn || next.turnId !== agentTurn.turnId) return;
+    agentTurn = { turnId: next.turnId, role: next.role, provider: next.provider, state: next.state };
+    waitingFor = undefined;
+    status = agentTurnResumeStatus;
+    await publish();
+  });
   setHandler(pendingMessagesQuery, (role, fromIndex) => {
     // The raw slice from `fromIndex` (indices align with the array the activity is
     // tracking). A negative/over-range index clamps to a safe empty/whole slice.
@@ -536,9 +580,24 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           lastError = describeError(err);
           error = lastError;
           const prevStage = stage;
-          stage = 'resolve';
-          await publish();
-          const auto = await core.autoResolve({ taskId, stage: stageName, error });
+          // v1 command order is recorded in existing histories: publish Resolve,
+          // then invoke autoResolve. The improved no-flicker order belongs to the
+          // distinct v1.1 Temporal type and must never rewrite v1 replay.
+          let auto;
+          if (behaviorVersion === '1.0.0') {
+            stage = 'resolve';
+            await publish();
+            auto = await core.autoResolve({ taskId, stage: stageName, error });
+          } else {
+            auto = await core.autoResolve({ taskId, stage: stageName, error });
+            if (auto.resolved) {
+              log.info('auto-resolve matched', { stage: stageName, action: auto.action, note: auto.note });
+              error = undefined;
+              continue;
+            }
+            stage = 'resolve';
+            await publish();
+          }
           if (!auto.resolved && world) {
             // The resolve agent is about to run — freeze `agent:resolve` (SPEC §5.5).
             consumed.add('agent:resolve');
@@ -551,20 +610,33 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
               ts: resolveMsgs.length,
             };
             resolveMsgs.push(rin);
-            const r = await leasedTurn('resolve', (accountConfigHome, accountApiKeyHandle) =>
-              turns.runAgentTurn({
-                taskId,
-                role: 'resolve',
-                worldHandle: world as any,
-                // Include the resolve agent's full transcript so a human follow-up
-                // addressed to it (SPEC §5.6) reaches it on this turn.
-                messages: resolveMsgs,
-                task: liveInput,
-                bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
-                accountConfigHome,
-                accountApiKeyHandle,
-              }),
-            );
+            let r;
+            try {
+              r = await leasedTurn('resolve', (accountConfigHome, accountApiKeyHandle, agentTurnId) =>
+                turns.runAgentTurn({
+                  taskId,
+                  role: 'resolve',
+                  worldHandle: world as any,
+                  // Include the resolve agent's full transcript so a human follow-up
+                  // addressed to it (SPEC §5.6) reaches it on this turn.
+                  messages: resolveMsgs,
+                  task: liveInput,
+                  bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
+                  accountConfigHome,
+                  accountApiKeyHandle,
+                  ...(agentTurnId ? { agentTurnId } : {}),
+                }),
+              );
+            } catch (resolveErr) {
+              // An exception thrown while handling a catch is NOT caught by that
+              // same catch. This missing boundary made a quota/error in the Resolve
+              // agent escape withResolve and terminally fail the Temporal execution
+              // (tasks #130/#133/#150). Resolution machinery exhausting itself is a
+              // human escalation, never an unhandled workflow failure.
+              lastError = `Resolve agent failed while handling the ${stageName} error: ${describeError(resolveErr)}`;
+              error = lastError;
+              break;
+            }
             if (r.output?.trim()) resolveMsgs.push({ id: `r-out-${resolveMsgs.length}`, role: 'agent', text: r.output, ts: resolveMsgs.length });
             // Consume the agent's structured verdict (SPEC §5.2, RESOLVE-PLAN §3.2)
             // instead of blindly retrying. This is the fix for "the resolve agent's
@@ -632,12 +704,50 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
    * and arms a refresh timer, then the error is rethrown so withResolve re-leases a
    * different available login — or parks until one refreshes.
    */
-  async function leasedTurn<T>(role: string, fn: (accountConfigHome?: string, accountApiKeyHandle?: string) => Promise<T>): Promise<T> {
-    // No pool ⇒ no leasing at all (zero behavior change, no extra activity).
-    if (accountPool <= 0) return await runCancellable(() => fn(undefined, undefined));
+  async function leasedTurn<T>(
+    role: AgentRole,
+    fn: (accountConfigHome?: string, accountApiKeyHandle?: string, agentTurnId?: string) => Promise<T>,
+  ): Promise<T> {
+    /** v1.1 publishes the host-admission state before scheduling the turn. The
+     * activity changes it to `running` only after it actually acquires a slot. */
+    const admittedTurn = async (
+      turnId: string,
+      provider: 'claude' | 'codex' | 'mock' | undefined,
+      resumeStatus: TaskView['status'],
+      home?: string,
+      key?: string,
+    ): Promise<T> => {
+      if (liveAgentStates) {
+        agentTurnResumeStatus = resumeStatus === 'waiting' ? 'active' : resumeStatus;
+        agentTurn = { turnId, role, provider, state: 'waiting-slot' };
+        status = 'waiting';
+        waitingFor = { kind: 'agentSlot', provider, detail: 'Waiting for host capacity to run the agent' };
+        await publish();
+      }
+      try {
+        return await runCancellable(() => fn(home, key, liveAgentStates ? turnId : undefined));
+      } finally {
+        if (liveAgentStates && agentTurn?.turnId === turnId) {
+          agentTurn = undefined;
+          waitingFor = undefined;
+          if (status === 'waiting') status = agentTurnResumeStatus;
+          await publish();
+        }
+      }
+    };
+
+    // v1 took this exact zero-activity passthrough. v1.1 still exposes host-slot
+    // admission even when there is no configured account pool.
+    if (accountPool <= 0) {
+      if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
+      return await admittedTurn(`${taskId}#${turnSeq++}`, undefined, status);
+    }
     const prov = await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
     const provider = prov === 'claude' || prov === 'codex' || prov === 'mock' ? prov : undefined;
-    if (!provider) return await runCancellable(() => fn(undefined, undefined));
+    if (!provider) {
+      if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
+      return await admittedTurn(`${taskId}#${turnSeq++}`, undefined, status);
+    }
     // Credential-policy allow-list for real providers (precedence + enable/disable,
     // resolved global→project→task); mock uses the coordinator's provider fallback.
     const allowed =
@@ -650,11 +760,30 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     status = 'waiting';
     waitingFor = { kind: 'account', provider };
     await publish();
-    await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
-    waitingFor = undefined;
-    if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
+    if (liveAgentStates) {
+      // The coordinator owns refresh timers and signals every grant. An arbitrary
+      // workflow-side timeout used to fall through with no grant and accidentally
+      // run on the profile credential, bypassing the exhausted account policy.
+      await condition(() => accountGrants.has(turnId) || cancelled);
+    } else {
+      // Immutable v1 command history: extant executions recorded this timer.
+      await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
+    }
     const grant = accountGrants.get(turnId);
     accountGrants.delete(turnId);
+    if (liveAgentStates && cancelled && !grant) await coord.cancelAccount(taskId, turnId).catch(() => undefined);
+    if (!liveAgentStates) {
+      // Preserve v1's in-memory transition. It intentionally did not publish here;
+      // changing that command sequence would break every extant v1 history.
+      waitingFor = undefined;
+      if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
+    } else if (cancelled || grant?.accountId === '(denied)') {
+      // No model turn follows these paths, so explicitly clear the account wait.
+      waitingFor = undefined;
+      if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
+      await publish();
+    }
+    if (liveAgentStates && cancelled) throw new Cancelled();
     // The coordinator denies a turn whose every allowed credential needs human action
     // (#5): escalate rather than run/park.
     if (grant?.accountId === '(denied)') {
@@ -665,7 +794,9 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const leasedHome = passthrough ? undefined : grant?.configHome;
     const leasedKey = passthrough ? undefined : grant?.apiKeyHandle;
     try {
-      return await runCancellable(() => fn(leasedHome, leasedKey));
+      // This publish happens immediately after the lease grant and replaces the
+      // stale account-wait view with the distinct host-slot state.
+      return await admittedTurn(turnId, provider, priorStatus, leasedHome, leasedKey);
     } catch (err) {
       // Limit failure → update the coordinator so it re-leases the next allowed
       // credential: a transient window arms a refresh timer; a HARD billing/auth
@@ -711,7 +842,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     // never reached the agent (SPEC §5.6 — a queued follow-up must reach the agent).
     let deliveredNow = seen;
     const turn = await withResolve('do', () =>
-      leasedTurn('do', (accountConfigHome, accountApiKeyHandle) => {
+      leasedTurn('do', (accountConfigHome, accountApiKeyHandle, agentTurnId) => {
         doHome = accountConfigHome ?? '(profile)';
         // Resume only when the leased login matches the one that minted the session
         // (§2.5). When we do, the session already holds the first `seen` messages
@@ -729,6 +860,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           task: liveInput,
           accountConfigHome,
           accountApiKeyHandle,
+          ...(agentTurnId ? { agentTurnId } : {}),
         });
       }),
     );
@@ -782,7 +914,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     });
     confirmMsgs.push({ id: `c-in-${confirmMsgs.length}`, role: 'user', text: request, ts: confirmMsgs.length });
     const ct = await withResolve('confirm', () =>
-      leasedTurn('confirm', (accountConfigHome, accountApiKeyHandle) =>
+      leasedTurn('confirm', (accountConfigHome, accountApiKeyHandle, agentTurnId) =>
         // Each Review runs a FRESH confirm turn (session left unset) so the reviewer
         // always gets an up-to-date system prompt (fresh reviewInfo / changed files);
         // continuity comes from `confirmMsgs`, replayed to the fresh session — prior
@@ -801,6 +933,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           },
           accountConfigHome,
           accountApiKeyHandle,
+          ...(agentTurnId ? { agentTurnId } : {}),
         }),
       ),
     ).catch((e) => {
@@ -884,14 +1017,20 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     }
   }
 
-  /** Cancel any still-running children (on our own abort). Best effort. */
-  async function cancelChildren() {
+  /** Cancel any still-running children (on our own abort). Best effort. v1.1 can
+   * wait briefly for their graceful cancellation so Temporal's parent-close
+   * policy does not race the signal and turn a cancelled child into Terminated. */
+  async function cancelChildren(waitForSettlement = false) {
     for (const cid of outstanding) {
       try {
         await getExternalWorkflowHandle(cid).signal(cancelSignal);
       } catch {
         /* best effort */
       }
+    }
+    if (waitForSettlement && outstanding.size) {
+      const targets = [...outstanding];
+      await condition(() => targets.every((cid) => settled.some((s) => s.childTaskId === cid)), '10 seconds');
     }
   }
 
@@ -948,9 +1087,11 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   try {
   // ── Setup ──
   await publish();
-  world = (await withResolve('setup', () =>
-    core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, kind }),
-  )) as WorldHandleLike;
+  if (!world) {
+    world = (await withResolve('setup', () =>
+      core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
+    )) as WorldHandleLike;
+  }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
   accountPool = await coord.accountPoolSize().catch(() => 0);
 
@@ -1041,6 +1182,38 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const gaveUpOnSubagents = !!turn.pendingSubagents && subagentNudges >= MAX_SUBAGENT_NUDGES;
     subagentNudges = 0; // sub-agents settled (or nudge budget spent) → reset for next Do phase
 
+    // A `run_in_background` shell (e.g. a backgrounded `npm test`) may still be running
+    // when the turn returned — the agent ends its turn meaning to fold in the result
+    // later, and a returned Do turn otherwise falls straight through to Review (task 130).
+    // Hold in Do and re-prompt instead. Bounded SMALL and softer than the sub-agent case:
+    // the shell might be a dev server the task deliberately left running, so after the
+    // budget we proceed anyway (with the note below).
+    if (turn.pendingBackgroundShells && shellNudges < MAX_SHELL_NUDGES) {
+      shellNudges++;
+      status = 'waiting';
+      waitingFor = { kind: 'shell', detail: `${turn.pendingBackgroundShells} background job(s) still running` };
+      await publish();
+      // Back off before re-prompting, but stay redirectable: a human follow-up or a
+      // cancel wakes us early.
+      await condition(() => cancelled || msgs.length > seen, input.subagentWaitMs ?? DEFAULT_SUBAGENT_WAIT_MS);
+      if (cancelled) return await abort();
+      if (msgs.length === seen) {
+        msgs.push({
+          id: `sh-${msgs.length}`,
+          role: 'user',
+          text: 'A background job you started (a run_in_background shell) is still running. If you are waiting on its result — e.g. a test run — wait for it to finish, fold in the result, then call signal_completion. If you are deliberately leaving it running (e.g. a dev server), call signal_completion now to proceed to review.',
+          ts: msgs.length,
+        });
+      }
+      stage = 'do';
+      status = 'active';
+      continue;
+    }
+    // Fell through with a background shell still running ⇒ the nudge budget is spent
+    // (likely a long-lived process the agent means to leave running). Proceed, but note it.
+    const gaveUpOnShells = !!turn.pendingBackgroundShells && shellNudges >= MAX_SHELL_NUDGES;
+    shellNudges = 0; // shells settled (or nudge budget spent) → reset for next Do phase
+
     {
       // Goal mode: keep nudging the agent until it signals structured completion
       // (unless it's explicitly raising to its parent, which needs an answer).
@@ -1072,10 +1245,27 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       }
       // An explicit raise carries its own message; show it as the review summary.
       if (turn.raise?.detail) reviewInfo = { ...reviewInfo, summary: turn.raise.detail };
+      // Record HOW this turn reached Review so the confirmer can tell an asserted finish
+      // from a silent stall. `completed`/`needsInput` only change control flow in auto/goal
+      // modes (the zero-layers auto-confirm guard below and the goal keep-going loop above);
+      // under a human/agent confirmer every path lands at the same gate, so this marker is
+      // the one thing that surfaces the distinction the runtime already computes. A stall
+      // means the agent went quiet WITHOUT calling signal_completion — the work may be
+      // partial — so the reviewer should scrutinise rather than rubber-stamp.
+      reviewInfo = {
+        ...reviewInfo,
+        completion: turn.completed ? 'signalled' : turn.raise ? 'raised' : 'stalled',
+      };
       // We stopped waiting on still-running sub-agents (budget spent) — prepend a note so
       // the reviewer knows this reached Review with delegated work possibly incomplete.
       if (gaveUpOnSubagents) {
         const note = `⚠️ Proceeded to Review with ${turn.pendingSubagents} sub-agent(s) still reported running after ${MAX_SUBAGENT_NUDGES} waits — a sub-agent may be wedged and its output missing.`;
+        reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
+      }
+      // Same for a background shell we stopped waiting on (budget spent) — it may be a
+      // dev server left running on purpose, or a job whose result never got folded in.
+      if (gaveUpOnShells) {
+        const note = `⚠️ Proceeded to Review with ${turn.pendingBackgroundShells} background job(s) still running after ${MAX_SHELL_NUDGES} waits — if this was a test/build run, its result may not have been folded in.`;
         reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${note}\n\n${reviewInfo.summary}` : note };
       }
       stage = 'review';
@@ -1157,7 +1347,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   status = 'active';
   await publish();
   if (cancelled) return await abort();
-  if (input.project.openGithubPr) {
+  if (remotePolicyOf(input.project) === 'pr') {
     // Opening a PR binds it to `target`; close the edit window before we do (SPEC §2).
     targetLocked = true;
     await publish();
@@ -1176,6 +1366,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   // knows what to fix — a human retry resets the attempt budget, not the context).
   let mergeAttempts = 0;
   let mergeConflict: string | undefined;
+  let mergeDirty: string | undefined;
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -1220,16 +1411,18 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     const mergeIn: Message = {
       id: `m-in-${mergeMsgs.length}`,
       role: 'user',
-      text: mergeConflict
-        ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
-        : `Prepare branch for merge into ${target}.`,
+      text: mergeDirty
+        ? `The merge into ${target} was rejected — the worktree has uncommitted changes:\n${mergeDirty}\nStage and commit what belongs in this change; gitignore (or delete) what doesn't. Leave the worktree clean.`
+        : mergeConflict
+          ? `The merge into ${target} was rejected — unresolved conflicts or leftover conflict markers in:\n${mergeConflict}\nIn the worktree: merge ${target} into the current branch, resolve every conflict (no <<<<<<< / ======= / >>>>>>> markers may remain anywhere), preserve both sides' intent, and commit the resolution.`
+          : `Prepare branch for merge into ${target}. Commit any work that should land; gitignore (or delete) anything that shouldn't — the merge is rejected if the worktree isn't clean.`,
       ts: mergeMsgs.length,
     };
     mergeMsgs.push(mergeIn);
     let result;
     try {
       // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
-      const mt = await leasedTurn('merge', (accountConfigHome, accountApiKeyHandle) =>
+      const mt = await leasedTurn('merge', (accountConfigHome, accountApiKeyHandle, agentTurnId) =>
         turns.runAgentTurn({
           taskId,
           role: 'merge',
@@ -1242,6 +1435,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           bindings: { reviewInfo: reviewInfo?.summary ?? '' },
           accountConfigHome,
           accountApiKeyHandle,
+          ...(agentTurnId ? { agentTurnId } : {}),
         }),
       ).catch((e) => {
         if (isCancellation(e)) throw e; // pre-merge cancel → abort, don't merge
@@ -1259,14 +1453,22 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
     if (result.merged) {
       sha = result.sha;
       pointOfNoReturnPassed = true;
+      // Remote policy 'push'/'pr' (PLAN-git-config.md §5): the landed target leaves
+      // the machine — push it (and under 'pr', GitHub marks the PR merged).
+      // Best-effort: the merge IS the deliverable; a failed push is recorded, not fatal.
+      if (remotePolicyOf(input.project) !== 'none') {
+        await core.pushTarget(world as any, target).catch(() => undefined);
+      }
       break;
     }
-    // Merge rejected. Conflicts (including leftover markers) are the merge
-    // agent's job: loop straight back to it with the details, bounded, before
-    // bothering a human/parent (SPEC §5.2).
-    error = `merge failed: ${result.conflict ?? result.note ?? 'unknown'}`;
-    if (result.conflict) {
-      mergeConflict = `${result.note ? `${result.note}\n` : ''}${result.conflict}`;
+    // Merge rejected. Conflicts (including leftover markers) and dirty worktrees
+    // (commit-vs-gitignore is a judgment call — PLAN-git-config.md §6) are the
+    // merge agent's job: loop straight back to it with the details, bounded,
+    // before bothering a human/parent (SPEC §5.2).
+    error = `merge failed: ${result.conflict ?? result.dirty ?? result.note ?? 'unknown'}`;
+    if (result.conflict || result.dirty) {
+      mergeDirty = result.dirty;
+      mergeConflict = result.dirty ? undefined : `${result.note ? `${result.note}\n` : ''}${result.conflict}`;
       if (++mergeAttempts < MAX_MERGE_ATTEMPTS) {
         mergeMsgs.push({
           id: `m-sys-${mergeMsgs.length}`,
@@ -1312,7 +1514,7 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   async function abort() {
     stage = 'cancelled';
     status = 'cancelled';
-    await cancelChildren(); // don't strand children when we go away
+    await cancelChildren(liveAgentStates); // don't strand children when we go away
     await publish();
     if (world) await core.destroyWorld(world as any);
     return { stage } as { stage: Stage };

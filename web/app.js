@@ -39,6 +39,7 @@ const S = {
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
   returnRoute: null, // where "close drawer" returns to (the list/queue we opened from)
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
+  modelCatalog: null, // provider-native model metadata loaded from the gateway
 };
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
@@ -193,11 +194,17 @@ const MODELS = {
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
   mock: ['mock'],
 };
+function modelOptions(provider) {
+  const live = S.modelCatalog?.[provider];
+  return live?.length ? live.map((m) => m.id) : (MODELS[provider] || MODELS.claude);
+}
 // Which reasoning-effort levels a given model actually accepts (mirrors the
 // server's src/agent/effort.ts gating). Empty = the model has no effort control.
 const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
 function effortLevelsFor(provider, model) {
   const m = (model || '').toLowerCase();
+  const advertised = S.modelCatalog?.[provider]?.find((x) => x.id === model)?.effort;
+  if (advertised) return advertised;
   if (provider === 'claude') {
     if (!/opus-4-(5|6|7|8)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
     const ok = new Set(['low', 'medium', 'high']);
@@ -286,11 +293,54 @@ function renderField(f, own, inherited, withChips, alt) {
   return `<div class="form-row" data-row="${esc(f.name)}">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
+const agentGroupFields = (fields) => ['do', 'merge', 'resolve'].map((role) => fields.find((f) => f.type === 'agent' && f.role === role));
+const inferredSeparateAgents = (values = {}) => values.separateAgents === true ||
+  (values.separateAgents === undefined && ['do', 'merge', 'resolve'].some((role) => values[`agent:${role}`] !== undefined));
+
+// Software-dev owns three operational roles, but most tasks want one identity for
+// all of them. Keep the manifest's role fields (the workflow still consumes those)
+// while presenting a compact virtual `agent:unified` field by default.
+function renderAgentGroup(fields, own = {}, inherited = {}, altFor) {
+  const [doField, mergeField, resolveField] = agentGroupFields(fields);
+  if (!doField || !mergeField || !resolveField) return null;
+  const separate = inferredSeparateAgents(own);
+  const unifiedField = { ...doField, name: 'agent:unified', role: 'unified', label: 'Agent' };
+  const unifiedOwn = own['agent:unified'] ?? (!separate ? own['agent:do'] : undefined);
+  const unifiedInherited = inherited['agent:do'] ?? inherited['agent:unified'];
+  return `<div class="agent-group" data-agent-group>
+    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate Do, Merge and Resolve agent configurations</label>
+    <div class="agent-unified-panel" ${separate ? 'hidden' : ''}>${renderField(unifiedField, unifiedOwn, unifiedInherited, false, altFor?.(doField))}</div>
+    <div class="agent-separated-panel" ${separate ? '' : 'hidden'}>
+      ${[doField, mergeField, resolveField].map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
+    </div>
+  </div>`;
+}
+
+function renderFields(fields, own = {}, inherited = {}, withPromptChips = false, altFor) {
+  const group = renderAgentGroup(fields, own, inherited, altFor);
+  const grouped = new Set(group ? agentGroupFields(fields).map((f) => f.name) : []);
+  let groupDrawn = false;
+  const html = [];
+  for (const f of fields) {
+    if (grouped.has(f.name)) {
+      if (!groupDrawn) { html.push(group); groupDrawn = true; }
+      continue;
+    }
+    if (f.name === 'base' && fields.some((x) => x.name === 'target')) {
+      const target = fields.find((x) => x.name === 'target');
+      html.push(`<div class="branch-pair">${renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))}${renderField(target, own[target.name], inherited[target.name], false, altFor?.(target))}</div>`);
+      continue;
+    }
+    if (f.name === 'target' && fields.some((x) => x.name === 'base')) continue;
+    html.push(renderField(f, own[f.name], inherited[f.name], withPromptChips && f.name === 'prompt', altFor?.(f)));
+  }
+  return html.join('');
+}
+
 function renderAgentField(f, spec, inherited) {
   const inh = inherited || {};
   const e = spec || inh; // prefill with the effective spec
   const provider = e.provider || 'claude';
-  const models = MODELS[provider] || MODELS.claude;
   const role = f.role || f.name;
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -302,7 +352,7 @@ function renderAgentField(f, spec, inherited) {
       </div>
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
-    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Fork a previous agent</summary>
+    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</summary>
       <button type="button" class="btn sm af-resume-pick" style="margin-top:6px">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
       <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
@@ -410,7 +460,19 @@ function readConfirmerLayers(box) {
 // Read a form's values back out; only return fields CHANGED from inherited.
 function collectForm(root, fields) {
   const out = {};
+  const group = root.querySelector('[data-agent-group]');
+  const groupedRoles = group ? new Set(['do', 'merge', 'resolve']) : new Set();
+  if (group) {
+    const separate = group.querySelector('.agent-separate').checked;
+    out.separateAgents = separate;
+    const panels = separate ? [group.querySelector('.agent-separated-panel')] : [group.querySelector('.agent-unified-panel')];
+    const selectedFields = separate
+      ? fields.filter((f) => f.type === 'agent' && groupedRoles.has(f.role))
+      : [{ ...fields.find((f) => f.type === 'agent' && f.role === 'do'), name: 'agent:unified', role: 'unified' }];
+    Object.assign(out, collectForm(panels[0], selectedFields));
+  }
   for (const f of fields) {
+    if (f.type === 'agent' && groupedRoles.has(f.role)) continue;
     if (f.type === 'agent') {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
@@ -493,7 +555,7 @@ function wireCombo(combo, getOptions, onChange) {
 function wireAgentBox(box) {
   const combo = box.querySelector('.af-model-combo');
   const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
-  if (combo) wireCombo(combo, () => MODELS[providerOf()] || MODELS.claude, () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
+  if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
   box.querySelector('.af-provider')?.addEventListener('change', () => {
     box.querySelector('.af-model').value = ''; // model choices are provider-specific
     refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
@@ -519,6 +581,31 @@ function wireAgentBox(box) {
   );
 }
 function wireAgentFields(root) {
+  root.querySelectorAll('[data-agent-group]').forEach((group) => {
+    const toggle = group.querySelector('.agent-separate');
+    toggle?.addEventListener('change', () => {
+      group.querySelector('.agent-unified-panel').hidden = toggle.checked;
+      group.querySelector('.agent-separated-panel').hidden = !toggle.checked;
+      group.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const unifiedBox = group.querySelector('.agent-unified-panel .agent-field');
+    const reset = group.querySelector('.agent-unified-panel .field-reset');
+    if (unifiedBox && reset) {
+      const sync = () => {
+        const inh = JSON.parse(unifiedBox.getAttribute('data-inherit') || 'null');
+        const cur = { provider: unifiedBox.querySelector('.af-provider').value };
+        const model = unifiedBox.querySelector('.af-model').value.trim();
+        const effort = unifiedBox.querySelector('.af-effort').value;
+        if (model) cur.model = model;
+        if (effort) cur.effort = effort;
+        reset.hidden = sameJson(normSpec(cur), normSpec(inh));
+      };
+      unifiedBox.addEventListener('input', sync);
+      unifiedBox.addEventListener('change', sync);
+      reset.addEventListener('click', () => { resetAgentField(unifiedBox); sync(); });
+      sync();
+    }
+  });
   root.querySelectorAll('.agent-field').forEach(wireAgentBox);
   root.querySelectorAll('.confirmer-field').forEach(wireConfirmerField);
 }
@@ -808,6 +895,7 @@ async function boot() {
   try {
     S.contributions = await api('/api/contributions');
     S.schema = await api('/api/schema');
+    S.modelCatalog = (await api('/api/models')).providers;
   } catch {}
   await loadProjects();
   connectWs();
@@ -1391,13 +1479,11 @@ function taskRow(t) {
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
   const archived = t.params?.archived;
-  // archivable when not progressing on its own / not awaiting review
-  const terminal = !['active', 'waiting'].includes(status);
+  // Any task can be archived/un-archived — archiving only hides it from the list,
+  // it never affects a running task's execution.
   const archiveBtn = archived
     ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
-    : terminal
-      ? `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`
-      : '';
+    : `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
     <div class="task-row ${archived ? 'archived' : ''}" data-id="${t.id}" tabindex="0">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
@@ -2122,7 +2208,7 @@ async function openTaskForm(workflow, draft, seedText) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name], f === promptField)).join('')}
+        <div style="padding:14px 16px" id="tf-body">${renderFields(fields, values, inherited, true)}
           ${promptField ? '' : `<div class="form-row" data-row="__images">
             <div class="label-row"><label>Images</label></div>
             <div class="img-chips" id="tf-chips" style="display:none"></div>
@@ -2389,7 +2475,7 @@ async function renderSeriesDrawer(rec) {
       </div>
       <div class="drawer-body" id="drawer-body">
         <div id="tf-body">
-          ${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
+          ${renderFields(fields, values, inherited)}
           <div class="form-row" data-row="__notes">
             <div class="label-row"><label>Notes</label></div>
             <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent" style="width:100%">${esc(rec.notes || '')}</textarea>
@@ -3098,9 +3184,20 @@ function drawerBody(v) {
     })
     .join('');
   const caption = v.reviewInfo?.caption || v.reviewInfo?.summary;
+  // How the agent's turn reached Review (set by the workflow): a `stalled` badge warns the
+  // reviewer the agent went quiet WITHOUT calling signal_completion, so the work may be
+  // partial. `signalled`/`raised` are reassuring and shown subtly. See ReviewInfo.completion.
+  const completionBadge = v.reviewInfo?.completion === 'stalled'
+    ? `<div class="summary" style="color:var(--warn,#c60);font-weight:600">⚠ Agent stopped without signalling completion — work may be incomplete; verify before confirming.</div>`
+    : v.reviewInfo?.completion === 'signalled'
+      ? `<div class="task-sub" style="color:var(--ink-3);margin:0 0 6px">✓ Agent signalled completion</div>`
+      : v.reviewInfo?.completion === 'raised'
+        ? `<div class="task-sub" style="color:var(--ink-3);margin:0 0 6px">↑ Agent raised for a decision</div>`
+        : '';
   const review = v.reviewInfo
     ? `<div class="section-h">Review</div>
        <div class="review">
+         ${completionBadge}
          ${caption ? `<div class="summary">${esc(caption)}</div>` : ''}
          ${v.reviewInfo.actions?.length ? `<div class="review-actions" id="review-actions">${v.reviewInfo.actions.map((a, i) => reviewActionBtn(a, i)).join('')}</div>
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
@@ -3112,6 +3209,9 @@ function drawerBody(v) {
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
   const waiting = v.waitingFor
     ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
+    : '';
+  const agentTurn = v.agentTurn
+    ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
     : '';
   const subtasks = v.subTasks?.length
     ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
@@ -3136,6 +3236,7 @@ function drawerBody(v) {
     ${pipelineLarge(v)}
     ${error}
     ${waiting}
+    ${agentTurn}
     ${drawerNotes(v)}
     ${drawerParams(v)}
     ${review}
@@ -3153,7 +3254,7 @@ function drawerBody(v) {
       <div class="section-h">Live events</div>
       <div class="events" id="drawer-events"></div>
       <div class="section-h">Structured state (the view-model floor)</div>
-      <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>
+      <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>
     </details>`;
 }
 
@@ -3173,10 +3274,12 @@ function waitingLabel(w) {
     // grant latency, where asserting a quota cause sends the user to check a
     // dashboard that rightly shows nothing wrong.
     case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to free up'}`;
+    case 'agentSlot': return w.detail || 'a host agent slot';
     case 'mergeSlot': return 'a merge slot';
     case 'human': return w.detail ? `human input (${w.detail})` : 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
     case 'subagent': return w.detail || 'its sub-agents to finish';
+    case 'shell': return w.detail || 'a background job to finish';
     case 'parent': return 'the parent task to respond';
     case 'confirm': return w.detail ? `the confirm agent to review (${w.detail})` : 'the confirm agent to review';
     default: return w.detail || w.kind;
@@ -4030,6 +4133,18 @@ async function renderDashboard() {
       catch (e) { toast(e.message, true); }
       btn.textContent = label; renderDashboard();
     };
+    // Auto-refresh stale usage: a snapshot whose window has already reset (server
+    // marks it `stale`) or a pollable login never probed. Without this the % froze
+    // at whenever ↻ was last clicked and a week-old 15% read as current. Guarded to
+    // one attempt a minute so a failing probe can't loop the dashboard.
+    if ([...pollable].some((id) => !usage[id] || usage[id].stale) && Date.now() - (S.usageAutoAt || 0) > 60_000) {
+      S.usageAutoAt = Date.now();
+      api('/api/accounts/usage/recheck', { method: 'POST', body: JSON.stringify({}) }).then(() => {
+        // Skip the re-render if the user is mid-edit in the panel (e.g. concurrency).
+        const el = document.activeElement;
+        if (S.tab === 'dashboard' && !(box.contains(el) && /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName || ''))) renderDashboard();
+      }).catch(() => {});
+    }
     box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
     box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
     box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
@@ -4068,7 +4183,7 @@ async function renderDashboard() {
 function usageBlock(id, snap, isPollable) {
   if (!snap) {
     return isPollable
-      ? `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">Usage not checked yet — click “↻ Re-check usage”.</div>`
+      ? `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">Usage not checked yet — checking…</div>`
       : '';
   }
   if (!snap.ok) {
@@ -4083,20 +4198,29 @@ function usageBlock(id, snap, isPollable) {
   if (snap.session) rows.push(usageRow('Session', snap.session));
   if (snap.week) rows.push(usageRow('Week', snap.week));
   for (const m of snap.models || []) rows.push(usageRow(m.name || 'model', m));
+  const freshness = snap.stale
+    ? `<span style="color:var(--warn,#f5a623)">stale — checked ${esc(fmtAgo(snap.at))}, re-checking…</span>`
+    : `checked ${esc(fmtAgo(snap.at))}`;
   return `<div style="margin-top:6px">${rows.join('')}
-    <div class="task-sub" style="color:var(--ink-3);font-size:11px">checked ${esc(fmtAgo(snap.at))}</div></div>`;
+    <div class="task-sub" style="color:var(--ink-3);font-size:11px">${freshness}</div></div>`;
 }
 
 function usageRow(label, win) {
   const pct = Math.max(0, Math.min(100, win.pct || 0));
-  const hue = pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
-  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px">
+  // A window whose reset instant has passed no longer exists — its % is history,
+  // not the current window. Dim it and say so rather than showing "resets … · now".
+  const expired = win.resetAt && win.resetAt < Date.now();
+  const hue = expired ? 'var(--ink-3)' : pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
+  const reset = expired
+    ? `window reset ${esc(win.resetLabel || '')}${win.tz ? ` (${esc(win.tz)})` : ''} — % is from the previous window`
+    : `resets ${esc(fmtUsageReset(win))}`;
+  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px${expired ? ';opacity:.55' : ''}">
     <span style="width:64px;color:var(--ink-2)">${esc(label)}</span>
     <span style="flex:1;height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:180px">
       <span style="display:block;height:100%;width:${pct}%;background:${hue}"></span>
     </span>
     <span class="mono" style="width:38px;text-align:right">${pct}%</span>
-    <span style="color:var(--ink-3)">resets ${esc(fmtUsageReset(win))}</span>
+    <span style="color:var(--ink-3)">${reset}</span>
   </div>`;
 }
 
@@ -4120,7 +4244,8 @@ function fmtAgo(epoch) {
   const ms = Date.now() - epoch;
   if (ms < 60_000) return 'just now';
   const m = Math.floor(ms / 60_000);
-  return m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
+  if (m < 60) return `${m}m ago`;
+  return m < 1440 ? `${Math.floor(m / 60)}h ago` : `${Math.floor(m / 1440)}d ago`;
 }
 
 // Format an absolute reset instant as a local time + relative countdown.
@@ -4143,7 +4268,7 @@ function settingsForms(scope, projectId) {
       if (!fields.length) return '';
       return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— defaults</span></summary>
-        <div class="wf-form" style="margin-top:10px">${fields.map((f) => renderField(f, undefined)).join('')}</div>
+        <div class="wf-form" style="margin-top:10px">${renderFields(fields)}</div>
         <button class="btn primary sm" data-save="${esc(s.name)}">Save ${esc(s.name)} defaults</button>
       </details>`;
     })
@@ -4162,7 +4287,7 @@ async function hydrateSettingsForms(scope, projectId) {
       inherited = d[scope].inherited;
     } catch {}
     const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
-    sec.querySelector('.wf-form').innerHTML = fields.map((f) => renderField(f, own[f.name], inherited[f.name])).join('');
+    sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
@@ -4200,13 +4325,10 @@ async function hydrateQuickSettingsForms(scope, projectId) {
     const inherited = d?.[key]?.inherited || {};
     const inheritedAlt = d?.[key]?.inheritedAlt || {};
     const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
-    sec.querySelector('.wf-form').innerHTML = fields
-      .map((f) => {
-        // Project-quick fields have two inheritance sources → two reset buttons.
-        const alt = scope === 'project' ? { primaryLabel: 'Global quick', altLabel: 'Project default', value: inheritedAlt[f.name] } : undefined;
-        return renderField(f, own[f.name], inherited[f.name], false, alt);
-      })
-      .join('');
+    const altFor = scope === 'project'
+      ? (f) => ({ primaryLabel: 'Global quick', altLabel: 'Project default', value: inheritedAlt[f.name] })
+      : undefined;
+    sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited, false, altFor);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
@@ -4245,6 +4367,12 @@ function settingsView(proj) {
     </div>
     ${profilesCard('project')}
     ${paymentsCard('project')}
+    <div class="card" id="git-preflight-card">
+      <div class="section-h">Git setup</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Which git identity/credentials this project's worlds resolve to (its <b>Git profile</b> above, the global default, or the host's own setup), and whether pushes/PRs can reach the repos' remotes non-interactively. Profiles are managed in <b>Global settings → Git accounts</b>.</p>
+      <button class="btn sm" id="git-preflight-run">Check git setup</button>
+      <div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div>
+    </div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">Pin this project to a specific version of a workflow, or track the latest. A pin only affects <b>new</b> tasks — running ones keep the version they started on.</p>
@@ -4302,6 +4430,20 @@ function wireSettingsView(proj) {
     }),
   );
   wirePaymentsCard('project', proj.id);
+  $('#git-preflight-run')?.addEventListener('click', async () => {
+    const out = $('#git-preflight-result');
+    const btn = $('#git-preflight-run');
+    btn.disabled = true;
+    out.innerHTML = 'Checking identity, credentials and remote reachability…';
+    try {
+      const r = await api(`/api/git-profiles/preflight?projectId=${encodeURIComponent(proj.id)}`);
+      out.innerHTML = `<div style="margin-bottom:4px">Tier: <b>${r.tier === 'profile' ? `git profile “${esc(r.profile)}”` : 'host fallback (no profile configured)'}</b></div>` +
+        r.checks.map((c) => `<div>${c.ok ? '🟢' : '🔴'} <b>${esc(c.label)}</b> — ${esc(c.detail || (c.ok ? 'ok' : 'failed'))}</div>`).join('');
+    } catch (e) {
+      out.textContent = e.message;
+      out.style.color = 'var(--bad, crimson)';
+    } finally { btn.disabled = false; }
+  });
   $('#activate-sd')?.addEventListener('click', async () => {
     try {
       const r = await api(`/api/projects/${proj.id}/activate-workflow`, { method: 'POST', body: JSON.stringify({ workflow: 'software-dev' }) });
@@ -4375,6 +4517,26 @@ function globalSettingsView() {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Stored encrypted in the vault; the key is never shown again. (You enter it — karmax never sees it elsewhere.)</div>
       </div>
     </div>
+    <div class="card" id="git-accounts-card">
+      <div class="section-h">Git accounts</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named git identities for the repos karmax works on: who commits are attributed to (and optionally signed by), and the SSH key / GitHub token used to push and open PRs. A project picks one in its settings (<b>Git profile</b>); without one, worlds fall back to the host's own git setup. Secrets go straight to the encrypted vault and are injected per subprocess — never written to any git config.</p>
+      <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
+      <div class="form-row"><label>Add / update a profile</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input id="gitp-name" placeholder="profile name (e.g. personal)" style="width:160px" />
+          <input id="gitp-username" placeholder="git user.name" style="flex:1;min-width:130px" />
+          <input id="gitp-email" placeholder="git user.email" style="flex:1;min-width:160px" />
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
+          <input id="gitp-token" type="password" placeholder="GitHub token (optional)" style="flex:1;min-width:160px" />
+          <textarea id="gitp-ssh" placeholder="SSH private key for push/fetch (optional)" rows="1" style="flex:1;min-width:160px"></textarea>
+          <textarea id="gitp-signing" placeholder="SSH signing key (optional)" rows="1" style="flex:1;min-width:160px"></textarea>
+          <button class="btn primary" id="gitp-save">Save</button>
+        </div>
+        <div id="gitp-result" style="font-size:12px;margin-top:6px"></div>
+        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Re-saving a profile with a blank secret keeps the stored one. Interactive auth (password prompts at push) is never supported — configure a profile, or pre-authorize the host non-interactively.</div>
+      </div>
+    </div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows</div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
@@ -4397,6 +4559,31 @@ function globalSettingsView() {
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
     </div>`;
+}
+
+async function hydrateGitProfiles() {
+  const box = $('#git-profiles-list');
+  if (!box) return;
+  let data = { profiles: [], defaultProfile: null };
+  try { data = await api('/api/git-profiles'); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
+  if (!data.profiles.length) { box.innerHTML = '<span style="color:var(--ink-3)">No git profiles yet — worlds use the host’s own git setup.</span>'; return; }
+  box.innerHTML = data.profiles.map((p) => `<div class="queue-item" data-gitp="${esc(p.name)}">
+      <div style="flex:1"><b>${esc(p.name)}</b>
+        ${data.defaultProfile === p.name ? '<span class="chip">default</span>' : `<button class="btn sm" data-gitp-default="${esc(p.name)}">make default</button>`}
+        <span class="task-sub" style="color:var(--ink-3)">${esc(p.userName)} &lt;${esc(p.userEmail)}&gt;</span>
+        <div class="task-sub" style="color:var(--ink-3)">${[p.sshKey ? 'ssh key' : null, p.signingKey ? 'signing key' : null, p.githubToken ? 'github token' : null].filter(Boolean).join(' · ') || 'identity only'}</div>
+      </div>
+      <button class="btn sm danger" data-gitp-del="${esc(p.name)}">Delete</button>
+    </div>`).join('');
+  box.querySelectorAll('[data-gitp-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`Delete git profile "${b.dataset.gitpDel}" (and its stored secrets)?`)) return;
+    try { await api(`/api/git-profiles/${encodeURIComponent(b.dataset.gitpDel)}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
+    hydrateGitProfiles();
+  }));
+  box.querySelectorAll('[data-gitp-default]').forEach((b) => b.addEventListener('click', async () => {
+    try { await api('/api/git-profiles/default', { method: 'POST', body: JSON.stringify({ name: b.dataset.gitpDefault }) }); } catch (e) { toast(e.message, true); }
+    hydrateGitProfiles();
+  }));
 }
 
 async function hydrateWorkflows() {
@@ -4557,7 +4744,7 @@ async function hydrateProfiles(scope, projectId) {
   list.querySelectorAll('[data-profile]').forEach((card) => {
     const combo = card.querySelector('.pf-model-combo');
     const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
-    if (combo) wireCombo(combo, () => MODELS[providerOf()] || MODELS.claude, () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
+    if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort'));
     card.querySelector('.pf-provider')?.addEventListener('change', () => {
       card.querySelector('.pf-model').value = ''; // model choices are provider-specific
       refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
@@ -4608,7 +4795,31 @@ function wireGlobalSettings() {
   renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
   hydrateProfiles('global');
   hydrateWorkflows();
+  hydrateGitProfiles();
   wirePaymentsCard('global');
+  $('#gitp-save')?.addEventListener('click', async () => {
+    const name = $('#gitp-name').value.trim();
+    const userName = $('#gitp-username').value.trim();
+    const userEmail = $('#gitp-email').value.trim();
+    const out = $('#gitp-result');
+    if (!name || !userName || !userEmail) return toast('profile name, user.name and user.email required', true);
+    const btn = $('#gitp-save'); btn.disabled = true;
+    try {
+      await api('/api/git-profiles', { method: 'POST', body: JSON.stringify({
+        name, userName, userEmail,
+        githubToken: $('#gitp-token').value.trim() || undefined,
+        sshKey: $('#gitp-ssh').value.trim() || undefined,
+        signingKey: $('#gitp-signing').value.trim() || undefined,
+      }) });
+      out.innerHTML = `🟢 Saved <b>${esc(name)}</b>. Secrets went to the vault and are never shown again.`;
+      out.style.color = 'var(--ok, green)';
+      for (const id of ['#gitp-token', '#gitp-ssh', '#gitp-signing']) $(id).value = '';
+      hydrateGitProfiles();
+    } catch (e) {
+      out.textContent = e.message;
+      out.style.color = 'var(--bad, crimson)';
+    } finally { btn.disabled = false; }
+  });
   $('#wf-install')?.addEventListener('click', async () => {
     const url = $('#wf-url').value.trim();
     const ref = $('#wf-ref').value.trim();

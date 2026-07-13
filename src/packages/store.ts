@@ -1,4 +1,4 @@
-import { WorkflowManifest, MANIFESTS } from '../contrib/manifests.js';
+import { WorkflowManifest, MANIFESTS, LEGACY_BUNDLED_MANIFESTS } from '../contrib/manifests.js';
 import { TaskRecord } from '../domain/types.js';
 import { parseManifest, safeParseManifest } from './schema.js';
 
@@ -36,10 +36,10 @@ export function livePinnedRefs(tasks: TaskRecord[]): Set<string> {
 export class PackageStore {
   private pkgs = new Map<string, Map<string, WorkflowManifest>>(); // name → version → manifest
 
-  /** A store preloaded with the bundled workflows (each at its manifest version). */
+  /** A store preloaded with current and still-replayable bundled versions. */
   static withBundled(): PackageStore {
     const s = new PackageStore();
-    for (const m of MANIFESTS) s.register(m);
+    for (const m of [...MANIFESTS, ...LEGACY_BUNDLED_MANIFESTS]) s.register(m);
     return s;
   }
 

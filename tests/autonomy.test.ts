@@ -62,14 +62,23 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('writes the MCP baseline into a Codex home (config.toml)', () => {
+  it('idempotently merges the MCP baseline into a Codex home (config.toml)', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mcpc-'));
     const mgr = new ConfigHomeManager(dir);
     const home = mgr.ensure('codex', 'work');
-    mgr.writeMcpConfig(home, 'codex', { browser: 'chrome-devtools' });
+    const file = path.join(home, 'config.toml');
+    fs.writeFileSync(file, `model = "custom"\n\n[mcp_servers.keep]\ncommand = "keep"\n\n[mcp_servers.playwright]\ncommand = "old-browser"\n\n[mcp_servers.chrome-devtools]\ncommand = "old"\n\n[mcp_servers.chrome-devtools]\ncommand = "duplicate"\n`);
+    const baseline = { browser: 'chrome-devtools' as const, platform: { command: 'node', args: ['mcp.js'], env: { KARMAX_GATEWAY_URL: 'http://localhost:4505' } } };
+    mgr.writeMcpConfig(home, 'codex', baseline);
+    mgr.writeMcpConfig(home, 'codex', baseline);
     const toml = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
-    expect(toml).toContain('[mcp_servers.chrome-devtools]');
+    expect(toml.match(/^\[mcp_servers\.chrome-devtools]$/gm)).toHaveLength(1);
+    expect(toml.match(/^\[mcp_servers\.karmax]$/gm)).toHaveLength(1);
+    expect(toml.match(/^\[mcp_servers\.karmax\.env]$/gm)).toHaveLength(1);
+    expect(toml).not.toContain('[mcp_servers.playwright]');
     expect(toml).toContain('command = "npx"');
+    expect(toml).toContain('model = "custom"');
+    expect(toml).toContain('[mcp_servers.keep]');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
