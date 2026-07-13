@@ -592,6 +592,9 @@ export interface TaskInput {
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */
   grant?: string[];
+  /** Principal and job-shaped profile from which `grant` was attenuated. */
+  grantPrincipal?: string;
+  authorizationProfile?: string;
   /**
    * Snapshot of the process-wide Resolve-agent flag. It is carried in workflow
    * input so Temporal replay never depends on mutable process state. `undefined`
