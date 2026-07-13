@@ -335,14 +335,14 @@ export interface ReviewInfo {
    * How the Do turn that reached Review actually ended — set by the workflow (NOT the
    * agent), so a reviewer can tell an asserted finish from a silent stall:
    *   - `signalled`: the agent called `signal_completion` → it claims the work is done.
-   *   - `stalled`:   the turn ended with no completion signal and nothing else pending
-   *                  (`TurnResult.needsInput`) → the agent went quiet, work may be partial.
+   *   - `finished`:  the provider emitted its verified successful terminal event.
+   *   - `stalled`:   legacy v1.0/v1.1 turn ended without signal_completion.
    *   - `raised`:    the agent raised a decision/question to its confirmer.
    * Under a human confirmer all three route to the same gate (see software-dev's Review
    * block), so without this marker the distinction the runtime computes is discarded.
    * See the `signal_completion` note in src/agent/runtime.ts.
    */
-  completion?: 'signalled' | 'stalled' | 'raised';
+  completion?: 'finished' | 'signalled' | 'stalled' | 'raised';
 }
 
 export type ActionKind = 'signal' | 'update' | 'query';

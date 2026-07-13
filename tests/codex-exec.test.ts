@@ -32,6 +32,13 @@ if (mode === 'limit') {
   process.stdout.write(JSON.stringify({ type: 'turn.failed', error: { type: 'UsageLimitReachedError', resets_in_seconds: 1800 } }) + '\\n');
   process.exit(1);
 }
+if (mode === 'partial-fail') {
+  if (outFile) fs.writeFileSync(outFile, 'PARTIAL ANSWER that must not count as success');
+  process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
+  process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'partial' } }) + '\\n');
+  process.stdout.write(JSON.stringify({ type: 'turn.failed', error: { message: 'connection reset during turn' } }) + '\\n');
+  process.exit(1);
+}
 if (outFile) fs.writeFileSync(outFile, 'FINAL ANSWER from codex stub');
 process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
 process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'working on it' } }) + '\\n');
@@ -81,6 +88,11 @@ describe('CodexAdapter subscription path (codex exec)', () => {
   it('throws a usage-limit error carrying the reset on a turn.failed limit event', async () => {
     process.env.STUB_MODE = 'limit';
     await expect(adapter.runTurn(makeInput() as any, ctx)).rejects.toThrow(/usage limit reached.*1800s/i);
+  });
+
+  it('rejects a nonzero exit even when Codex wrote a partial final-message file', async () => {
+    process.env.STUB_MODE = 'partial-fail';
+    await expect(adapter.runTurn(makeInput() as any, ctx)).rejects.toThrow(/terminated before successful completion.*connection reset/i);
   });
 
   it('attaches prompt images via `-i <file>` and cleans up the temp files', async () => {

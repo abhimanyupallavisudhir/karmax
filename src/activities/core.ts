@@ -278,6 +278,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let heartbeat: (() => void) | undefined;
       let hbSession: string | undefined; // set once real progress exists (onSession)
       let legacyAgentTurnId: string | undefined;
+      let turnSessionKey: string | undefined;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -294,7 +295,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (!args.agentTurnId && actx.info.workflowExecution) {
           legacyAgentTurnId = `legacy:${actx.info.workflowExecution.runId}:${actx.info.activityId}`;
         }
-        const prior = (actx.info.heartbeatDetails as { session?: string } | undefined)?.session;
+        const stableTurnId = args.agentTurnId ?? legacyAgentTurnId;
+        turnSessionKey = stableTurnId ? `turnsession:${stableTurnId}` : undefined;
+        // Heartbeat details are Temporal's primary retry checkpoint. The per-turn
+        // SQLite key closes the small hard-kill window before a heartbeat reaches the
+        // service; unlike session:<task>:<role>, it cannot accidentally pick up a
+        // stale session from an earlier turn.
+        const prior =
+          (actx.info.heartbeatDetails as { session?: string } | undefined)?.session ??
+          (actx.info.attempt > 1 && turnSessionKey ? store.kvGet(turnSessionKey) : undefined);
         if (actx.info.attempt > 1 && prior) {
           liveChannel = false;
           // The interrupted attempt's session already holds the original prompt and
@@ -308,7 +317,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             {
               id: `retry-${actx.info.attempt}`,
               role: 'user',
-              text: '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result and signal completion as usual.)',
+              text: '(This turn was interrupted mid-run — the connection dropped or the host slept. Continue from where you left off; if the work was already finished, restate the final result.)',
               ts: 0,
             },
           ];
@@ -578,6 +587,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // not only at turn-end (RESOLVE-PLAN #3). Fire-once per session in the adapters.
           onSession: (s) => {
             hbSession = s; // heartbeats now carry it → a retry resumes this session
+            if (turnSessionKey) store.kvSet(turnSessionKey, s);
+            // Do not wait for the 10-second liveness interval: checkpoint the newly
+            // minted provider session immediately so a restart on the next instruction
+            // still resumes this exact turn.
+            heartbeat?.();
             store.kvSet(`session:${args.taskId}:${args.role}`, s);
             store.kvSet(
               `sessionmeta:${args.taskId}:${args.role}`,
@@ -626,6 +640,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       record(args.taskId, 'turn.result', {
         completed: result.completed,
+        providerCompleted: result.providerCompleted,
+        providerTermination: result.providerTermination,
         subTasks: result.subTasks?.length ?? 0,
         hasReview: !!result.reviewInfo,
         output: result.output.slice(0, 2000),

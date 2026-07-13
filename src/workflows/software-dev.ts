@@ -99,7 +99,7 @@ export interface SoftwareDevInput extends TaskInput {
   /** Sub-tasks run with the parent as confirmer. Only top-level goal tasks (no parent)
    *  auto-confirm; a child with a `parentTaskId` always routes its Review to the parent. */
   autoConfirm?: boolean;
-  /** Goal workflow (SPEC §4.7): auto-send "keep going" until structured completion. */
+  /** Goal workflow (SPEC §4.7): auto-confirm a verified successful provider turn. */
   goalMode?: boolean;
   /** How often (ms) a parent re-enters Do to re-prompt itself while a child is still
    *  awaiting its response, so an unanswered raise never dead-parks the parent (SPEC
@@ -172,14 +172,21 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   return softwareDevImpl(input, '1.1.0');
 }
 
+/** Current provider-terminal semantics. Kept separate from the bare/back-compat
+ * export so executions recorded as `softwareDev` continue replaying v1.1. */
+export async function softwareDevV1_2(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.2.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0' | '1.1.0'): Promise<{ stage: Stage; sha?: string }> {
+async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0'): Promise<{ stage: Stage; sha?: string }> {
   const liveAgentStates = behaviorVersion !== '1.0.0';
+  const providerTerminalCompletion = behaviorVersion === '1.2.0';
   const taskId = input.taskId;
   const recovery = input.recovery;
   let stage: Stage = recovery ? 'do' : 'setup';
@@ -1104,7 +1111,10 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
 
-    const finishing = turn.completed || turn.needsInput || turn.raise;
+    // v1.2 advances only after an adapter observed the provider's successful terminal
+    // event. v1.0/v1.1 retain their immutable signal/idle semantics for replay.
+    const turnFinished = providerTerminalCompletion ? !!turn.providerCompleted : turn.completed;
+    const finishing = turnFinished || (!providerTerminalCompletion && turn.needsInput) || turn.raise;
 
     // While children are still running, the parent doesn't leave the Do loop:
     if (outstanding.size > 0) {
@@ -1157,7 +1167,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
         msgs.push({
           id: `sa-${msgs.length}`,
           role: 'user',
-          text: 'Your sub-agents are still running. Wait for all of them to finish, incorporate their results, then call signal_completion.',
+          text: providerTerminalCompletion
+            ? 'Your sub-agents are still running. Wait for all of them to finish, incorporate their results, then finish this turn with the complete result.'
+            : 'Your sub-agents are still running. Wait for all of them to finish, incorporate their results, then call signal_completion.',
           ts: msgs.length,
         });
       }
@@ -1190,7 +1202,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
         msgs.push({
           id: `sh-${msgs.length}`,
           role: 'user',
-          text: 'A background job you started (a run_in_background shell) is still running. If you are waiting on its result — e.g. a test run — wait for it to finish, fold in the result, then call signal_completion. If you are deliberately leaving it running (e.g. a dev server), call signal_completion now to proceed to review.',
+          text: providerTerminalCompletion
+            ? 'A background job you started (a run_in_background shell) is still running. If you need its result — e.g. a test run — wait for it, fold in the result, then finish the turn. If it is deliberately long-lived (e.g. a dev server), finish now and explain that.'
+            : 'A background job you started (a run_in_background shell) is still running. If you are waiting on its result — e.g. a test run — wait for it to finish, fold in the result, then call signal_completion. If you are deliberately leaving it running (e.g. a dev server), call signal_completion now to proceed to review.',
           ts: msgs.length,
         });
       }
@@ -1204,13 +1218,15 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     shellNudges = 0; // shells settled (or nudge budget spent) → reset for next Do phase
 
     {
-      // Goal mode: keep nudging the agent until it signals structured completion
-      // (unless it's explicitly raising to its parent, which needs an answer).
-      if (input.goalMode && !turn.completed && !turn.raise) {
+      // Legacy goal versions required signal_completion. v1.2 treats the provider's
+      // verified successful terminal event as the authoritative turn boundary.
+      if (input.goalMode && !turnFinished && !turn.raise) {
         msgs.push({
           id: `kg-${msgs.length}`,
           role: 'user',
-          text: 'Keep going until the goal is fully complete, then call signal_completion.',
+          text: providerTerminalCompletion
+            ? 'Keep going until the goal is fully complete, then finish with the result.'
+            : 'Keep going until the goal is fully complete, then call signal_completion.',
           ts: msgs.length,
         });
         stage = 'do';
@@ -1243,7 +1259,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       // partial — so the reviewer should scrutinise rather than rubber-stamp.
       reviewInfo = {
         ...reviewInfo,
-        completion: turn.completed ? 'signalled' : turn.raise ? 'raised' : 'stalled',
+        completion: providerTerminalCompletion
+          ? turn.raise ? 'raised' : turn.completed ? 'signalled' : turnFinished ? 'finished' : 'stalled'
+          : turn.completed ? 'signalled' : turn.raise ? 'raised' : 'stalled',
       };
       // We stopped waiting on still-running sub-agents (budget spent) — prepend a note so
       // the reviewer knows this reached Review with delegated work possibly incomplete.
@@ -1275,7 +1293,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
         // in goal mode the loop above already guarantees completed|raise here, so this is
         // a replay-safe guard — it changes no reachable path now but stops an empty turn
         // from being silently merged. A stall falls through to the human gate below.
-        if (turn.completed || turn.raise) confirmed = true;
+        if (turnFinished || turn.raise) confirmed = true;
       } else if (confirmMode === 'agent') {
         // Run the Confirm agent; its verdict maps onto the SAME transitions a human
         // drives (confirm / follow-up-to-Do / cancel).

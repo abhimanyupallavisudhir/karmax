@@ -145,7 +145,7 @@ You are merging task "{{title}}". Its work is on branch {{branch}} in the worktr
 {{worldRepos}}
 Merge {{target}} into this branch, resolve any conflicts, ensure the build and tests pass, then the work will be merged into {{target}}.
 Review context: {{reviewInfo}}
-Call signal_completion when the branch is ready to merge.`,
+Finish the turn only when the branch is ready to merge. signal_completion is optional.`,
 };
 const RESOLVE_ROLE: WorkflowRole = {
   name: 'resolve',
@@ -282,7 +282,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.1.0',
+    version: '1.2.0',
     description: 'Branch/world → do → review → PR → merge → end, with resolve and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -382,8 +382,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.1.0',
-    description: 'Like software-dev, but auto-continues until structured completion.',
+    version: '1.2.0',
+    description: 'Like software-dev, but auto-confirms a verified successful provider turn.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
@@ -450,7 +450,10 @@ export const MANIFESTS: WorkflowManifest[] = [
  * from MANIFESTS so workflow pickers expose only the current release. */
 export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
   .filter((m) => m.name === 'software-dev' || m.name === 'just-do' || m.name === 'goal' || m.name === 'merge-only')
-  .map((m) => ({ ...m, version: '1.0.0' }));
+  .flatMap((m) => [
+    { ...m, version: '1.0.0' },
+    ...((m.name === 'software-dev' || m.name === 'goal') ? [{ ...m, version: '1.1.0' }] : []),
+  ]);
 
 export function manifest(name: string): WorkflowManifest | undefined {
   return MANIFESTS.find((m) => m.name === name);

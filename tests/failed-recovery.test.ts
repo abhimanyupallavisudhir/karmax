@@ -65,7 +65,7 @@ describe('failed software-dev recovery', () => {
     await api.signalTask(token, task.id, 'retry');
 
     expect(starts).toHaveLength(1);
-    expect(starts[0]![0]).toBe('softwareDev@1.1.0');
+    expect(starts[0]![0]).toBe('softwareDev@1.2.0');
     const options = starts[0]![1];
     expect(options.workflowId).toBe(task.id);
     expect(options.workflowIdReusePolicy).toBe('ALLOW_DUPLICATE_FAILED_ONLY');
@@ -80,7 +80,7 @@ describe('failed software-dev recovery', () => {
     );
     expect(fs.readFileSync(path.join(world, 'dirty-work.txt'), 'utf8')).toBe('must survive');
     expect(store.getTask(task.id)?.lastView).toMatchObject({ stage: 'do', status: 'active' });
-    expect(store.getTask(task.id)?.workflowVersion).toBe('1.1.0');
+    expect(store.getTask(task.id)?.workflowVersion).toBe('1.2.0');
   });
 
   it('queries through a stale v1 account-wait snapshot but keeps current snapshots fast', async () => {

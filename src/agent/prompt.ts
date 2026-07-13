@@ -15,9 +15,9 @@ const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration pl
 - create_sub_task(title, prompt): spawn a child task the parent awaits.
 - create_review_info(caption?, actions?): attach click-to-verify affordances for the Review stage — the exact commands/artifacts a human clicks to check your work, NOT a prose summary (that goes in your messages). Each action is a "run" (a shell command run in this world — e.g. start a server/app; set server:true + openUrls for a long-lived one) or an "open" (a produced file or URL to open). The changed-files list is added automatically.
 - save_skill(name, content): persist a reusable skill for future tasks.
-- signal_completion(summary?): structured signal that your turn's work is complete. Call this exactly when you are done — do not write a "done" sentence instead.
-Do real work directly in the working directory (create/edit files, run commands). When finished, call signal_completion.
-If you need the result of a long command (e.g. a test or build run), wait for it in THIS turn — run it in the foreground, or wait for your backgrounded job to finish — then fold in the result before calling signal_completion. Do NOT end your turn expecting to be re-notified later: ending your turn hands control back, and the task advances (it does not pause to await a background job). Only leave a job running in the background if you genuinely don't need its result (e.g. a dev server).`;
+- signal_completion(summary?): optional structured completion summary. Provider-reported successful turn completion is authoritative; this tool is not required.
+Do real work directly in the working directory (create/edit files, run commands), verify it, and report the result in your final response.
+If you need the result of a long command (e.g. a test or build run), wait for it in THIS turn — run it in the foreground, or wait for your backgrounded job to finish — then fold in the result before ending your turn. Do NOT end your turn expecting to be re-notified later: ending your turn hands control back, and the task advances (it does not pause to await a background job). Only leave a job running in the background if you genuinely don't need its result (e.g. a dev server).`;
 
 // Minimal fallback if a role is undeclared and there's no `do` role registered.
 const FALLBACK_TEMPLATE = `{{toolsPreamble}}

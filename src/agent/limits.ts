@@ -42,7 +42,7 @@ export interface LimitClassification {
 export function isTransportError(message: string): boolean {
   const lc = String(message ?? '').toLowerCase();
   return (
-    /connection (closed|error|refused|reset|terminated)|socket hang ?up|network error|fetch failed|premature close|server disconnected|stream (closed|ended unexpectedly|error)|econnreset|econnrefused|etimedout|epipe|enetunreach|eai_again|enotfound|\boverloaded\b/.test(
+    /connection (closed|error|refused|reset|terminated)|socket hang ?up|network error|fetch failed|premature close|server disconnected|stream (closed|disconnected|ended unexpectedly|error)|turn interrupted before completion|econnreset|econnrefused|etimedout|epipe|enetunreach|eai_again|enotfound|\boverloaded\b/.test(
       lc,
     ) || /\b(?:50[234]|529)\b/.test(lc)
   );

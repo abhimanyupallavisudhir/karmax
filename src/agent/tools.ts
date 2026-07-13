@@ -18,8 +18,8 @@ const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) 
 
 /**
  * The tools every real agent gets: do real work in the world (bash/read/write)
- * plus the platform tools (SPEC §5.2). signal_completion is the structured,
- * unspoofable completion signal — never a parsed "done" string.
+ * plus the platform tools (SPEC §5.2). signal_completion is an optional structured
+ * summary; adapters establish completion from provider-native terminal events.
  */
 export const TOOL_SCHEMAS: ToolSchema[] = [
   {
@@ -148,7 +148,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'signal_completion',
-    description: 'Signal that your turn is complete. Call this exactly when finished — do not write a "done" message instead.',
+    description: 'Optionally attach a structured completion summary. A successful provider turn already establishes completion; this tool is not required.',
     parameters: {
       type: 'object',
       properties: { summary: { type: 'string' } },

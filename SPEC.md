@@ -168,7 +168,7 @@ Two manifest mechanisms, kept deliberately minimal:
 - **software-dev** — branch/world → do → review → PR (optional) → merge → end, with resolve and sub-tasks. Detailed in §5.
 - **just-do** — a single straightforward agent call, no merge machinery.
 - **script-exec** — run a script/command as a task.
-- **goal** — like software-dev, but instead of pausing at the review gate it auto-sends a "keep going" message to the agent until the agent emits a structured completion signal.
+- **goal** — like software-dev, but auto-confirms after the provider reports a verified successful turn completion. `signal_completion` may attach a structured summary but is not required.
 - **merge-only** — the review-and-merge half of software-dev (no Do stage). Starts at the review gate, then optional PR, then merge. Used to review agents' PRs, including edits to workflow repos.
 - **merge-queue** (coordinator) — leases the single merge slot per target branch (§6).
 - **token/account coordinator** — tracks per-account limits and leases agent-account capacity (§6, §7).
@@ -210,7 +210,7 @@ Merge is the point of no return.
 | From | To | Condition |
 |---|---|---|
 | Setup | Do | world ready |
-| Do | Review | structured completion signal (or idle/needs-input surfaced) |
+| Do | Review | provider's verified successful turn terminal event (or an explicit raise) |
 | Do | Do | sub-tasks spawned → awaited → resumed |
 | Review | Do | follow-up message |
 | Review | PR | confirm |
@@ -224,8 +224,8 @@ Merge is the point of no return.
 
 Assembled per role by an activity that fills the **role template** (owned by the agent profile) with **task bindings** (owned by the workflow) plus global/project instructions, then snapshots the result as the journaled turn input.
 
-- **Do agent:** global + project instructions; a "you are running inside karmax; here are your tools" preamble listing the platform MCP tools (create-sub-task, create-review-info, signal-completion, save-skill); the world handle; the task prompt.
-- **Merge agent (`prompts/merge.md`):** "You are merging task `{{task}}`. Its work is on branch `{{branch}}` in the worktree at `{{path}}`. Merge `{{targetBranch}}` into this branch, resolve conflicts, ensure the build and tests pass, then merge into `{{targetBranch}}`. Review context: `{{reviewInfo}}`. Signal completion when done."
+- **Do agent:** global + project instructions; a "you are running inside karmax; here are your tools" preamble listing the platform MCP tools (create-sub-task, create-review-info, optional signal-completion summary, save-skill); the world handle; the task prompt.
+- **Merge agent (`prompts/merge.md`):** "You are merging task `{{task}}`. Its work is on branch `{{branch}}` in the worktree at `{{path}}`. Merge `{{targetBranch}}` into this branch, resolve conflicts, ensure the build and tests pass, then merge into `{{targetBranch}}`. Review context: `{{reviewInfo}}`. Finish only when the branch is ready."
 - **Resolve agent (`prompts/resolve.md`):** "The `{{stage}}` step failed for task `{{task}}`. Error: `{{error}}`. Worktree: `{{path}}`. Recent transcript: `[[transcript]]`. Candidate resolution skills: `[[skills]]`. Diagnose and fix so `{{stage}}` can resume; if you cannot, explain why."
 
 `{{...}}` are bindings filled at assembly; `[[...]]` are links resolved from the content store at assembly time and snapshotted.
@@ -332,7 +332,7 @@ A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capa
 The task view reports the turn's resource boundaries separately: `waitingFor: account` while credential capacity is being leased, `waitingFor: agentSlot` / `agentTurn: waiting-slot` after the account grant while host admission is pending, and `agentTurn: running` only after the activity has acquired the host slot. The workflow publishes the post-grant transition immediately; it must not leave the last account-wait snapshot visible for the duration of a running turn.
 
 1. Spins up / resumes the agent session (via session/thread ID stored in workflow state).
-2. Lets the agent work until a turn boundary (completion / idle / needs-input).
+2. Lets the agent work until the provider emits a verified successful terminal event. Failed, interrupted, cancelled, truncated, or transport-ended terminal states throw even if partial text exists; infrastructure interruptions retry and resume the checkpointed provider session.
 3. Captures output, events, and the new session ID; exits — the process dies, RAM is reclaimed.
 
 Between turns — where all waits live — the agent is only a stored session ID. **RAM is consumed strictly during turns, never during waits**, regardless of whether a wait is five seconds or five hours. This is the fix for the naive "long-lived agent process" design that exhausts system resources.
