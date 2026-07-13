@@ -23,7 +23,6 @@
   --danger: #c63a31;
   --danger-weak: #fbe7e4;
   --shadow: 0 1px 2px rgba(20, 24, 34, 0.06), 0 8px 24px rgba(20, 24, 34, 0.06);
-  --shadow-drawer: -12px 0 40px rgba(20, 24, 34, 0.12);
   --r: 9px;
   --r-sm: 6px;
   --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Inter, "Helvetica Neue", sans-serif;
@@ -50,7 +49,6 @@ html[data-theme="dark"],
   --danger: #f0635a;
   --danger-weak: #321c1a;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.3);
-  --shadow-drawer: -12px 0 40px rgba(0, 0, 0, 0.45);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -73,7 +71,6 @@ html[data-theme="dark"],
     --danger: #f0635a;
     --danger-weak: #321c1a;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.3);
-    --shadow-drawer: -12px 0 40px rgba(0, 0, 0, 0.45);
   }
 }
 
@@ -208,7 +205,6 @@ a { color: var(--accent); text-decoration: none; }
 .task-title { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* Human-facing sequential task id (SPEC §10.6): a quiet monospace tag before the title. */
 .task-num { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); font-weight: 500; }
-.drawer-head .row1 .task-num { font-size: 13px; align-self: center; }
 .task-sub { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-3); margin-top: 3px; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
@@ -244,7 +240,7 @@ a { color: var(--accent); text-decoration: none; }
 .pipeline .ponr.current { background: var(--accent); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
-/* big labeled pipeline in drawer */
+/* big labeled pipeline on the task page (Overview tab) */
 .pipeline-lg { display: flex; align-items: flex-start; gap: 0; margin: 4px 0 8px; flex-wrap: wrap; }
 .pipeline-lg .node { display: flex; flex-direction: column; align-items: center; gap: 6px; flex: 1; min-width: 52px; }
 .pipeline-lg .node .bar { height: 5px; width: 100%; background: var(--line); border-radius: 3px; }
@@ -282,24 +278,68 @@ a { color: var(--accent); text-decoration: none; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn.sm { padding: 5px 10px; font-size: 13px; }
 
-/* ── drawer ─────────────────────────────────────────────────── */
-.scrim { position: fixed; inset: 0; background: rgba(20, 24, 34, 0.28); opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 40; }
-.scrim.open { opacity: 1; pointer-events: auto; }
-.drawer {
-  position: fixed; top: 0; right: 0; height: 100vh; width: min(560px, 94vw);
-  background: var(--surface); border-left: 1px solid var(--line); box-shadow: var(--shadow-drawer);
-  transform: translateX(100%); transition: transform .2s cubic-bezier(.2,.8,.2,1);
-  z-index: 41; display: flex; flex-direction: column;
-}
-.drawer.open { transform: none; }
-.drawer-head { padding: 16px 20px; border-bottom: 1px solid var(--line); }
-.drawer-head .row1 { display: flex; align-items: center; gap: 10px; }
-.drawer-head h2 { font-size: 16px; margin: 0; flex: 1; letter-spacing: -0.01em; }
-.drawer-head .meta { display: flex; gap: 10px; align-items: center; margin-top: 8px; font-size: 12px; color: var(--ink-3); font-family: var(--font-mono); flex-wrap: wrap; }
-.drawer-body { flex: 1; overflow-y: auto; padding: 18px 20px; }
+/* ── task page ──────────────────────────────────────────────── */
+/* A task opens as a page of its own inside #main (.main-inner): fixed head
+   (title + tabs) and foot (the workflow's declared actions, visible on every
+   tab) around a scrollable body. The page owns the scrolling, so the shell's
+   scroll container stops and the inner column unclamps to the full cell —
+   tp-head/tp-content re-center their own 960px column against the full-bleed
+   head/foot borders. */
+.main:has(.task-page) { overflow: hidden; }
+.main-inner:has(> .task-page) { max-width: none; padding: 0; height: 100%; }
+.task-page { display: flex; flex-direction: column; height: 100%; }
+/* Head, body content and foot all share ONE column: max-width 960 incl. 28px
+   side padding, centered — so the title, meta, tabs, section content and the
+   action buttons line up on the same left edge (the strips stay full-bleed). */
+.tp-head { padding-top: 14px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.tp-head > * { max-width: 960px; margin-left: auto; margin-right: auto; padding: 0 28px; }
+/* No tabs (the repeatable-series config page) → the head needs its own bottom gap. */
+.tp-head:not(:has(.tp-tabs)) { padding-bottom: 14px; }
+.tp-head .row1 { display: flex; align-items: center; gap: 10px; }
+.tp-head h2 { font-size: 17px; margin: 0; flex: 1; letter-spacing: -0.01em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tp-head .row1 .task-num { font-size: 13px; }
+.tp-head .meta { display: flex; gap: 10px; align-items: center; margin-top: 6px; font-size: 12px; color: var(--ink-3); font-family: var(--font-mono); flex-wrap: wrap; }
+/* margin-top/bottom longhands keep the parent rule's auto side margins (and kill
+   the base .tabs 18px bottom margin — the head's border sits right under the tabs);
+   the 14px side padding cancels the first tab's own padding so its LABEL sits on
+   the column edge. */
+.tp-tabs { margin-top: 10px; margin-bottom: 0; padding: 0 14px; border-bottom: none; position: static; background: transparent; }
+.tp-tabs .tab { text-decoration: none; margin-bottom: 0; }
+.tp-body { flex: 1; overflow-y: auto; }
 /* Focused programmatically for keyboard scrolling — it's the whole active surface, not a control, so no outline. */
-.drawer-body:focus, .drawer-body:focus-visible { outline: none; }
-.drawer-foot { border-top: 1px solid var(--line); padding: 14px 20px; background: var(--surface-2); }
+.tp-body:focus, .tp-body:focus-visible { outline: none; }
+.tp-content { max-width: 960px; margin: 0 auto; padding: 20px 28px 48px; }
+.tp-foot { border-top: 1px solid var(--line); padding: 12px 0; background: var(--surface-2); }
+.tp-foot-inner { max-width: 960px; margin: 0 auto; padding: 0 28px; display: flex; gap: 8px; align-items: center; }
+.tp-foot-inner > .actions { flex: 1; }
+
+/* Check-in tab: a fixed sidebar (agent conversations + the ephemeral terminal)
+   beside a chat-style pane — the thread scrolls, the compose box stays put. */
+.tp-body[data-tab="checkin"] { overflow: hidden; }
+.tp-body[data-tab="checkin"] > .tp-content { max-width: none; padding: 0; height: 100%; }
+.ck-layout { display: grid; grid-template-columns: 208px 1fr; grid-template-rows: 100%; height: 100%; }
+.ck-side { border-right: 1px solid var(--line); background: var(--surface); overflow-y: auto; padding: 14px 10px; }
+.ck-side-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin: 0 10px 6px; }
+.ck-side-h:not(:first-child) { margin-top: 16px; }
+.ck-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 7px; cursor: pointer; color: var(--ink-2); font-size: 13px; }
+.ck-item:hover { background: var(--surface-2); color: var(--ink); }
+.ck-item.sel { background: var(--accent-weak); color: var(--ink); font-weight: 600; }
+.ck-item .ck-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ck-item .ck-count { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
+.ck-live { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); flex: none; animation: pulse 1.4s ease-in-out infinite; }
+.ck-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+.ck-pane-head { display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--line); background: var(--surface); flex-wrap: wrap; }
+/* min-height:0 lets the thread SHRINK below its content (a flex item's default
+   min-height is the content size) — without it a long conversation grows the
+   pane instead of scrolling, pushing the compose box off-screen. */
+.ck-thread { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 20px; }
+.ck-thread:focus, .ck-thread:focus-visible { outline: none; }
+.ck-thread > .thread { max-width: 860px; margin: 0 auto; }
+.ck-compose { border-top: 1px solid var(--line); padding: 10px 20px; background: var(--surface); }
+.ck-compose .followup-box { margin-top: 0; max-width: 860px; margin-left: auto; margin-right: auto; }
+.ck-term { flex: 1; display: flex; flex-direction: column; gap: 8px; padding: 12px 20px 16px; min-height: 0; }
+.ck-term .term-screen { flex: 1; height: auto; max-height: none; outline: none; }
+.ck-term .empty { margin: auto; }
 
 .section-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin: 18px 0 8px; }
 .section-h:first-child { margin-top: 0; }
@@ -336,7 +376,6 @@ a { color: var(--accent); text-decoration: none; }
 .followup-box .prompt-field { flex: 1; }
 .followup-box textarea { min-height: 38px; }
 /* The follow-up box now lives inside each conversation — set it apart from the thread above it. */
-.conversation .followup-box { margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
 
 /* live event stream */
 .events { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); display: flex; flex-direction: column; gap: 3px; max-height: 240px; overflow-y: auto; }
@@ -460,6 +499,12 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   .body { grid-template-columns: 1fr; }
   .rail { display: none; }
   .main-inner { padding: 16px; }
+  .tp-head > * { padding: 0 16px; }
+  .tp-tabs { padding: 0 2px; }
+  .tp-content { padding: 16px 16px 40px; }
+  .tp-foot { padding: 10px 0; }
+  .tp-foot-inner { padding: 0 16px; }
+  .ck-layout { grid-template-columns: 148px 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
@@ -523,7 +568,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .pk-session .task-sub .mono { font-size: 11px; }
 .pk-empty { padding: 10px; color: var(--ink-3); font-size: 13px; }
 
-/* the chosen fork source under "Fork a previous agent" (task form / drawer) */
+/* the chosen fork source under "Fork a previous agent" (task form / task page) */
 .af-resume-chosen { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 6px; }
 .af-resume-chosen:empty { display: none; }
 .af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
@@ -579,16 +624,16 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .repeat-toggle input { margin: 2px 0 0; }
 .repeat-toggle b { color: var(--ink); }
 
-/* ── Series row + runs (list + drawer) ───────────────────────────────────── */
+/* ── Series row + runs (list + series page) ───────────────────────────────────── */
 .series-row .series-caret { margin-right: 2px; color: var(--ink-3); background: transparent; border: 0; cursor: pointer; }
 .run-row { position: relative; padding-left: 40px; background: var(--surface-2); }
 .run-row .task-title { font-size: 13px; font-weight: 500; }
 .run-row::before { content: ""; position: absolute; left: 22px; top: -1px; bottom: 50%; width: 10px; border-left: 1px solid var(--line); border-bottom: 1px solid var(--line); border-bottom-left-radius: 4px; }
 .series-runs { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
 .series-runs-h { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-3); margin-bottom: 6px; }
-.run-drawer-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: var(--r-sm); cursor: pointer; }
-.run-drawer-row:hover { background: var(--surface-2); }
-.run-drawer-row .run-when { margin-left: auto; color: var(--ink-3); font-size: 12px; }
+.run-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: var(--r-sm); cursor: pointer; }
+.run-row:hover { background: var(--surface-2); }
+.run-row .run-when { margin-left: auto; color: var(--ink-3); font-size: 12px; }
 /* ── Image attachments (paste/drag an image into a prompt field) ── */
 /* A prompt box whose pasted-image chips sit inside it (below the text), so the
    whole field grows to fit them rather than shrinking the textarea or spilling
@@ -669,7 +714,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 }
 .group-h .pill { font-family: var(--font-mono); font-weight: 400; }
 
-/* Tag chips + priority flag on task rows and in the drawer. */
+/* Tag chips + priority flag on task rows and on the task page. */
 .tag-chip {
   --tag: var(--accent);
   font-size: 11px; padding: 1px 8px; border-radius: 999px; white-space: nowrap;
@@ -687,10 +732,10 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .prio.p3 { color: var(--working); }
 .prio.p4 { color: var(--danger); background: var(--danger-weak); }
 
-/* Drawer organization row (priority + tags). */
-.drawer-org { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; }
-.drawer-org .org-prio { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); }
-.drawer-org .org-tags { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+/* Organization row (priority + tags) — task page Parameters tab + task form. */
+.org-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; }
+.org-editor .org-prio { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); }
+.org-editor .org-tags { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 
 /* Filter picker + tags manager modals (reuse .palette shell). */
 .palette.fp, .palette.tagm { width: min(460px, 92vw); }
