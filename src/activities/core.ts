@@ -17,6 +17,8 @@ import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
+import { GitProfiles } from '../autonomy/git-profiles.js';
+import { worldRepos } from '../world/types.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
@@ -124,6 +126,9 @@ export interface CreateWorldArgs {
   branch?: string;
   copyGlobs?: string[];
   kind: WorldKind;
+  /** The project's git profile selection (PLAN-git-config.md §3); the activity
+   *  resolves it (project → global default) and materializes identity/signing. */
+  gitProfile?: string;
 }
 
 export interface RunAgentTurnArgs {
@@ -167,6 +172,7 @@ export interface PrepareChildArgs {
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
+  const gitProfiles = new GitProfiles(store, deps.broker);
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
     const ev = { type, taskId, ts: Date.now(), payload };
@@ -174,8 +180,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     deps.bus?.emit({ ...ev, seq });
   }
 
+  /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
+   *  the world's git profile (stamped on the handle at creation) → GIT_SSH_COMMAND /
+   *  GH_TOKEN, per subprocess. Empty when the world has no profile (host fallback)
+   *  or resolution fails — the op then runs with the host's own auth. */
+  function gitEnvFor(handle: WorldHandle, taskId?: string): Record<string, string> {
+    const name = handle.meta?.gitProfile;
+    if (typeof name !== 'string' || !name) return {};
+    try {
+      const profile = gitProfiles.get(name);
+      return profile ? gitProfiles.env(profile, { taskId }) : {};
+    } catch {
+      return {};
+    }
+  }
+
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
+      // Resolve the git profile (project → global default → none) and materialize
+      // its identity for worktree-scoped config (PLAN-git-config.md §4A). Identity
+      // failure downgrades to a warning — the world is still usable locally.
+      const profile = gitProfiles.resolve({ gitProfile: args.gitProfile });
+      let gitIdentity;
+      try {
+        gitIdentity = profile ? gitProfiles.identity(profile, { taskId: args.taskId }) : undefined;
+      } catch (e) {
+        record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` });
+      }
       const world = await worlds.create(args.kind, {
         taskId: args.taskId,
         repo: args.repo,
@@ -184,7 +215,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         target: args.target,
         branch: args.branch,
         copyGlobs: args.copyGlobs,
+        gitIdentity,
       });
+      if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
       record(args.taskId, 'world.created', { handle: world.handle });
       for (const warning of world.handle.warnings ?? []) {
         record(args.taskId, 'world.warning', { warning });
@@ -452,6 +485,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
+          // Git-profile credentials for the agent subprocess (PLAN-git-config.md
+          // §4B): an agent that pushes or runs `gh` acts as the project's account.
+          ...(() => {
+            const gitEnv = gitEnvFor(args.worldHandle, args.taskId);
+            return Object.keys(gitEnv).length ? { extraEnv: gitEnv } : {};
+          })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
         },
@@ -542,8 +581,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {
       const world = await worlds.open(handle);
-      const result = await finalizeMerge(world, target);
-      record(handle.id, 'merge.result', { merged: result.merged, sha: result.sha, conflict: result.conflict });
+      // Merge commits carry the world's profile identity too (PLAN-git-config.md
+      // §4A) — they land on the target, where worktree-scoped config doesn't reach.
+      let identity;
+      const profileName = handle.meta?.gitProfile;
+      if (typeof profileName === 'string' && profileName) {
+        try {
+          const profile = gitProfiles.get(profileName);
+          identity = profile ? gitProfiles.identity(profile, { taskId: handle.id }) : undefined;
+        } catch {
+          identity = undefined; // fall back to ensureIdentity inside finalizeMerge
+        }
+      }
+      const result = await finalizeMerge(world, target, identity);
+      record(handle.id, 'merge.result', { merged: result.merged, sha: result.sha, conflict: result.conflict, dirty: result.dirty });
       return result;
     },
 
@@ -588,14 +639,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async openPr(handle: WorldHandle, target: string): Promise<{ url: string; number: number } | null> {
       // GitHub PRs are an optional integration (SPEC §5.2). Use `gh` if present
-      // and authorized; otherwise the Review stage IS the conceptual PR.
+      // and authorized; otherwise the Review stage IS the conceptual PR. The git
+      // profile's credentials (GH_TOKEN / GIT_SSH_COMMAND) select the account per
+      // subprocess (PLAN-git-config.md §4B — never `gh auth switch`).
       const world = await worlds.open(handle);
-      const which = await world.exec('bash', ['-lc', 'command -v gh && gh auth status >/dev/null 2>&1 && echo ok || echo no']);
+      const env = gitEnvFor(handle, handle.id);
+      const which = await world.exec('bash', ['-lc', 'command -v gh && gh auth status >/dev/null 2>&1 && echo ok || echo no'], { env });
       if (!which.stdout.includes('ok')) {
         record(handle.id, 'pr.skipped', { reason: 'gh not available/authorized' });
         return null;
       }
-      const push = await world.exec('git', ['push', '-u', 'origin', handle.branch]);
+      const push = await world.exec('git', ['push', '-u', 'origin', handle.branch], { env });
       if (push.code !== 0) {
         record(handle.id, 'pr.skipped', { reason: 'push failed', detail: push.stderr.slice(0, 300) });
         return null;
@@ -603,7 +657,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const pr = await world.exec('bash', [
         '-lc',
         `gh pr create --base ${target} --head ${handle.branch} --fill --json url,number 2>/dev/null || gh pr view --json url,number`,
-      ]);
+      ], { env });
       try {
         const parsed = JSON.parse(pr.stdout);
         record(handle.id, 'pr.opened', parsed);
@@ -611,6 +665,35 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch {
         return null;
       }
+    },
+
+    /**
+     * Push the landed target branch to each repo's origin (remote policy
+     * 'push'/'pr', PLAN-git-config.md §5). Best-effort by contract: the local
+     * merge is the deliverable; every skip/failure is recorded, never thrown.
+     */
+    async pushTarget(handle: WorldHandle, target: string): Promise<{ pushed: string[]; skipped: string[] }> {
+      const env = { GIT_TERMINAL_PROMPT: '0', ...gitEnvFor(handle, handle.id) };
+      const world = await worlds.open(handle);
+      const pushed: string[] = [];
+      const skipped: string[] = [];
+      for (const r of worldRepos(handle)) {
+        const hasOrigin = await world.exec('git', ['remote', 'get-url', 'origin'], { cwd: r.repo, env });
+        if (hasOrigin.code !== 0) {
+          skipped.push(r.name);
+          record(handle.id, 'push.skipped', { repo: r.name, reason: 'no origin remote' });
+          continue;
+        }
+        const push = await world.exec('git', ['push', 'origin', target], { cwd: r.repo, env });
+        if (push.code === 0) {
+          pushed.push(r.name);
+          record(handle.id, 'push.done', { repo: r.name, target });
+        } else {
+          skipped.push(r.name);
+          record(handle.id, 'push.failed', { repo: r.name, target, detail: (push.stderr || push.stdout).slice(0, 300) });
+        }
+      }
+      return { pushed, skipped };
     },
 
     async publishView(taskId: string, view: TaskView): Promise<void> {

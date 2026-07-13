@@ -87,6 +87,17 @@ describe('multi-repo worlds (real git)', () => {
     await world.writeFile('alpha/feature.js', 'export const fa = () => 42;\n');
     await world.writeFile('beta/feature.js', 'export const fb = () => 7;\n');
 
+    // Uncommitted work is rejected back to the merge agent, with the offending
+    // paths prefixed by repo name (PLAN-git-config.md §6) — never blind-swept.
+    const rejected = await finalizeMerge(world, 'main');
+    expect(rejected.merged).toBe(false);
+    expect(rejected.dirty).toContain('alpha/feature.js');
+
+    // the merge agent commits in each repo; the re-run lands everything
+    for (const r of world.handle.repos!) {
+      await git(r.root, ['add', '-A']);
+      await git(r.root, ['commit', '-q', '-m', 'work']);
+    }
     const res = await finalizeMerge(world, 'main');
     expect(res.merged).toBe(true);
     expect(res.landedFiles).toContain('alpha/feature.js');
@@ -108,6 +119,10 @@ describe('multi-repo worlds (real git)', () => {
     // divergent main (target moved on the same line under the world).
     await world.writeFile('alpha/feature.js', 'export const ok = true;\n');
     await world.writeFile('beta/b.js', 'export const b = 99;\n');
+    for (const r of world.handle.repos!) {
+      await git(r.root, ['add', '-A']);
+      await git(r.root, ['commit', '-q', '-m', 'work']);
+    }
     fs.writeFileSync(path.join(beta, 'b.js'), 'export const b = 100;\n');
     await git(beta, ['add', '-A']);
     await git(beta, ['commit', '-q', '-m', 'diverge on beta']);
@@ -168,6 +183,8 @@ describe('multi-repo worlds (real git)', () => {
     expect(world.handle.repos).toHaveLength(1);
     expect(world.handle.root).toBe(world.handle.repos![0]!.root);
     await world.writeFile('extra.js', '1');
+    await git(world.handle.root, ['add', '-A']);
+    await git(world.handle.root, ['commit', '-q', '-m', 'work']);
     const res = await finalizeMerge(world, 'main');
     expect(res.merged).toBe(true);
     expect(res.landedFiles).toContain('extra.js'); // NOT prefixed for a single repo

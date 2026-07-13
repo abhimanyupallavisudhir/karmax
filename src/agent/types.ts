@@ -87,6 +87,10 @@ export interface TurnInput {
   maxTurns?: number;
   /** Credentials resolved JIT by the broker (never journaled); preferred over env. */
   resolvedAuth?: { apiKey?: string; configHome?: string; oauthToken?: string };
+  /** Extra env for the agent subprocess, resolved JIT (never journaled) — e.g. the
+   *  git profile's GIT_SSH_COMMAND / GH_TOKEN (PLAN-git-config.md §4B), so an agent
+   *  that pushes or runs `gh` does so as the project's git account. */
+  extraEnv?: Record<string, string>;
   /** MCP servers the workflow gives its agents, beyond the platform baseline (SPEC §7.5). */
   agentMcp?: import('../contrib/manifests.js').AgentMcpServer[];
 }

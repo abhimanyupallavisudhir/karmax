@@ -4180,6 +4180,12 @@ function settingsView(proj) {
     </div>
     ${profilesCard('project')}
     ${paymentsCard('project')}
+    <div class="card" id="git-preflight-card">
+      <div class="section-h">Git setup</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Which git identity/credentials this project's worlds resolve to (its <b>Git profile</b> above, the global default, or the host's own setup), and whether pushes/PRs can reach the repos' remotes non-interactively. Profiles are managed in <b>Global settings → Git accounts</b>.</p>
+      <button class="btn sm" id="git-preflight-run">Check git setup</button>
+      <div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div>
+    </div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">Pin this project to a specific version of a workflow, or track the latest. A pin only affects <b>new</b> tasks — running ones keep the version they started on.</p>
@@ -4237,6 +4243,20 @@ function wireSettingsView(proj) {
     }),
   );
   wirePaymentsCard('project', proj.id);
+  $('#git-preflight-run')?.addEventListener('click', async () => {
+    const out = $('#git-preflight-result');
+    const btn = $('#git-preflight-run');
+    btn.disabled = true;
+    out.innerHTML = 'Checking identity, credentials and remote reachability…';
+    try {
+      const r = await api(`/api/git-profiles/preflight?projectId=${encodeURIComponent(proj.id)}`);
+      out.innerHTML = `<div style="margin-bottom:4px">Tier: <b>${r.tier === 'profile' ? `git profile “${esc(r.profile)}”` : 'host fallback (no profile configured)'}</b></div>` +
+        r.checks.map((c) => `<div>${c.ok ? '🟢' : '🔴'} <b>${esc(c.label)}</b> — ${esc(c.detail || (c.ok ? 'ok' : 'failed'))}</div>`).join('');
+    } catch (e) {
+      out.textContent = e.message;
+      out.style.color = 'var(--bad, crimson)';
+    } finally { btn.disabled = false; }
+  });
   $('#activate-sd')?.addEventListener('click', async () => {
     try {
       const r = await api(`/api/projects/${proj.id}/activate-workflow`, { method: 'POST', body: JSON.stringify({ workflow: 'software-dev' }) });
@@ -4310,6 +4330,26 @@ function globalSettingsView() {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Stored encrypted in the vault; the key is never shown again. (You enter it — karmax never sees it elsewhere.)</div>
       </div>
     </div>
+    <div class="card" id="git-accounts-card">
+      <div class="section-h">Git accounts</div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named git identities for the repos karmax works on: who commits are attributed to (and optionally signed by), and the SSH key / GitHub token used to push and open PRs. A project picks one in its settings (<b>Git profile</b>); without one, worlds fall back to the host's own git setup. Secrets go straight to the encrypted vault and are injected per subprocess — never written to any git config.</p>
+      <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
+      <div class="form-row"><label>Add / update a profile</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input id="gitp-name" placeholder="profile name (e.g. personal)" style="width:160px" />
+          <input id="gitp-username" placeholder="git user.name" style="flex:1;min-width:130px" />
+          <input id="gitp-email" placeholder="git user.email" style="flex:1;min-width:160px" />
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
+          <input id="gitp-token" type="password" placeholder="GitHub token (optional)" style="flex:1;min-width:160px" />
+          <textarea id="gitp-ssh" placeholder="SSH private key for push/fetch (optional)" rows="1" style="flex:1;min-width:160px"></textarea>
+          <textarea id="gitp-signing" placeholder="SSH signing key (optional)" rows="1" style="flex:1;min-width:160px"></textarea>
+          <button class="btn primary" id="gitp-save">Save</button>
+        </div>
+        <div id="gitp-result" style="font-size:12px;margin-top:6px"></div>
+        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Re-saving a profile with a blank secret keeps the stored one. Interactive auth (password prompts at push) is never supported — configure a profile, or pre-authorize the host non-interactively.</div>
+      </div>
+    </div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows</div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
@@ -4332,6 +4372,31 @@ function globalSettingsView() {
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
     </div>`;
+}
+
+async function hydrateGitProfiles() {
+  const box = $('#git-profiles-list');
+  if (!box) return;
+  let data = { profiles: [], defaultProfile: null };
+  try { data = await api('/api/git-profiles'); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
+  if (!data.profiles.length) { box.innerHTML = '<span style="color:var(--ink-3)">No git profiles yet — worlds use the host’s own git setup.</span>'; return; }
+  box.innerHTML = data.profiles.map((p) => `<div class="queue-item" data-gitp="${esc(p.name)}">
+      <div style="flex:1"><b>${esc(p.name)}</b>
+        ${data.defaultProfile === p.name ? '<span class="chip">default</span>' : `<button class="btn sm" data-gitp-default="${esc(p.name)}">make default</button>`}
+        <span class="task-sub" style="color:var(--ink-3)">${esc(p.userName)} &lt;${esc(p.userEmail)}&gt;</span>
+        <div class="task-sub" style="color:var(--ink-3)">${[p.sshKey ? 'ssh key' : null, p.signingKey ? 'signing key' : null, p.githubToken ? 'github token' : null].filter(Boolean).join(' · ') || 'identity only'}</div>
+      </div>
+      <button class="btn sm danger" data-gitp-del="${esc(p.name)}">Delete</button>
+    </div>`).join('');
+  box.querySelectorAll('[data-gitp-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`Delete git profile "${b.dataset.gitpDel}" (and its stored secrets)?`)) return;
+    try { await api(`/api/git-profiles/${encodeURIComponent(b.dataset.gitpDel)}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
+    hydrateGitProfiles();
+  }));
+  box.querySelectorAll('[data-gitp-default]').forEach((b) => b.addEventListener('click', async () => {
+    try { await api('/api/git-profiles/default', { method: 'POST', body: JSON.stringify({ name: b.dataset.gitpDefault }) }); } catch (e) { toast(e.message, true); }
+    hydrateGitProfiles();
+  }));
 }
 
 async function hydrateWorkflows() {
@@ -4543,7 +4608,31 @@ function wireGlobalSettings() {
   renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
   hydrateProfiles('global');
   hydrateWorkflows();
+  hydrateGitProfiles();
   wirePaymentsCard('global');
+  $('#gitp-save')?.addEventListener('click', async () => {
+    const name = $('#gitp-name').value.trim();
+    const userName = $('#gitp-username').value.trim();
+    const userEmail = $('#gitp-email').value.trim();
+    const out = $('#gitp-result');
+    if (!name || !userName || !userEmail) return toast('profile name, user.name and user.email required', true);
+    const btn = $('#gitp-save'); btn.disabled = true;
+    try {
+      await api('/api/git-profiles', { method: 'POST', body: JSON.stringify({
+        name, userName, userEmail,
+        githubToken: $('#gitp-token').value.trim() || undefined,
+        sshKey: $('#gitp-ssh').value.trim() || undefined,
+        signingKey: $('#gitp-signing').value.trim() || undefined,
+      }) });
+      out.innerHTML = `🟢 Saved <b>${esc(name)}</b>. Secrets went to the vault and are never shown again.`;
+      out.style.color = 'var(--ok, green)';
+      for (const id of ['#gitp-token', '#gitp-ssh', '#gitp-signing']) $(id).value = '';
+      hydrateGitProfiles();
+    } catch (e) {
+      out.textContent = e.message;
+      out.style.color = 'var(--bad, crimson)';
+    } finally { btn.disabled = false; }
+  });
   $('#wf-install')?.addEventListener('click', async () => {
     const url = $('#wf-url').value.trim();
     const ref = $('#wf-ref').value.trim();

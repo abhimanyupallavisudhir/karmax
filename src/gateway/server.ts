@@ -880,6 +880,57 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
+      // Git profiles (PLAN-git-config.md §3): named git identity + credentials for
+      // the repos karmax works on. The registry is public; secrets are write-only
+      // into the vault (never echoed) and resolved JIT by the broker at use time.
+      if (p === '/api/git-profiles' && method === 'GET') {
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        const gp = new GitProfiles(store, this.deps.broker);
+        return this.json(res, 200, { profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null });
+      }
+      if (p === '/api/git-profiles' && method === 'POST') {
+        const b = await this.body(req);
+        if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+        if (!b.name || !b.userName || !b.userEmail) return this.json(res, 400, { error: 'name, userName, userEmail required' });
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        const gp = new GitProfiles(store, this.deps.broker);
+        try {
+          const rec = gp.save({
+            name: String(b.name),
+            userName: String(b.userName),
+            userEmail: String(b.userEmail),
+            sshKey: b.sshKey ? String(b.sshKey) : undefined,
+            signingKey: b.signingKey ? String(b.signingKey) : undefined,
+            githubToken: b.githubToken ? String(b.githubToken) : undefined,
+          });
+          if (b.default) gp.setDefault(rec.name);
+          return this.json(res, 200, { profile: rec }); // never echoes the secrets
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const gitProfileMatch = p.match(/^\/api\/git-profiles\/([^/]+)$/);
+      if (gitProfileMatch && method === 'DELETE') {
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        new GitProfiles(store, this.deps.broker).delete(decodeURIComponent(gitProfileMatch[1]!));
+        return this.json(res, 200, { ok: true });
+      }
+      // The doctor check (PLAN-git-config.md §7): which tier a project's remote
+      // ops resolve to (profile / host fallback) and whether it can reach the
+      // repos' remotes non-interactively. Read-only.
+      if (p === '/api/git-profiles/preflight' && method === 'GET') {
+        const projectId = url.searchParams.get('projectId') ?? undefined;
+        const project = projectId ? store.getProject(projectId) : undefined;
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        return this.json(res, 200, await new GitProfiles(store, this.deps.broker).preflight(project?.config));
+      }
+      if (p === '/api/git-profiles/default' && method === 'POST') {
+        const b = await this.body(req);
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        new GitProfiles(store, this.deps.broker).setDefault(b.name ? String(b.name) : undefined);
+        return this.json(res, 200, { ok: true });
+      }
+
       // Manual availability override for an agent login (SPEC §6.2): force a login
       // on/off or edit its reset time (e.g. after upgrading a plan) without waiting
       // for the old refresh. Signals the account coordinator directly.

@@ -41,7 +41,24 @@ const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: '
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directories', help: 'One per line — absolute path, or starting with ~. Multiple repos are each checked out in their own subdirectory of the task world.', scopes: ['project'], bind: 'project' });
 const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
 const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', options: ['worktree', 'container'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
-const prToggleField = (): FieldSpec => ({ name: 'openGithubPr', type: 'boolean', label: 'Open a GitHub PR on confirm', default: false, scopes: ['project', 'global'], bind: 'project' });
+const remoteField = (): FieldSpec => ({
+  name: 'remote',
+  type: 'select',
+  label: 'Remote policy',
+  help: 'What leaves the machine: none — merges stay local; push — push the target branch after a merge lands; pr — open a GitHub PR at Review and push the target after merge (PLAN-git-config.md §5).',
+  options: ['none', 'push', 'pr'],
+  default: 'none',
+  scopes: ['project', 'global'],
+  bind: 'project',
+});
+const gitProfileField = (): FieldSpec => ({
+  name: 'gitProfile',
+  type: 'string',
+  label: 'Git profile',
+  help: 'Named git identity/credentials (Global settings → Git accounts) this project commits, signs and pushes as. Empty ⇒ the default profile, else the host’s own git setup.',
+  scopes: ['project', 'global'],
+  bind: 'project',
+});
 
 export interface EventSchemaDecl {
   type: string;
@@ -308,7 +325,8 @@ export const MANIFESTS: WorkflowManifest[] = [
       reposField(),
       copyGlobsField(),
       worldProviderField(),
-      prToggleField(),
+      remoteField(),
+      gitProfileField(),
       agentField('merge', 'Merge agent', 'always'),
       agentField('resolve', 'Resolve agent', 'always'),
       confirmerField(),
@@ -374,7 +392,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it runs merge/resolve too.
     roles: [DO_ROLE, MERGE_ROLE, RESOLVE_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), prToggleField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), remoteField(), gitProfileField(), confirmerField()],
   },
   {
     name: 'merge-only',
