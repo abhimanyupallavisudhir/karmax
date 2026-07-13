@@ -39,9 +39,9 @@ global.seedActivity = () => {};
 global.seedQueue = () => {};
 global.renderDashboard = () => {};
 global.resolveProjectTaskKey = async () => null;
-global.openDrawer = async () => {};
-global.highlightRow = () => {};
-global.closeDrawerDom = () => { calls.push('closeDrawerDom'); };
+global.openTask = async () => {};
+global.renderTaskPage = () => {};
+global.closeTaskDom = () => { calls.push('closeTaskDom'); };
 
 // Previous project 'A' with a live query, a selected saved view, a stale search
 // result and a roving cursor — none of which belong to project 'B'.
