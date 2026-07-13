@@ -17,15 +17,20 @@ import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
+import { GitProfiles } from '../autonomy/git-profiles.js';
+import { worldRepos } from '../world/types.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
 import os from 'node:os';
+import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
 import { attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
+import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 
 const DEFAULT_GRANT = ['*'];
 
@@ -124,6 +129,9 @@ export interface CreateWorldArgs {
   branch?: string;
   copyGlobs?: string[];
   kind: WorldKind;
+  /** The project's git profile selection (PLAN-git-config.md §3); the activity
+   *  resolves it (project → global default) and materializes identity/signing. */
+  gitProfile?: string;
 }
 
 export interface RunAgentTurnArgs {
@@ -145,6 +153,8 @@ export interface RunAgentTurnArgs {
    * credential); resolved JIT and overrides the auth. Env keys carry no handle —
    * they fall through to the adapter's env credential. */
   accountApiKeyHandle?: string;
+  /** Workflow-generated id used to correlate live admission/running signals. */
+  agentTurnId?: string;
 }
 
 export interface PrepareChildArgs {
@@ -167,6 +177,7 @@ export interface PrepareChildArgs {
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
+  const gitProfiles = new GitProfiles(store, deps.broker);
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
     const ev = { type, taskId, ts: Date.now(), payload };
@@ -174,8 +185,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     deps.bus?.emit({ ...ev, seq });
   }
 
+  /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
+   *  the world's git profile (stamped on the handle at creation) → GIT_SSH_COMMAND /
+   *  GH_TOKEN, per subprocess. Empty when the world has no profile (host fallback)
+   *  or resolution fails — the op then runs with the host's own auth. */
+  function gitEnvFor(handle: WorldHandle, taskId?: string): Record<string, string> {
+    const name = handle.meta?.gitProfile;
+    if (typeof name !== 'string' || !name) return {};
+    try {
+      const profile = gitProfiles.get(name);
+      return profile ? gitProfiles.env(profile, { taskId }) : {};
+    } catch {
+      return {};
+    }
+  }
+
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
+      // Resolve the git profile (project → global default → none) and materialize
+      // its identity for worktree-scoped config (PLAN-git-config.md §4A). Identity
+      // failure downgrades to a warning — the world is still usable locally.
+      const profile = gitProfiles.resolve({ gitProfile: args.gitProfile });
+      let gitIdentity;
+      try {
+        gitIdentity = profile ? gitProfiles.identity(profile, { taskId: args.taskId }) : undefined;
+      } catch (e) {
+        record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` });
+      }
       const world = await worlds.create(args.kind, {
         taskId: args.taskId,
         repo: args.repo,
@@ -184,7 +220,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         target: args.target,
         branch: args.branch,
         copyGlobs: args.copyGlobs,
+        gitIdentity,
       });
+      if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
       record(args.taskId, 'world.created', { handle: world.handle });
       for (const warning of world.handle.warnings ?? []) {
         record(args.taskId, 'world.warning', { warning });
@@ -239,6 +277,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let signal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
       let hbSession: string | undefined; // set once real progress exists (onSession)
+      let legacyAgentTurnId: string | undefined;
       // Live in-flight-injection channel: a streaming adapter polls the workflow for
       // follow-ups queued WHILE this turn runs and injects them into the live session
       // (SPEC §5.6). Off on a resumed retry — its `messages` were replaced by a single
@@ -248,6 +287,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const actx = activityContext.current();
         signal = actx.cancellationSignal;
         heartbeat = () => actx.heartbeat(hbSession ? { session: hbSession } : undefined);
+        // v1 workflows cannot add the new agentTurnId argument without changing
+        // their recorded activity command. Derive a stable compatibility id from
+        // the existing activity execution instead, so the activity can repair the
+        // persisted view without changing workflow history.
+        if (!args.agentTurnId && actx.info.workflowExecution) {
+          legacyAgentTurnId = `legacy:${actx.info.workflowExecution.runId}:${actx.info.activityId}`;
+        }
         const prior = (actx.info.heartbeatDetails as { session?: string } | undefined)?.session;
         if (actx.info.attempt > 1 && prior) {
           liveChannel = false;
@@ -433,10 +479,62 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           : undefined;
 
+      /** Compatibility publisher for immutable v1 histories. Those workflows
+       * clear their in-memory account wait after a grant but cannot schedule a
+       * publish there without becoming nondeterministic. The activity is already
+       * a side-effect boundary, so it may keep the SQLite/UI snapshot truthful:
+       * account granted → waiting for host slot → running. A matching id prevents
+       * a late retry/cancellation from overwriting a newer turn's view. */
+      const publishLegacyAgentState = (state: 'waiting-slot' | 'running' | undefined) => {
+        if (!legacyAgentTurnId) return;
+        const taskRecord = store.getTask(args.taskId);
+        // A late retry from a terminated v1 execution must never overwrite the
+        // replacement run's v1.1+ snapshot. Workflow version is the stable guard;
+        // view shape alone is not (a review wait legitimately has no agentTurn).
+        if (taskRecord?.workflowVersion !== '1.0.0') return;
+        const prev = taskRecord.lastView;
+        if (!prev || prev.status === 'done' || prev.status === 'failed' || prev.status === 'cancelled') return;
+        if (state) {
+          if (prev.agentTurn && prev.agentTurn.turnId !== legacyAgentTurnId) return;
+        } else if (prev.agentTurn?.turnId !== legacyAgentTurnId) {
+          return;
+        }
+        const next: TaskView = state
+          ? {
+              ...prev,
+              status: state === 'running' ? 'active' : 'waiting',
+              waitingFor:
+                state === 'waiting-slot'
+                  ? { kind: 'agentSlot', provider: profile.provider, detail: 'Waiting for host capacity to run the agent' }
+                  : undefined,
+              agentTurn: { turnId: legacyAgentTurnId, role: args.role, provider: profile.provider, state },
+            }
+          : { ...prev, status: prev.status === 'waiting' ? 'active' : prev.status, waitingFor: undefined, agentTurn: undefined };
+        store.saveView(args.taskId, next);
+        record(args.taskId, 'view.updated', {
+          stage: next.stage,
+          status: next.status,
+          waitingFor: next.waitingFor?.kind ?? null,
+          agentTurn: next.agentTurn?.state ?? null,
+          agentRole: next.agentTurn?.role ?? null,
+          compatibility: 'legacy-agent-turn',
+        });
+      };
+
       // Host-wide agent-turn admission (SPEC §12): cap concurrent model
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
-      const releaseSlot = await acquireAgentSlot(heartbeat);
+      publishLegacyAgentState('waiting-slot');
+      const releaseSlot = await acquireAgentSlot(heartbeat, signal);
+      // The workflow publishes `waiting-slot` immediately after the account grant;
+      // only admission itself can truthfully report that the model is now running.
+      if (deps.client && args.agentTurnId) {
+        await deps.client.workflow
+          .getHandle(args.taskId)
+          .signal(SIG_AGENT_TURN_STATE, { turnId: args.agentTurnId, role: args.role, provider: profile.provider, state: 'running' })
+          .catch(() => undefined);
+      }
+      publishLegacyAgentState('running');
       let lastEmit: string | undefined;
       let result;
       try {
@@ -452,6 +550,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
+          // Git-profile credentials for the agent subprocess (PLAN-git-config.md
+          // §4B): an agent that pushes or runs `gh` acts as the project's account.
+          ...(() => {
+            const gitEnv = gitEnvFor(args.worldHandle, args.taskId);
+            return Object.keys(gitEnv).length ? { extraEnv: gitEnv } : {};
+          })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
         },
@@ -490,12 +594,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
         },
         );
+        // Defence in depth around the activity boundary. `runTurn` rejects an
+        // adapter return after abort, but cancellation can race the few synchronous
+        // instructions between that check and this await continuation. Never report
+        // a normal Temporal activity result once shutdown/cancellation is visible.
+        if (signal?.aborted) {
+          throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
+        }
       } catch (err) {
         if (token) deps.tokens?.revoke(token);
         if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
         throw classifyTurnError(err);
       } finally {
         releaseSlot();
+        publishLegacyAgentState(undefined);
       }
       if (token) deps.tokens?.revoke(token);
       // Persist the session id so other tasks can resume from this one (§10.5), plus
@@ -542,8 +654,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {
       const world = await worlds.open(handle);
-      const result = await finalizeMerge(world, target);
-      record(handle.id, 'merge.result', { merged: result.merged, sha: result.sha, conflict: result.conflict });
+      // Merge commits carry the world's profile identity too (PLAN-git-config.md
+      // §4A) — they land on the target, where worktree-scoped config doesn't reach.
+      let identity;
+      const profileName = handle.meta?.gitProfile;
+      if (typeof profileName === 'string' && profileName) {
+        try {
+          const profile = gitProfiles.get(profileName);
+          identity = profile ? gitProfiles.identity(profile, { taskId: handle.id }) : undefined;
+        } catch {
+          identity = undefined; // fall back to ensureIdentity inside finalizeMerge
+        }
+      }
+      const result = await finalizeMerge(world, target, identity);
+      record(handle.id, 'merge.result', { merged: result.merged, sha: result.sha, conflict: result.conflict, dirty: result.dirty });
       return result;
     },
 
@@ -565,7 +689,52 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const r = await world.exec('bash', ['-lc', 'npm test --silent 2>&1 | tail -40'], { timeoutMs: 10 * 60_000 });
       record(args.taskId, 'checks.done', { code: r.code });
-      return { passed: r.code === 0, detail: r.stdout.slice(-600) };
+      if (r.code !== 0) return { passed: false, detail: r.stdout.slice(-600) };
+
+      // SPEC §4.4's replay gate is literal: fetch every currently-running history
+      // and compare the candidate bundle with the bundle serving production now.
+      // Pre-existing incompatibilities are reported but do not make unrelated edits
+      // impossible; any history that regresses from baseline-pass to candidate-fail
+      // blocks the merge.
+      if (!deps.client) return { passed: false, detail: 'tests passed, but replay compatibility could not run: no Temporal client' };
+      const candidatePath = path.join(args.worldHandle.root, 'src', 'workflows', 'index.ts');
+      if (!fs.existsSync(candidatePath)) return { passed: false, detail: `tests passed, but candidate workflow bundle is missing: ${candidatePath}` };
+      try {
+        const histories: Array<{ workflowId: string; history: unknown }> = [];
+        for await (const execution of deps.client.workflow.list({ query: "ExecutionStatus='Running'" })) {
+          histories.push({ workflowId: execution.workflowId, history: await deps.client.workflow.getHandle(execution.workflowId, execution.runId).fetchHistory() });
+        }
+        const { Worker } = await import('@temporalio/worker');
+        const replay = async (workflowsPath: string) => {
+          const failures = new Map<string, string>();
+          for await (const result of Worker.runReplayHistories({ workflowsPath }, histories)) {
+            if (result.error) failures.set(result.workflowId, result.error.message);
+          }
+          return failures;
+        };
+        const baselinePath = fileURLToPath(new URL('../workflows/index.ts', import.meta.url));
+        const baselineFailures = await replay(baselinePath);
+        const candidateFailures = await replay(candidatePath);
+        const regressions = [...candidateFailures.entries()].filter(([id]) => !baselineFailures.has(id));
+        const fixed = [...baselineFailures.keys()].filter((id) => !candidateFailures.has(id));
+        const existing = [...candidateFailures.keys()].filter((id) => baselineFailures.has(id));
+        record(args.taskId, 'checks.replay', {
+          histories: histories.length,
+          regressions: regressions.map(([id]) => id),
+          preExisting: existing,
+          fixed,
+        });
+        if (regressions.length) {
+          const detail = regressions.map(([id, error]) => `${id}: ${error}`).join('\n');
+          return { passed: false, detail: `tests passed; replay REGRESSED ${regressions.length}/${histories.length} active histories:\n${detail}`.slice(-4000) };
+        }
+        return {
+          passed: true,
+          detail: `tests + replay passed (${histories.length} active histories; ${existing.length} pre-existing incompatibilities${fixed.length ? `; ${fixed.length} repaired` : ''})`,
+        };
+      } catch (e) {
+        return { passed: false, detail: `tests passed, but replay compatibility failed to run: ${e instanceof Error ? e.message : String(e)}` };
+      }
     },
 
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
@@ -588,14 +757,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async openPr(handle: WorldHandle, target: string): Promise<{ url: string; number: number } | null> {
       // GitHub PRs are an optional integration (SPEC §5.2). Use `gh` if present
-      // and authorized; otherwise the Review stage IS the conceptual PR.
+      // and authorized; otherwise the Review stage IS the conceptual PR. The git
+      // profile's credentials (GH_TOKEN / GIT_SSH_COMMAND) select the account per
+      // subprocess (PLAN-git-config.md §4B — never `gh auth switch`).
       const world = await worlds.open(handle);
-      const which = await world.exec('bash', ['-lc', 'command -v gh && gh auth status >/dev/null 2>&1 && echo ok || echo no']);
+      const env = gitEnvFor(handle, handle.id);
+      const which = await world.exec('bash', ['-lc', 'command -v gh && gh auth status >/dev/null 2>&1 && echo ok || echo no'], { env });
       if (!which.stdout.includes('ok')) {
         record(handle.id, 'pr.skipped', { reason: 'gh not available/authorized' });
         return null;
       }
-      const push = await world.exec('git', ['push', '-u', 'origin', handle.branch]);
+      const push = await world.exec('git', ['push', '-u', 'origin', handle.branch], { env });
       if (push.code !== 0) {
         record(handle.id, 'pr.skipped', { reason: 'push failed', detail: push.stderr.slice(0, 300) });
         return null;
@@ -603,7 +775,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const pr = await world.exec('bash', [
         '-lc',
         `gh pr create --base ${target} --head ${handle.branch} --fill --json url,number 2>/dev/null || gh pr view --json url,number`,
-      ]);
+      ], { env });
       try {
         const parsed = JSON.parse(pr.stdout);
         record(handle.id, 'pr.opened', parsed);
@@ -613,9 +785,44 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
     },
 
+    /**
+     * Push the landed target branch to each repo's origin (remote policy
+     * 'push'/'pr', PLAN-git-config.md §5). Best-effort by contract: the local
+     * merge is the deliverable; every skip/failure is recorded, never thrown.
+     */
+    async pushTarget(handle: WorldHandle, target: string): Promise<{ pushed: string[]; skipped: string[] }> {
+      const env = { GIT_TERMINAL_PROMPT: '0', ...gitEnvFor(handle, handle.id) };
+      const world = await worlds.open(handle);
+      const pushed: string[] = [];
+      const skipped: string[] = [];
+      for (const r of worldRepos(handle)) {
+        const hasOrigin = await world.exec('git', ['remote', 'get-url', 'origin'], { cwd: r.repo, env });
+        if (hasOrigin.code !== 0) {
+          skipped.push(r.name);
+          record(handle.id, 'push.skipped', { repo: r.name, reason: 'no origin remote' });
+          continue;
+        }
+        const push = await world.exec('git', ['push', 'origin', target], { cwd: r.repo, env });
+        if (push.code === 0) {
+          pushed.push(r.name);
+          record(handle.id, 'push.done', { repo: r.name, target });
+        } else {
+          skipped.push(r.name);
+          record(handle.id, 'push.failed', { repo: r.name, target, detail: (push.stderr || push.stdout).slice(0, 300) });
+        }
+      }
+      return { pushed, skipped };
+    },
+
     async publishView(taskId: string, view: TaskView): Promise<void> {
       store.saveView(taskId, view);
-      record(taskId, 'view.updated', { stage: view.stage, status: view.status });
+      record(taskId, 'view.updated', {
+        stage: view.stage,
+        status: view.status,
+        waitingFor: view.waitingFor?.kind ?? null,
+        agentTurn: view.agentTurn?.state ?? null,
+        agentRole: view.agentTurn?.role ?? null,
+      });
     },
 
     async recordEvent(taskId: string, type: string, payload: Record<string, unknown>): Promise<void> {

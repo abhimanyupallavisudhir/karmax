@@ -37,6 +37,10 @@ export class CredentialBroker {
     return this.vault.has(handle);
   }
 
+  deleteHandle(handle: string) {
+    this.vault.delete(handle);
+  }
+
   listHandles(): string[] {
     return this.vault.list();
   }

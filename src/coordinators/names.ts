@@ -19,6 +19,7 @@ export const SIG_MERGE_GRANTED = 'mergeGranted';
 export const QRY_QUEUE = 'queue';
 
 export const SIG_LEASE_ACCOUNT = 'leaseAccount';
+export const SIG_CANCEL_ACCOUNT = 'cancelAccountLease';
 export const SIG_RETURN_ACCOUNT = 'returnAccount';
 export const SIG_ACCOUNT_GRANTED = 'accountGranted';
 export const SIG_REGISTER_ACCOUNTS = 'registerAccounts';

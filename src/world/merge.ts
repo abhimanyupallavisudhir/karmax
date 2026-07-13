@@ -1,12 +1,27 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { World, WorldRepo, worldRepos } from './types.js';
+import { World, WorldRepo, WorldGitIdentity, worldRepos } from './types.js';
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
+
+/** Per-invocation `-c` config for the profile identity (PLAN-git-config.md §4A):
+ *  merge commits land in the TARGET's worktree (or a temp one), which carries no
+ *  worktree-scoped profile config — inject it per command instead so those
+ *  commits are attributed (and signed) exactly like the attempt's. */
+function identityArgs(id?: WorldGitIdentity): string[] {
+  if (!id) return [];
+  const args = ['-c', `user.name=${id.name}`, '-c', `user.email=${id.email}`];
+  if (id.signingKeyPath) args.push('-c', 'gpg.format=ssh', '-c', `user.signingKey=${id.signingKeyPath}`, '-c', 'commit.gpgsign=true');
+  return args;
+}
 
 export interface MergeResult {
   merged: boolean;
   sha?: string;
   conflict?: string;
+  /** Uncommitted paths that blocked the merge (newline-joined). Commit-vs-gitignore
+   *  is a judgment call, so a dirty tree is rejected back to the merge agent
+   *  instead of being blind-swept (PLAN-git-config.md §6). */
+  dirty?: string;
   landedFiles: string[];
   note?: string;
 }
@@ -18,21 +33,22 @@ export interface MergeResult {
  * merge agent can resolve it and re-run — repos that already landed re-merge as
  * no-ops, so the retry is safe (partial-merge recoverable, not atomic).
  */
-export async function finalizeMerge(world: World, target: string): Promise<MergeResult> {
+export async function finalizeMerge(world: World, target: string, identity?: WorldGitIdentity): Promise<MergeResult> {
   const repos = worldRepos(world.handle);
   if (!repos.length) return { merged: false, landedFiles: [], note: 'no source repo (non-git world)' };
-  if (repos.length === 1) return finalizeMergeRepo(repos[0]!, target, world.handle.id);
+  if (repos.length === 1) return finalizeMergeRepo(repos[0]!, target, world.handle.id, identity);
 
   const landedFiles: string[] = [];
   let sha: string | undefined;
   for (const r of repos) {
-    const res = await finalizeMergeRepo(r, target, world.handle.id);
+    const res = await finalizeMergeRepo(r, target, world.handle.id, identity);
     landedFiles.push(...res.landedFiles.map((f) => `${r.name}/${f}`));
     if (!res.merged) {
       return {
         merged: false,
         landedFiles,
         conflict: res.conflict,
+        dirty: res.dirty ? res.dirty.split('\n').map((f) => `${r.name}/${f}`).join('\n') : undefined,
         note: `repo "${r.name}": ${res.note ?? (res.conflict ? 'merge conflict' : 'merge failed')}`,
       };
     }
@@ -42,14 +58,15 @@ export async function finalizeMerge(world: World, target: string): Promise<Merge
 }
 
 /** Merge one repo's attempt branch into `target` (the per-repo primitive). */
-async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: string): Promise<MergeResult> {
+async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: string, identity?: WorldGitIdentity): Promise<MergeResult> {
   const root = worldRepo.root;
   const repo = worldRepo.repo;
   const branch = worldRepo.branch;
   const base = worldRepo.base;
+  const asIdentity = identityArgs(identity);
   if (!repo) return { merged: false, landedFiles: [], note: 'no source repo (non-git world)' };
 
-  await ensureIdentity(root);
+  if (!identity) await ensureIdentity(root);
 
   // 0. A merge-agent turn may have died (or given up) mid-`git merge`, leaving an
   //    in-progress merge with unresolved conflict hunks. Committing that state
@@ -66,13 +83,29 @@ async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: 
     };
   }
 
-  // 1. Commit any pending work on the attempt branch. (If the agent resolved a
-  //    merge but forgot to commit — MERGE_HEAD present, everything staged, no
-  //    unresolved paths — this completes that merge on purpose; the marker scan
-  //    below still rejects anything that would land conflict hunks as content.)
+  // 1. A dirty tree is the merge agent's to resolve, never machinery's: commit-
+  //    vs-gitignore is a judgment call, and a blind `git add -A` here would land
+  //    files generated AFTER the Review gate (test artifacts, logs) unseen.
+  //    Reject with the file list so the workflow loops back to the merge agent
+  //    (PLAN-git-config.md §6). One mechanical exception: a RESOLVED but
+  //    uncommitted merge (MERGE_HEAD present; step 0 ruled out unresolved paths)
+  //    is completed on purpose — that is a forgotten `git commit`, not a
+  //    judgment call — and the marker scan below still rejects anything that
+  //    would land conflict hunks as content.
   if (await isDirty(root)) {
+    const mergeHead = (await git(root, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'])).code === 0;
+    if (!mergeHead) {
+      const st = await git(root, ['status', '--porcelain']);
+      const dirty = st.stdout.split('\n').map((s) => s.slice(3).trim()).filter(Boolean).join('\n');
+      return {
+        merged: false,
+        landedFiles: [],
+        dirty,
+        note: 'uncommitted changes in the worktree — commit what belongs in the change; gitignore or delete what does not',
+      };
+    }
     await git(root, ['add', '-A']);
-    const c = await git(root, ['commit', '-q', '-m', `karmax: work for ${worldId}`]);
+    const c = await git(root, [...asIdentity, 'commit', '-q', '-m', `karmax: work for ${worldId}`]);
     if (c.code !== 0 && !/nothing to commit/.test(c.stdout + c.stderr)) {
       return { merged: false, landedFiles: [], note: `commit failed: ${c.stderr || c.stdout}` };
     }
@@ -112,6 +145,7 @@ async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: 
   // 2. Bring the target into the branch so conflicts surface here (resolvable
   //    by the merge agent in a prior turn). Abort + report on conflict.
   const into = await git(root, [
+    ...asIdentity,
     'merge',
     '--no-ff',
     '--no-edit',
@@ -157,8 +191,9 @@ async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: 
   }
 
   try {
-    await ensureIdentity(dir);
+    if (!identity) await ensureIdentity(dir);
     const land = await git(dir, [
+      ...asIdentity,
       'merge',
       '--no-ff',
       '--no-edit',

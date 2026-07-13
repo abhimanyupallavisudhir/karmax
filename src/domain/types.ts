@@ -30,14 +30,57 @@ export interface ProjectConfig {
   defaultTarget?: string;
   /** Gitignored files copied into each world at setup (e.g. .env). */
   copyGlobs?: string[];
-  /** Open a real GitHub PR (gated by GitHub auth). The Review stage IS the PR conceptually. */
+  /** @deprecated Superseded by `remote: 'pr'` (PLAN-git-config.md §5); still honored. */
   openGithubPr?: boolean;
+  /**
+   * Remote policy (PLAN-git-config.md §5): what leaves the machine, and when.
+   * 'none' (default) — merges are local. 'push' — the target branch is pushed
+   * after a merge lands. 'pr' — the task branch is pushed and a GitHub PR opened
+   * at the PR stage, and the target pushed after merge. Anything beyond this
+   * happens only when a task explicitly asks its agent to push.
+   */
+  remote?: RemotePolicy;
+  /** Named git identity/credentials (a GitProfile, Global settings → Git accounts)
+   *  this project's worlds commit and push as. Absent ⇒ the global default
+   *  profile, else the host's own git setup (PLAN-git-config.md §3). */
+  gitProfile?: string;
   /** role -> agent profile id. */
   defaultProfiles?: Record<string, string>;
   /** World backend. */
   worldProvider?: 'worktree' | 'container';
   /** Snapshot-on-park resumable worlds (§11.3). */
   resumeWorlds?: boolean;
+}
+
+// ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────
+
+export type RemotePolicy = 'none' | 'push' | 'pr';
+
+/** The effective remote policy, honoring the deprecated `openGithubPr` flag. */
+export function remotePolicyOf(project: ProjectConfig | undefined): RemotePolicy {
+  return project?.remote ?? (project?.openGithubPr ? 'pr' : 'none');
+}
+
+/**
+ * A named bundle of git identity + credentials — the git analogue of an agent
+ * config-home account. The record itself carries NO secrets: the three key
+ * fields are true/false flags for whether a vault secret exists under the
+ * profile's handles (`git:<name>:ssh` / `git:<name>:signing` / `git:<name>:token`).
+ * Selection is per project (`ProjectConfig.gitProfile`) with a global default;
+ * an unconfigured project falls through to the host's own git setup.
+ */
+export interface GitProfile {
+  name: string;
+  /** git user.name commits are attributed to. */
+  userName: string;
+  /** git user.email. */
+  userEmail: string;
+  /** An SSH signing key is stored (worktree-scoped commit.gpgsign, gpg.format=ssh). */
+  signingKey?: boolean;
+  /** An SSH auth key is stored (injected as GIT_SSH_COMMAND for fetch/push). */
+  sshKey?: boolean;
+  /** A GitHub token is stored (injected as GH_TOKEN for gh + https pushes). */
+  githubToken?: boolean;
 }
 
 export interface TaskList {
@@ -367,21 +410,40 @@ export interface AgentSpec {
 }
 
 /**
- * Who drives the Review gate (SPEC §5.2/§5.3). `human` waits for a person to click
- * Confirm (the default, back-compat behaviour). `auto` confirms the moment Review is
- * reached. `agent` runs a Confirm-agent turn that reviews the work and returns a
- * structured verdict (confirm / revise / reject) — the same three transitions a human
- * drives. When `mode === 'agent'` the remaining `AgentSpec` fields configure that
- * agent exactly like the Do/Merge/Resolve agent fields (including `resumeFrom`).
+ * Who drives the Review gate (SPEC §5.2/§5.3): an ordered list of confirm LAYERS,
+ * played sequentially each time the task reaches Review. Every layer must approve
+ * for the task to proceed to PR/merge; a revise verdict or a follow-up sends the
+ * task back to Do, and the next Review replays the sequence from the first layer.
+ * Zero layers ⇒ auto-confirm (e.g. "agent review, then a final human confirmation"
+ * is `[{ kind: 'agent', … }, { kind: 'human' }]`; auto-confirm is `[]`).
+ *
+ * A `human` layer waits for a person to click Confirm. An `agent` layer runs a
+ * Confirm-agent turn that reviews the work and returns a structured verdict
+ * (confirm / revise / reject) — the same three transitions a human drives; its
+ * `AgentSpec` fields configure that agent exactly like the Do/Merge/Resolve agent
+ * fields (including `resumeFrom`).
+ *
+ * The pre-layers single-gate shape ({ mode, …agent }) is still accepted anywhere a
+ * ConfirmConfig flows (old stored settings, old drafts, in-flight inputs) and is
+ * normalized via confirmLayersOf (domain/confirm.ts): auto ⇒ [], human ⇒ one human
+ * layer, agent ⇒ one agent layer.
  */
 export type ConfirmMode = 'human' | 'auto' | 'agent';
+export interface ConfirmLayer extends Partial<AgentSpec> {
+  kind: 'human' | 'agent';
+  /** Agent layers: the review-request message template sent each time the task
+   *  reaches Review — optional instructions/guidance ("ensure X, Y and Z"), with
+   *  {{prompt}} / {{response}} placeholders for the task prompt and the Do agent's
+   *  latest response (see domain/confirm-prompt.ts). Empty ⇒ the built-in default
+   *  (CONFIRM_PROMPT_DEFAULT, pre-filled in the form). */
+  prompt?: string;
+}
 export interface ConfirmConfig extends Partial<AgentSpec> {
-  mode: ConfirmMode;
-  /** The review-request message template sent to the Confirm agent each time the
-   *  task reaches Review — optional instructions/guidance ("ensure X, Y and Z"),
-   *  with {{prompt}} / {{response}} placeholders for the task prompt and the Do
-   *  agent's latest response (see domain/confirm-prompt.ts). Empty ⇒ the built-in
-   *  default (CONFIRM_PROMPT_DEFAULT, pre-filled in the form). */
+  /** The ordered Review gates. [] ⇒ auto-confirm. Wins over the legacy `mode`. */
+  layers?: ConfirmLayer[];
+  /** Legacy single-gate mode (pre-layers shape); read only when `layers` is absent. */
+  mode?: ConfirmMode;
+  /** Legacy: the single agent gate's review-request template. */
   prompt?: string;
 }
 
@@ -448,7 +510,9 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
+  /** Live model-turn admission/execution state, separate from account leasing. */
+  agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
   /**
    * Task-scope param field names the workflow will accept live edits for right
@@ -516,8 +580,9 @@ export interface TaskInput {
   profiles?: Record<string, string>;
   /** Per-role agent overrides (provider/model/effort/resume) from the task form (§10.5). */
   agents?: Record<string, AgentSpec>;
-  /** Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent.
-   *  Absent ⇒ human (or `auto` when the legacy `autoConfirm` flag is set). */
+  /** The Review-gate confirm layers (SPEC §5.2), played in order — each a human
+   *  confirmation or a Confirm-agent turn; [] ⇒ auto-confirm. Absent ⇒ one human
+   *  layer (or none when the legacy `autoConfirm` flag is set). */
   confirm?: ConfirmConfig;
   /** A snapshot of project config, captured at creation. */
   project: ProjectConfig;
@@ -530,6 +595,36 @@ export interface TaskInput {
    * Sparse — only non-`queue` fields are carried; a missing name means `queue`.
    */
   paramWindows?: Record<string, FieldMutable>;
+  /**
+   * Recovery checkpoint for restarting a failed software-dev execution. A failed
+   * Temporal run is terminal, so Retry starts a new run which opens this existing
+   * world instead of recreating it (and thereby deleting dirty work). Kept on the
+   * generic input for serialization; only software-dev consumes it.
+   */
+  recovery?: TaskRecoveryCheckpoint;
+}
+
+/** Plain serializable world handle + conversation state needed to resume a failed
+ * software-dev task. Mirrors world/types without importing Node-facing world code. */
+export interface TaskRecoveryCheckpoint {
+  world: {
+    kind: 'worktree' | 'container' | 'memory';
+    id: string;
+    root: string;
+    branch: string;
+    base: string;
+    repo?: string;
+    target?: string;
+    repos?: { name: string; repo: string; root: string; branch: string; base: string }[];
+    meta?: Record<string, unknown>;
+  };
+  messages: Message[];
+  transcripts?: { role: string; label: string; messages: Message[] }[];
+  reviewInfo?: ReviewInfo;
+  session?: string;
+  sessionHome?: string;
+  seen?: number;
+  target?: string;
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────

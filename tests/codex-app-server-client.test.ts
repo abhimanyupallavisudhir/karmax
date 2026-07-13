@@ -90,4 +90,27 @@ describe('CodexAppServerClient', () => {
     client.close();
     await expect(p).rejects.toThrow(/closed/);
   });
+
+  it('turns an asynchronous stdin EPIPE into a request rejection instead of an uncaught process error', async () => {
+    const stdout = new PassThrough();
+    const stdin = new PassThrough();
+    const client = new CodexAppServerClient(stdin, stdout);
+    const p = client.request('turn/start', {});
+
+    // Real child stdin sockets emit this asynchronously; emit() would throw and
+    // fail the whole test process if the transport had no error listener.
+    const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    expect(() => stdin.emit('error', epipe)).not.toThrow();
+    await expect(p).rejects.toThrow(/transport failed: write EPIPE/);
+    await expect(client.request('thread/start', {})).rejects.toThrow(/closed/);
+  });
+
+  it('rejects pending requests when app-server stdout disappears before child close', async () => {
+    const stdout = new PassThrough();
+    const stdin = new PassThrough();
+    const client = new CodexAppServerClient(stdin, stdout);
+    const p = client.request('initialize', {});
+    stdout.end();
+    await expect(p).rejects.toThrow(/stdout ended/);
+  });
 });

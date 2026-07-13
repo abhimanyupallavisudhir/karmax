@@ -22,7 +22,9 @@ import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
+import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -89,6 +91,7 @@ export class Gateway {
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions = new ReviewActionRunner();
   private attachments = new AttachmentStore();
+  private modelCatalog?: { at: number; value: ModelCatalog };
 
   constructor(private deps: GatewayDeps) {}
 
@@ -125,20 +128,42 @@ export class Gateway {
       ws.on('close', off);
       ws.on('error', off);
     });
-    wssTerm.on('connection', (ws, req) => this.terminal(ws, req));
+    wssTerm.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
+    });
     wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
 
-    await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', () => resolve()));
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      server.once('error', onError);
+      server.listen(port, '127.0.0.1', () => {
+        server.off('error', onError);
+        // Keep an operational listener after the startup race; errors are exposed
+        // by endpoint-specific handling instead of becoming uncaught events.
+        server.on('error', () => {});
+        resolve();
+      });
+    });
     return {
       url: `http://127.0.0.1:${port}`,
       port,
       close: () =>
         new Promise<void>((resolve) => {
           this.reviewActions.stopAll();
+          // `WebSocketServer.close()` does not terminate existing upgraded
+          // sockets, and `http.Server.close()` waits for them forever. A stale
+          // browser/test connection therefore used to wedge shutdown and leave
+          // the Temporal worker/runtime installed. Close clients explicitly,
+          // then force any remaining HTTP keep-alive sockets to drain.
+          for (const wss of [wssEvents, wssTerm, wssAction]) {
+            for (const ws of wss.clients) ws.terminate();
+          }
           wssEvents.close();
           wssTerm.close();
           wssAction.close();
           server.close(() => resolve());
+          server.closeAllConnections();
         }),
     };
   }
@@ -768,6 +793,12 @@ export class Gateway {
         });
         return this.json(res, 200, view);
       }
+      // Provider-native, account-aware model pickers. Both the Claude Agent SDK and
+      // Codex app-server expose this metadata; cache it because each refresh boots a
+      // short-lived provider subprocess for every distinct connected login.
+      if (p === '/api/models' && method === 'GET') {
+        return this.json(res, 200, await this.availableModels(url.searchParams.get('refresh') === '1'));
+      }
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
@@ -880,6 +911,57 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
+      // Git profiles (PLAN-git-config.md §3): named git identity + credentials for
+      // the repos karmax works on. The registry is public; secrets are write-only
+      // into the vault (never echoed) and resolved JIT by the broker at use time.
+      if (p === '/api/git-profiles' && method === 'GET') {
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        const gp = new GitProfiles(store, this.deps.broker);
+        return this.json(res, 200, { profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null });
+      }
+      if (p === '/api/git-profiles' && method === 'POST') {
+        const b = await this.body(req);
+        if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+        if (!b.name || !b.userName || !b.userEmail) return this.json(res, 400, { error: 'name, userName, userEmail required' });
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        const gp = new GitProfiles(store, this.deps.broker);
+        try {
+          const rec = gp.save({
+            name: String(b.name),
+            userName: String(b.userName),
+            userEmail: String(b.userEmail),
+            sshKey: b.sshKey ? String(b.sshKey) : undefined,
+            signingKey: b.signingKey ? String(b.signingKey) : undefined,
+            githubToken: b.githubToken ? String(b.githubToken) : undefined,
+          });
+          if (b.default) gp.setDefault(rec.name);
+          return this.json(res, 200, { profile: rec }); // never echoes the secrets
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const gitProfileMatch = p.match(/^\/api\/git-profiles\/([^/]+)$/);
+      if (gitProfileMatch && method === 'DELETE') {
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        new GitProfiles(store, this.deps.broker).delete(decodeURIComponent(gitProfileMatch[1]!));
+        return this.json(res, 200, { ok: true });
+      }
+      // The doctor check (PLAN-git-config.md §7): which tier a project's remote
+      // ops resolve to (profile / host fallback) and whether it can reach the
+      // repos' remotes non-interactively. Read-only.
+      if (p === '/api/git-profiles/preflight' && method === 'GET') {
+        const projectId = url.searchParams.get('projectId') ?? undefined;
+        const project = projectId ? store.getProject(projectId) : undefined;
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        return this.json(res, 200, await new GitProfiles(store, this.deps.broker).preflight(project?.config));
+      }
+      if (p === '/api/git-profiles/default' && method === 'POST') {
+        const b = await this.body(req);
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        new GitProfiles(store, this.deps.broker).setDefault(b.name ? String(b.name) : undefined);
+        return this.json(res, 200, { ok: true });
+      }
+
       // Manual availability override for an agent login (SPEC §6.2): force a login
       // on/off or edit its reset time (e.g. after upgrading a plan) without waiting
       // for the old refresh. Signals the account coordinator directly.
@@ -918,7 +1000,7 @@ export class Gateway {
       if (p === '/api/accounts/usage' && method === 'GET') {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
-        const { isUsagePollable } = await import('../agent/usage.js');
+        const { isUsagePollable, isUsageStale } = await import('../agent/usage.js');
         const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
         const usage: Record<string, unknown> = {};
         const pollable: string[] = [];
@@ -926,7 +1008,14 @@ export class Gateway {
           const canPoll = isUsagePollable(c);
           if (canPoll) pollable.push(c.key);
           const cached = store.kvGet(`usage:${c.key}`);
-          if (cached) usage[c.key] = JSON.parse(cached);
+          // `stale` = a window already reset or the probe outlived its TTL; the
+          // dashboard auto-rechecks stale snapshots instead of presenting them as
+          // current (a week-old 15% once masqueraded as live while the login was
+          // actually exhausted).
+          if (cached) {
+            const snap = JSON.parse(cached);
+            usage[c.key] = canPoll ? { ...snap, stale: isUsageStale(snap, Date.now()) } : snap;
+          }
           // Explain absence on a Claude login that CAN'T be polled (setup-token, no
           // full `.credentials.json`) so the dashboard shows a reason, not a blank.
           else if (!canPoll && c.provider === 'claude' && c.kind !== 'key') usage[c.key] = { ok: false, reason: 'setup-token' };
@@ -1137,6 +1226,37 @@ export class Gateway {
     return { activated: workflow, requires: m?.requires ?? [], spawnedTasks: spawned };
   }
 
+  private async availableModels(refresh = false): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
+    if (!refresh && this.modelCatalog && Date.now() - this.modelCatalog.at < 5 * 60_000) {
+      return { providers: this.modelCatalog.value, refreshedAt: this.modelCatalog.at };
+    }
+    const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+    const { enumerateCredentials } = await import('../platform/credentials.js');
+    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+    const homes = (provider: 'claude' | 'codex') => {
+      const values = creds.filter((c) => c.provider === provider && c.kind !== 'key').map((c) => c.configHome);
+      // No subscription login: let the provider process use the ambient API key.
+      if (!values.length && creds.some((c) => c.provider === provider && c.kind === 'key')) values.push(undefined);
+      return [...new Set(values)];
+    };
+    const settled = async (provider: 'claude' | 'codex') => {
+      const fn = provider === 'claude' ? claudeModels : codexModels;
+      const results = await Promise.all(homes(provider).map((home) => fn(home).catch(() => [])));
+      return mergeModels(results);
+    };
+    const [claude, codex] = await Promise.all([settled('claude'), settled('codex')]);
+    // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
+    // safe presets so forms never degrade to an empty, non-actionable picker.
+    const value: ModelCatalog = {
+      claude: claude.length ? claude : [
+        { id: 'claude-sonnet-5' }, { id: 'claude-opus-4-8' }, { id: 'claude-haiku-4-5' }, { id: 'claude-fable-5' },
+      ],
+      codex: codex.length ? codex : [{ id: 'gpt-5.5' }, { id: 'gpt-5.4-mini' }],
+    };
+    this.modelCatalog = { at: Date.now(), value };
+    return { providers: value, refreshedAt: this.modelCatalog.at };
+  }
+
   /** For each agent field, resolve the concrete provider/model the server would
    *  actually run (setting → seeded profile → code default), so the form can show
    *  it as the inherited default. */
@@ -1158,7 +1278,10 @@ export class Gateway {
 
   /** Probe usage for the pollable Claude logins (all, or just `only`) and cache the
    *  snapshots in kv under `usage:<credKey>`. Drives the dashboard's real %; a probe
-   *  shells out `claude -p '/usage'` in an isolated dir so it can't race a leased home. */
+   *  shells out `claude -p '/usage'` in an isolated dir so it can't race a leased home.
+   *  Overlapping rechecks (auto-refresh + button, multiple tabs) share one in-flight
+   *  probe per login rather than spawning duplicate CLIs. */
+  private usageProbes = new Map<string, Promise<unknown>>();
   private async refreshUsage(only?: string): Promise<Record<string, unknown>> {
     const { store } = this.deps;
     const { enumerateCredentials } = await import('../platform/credentials.js');
@@ -1168,10 +1291,15 @@ export class Gateway {
       .filter((c) => isUsagePollable(c) && (!only || c.key === only));
     const out: Record<string, unknown> = {};
     await Promise.all(creds.map(async (c) => {
-      // ambient uses ~/.claude (no configHome); a login uses its own home.
-      const snap = await probeClaudeUsage({ configHome: c.kind === 'ambient' ? undefined : c.configHome });
-      store.kvSet(`usage:${c.key}`, JSON.stringify(snap));
-      out[c.key] = snap;
+      let probe = this.usageProbes.get(c.key);
+      if (!probe) {
+        // ambient uses ~/.claude (no configHome); a login uses its own home.
+        probe = probeClaudeUsage({ configHome: c.kind === 'ambient' ? undefined : c.configHome })
+          .then((snap) => { store.kvSet(`usage:${c.key}`, JSON.stringify(snap)); return snap; })
+          .finally(() => this.usageProbes.delete(c.key));
+        this.usageProbes.set(c.key, probe);
+      }
+      out[c.key] = await probe;
     }));
     return out;
   }
@@ -1189,13 +1317,23 @@ export class Gateway {
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
-      // A confirmer also carries a MODE (human/auto/agent) that inherits normally —
-      // plus its review-request prompt template, when one is stored at this scope
-      // (the form falls back to the field's promptDefault); the agent knobs above
-      // are the defaults shown once "agent" mode is selected.
+      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
+      // A confirmer carries the ordered confirm LAYERS (legacy {mode} values
+      // normalize). Each agent layer gets the role-default agent knobs filled in,
+      // same as a bare agent field; `agentDefault` rides along so the form can
+      // prefill a NEWLY added agent layer the same way (display-only — collectForm
+      // never stores it).
       out[f.name] = f.type === 'confirmer'
-        ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}), ...(spec.prompt ? { prompt: spec.prompt } : {}) }
+        ? {
+            layers: confirmLayersOf(Object.keys(spec).length ? spec : (f.default as any)).map((l) => {
+              if (l.kind !== 'agent') return { kind: l.kind };
+              const lprov = l.provider ?? prof?.provider ?? defaultProvider().provider;
+              const lmodel = l.model ?? prof?.model ?? defaultModel(lprov);
+              const leffort = l.effort ?? prof?.effort ?? defaultEffort(lprov);
+              return { ...l, provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
+            }),
+            agentDefault: agent,
+          }
         : agent;
     }
     return out;

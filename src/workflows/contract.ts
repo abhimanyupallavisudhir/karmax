@@ -5,11 +5,14 @@
  */
 export type {
   TaskInput,
+  TaskRecoveryCheckpoint,
   TaskView,
   Stage,
   TaskStatus,
+  AgentRole,
   AgentSpec,
   ConfirmConfig,
+  ConfirmLayer,
   ConfirmMode,
   ConfirmDecision,
   ConfirmAction,
@@ -24,7 +27,11 @@ export type {
   RaiseToParent,
   RaiseType,
   SubTaskAction,
+  RemotePolicy,
 } from '../domain/types.js';
+
+// Pure, deterministic helper (no Node imports) — safe inside the workflow sandbox.
+export { remotePolicyOf } from '../domain/types.js';
 
 /** One repo checked out in a (possibly multi-repo) world, as carried in state. */
 export interface WorldRepoLike {

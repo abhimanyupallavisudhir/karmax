@@ -271,8 +271,12 @@ export class ClaudeAdapter implements AgentAdapter {
     const env = scrubbedEnv({
       provider: 'claude',
       configHome: input.resolvedAuth?.configHome,
-      // A captured setup-token login: re-supply it (scrubbedEnv strips it by default).
-      ...(input.resolvedAuth?.oauthToken ? { extra: { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } } : {}),
+      // A captured setup-token login: re-supply it (scrubbedEnv strips it by default),
+      // plus any JIT-resolved subprocess env (git profile credentials, §4B).
+      extra: {
+        ...(input.extraEnv ?? {}),
+        ...(input.resolvedAuth?.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } : {}),
+      },
     });
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
@@ -378,6 +382,10 @@ export class ClaudeAdapter implements AgentAdapter {
             windowsHide: true,
             detached: true, // own process group ⇒ group kills reap tool subprocesses too
           });
+          // The SDK attaches its own transport handling after this callback returns;
+          // cover the spawn→return edge so an asynchronous ENOENT never becomes an
+          // unhandled EventEmitter error in the host process.
+          child.on('error', () => {});
           if (child.pid) {
             const pid = child.pid;
             registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });

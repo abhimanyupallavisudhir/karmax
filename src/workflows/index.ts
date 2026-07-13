@@ -24,14 +24,19 @@ export { budgetCoordinator } from '../coordinators/budget.js';
  * per-execution version pin. The bare names above stay for back-compat with
  * in-flight executions started before versioning and with unversioned callers.
  *
- * Bundled workflows only ever ship their current manifest version here; older
- * pins and third-party versions arrive as separate packages (§21c). The probe
- * pair proves two versions of one type coexist in a single worker.
+ * Bundled workflow versions with live/replayable histories remain explicit
+ * exports here. A version string is an immutable code contract, not an alias to
+ * whatever implementation is current. The probe pair proves two versions of
+ * one type coexist in a single worker.
  */
-export { softwareDev as 'softwareDev@1.0.0' } from './software-dev.js';
-export { justDo as 'justDo@1.0.0' } from './just-do.js';
+export { softwareDevV1 as 'softwareDev@1.0.0' } from './software-dev.js';
+export { softwareDev as 'softwareDev@1.1.0' } from './software-dev.js';
+export { justDoV1 as 'justDo@1.0.0' } from './just-do.js';
+export { justDo as 'justDo@1.1.0' } from './just-do.js';
 export { scriptExec as 'scriptExec@1.0.0' } from './script-exec.js';
-export { goal as 'goal@1.0.0' } from './goal.js';
-export { mergeOnly as 'mergeOnly@1.0.0' } from './merge-only.js';
+export { goalV1 as 'goal@1.0.0' } from './goal.js';
+export { goal as 'goal@1.1.0' } from './goal.js';
+export { mergeOnlyV1 as 'mergeOnly@1.0.0' } from './merge-only.js';
+export { mergeOnly as 'mergeOnly@1.1.0' } from './merge-only.js';
 export { versionedProbeV1 as 'versionedProbe@1.0.0' } from './versioned-probe.js';
 export { versionedProbeV2 as 'versionedProbe@2.0.0' } from './versioned-probe.js';

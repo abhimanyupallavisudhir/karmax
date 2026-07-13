@@ -248,7 +248,9 @@ function agentField(key: string): FieldDef {
   const role = m[1]!.toLowerCase();
   const storageKey = AGENT_SUB[m[2]!.toLowerCase()]!;
   const read = (t: SearchTask) => {
-    const spec = t.params?.[role] as any;
+    let spec = t.params?.[role] as any;
+    // A confirmer stores layers; read the first agent layer's spec.
+    if (spec && typeof spec === 'object' && Array.isArray(spec.layers)) spec = spec.layers.find((l: any) => l?.kind === 'agent');
     const v = spec && typeof spec === 'object' ? spec[storageKey] : undefined;
     return v == null ? undefined : String(v);
   };

@@ -14,7 +14,9 @@ import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision } from './contract.js';
+import { confirmLayersOf } from '../domain/confirm.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer, remotePolicyOf } from './contract.js';
+import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 const long = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', retry: { maximumAttempts: 1 } });
@@ -51,6 +53,15 @@ export interface MergeOnlyInput extends TaskInput {
  * PR-test-approve gate (§4.4) is dogfooded, not separate machinery.
  */
 export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true);
+}
+
+/** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
+export async function mergeOnlyV1(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, false);
+}
+
+async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Promise<{ stage: Stage; sha?: string }> {
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -62,12 +73,16 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   let confirmed = false;
   let cancelled = false;
   let world: WorldHandleLike | undefined;
-  // Who confirms at the Review gate (SPEC §5.2): human / auto / a Confirm agent. The
-  // legacy `autoConfirm` flag maps to `auto`; explicit `input.confirm` wins.
-  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? (input.autoConfirm ? 'auto' : 'human');
+  // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
+  // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
+  // and the `autoConfirm` flag normalize to their layer equivalents.
+  const confirmLayers = confirmLayersOf(input.confirm, !!input.autoConfirm);
   let reviewInfo: ReviewInfo | undefined;
   let mergeGranted = false;
   let checks: { passed: boolean; detail?: string } | undefined;
+  let waitingFor: TaskView['waitingFor'];
+  let agentTurn: TaskView['agentTurn'];
+  let mergeQueue: { position: number; total: number; current?: string } | undefined;
   let pointOfNoReturnPassed = false;
   // `target` is editable in-flight until committed to the merge queue / a PR opens.
   let targetLocked = false;
@@ -101,21 +116,38 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
       taskId, title: input.title, workflow: 'merge-only', stage, status, messages: msgs, reviewInfo,
       actions: actions(), state: { checks, mergeGranted, targetLocked }, branch: world?.branch, base, targetBranch: target,
       worldPath: world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
-      editableParams: editableParamsNow(),
+      editableParams: editableParamsNow(), waitingFor, agentTurn, mergeQueue,
       updatedAt: workflowInfo().historyLength,
     };
   }
   const publish = async () => core.publishView(taskId, view());
+  const leaser = managedTurns
+    ? createAgentTurnLeaser(core, coord, {
+        taskId,
+        projectId: input.projectId,
+        task: () => input,
+        status: () => status,
+        setStatus: (next) => { status = next; },
+        setWaitingFor: (next) => { waitingFor = next; },
+        setAgentTurn: (next) => { agentTurn = next; },
+        cancelled: () => cancelled,
+        publish,
+      })
+    : undefined;
 
   /** Run one Confirm-agent turn (SPEC §5.2): review the branch, return a verdict, or
    *  undefined on failure so the caller leaves the gate to a human. */
-  async function runConfirm(): Promise<ConfirmDecision | undefined> {
+  async function runConfirm(layer: ConfirmLayer): Promise<ConfirmDecision | undefined> {
     try {
+      // The layer's own agent spec drives this turn (each agent layer can run a
+      // different reviewer); a spec-less layer falls back to the confirm profile.
+      const { kind: _kind, prompt: _prompt, ...layerSpec } = layer;
+      const task = layerSpec.provider ? { ...input, agents: { ...(input.agents ?? {}), confirm: { ...layerSpec, provider: layerSpec.provider } } } : input;
       // Fresh turn each Review so the reviewer judges the current branch; a mid-turn
       // retry still resumes via runAgentTurn heartbeat details. The review request
       // (task prompt + what's under review, template user-editable via the confirmer
       // field) is delivered as the conversation message, like software-dev's.
-      const request = renderConfirmPrompt(input.confirm?.prompt, {
+      const request = renderConfirmPrompt(layer.prompt ?? input.confirm?.prompt, {
         title: input.title,
         prompt: input.prompt,
         response: reviewInfo?.summary ?? '(no summary)',
@@ -123,18 +155,21 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
         changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
         transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
       });
-      const ct = await turns.runAgentTurn({
-        taskId,
-        role: 'confirm',
-        worldHandle: world as any,
-        messages: [{ id: 'c-in-0', role: 'user', text: request, ts: 0 }],
-        task: input,
-        bindings: {
-          reviewInfo: reviewInfo?.summary ?? '',
-          changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
-          transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
-        },
-      });
+      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+        turns.runAgentTurn({
+          taskId,
+          role: 'confirm',
+          worldHandle: world as any,
+          messages: [{ id: 'c-in-0', role: 'user', text: request, ts: 0 }],
+          task,
+          bindings: {
+            reviewInfo: reviewInfo?.summary ?? '',
+            changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
+            transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
+          },
+          ...(lease ? lease : {}),
+        });
+      const ct = leaser ? await leaser.run('confirm', invoke) : await invoke();
       return ct.confirmDecision;
     } catch {
       return undefined;
@@ -150,7 +185,10 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
     msgs.push({ ...m, ts: msgs.length });
   });
   setHandler(cancelSignal, () => {
-    if (!pointOfNoReturnPassed) cancelled = true;
+    if (!pointOfNoReturnPassed) {
+      cancelled = true;
+      leaser?.cancelActive();
+    }
   });
   setHandler(mergeGrantedSignal, () => {
     mergeGranted = true;
@@ -159,7 +197,8 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
 
   await publish();
   // Open a world on the EXISTING branch under review.
-  world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base: target, branch: input.branch, kind: 'worktree' })) as WorldHandleLike;
+  world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base: target, branch: input.branch, gitProfile: input.project.gitProfile, kind: 'worktree' })) as WorldHandleLike;
+  if (leaser) await leaser.init();
 
   // Workflow-repo edits must pass tests + replay-compat before they can merge.
   if (input.workflowEdit) {
@@ -175,17 +214,31 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   status = 'waiting';
   // Never confirm a workflow-edit whose checks failed, whatever the confirmer says.
   const mayConfirm = !input.workflowEdit || (checks?.passed ?? true);
-  if (mayConfirm && confirmMode === 'auto') {
-    confirmed = true;
-  } else if (mayConfirm && confirmMode === 'agent') {
-    await publish();
-    const decision = await runConfirm();
-    if (decision?.action === 'confirm') confirmed = true;
-    else if (decision?.action === 'reject') {
-      if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
-      cancelled = true;
+  if (mayConfirm) {
+    // Play the confirm layers in order (SPEC §5.2); every layer must approve.
+    // [] ⇒ auto-confirm. There is no Do stage to send a `revise` back to, so a
+    // revise / no-verdict agent layer leaves the rest of the gate to a human.
+    let leftToHuman = false;
+    for (const layer of confirmLayers) {
+      if (cancelled || leftToHuman) break;
+      if (layer.kind === 'agent') {
+        await publish();
+        const decision = await runConfirm(layer);
+        if (decision?.action === 'confirm') continue;
+        if (decision?.action === 'reject') {
+          if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
+          cancelled = true;
+        } else {
+          leftToHuman = true;
+        }
+      } else {
+        // A human layer: one Approve click passes ONE layer.
+        await publish();
+        await condition(() => confirmed || cancelled);
+        confirmed = false; // consumed by this layer
+      }
     }
-    // `revise` / no verdict → leave it for a human (no Do stage to send it back to).
+    if (!cancelled && !leftToHuman) confirmed = true;
   }
   await publish();
   await condition(() => confirmed || cancelled);
@@ -197,20 +250,29 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
     return { stage };
   }
 
-  if (input.project.openGithubPr) {
+  if (remotePolicyOf(input.project) === 'pr') {
     targetLocked = true; // opening a PR binds it to `target` (SPEC §2)
     const opened = await core.openPr(world as any, target);
     if (opened) reviewInfo = { ...reviewInfo, links: [...(reviewInfo?.links ?? []), { label: 'PR', url: opened.url }] };
   }
 
   stage = 'merge';
+  if (managedTurns) status = 'active';
   await publish();
   // Commit `target` to the merge-queue domain — no await between locking and
   // reading it, so a queued edit can't desync the domain (SPEC §5.5).
   targetLocked = true;
   const domain = `${world!.repo ?? input.projectId}:${target}`;
   await coord.enqueueMerge(domain, taskId);
+  if (managedTurns) {
+    status = 'waiting';
+    waitingFor = { kind: 'mergeSlot', detail: `Waiting to merge into ${target}` };
+  }
   while (!mergeGranted && !cancelled) {
+    if (managedTurns) {
+      mergeQueue = await coord.mergeQueuePosition(domain, taskId);
+      await publish();
+    }
     await condition(() => mergeGranted || cancelled, '5s');
   }
   if (cancelled && !mergeGranted) {
@@ -220,16 +282,27 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
     await publish();
     return { stage };
   }
+  if (managedTurns) {
+    waitingFor = undefined;
+    status = 'active';
+    mergeQueue = { position: 0, total: mergeQueue?.total ?? 1, current: taskId };
+    await publish();
+  }
   const result = await long.finalizeMergeActivity(world as any, target);
   await coord.releaseMerge(domain, taskId);
   if (!result.merged) {
     stage = 'failed';
     status = 'failed';
-    reviewInfo = { ...reviewInfo, summary: `Merge failed: ${result.conflict ?? result.note}` };
+    reviewInfo = { ...reviewInfo, summary: `Merge failed: ${result.dirty ? `uncommitted changes in the worktree:\n${result.dirty}` : (result.conflict ?? result.note)}` };
     await publish();
     return { stage };
   }
   pointOfNoReturnPassed = true;
+  // Remote policy 'push'/'pr' (PLAN-git-config.md §5): best-effort push of the
+  // landed target — the merge is the deliverable, a failed push is not fatal.
+  if (remotePolicyOf(input.project) !== 'none') {
+    await core.pushTarget(world as any, target).catch(() => undefined);
+  }
   stage = 'done';
   status = 'done';
   reviewInfo = { ...reviewInfo, summary: `Merged into ${target} as ${result.sha?.slice(0, 8)}.` };

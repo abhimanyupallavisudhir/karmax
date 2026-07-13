@@ -1,5 +1,6 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
+import { worldRepos } from '../world/types.js';
 
 /**
  * Deterministic mock agent for hermetic tests. It executes simple directives
@@ -52,6 +53,13 @@ export class MockAdapter implements AgentAdapter {
     const session = input.session ?? `mock-${input.world.handle.id}`;
     ctx.onSession?.(session);
     ctx.heartbeat?.();
+
+    // Hermetic regression hook for the Resolve boundary: the original Do failure
+    // is carried into the Resolve system prompt, letting a test prove that a
+    // failure OF the resolver escalates instead of terminally failing the workflow.
+    if (input.role === 'resolve' && input.systemPrompt.includes('resolve-agent-failure-test')) {
+      throw new Error('resolve agent itself failed');
+    }
 
     let complete = true;
     let pendingSubagents = 0;
@@ -263,6 +271,16 @@ export class MockAdapter implements AgentAdapter {
     const recent = input.messages.filter((m) => m.role === 'user');
     const initialText = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
     await processText(initialText);
+    // A competent merge agent answers the dirty-worktree rejection by committing
+    // (PLAN-git-config.md §6 — finalizeMerge no longer sweeps uncommitted work).
+    // The mock mirrors that, so the loop-back is the exercised path in every
+    // pipeline test whose Do agent @writes without committing.
+    if (/uncommitted changes/.test(initialText) && /commit/i.test(initialText)) {
+      for (const r of worldRepos(input.world.handle)) {
+        await input.world.exec('bash', ['-lc', 'git add -A && git commit -q -m "mock: commit pending work" || true'], { cwd: r.root });
+      }
+      outputs.push('committed pending work');
+    }
     // Catch any follow-up that landed near the end of the turn (or during a non-sleep
     // turn) — process it in-flight rather than deferring it to the next turn.
     await drainFollowUps();
