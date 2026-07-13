@@ -33,6 +33,7 @@ const ctx = (): PlatformToolContext => ({
   confirmDecision() {},
   async requestSpend() { return { status: 'denied' as const }; },
   emit() {},
+  emitActivity() {},
 });
 
 let worldsHome: string;

@@ -292,6 +292,7 @@ export class KarmaxApi {
       title,
       project: project.config,
     });
+    input.createdAt = task.createdAt;
     input.workflow = workflow;
     input.intentId = task.intentId ?? task.id;
     if (args.profiles) input.profiles = args.profiles;
@@ -435,6 +436,7 @@ export class KarmaxApi {
       title: task.title,
       project: project.config,
     });
+    input.createdAt = task.createdAt;
     input.workflow = task.workflow;
     input.intentId = task.intentId ?? task.id;
     if (profiles) input.profiles = profiles as Record<string, string>;
@@ -973,11 +975,12 @@ export class KarmaxApi {
     if (terminal?.status === 'failed' && terminal.workflow === 'software-dev' && !terminal.pointOfNoReturnPassed) {
       if (signal === SIG.retry) return await this.recoverFailedTask(taskId);
       if (signal === SIG.followUp) {
-        const msg: Message = { id: `u${Date.now()}`, role: 'user', text: text ?? '', ts: 0, ...(images?.length ? { images } : {}) };
+        const now = Date.now();
+        const msg: Message = { id: `u${now}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}) };
         const messages = terminal.messages.map((m) => ({ ...m }));
         const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
-        (target ?? messages).push({ ...msg, ts: (target ?? messages).length });
+        (target ?? messages).push(msg);
         this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() });
         return;
       }
@@ -996,11 +999,12 @@ export class KarmaxApi {
     const handle = this.deps.client.workflow.getHandle(taskId);
     try {
       if (signal === SIG.followUp) {
+        const now = Date.now();
         const msg: Message = {
-          id: `u${Date.now()}`,
+          id: `u${now}`,
           role: 'user',
           text: text ?? '',
-          ts: 0,
+          ts: now,
           ...(images?.length ? { images } : {}),
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
@@ -1139,6 +1143,7 @@ export class KarmaxApi {
               taskId: task.id,
               projectId: args.projectId,
               title: args.title,
+              createdAt: task.createdAt,
               prompt: args.title,
               branch: args.branch,
               target: args.target,

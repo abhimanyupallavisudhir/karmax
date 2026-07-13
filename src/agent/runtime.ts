@@ -1,6 +1,6 @@
 import { AgentAdapter, PlatformToolContext, TurnInput, TurnResult } from './types.js';
 import type { Transition } from '../resolve/transitions.js';
-import { Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, Provider, ReviewInfo, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 
 const fmt = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(2)}`;
 
@@ -8,6 +8,8 @@ export interface RunTurnDeps {
   adapters: Map<Provider, AgentAdapter>;
   /** Stream incremental output to the task's live event log. */
   onEmit?: (text: string) => void;
+  /** Durable, provider-neutral turn items (tools, commands, edits, status, text). */
+  onActivity?: (activity: AgentActivity) => void;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
   budget?: {
     request(ctx: { projectId: string; taskId: string }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -106,6 +108,9 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     emit(text) {
       deps.onEmit?.(text);
     },
+    emitActivity(activity) {
+      deps.onActivity?.(activity);
+    },
     onSession: deps.onSession,
     signal: deps.signal,
     heartbeat: deps.heartbeat,
@@ -126,6 +131,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       }, 10_000)
     : undefined;
   let turn;
+  deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' });
   try {
     turn = await adapter.runTurn(input, ctx);
     // An adapter may deliberately swallow its provider's AbortError so it can clean
@@ -145,6 +151,22 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     if (turn.termination?.kind !== 'success') {
       throw new Error('agent provider ended without a verified successful terminal event');
     }
+    deps.onActivity?.({
+      id: 'turn',
+      kind: 'turn',
+      phase: 'completed',
+      title: 'Agent finished',
+      ...(turn.termination.reason ? { detail: turn.termination.reason } : {}),
+    });
+  } catch (error) {
+    deps.onActivity?.({
+      id: 'turn',
+      kind: 'turn',
+      phase: 'failed',
+      title: 'Agent turn failed',
+      detail: error instanceof Error ? error.message.slice(0, 1200) : String(error).slice(0, 1200),
+    });
+    throw error;
   } finally {
     if (hb) clearInterval(hb);
   }

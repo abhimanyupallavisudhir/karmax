@@ -346,11 +346,36 @@ a { color: var(--accent); text-decoration: none; }
 
 /* thread */
 .thread { display: flex; flex-direction: column; gap: 10px; }
-.msg { padding: 10px 13px; border-radius: 10px; max-width: 92%; white-space: pre-wrap; word-break: break-word; }
+.msg { padding: 10px 13px; border-radius: 10px; max-width: 92%; word-break: break-word; }
 .msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 3px; }
 .msg.agent { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--line); border-bottom-left-radius: 3px; }
 .msg.system { align-self: center; background: transparent; color: var(--ink-3); font-size: 12px; font-style: italic; }
-.msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; margin-bottom: 3px; font-family: var(--font-mono); }
+.msg-text { white-space: pre-wrap; }
+.msg-meta { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; }
+.msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; font-family: var(--font-mono); }
+.msg time, .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
+
+/* Provider-native work items. Commands, file edits, tools, reasoning and turn
+   lifecycle live inline with the messages, but stay visually quieter than chat. */
+.agent-activity { width: min(92%, 760px); align-self: flex-start; display: flex; gap: 10px; padding: 7px 10px; margin: -2px 0; color: var(--ink-2); font-size: 12px; }
+.activity-icon { width: 20px; height: 20px; flex: none; display: grid; place-items: center; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--line); color: var(--ink-3); font: 11px/1 var(--font-mono); }
+.agent-activity.running .activity-icon, .agent-activity.started .activity-icon, .agent-activity.updated .activity-icon { color: var(--working); border-color: color-mix(in srgb, var(--working) 35%, var(--line)); }
+.agent-activity.failed .activity-icon { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); background: var(--danger-weak); }
+.agent-activity.completed .activity-icon { color: var(--merged); }
+.activity-body { min-width: 0; flex: 1; }
+.activity-head { min-height: 20px; display: flex; align-items: center; gap: 8px; }
+.activity-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); color: var(--ink-2); }
+.activity-state { padding: 1px 5px; border-radius: 999px; background: var(--surface-2); color: var(--ink-3); font: 9px/1.5 var(--font-mono); text-transform: uppercase; }
+.activity-head time { margin-left: auto; }
+.activity-detail { margin-top: 3px; }
+.activity-detail summary { width: max-content; color: var(--ink-3); cursor: pointer; font-size: 11px; }
+.activity-detail pre { max-height: 260px; overflow: auto; margin: 5px 0 0; padding: 8px 10px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2); white-space: pre-wrap; word-break: break-word; font: 11px/1.45 var(--font-mono); }
+.conversation-presence { display: inline-flex; align-items: center; gap: 6px; padding: 2px 7px; border-radius: 999px; color: var(--ink-2); background: var(--surface-2); font-size: 11px; }
+.presence-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); }
+.conversation-presence.working .presence-dot { background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+.conversation-presence.waiting .presence-dot { background: var(--working); }
+.conversation-presence.done .presence-dot { background: var(--merged); }
+.conversation-presence.failed .presence-dot { background: var(--danger); }
 
 /* review panel */
 .review { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; background: var(--surface-2); }

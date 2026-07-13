@@ -47,6 +47,7 @@ export class MockAdapter implements AgentAdapter {
   readonly provider = 'mock' as const;
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    ctx.emitActivity ??= () => {};
     // Mirror the real adapters: publish the session id the moment it exists and
     // beat once, so an interrupted turn's retry can resume it (heartbeat details
     // carry the session — see runAgentTurn) and pending cancellations deliver.
@@ -100,13 +101,23 @@ export class MockAdapter implements AgentAdapter {
       switch (directive) {
         case 'write': {
           const [p, content = ''] = splitOn(rest, '::');
+          ctx.emitActivity({ id: `write-${p.trim()}`, kind: 'file', phase: 'started', title: `Write ${p.trim()}` });
           await input.world.writeFile(p.trim(), content.replace(/\\n/g, '\n'));
+          ctx.emitActivity({ id: `write-${p.trim()}`, kind: 'file', phase: 'completed', title: `Wrote ${p.trim()}` });
           ctx.emit(`wrote ${p.trim()}`);
           outputs.push(`wrote ${p.trim()}`);
           break;
         }
         case 'run': {
+          ctx.emitActivity({ id: `run-${rest}`, kind: 'command', phase: 'started', title: rest });
           const r = await input.world.exec('bash', ['-lc', rest]);
+          ctx.emitActivity({
+            id: `run-${rest}`,
+            kind: 'command',
+            phase: r.code === 0 ? 'completed' : 'failed',
+            title: rest,
+            detail: `${r.stdout}${r.stderr}`.trim().slice(0, 1600),
+          });
           ctx.emit(`$ ${rest}\n${r.stdout}${r.stderr}`);
           outputs.push(`ran: ${rest} (exit ${r.code})`);
           break;
@@ -302,6 +313,7 @@ export class MockAdapter implements AgentAdapter {
 
     if (outputs.length === 0) outputs.push('(mock agent: no directives; nothing to do)');
     if (complete) ctx.signalCompletion(outputs.join('; '));
+    ctx.emitActivity({ id: `message-${deliveredIndex}`, kind: 'message', phase: 'completed', title: outputs.join('\n') });
     return {
       termination: { kind: 'success', status: 'mock.completed' },
       session,

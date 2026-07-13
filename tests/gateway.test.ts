@@ -88,6 +88,10 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     // events endpoint returns a live log
     const events: any = await (await fetch(`${base}/api/tasks/${task.id}/events?since=0`, { headers: auth() })).json();
     expect(events.length).toBeGreaterThan(0);
+    expect(events.some((event: any) => event.type === 'agent.activity' && event.payload?.kind === 'file')).toBe(true);
+    const reviewView: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+    expect(reviewView.messages[0].role).toBe('user');
+    expect(reviewView.messages[0].ts).toBeGreaterThan(1_000_000_000_000);
 
     // confirm → merges
     await fetch(`${base}/api/tasks/${task.id}/signal`, {

@@ -13,6 +13,7 @@ import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBack
 import { spawn } from 'node:child_process';
 import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
+import { activityDetail, claudeToolActivity } from './activity.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -38,6 +39,9 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+    // Optional for compatibility with third-party adapters/test harnesses built
+    // before structured timeline events were introduced.
+    ctx.emitActivity ??= () => {};
     const auth = input.resolvedAuth;
     // Route on the PROFILE's resolved auth first, so each profile picks its rail:
     // an API key → the Messages API (metered); a config home → the subscription
@@ -130,6 +134,7 @@ export class ClaudeAdapter implements AgentAdapter {
       if (text) {
         finalText = text;
         ctx.emit(text);
+        ctx.emitActivity({ id: `message-${i}`, kind: 'message', phase: 'completed', title: text });
       }
       if (toolUses.length === 0) {
         // A `max_tokens` cut-off is a TRUNCATED response, not a finished turn — the
@@ -159,7 +164,9 @@ export class ClaudeAdapter implements AgentAdapter {
       let completed = false;
       for (const use of toolUses) {
         const handler = handlers[use.name];
+        ctx.emitActivity(claudeToolActivity(use, 'started'));
         const result = handler ? await handler(use.input ?? {}) : `unknown tool ${use.name}`;
+        ctx.emitActivity(claudeToolActivity(use, 'completed', result));
         toolResults.push({ type: 'tool_result', tool_use_id: use.id, content: result });
         if (use.name === 'signal_completion') completed = true;
       }
@@ -328,6 +335,7 @@ export class ClaudeAdapter implements AgentAdapter {
     let finalText = '';
     let session = input.session;
     let completionSeen = false; // agent called signal_completion → stop injecting, end the turn
+    const toolActivities = new Map<string, ReturnType<typeof claudeToolActivity>>();
     let successfulResult: any;
     // Track in-harness sub-agents (the Task tool). Claude Code auto-backgrounds long
     // sub-agents, so the main `result` can arrive — completion already signalled —
@@ -448,6 +456,29 @@ export class ClaudeAdapter implements AgentAdapter {
           if (text) {
             finalText = text;
             ctx.emit(text);
+            ctx.emitActivity({
+              id: String((message as any).uuid ?? `message-${Date.now()}`),
+              kind: 'message',
+              phase: 'completed',
+              title: text,
+            });
+          }
+          for (const block of content) {
+            if (block?.type === 'tool_use') {
+              const activity = claudeToolActivity(block, 'started');
+              toolActivities.set(activity.id, activity);
+              ctx.emitActivity(activity);
+            }
+            else if (block?.type === 'thinking') {
+              const detail = activityDetail(block.thinking ?? block.text);
+              ctx.emitActivity({
+                id: String(block.signature ?? `${(message as any).uuid ?? 'thinking'}-thinking`),
+                kind: 'reasoning',
+                phase: 'completed',
+                title: 'Reasoning',
+                ...(detail ? { detail } : {}),
+              });
+            }
           }
           // The agent's explicit "I'm done" — a signal_completion tool call (the MCP
           // tool name is namespaced, e.g. `mcp__karmax__signal_completion`). Once seen,
@@ -456,6 +487,72 @@ export class ClaudeAdapter implements AgentAdapter {
           if (content.some((b: any) => b.type === 'tool_use' && /signal_completion$/.test(String(b.name ?? '')))) {
             completionSeen = true;
           }
+        } else if (message.type === 'user') {
+          const content = Array.isArray((message as any).message?.content) ? (message as any).message.content : [];
+          for (const block of content) {
+            if (block?.type !== 'tool_result') continue;
+            const detail = activityDetail(block.content ?? (message as any).tool_use_result);
+            const id = String(block.tool_use_id ?? 'tool-result');
+            const prior = toolActivities.get(id);
+            ctx.emitActivity({
+              id,
+              kind: prior?.kind ?? 'tool',
+              phase: block.is_error ? 'failed' : 'completed',
+              title: prior?.title ?? (block.is_error ? 'Tool failed' : 'Tool completed'),
+              ...(detail ? { detail } : {}),
+            });
+          }
+        } else if (message.type === 'tool_progress') {
+          ctx.emitActivity({
+            id: String((message as any).tool_use_id),
+            kind: 'tool',
+            phase: 'updated',
+            title: String((message as any).tool_name ?? 'Tool call'),
+            detail: `${Number((message as any).elapsed_time_seconds ?? 0).toFixed(1)}s elapsed`,
+          });
+        } else if (message.type === 'tool_use_summary') {
+          ctx.emitActivity({
+            id: String((message as any).preceding_tool_use_ids?.[0] ?? (message as any).uuid ?? 'tool-summary'),
+            kind: 'tool',
+            phase: 'updated',
+            title: 'Tool activity',
+            ...(activityDetail((message as any).summary) ? { detail: activityDetail((message as any).summary) } : {}),
+          });
+        } else if (message.type === 'system' && (message as any).subtype === 'status') {
+          const status = (message as any).status;
+          if (status) ctx.emitActivity({ id: 'claude-status', kind: 'status', phase: 'updated', title: status === 'compacting' ? 'Compacting conversation context' : 'Contacting Claude' });
+        } else if (message.type === 'system' && (message as any).subtype === 'task_started' && !(message as any).skip_transcript) {
+          ctx.emitActivity({
+            id: String((message as any).task_id),
+            kind: 'subagent',
+            phase: 'started',
+            title: String((message as any).description ?? 'Started sub-agent'),
+            ...(activityDetail((message as any).prompt) ? { detail: activityDetail((message as any).prompt) } : {}),
+          });
+        } else if (message.type === 'system' && (message as any).subtype === 'task_progress') {
+          ctx.emitActivity({
+            id: String((message as any).task_id),
+            kind: 'subagent',
+            phase: 'updated',
+            title: String((message as any).description ?? 'Sub-agent working'),
+            ...(activityDetail((message as any).summary ?? (message as any).last_tool_name) ? { detail: activityDetail((message as any).summary ?? (message as any).last_tool_name) } : {}),
+          });
+        } else if (message.type === 'system' && (message as any).subtype === 'task_notification' && !(message as any).skip_transcript) {
+          const failed = (message as any).status === 'failed';
+          ctx.emitActivity({
+            id: String((message as any).task_id),
+            kind: 'subagent',
+            phase: failed ? 'failed' : 'completed',
+            title: String((message as any).summary ?? `Sub-agent ${(message as any).status}`),
+          });
+        } else if (message.type === 'system' && (message as any).subtype === 'permission_denied') {
+          ctx.emitActivity({
+            id: String((message as any).tool_use_id),
+            kind: 'tool',
+            phase: 'failed',
+            title: `${String((message as any).tool_name ?? 'Tool')} denied`,
+            ...(activityDetail((message as any).message) ? { detail: activityDetail((message as any).message) } : {}),
+          });
         } else if (message.type === 'result') {
           session = message.session_id ?? session;
           const result = message as any;

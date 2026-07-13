@@ -1072,8 +1072,13 @@ function connectWs() {
     if (S.selected && ev.taskId === S.selected) {
       S.taskEvents.push(ev);
       if (ev.type === 'agent.output' && ev.payload?.text) {
-        S.liveOutput += (S.liveOutput ? '\n' : '') + ev.payload.text;
+        // Provider adapters emit the current complete block, not a token delta.
+        // Replacing avoids the old "H / He / Hello" cumulative transcript.
+        S.liveOutput = ev.payload.text;
         updateLiveBubble();
+      } else if (ev.type === 'agent.activity') {
+        if (S.taskTab === 'checkin') renderTaskPage();
+        else renderTaskEvents();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
         S.liveOutput = '';
@@ -3437,7 +3442,7 @@ function checkinTab(v) {
     .map((t) => `<div class="ck-item ${sel === t.role ? 'sel' : ''}" data-checkin="${esc(t.role)}">
         <span class="ck-name">${esc(t.label || t.role)}</span>
         ${t.role === liveRole && v.status === 'active' ? '<span class="ck-live" title="agent working"></span>' : ''}
-        <span class="ck-count">${(t.messages || []).length}</span>
+        <span class="ck-count">${conversationEntries(t).length}</span>
       </div>`)
     .join('');
   return `<div class="ck-layout">
@@ -3456,12 +3461,12 @@ function checkinTab(v) {
 
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
-  const msgs = (t.messages || [])
-    .map((m) => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${esc(m.text)}${renderMessageImages(m.images)}</div>`)
-    .join('') || '<div class="msg system">No messages yet</div>';
+  const entries = conversationEntries(t);
+  const msgs = entries.map(renderConversationEntry).join('') || '<div class="msg system">No messages yet</div>';
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
-  const live = t.role === liveRoleFor(v)
+  const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
+  const live = t.role === liveRoleFor(v) && !hasStructuredMessages
     ? `<div class="msg agent ${S.liveOutput && v.status === 'active' ? '' : 'hidden'}" id="live-bubble"><div class="role">agent · live</div>${esc(S.liveOutput)}</div>`
     : '';
   // Only subscription/CLI sessions carry a config home; API-key / stateless
@@ -3476,6 +3481,7 @@ function conversationPane(v, t) {
   // so a human can address any agent — Do, Merge or Resolve — not just Do. It
   // appears only when the workflow currently allows follow-ups.
   const agentName = esc(t.label || t.role);
+  const presence = conversationPresence(v, t);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = followUp
@@ -3490,12 +3496,102 @@ function conversationPane(v, t) {
   return `
     <div class="ck-pane-head">
       <b>${agentName}</b>
-      <span class="pal-sub">${(t.messages || []).length} message${(t.messages || []).length === 1 ? '' : 's'}</span>
+      <span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>
+      <span class="pal-sub">${entries.length} item${entries.length === 1 ? '' : 's'}</span>
       <span style="flex:1"></span>
       ${copy}
     </div>
     <div class="ck-thread" id="ck-thread" tabindex="-1"><div class="thread">${msgs}${live}</div></div>
     ${fu}`;
+}
+
+// The provider stream is an ordered item timeline (Codex ThreadItems / Claude
+// SDK messages), while `messages` remains the clean model-input transcript. Merge
+// the two only for presentation. Activity updates with the same provider item id
+// replace in place, so a command is one row that moves running → completed rather
+// than two noisy rows.
+function conversationEntries(t) {
+  const updates = (S.taskEvents || []).filter((event) => event.type === 'agent.activity' && event.payload?.role === t.role);
+  const activities = new Map();
+  for (const event of updates) {
+    const activity = event.payload || {};
+    const turn = activity.turnId || `legacy-${event.seq || event.ts}`;
+    const key = `${turn}/${activity.id || event.seq || event.ts}`;
+    const prior = activities.get(key);
+    activities.set(key, {
+      type: 'activity',
+      activity: { ...(prior?.activity || {}), ...activity },
+      ts: prior?.ts || event.ts,
+      order: prior?.order ?? event.seq ?? event.ts,
+    });
+  }
+
+  // The workflow stores the final assistant reply for provider resume. The same
+  // reply also arrives as a structured provider message; suppress that exact
+  // duplicate while retaining intermediate assistant messages around tool calls.
+  const providerTexts = new Set(
+    [...activities.values()]
+      .filter((entry) => entry.activity.kind === 'message')
+      .map((entry) => String(entry.activity.title || '').trim()),
+  );
+  const messages = (t.messages || [])
+    .filter((message) => message.role !== 'agent' || !providerTexts.has(String(message.text || '').trim()))
+    .map((message, index) => ({ type: 'message', message, ts: message.ts, order: index }));
+  const combined = [...messages, ...activities.values()];
+  return combined.sort((a, b) => {
+    const at = Number(a.ts) > 100000000000 ? Number(a.ts) : -1000000000000 + Number(a.order || 0);
+    const bt = Number(b.ts) > 100000000000 ? Number(b.ts) : -1000000000000 + Number(b.order || 0);
+    return at - bt || Number(a.order || 0) - Number(b.order || 0);
+  });
+}
+
+function conversationTime(ts) {
+  if (Number(ts) < 100000000000) return '';
+  const date = new Date(Number(ts));
+  if (Number.isNaN(date.getTime())) return '';
+  const today = new Date();
+  const sameDay = date.toDateString() === today.toDateString();
+  return new Intl.DateTimeFormat(undefined, sameDay
+    ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+    : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date);
+}
+
+function conversationTimeHtml(ts) {
+  const label = conversationTime(ts);
+  if (!label) return '';
+  return `<time datetime="${new Date(Number(ts)).toISOString()}" title="${esc(new Date(Number(ts)).toLocaleString())}">${esc(label)}</time>`;
+}
+
+function renderConversationEntry(entry) {
+  if (entry.type === 'message') {
+    const m = entry.message;
+    const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
+    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}</div><div class="msg-text">${esc(m.text)}</div>${renderMessageImages(m.images)}</div>`;
+  }
+  const a = entry.activity;
+  if (a.kind === 'message') {
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}</div><div class="msg-text">${esc(a.title)}</div></div>`;
+  }
+  const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
+  const detail = a.detail
+    ? `<details class="activity-detail"><summary>Details</summary><pre>${esc(a.detail)}</pre></details>`
+    : '';
+  return `<div class="agent-activity ${esc(a.kind)} ${esc(a.phase)}">
+    <span class="activity-icon" aria-hidden="true">${icons[a.kind] || '·'}</span>
+    <div class="activity-body"><div class="activity-head"><span class="activity-title">${esc(a.title)}</span><span class="activity-state">${esc(a.phase)}</span>${conversationTimeHtml(entry.ts)}</div>${detail}</div>
+  </div>`;
+}
+
+function conversationPresence(v, t) {
+  if (v.agentTurn?.role === t.role) {
+    return v.agentTurn.state === 'running'
+      ? { label: 'Working now', tone: 'working' }
+      : { label: 'Waiting for an agent slot', tone: 'waiting' };
+  }
+  if (t.role === liveRoleFor(v) && v.waitingFor) return { label: v.waitingFor.detail || `Waiting for ${v.waitingFor.kind}`, tone: 'waiting' };
+  if (v.status === 'failed') return { label: 'Failed', tone: 'failed' };
+  if (v.status === 'done') return { label: 'Finished', tone: 'done' };
+  return { label: 'Idle', tone: 'idle' };
 }
 
 // The ephemeral terminal: a real PTY in the task's world; type straight into it
