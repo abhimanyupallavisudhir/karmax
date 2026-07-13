@@ -1,4 +1,4 @@
-// Regression coverage for the drawer attempt switcher. Attempts are selectable
+// Regression coverage for the task-page attempt switcher. Attempts are selectable
 // rows (including the principal and drafts), with one unambiguous current marker.
 // Run: node web/attempts.test.cjs
 const fs = require('fs');
@@ -20,6 +20,7 @@ function extractFn(name) {
 global.esc = (s) => String(s);
 global.S = {
   tasks: [{ id: 'attempt-1', title: 'Task', projectId: 'p' }],
+  taskTab: 'overview',
   attemptGroup: {
     principalAttemptId: 'attempt-1',
     attempts: [
@@ -31,7 +32,7 @@ global.S = {
 
 eval(extractFn('taskRecord'));
 eval(extractFn('stageLabel'));
-eval(extractFn('drawerAttempts'));
+eval(extractFn('taskAttempts'));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
@@ -39,17 +40,17 @@ const ok = (condition, message) => {
   else { fail++; console.error('FAIL:', message); }
 };
 
-const html = drawerAttempts({ taskId: 'attempt-2' });
+const html = taskAttempts({ taskId: 'attempt-2' });
 ok((html.match(/data-attempt-select=/g) || []).length === 2, 'every attempt is a selectable row');
 ok(html.includes('data-attempt-select="attempt-1"'), 'principal can be selected again');
 ok(html.includes('data-attempt-select="attempt-2"'), 'draft can be selected');
 ok(html.includes('attempt-card selected') && html.includes('aria-current="true"'), 'current attempt is visibly and semantically selected');
 ok(!html.includes('<details') && !html.includes('View full attempt'), 'switching needs no expansion or secondary action');
-ok(taskRecord('attempt-2')?.params?.draft === true, 'drawer resolves non-principal records from the attempt group');
+ok(taskRecord('attempt-2')?.params?.draft === true, 'task page resolves non-principal records from the attempt group');
 ok(stageLabel({ stage: 'setup', state: { draft: true } }) === 'draft', 'draft stage is labelled clearly');
 
 // Clicking either a sibling or the principal performs an explicit attempt switch,
-// which prevents principal auto-redirection from snapping the drawer back.
+// which prevents principal auto-redirection from snapping the page back.
 const buttons = ['attempt-1', 'attempt-2'].map((id) => ({
   dataset: { attemptSelect: id },
   addEventListener(_event, handler) { this.click = handler; },
@@ -59,7 +60,7 @@ global.document = {
   querySelectorAll: () => buttons,
 };
 const opened = [];
-global.openDrawer = (...args) => opened.push(args);
+global.openTask = (...args) => opened.push(args);
 global.api = async () => ({});
 global.refreshTasks = async () => {};
 global.openTaskForm = () => {};
@@ -67,7 +68,7 @@ global.toast = () => {};
 eval(extractFn('wireAttempts'));
 wireAttempts({ taskId: 'attempt-2' });
 buttons[0].click();
-ok(JSON.stringify(opened) === JSON.stringify([['attempt-1', true]]), 'principal row switches back explicitly');
+ok(JSON.stringify(opened) === JSON.stringify([['attempt-1', 'overview', true]]), 'principal row switches back explicitly');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

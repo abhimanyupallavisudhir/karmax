@@ -469,6 +469,12 @@ export class Store {
     this.db.prepare('UPDATE tasks SET params = ? WHERE id = ?').run(JSON.stringify(params), taskId);
   }
 
+  /** Re-pin a terminal task when recovery deliberately migrates it to a newer
+   * compatible workflow implementation. Ordinary starts never rewrite pins. */
+  setTaskWorkflowVersion(taskId: string, workflowVersion: string) {
+    this.db.prepare('UPDATE tasks SET workflowVersion = ? WHERE id = ?').run(workflowVersion, taskId);
+  }
+
   /** Update a task's display title (e.g. to track an edited prompt). */
   setTaskTitle(taskId: string, title: string) {
     if (title) this.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run(title, taskId);

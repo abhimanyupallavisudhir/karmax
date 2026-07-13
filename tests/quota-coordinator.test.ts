@@ -94,6 +94,20 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  it('removes a cancelled parked request immediately', async () => {
+    const coord = await startCoord([A({ status: 'exhausted', resetAt: Date.now() + 3_600_000 })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 'cancel-me', provider: 'claude' });
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 3000 }).toBe(1);
+
+    await coord.signal('cancelAccountLease', { taskId: g.id, turnId: 'cancel-me' });
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 3000 }).toBe(0);
+    expect((await acct('A')).inUse).toBe(0);
+
+    await g.h.signal('finish');
+    await coord.terminate('done');
+  });
+
   it('grants the first AVAILABLE credential in the allow-list order (policy precedence)', async () => {
     const coord = await startCoord([A({ id: 'A' }), A({ id: 'B', configHome: '/tmp/B' })]);
     const g = await grantee();

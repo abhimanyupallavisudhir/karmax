@@ -25,14 +25,15 @@ const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Pr
 // swapped mid-flight (retune model/effort, or send a follow-up to redirect it);
 // merge/resolve can still be fully swapped until their own turn runs.
 const agentField = (role: string, label: string, mutable?: FieldSpec['mutable']): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role, ...(mutable ? { mutable } : {}) });
-// The confirmer field selects WHO drives the Review gate — human / auto / an agent.
-// Unlike the agent fields it spans all scopes (task/project/global) so the mode has
-// the usual default-inheritance; when the mode is `agent` it carries the same agent
+// The confirmer field holds the ordered confirm LAYERS the Review gate plays —
+// each a human confirmation or a review agent; zero layers ⇒ auto-confirm.
+// Unlike the agent fields it spans all scopes (task/project/global) so the layer
+// list has the usual default-inheritance; an agent layer carries the same agent
 // knobs (provider/model/effort/fork) as the Do/Merge/Resolve fields, PLUS the
 // review-request prompt template (pre-filled with `promptDefault`, editable per
 // task/project/global). Chosen at task creation (queue-time), like the other agent
 // selections.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm agent', help: 'Who confirms at the Review gate: a human, an agent, or auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { mode: 'human' }, promptDefault: CONFIRM_PROMPT_DEFAULT });
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm layers', help: 'Played in order at Review — each layer is a human confirmation or a review agent; every layer must approve. No layers ⇒ auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human' }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
@@ -282,7 +283,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'Branch/world → do → review → PR → merge → end, with resolve and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -342,7 +343,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'just-do',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'A single straightforward agent call, no merge machinery.',
     requires: [],
     capabilities: ['create-review-info', 'signal-completion', 'save-skill'],
@@ -382,7 +383,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'Like software-dev, but auto-continues until structured completion.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -396,7 +397,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'merge-only',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'The review-and-merge half of software-dev (no Do). The dogfooded PR gate.',
     requires: ['merge-queue'],
     capabilities: ['create-review-info', 'signal-completion', 'merge-into:*'],
@@ -445,6 +446,13 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
 ];
 
+/** Bundled historical manifests whose workflow implementations must remain
+ * resolvable for existing version-pinned tasks. They are intentionally omitted
+ * from MANIFESTS so workflow pickers expose only the current release. */
+export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
+  .filter((m) => m.name === 'software-dev' || m.name === 'just-do' || m.name === 'goal' || m.name === 'merge-only')
+  .map((m) => ({ ...m, version: '1.0.0' }));
+
 export function manifest(name: string): WorkflowManifest | undefined {
   return MANIFESTS.find((m) => m.name === name);
 }
@@ -457,7 +465,7 @@ export function manifest(name: string): WorkflowManifest | undefined {
  * meaningful choices rather than raw noise.
  */
 export const PLATFORM_EVENTS: EventSchemaDecl[] = [
-  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled' } },
+  { type: 'view.updated', description: "A task changed stage/status (the task lifecycle feed).", fields: { stage: 'string', status: 'active | waiting | done | failed | cancelled', waitingFor: 'account | agentSlot | mergeSlot | human | other | null', agentTurn: 'waiting-slot | running | null' } },
   { type: 'pr.opened', description: 'A pull request was opened for a task.', fields: { number: 'number', url: 'string' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },

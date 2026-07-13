@@ -29,7 +29,7 @@ describe('resolveParams (overlay: task → project → global → default)', () 
     expect(r.base).toBe('feature'); // task wins
     expect(r.target).toBe('develop'); // project wins over global
     expect(r.worldProvider).toBe('container'); // global used (no task/project)
-    expect(r.openGithubPr).toBe(false); // field default
+    expect(r.remote).toBe('none'); // field default
   });
 
   it('resolves unified/separate agent forms across inheritance layers', () => {
@@ -105,7 +105,7 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
       repos: ['~/code/app'],
       copyGlobs: ['.env'],
       worldProvider: 'container',
-      openGithubPr: true,
+      remote: 'pr',
       'agent:do': { provider: 'codex', model: 'gpt-4.1', effort: 'high' },
     };
     const input = assembleTaskInput(sd, resolved, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
@@ -115,20 +115,31 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
     expect(input.project.repos).toEqual([path.join(os.homedir(), 'code/app')]); // ~ expanded
     expect(input.project.copyGlobs).toEqual(['.env']);
     expect(input.project.worldProvider).toBe('container');
-    expect(input.project.openGithubPr).toBe(true);
+    expect(input.project.remote).toBe('pr');
     expect(input.project.defaultBase).toBe('main'); // mirrored
     expect(input.project.defaultTarget).toBe('release');
     expect(input.agents?.do).toEqual({ provider: 'codex', model: 'gpt-4.1', effort: 'high' });
   });
 
-  it('carries the confirmer mode + review-request prompt into input.confirm (agent knobs also land on agents.confirm)', () => {
+  it('normalizes a legacy confirmer {mode} value into confirm layers', () => {
     const resolved = {
       prompt: 'build X',
       confirm: { mode: 'agent', provider: 'mock', prompt: 'Ensure X, Y and Z.\n{{response}}' },
     };
     const input = assembleTaskInput(sd, resolved, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
-    expect(input.confirm).toEqual({ mode: 'agent', provider: 'mock', prompt: 'Ensure X, Y and Z.\n{{response}}' });
-    expect(input.agents?.confirm).toEqual({ provider: 'mock' }); // prompt is not an AgentSpec knob
+    expect(input.confirm).toEqual({ layers: [{ kind: 'agent', provider: 'mock', prompt: 'Ensure X, Y and Z.\n{{response}}' }] });
+    expect(input.agents?.confirm).toBeUndefined(); // per-layer specs land on agents.confirm at turn time, in the workflow
+  });
+
+  it('carries confirm layers into input.confirm as given (auto-confirm = zero layers)', () => {
+    const layers = [
+      { kind: 'agent', provider: 'mock', model: 'm1', prompt: 'Check it.\n{{response}}' },
+      { kind: 'human' },
+    ];
+    const input = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers } }, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
+    expect(input.confirm).toEqual({ layers });
+    const auto = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers: [] } }, { taskId: 't2', projectId: 'p1', title: 'X', project: {} });
+    expect(auto.confirm).toEqual({ layers: [] });
   });
 });
 
@@ -145,7 +156,7 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
     expect(s.base).toBe('main');
     expect(s.target).toBe('prod');
     expect(s.repos).toEqual(['/r']);
-    expect(s.openGithubPr).toBe(true);
+    expect(s.remote).toBe('pr');
   });
 
   it('uses the stored settings row when present', () => {

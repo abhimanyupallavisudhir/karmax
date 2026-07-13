@@ -10,6 +10,7 @@ import {
 } from '@temporalio/workflow';
 import {
   SIG_LEASE_ACCOUNT,
+  SIG_CANCEL_ACCOUNT,
   SIG_RETURN_ACCOUNT,
   SIG_ACCOUNT_GRANTED,
   SIG_REGISTER_ACCOUNTS,
@@ -102,6 +103,7 @@ export interface RegisteredAccount {
 }
 
 export const leaseAccountSignal = defineSignal<[{ taskId: string; turnId: string; provider?: AccountProvider; allowed?: string[] }]>(SIG_LEASE_ACCOUNT);
+export const cancelAccountSignal = defineSignal<[{ taskId: string; turnId: string }]>(SIG_CANCEL_ACCOUNT);
 export const returnAccountSignal = defineSignal<[{ accountId: string }]>(SIG_RETURN_ACCOUNT);
 export const registerAccountsSignal = defineSignal<[{ accounts: RegisteredAccount[] }]>(SIG_REGISTER_ACCOUNTS);
 /** Ground-truth exhaustion feed (from the reportAccountExhausted activity). */
@@ -209,6 +211,9 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       queue.push({ taskId: req.taskId, turnId: req.turnId, provider: req.provider, allowed: req.allowed });
     }
   });
+  setHandler(cancelAccountSignal, ({ taskId, turnId }) => {
+    queue = queue.filter((q) => q.taskId !== taskId || q.turnId !== turnId);
+  });
   setHandler(returnAccountSignal, ({ accountId }) => {
     const a = accounts.find((x) => x.id === accountId);
     if (a && a.inUse > 0) a.inUse--;
@@ -291,7 +296,11 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
           .map((a) => a.resetAt!);
         const sleepMs = resets.length ? Math.max(0, Math.min(...resets) - now) : BACKSTOP_PARK_MS;
         await Promise.race([
-          condition(() => queue.some((q) => serveable(q))),
+          // Cancellation of the last parked request must wake this branch too;
+          // otherwise the coordinator can remain asleep until the six-hour
+          // backstop despite its query already reporting an empty queue. Manual
+          // status changes that make a request deniable must wake it as well.
+          condition(() => queue.length === 0 || queue.some((q) => serveable(q) || deniable(q))),
           sleep(sleepMs),
         ]);
         continue;

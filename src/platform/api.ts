@@ -1,4 +1,5 @@
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
+import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
@@ -63,6 +64,21 @@ const QUERY_TIMEOUT_MS = 3000;
  * "clicked queue, nothing happened, pile of tasks stuck at setup" failure mode).
  */
 const START_TIMEOUT_MS = 12_000;
+
+/** A failed execution is terminal, but software-dev can start a replacement run
+ * from its persisted world/conversation checkpoint. These mirror escalation's
+ * controls; signalTask gives them terminal-aware semantics. */
+const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
+  { name: 'retry', kind: 'signal', label: 'Retry', enabled: true },
+  {
+    name: 'followUp',
+    kind: 'signal',
+    label: 'Send follow-up',
+    enabled: true,
+    args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
+  },
+  { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true },
+];
 
 export interface KarmaxApiDeps {
   store: Store;
@@ -396,9 +412,9 @@ export class KarmaxApi {
    * against the CURRENT project/global defaults and pin the stamped version.
    * Meta fields (profiles/draft/archived/triggers) aren't workflow overrides.
    */
-  private async buildStart(task: TaskRecord): Promise<{ startType: string; input: TaskInput }> {
+  private async buildStart(task: TaskRecord, migrateToLatest = false): Promise<{ startType: string; input: TaskInput; version: string }> {
     const project = this.deps.store.getProject(task.projectId);
-    const start = this.resolveStart(task.workflow, task.workflowVersion);
+    const start = this.resolveStart(task.workflow, migrateToLatest ? undefined : task.workflowVersion);
     if (!project || !start) throw new Error(`cannot start task ${task.id}`);
     const { manifest, startType } = start;
     // Re-resolve against the CURRENT project/global defaults. The task stored only
@@ -423,7 +439,7 @@ export class KarmaxApi {
     input.intentId = task.intentId ?? task.id;
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
-    return { startType, input };
+    return { startType, input, version: manifest.version };
   }
 
   /**
@@ -630,7 +646,15 @@ export class KarmaxApi {
     // Cosmetic human notes live on the record (never on the workflow), so mirror
     // them onto whichever view we return — the UI shows/edits them at any stage.
     const withNotes = (view: TaskView | undefined): TaskView | undefined =>
-      view ? { ...view, notes: this.deps.store.getTask(taskId)?.notes } : view;
+      view
+        ? {
+            ...view,
+            notes: this.deps.store.getTask(taskId)?.notes,
+            ...(view.status === 'failed' && view.workflow === 'software-dev' && !view.pointOfNoReturnPassed
+              ? { actions: FAILED_RECOVERY_ACTIONS() }
+              : {}),
+          }
+        : view;
     // Snapshot-first (the default). The workflow persists `lastView` to the store on
     // every change via the `publishView` activity AND pushes a `view.updated` event
     // over the bus/WebSocket in the same call — so the stored snapshot is kept fresh
@@ -642,7 +666,16 @@ export class KarmaxApi {
     // (post-`updateParams` responses, review-action resolution). We also fall through to
     // a live query when there is no snapshot yet (a brand-new task, pre-first-publish).
     const snap = snapshot();
-    if (snap && !opts?.live) return withNotes(snap);
+    // softwareDev@1.0.0 could persist "waiting for account" immediately before
+    // scheduling a turn, then clear it only in workflow memory after the grant.
+    // It cannot add a publish at that point without breaking replay. Treat that
+    // one legacy shape as stale-prone and query its authoritative live state;
+    // current workflows carry agentTurn and remain snapshot-fast.
+    const legacyAccountWait =
+      this.deps.store.getTask(taskId)?.workflowVersion === '1.0.0' &&
+      snap?.waitingFor?.kind === 'account' &&
+      !snap.agentTurn;
+    if (snap && !opts?.live && !legacyAccountWait) return withNotes(snap);
     // Live path — bound it: a wedged workflow (e.g. stuck in a workflow-task-failure
     // loop) makes a query hang without rejecting, which would otherwise freeze the
     // caller. Fall back fast to whatever snapshot we have.
@@ -838,8 +871,128 @@ export class KarmaxApi {
     this.deps.store.deleteView(id);
   }
 
+  /** Restart a terminally failed software-dev execution without running Setup.
+   * Setup's createWorld deliberately replaces stale worktrees; doing that here
+   * would erase the exact dirty work a recovery exists to preserve. */
+  private async recoverFailedTask(taskId: string): Promise<void> {
+    const task = this.deps.store.getTask(taskId);
+    const view = task?.lastView;
+    if (!task || !view) throw new Error(`no failed task ${taskId}`);
+    if (task.workflow !== 'software-dev' || view.status !== 'failed') throw new Error('only failed software-dev tasks can be recovered');
+    if (view.pointOfNoReturnPassed) throw new Error('cannot recover a task after its merge point of no return');
+
+    // Recovery is an explicit migration boundary. Replaying a replacement with
+    // the same obsolete implementation can reproduce the exact incompatibility
+    // that made the old run terminal, so resume on the current bundled version
+    // and persist that new pin only after Temporal accepts the replacement.
+    const { startType, input, version } = await this.buildStart(task, true);
+    const savedWorld = view.state?.recoveryWorld as any;
+    let world = savedWorld?.root && savedWorld?.branch ? savedWorld : undefined;
+
+    // Back-compat for failures recorded before recoveryWorld was added. The three
+    // production incidents were single-repo worktrees and retain enough fields in
+    // TaskView to rebuild their plain handle safely. Refuse ambiguous multi-repo or
+    // container recovery rather than risking work loss.
+    if (!world) {
+      const repos = input.project.repos?.filter(Boolean) ?? [];
+      if (!view.worldPath || !view.branch) throw new Error('failed task has no preserved world to recover');
+      if (input.project.worldProvider === 'container') throw new Error('legacy container task has no recoverable container handle');
+      if (repos.length > 1) throw new Error('legacy multi-repo task has no complete world checkpoint; recover its worktrees manually');
+      const repo = repos[0];
+      world = {
+        kind: 'worktree',
+        id: taskId,
+        root: view.worldPath,
+        branch: view.branch,
+        base: view.base ?? input.base ?? 'main',
+        target: view.targetBranch ?? input.target,
+        ...(repo
+          ? {
+              repo,
+              repos: [{ name: path.basename(repo), repo, root: view.worldPath, branch: view.branch, base: view.base ?? input.base ?? 'main' }],
+            }
+          : {}),
+      };
+    }
+    if (world.kind === 'worktree' && !fs.existsSync(world.root)) throw new Error(`preserved worktree no longer exists: ${world.root}`);
+
+    const messages = view.messages.map((m) => ({ ...m }));
+    const seen = typeof view.state?.turnsSeen === 'number' ? view.state.turnsSeen : messages.length;
+    messages.push({
+      id: `recovery-${Date.now()}`,
+      role: 'user',
+      text: `Karmax recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
+      ts: messages.length,
+    });
+    const session = this.deps.store.kvGet(`session:${taskId}:do`) || undefined;
+    let sessionHome: string | undefined;
+    try {
+      const meta = JSON.parse(this.deps.store.kvGet(`sessionmeta:${taskId}:do`) ?? '{}');
+      sessionHome = typeof meta.home === 'string' ? meta.home || '(profile)' : undefined;
+    } catch {
+      /* malformed legacy metadata: conversation still recovers without session resume */
+    }
+    input.recovery = {
+      world,
+      messages,
+      transcripts: view.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) })),
+      reviewInfo: view.reviewInfo,
+      session,
+      sessionHome,
+      seen,
+      target: view.targetBranch,
+    };
+
+    await withTimeout(
+      this.deps.client.workflow.start(startType, {
+        taskQueue: this.deps.taskQueue,
+        workflowId: taskId,
+        workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+        args: [input],
+      }),
+      START_TIMEOUT_MS,
+    );
+    this.deps.store.setTaskWorkflowVersion(taskId, version);
+    // Close the short acceptance→first-publish window so the UI cannot offer a
+    // second recovery while the replacement run is already starting.
+    this.deps.store.saveView(taskId, {
+      ...view,
+      stage: 'do',
+      status: 'active',
+      messages,
+      error: undefined,
+      waitingFor: undefined,
+      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
+      state: { ...view.state, recoveryWorld: world },
+    });
+  }
+
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
     this.require(token, 'signal_task');
+    const terminal = this.deps.store.getTask(taskId)?.lastView;
+    if (terminal?.status === 'failed' && terminal.workflow === 'software-dev' && !terminal.pointOfNoReturnPassed) {
+      if (signal === SIG.retry) return await this.recoverFailedTask(taskId);
+      if (signal === SIG.followUp) {
+        const msg: Message = { id: `u${Date.now()}`, role: 'user', text: text ?? '', ts: 0, ...(images?.length ? { images } : {}) };
+        const messages = terminal.messages.map((m) => ({ ...m }));
+        const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
+        const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
+        (target ?? messages).push({ ...msg, ts: (target ?? messages).length });
+        this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() });
+        return;
+      }
+      if (signal === SIG.cancel) {
+        this.deps.store.saveView(taskId, {
+          ...terminal,
+          stage: 'cancelled',
+          status: 'cancelled',
+          waitingFor: undefined,
+          actions: [],
+          state: { ...terminal.state, cancelled: true },
+        });
+        return;
+      }
+    }
     const handle = this.deps.client.workflow.getHandle(taskId);
     try {
       if (signal === SIG.followUp) {
@@ -965,18 +1118,20 @@ export class KarmaxApi {
     this.require(token, 'edit_workflow');
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
+    const mergeOnlyVersion = MANIFESTS.find((m) => m.name === 'merge-only')?.version;
+    if (!mergeOnlyVersion) throw new Error('bundled merge-only manifest is missing');
     const task = this.deps.store.createTask({
       projectId: args.projectId,
       title: args.title,
       workflow: 'merge-only',
-      workflowVersion: '1.0.0',
+      workflowVersion: mergeOnlyVersion,
       // Record the edit target so the self-healing loop can reload the workflow
       // from `repo@target` once this merge completes (§4.4).
       params: { prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true },
     });
     try {
       await withTimeout(
-        this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, '1.0.0'), {
+        this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, mergeOnlyVersion), {
           taskQueue: this.deps.taskQueue,
           workflowId: task.id,
           args: [

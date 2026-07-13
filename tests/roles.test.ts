@@ -11,10 +11,13 @@ const profile = (over: any = {}) => ({ id: 'do', name: 'Do', provider: 'claude',
 describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', () => {
   it('aggregates declared roles across the bundled workflows, tracking who uses each', () => {
     const roles = Object.fromEntries(allRoles().map((r) => [r.name, r]));
-    expect(Object.keys(roles).sort()).toEqual(['do', 'merge', 'resolve']);
+    expect(Object.keys(roles).sort()).toEqual(['confirm', 'do', 'merge', 'resolve']);
     expect(roles.do!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal']));
     expect(roles.merge!.workflows).toEqual(expect.arrayContaining(['software-dev', 'merge-only', 'goal']));
     expect(roles.resolve!.workflows).toEqual(expect.arrayContaining(['software-dev', 'goal']));
+    // every workflow with a Review gate declares the confirm role (agent confirm layers)
+    expect(roles.confirm!.workflows).toEqual(expect.arrayContaining(['software-dev', 'just-do', 'goal', 'merge-only']));
+    expect(roles.confirm!.capabilities).toContain('confirm-decision');
   });
 
   it('exposes each role its declared prompt template + capability ceiling', () => {
@@ -40,7 +43,7 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
 
   it('seeds one default profile per declared role, carrying the role capabilities', () => {
     const profiles = makeDefaultProfiles('claude');
-    expect(profiles.map((p) => p.id).sort()).toEqual(['do-default', 'merge-default', 'resolve-default']);
+    expect(profiles.map((p) => p.id).sort()).toEqual(['confirm-default', 'do-default', 'merge-default', 'resolve-default']);
     const merge = profiles.find((p) => p.id === 'merge-default')!;
     expect(merge.role).toBe('merge');
     expect(merge.capabilities).toContain('merge-into:*');

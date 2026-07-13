@@ -22,6 +22,7 @@ import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
 
@@ -127,20 +128,42 @@ export class Gateway {
       ws.on('close', off);
       ws.on('error', off);
     });
-    wssTerm.on('connection', (ws, req) => this.terminal(ws, req));
+    wssTerm.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
+    });
     wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
 
-    await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', () => resolve()));
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      server.once('error', onError);
+      server.listen(port, '127.0.0.1', () => {
+        server.off('error', onError);
+        // Keep an operational listener after the startup race; errors are exposed
+        // by endpoint-specific handling instead of becoming uncaught events.
+        server.on('error', () => {});
+        resolve();
+      });
+    });
     return {
       url: `http://127.0.0.1:${port}`,
       port,
       close: () =>
         new Promise<void>((resolve) => {
           this.reviewActions.stopAll();
+          // `WebSocketServer.close()` does not terminate existing upgraded
+          // sockets, and `http.Server.close()` waits for them forever. A stale
+          // browser/test connection therefore used to wedge shutdown and leave
+          // the Temporal worker/runtime installed. Close clients explicitly,
+          // then force any remaining HTTP keep-alive sockets to drain.
+          for (const wss of [wssEvents, wssTerm, wssAction]) {
+            for (const ws of wss.clients) ws.terminate();
+          }
           wssEvents.close();
           wssTerm.close();
           wssAction.close();
           server.close(() => resolve());
+          server.closeAllConnections();
         }),
     };
   }
@@ -1321,12 +1344,22 @@ export class Gateway {
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
       const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
-      // A confirmer also carries a MODE (human/auto/agent) that inherits normally —
-      // plus its review-request prompt template, when one is stored at this scope
-      // (the form falls back to the field's promptDefault); the agent knobs above
-      // are the defaults shown once "agent" mode is selected.
+      // A confirmer carries the ordered confirm LAYERS (legacy {mode} values
+      // normalize). Each agent layer gets the role-default agent knobs filled in,
+      // same as a bare agent field; `agentDefault` rides along so the form can
+      // prefill a NEWLY added agent layer the same way (display-only — collectForm
+      // never stores it).
       out[f.name] = f.type === 'confirmer'
-        ? { mode: spec.mode ?? (f.default as any)?.mode ?? 'human', ...agent, ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}), ...(spec.prompt ? { prompt: spec.prompt } : {}) }
+        ? {
+            layers: confirmLayersOf(Object.keys(spec).length ? spec : (f.default as any)).map((l) => {
+              if (l.kind !== 'agent') return { kind: l.kind };
+              const lprov = l.provider ?? prof?.provider ?? defaultProvider().provider;
+              const lmodel = l.model ?? prof?.model ?? defaultModel(lprov);
+              const leffort = l.effort ?? prof?.effort ?? defaultEffort(lprov);
+              return { ...l, provider: lprov, ...(lmodel ? { model: lmodel } : {}), ...(leffort ? { effort: leffort } : {}) };
+            }),
+            agentDefault: agent,
+          }
         : agent;
     }
     return out;

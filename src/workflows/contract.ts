@@ -5,11 +5,14 @@
  */
 export type {
   TaskInput,
+  TaskRecoveryCheckpoint,
   TaskView,
   Stage,
   TaskStatus,
+  AgentRole,
   AgentSpec,
   ConfirmConfig,
+  ConfirmLayer,
   ConfirmMode,
   ConfirmDecision,
   ConfirmAction,

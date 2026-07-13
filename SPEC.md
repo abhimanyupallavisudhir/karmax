@@ -137,7 +137,7 @@ Each workflow lives in its own git repo under `~/.karmax/workflows/<name>/`:
 
 There are **two different artifacts with two different update models**:
 
-**Workflow code** is deterministic and replay-bound, so it is **version-pinned per execution**. A task records the workflow version at creation and runs that version to completion; new tasks pick up the newest version; running tasks are never hot-swapped. Editing is **a pull request, literally**:
+**Workflow code** is deterministic and replay-bound, so it is **version-pinned per execution**. A task records the workflow version at creation and runs that version to completion; new tasks pick up the newest version; running tasks are never hot-swapped. A published `type@version` export is immutable: changed command ordering or behavior is registered under a new version while the old implementation remains available for replay. Editing is **a pull request, literally**:
 
 1. An agent (or human) edits the workflow repo on a branch.
 2. The workflow's own test suite runs, plus a replay-compatibility check.
@@ -197,7 +197,7 @@ Merge is the point of no return.
 
 **Do.** Runs the assigned coding agent profile **one turn per activity** (`runAgentTurn`). Between turns only a session ID is stored; the agent process does not exist while the task waits (§7). During a turn the agent may, via the platform MCP: create review info, spawn sub-tasks, save skills, and **signal completion via a structured tool call** (not a parsed "promise" string — structured is unambiguous and unspoofable). On completion/idle/needs-input → Review.
 
-**Review.** The workflow's view-model exposes the allowed actions `[confirm]` and `[send follow-up]` plus review info. The **confirmer** is a human by default, or an AI; for a **sub-task the confirmer is the parent task's workflow**, which receives the child's review info and either confirms or sends a follow-up — the ordinary parent/child signal pattern. Confirm → PR. Follow-up → append to agent input, return to Do.
+**Review.** The workflow's view-model exposes the allowed actions `[confirm]` and `[send follow-up]` plus review info. The **confirmer** is an ordered list of **confirm layers**, played sequentially each time the task reaches Review — each layer is either a **human** confirmation (waits for the Confirm click) or a **Confirm agent** turn that reviews the work and returns a structured verdict (confirm / revise / reject — the same transitions a human drives). Every layer must approve for the task to advance; a revise/follow-up returns to Do and the next Review replays the sequence from the first layer. Zero layers ⇒ auto-confirm; the default is a single human layer; "agent review, then a final human confirmation" is two layers. Layer lists inherit like every other field (task → project → global defaults). For a **sub-task the confirmer is the parent task's workflow** regardless, which receives the child's review info and either confirms or sends a follow-up — the ordinary parent/child signal pattern. Confirm → PR. Follow-up → append to agent input, return to Do.
 
 **PR.** Opening a GitHub PR is **optional** — a project setting gated by GitHub authorization. The Review stage *is* the conceptual PR; a GitHub PR is just an optional integration output. Off → the merge agent merges branches locally under the queue. On → open a real PR.
 
@@ -277,7 +277,7 @@ export async function softwareDev(task: TaskInput) {
         if (confirmed) break;                          // -> PR; else loop back to Do
       }
     }
-    stage = 'pr';    if (project.openGithubPr) await act.openPr(world, target);
+    stage = 'pr';    if (project.remote === 'pr') await act.openPr(world, target);
     stage = 'merge'; await mergeQueue.acquire(target);
                      await act.runAgentTurn(profiles.merge, world, null, session);
                      await mergeQueue.release(target);
@@ -328,6 +328,8 @@ A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capa
 ### 7.2 The per-turn execution model
 
 **The workflow is the long-lived (but cheap) thing; the agent runs one turn at a time inside an activity (expensive, but ephemeral).** `runAgentTurn`:
+
+The task view reports the turn's resource boundaries separately: `waitingFor: account` while credential capacity is being leased, `waitingFor: agentSlot` / `agentTurn: waiting-slot` after the account grant while host admission is pending, and `agentTurn: running` only after the activity has acquired the host slot. The workflow publishes the post-grant transition immediately; it must not leave the last account-wait snapshot visible for the duration of a running turn.
 
 1. Spins up / resumes the agent session (via session/thread ID stored in workflow state).
 2. Lets the agent work until a turn boundary (completion / idle / needs-input).
@@ -618,7 +620,7 @@ Invariants: dependents bind to the **task**, never to an attempt; at most one at
 ## 15. Glossary
 
 - **World** — the environment a task's work happens in (worktree/container/sandbox).
-- **Review stage** — the gate where a confirmer (human, or AI/parent) confirms or sends a follow-up. (Formerly "Confirm.")
+- **Review stage** — the gate where the confirm layers (each a human or a Confirm agent; the parent, for sub-tasks) approve in order or send a follow-up. (Formerly "Confirm.")
 - **Point of no return** — the merge commit; cancellation is impossible after it.
 - **Lease** — a grant of a scarce resource handed out by a coordinator (merge slot, account capacity, budget).
 - **View-model** — the structured, typed projection of a task's (or coordinator's) state and allowed actions that the UI renders.
