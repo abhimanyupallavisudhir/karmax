@@ -594,6 +594,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             : {}),
         },
         );
+        // Defence in depth around the activity boundary. `runTurn` rejects an
+        // adapter return after abort, but cancellation can race the few synchronous
+        // instructions between that check and this await continuation. Never report
+        // a normal Temporal activity result once shutdown/cancellation is visible.
+        if (signal?.aborted) {
+          throw signal.reason instanceof Error ? signal.reason : new Error('agent turn cancelled');
+        }
       } catch (err) {
         if (token) deps.tokens?.revoke(token);
         if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched

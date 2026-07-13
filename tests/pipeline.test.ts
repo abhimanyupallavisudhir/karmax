@@ -5,6 +5,8 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
+import { MockAdapter } from '../src/agent/mock.js';
+import type { AgentAdapter } from '../src/agent/types.js';
 
 function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any }) {
   return {
@@ -25,7 +27,30 @@ const view = (h: any) => h.query('view') as Promise<any>;
 describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   let h: Harness;
   beforeAll(async () => {
-    h = await bootHarness('mock');
+    const mock = new MockAdapter();
+    const restartSession = 'restart-regression-session';
+    // Model the real Claude/Codex shutdown behaviour: provider cleanup consumes the
+    // AbortError and returns partial output. The runtime boundary must still reject
+    // that result so Temporal retries the activity after the worker comes back.
+    const adapter: AgentAdapter = {
+      provider: 'mock',
+      async runTurn(input, ctx) {
+        const restartCase = input.session === restartSession || input.messages.some((m) => m.text.includes('@restart-regression'));
+        if (!restartCase) return mock.runTurn(input, ctx);
+        if (input.session === restartSession) {
+          ctx.signalCompletion('resumed after restart');
+          return { session: restartSession, output: 'resumed and completed' };
+        }
+        ctx.onSession?.(restartSession);
+        ctx.heartbeat?.();
+        await new Promise<void>((resolve) => {
+          if (ctx.signal?.aborted) return resolve();
+          ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return { session: restartSession, output: 'partial output from interrupted turn' };
+      },
+    };
+    h = await bootHarness('mock', adapter);
   }, 60_000);
   afterAll(async () => {
     await h?.stop();
@@ -67,6 +92,32 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const onMain = await git(repo, ['show', 'main:factorial.js']);
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('export const f');
+  });
+
+  it('restarts an interrupted turn in Do instead of accepting partial output as Review (Task 162)', async () => {
+    const repo = await h.makeRepo('restart-do-stage');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Restart in Do', prompt: '@restart-regression' })],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await expect.poll(() => h.store.kvGet(`session:${taskId}:do`), { timeout: 15_000 }).toBe('restart-regression-session');
+
+    await h.restartWorker();
+
+    // The swallowed provider abort is an interrupted activity, not a turn boundary.
+    // Durable replay therefore restores the originating stage until the retry runs.
+    expect((await view(handle)).stage).toBe('do');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const resumed = await view(handle);
+    expect(resumed.reviewInfo?.completion).toBe('signalled');
+    expect(resumed.messages.some((m: any) => m.text === 'partial output from interrupted turn')).toBe(false);
+
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
   });
 
   it('marks a Review reached without signal_completion as a stall, so the reviewer is warned', async () => {
