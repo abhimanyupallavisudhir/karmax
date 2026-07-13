@@ -23,6 +23,7 @@ import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
 import { ReviewActionRunner } from './review-actions.js';
+import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -89,6 +90,7 @@ export class Gateway {
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions = new ReviewActionRunner();
   private attachments = new AttachmentStore();
+  private modelCatalog?: { at: number; value: ModelCatalog };
 
   constructor(private deps: GatewayDeps) {}
 
@@ -768,6 +770,12 @@ export class Gateway {
         });
         return this.json(res, 200, view);
       }
+      // Provider-native, account-aware model pickers. Both the Claude Agent SDK and
+      // Codex app-server expose this metadata; cache it because each refresh boots a
+      // short-lived provider subprocess for every distinct connected login.
+      if (p === '/api/models' && method === 'GET') {
+        return this.json(res, 200, await this.availableModels(url.searchParams.get('refresh') === '1'));
+      }
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
@@ -1195,6 +1203,37 @@ export class Gateway {
     return { activated: workflow, requires: m?.requires ?? [], spawnedTasks: spawned };
   }
 
+  private async availableModels(refresh = false): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
+    if (!refresh && this.modelCatalog && Date.now() - this.modelCatalog.at < 5 * 60_000) {
+      return { providers: this.modelCatalog.value, refreshedAt: this.modelCatalog.at };
+    }
+    const { gatherCredentialSources } = await import('../platform/credential-sources.js');
+    const { enumerateCredentials } = await import('../platform/credentials.js');
+    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+    const homes = (provider: 'claude' | 'codex') => {
+      const values = creds.filter((c) => c.provider === provider && c.kind !== 'key').map((c) => c.configHome);
+      // No subscription login: let the provider process use the ambient API key.
+      if (!values.length && creds.some((c) => c.provider === provider && c.kind === 'key')) values.push(undefined);
+      return [...new Set(values)];
+    };
+    const settled = async (provider: 'claude' | 'codex') => {
+      const fn = provider === 'claude' ? claudeModels : codexModels;
+      const results = await Promise.all(homes(provider).map((home) => fn(home).catch(() => [])));
+      return mergeModels(results);
+    };
+    const [claude, codex] = await Promise.all([settled('claude'), settled('codex')]);
+    // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
+    // safe presets so forms never degrade to an empty, non-actionable picker.
+    const value: ModelCatalog = {
+      claude: claude.length ? claude : [
+        { id: 'claude-sonnet-5' }, { id: 'claude-opus-4-8' }, { id: 'claude-haiku-4-5' }, { id: 'claude-fable-5' },
+      ],
+      codex: codex.length ? codex : [{ id: 'gpt-5.5' }, { id: 'gpt-5.4-mini' }],
+    };
+    this.modelCatalog = { at: Date.now(), value };
+    return { providers: value, refreshedAt: this.modelCatalog.at };
+  }
+
   /** For each agent field, resolve the concrete provider/model the server would
    *  actually run (setting → seeded profile → code default), so the form can show
    *  it as the inherited default. */
@@ -1255,7 +1294,7 @@ export class Gateway {
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
       // A confirmer also carries a MODE (human/auto/agent) that inherits normally —
       // plus its review-request prompt template, when one is stored at this scope
       // (the form falls back to the field's promptDefault); the agent knobs above

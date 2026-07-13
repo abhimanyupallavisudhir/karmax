@@ -1,4 +1,4 @@
-import type { Client } from '@temporalio/client';
+import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Store } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
@@ -7,7 +7,7 @@ import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, SIG_REORDER, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentSpec, Provider } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -18,6 +18,8 @@ import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
+import { defaultProvider } from '../agent/adapters.js';
+import { defaultModel, defaultEffort } from '../agent/profiles.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -268,6 +270,7 @@ export class KarmaxApi {
       ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
+    this.materializeUnifiedAgents(resolved, project.id);
 
     // Auto-detect the repo's default branch when base/target weren't set anywhere,
     // instead of guessing "main" (which would create a phantom target branch).
@@ -283,6 +286,25 @@ export class KarmaxApi {
       }
     }
     return resolved;
+  }
+
+  /** Turn the compact Agent setting into concrete per-role input. Profile defaults
+   * live outside parameter settings, so this final materialization must happen
+   * after the parameter overlays have selected the child scope's form shape. */
+  private materializeUnifiedAgents(resolved: ValueMap, projectId: string): void {
+    if (resolved.separateAgents !== false) return;
+    let spec = resolved['agent:do'] as AgentSpec | undefined;
+    if (!spec?.provider) {
+      const profile = this.deps.store.getProfile(`${projectId}::do-default`) ?? this.deps.store.getProfile('do-default');
+      const provider = (profile?.provider ?? defaultProvider().provider) as Provider;
+      const model = profile?.model ?? defaultModel(provider);
+      const effort = profile?.effort ?? defaultEffort(provider);
+      spec = { provider, ...(model ? { model } : {}), ...(effort ? { effort: effort as AgentSpec['effort'] } : {}) };
+    }
+    resolved['agent:do'] = spec;
+    const { resumeFrom: _resumeFrom, ...shared } = spec;
+    resolved['agent:merge'] = shared;
+    resolved['agent:resolve'] = shared;
   }
 
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
@@ -697,19 +719,45 @@ export class KarmaxApi {
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
     this.require(token, 'signal_task');
     const handle = this.deps.client.workflow.getHandle(taskId);
-    if (signal === SIG.followUp) {
-      const msg: Message = {
-        id: `u${Date.now()}`,
-        role: 'user',
-        text: text ?? '',
-        ts: 0,
-        ...(images?.length ? { images } : {}),
-      };
-      // `role` (the addressed agent) is optional — single-agent workflows ignore it
-      // and route every follow-up to their sole conversation.
-      await handle.signal(SIG.followUp, msg, role);
-    } else {
-      await handle.signal(signal);
+    try {
+      if (signal === SIG.followUp) {
+        const msg: Message = {
+          id: `u${Date.now()}`,
+          role: 'user',
+          text: text ?? '',
+          ts: 0,
+          ...(images?.length ? { images } : {}),
+        };
+        // `role` (the addressed agent) is optional — single-agent workflows ignore it
+        // and route every follow-up to their sole conversation.
+        await handle.signal(SIG.followUp, msg, role);
+      } else {
+        await handle.signal(signal);
+      }
+    } catch (e) {
+      // Cancellation is idempotent at the task API boundary. The drawer can be
+      // acting on a view published immediately before the workflow closes, in
+      // which case Temporal reports the closed execution as "not found". Settle
+      // a stale non-terminal snapshot locally (the closed workflow can no longer
+      // publish one), but preserve an already-terminal result such as `done`.
+      // Other signals must still report stale/invalid actions.
+      if (signal === SIG.cancel && e instanceof WorkflowNotFoundError) {
+        const task = this.deps.store.getTask(taskId);
+        if (!task) throw e;
+        const view = task.lastView;
+        if (view && !['done', 'cancelled', 'failed'].includes(view.status)) {
+          this.deps.store.saveView(taskId, {
+            ...view,
+            stage: 'cancelled',
+            status: 'cancelled',
+            actions: [],
+            state: { ...view.state, cancelled: true },
+            waitingFor: undefined,
+          });
+        }
+        return;
+      }
+      throw e;
     }
   }
 

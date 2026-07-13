@@ -33,7 +33,7 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // task/project/global). Chosen at task creation (queue-time), like the other agent
 // selections.
 const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm agent', help: 'Who confirms at the Review gate: a human, an agent, or auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { mode: 'human' }, promptDefault: CONFIRM_PROMPT_DEFAULT });
-const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
+const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
