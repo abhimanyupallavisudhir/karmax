@@ -63,15 +63,39 @@ export class ConfigHomeManager {
       // Minimal TOML for [mcp_servers.<name>] (command + args + env).
       const file = path.join(home, 'config.toml');
       const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+      // Account connect can run more than once for an existing home. Replace the
+      // tables karmax owns instead of appending duplicate TOML table declarations.
+      const preserved = removeTomlTables(existing, [
+        'mcp_servers.chrome-devtools',
+        'mcp_servers.playwright',
+        'mcp_servers.karmax',
+      ]);
       const toml = Object.entries(servers)
         .map(([name, s]) => {
           const envLines = s.env ? Object.entries(s.env).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join('\n') : '';
           return `\n[mcp_servers.${name}]\ncommand = ${JSON.stringify(s.command)}\nargs = ${JSON.stringify(s.args)}\n${s.env ? `\n[mcp_servers.${name}.env]\n${envLines}\n` : ''}`;
         })
         .join('');
-      fs.writeFileSync(file, existing + toml);
+      fs.writeFileSync(file, preserved.trimEnd() + toml);
     }
   }
+}
+
+/** Remove TOML tables (and their child tables) while leaving all other text intact. */
+function removeTomlTables(source: string, tables: string[]): string {
+  if (tables.length === 0) return source;
+  let remove = false;
+  return source
+    .split(/(?<=\n)/)
+    .filter((line) => {
+      const header = line.match(/^\s*\[([^\]]+)]\s*(?:#.*)?(?:\r?\n)?$/);
+      if (header) {
+        const table = header[1]!.trim();
+        remove = tables.some((owned) => table === owned || table.startsWith(`${owned}.`));
+      }
+      return !remove;
+    })
+    .join('');
 }
 
 export type BrowserMcp = 'chrome-devtools' | 'playwright' | 'none';
