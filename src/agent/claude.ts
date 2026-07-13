@@ -382,6 +382,10 @@ export class ClaudeAdapter implements AgentAdapter {
             windowsHide: true,
             detached: true, // own process group ⇒ group kills reap tool subprocesses too
           });
+          // The SDK attaches its own transport handling after this callback returns;
+          // cover the spawn→return edge so an asynchronous ENOENT never becomes an
+          // unhandled EventEmitter error in the host process.
+          child.on('error', () => {});
           if (child.pid) {
             const pid = child.pid;
             registerAgent({ pid, cmd: o.command.split('/').pop() ?? o.command, provider: 'claude', taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });

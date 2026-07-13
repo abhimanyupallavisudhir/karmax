@@ -65,6 +65,7 @@ describe('failed software-dev recovery', () => {
     await api.signalTask(token, task.id, 'retry');
 
     expect(starts).toHaveLength(1);
+    expect(starts[0]![0]).toBe('softwareDev@1.1.0');
     const options = starts[0]![1];
     expect(options.workflowId).toBe(task.id);
     expect(options.workflowIdReusePolicy).toBe('ALLOW_DUPLICATE_FAILED_ONLY');
@@ -79,5 +80,53 @@ describe('failed software-dev recovery', () => {
     );
     expect(fs.readFileSync(path.join(world, 'dirty-work.txt'), 'utf8')).toBe('must survive');
     expect(store.getTask(task.id)?.lastView).toMatchObject({ stage: 'do', status: 'active' });
+    expect(store.getTask(task.id)?.workflowVersion).toBe('1.1.0');
+  });
+
+  it('queries through a stale v1 account-wait snapshot but keeps current snapshots fast', async () => {
+    const store = new Store(':memory:');
+    const tokens = new TokenAuthority();
+    const token = tokens.mint({
+      taskId: 'operator',
+      profileId: 'do',
+      principal: 'user:test',
+      ceiling: ['read-task'],
+      grantorCaps: ['read-task'],
+    }).token;
+    const project = store.createProject('Legacy view');
+    const task = store.createTask({
+      projectId: project.id,
+      title: 'Old run',
+      workflow: 'software-dev',
+      workflowVersion: '1.0.0',
+      params: { prompt: 'continue' },
+    });
+    const stale = {
+      taskId: task.id,
+      title: task.title,
+      workflow: 'software-dev',
+      stage: 'do' as const,
+      status: 'waiting' as const,
+      waitingFor: { kind: 'account' as const, provider: 'codex' as const },
+      messages: [],
+      actions: [],
+      state: {},
+      updatedAt: 1,
+    };
+    store.saveView(task.id, stale);
+    let queries = 0;
+    const live = { ...stale, status: 'active' as const, waitingFor: undefined, updatedAt: 2 };
+    const client = {
+      workflow: { getHandle: () => ({ query: async () => (queries++, live) }) },
+    } as any;
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens });
+
+    expect(await api.getTaskView(token, task.id)).toMatchObject({ status: 'active', updatedAt: 2 });
+    expect(queries).toBe(1);
+
+    store.setTaskWorkflowVersion(task.id, '1.1.0');
+    store.saveView(task.id, stale);
+    expect(await api.getTaskView(token, task.id)).toMatchObject({ status: 'waiting', updatedAt: 1 });
+    expect(queries).toBe(1);
   });
 });

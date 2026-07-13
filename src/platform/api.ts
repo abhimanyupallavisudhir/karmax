@@ -360,9 +360,9 @@ export class KarmaxApi {
    * against the CURRENT project/global defaults and pin the stamped version.
    * Meta fields (profiles/draft/archived/triggers) aren't workflow overrides.
    */
-  private async buildStart(task: TaskRecord): Promise<{ startType: string; input: TaskInput }> {
+  private async buildStart(task: TaskRecord, migrateToLatest = false): Promise<{ startType: string; input: TaskInput; version: string }> {
     const project = this.deps.store.getProject(task.projectId);
-    const start = this.resolveStart(task.workflow, task.workflowVersion);
+    const start = this.resolveStart(task.workflow, migrateToLatest ? undefined : task.workflowVersion);
     if (!project || !start) throw new Error(`cannot start task ${task.id}`);
     const { manifest, startType } = start;
     // Re-resolve against the CURRENT project/global defaults. The task stored only
@@ -381,7 +381,7 @@ export class KarmaxApi {
     input.workflow = task.workflow;
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
-    return { startType, input };
+    return { startType, input, version: manifest.version };
   }
 
   /**
@@ -600,7 +600,16 @@ export class KarmaxApi {
     // (post-`updateParams` responses, review-action resolution). We also fall through to
     // a live query when there is no snapshot yet (a brand-new task, pre-first-publish).
     const snap = snapshot();
-    if (snap && !opts?.live) return withNotes(snap);
+    // softwareDev@1.0.0 could persist "waiting for account" immediately before
+    // scheduling a turn, then clear it only in workflow memory after the grant.
+    // It cannot add a publish at that point without breaking replay. Treat that
+    // one legacy shape as stale-prone and query its authoritative live state;
+    // current workflows carry agentTurn and remain snapshot-fast.
+    const legacyAccountWait =
+      this.deps.store.getTask(taskId)?.workflowVersion === '1.0.0' &&
+      snap?.waitingFor?.kind === 'account' &&
+      !snap.agentTurn;
+    if (snap && !opts?.live && !legacyAccountWait) return withNotes(snap);
     // Live path — bound it: a wedged workflow (e.g. stuck in a workflow-task-failure
     // loop) makes a query hang without rejecting, which would otherwise freeze the
     // caller. Fall back fast to whatever snapshot we have.
@@ -750,7 +759,11 @@ export class KarmaxApi {
     if (task.workflow !== 'software-dev' || view.status !== 'failed') throw new Error('only failed software-dev tasks can be recovered');
     if (view.pointOfNoReturnPassed) throw new Error('cannot recover a task after its merge point of no return');
 
-    const { startType, input } = await this.buildStart(task);
+    // Recovery is an explicit migration boundary. Replaying a replacement with
+    // the same obsolete implementation can reproduce the exact incompatibility
+    // that made the old run terminal, so resume on the current bundled version
+    // and persist that new pin only after Temporal accepts the replacement.
+    const { startType, input, version } = await this.buildStart(task, true);
     const savedWorld = view.state?.recoveryWorld as any;
     let world = savedWorld?.root && savedWorld?.branch ? savedWorld : undefined;
 
@@ -817,6 +830,7 @@ export class KarmaxApi {
       }),
       START_TIMEOUT_MS,
     );
+    this.deps.store.setTaskWorkflowVersion(taskId, version);
     // Close the short acceptance→first-publish window so the UI cannot offer a
     // second recovery while the replacement run is already starting.
     this.deps.store.saveView(taskId, {
@@ -982,18 +996,20 @@ export class KarmaxApi {
     this.require(token, 'edit_workflow');
     const project = this.deps.store.getProject(args.projectId);
     if (!project) throw new Error(`no project ${args.projectId}`);
+    const mergeOnlyVersion = MANIFESTS.find((m) => m.name === 'merge-only')?.version;
+    if (!mergeOnlyVersion) throw new Error('bundled merge-only manifest is missing');
     const task = this.deps.store.createTask({
       projectId: args.projectId,
       title: args.title,
       workflow: 'merge-only',
-      workflowVersion: '1.0.0',
+      workflowVersion: mergeOnlyVersion,
       // Record the edit target so the self-healing loop can reload the workflow
       // from `repo@target` once this merge completes (§4.4).
       params: { prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true },
     });
     try {
       await withTimeout(
-        this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, '1.0.0'), {
+        this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, mergeOnlyVersion), {
           taskQueue: this.deps.taskQueue,
           workflowId: task.id,
           args: [
