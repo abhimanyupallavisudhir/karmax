@@ -540,11 +540,19 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
           }
           lastError = describeError(err);
           error = lastError;
+          const auto = await core.autoResolve({ taskId, stage: stageName, error });
+          if (auto.resolved) {
+            // A scripted resolution is not a Resolve-agent turn. Keep the task in
+            // its originating stage so quota errors do not visibly enter Resolve
+            // (and operators do not infer that another quota-bound agent ran).
+            log.info('auto-resolve matched', { stage: stageName, action: auto.action, note: auto.note });
+            error = undefined;
+            continue;
+          }
           const prevStage = stage;
           stage = 'resolve';
           await publish();
-          const auto = await core.autoResolve({ taskId, stage: stageName, error });
-          if (!auto.resolved && world) {
+          if (world) {
             // The resolve agent is about to run — freeze `agent:resolve` (SPEC §5.5).
             consumed.add('agent:resolve');
             // Escalate to the Resolve agent with a context bundle, accumulating its

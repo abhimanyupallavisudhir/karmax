@@ -343,6 +343,26 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('cancelled');
   });
 
+  it('auto-resolves provider usage limits without spawning a quota-bound Resolve agent', async () => {
+    const repo = await h.makeRepo('app-usage-limit');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Quota', prompt: '@fail Codex usage limit reached · resets in 1800s' })],
+    });
+    // The scripted handler retries the originating stage. With no alternate
+    // credential configured those bounded retries eventually require a human,
+    // but another agent must never be started using the exhausted credential.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
+    const v = await view(handle);
+    const resolve = (v.transcripts ?? []).find((t: any) => t.role === 'resolve');
+    expect(resolve?.messages?.length ?? 0).toBe(0);
+    expect(v.error).toMatch(/usage limit reached/i);
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+  });
+
   it('retries a transient transport failure in-place — session resumed, Resolve never runs', async () => {
     const repo = await h.makeRepo('app-flaky');
     const taskId = newId('task');
