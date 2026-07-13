@@ -18,6 +18,9 @@ import { worldRepos } from '../world/types.js';
  *   @subagents <n>                  report in-harness sub-agents (Task tool) still running:
  *                                   N this turn, then N-1, … draining by one each turn until
  *                                   0 — models sub-agents that settle over several turns
+ *   @shells <n>                     report backgrounded shells (run_in_background Bash) still
+ *                                   running: N this turn, then N-1, … draining by one each turn
+ *                                   until 0 — models a `npm test &` the turn ended while awaiting
  *   @review <summary>               attach review info
  *   @skill <name> :: <content>      save a skill
  *   @fail <message>                 throw (exercises Resolve)
@@ -36,6 +39,9 @@ const failedOnce = new Set<string>();
 // so a turn that "finished" is HELD in Do until the count reaches 0 — modelling
 // auto-backgrounded Claude Agent SDK sub-agents that settle over several turns.
 const stickySubagents = new Map<string, number>();
+// `@shells N` ledger: same draining model, for backgrounded shells (run_in_background
+// Bash) the turn returned while still running — held in Do, but with a smaller budget.
+const stickyShells = new Map<string, number>();
 
 export class MockAdapter implements AgentAdapter {
   readonly provider = 'mock' as const;
@@ -232,6 +238,12 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`subagents: ${rest.trim()}`);
           break;
         }
+        case 'shells': {
+          // Simulate a turn that returned while N backgrounded shells are still running.
+          stickyShells.set(input.world.handle.id, Number(rest.trim()) || 0);
+          outputs.push(`shells: ${rest.trim()}`);
+          break;
+        }
         case 'profile':
           // Echo the model/effort this turn actually ran with, so tests can assert
           // an in-flight retune (SPEC §5.5) reaches the agent on its next turn.
@@ -273,10 +285,23 @@ export class MockAdapter implements AgentAdapter {
       pendingSubagents = sticky;
       stickySubagents.set(input.world.handle.id, sticky - 1);
     }
+    // Same draining for backgrounded shells.
+    let pendingBackgroundShells = 0;
+    const stickySh = stickyShells.get(input.world.handle.id) ?? 0;
+    if (stickySh > 0) {
+      pendingBackgroundShells = stickySh;
+      stickyShells.set(input.world.handle.id, stickySh - 1);
+    }
 
     if (outputs.length === 0) outputs.push('(mock agent: no directives; nothing to do)');
     if (complete) ctx.signalCompletion(outputs.join('; '));
-    return { session, output: outputs.join('\n'), delivered: deliveredIndex, ...(pendingSubagents ? { pendingSubagents } : {}) };
+    return {
+      session,
+      output: outputs.join('\n'),
+      delivered: deliveredIndex,
+      ...(pendingSubagents ? { pendingSubagents } : {}),
+      ...(pendingBackgroundShells ? { pendingBackgroundShells } : {}),
+    };
   }
 }
 

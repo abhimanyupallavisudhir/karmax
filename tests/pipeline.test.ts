@@ -53,6 +53,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // @review sets the terse caption; the git-derived summary/changedFiles are added automatically.
     expect(review.reviewInfo?.caption).toContain('factorial');
     expect(review.actions.map((a: any) => a.name)).toContain('confirm');
+    // The agent called signal_completion (mock default), so the gate marks it as an
+    // asserted finish rather than a silent stall.
+    expect(review.reviewInfo?.completion).toBe('signalled');
 
     await handle.signal('confirm');
     const result = await handle.result();
@@ -63,6 +66,32 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const onMain = await git(repo, ['show', 'main:factorial.js']);
     expect(onMain.code).toBe(0);
     expect(onMain.stdout).toContain('export const f');
+  });
+
+  it('marks a Review reached without signal_completion as a stall, so the reviewer is warned', async () => {
+    const repo = await h.makeRepo('app');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        input({
+          taskId,
+          repo,
+          title: 'Half-finished change',
+          // The agent writes a file but does NOT signal completion (@incomplete) — it went
+          // quiet mid-task. It still surfaces at Review (needsInput), but flagged as a stall.
+          prompt: 'Start the work.\n@write half.js :: export const x = 1;\n@incomplete',
+        }),
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.reviewInfo?.completion).toBe('stalled');
+    // The distinction is real, not cosmetic: a stall is never auto-confirmed, so the task
+    // waits at the human gate rather than advancing.
+    expect(review.actions.map((a: any) => a.name)).toContain('confirm');
   });
 
   it('multi-repo: passes every configured repo to the agent and lands work in each', async () => {
@@ -561,6 +590,52 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     // …and the reviewer is told why (a sub-agent may be wedged and its output missing).
     expect(review.reviewInfo?.summary).toContain('sub-agent(s) still reported running');
     expect(review.reviewInfo?.summary).toContain('may be wedged');
+
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
+
+  it('holds Do→Review while the agent left a run_in_background shell running (task 130)', async () => {
+    const repo = await h.makeRepo('app-shells');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // The agent did its work but ended the turn WITHOUT signalling completion, leaving a
+      // backgrounded shell (e.g. `npm test`) running — the exact task-130 shape. It must NOT
+      // fall straight through to Review: held in Do (waitingFor 'shell') until the shell drains.
+      args: [input({ taskId, repo, title: 'Shells', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@shells 2\n@incomplete', subagentWaitMs: 1500 })],
+    });
+
+    await expect
+      .poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind ?? '-'}`; }, { timeout: 20_000 })
+      .toBe('do/shell');
+    // nothing landed while it waits
+    expect((await git(repo, ['show', 'main:out.txt'])).code).not.toBe(0);
+
+    // Once the shell settles (count → 0) it advances to Review on its own.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:out.txt'])).stdout).toContain('hi');
+  }, 60_000);
+
+  it('gives up on a long-lived background shell after a small budget, with a Review note', async () => {
+    const repo = await h.makeRepo('app-shells-devserver');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      // 6 drains > MAX_SHELL_NUDGES (3): the shell is still reported running when the budget
+      // is spent (models a dev server left running on purpose). It must proceed to Review
+      // (never park forever) with a note that a background job's result may be missing.
+      args: [input({ taskId, repo, title: 'DevServer', prompt: '@write out.txt :: hi\n@review Implemented out.txt\n@shells 6\n@incomplete', subagentWaitMs: 300 })],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const review = await view(handle);
+    expect(review.reviewInfo?.summary).toContain('background job(s) still running');
 
     await handle.signal('confirm');
     expect((await handle.result()).stage).toBe('done');

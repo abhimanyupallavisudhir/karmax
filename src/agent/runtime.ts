@@ -50,6 +50,19 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const skills: { name: string; content: string }[] = [];
 
   const ctx: PlatformToolContext = {
+    // `signal_completion` is the agent's structured, unspoofable "I'm done — advance me"
+    // (SPEC §5.2: "not a parsed 'promise' string — structured is unambiguous and
+    // unspoofable"). It ONLY sets `completed`; it does not itself move the task. The turn
+    // ending is a SEPARATE event: when the adapter's runTurn returns without this having
+    // been called, the turn is surfaced as `needsInput` (a stall) below — NOT as complete.
+    //
+    // Where the completed-vs-stall distinction actually changes control flow: only the
+    // no-human-in-the-loop modes — the `goal` workflow's keep-going loop (which terminates
+    // only on a structured completion signal) and `confirmMode==='auto'` (which gates the
+    // auto-merge on `completed || raise`). Under the default human/agent confirmer every
+    // ending routes to the same Review gate, so the flag is otherwise a semantic label —
+    // now surfaced to the reviewer via `ReviewInfo.completion` (set in software-dev's
+    // Review block) rather than being silently discarded.
     signalCompletion(summary) {
       completed = true;
       if (summary && !reviewInfo?.summary) reviewInfo = { ...reviewInfo, summary };
@@ -139,14 +152,21 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     raise,
     waitForSubtasks,
     pendingSubagents: turn.pendingSubagents,
+    pendingBackgroundShells: turn.pendingBackgroundShells,
     subTasks: subTasks.length ? subTasks : undefined,
     subTaskResponses: subTaskResponses.length ? subTaskResponses : undefined,
     skills: skills.length ? skills : undefined,
     // If the agent did work but didn't signal completion — and didn't spawn, answer,
     // raise, or wait on a sub-task, and isn't still waiting on its own in-harness
-    // sub-agents (those route through the workflow, not the human Review gate) — it is
-    // surfaced as needs-input.
+    // sub-agents or backgrounded shells (those route through the workflow, not the
+    // human Review gate) — it is surfaced as needs-input.
     needsInput:
-      !completed && subTasks.length === 0 && subTaskResponses.length === 0 && !raise && !waitForSubtasks && !turn.pendingSubagents,
+      !completed &&
+      subTasks.length === 0 &&
+      subTaskResponses.length === 0 &&
+      !raise &&
+      !waitForSubtasks &&
+      !turn.pendingSubagents &&
+      !turn.pendingBackgroundShells,
   };
 }

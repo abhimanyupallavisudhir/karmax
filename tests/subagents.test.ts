@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { newSubagentTracker, trackTaskMessage, pendingSubagentCount } from '../src/agent/subagents.js';
+import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from '../src/agent/subagents.js';
 
 /** Synthetic Claude-Agent-SDK `system` task-lifecycle messages (sdk.d.ts shapes). */
 const started = (task_id: string, subagent_type?: string) => ({
@@ -45,9 +45,9 @@ describe('subagent tracker', () => {
     expect(pendingSubagentCount(t)).toBe(0);
   });
 
-  it('does NOT track non-sub-agent tasks (shells, monitors) — those must not block the turn', () => {
+  it('does NOT count shells/workflows toward the sub-agent total — those must not block the turn', () => {
     const t = newSubagentTracker();
-    trackTaskMessage(t, started('shell-1')); // no subagent_type → a backgrounded shell/dev-server
+    trackTaskMessage(t, started('shell-1')); // no subagent_type → a backgrounded shell
     trackTaskMessage(t, { type: 'system', subtype: 'task_started', task_id: 'wf-1', task_type: 'workflow', name: 'spec' });
     expect(pendingSubagentCount(t)).toBe(0);
   });
@@ -75,5 +75,50 @@ describe('subagent tracker', () => {
     expect(pendingSubagentCount(t)).toBe(3);
     trackTaskMessage(t, notify('b', 'failed'));
     expect(pendingSubagentCount(t)).toBe(2);
+  });
+});
+
+describe('background-shell tracker', () => {
+  it('counts a backgrounded shell (run_in_background Bash) as still in flight', () => {
+    const t = newSubagentTracker();
+    trackTaskMessage(t, started('sh-1')); // no subagent_type / task_type → a shell
+    trackTaskMessage(t, updated('sh-1', { is_backgrounded: true }));
+    expect(pendingBackgroundShellCount(t)).toBe(1);
+    expect(pendingSubagentCount(t)).toBe(0); // not a sub-agent
+  });
+
+  it('counts an unsettled shell even without an explicit is_backgrounded patch', () => {
+    // Task 130: `npm test` left running; at turn end it simply never settled.
+    const t = newSubagentTracker();
+    trackTaskMessage(t, started('sh-1'));
+    expect(pendingBackgroundShellCount(t)).toBe(1);
+  });
+
+  it('clears a shell that settles (completed / notification)', () => {
+    const t = newSubagentTracker();
+    trackTaskMessage(t, started('sh-1'));
+    trackTaskMessage(t, updated('sh-1', { status: 'completed' }));
+    expect(pendingBackgroundShellCount(t)).toBe(0);
+
+    const t2 = newSubagentTracker();
+    trackTaskMessage(t2, started('sh-2'));
+    trackTaskMessage(t2, notify('sh-2', 'completed'));
+    expect(pendingBackgroundShellCount(t2)).toBe(0);
+  });
+
+  it('does NOT count workflow tasks or ambient/housekeeping tasks as shells', () => {
+    const t = newSubagentTracker();
+    trackTaskMessage(t, { type: 'system', subtype: 'task_started', task_id: 'wf-1', task_type: 'workflow' });
+    trackTaskMessage(t, { type: 'system', subtype: 'task_started', task_id: 'lw-1', task_type: 'local_workflow' });
+    trackTaskMessage(t, { type: 'system', subtype: 'task_started', task_id: 'mon-1', skip_transcript: true }); // MCP monitor
+    expect(pendingBackgroundShellCount(t)).toBe(0);
+  });
+
+  it('keeps sub-agent and shell counts separate', () => {
+    const t = newSubagentTracker();
+    trackTaskMessage(t, started('a1', 'general-purpose'));
+    trackTaskMessage(t, started('sh-1'));
+    expect(pendingSubagentCount(t)).toBe(1);
+    expect(pendingBackgroundShellCount(t)).toBe(1);
   });
 });

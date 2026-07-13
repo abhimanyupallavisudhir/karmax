@@ -9,7 +9,7 @@ import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
-import { newSubagentTracker, trackTaskMessage, pendingSubagentCount } from './subagents.js';
+import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
 import { spawn } from 'node:child_process';
 import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
@@ -459,7 +459,14 @@ export class ClaudeAdapter implements AgentAdapter {
     // consumed (initial delta + in-flight injections) so the workflow advances its
     // boundary past exactly them.
     const pending = pendingSubagentCount(subagents);
-    return { session, output: finalText, delivered: deliveredIndex, ...(pending ? { pendingSubagents: pending } : {}) };
+    const pendingShells = pendingBackgroundShellCount(subagents);
+    return {
+      session,
+      output: finalText,
+      delivered: deliveredIndex,
+      ...(pending ? { pendingSubagents: pending } : {}),
+      ...(pendingShells ? { pendingBackgroundShells: pendingShells } : {}),
+    };
   }
 }
 

@@ -500,23 +500,29 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   font-size: 11px; line-height: 1; padding: 0; opacity: .65;
 }
 .dep-chip .dep-x:hover { opacity: 1; }
-.chip-input .chip-text {
-  flex: 1; min-width: 120px; border: 0; outline: 0; background: transparent;
-  color: var(--ink); font: inherit; padding: 2px;
-}
-.dep-menu {
-  position: relative; margin-top: 2px; border: 1px solid var(--line);
-  border-radius: var(--r-sm); background: var(--surface); box-shadow: var(--shadow);
-  max-height: 208px; overflow: auto; display: none; z-index: 5;
-}
-.dep-menu.open { display: block; }
-.dep-item {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
-  padding: 6px 9px; cursor: pointer; font-size: 13px;
-}
-.dep-item.hi, .dep-item:hover { background: var(--accent-weak); }
-.dep-item-wf { color: var(--ink-3); font-size: 11px; }
 .label-row .hint { font-weight: 400; color: var(--ink-3); font-size: 12px; cursor: help; }
+
+/* ── Overlay task picker (dependency search + fork-from search) ───────────── */
+.palette.picker { width: min(720px, 94vw); }
+.picker .organizer { margin: 10px 12px 0; }
+.picker .pk-hint { padding: 8px 16px 0; font-size: 12px; color: var(--ink-3); }
+.picker #pk-list { max-height: 52vh; overflow: auto; padding: 8px 12px 12px; }
+.picker #pk-list .group-h { margin: 10px 0 4px; }
+.pick-row { display: flex; align-items: center; gap: 12px; padding: 8px 10px; border-radius: 7px; cursor: pointer; }
+.pick-row:hover, .pick-row.hi { background: var(--accent-weak); }
+.pick-row .task-main { min-width: 0; flex: 1; }
+.pick-row .task-title { font-size: 13px; }
+.pk-caret { color: var(--ink-3); font-size: 12px; }
+.pk-sessions { margin: 0 0 4px 26px; border-left: 1px solid var(--line); padding-left: 8px; }
+.pk-fork { color: var(--accent); }
+.pk-session .task-sub .mono { font-size: 11px; }
+.pk-empty { padding: 10px; color: var(--ink-3); font-size: 13px; }
+
+/* the chosen fork source under "Fork a previous agent" (task form / drawer) */
+.af-resume-chosen { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 6px; }
+.af-resume-chosen:empty { display: none; }
+.af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
+.af-resume-clear:hover { color: var(--danger); }
 
 /* ── Schedule builder + 5-field cron grid (task form) ─────────────────────── */
 .sched-builder { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -549,17 +555,6 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   content: ""; position: absolute; left: 20px; top: 0; bottom: 0; width: 1px; background: var(--line);
 }
 .run-row { position: relative; }
-
-/* ── Event trigger builder ────────────────────────────────────────────────── */
-.event-extra { margin-top: 6px; }
-.ev-filter-hint { font-size: 12px; color: var(--ink-3); margin: 4px 0 2px; }
-.ev-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; }
-.ev-filter { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--ink-2); }
-.ev-filter small { color: var(--ink-3); font-size: 10px; }
-.ev-filter input, .ev-source select {
-  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 4px 6px; background: var(--surface); color: var(--ink); font-size: 13px;
-}
-.ev-source { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--ink-2); }
 
 /* ── Repeatable toggle (prominent, task-level) ───────────────────────────── */
 .repeat-row { margin-top: 12px; }
