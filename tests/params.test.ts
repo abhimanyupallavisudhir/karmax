@@ -93,14 +93,25 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
     expect(input.agents?.do).toEqual({ provider: 'codex', model: 'gpt-4.1', effort: 'high' });
   });
 
-  it('carries the confirmer mode + review-request prompt into input.confirm (agent knobs also land on agents.confirm)', () => {
+  it('normalizes a legacy confirmer {mode} value into confirm layers', () => {
     const resolved = {
       prompt: 'build X',
       confirm: { mode: 'agent', provider: 'mock', prompt: 'Ensure X, Y and Z.\n{{response}}' },
     };
     const input = assembleTaskInput(sd, resolved, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
-    expect(input.confirm).toEqual({ mode: 'agent', provider: 'mock', prompt: 'Ensure X, Y and Z.\n{{response}}' });
-    expect(input.agents?.confirm).toEqual({ provider: 'mock' }); // prompt is not an AgentSpec knob
+    expect(input.confirm).toEqual({ layers: [{ kind: 'agent', provider: 'mock', prompt: 'Ensure X, Y and Z.\n{{response}}' }] });
+    expect(input.agents?.confirm).toBeUndefined(); // per-layer specs land on agents.confirm at turn time, in the workflow
+  });
+
+  it('carries confirm layers into input.confirm as given (auto-confirm = zero layers)', () => {
+    const layers = [
+      { kind: 'agent', provider: 'mock', model: 'm1', prompt: 'Check it.\n{{response}}' },
+      { kind: 'human' },
+    ];
+    const input = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers } }, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
+    expect(input.confirm).toEqual({ layers });
+    const auto = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers: [] } }, { taskId: 't2', projectId: 'p1', title: 'X', project: {} });
+    expect(auto.confirm).toEqual({ layers: [] });
   });
 });
 

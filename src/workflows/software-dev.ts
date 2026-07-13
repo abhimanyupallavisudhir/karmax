@@ -19,6 +19,7 @@ import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 import { classifyLimitError } from '../agent/limits.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import {
@@ -26,6 +27,7 @@ import {
   TaskView,
   Stage,
   AgentSpec,
+  ConfirmLayer,
   Message,
   ReviewInfo,
   DeclaredAction,
@@ -207,11 +209,13 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
   const mergeMsgs: Message[] = [];
   const resolveMsgs: Message[] = [];
   const confirmMsgs: Message[] = [];
-  // Who drives the Review gate (SPEC §5.2). Explicit `input.confirm` wins; otherwise
-  // fall back to the legacy `autoConfirm` flag (top-level goal tasks) → `auto`, else a
-  // human. A child with a `parentTaskId` always routes Review to its parent regardless
-  // (parent-as-confirmer, SPEC §5.3), so this only governs top-level tasks.
-  const confirmMode: 'human' | 'auto' | 'agent' = input.confirm?.mode ?? (input.autoConfirm ? 'auto' : 'human');
+  // Who drives the Review gate (SPEC §5.2): the ordered confirm layers, played
+  // sequentially at each Review — every layer must approve; [] ⇒ auto-confirm.
+  // Legacy shapes ({mode} configs, the goal-task `autoConfirm` flag) normalize to
+  // their layer equivalents. A child with a `parentTaskId` always routes Review to
+  // its parent regardless (parent-as-confirmer, SPEC §5.3), so this only governs
+  // top-level tasks.
+  const confirmLayers = confirmLayersOf(input.confirm, !!input.autoConfirm);
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, { accountId: string; configHome?: string; apiKeyHandle?: string }>();
   let turnSeq = 0;
@@ -754,14 +758,21 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
    *  human makes. Leased + resolve-wrapped like every other role. Returns the verdict,
    *  or undefined if the agent turn failed or declined to decide (caller falls back to
    *  the human gate so nothing is silently auto-confirmed). */
-  async function confirmTurn(): Promise<import('./contract.js').ConfirmDecision | undefined> {
+  async function confirmTurn(layer: ConfirmLayer): Promise<import('./contract.js').ConfirmDecision | undefined> {
+    // The layer's own agent spec drives this turn (each agent layer can run a
+    // different reviewer): land it on liveInput.agents.confirm so the shared
+    // machinery (provider lease + runAgentTurn's per-role override) picks it up;
+    // a spec-less layer clears the slot and falls back to the confirm profile.
+    const { kind: _kind, prompt: _prompt, ...layerSpec } = layer;
+    const { confirm: _prev, ...otherAgents } = liveInput.agents ?? {};
+    liveInput.agents = layerSpec.provider ? { ...otherAgents, confirm: { ...layerSpec, provider: layerSpec.provider } } : otherAgents;
     // Each Review appends a fresh review-request to the Confirm transcript — the task
     // prompt + the Do agent's latest response, rendered from the (user-editable)
     // confirm prompt template — so repeated Reviews read as ONE conversation:
     // request, verdict, request with the new response, ad recursum.
     const response =
       [...msgs].reverse().find((m) => m.role === 'agent')?.text ?? reviewInfo?.summary ?? '(the agent produced no final message)';
-    const request = renderConfirmPrompt(input.confirm?.prompt, {
+    const request = renderConfirmPrompt(layer.prompt ?? input.confirm?.prompt, {
       title: input.title,
       prompt: input.prompt,
       response,
@@ -1070,52 +1081,71 @@ export async function softwareDev(input: SoftwareDevInput): Promise<{ stage: Sta
       stage = 'review';
       status = 'waiting';
       // Who confirms (SPEC §5.2/§5.3): a child always routes to its parent; a top-level
-      // task uses its configured confirmer — auto, a Confirm agent, or a human.
+      // task plays its confirm layers in order (each a human click or a Confirm agent).
       if (input.parentTaskId) {
         // Parent-as-confirmer (SPEC §5.3): raise to the parent instead of blocking on
         // a human the parent-managed child isn't even surfaced to. The parent's reply
         // drives `confirmed`/follow-up via parentResponseSignal.
         waitingFor = { kind: 'parent' };
         await notifyParent(turn.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
-      } else if (confirmMode === 'auto') {
-        // Auto-confirm only a turn that actually finished its work (or is explicitly
-        // raising for a decision) — never a bare needsInput stall, which would push a
-        // zero-/partial-work diff straight through to merge unseen. `auto` today comes
-        // only from a top-level goal task (autoConfirm) or an explicit confirm.mode:auto;
-        // in goal mode the loop above already guarantees completed|raise here, so this is
-        // a replay-safe guard — it changes no reachable path now but stops an empty turn
-        // from being silently merged. A stall falls through to the human gate below.
-        if (turn.completed || turn.raise) confirmed = true;
-      } else if (confirmMode === 'agent') {
-        // Run the Confirm agent; its verdict maps onto the SAME transitions a human
-        // drives (confirm / follow-up-to-Do / cancel).
-        waitingFor = { kind: 'confirm' };
         await publish();
-        const decision = await confirmTurn();
+        await condition(() => confirmed || cancelled || msgs.length > seen);
         waitingFor = undefined;
         if (cancelled) return await abort();
-        if (decision?.action === 'confirm') {
-          confirmed = true;
-        } else if (decision?.action === 'reject') {
-          if (decision.text) msgs.push({ id: `cr-${msgs.length}`, role: 'system', text: `Confirm agent rejected the work: ${decision.text}`, ts: msgs.length });
-          cancelled = true;
-          return await abort();
-        } else if (decision?.action === 'revise') {
-          // Feedback goes into the Do transcript as a follow-up and we loop back to Do.
-          msgs.push({ id: `cv-${msgs.length}`, role: 'user', text: decision.text || 'Please revise the work per the reviewer feedback.', ts: msgs.length });
-          stage = 'do';
-          status = 'active';
-          continue;
-        }
-        // No verdict (turn failed / declined) → fall through to the human gate below so
-        // nothing is silently auto-confirmed.
+        if (confirmed) break;
+        // the parent's comment arrived → back to Do
+        stage = 'do';
+        status = 'active';
+        continue;
       }
-      await publish();
-      await condition(() => confirmed || cancelled || msgs.length > seen);
-      waitingFor = undefined;
-      if (cancelled) return await abort();
-      if (confirmed) break;
-      // follow-up (a human, or the parent's comment) arrived → back to Do
+      // Zero layers auto-confirm — but only a turn that actually finished its work (or
+      // is explicitly raising for a decision), never a bare needsInput stall, which
+      // would push a zero-/partial-work diff straight through to merge unseen: a stall
+      // degrades to a single human gate. (In goal mode the loop above already
+      // guarantees completed|raise here, so the guard changes no reachable goal path.)
+      const gates: ConfirmLayer[] = confirmLayers.length || turn.completed || turn.raise ? confirmLayers : [{ kind: 'human' }];
+      let backToDo = false;
+      for (let li = 0; li < gates.length && !backToDo; li++) {
+        const layer = gates[li]!;
+        const gateDetail = gates.length > 1 ? `confirm layer ${li + 1}/${gates.length}` : undefined;
+        if (layer.kind === 'agent') {
+          // Run this layer's Confirm agent; its verdict maps onto the SAME transitions
+          // a human drives (confirm / follow-up-to-Do / cancel).
+          waitingFor = { kind: 'confirm', ...(gateDetail ? { detail: gateDetail } : {}) };
+          await publish();
+          const decision = await confirmTurn(layer);
+          waitingFor = undefined;
+          if (cancelled) return await abort();
+          if (decision?.action === 'confirm') continue; // this layer approves → the next
+          if (decision?.action === 'reject') {
+            if (decision.text) msgs.push({ id: `cr-${msgs.length}`, role: 'system', text: `Confirm agent rejected the work: ${decision.text}`, ts: msgs.length });
+            cancelled = true;
+            return await abort();
+          }
+          if (decision?.action === 'revise') {
+            // Feedback goes into the Do transcript as a follow-up and we loop back to
+            // Do; the next Review replays the layers from the first.
+            msgs.push({ id: `cv-${msgs.length}`, role: 'user', text: decision.text || 'Please revise the work per the reviewer feedback.', ts: msgs.length });
+            backToDo = true;
+            continue;
+          }
+          // No verdict (turn failed / declined) → degrade THIS layer to the human gate
+          // below so nothing is silently auto-confirmed.
+        }
+        // A human layer: wait for the Confirm click — one click passes ONE layer — or a
+        // follow-up, which sends the task back to Do.
+        if (gateDetail) waitingFor = { kind: 'human', detail: gateDetail };
+        await publish();
+        await condition(() => confirmed || cancelled || msgs.length > seen);
+        waitingFor = undefined;
+        if (cancelled) return await abort();
+        if (!confirmed) backToDo = true; // follow-up arrived → back to Do
+        confirmed = false; // consumed by this layer (a later layer needs its own click)
+      }
+      if (!backToDo) {
+        confirmed = true; // every layer approved
+        break;
+      }
       stage = 'do';
       status = 'active';
       continue;

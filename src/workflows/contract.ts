@@ -10,6 +10,7 @@ export type {
   TaskStatus,
   AgentSpec,
   ConfirmConfig,
+  ConfirmLayer,
   ConfirmMode,
   ConfirmDecision,
   ConfirmAction,

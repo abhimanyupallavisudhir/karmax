@@ -25,14 +25,15 @@ const promptField = (): FieldSpec => ({ name: 'prompt', type: 'text', label: 'Pr
 // swapped mid-flight (retune model/effort, or send a follow-up to redirect it);
 // merge/resolve can still be fully swapped until their own turn runs.
 const agentField = (role: string, label: string, mutable?: FieldSpec['mutable']): FieldSpec => ({ name: `agent:${role}`, type: 'agent', label, scopes: ['task'], bind: 'profile', role, ...(mutable ? { mutable } : {}) });
-// The confirmer field selects WHO drives the Review gate — human / auto / an agent.
-// Unlike the agent fields it spans all scopes (task/project/global) so the mode has
-// the usual default-inheritance; when the mode is `agent` it carries the same agent
+// The confirmer field holds the ordered confirm LAYERS the Review gate plays —
+// each a human confirmation or a review agent; zero layers ⇒ auto-confirm.
+// Unlike the agent fields it spans all scopes (task/project/global) so the layer
+// list has the usual default-inheritance; an agent layer carries the same agent
 // knobs (provider/model/effort/fork) as the Do/Merge/Resolve fields, PLUS the
 // review-request prompt template (pre-filled with `promptDefault`, editable per
 // task/project/global). Chosen at task creation (queue-time), like the other agent
 // selections.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm agent', help: 'Who confirms at the Review gate: a human, an agent, or auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { mode: 'human' }, promptDefault: CONFIRM_PROMPT_DEFAULT });
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm layers', help: 'Played in order at Review — each layer is a human confirmation or a review agent; every layer must approve. No layers ⇒ auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human' }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
