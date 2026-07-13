@@ -6,7 +6,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 
-function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number }) {
+function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any }) {
   return {
     taskId: over.taskId,
     projectId: 'p1',
@@ -17,6 +17,7 @@ function input(over: { taskId: string; repo: string; prompt: string; title?: str
     project: { repos: [over.repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
     ...(over.subtaskNagMs !== undefined ? { subtaskNagMs: over.subtaskNagMs } : {}),
     ...(over.subagentWaitMs !== undefined ? { subagentWaitMs: over.subagentWaitMs } : {}),
+    ...(over.recovery ? { recovery: over.recovery } : {}),
   };
 }
 const view = (h: any) => h.query('view') as Promise<any>;
@@ -341,6 +342,58 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await handle.signal('cancel');
     const result = await handle.result();
     expect(result.stage).toBe('cancelled');
+  });
+
+  it('escalates when the Resolve agent itself fails instead of failing the workflow', async () => {
+    const repo = await h.makeRepo('app-resolver-fail');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Resolver failure', prompt: '@fail resolve-agent-failure-test' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
+    const v = await view(handle);
+    expect(v.status).toBe('blocked');
+    expect(v.error).toMatch(/Resolve agent failed.*resolve agent itself failed/i);
+    // The execution is still alive and accepts the same controls as any other
+    // escalation; before the fix it was terminally FAILED here.
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+  });
+
+  it('opens a recovery checkpoint without recreating its dirty worktree', async () => {
+    const repo = await h.makeRepo('app-recovery-world');
+    const taskId = newId('task');
+    const existing = await h.worlds.create('worktree', { taskId, repo, base: 'main', target: 'main' });
+    await existing.writeFile('preserved.txt', 'work from the failed run');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        input({
+          taskId,
+          repo,
+          title: 'Recovered execution',
+          prompt: 'original prompt',
+          recovery: {
+            world: existing.handle,
+            messages: [{ id: 'recover', role: 'user', text: '@write continued.txt ::resumed\n@review recovered safely', ts: 0 }],
+            seen: 0,
+            target: 'main',
+          },
+        }),
+      ],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    // createWorld would have force-removed this worktree; opening the checkpoint
+    // keeps both the old dirty file and the newly continued work.
+    expect(await existing.readFile('preserved.txt')).toBe('work from the failed run');
+    expect(await existing.readFile('continued.txt')).toBe('resumed');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:preserved.txt'])).stdout).toContain('failed run');
+    expect((await git(repo, ['show', 'main:continued.txt'])).stdout).toContain('resumed');
   });
 
   it('auto-resolves provider usage limits without spawning a quota-bound Resolve agent', async () => {
