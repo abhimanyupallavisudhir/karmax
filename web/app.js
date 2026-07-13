@@ -378,31 +378,84 @@ function readResume(box) {
   return resumeFrom;
 }
 
-// The confirmer field: a mode selector (human / auto / agent) plus the SAME agent
-// sub-form as Do/Merge/Resolve, shown only when the mode is "agent". Reuses
-// renderAgentField for the agent controls (so provider/model/effort + "Fork a
-// previous agent" all work identically), and carries the mode alongside. Agent mode
-// also exposes the review-request prompt template — the message the Confirm agent
-// receives each time the task reaches Review — pre-filled with the built-in default
+// The confirmer field: an ordered LIST of confirm layers, played sequentially at
+// the Review gate — each layer is a human confirmation or a review agent; zero
+// layers ⇒ auto-confirm. Layers can be added, removed and reordered; an agent
+// layer reuses the SAME agent sub-form as Do/Merge/Resolve (renderAgentField, so
+// provider/model/effort + "Fork a previous agent" all work identically) plus the
+// review-request prompt template — pre-filled with the built-in default
 // (f.promptDefault) and stored only when edited, so it keeps inheriting otherwise.
-const CONFIRM_MODE_LABELS = { human: 'Human (you confirm)', auto: 'Auto-confirm', agent: 'Agent confirms' };
-function renderConfirmerField(f, own, inherited, alt) {
-  const inh = inherited || {};
-  const e = own || inh;
-  const mode = e.mode || inh.mode || 'human';
-  const promptVal = (own?.prompt ?? inh.prompt ?? f.promptDefault) || '';
-  const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
-  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}'>
-    <select class="cf-mode">${['human', 'auto', 'agent'].map((m) => `<option value="${m}" ${m === mode ? 'selected' : ''}>${esc(CONFIRM_MODE_LABELS[m])}</option>`).join('')}</select>
-    <div class="cf-agent" style="margin-top:8px;${mode === 'agent' ? '' : 'display:none'}">${renderAgentField(f, own, inherited)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Confirm agent prompt — sent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+// Legacy single-gate values ({mode:…}) are normalized to layers on read.
+function cfLayersOf(v) {
+  if (Array.isArray(v?.layers)) return v.layers;
+  const mode = v?.mode || 'human';
+  if (mode === 'auto') return [];
+  if (mode === 'agent') { const { mode: _m, layers: _l, agentDefault: _d, ...rest } = v || {}; return [{ kind: 'agent', ...rest }]; }
+  return [{ kind: 'human' }];
+}
+function cfLayerHtml(f, layer, agentDefault) {
+  const isAgent = layer.kind === 'agent';
+  const promptVal = (isAgent ? layer.prompt ?? f.promptDefault : f.promptDefault) || '';
+  return `<div class="cf-layer" data-kind="${esc(layer.kind)}">
+    <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
+      <span class="cf-layer-num" style="font-size:11px;color:var(--ink-3);min-width:14px;text-align:right"></span>
+      <select class="cf-kind">${[['human', 'Human confirms'], ['agent', 'Agent reviews']].map(([k, l]) => `<option value="${k}" ${k === layer.kind ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <span style="flex:1"></span>
+      <button type="button" class="btn sm cf-move" data-dir="-1" title="Move layer up">↑</button>
+      <button type="button" class="btn sm cf-move" data-dir="1" title="Move layer down">↓</button>
+      <button type="button" class="btn sm cf-del" title="Remove this layer">✕</button>
+    </div>
+    <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
+  </div>`;
+}
+function cfListHtml(f, layers, agentDefault) {
+  return layers.map((l) => cfLayerHtml(f, l, agentDefault)).join('');
+}
+function renderConfirmerField(f, own, inherited, alt) {
+  const inh = inherited || {};
+  const layers = cfLayersOf(own || inh);
+  const agentDefault = inh.agentDefault || {};
+  const altAttr = alt ? ` data-inherit-alt='${esc(JSON.stringify(alt.value ?? null))}'` : '';
+  return `<div class="confirmer-field" data-confirmer="${esc(f.role || f.name)}" data-inherit='${esc(JSON.stringify(inh))}'${altAttr} data-prompt-default='${esc(JSON.stringify(f.promptDefault ?? ''))}' data-agent-default='${esc(JSON.stringify(agentDefault))}'>
+    <div class="cf-layers">${cfListHtml(f, layers, agentDefault)}</div>
+    <div class="cf-empty" style="font-size:12px;color:var(--ink-3);padding:2px 0;${layers.length ? 'display:none' : ''}">No layers — the task auto-confirms at Review.</div>
+    <button type="button" class="btn sm cf-add" style="margin-top:6px">+ Add layer</button>
   </div>`;
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
+// Canonical shape of a confirm layer for changed-vs-inherited comparison.
+const normLayers = (ls) =>
+  (ls || []).map((l) =>
+    l.kind === 'agent'
+      ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
+      : { kind: 'human' },
+  );
+
+// Read a confirmer box's layer list back out of the DOM (the stored value shape).
+function readConfirmerLayers(box) {
+  const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
+  return [...box.querySelectorAll('.cf-layer')].map((row) => {
+    if (row.querySelector('.cf-kind')?.value !== 'agent') return { kind: 'human' };
+    const ab = row.querySelector('.agent-field');
+    const spec = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
+    const model = ab.querySelector('.af-model').value.trim();
+    const effort = ab.querySelector('.af-effort').value;
+    if (model) spec.model = model;
+    if (effort) spec.effort = effort;
+    const resumeFrom = readResume(ab);
+    if (resumeFrom) spec.resumeFrom = resumeFrom;
+    // Store the review-request prompt only when it diverges from the built-in
+    // default; the pre-filled default itself is never persisted.
+    const prompt = row.querySelector('.cf-prompt')?.value ?? '';
+    if (prompt.trim() !== '' && prompt !== promptDefault) spec.prompt = prompt;
+    return spec;
+  });
+}
 
 // Read a form's values back out; only return fields CHANGED from inherited.
 function collectForm(root, fields) {
@@ -439,32 +492,10 @@ function collectForm(root, fields) {
       const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
       const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
-      const mode = box.querySelector('.cf-mode').value;
-      const spec = { mode };
-      let resumeFrom;
-      let promptChanged = false;
-      if (mode === 'agent') {
-        const ab = box.querySelector('.agent-field');
-        spec.provider = ab.querySelector('.af-provider').value;
-        const model = ab.querySelector('.af-model').value.trim();
-        const effort = ab.querySelector('.af-effort').value;
-        if (model) spec.model = model;
-        if (effort) spec.effort = effort;
-        resumeFrom = readResume(ab);
-        if (resumeFrom) spec.resumeFrom = resumeFrom;
-        // Store the review-request prompt only when it diverges from the inherited
-        // template (a stored override or the built-in default); empty ⇒ inherit.
-        const prompt = box.querySelector('.cf-prompt')?.value ?? '';
-        const inhPrompt = inh?.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
-        promptChanged = prompt.trim() !== '' && prompt !== inhPrompt;
-        if (promptChanged) spec.prompt = prompt;
-        else if (inh?.prompt) spec.prompt = inh.prompt; // keep an inherited override when re-storing
-      }
-      // Store only when it differs from the inherited default: a different mode, or (in
-      // agent mode) a different agent config, a chosen fork, or an edited prompt.
-      const inhMode = inh?.mode || 'human';
-      const changed = mode !== inhMode || (mode === 'agent' && (resumeFrom || promptChanged || !sameJson(normSpec(spec), normSpec(inh))));
-      if (f.required || changed) out[f.name] = spec;
+      const layers = readConfirmerLayers(box);
+      // Store only when the layer list differs from the inherited default (layers
+      // are stored atomically — inherited prompts/specs are carried by value).
+      if (f.required || !sameJson(normLayers(layers), normLayers(cfLayersOf(inh)))) out[f.name] = { layers };
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -520,7 +551,35 @@ function wireCombo(combo, getOptions, onChange) {
   });
 }
 
-// Wire agent-field controls: provider→model combobox + fork search (no toggle).
+// Wire one agent box's controls: provider→model combobox + fork search (no toggle).
+function wireAgentBox(box) {
+  const combo = box.querySelector('.af-model-combo');
+  const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
+  if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
+  box.querySelector('.af-provider')?.addEventListener('change', () => {
+    box.querySelector('.af-model').value = ''; // model choices are provider-specific
+    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+  });
+  // Fork-from search: the full task-picker overlay in agent mode (archived tasks
+  // included — the completed ones are the ones you most often fork from).
+  const chosen = box.querySelector('.af-resume-chosen');
+  const setResume = (rf, task) => {
+    if (!chosen) return;
+    chosen.dataset.resume = JSON.stringify(rf ?? null);
+    chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
+    box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
+  };
+  chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
+  box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
+    openTaskPicker({
+      title: 'Fork a previous agent',
+      hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
+      mode: 'agent',
+      defaults: ['draft', 'series'],
+      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
+    }),
+  );
+}
 function wireAgentFields(root) {
   root.querySelectorAll('[data-agent-group]').forEach((group) => {
     const toggle = group.querySelector('.agent-separate');
@@ -547,42 +606,65 @@ function wireAgentFields(root) {
       sync();
     }
   });
-  root.querySelectorAll('.agent-field').forEach((box) => {
-    const combo = box.querySelector('.af-model-combo');
-    const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
-    if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
-    box.querySelector('.af-provider')?.addEventListener('change', () => {
-      box.querySelector('.af-model').value = ''; // model choices are provider-specific
-      refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-    });
-    // Fork-from search: the full task-picker overlay in agent mode (archived tasks
-    // included — the completed ones are the ones you most often fork from).
-    const chosen = box.querySelector('.af-resume-chosen');
-    const setResume = (rf, task) => {
-      if (!chosen) return;
-      chosen.dataset.resume = JSON.stringify(rf ?? null);
-      chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
-      box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
-    };
-    chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
-    box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
-      openTaskPicker({
-        title: box.dataset.agent === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent',
-        hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
-        mode: 'agent',
-        defaults: ['draft', 'series'],
-        onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
-      }),
-    );
+  root.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  root.querySelectorAll('.confirmer-field').forEach(wireConfirmerField);
+}
+
+// Renumber the layer rows and toggle the "auto-confirm" empty state.
+function cfSync(box) {
+  const rows = [...box.querySelectorAll('.cf-layer')];
+  rows.forEach((r, i) => { const n = r.querySelector('.cf-layer-num'); if (n) n.textContent = `${i + 1}.`; });
+  const empty = box.querySelector('.cf-empty');
+  if (empty) empty.style.display = rows.length ? 'none' : '';
+}
+
+// Confirmer fields: an editable layer list. Row controls are delegated to the box
+// so a reset (which re-renders the rows) needs no re-wiring; only dynamically
+// added agent sub-forms are wired as they appear.
+function wireConfirmerField(box) {
+  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
+  const list = box.querySelector('.cf-layers');
+  const changed = () => box.dispatchEvent(new Event('change', { bubbles: true }));
+  box.addEventListener('click', (e) => {
+    const del = e.target.closest('.cf-del');
+    const move = e.target.closest('.cf-move');
+    const add = e.target.closest('.cf-add');
+    if (del) {
+      del.closest('.cf-layer').remove();
+      cfSync(box); changed();
+    } else if (move) {
+      const row = move.closest('.cf-layer');
+      const sib = Number(move.dataset.dir) < 0 ? row.previousElementSibling : row.nextElementSibling;
+      if (!sib) return;
+      if (Number(move.dataset.dir) < 0) list.insertBefore(row, sib);
+      else list.insertBefore(sib, row);
+      cfSync(box); changed();
+    } else if (add) {
+      // An empty list gets its human confirmation back; otherwise the added layer
+      // is an agent review, slotted BEFORE the first human layer (the common
+      // shape: agent review(s), then a final human confirmation).
+      const rows = [...list.querySelectorAll('.cf-layer')];
+      const firstHuman = rows.find((r) => r.getAttribute('data-kind') === 'human');
+      const kind = rows.length ? 'agent' : 'human';
+      const tpl = document.createElement('template');
+      tpl.innerHTML = cfLayerHtml(f, kind === 'agent' ? { kind, ...agentDefault } : { kind }, agentDefault);
+      const row = tpl.content.firstElementChild;
+      if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
+      else list.appendChild(row);
+      row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      cfSync(box); changed();
+    }
   });
-  // Confirmer fields: show the agent sub-form only when mode is "agent".
-  root.querySelectorAll('.confirmer-field').forEach((box) => {
-    const mode = box.querySelector('.cf-mode');
-    const agentBox = box.querySelector('.cf-agent');
-    mode?.addEventListener('change', () => {
-      if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
-    });
+  // Kind flip: show the agent sub-form only for agent layers.
+  box.addEventListener('change', (e) => {
+    if (!e.target.classList?.contains('cf-kind')) return;
+    const row = e.target.closest('.cf-layer');
+    row.setAttribute('data-kind', e.target.value);
+    const ab = row.querySelector('.cf-agent');
+    if (ab) ab.style.display = e.target.value === 'agent' ? '' : 'none';
   });
+  cfSync(box);
 }
 
 // Wire per-field "Reset to default" buttons: show the button whenever the field
@@ -639,19 +721,7 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
     if (!box) return false;
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
-    const mode = box.querySelector('.cf-mode').value;
-    if (mode !== (inh?.mode || 'human')) return true;
-    if (mode !== 'agent') return false;
-    const prompt = box.querySelector('.cf-prompt')?.value ?? '';
-    const inhPrompt = inh?.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
-    if (prompt.trim() !== '' && prompt !== inhPrompt) return true;
-    const ab = box.querySelector('.agent-field');
-    const spec = { provider: ab.querySelector('.af-provider').value };
-    const model = ab.querySelector('.af-model').value.trim();
-    const effort = ab.querySelector('.af-effort').value;
-    if (model) spec.model = model;
-    if (effort) spec.effort = effort;
-    return !sameJson(normSpec(spec), normSpec(inh));
+    return !sameJson(normLayers(readConfirmerLayers(box)), normLayers(cfLayersOf(inh)));
   }
   const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
   if (!el) return false;
@@ -686,14 +756,14 @@ function resetAgentField(box, attr = 'data-inherit') {
 
 function resetConfirmerField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
-  const mode = box.querySelector('.cf-mode');
-  mode.value = inh.mode || 'human';
-  const agentBox = box.querySelector('.cf-agent');
-  if (agentBox) agentBox.style.display = mode.value === 'agent' ? '' : 'none';
-  const ab = box.querySelector('.agent-field');
-  if (ab) resetAgentField(ab, attr);
-  const promptEl = box.querySelector('.cf-prompt');
-  if (promptEl) promptEl.value = inh.prompt || JSON.parse(box.getAttribute('data-prompt-default') || '""');
+  const f = { role: box.getAttribute('data-confirmer'), name: box.getAttribute('data-confirmer'), promptDefault: JSON.parse(box.getAttribute('data-prompt-default') || '""') };
+  const agentDefault = JSON.parse(box.getAttribute('data-agent-default') || '{}');
+  const list = box.querySelector('.cf-layers');
+  // Re-render the rows from the inherited layers; row controls are delegated to
+  // the box, so only the fresh agent sub-forms need wiring.
+  list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
+  list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  cfSync(box);
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
@@ -3206,12 +3276,12 @@ function waitingLabel(w) {
     case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to free up'}`;
     case 'agentSlot': return w.detail || 'a host agent slot';
     case 'mergeSlot': return 'a merge slot';
-    case 'human': return 'human input';
+    case 'human': return w.detail ? `human input (${w.detail})` : 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
     case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'shell': return w.detail || 'a background job to finish';
     case 'parent': return 'the parent task to respond';
-    case 'confirm': return 'the confirm agent to review';
+    case 'confirm': return w.detail ? `the confirm agent to review (${w.detail})` : 'the confirm agent to review';
     default: return w.detail || w.kind;
   }
 }
@@ -3532,6 +3602,11 @@ function paramCurrentValue(f, v, rec) {
 function displayParam(f, val) {
   if (val === undefined || val === null || val === '') return '(default)';
   if (f.type === 'agent') return [val.provider, val.model].filter(Boolean).join(' · ') || '(default)';
+  if (f.type === 'confirmer') {
+    const layers = cfLayersOf(val);
+    if (!layers.length) return 'auto-confirm';
+    return layers.map((l) => (l.kind === 'agent' ? `agent (${[l.provider, l.model].filter(Boolean).join(' · ') || 'default'})` : 'human')).join(' → ');
+  }
   if (Array.isArray(val)) return val.join(', ') || '(none)';
   if (typeof val === 'boolean') return val ? 'on' : 'off';
   return String(val);
