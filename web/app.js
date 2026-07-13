@@ -293,6 +293,50 @@ function renderField(f, own, inherited, withChips, alt) {
   return `<div class="form-row" data-row="${esc(f.name)}">${label}<input ${attrs} type="${f.type === 'number' ? 'number' : 'text'}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" /></div>`;
 }
 
+const agentGroupFields = (fields) => ['do', 'merge', 'resolve'].map((role) => fields.find((f) => f.type === 'agent' && f.role === role));
+const inferredSeparateAgents = (values = {}) => values.separateAgents === true ||
+  (values.separateAgents === undefined && ['do', 'merge', 'resolve'].some((role) => values[`agent:${role}`] !== undefined));
+
+// Software-dev owns three operational roles, but most tasks want one identity for
+// all of them. Keep the manifest's role fields (the workflow still consumes those)
+// while presenting a compact virtual `agent:unified` field by default.
+function renderAgentGroup(fields, own = {}, inherited = {}, altFor) {
+  const [doField, mergeField, resolveField] = agentGroupFields(fields);
+  if (!doField || !mergeField || !resolveField) return null;
+  const separate = inferredSeparateAgents(own);
+  const unifiedField = { ...doField, name: 'agent:unified', role: 'unified', label: 'Agent' };
+  const unifiedOwn = own['agent:unified'] ?? (!separate ? own['agent:do'] : undefined);
+  const unifiedInherited = inherited['agent:do'] ?? inherited['agent:unified'];
+  return `<div class="agent-group" data-agent-group>
+    <label class="agent-separate-toggle"><input type="checkbox" class="agent-separate" ${separate ? 'checked' : ''}> Separate Do, Merge and Resolve agents</label>
+    <div class="agent-unified-panel" ${separate ? 'hidden' : ''}>${renderField(unifiedField, unifiedOwn, unifiedInherited, false, altFor?.(doField))}</div>
+    <div class="agent-separated-panel" ${separate ? '' : 'hidden'}>
+      ${[doField, mergeField, resolveField].map((f) => renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))).join('')}
+    </div>
+  </div>`;
+}
+
+function renderFields(fields, own = {}, inherited = {}, withPromptChips = false, altFor) {
+  const group = renderAgentGroup(fields, own, inherited, altFor);
+  const grouped = new Set(group ? agentGroupFields(fields).map((f) => f.name) : []);
+  let groupDrawn = false;
+  const html = [];
+  for (const f of fields) {
+    if (grouped.has(f.name)) {
+      if (!groupDrawn) { html.push(group); groupDrawn = true; }
+      continue;
+    }
+    if (f.name === 'base' && fields.some((x) => x.name === 'target')) {
+      const target = fields.find((x) => x.name === 'target');
+      html.push(`<div class="branch-pair">${renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))}${renderField(target, own[target.name], inherited[target.name], false, altFor?.(target))}</div>`);
+      continue;
+    }
+    if (f.name === 'target' && fields.some((x) => x.name === 'base')) continue;
+    html.push(renderField(f, own[f.name], inherited[f.name], withPromptChips && f.name === 'prompt', altFor?.(f)));
+  }
+  return html.join('');
+}
+
 function renderAgentField(f, spec, inherited) {
   const inh = inherited || {};
   const e = spec || inh; // prefill with the effective spec
@@ -308,7 +352,7 @@ function renderAgentField(f, spec, inherited) {
       </div>
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
-    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">Fork a previous agent</summary>
+    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</summary>
       <button type="button" class="btn sm af-resume-pick" style="margin-top:6px">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
       <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
@@ -363,7 +407,19 @@ const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effor
 // Read a form's values back out; only return fields CHANGED from inherited.
 function collectForm(root, fields) {
   const out = {};
+  const group = root.querySelector('[data-agent-group]');
+  const groupedRoles = group ? new Set(['do', 'merge', 'resolve']) : new Set();
+  if (group) {
+    const separate = group.querySelector('.agent-separate').checked;
+    out.separateAgents = separate;
+    const panels = separate ? [group.querySelector('.agent-separated-panel')] : [group.querySelector('.agent-unified-panel')];
+    const selectedFields = separate
+      ? fields.filter((f) => f.type === 'agent' && groupedRoles.has(f.role))
+      : [{ ...fields.find((f) => f.type === 'agent' && f.role === 'do'), name: 'agent:unified', role: 'unified' }];
+    Object.assign(out, collectForm(panels[0], selectedFields));
+  }
   for (const f of fields) {
+    if (f.type === 'agent' && groupedRoles.has(f.role)) continue;
     if (f.type === 'agent') {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
@@ -466,6 +522,31 @@ function wireCombo(combo, getOptions, onChange) {
 
 // Wire agent-field controls: provider→model combobox + fork search (no toggle).
 function wireAgentFields(root) {
+  root.querySelectorAll('[data-agent-group]').forEach((group) => {
+    const toggle = group.querySelector('.agent-separate');
+    toggle?.addEventListener('change', () => {
+      group.querySelector('.agent-unified-panel').hidden = toggle.checked;
+      group.querySelector('.agent-separated-panel').hidden = !toggle.checked;
+      group.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const unifiedBox = group.querySelector('.agent-unified-panel .agent-field');
+    const reset = group.querySelector('.agent-unified-panel .field-reset');
+    if (unifiedBox && reset) {
+      const sync = () => {
+        const inh = JSON.parse(unifiedBox.getAttribute('data-inherit') || 'null');
+        const cur = { provider: unifiedBox.querySelector('.af-provider').value };
+        const model = unifiedBox.querySelector('.af-model').value.trim();
+        const effort = unifiedBox.querySelector('.af-effort').value;
+        if (model) cur.model = model;
+        if (effort) cur.effort = effort;
+        reset.hidden = sameJson(normSpec(cur), normSpec(inh));
+      };
+      unifiedBox.addEventListener('input', sync);
+      unifiedBox.addEventListener('change', sync);
+      reset.addEventListener('click', () => { resetAgentField(unifiedBox); sync(); });
+      sync();
+    }
+  });
   root.querySelectorAll('.agent-field').forEach((box) => {
     const combo = box.querySelector('.af-model-combo');
     const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
@@ -486,7 +567,7 @@ function wireAgentFields(root) {
     chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
     box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
       openTaskPicker({
-        title: 'Fork a previous agent',
+        title: box.dataset.agent === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent',
         hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
         mode: 'agent',
         defaults: ['draft', 'series'],
@@ -2057,7 +2138,7 @@ async function openTaskForm(workflow, draft, seedText) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${fields.map((f) => renderField(f, values[f.name], inherited[f.name], f === promptField)).join('')}
+        <div style="padding:14px 16px" id="tf-body">${renderFields(fields, values, inherited, true)}
           ${promptField ? '' : `<div class="form-row" data-row="__images">
             <div class="label-row"><label>Images</label></div>
             <div class="img-chips" id="tf-chips" style="display:none"></div>
@@ -2324,7 +2405,7 @@ async function renderSeriesDrawer(rec) {
       </div>
       <div class="drawer-body" id="drawer-body">
         <div id="tf-body">
-          ${fields.map((f) => renderField(f, values[f.name], inherited[f.name])).join('')}
+          ${renderFields(fields, values, inherited)}
           <div class="form-row" data-row="__notes">
             <div class="label-row"><label>Notes</label></div>
             <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent" style="width:100%">${esc(rec.notes || '')}</textarea>
@@ -4107,7 +4188,7 @@ function settingsForms(scope, projectId) {
       if (!fields.length) return '';
       return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— defaults</span></summary>
-        <div class="wf-form" style="margin-top:10px">${fields.map((f) => renderField(f, undefined)).join('')}</div>
+        <div class="wf-form" style="margin-top:10px">${renderFields(fields)}</div>
         <button class="btn primary sm" data-save="${esc(s.name)}">Save ${esc(s.name)} defaults</button>
       </details>`;
     })
@@ -4126,7 +4207,7 @@ async function hydrateSettingsForms(scope, projectId) {
       inherited = d[scope].inherited;
     } catch {}
     const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
-    sec.querySelector('.wf-form').innerHTML = fields.map((f) => renderField(f, own[f.name], inherited[f.name])).join('');
+    sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
@@ -4164,13 +4245,10 @@ async function hydrateQuickSettingsForms(scope, projectId) {
     const inherited = d?.[key]?.inherited || {};
     const inheritedAlt = d?.[key]?.inheritedAlt || {};
     const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
-    sec.querySelector('.wf-form').innerHTML = fields
-      .map((f) => {
-        // Project-quick fields have two inheritance sources → two reset buttons.
-        const alt = scope === 'project' ? { primaryLabel: 'Global quick', altLabel: 'Project default', value: inheritedAlt[f.name] } : undefined;
-        return renderField(f, own[f.name], inherited[f.name], false, alt);
-      })
-      .join('');
+    const altFor = scope === 'project'
+      ? (f) => ({ primaryLabel: 'Global quick', altLabel: 'Project default', value: inheritedAlt[f.name] })
+      : undefined;
+    sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited, false, altFor);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
