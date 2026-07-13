@@ -316,7 +316,15 @@ export class CodexAdapter implements AgentAdapter {
       //    instructions; the thread carries them so resumes don't re-send them). ──
       const resuming = !!input.session;
       if (resuming) {
-        await client.request('thread/resume', { threadId: input.session, cwd, ...(model ? { model } : {}) });
+        // Resume otherwise reloads the CLI/config defaults (`:workspace` +
+        // on-request in current Codex), discarding karmax's headless posture.
+        await client.request('thread/resume', {
+          threadId: input.session,
+          cwd,
+          sandbox: 'danger-full-access',
+          approvalPolicy: 'never',
+          ...(model ? { model } : {}),
+        });
       } else {
         const started = await client.request<any>('thread/start', {
           cwd,
@@ -346,6 +354,10 @@ export class CodexAdapter implements AgentAdapter {
         const started = await client.request<any>('turn/start', {
           threadId,
           input: nextInput,
+          // Reassert this per turn as well as per thread. Besides defending against
+          // config/default drift, this updates resumed threads created by older karmax.
+          sandboxPolicy: { type: 'dangerFullAccess' },
+          approvalPolicy: 'never',
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),
         });

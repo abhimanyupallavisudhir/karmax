@@ -524,6 +524,17 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .af-resume-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .af-resume-clear:hover { color: var(--danger); }
 
+.agent-group { margin-bottom: 14px; }
+.agent-separate-toggle {
+  display: flex; align-items: center; gap: 6px; width: max-content; margin: 0 0 8px;
+  color: var(--ink-3); font-size: 11px; cursor: pointer;
+}
+.agent-separate-toggle input { width: auto; margin: 0; }
+.agent-group [hidden] { display: none !important; }
+.branch-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.branch-pair .form-row { min-width: 0; }
+@media (max-width: 700px) { .branch-pair { grid-template-columns: 1fr; } }
+
 /* ── Schedule builder + 5-field cron grid (task form) ─────────────────────── */
 .sched-builder { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
 .sched-extra { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--ink-2); font-size: 13px; }

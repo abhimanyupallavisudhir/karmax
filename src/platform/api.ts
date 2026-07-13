@@ -7,7 +7,7 @@ import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, SIG_REORDER, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentSpec, Provider } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -18,6 +18,8 @@ import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
+import { defaultProvider } from '../agent/adapters.js';
+import { defaultModel, defaultEffort } from '../agent/profiles.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -268,6 +270,7 @@ export class KarmaxApi {
       ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
+    this.materializeUnifiedAgents(resolved, project.id);
 
     // Auto-detect the repo's default branch when base/target weren't set anywhere,
     // instead of guessing "main" (which would create a phantom target branch).
@@ -283,6 +286,25 @@ export class KarmaxApi {
       }
     }
     return resolved;
+  }
+
+  /** Turn the compact Agent setting into concrete per-role input. Profile defaults
+   * live outside parameter settings, so this final materialization must happen
+   * after the parameter overlays have selected the child scope's form shape. */
+  private materializeUnifiedAgents(resolved: ValueMap, projectId: string): void {
+    if (resolved.separateAgents !== false) return;
+    let spec = resolved['agent:do'] as AgentSpec | undefined;
+    if (!spec?.provider) {
+      const profile = this.deps.store.getProfile(`${projectId}::do-default`) ?? this.deps.store.getProfile('do-default');
+      const provider = (profile?.provider ?? defaultProvider().provider) as Provider;
+      const model = profile?.model ?? defaultModel(provider);
+      const effort = profile?.effort ?? defaultEffort(provider);
+      spec = { provider, ...(model ? { model } : {}), ...(effort ? { effort: effort as AgentSpec['effort'] } : {}) };
+    }
+    resolved['agent:do'] = spec;
+    const { resumeFrom: _resumeFrom, ...shared } = spec;
+    resolved['agent:merge'] = shared;
+    resolved['agent:resolve'] = shared;
   }
 
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */

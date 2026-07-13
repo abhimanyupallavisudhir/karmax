@@ -31,6 +31,34 @@ describe('resolveParams (overlay: task → project → global → default)', () 
     expect(r.worldProvider).toBe('container'); // global used (no task/project)
     expect(r.openGithubPr).toBe(false); // field default
   });
+
+  it('resolves unified/separate agent forms across inheritance layers', () => {
+    const doAgent = { provider: 'codex', model: 'do-model', resumeFrom: { taskId: 'old' } };
+    const mergeAgent = { provider: 'claude', model: 'merge-model', resumeFrom: { taskId: 'merge-old' } };
+    const resolveAgent = { provider: 'mock', model: 'resolve-model' };
+
+    const separatedChild = resolveParams(sd, {
+      task: { separateAgents: true },
+      project: { separateAgents: false, 'agent:unified': doAgent },
+    });
+    expect(separatedChild['agent:do']).toEqual(doAgent);
+    expect(separatedChild['agent:merge']).toEqual({ provider: 'codex', model: 'do-model' });
+    expect(separatedChild['agent:resolve']).toEqual({ provider: 'codex', model: 'do-model' });
+
+    const unifiedChild = resolveParams(sd, {
+      task: { separateAgents: false },
+      project: {
+        separateAgents: true,
+        'agent:do': doAgent,
+        'agent:merge': mergeAgent,
+        'agent:resolve': resolveAgent,
+      },
+    });
+    expect(unifiedChild['agent:do']).toEqual(doAgent);
+    expect(unifiedChild['agent:merge']).toEqual({ provider: 'codex', model: 'do-model' });
+    expect(unifiedChild['agent:resolve']).toEqual({ provider: 'codex', model: 'do-model' });
+    expect(unifiedChild.separateAgents).toBe(false);
+  });
 });
 
 describe('resolveParams treats an empty list at a layer as "inherit", not an override', () => {

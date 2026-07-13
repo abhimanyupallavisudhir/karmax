@@ -34,7 +34,58 @@ export function resolveParamsLayers(manifest: WorkflowManifest, layers: (ValueMa
     for (let i = layers.length - 1; i >= 0; i--) v = pick(layers[i]?.[f.name], v);
     if (v !== undefined) out[f.name] = v;
   }
+  resolveAgentGroup(manifest, layers, out);
   return out;
+}
+
+const AGENT_GROUP_ROLES = ['do', 'merge', 'resolve'] as const;
+
+/**
+ * Do/Merge/Resolve have a compact, unified editor by default. The editor shape is
+ * itself an inherited setting: a unified child inherits only its parent's Do
+ * agent and applies that identity to all three roles; a separated child inherits
+ * each corresponding parent role. Fork/session state is deliberately copied only
+ * to Do when a unified value fans out.
+ *
+ * Older rows predate `separateAgents`; infer their old three-form shape when they
+ * contain any role override so existing settings retain their meaning.
+ */
+function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undefined)[], out: ValueMap): void {
+  const names = new Set(manifest.params.filter((f) => f.type === 'agent' && f.role).map((f) => f.role));
+  if (!AGENT_GROUP_ROLES.every((role) => names.has(role))) return;
+
+  const resolved: Record<string, unknown> = {};
+  let topSeparate = false;
+  let sawLayer = false;
+  for (let i = layers.length - 1; i >= 0; i--) {
+    const layer = layers[i];
+    if (!layer) continue;
+    sawLayer = true;
+    const separate = layer.separateAgents === true ||
+      (layer.separateAgents === undefined && AGENT_GROUP_ROLES.some((role) => layer[`agent:${role}`] !== undefined));
+    topSeparate = separate;
+    if (separate) {
+      for (const role of AGENT_GROUP_ROLES) resolved[role] = pick(layer[`agent:${role}`], resolved[role]);
+      continue;
+    }
+    const unified = pick(layer['agent:unified'], pick(layer['agent:do'], resolved.do));
+    if (unified !== undefined) {
+      resolved.do = unified;
+      resolved.merge = withoutResume(unified);
+      resolved.resolve = withoutResume(unified);
+    }
+  }
+  for (const role of AGENT_GROUP_ROLES) {
+    if (resolved[role] !== undefined) out[`agent:${role}`] = resolved[role];
+  }
+  if (sawLayer) out.separateAgents = topSeparate;
+  if (resolved.do !== undefined) out['agent:unified'] = resolved.do;
+}
+
+function withoutResume(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const { resumeFrom: _resumeFrom, ...rest } = value as Record<string, unknown>;
+  return rest;
 }
 
 function pick<T>(a: T, fallback: T): T {
