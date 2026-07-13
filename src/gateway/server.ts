@@ -1255,7 +1255,7 @@ export class Gateway {
       const provider = spec.provider ?? prof?.provider ?? defaultProvider().provider;
       const model = spec.model ?? prof?.model ?? defaultModel(provider);
       const effort = spec.effort ?? prof?.effort ?? defaultEffort(provider);
-      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+      const agent = { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(spec.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}) };
       // A confirmer also carries a MODE (human/auto/agent) that inherits normally —
       // plus its review-request prompt template, when one is stored at this scope
       // (the form falls back to the field's promptDefault); the agent knobs above
