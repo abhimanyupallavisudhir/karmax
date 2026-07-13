@@ -3,6 +3,8 @@
  * signature. A hit returns a vetted action (e.g. retry); a miss falls through to
  * the Resolve agent. Agents extend this list through the reviewed PR path.
  */
+import { classifyLimitError } from '../agent/limits.js';
+
 export interface ResolveOutcome {
   resolved: boolean;
   action?: 'retry';
@@ -46,8 +48,15 @@ const CASES: ResolveCase[] = [
   },
   {
     name: 'rate-limit',
-    match: (_s, e) => /429|rate limit|too many requests|quota/i.test(e),
-    outcome: { resolved: true, action: 'retry', note: 'rate limited — retrying after backoff' },
+    // Keep this in lockstep with the turn-error classifier. The old local regex
+    // missed the provider strings we emit ourselves ("Codex usage limit reached")
+    // plus Claude's session/weekly-limit strings, so those failures incorrectly
+    // spawned a Resolve agent which was subject to the very same exhausted quota.
+    match: (_s, e) => {
+      const limit = classifyLimitError(e);
+      return limit.limited;
+    },
+    outcome: { resolved: true, action: 'retry', note: 'usage limit reached — retrying without a Resolve agent' },
   },
 ];
 
