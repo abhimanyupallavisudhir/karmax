@@ -63,6 +63,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
     const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
     expect(task.workflow).toBe('software-dev');
     expect(started).toHaveLength(1); // guard passed → workflow started
+    expect((started[0]![1] as any).args[0].resolveAgentEnabled).toBe(false);
   });
 
   it('lets a draft be saved without a repo, but blocks queueing it', async () => {
