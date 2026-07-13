@@ -115,6 +115,12 @@ describe('workflow-declared resolve rules (SPEC §5.2)', () => {
     expect(autoResolve('do', "You've hit your session limit · resets 3:45pm").resolved).toBe(true);
     expect(autoResolve('do', "You've hit your weekly limit · resets Mon 12:00am").resolved).toBe(true);
     expect(autoResolve('do', 'OpenAI insufficient_quota: check billing').resolved).toBe(true);
+    expect(
+      autoResolve(
+        'do',
+        "Activity task failed → Claude Code returned an error result: You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.",
+      ).resolved,
+    ).toBe(true); // task #151: hard credit exhaustion must not spawn Resolve
     expect(autoResolve('do', 'a totally novel error').resolved).toBe(false);
   });
   it('a bad regex in a declared rule never wedges resolve', () => {

@@ -20,8 +20,7 @@ import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED } from '../coordinators/names.js
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { classifyLimitError } from '../agent/limits.js';
-import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
+import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS } from './failures.js';
 import {
   TaskInput,
   TaskView,
@@ -587,6 +586,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
           }
           lastError = describeError(err);
           error = lastError;
+          const providerLimit = limitFailureClassification(err);
           const prevStage = stage;
           // v1 command order is recorded in existing histories: publish Resolve,
           // then invoke autoResolve. The improved no-flicker order belongs to the
@@ -595,9 +595,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
           if (behaviorVersion === '1.0.0' && input.resolveAgentEnabled !== false) {
             stage = 'resolve';
             await publish();
-            auto = await core.autoResolve({ taskId, stage: stageName, error });
+            auto = await core.autoResolve({ taskId, stage: stageName, error, ...(providerLimit ? { limit: providerLimit } : {}) });
           } else {
-            auto = await core.autoResolve({ taskId, stage: stageName, error });
+            auto = await core.autoResolve({ taskId, stage: stageName, error, ...(providerLimit ? { limit: providerLimit } : {}) });
             if (auto.resolved) {
               log.info('auto-resolve matched', { stage: stageName, action: auto.action, note: auto.note });
               error = undefined;
@@ -813,10 +813,10 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       // credential: a transient window arms a refresh timer; a HARD billing/auth
       // failure is flagged needs-attention (won't self-refresh → a human must act).
       if (grant && !passthrough && !cancelled && !isCancellation(err)) {
-        const cls = classifyLimitError(describeError(err));
-        if (cls.hard) {
+        const cls = limitFailureClassification(err);
+        if (cls?.hard) {
           await coord.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
-        } else if (cls.limited) {
+        } else if (cls?.limited) {
           await coord
             .reportAccountExhausted({ accountId: grant.accountId, window: cls.window ?? '5h', resetHint: cls.resetHint, note: cls.note })
             .catch(() => undefined);

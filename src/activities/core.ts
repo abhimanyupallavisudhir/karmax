@@ -1,7 +1,7 @@
 import type { Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { classifyLimitError, isTransportError, isResourceKill } from '../agent/limits.js';
+import { classifyProviderTurnError, isTransportError, isResourceKill, type LimitClassification } from '../agent/limits.js';
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
@@ -69,14 +69,22 @@ async function acquireConfirmLock(key: string): Promise<() => void> {
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
  * workflows) — see src/workflows/failures.ts for the taxonomy. Original
- * messages are preserved verbatim: the workflow's account-leasing re-parses
- * them with classifyLimitError, and the Resolve prompt quotes them.
+ * messages are preserved verbatim for display, while provider failure metadata
+ * rides in ApplicationFailure.details for account rotation and auto-resolve.
  */
-function classifyTurnError(err: unknown): Error {
+function classifyTurnError(err: unknown, provider?: Provider): Error {
   const msg = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error ? err : undefined;
-  const cls = classifyLimitError(msg);
-  if (cls.limited || cls.hard) return ApplicationFailure.create({ message: msg, type: 'agent-limit', nonRetryable: true, cause });
+  const { classification: cls, metadata } = classifyProviderTurnError(err, provider);
+  if (cls.limited) {
+    return ApplicationFailure.create({
+      message: msg,
+      type: 'agent-limit',
+      nonRetryable: true,
+      cause,
+      ...(metadata ? { details: [metadata] } : {}),
+    });
+  }
   // A signal-9/SIGKILL agent death is environmental, not a code bug (karmax#4):
   // classify it as retryable 'agent-infra' with an ACTIONABLE message — the raw
   // "terminated by signal SIGKILL" tells an operator nothing. Temporal re-runs the
@@ -708,7 +716,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (err) {
         if (token) deps.tokens?.revoke(token);
         if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
-        throw classifyTurnError(err);
+        throw classifyTurnError(err, profile.provider);
       } finally {
         releaseSlot();
         releaseConfirm();
@@ -995,12 +1003,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       };
     },
 
-    async autoResolve(args: { taskId: string; stage: string; error: string }): Promise<{ resolved: boolean; note?: string; action?: string }> {
+    async autoResolve(args: {
+      taskId: string;
+      stage: string;
+      error: string;
+      limit?: LimitClassification;
+    }): Promise<{ resolved: boolean; note?: string; action?: string }> {
       // Workflow-declared resolve rules (SPEC §5.2) take precedence over the defaults.
       const wf = store.getTask(args.taskId)?.workflow;
       const rules = wf ? manifest(wf)?.resolveRules : undefined;
-      const r = runAutoResolve(args.stage, args.error, rules);
-      record(args.taskId, 'resolve.auto', { stage: args.stage, resolved: r.resolved, action: r.action });
+      // A typed provider failure has already been classified at the adapter boundary;
+      // do not discard that ground truth and re-interpret provider prose here.
+      const r = args.limit?.limited
+        ? { resolved: true, action: 'retry' as const, note: 'provider account unavailable — retrying without a Resolve agent' }
+        : runAutoResolve(args.stage, args.error, rules);
+      record(args.taskId, 'resolve.auto', {
+        stage: args.stage,
+        resolved: r.resolved,
+        action: r.action,
+        source: args.limit?.limited ? 'provider-metadata' : 'message-rule',
+      });
       return r;
     },
 

@@ -1,4 +1,5 @@
 import { ActivityFailure, ApplicationFailure, TimeoutFailure } from '@temporalio/workflow';
+import { classifyLimitError, type LimitClassification, type ProviderFailureMetadata } from '../agent/limits.js';
 
 /**
  * Turn-failure taxonomy (SPEC §5.2). `runAgentTurn` tags what it throws so the
@@ -8,8 +9,8 @@ import { ActivityFailure, ApplicationFailure, TimeoutFailure } from '@temporalio
  *   'agent-infra'  transport/stream death — retryable; Temporal re-runs the
  *                  turn, and the next attempt resumes the interrupted session
  *                  from heartbeat details (a "continue", not a re-run)
- *   'agent-limit'  usage/session/billing limit — non-retryable; the workflow's
- *                  account leasing rotates to the next credential
+ *   'agent-limit'  usage/session/billing limit — non-retryable; typed metadata in
+ *                  details tells account leasing whether to rotate/park/escalate
  *   'agent-error'  everything else — non-retryable; the Resolve path
  *
  * Temporal-generated timeouts count as infrastructure too: a heartbeat gap
@@ -22,6 +23,28 @@ export function isInfraFailure(err: unknown): boolean {
   const cause = err.cause;
   if (cause instanceof TimeoutFailure) return true;
   return cause instanceof ApplicationFailure && cause.type === 'agent-infra';
+}
+
+/** Recover provider-ground-truth limit metadata serialized by runAgentTurn. Old
+ * histories have no details, so the `agent-limit` type remains authoritative and
+ * their message is parsed only to recover hard/reset hints. */
+export function limitFailureClassification(err: unknown): LimitClassification | undefined {
+  if (!(err instanceof ActivityFailure)) return undefined;
+  const cause = err.cause;
+  if (!(cause instanceof ApplicationFailure) || cause.type !== 'agent-limit') return undefined;
+  const detail = cause.details?.[0] as ProviderFailureMetadata | undefined;
+  if (detail?.kind && (detail.permanence === 'hard' || detail.permanence === 'transient')) {
+    return {
+      limited: true,
+      hard: detail.permanence === 'hard' || undefined,
+      kind: detail.kind,
+      window: detail.window,
+      resetHint: detail.resetHint,
+      note: detail.note,
+    };
+  }
+  const legacy = classifyLimitError(cause.message ?? '', { providerOrigin: true });
+  return legacy.limited ? legacy : { limited: true, kind: 'quota', window: '5h' };
 }
 
 /**

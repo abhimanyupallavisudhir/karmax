@@ -10,6 +10,7 @@ import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
+import { ProviderFailure, providerErrorFromMessage } from './limits.js';
 import { spawn } from 'node:child_process';
 import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
@@ -122,7 +123,10 @@ export class ClaudeAdapter implements AgentAdapter {
         }),
         signal: ctx.signal,
       });
-      if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${(await res.text()).slice(0, 500)}`);
+      if (!res.ok) {
+        const message = `Anthropic API ${res.status}: ${(await res.text()).slice(0, 500)}`;
+        throw providerErrorFromMessage('claude', message, 'structured');
+      }
       const data = (await res.json()) as any;
       messages.push({ role: 'assistant', content: data.content });
       const toolUses = (data.content ?? []).filter((b: any) => b.type === 'tool_use');
@@ -461,9 +465,10 @@ export class ClaudeAdapter implements AgentAdapter {
           const result = message as any;
           if (result.subtype !== 'success' || result.is_error === true) {
             const detail = Array.isArray(result.errors) ? result.errors.join('; ') : result.error ?? result.terminal_reason ?? '';
-            throw new Error(
-              `Claude Agent SDK turn failed (${String(result.subtype ?? 'unknown')}): ${String(detail || 'provider reported an unsuccessful result')}`,
-            );
+            const message =
+              `Claude Agent SDK turn failed (${String(result.subtype ?? 'unknown')}): ` +
+              String(detail || 'provider reported an unsuccessful result');
+            throw providerErrorFromMessage('claude', message);
           }
           successfulResult = result;
           // The agent went idle (finished responding to its current input). End the
@@ -482,7 +487,13 @@ export class ClaudeAdapter implements AgentAdapter {
       // A cancellation aborts the SDK subprocess mid-stream — the query iterator
       // throws an AbortError. The workflow already handled the cancel, so swallow
       // it (return the partial output); rethrow anything else as a real failure.
-      if (!ctx.signal?.aborted) throw e;
+      if (!ctx.signal?.aborted) {
+        if (e instanceof ProviderFailure) throw e;
+        const message = e instanceof Error ? e.message : String(e);
+        const classified = providerErrorFromMessage('claude', message);
+        if (classified instanceof ProviderFailure || !(e instanceof Error)) throw classified;
+        throw e; // preserve the original stack for unrelated SDK failures
+      }
     } finally {
       if (hb) clearInterval(hb);
       if (followPoll) clearInterval(followPoll);

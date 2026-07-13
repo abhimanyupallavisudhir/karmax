@@ -7,6 +7,7 @@ import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import type { AgentAdapter } from '../src/agent/types.js';
+import { accountCoordinatorId } from '../src/coordinators/names.js';
 
 function input(over: { taskId: string; repo: string; prompt: string; title?: string; subtaskNagMs?: number; subagentWaitMs?: number; recovery?: any; resolveAgentEnabled?: boolean }) {
   return {
@@ -518,13 +519,23 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await git(repo, ['show', 'main:continued.txt'])).stdout).toContain('resumed');
   });
 
-  it('auto-resolves provider usage limits without spawning a quota-bound Resolve agent', async () => {
+  it('auto-resolves hard provider credit exhaustion without spawning a quota-bound Resolve agent', async () => {
     const repo = await h.makeRepo('app-usage-limit');
     const taskId = newId('task');
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
-      args: [input({ taskId, repo, title: 'Quota', prompt: '@fail Codex usage limit reached · resets in 1800s' })],
+      // Exact provider error from task #151. This used to miss classifyLimitError,
+      // so autoResolve returned false and spent another turn on the Resolve agent.
+      args: [
+        input({
+          taskId,
+          repo,
+          title: 'Quota',
+          prompt:
+            "@fail Claude Code returned an error result: You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.",
+        }),
+      ],
     });
     // The scripted handler retries the originating stage. With no alternate
     // credential configured those bounded retries eventually require a human,
@@ -533,9 +544,53 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const v = await view(handle);
     const resolve = (v.transcripts ?? []).find((t: any) => t.role === 'resolve');
     expect(resolve?.messages?.length ?? 0).toBe(0);
-    expect(v.error).toMatch(/usage limit reached/i);
+    const autoEvents = h.store.eventsSince(taskId, 0).filter((e) => e.type === 'resolve.auto');
+    expect(autoEvents.length).toBeGreaterThan(0);
+    expect(autoEvents.every((e) => e.payload.resolved === true)).toBe(true);
+    expect(autoEvents.every((e) => e.payload.source === 'provider-metadata')).toBe(true);
+    expect(v.error).toMatch(/out of usage credits/i);
     await handle.signal('cancel');
     expect((await handle.result()).stage).toBe('cancelled');
+  });
+
+  it('semantically classifies novel provider quota wording and marks the credential needs-attention', async () => {
+    const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
+    const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coord.registerAccounts([
+      { id: 'mock:depleted', configHome: '/tmp/mock-depleted', provider: 'mock', maxConcurrent: 1 },
+    ]);
+    const accounts = h.client.workflow.getHandle(accountCoordinatorId());
+    await expect.poll(async () => ((await accounts.query('accounts')) as any).accounts.length, { timeout: 10_000 }).toBe(1);
+
+    const repo = await h.makeRepo('app-novel-quota-wording');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        input({
+          taskId,
+          repo,
+          title: 'Novel quota wording',
+          prompt: '@fail Your prepaid balance has now been fully consumed.',
+        }),
+      ],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
+    const v = await view(handle);
+    expect((v.transcripts ?? []).find((t: any) => t.role === 'resolve')?.messages?.length ?? 0).toBe(0);
+    const auto = h.store.eventsSince(taskId, 0).filter((e) => e.type === 'resolve.auto');
+    expect(auto).toHaveLength(1);
+    expect(auto[0]?.payload).toMatchObject({ resolved: true, source: 'provider-metadata' });
+    await expect.poll(async () => {
+      const state = (await accounts.query('accounts')) as any;
+      return state.accounts.find((a: any) => a.id === 'mock:depleted')?.status;
+    }, { timeout: 10_000 }).toBe('needs-attention');
+
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+    await accounts.terminate('test complete').catch(() => {});
   });
 
   it('retries a transient transport failure in-place — session resumed, Resolve never runs', async () => {
