@@ -1442,7 +1442,7 @@ function tasksView() {
     <div class="composer">
       <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
-      <button class="btn icon-only" id="draft-task" title="Save as draft" aria-label="Save as draft">${ICON.draft}</button>
+      <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.draft}</button>
       <button class="btn icon-only" id="expand-task" title="More fields ( N or ↵ )" aria-label="More fields">${ICON.more}</button>
       <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
@@ -2091,11 +2091,14 @@ function wireTasksView() {
   $('#draft-task')?.addEventListener('click', () => add(true));
   $('#add-task')?.addEventListener('click', () => add(false));
   // Enter opens the FULL form (carrying the typed text into its prompt field) so
-  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly.
+  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly;
+  // Alt+Enter saves it as an editable draft.
   $('#new-task')?.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter') return;
+    const mode = quickTaskSubmitMode(e);
+    if (!mode) return;
     e.preventDefault();
-    if (e.metaKey || e.ctrlKey) add(false);
+    if (mode === 'draft') add(true);
+    else if (mode === 'add') add(false);
     else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
   });
   // Paste / drag-drop an image into the quick-add box to attach it (SPEC — image prompts).
@@ -2110,6 +2113,15 @@ function wireTasksView() {
   $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
+
+// Keyboard modes for the quick composer. Keep this separate from the event
+// listener so the shortcut behavior stays easy to verify without a browser.
+function quickTaskSubmitMode(e) {
+  if (e.key !== 'Enter') return null;
+  if (e.altKey) return 'draft';
+  if (e.metaKey || e.ctrlKey) return 'add';
+  return 'form';
+}
 
 // The quick composer has two submission modes (start now / save draft), but both
 // must use the exact same sparse quick-defaults payload.

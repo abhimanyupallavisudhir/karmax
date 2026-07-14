@@ -38,6 +38,7 @@ eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
 eval(extractFn('adjacentCheckinPane'));
 eval(extractConst('firstLine').replace('const firstLine =', 'global.firstLine ='));
+eval(extractFn('quickTaskSubmitMode'));
 eval(extractFn('quickTaskPayload'));
 
 let pass = 0, fail = 0;
@@ -108,6 +109,11 @@ ok(adjacentCheckinPane(panes, 'terminal', 1) === 'do', 'Check-in next wraps to t
 ok(adjacentCheckinPane(panes, 'do', -1) === 'terminal', 'Check-in previous wraps to the terminal');
 
 // ── Quick-add submission modes ──
+ok(quickTaskSubmitMode(ev('Enter')) === 'form', 'Enter opens the full task form');
+ok(quickTaskSubmitMode(ev('Enter', { metaKey: true })) === 'add', 'Cmd/Ctrl+Enter starts the task');
+ok(quickTaskSubmitMode(ev('Enter', { ctrlKey: true })) === 'add', 'Ctrl+Enter starts the task');
+ok(quickTaskSubmitMode(ev('Enter', { altKey: true })) === 'draft', 'Alt+Enter saves a draft');
+ok(quickTaskSubmitMode(ev('x', { altKey: true })) === null, 'non-Enter keys do not submit the quick task');
 const sent = quickTaskPayload('run it', 'script-exec', [], false);
 const draft = quickTaskPayload('save it', 'software-dev', ['image-1'], true);
 ok(sent.quick === true && sent.command === 'run it' && sent.draft === undefined, 'quick send starts immediately');
