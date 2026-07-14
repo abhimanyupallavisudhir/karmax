@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
+import { RESOLVE_AGENT_ENABLED } from '../src/config/features.js';
 
 /**
  * The empty-repo guard. A repo-oriented workflow (its manifest declares a `repos`
@@ -63,9 +64,10 @@ describe('repo-required guard (empty-repo footgun)', () => {
     const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
     expect(task.workflow).toBe('software-dev');
     expect(started).toHaveLength(1); // guard passed → workflow started
+    expect((started[0]![1] as any).args[0].resolveAgentEnabled).toBe(false);
   });
 
-  it('snapshots and reports the exact unified Codex selection for every runtime role', async () => {
+  it('snapshots and reports the exact unified Codex selection for every enabled runtime role', async () => {
     const p = store.createProject('Codex', { repos: ['/some/repo'] });
     const selected = { provider: 'codex' as const, model: 'gpt-5.6-sol', effort: 'high' as const };
     const task = await api.createTask(token, {
@@ -75,8 +77,9 @@ describe('repo-required guard (empty-repo footgun)', () => {
       params: { separateAgents: false, 'agent:unified': selected },
     });
 
+    const expected = { do: selected, merge: selected, ...(RESOLVE_AGENT_ENABLED ? { resolve: selected } : {}) };
     const input = startedInput();
-    expect(input.agents).toEqual({ do: selected, merge: selected, resolve: selected });
+    expect(input.agents).toEqual(expected);
 
     // Workflows intentionally do not publish execution metadata (their histories
     // are immutable); the platform enriches any stored/live view with its durable
@@ -93,7 +96,7 @@ describe('repo-required guard (empty-repo footgun)', () => {
       updatedAt: 1,
     });
     const view = await api.getTaskView(token, task.id);
-    expect(view?.agents).toEqual({ do: selected, merge: selected, resolve: selected });
+    expect(view?.agents).toEqual(expected);
   });
 
   it('lets a draft be saved without a repo, but blocks queueing it', async () => {

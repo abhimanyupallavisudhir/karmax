@@ -7,7 +7,7 @@ import {
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
-import { classifyLimitError } from '../agent/limits.js';
+import { limitFailureClassification } from './failures.js';
 import { SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 import type { AgentRole, TaskInput, TaskView } from './contract.js';
@@ -143,9 +143,9 @@ export function createAgentTurnLeaser(
         return await admitted(turnId, role, provider, fn, home, key);
       } catch (err) {
         if (grant && !passthrough && !host.cancelled()) {
-          const cls = classifyLimitError(describeError(err));
-          if (cls.hard) await coord.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
-          else if (cls.limited)
+          const cls = limitFailureClassification(err);
+          if (cls?.hard) await coord.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
+          else if (cls?.limited)
             await coord.reportAccountExhausted({ accountId: grant.accountId, window: cls.window ?? '5h', resetHint: cls.resetHint, note: cls.note }).catch(() => undefined);
         }
         throw err;
@@ -154,13 +154,4 @@ export function createAgentTurnLeaser(
       }
     },
   };
-}
-
-function describeError(err: unknown): string {
-  const parts: string[] = [];
-  let next: any = err;
-  for (let depth = 0; next && depth < 6; depth++, next = next.cause) {
-    if (next.message && !parts.includes(next.message)) parts.push(next.message);
-  }
-  return parts.join(' → ') || String(err);
 }

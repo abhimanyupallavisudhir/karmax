@@ -12,6 +12,7 @@ export { scriptExec } from './script-exec.js';
 export { goal } from './goal.js';
 export { mergeOnly } from './merge-only.js';
 export { mergeQueue } from '../coordinators/merge-queue.js';
+export { agentQueue } from '../coordinators/agent-queue.js';
 export { accountCoordinator } from '../coordinators/account.js';
 export { budgetCoordinator } from '../coordinators/budget.js';
 

@@ -48,10 +48,10 @@ const CASES: ResolveCase[] = [
   },
   {
     name: 'rate-limit',
-    // Keep this in lockstep with the turn-error classifier. The old local regex
-    // missed the provider strings we emit ourselves ("Codex usage limit reached")
-    // plus Claude's session/weekly-limit strings, so those failures incorrectly
-    // spawned a Resolve agent which was subject to the very same exhausted quota.
+    // Compatibility fallback for old histories and non-turn errors. Current agent
+    // turns carry provider metadata into autoResolve directly; this message parser
+    // covers stable legacy strings without enabling fuzzy matching for arbitrary
+    // build/setup errors.
     match: (_s, e) => {
       const limit = classifyLimitError(e);
       return limit.limited;

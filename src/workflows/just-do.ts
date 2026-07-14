@@ -51,7 +51,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = input.prompt || input.images?.length
-    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}) }]
     : [];
   let confirmed = false;
   let cancelled = false;
@@ -133,7 +133,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
   setHandler(viewQuery, view);
   setHandler(pendingMessagesQuery, (_role, fromIndex) => msgs.slice(Math.max(0, fromIndex)));
   setHandler(followUpSignal, (m) => {
-    msgs.push({ ...m, ts: msgs.length });
+    msgs.push({ ...m, ts: m.ts || msgs.length });
   });
   setHandler(confirmSignal, () => {
     confirmed = true;

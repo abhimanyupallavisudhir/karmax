@@ -5,13 +5,14 @@ import path from 'node:path';
 import { paths } from '../config/paths.js';
 
 /**
- * Host-wide admission control for concurrent agent turns (SPEC §12 "RAM is
- * consumed strictly during turns"). Agent activities may be executed by any
- * worker polling the shared Temporal queue, including a deliberate second app
- * instance used for dogfooding. A module-local semaphore therefore is not a
- * host-wide cap: N workers could each admit N turns.
+ * Worker-side live-resource checks for concurrent agent turns (SPEC §12 "RAM is
+ * consumed strictly during turns"). Current executions get their configured,
+ * ordered capacity lease from the agent-queue workflow; memory/load can only be
+ * observed here, immediately before the model subprocess starts.
  *
- * Slots are atomic lease files under the shared KARMAX_HOME. Every holder is
+ * The file-slot path is retained for replay compatibility with historical task
+ * workflows that have no stable agent-turn id/coordinator enrollment. Those
+ * slots are atomic lease files under the shared KARMAX_HOME. Every holder is
  * tied to its worker pid + Linux process-start identity, so another worker can
  * reclaim the lease after a crash without mistaking a reused pid for the old
  * owner. On platforms without procfs, signal-0 liveness is the conservative
@@ -197,7 +198,7 @@ export function hostStats() {
   };
 }
 
-async function awaitResources(onWait?: () => void, signal?: AbortSignal): Promise<void> {
+export async function awaitAgentResources(onWait?: () => void, signal?: AbortSignal): Promise<void> {
   if (MIN_FREE_MB <= 0 && MAX_LOAD_FACTOR <= 0) return;
   const deadline = Date.now() + MEM_WAIT_MAX_MS;
   while ((memoryTight() || loadHigh()) && Date.now() < deadline) {
@@ -241,7 +242,7 @@ export async function acquireAgentSlot(onWait?: () => void, signal?: AbortSignal
   }
 
   try {
-    await awaitResources(onWait, signal);
+    await awaitAgentResources(onWait, signal);
   } catch (e) {
     removeOwned(slotFile, rec.token);
     throw e;

@@ -142,6 +142,16 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  it('also DENIES provider-fallback requests when every compatible credential needs attention', async () => {
+    const coord = await startCoord([A({ id: 'A', status: 'needs-attention' })]);
+    const g = await grantee();
+    await coord.signal('leaseAccount', { taskId: g.id, turnId: 'fallback', provider: 'claude' });
+    await expect.poll(async () => (await accounts()).waiting, { timeout: 5000 }).toBe(0);
+    expect((await acct('A')).inUse).toBe(0);
+    await g.h.signal('finish');
+    await coord.terminate('done');
+  });
+
   it('prunes a stale account no longer in the authoritative set, but keeps an in-use one', async () => {
     const coord = await startCoord([A({ id: 'A' }), A({ id: 'B', configHome: '/tmp/B' })]);
     // Lease A so it's in-use; B stays idle.

@@ -210,4 +210,32 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
 
     await wf.terminate('test done');
   });
+
+  it('agent queue owns capacity and supports durable waiting-order changes', async () => {
+    const { agentQueueId } = await import('../src/coordinators/names.js');
+    const held = [
+      { taskId: 'running-1', turnId: 'running-1#0', role: 'do' },
+      { taskId: 'running-2', turnId: 'running-2#0', role: 'confirm' },
+    ];
+    const waiting = [
+      { taskId: 't1', turnId: 't1#0', role: 'do' },
+      { taskId: 't2', turnId: 't2#0', role: 'merge' },
+      { taskId: 't3', turnId: 't3#0', role: 'resolve' },
+    ];
+    const wf = await h.client.workflow.start('agentQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: `${agentQueueId()}:reorder-test`,
+      args: [{ capacity: 2, state: { capacity: 2, current: held, queue: waiting, processed: 0 } }],
+    });
+    const q = async () => await wf.query('agentQueue') as any;
+    expect((await q()).queue.map((x: any) => x.turnId)).toEqual(['t1#0', 't2#0', 't3#0']);
+
+    await wf.signal('reorderQueue', { turnId: 't3#0', beforeTurnId: 't1#0' });
+    await expect.poll(async () => (await q()).queue.map((x: any) => x.turnId), { timeout: 10_000 }).toEqual(['t3#0', 't1#0', 't2#0']);
+
+    await wf.signal('setAgentCapacity', { capacity: 1 });
+    await expect.poll(async () => (await q()).capacity, { timeout: 10_000 }).toBe(1);
+    expect((await q()).current).toHaveLength(2); // shrinking never kills running turns
+    await wf.terminate('test done');
+  });
 });

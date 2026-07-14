@@ -294,6 +294,28 @@ export interface Message {
 }
 
 /**
+ * A provider-neutral item in an agent turn. Codex app-server and the Claude
+ * Agent SDK both expose work as typed, ordered events; keeping that shape lets
+ * clients render a faithful conversation instead of flattening commands, tool
+ * calls, edits, and progress into assistant prose.
+ *
+ * These items are written to the durable Karmax event log by the activity layer
+ * (with the event row's timestamp and task id), not into `Message[]`: provider
+ * actions are presentation/audit data and must never be replayed to the model as
+ * conversation input.
+ */
+export interface AgentActivity {
+  /** Provider item/tool id. Repeated updates with the same id replace in-place. */
+  id: string;
+  kind: 'message' | 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'subagent' | 'status' | 'turn' | 'error';
+  phase: 'started' | 'updated' | 'completed' | 'failed';
+  /** Compact human-facing label, e.g. "Read package.json" or "npm test". */
+  title: string;
+  /** Optional bounded detail (command output, tool arguments/result, progress). */
+  detail?: string;
+}
+
+/**
  * A single click-to-verify affordance the reviewer can act on. Review info is a
  * list of these — NOT a prose changelog (that belongs in the conversation). Two
  * primitives:
@@ -373,9 +395,8 @@ export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm';
  * enforces it, and the UI/gateway derive which fields to expose as editable.
  * - `queue`    — frozen once the workflow starts (draft-only). The default.
  * - `untilUsed`— editable in-flight until the workflow *consumes* it: the target
- *                branch until a PR opens / the merge enqueue; the merge agent
- *                until the merge turn runs; the resolve agent until a resolve
- *                turn runs. Consumption points are workflow-specific.
+ *                branch until a PR opens / the merge enqueue; an auxiliary agent
+ *                until that role's turn runs. Consumption points are workflow-specific.
  * - `always`   — editable at any time (reserved; unused in v1).
  * An `untilUsed`/`always` field is only truly live if the workflow actually
  * re-reads it at consumption time; declaring it without re-reading it is a bug.
@@ -393,8 +414,7 @@ export interface FieldSpec {
   placeholder?: string;
   scopes: FieldScope[];
   bind: FieldBind;
-  /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures
-   *  (do/merge/resolve/confirm). */
+  /** For agent fields / bind:'profile' / bind:'confirm' — the role this configures. */
   role?: string;
   /** For confirmer fields — the default Confirm-agent prompt template the form
    *  pre-fills (and inherits back to on reset) when no override is stored. */
@@ -424,7 +444,7 @@ export interface AgentSpec {
  * A `human` layer waits for a person to click Confirm. An `agent` layer runs a
  * Confirm-agent turn that reviews the work and returns a structured verdict
  * (confirm / revise / reject) — the same three transitions a human drives; its
- * `AgentSpec` fields configure that agent exactly like the Do/Merge/Resolve agent
+ * `AgentSpec` fields configure that agent exactly like the Do/Merge agent
  * fields (including `resumeFrom`).
  *
  * The pre-layers single-gate shape ({ mode, …agent }) is still accepted anywhere a
@@ -490,7 +510,7 @@ export interface TaskView {
   notes?: string;
   messages: Message[];
   /**
-   * Per-role conversation transcripts (Do / Merge / Resolve). `messages` above is
+   * Per-role conversation transcripts. `messages` above is
    * kept as the Do transcript for back-compat + the live bubble; this carries all
    * roles so the UI can show each — collapsed except the one owning the active
    * stage (SPEC §5.5). Roles with no turns yet are omitted.
@@ -577,6 +597,8 @@ export interface TaskInput {
   /** The workflow this task runs (so activities can read its manifest — roles, agentMcp). */
   workflow?: string;
   title: string;
+  /** Epoch milliseconds of the task record; used for the initial chat timestamp. */
+  createdAt?: number;
   prompt: string;
   /** Images attached to the initial prompt (references, never inline bytes). */
   images?: ImageRef[];
@@ -598,6 +620,15 @@ export interface TaskInput {
   project: ProjectConfig;
   /** Capability grant from the spawning principal. */
   grant?: string[];
+  /** Principal and job-shaped profile from which `grant` was attenuated. */
+  grantPrincipal?: string;
+  authorizationProfile?: string;
+  /**
+   * Snapshot of the process-wide Resolve-agent flag. It is carried in workflow
+   * input so Temporal replay never depends on mutable process state. `undefined`
+   * means enabled for historical executions created before the flag existed.
+   */
+  resolveAgentEnabled?: boolean;
   /**
    * Per-field in-flight editability windows (SPEC §4.5/§5.5), copied from the
    * workflow manifest at assembly time. Lets the deterministic workflow validate

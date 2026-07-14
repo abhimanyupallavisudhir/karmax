@@ -25,6 +25,11 @@ import { Provider, ProjectConfig } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
+import type { IdentityService } from '../auth/identity.js';
+import type { AuthorizationService } from '../platform/authorization.js';
+import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
+import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -44,6 +49,68 @@ export interface GatewayDeps {
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   password?: string;
   version?: string;
+  identity?: IdentityService;
+  authorization?: AuthorizationService;
+}
+
+/** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
+ * again for task operations; this layer covers the direct administrative routes. */
+function capabilityForRequest(method: string, p: string, url?: URL): string | undefined {
+  const read = method === 'GET';
+  if (p === '/api/meta' || p === '/api/session') return undefined;
+  if (p === '/api/platform') return 'workflow:read';
+  if (p === '/api/logout') return undefined;
+  if (p === '/api/dashboard') return 'diagnostic:read';
+  if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
+  if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
+  if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
+  if (p === '/api/authorization/profiles' && read) return 'task:create';
+  if (p.startsWith('/api/authorization') || p.startsWith('/api/audit')) return read ? 'authorization:read' : 'authorization:write';
+  if (p.startsWith('/api/accounts') || p.startsWith('/api/git-profiles')) return read ? 'credential:read' : 'credential:write';
+  if (p === '/api/credentials/policy') {
+    if (url?.searchParams.get('taskId')) return 'task:edit';
+    if (url?.searchParams.get('projectId')) return 'project:settings:write';
+    return 'credential:write';
+  }
+  if (p.startsWith('/api/credentials')) return read ? 'credential:read' : 'credential:write';
+  if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
+  if (p === '/api/safe-mode') return 'safe-mode:write';
+  if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (p.startsWith('/api/settings')) return read ? 'settings:read' : 'settings:write';
+  if (p.startsWith('/api/defaults/')) return 'task:read';
+  if (p.startsWith('/api/profiles')) return read ? 'profile:read' : 'profile:write';
+  if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
+  if (p === '/api/search/fields') return 'task:read';
+  if (p === '/api/attachments') return 'task:create';
+  if (p.startsWith('/api/workflows')) return read ? 'workflow:read' : (p.includes('/install') ? 'workflow:install' : 'workflow:edit');
+  if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
+  if (p === '/api/projects') return read ? 'project:read' : 'project:create';
+  if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
+  if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
+  if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
+  if (/^\/api\/(tags|views)\//.test(p)) return read ? 'task:read' : 'task:edit';
+  if (/^\/api\/projects\/[^/]+\/activate-workflow$/.test(p)) return 'workflow:install';
+  if (/^\/api\/projects\/[^/]+\/workflow-pins$/.test(p)) return read ? 'workflow:read' : 'workflow:edit';
+  if (/^\/api\/projects\/[^/]+\/propose-workflow-edit$/.test(p)) return 'workflow:edit';
+  if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
+  if (/\/(sessions|agents|conversation)$/.test(p)) return 'task:conversation:read';
+  if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
+  if (/\/review-action/.test(p) || /\/artifact$/.test(p)) return 'task:review:execute';
+  if (/\/signal$/.test(p)) return 'task:signal';
+  if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
+  if (p === '/api/skills') return 'skill:write';
+  return read ? 'project:read' : 'settings:write';
+}
+
+function requestHeaders(headers: Record<string, string | string[] | undefined>): Headers {
+  const out = new Headers();
+  for (const [key, value] of Object.entries(headers)) {
+    if (Array.isArray(value)) for (const v of value) out.append(key, v);
+    else if (value !== undefined) out.set(key, value);
+  }
+  return out;
 }
 
 /** Conventional gateway port. If it's taken we walk upward (findFreePortFrom),
@@ -82,6 +149,7 @@ const ARTIFACT_MIME: Record<string, string> = {
 interface Session {
   user: string;
   apiToken: string;
+  userId?: string;
 }
 
 export class Gateway {
@@ -92,6 +160,7 @@ export class Gateway {
   private reviewActions = new ReviewActionRunner();
   private attachments = new AttachmentStore();
   private modelCatalog?: { at: number; value: ModelCatalog };
+  private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
 
   constructor(private deps: GatewayDeps) {}
 
@@ -121,8 +190,18 @@ export class Gateway {
       else if (pathname === '/ws/review-action') wssAction.handleUpgrade(req, socket, head, (ws) => wssAction.emit('connection', ws, req));
       else socket.destroy();
     });
-    wssEvents.on('connection', (ws) => {
+    wssEvents.on('connection', async (ws, req) => {
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      const auth = await this.socketAuth(req, url);
+      if (!auth) { ws.close(4401, 'unauthorized'); return; }
+      const scoped = this.deps.tokens.verify(auth.apiToken);
       const off = this.deps.bus.onAny((ev) => {
+        const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
+        if (scoped?.projectId && projectId !== scoped.projectId) return;
+        if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
+          const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
+          if (!allows(humanCaps ?? [], 'task:event:read')) return;
+        }
         try { ws.send(JSON.stringify(ev)); } catch { /* ignore */ }
       });
       ws.on('close', off);
@@ -172,7 +251,13 @@ export class Gateway {
   private async terminal(ws: import('ws').WebSocket, req: http.IncomingMessage) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const taskId = url.searchParams.get('taskId') ?? '';
-    const cwd = this.deps.store.getTask(taskId)?.lastView?.worldPath;
+    const task = this.deps.store.getTask(taskId);
+    const auth = await this.socketAuth(req, url, task?.projectId);
+    if (!auth) { ws.close(4401, 'unauthorized'); return; }
+    if (!this.deps.tokens.check(auth.apiToken, 'task:edit', { projectId: task?.projectId, taskId }).ok) {
+      ws.close(4403, 'forbidden'); return;
+    }
+    const cwd = task?.lastView?.worldPath;
     if (!cwd) {
       ws.send(JSON.stringify({ type: 'data', data: 'No world for this task yet.\r\n' }));
       ws.close();
@@ -228,7 +313,7 @@ export class Gateway {
   /** Stream a running review action's output to the UI. `procId` names a process
    *  the client already started via POST /review-action. We replay the buffered
    *  output first, then push the live tail until it exits or the socket closes. */
-  private reviewActionStream(ws: import('ws').WebSocket, req: http.IncomingMessage) {
+  private async reviewActionStream(ws: import('ws').WebSocket, req: http.IncomingMessage) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const procId = url.searchParams.get('procId') ?? '';
     const rec = this.reviewActions.get(procId);
@@ -236,6 +321,12 @@ export class Gateway {
       try { ws.send(JSON.stringify({ type: 'exit', code: -1, data: 'No such action process.\n' })); } catch {}
       ws.close();
       return;
+    }
+    const task = this.deps.store.getTask(rec.taskId);
+    const auth = await this.socketAuth(req, url, task?.projectId);
+    if (!auth) { ws.close(4401, 'unauthorized'); return; }
+    if (!this.deps.tokens.check(auth.apiToken, 'task:review:execute', { projectId: task?.projectId, taskId: rec.taskId }).ok) {
+      ws.close(4403, 'forbidden'); return;
     }
     const send = (obj: unknown) => { try { ws.send(JSON.stringify(obj)); } catch {} };
     if (rec.output) send({ type: 'data', data: rec.output });
@@ -267,6 +358,16 @@ export class Gateway {
 
     // ── unauthenticated endpoints ──
     if (p === '/api/session' && method === 'GET') {
+      if (this.deps.identity) {
+        const current = await this.deps.identity.session(requestHeaders(req.headers));
+        if (current) return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user });
+        return this.json(res, 200, {
+          authRequired: true,
+          authenticated: false,
+          setupRequired: !this.deps.identity.hasUsers(),
+          signupAvailable: this.deps.identity.hasUsers(),
+        });
+      }
       const authRequired = !!this.deps.password;
       if (!authRequired) {
         const { sid } = this.newSession();
@@ -276,17 +377,50 @@ export class Gateway {
     }
     if (p === '/api/login' && method === 'POST') {
       const b = await this.body(req);
+      if (this.deps.identity) {
+        try {
+          const response = await this.deps.identity.signIn(String(b.email ?? ''), String(b.password ?? ''), requestHeaders(req.headers));
+          return this.sendWebResponse(res, response);
+        } catch { return this.json(res, 401, { error: 'invalid email or password' }); }
+      }
       if (this.deps.password && b.password === this.deps.password) {
         const { sid } = this.newSession();
         return this.json(res, 200, { token: sid, user: 'me' });
       }
       return this.json(res, 401, { error: 'invalid password' });
     }
+    if (p === '/api/setup' && method === 'POST' && this.deps.identity) {
+      if (this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'karmax has already been set up' });
+      const b = await this.body(req);
+      try {
+        const { response, user } = await this.deps.identity.bootstrap(
+          { name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') },
+          requestHeaders(req.headers),
+        );
+        this.deps.authorization?.bootstrapAdministrator(user.id);
+        return this.sendWebResponse(res, response);
+      } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
+    }
+    if (p === '/api/signup' && method === 'POST' && this.deps.identity) {
+      // The first account must still go through /setup so it becomes the one
+      // explicit trust root. Later signups create authenticated, no-access
+      // identities that an administrator can grant into projects.
+      if (!this.deps.identity.hasUsers()) return this.json(res, 409, { error: 'set up the first administrator before signing up' });
+      const b = await this.body(req);
+      try {
+        const response = await this.deps.identity.signUp(
+          { name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') },
+          requestHeaders(req.headers),
+        );
+        return this.sendWebResponse(res, response);
+      } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
+    }
     if (p === '/api/meta' && method === 'GET') {
       return this.json(res, 200, {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
         safeMode: this.safeMode,
+        resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
       });
     }
 
@@ -296,7 +430,20 @@ export class Gateway {
     const attGet = p.match(/^\/api\/attachments\/([^/]+)$/);
     if (attGet && method === 'GET') {
       const sid = url.searchParams.get('token') ?? '';
-      if (!this.sessions.has(sid)) return this.json(res, 401, { error: 'unauthorized' });
+      const projectId = url.searchParams.get('projectId') ?? undefined;
+      let attachmentSession = await this.auth(req, projectId);
+      if (!attachmentSession && sid) {
+        attachmentSession = this.sessions.get(sid);
+        const agent = this.deps.tokens.verify(sid);
+        if (!attachmentSession && agent) attachmentSession = { user: agent.principal, apiToken: sid };
+      }
+      if (!attachmentSession) return this.json(res, 401, { error: 'unauthorized' });
+      if (projectId && !this.deps.tokens.check(attachmentSession.apiToken, 'task:read', { projectId }).ok)
+        return this.json(res, 403, { error: 'missing capability task:read' });
+      // New uploads are project-scoped. Unscoped rows are legacy attachments
+      // created before the ACL table existed and remain readable for migration.
+      if (this.deps.store.attachmentIsScoped(attGet[1]!) && (!projectId || !this.deps.store.attachmentAllowed(attGet[1]!, projectId)))
+        return this.json(res, 404, { error: 'attachment not found' });
       const got = this.attachments.read(attGet[1]!);
       if (!got) return void res.writeHead(404).end('not found');
       res.writeHead(200, {
@@ -307,19 +454,97 @@ export class Gateway {
     }
 
     // ── authenticated endpoints ──
-    const session = this.auth(req);
+    const requestedScope = this.requestScope(p, url);
+    const session = await this.auth(req, requestedScope.projectId);
     if (!session) return this.json(res, 401, { error: 'unauthorized' });
     const token = session.apiToken;
     const { api, store } = this.deps;
 
+    const required = capabilityForRequest(method, p, url);
+    let authRecord = this.deps.tokens.verify(token);
+    if (required) {
+      const scope = requestedScope;
+      const checked = this.deps.tokens.check(token, required, scope);
+      // The project collection has no single scope. A project-only human may
+      // enter it when at least one project grant permits discovery; the response
+      // below is filtered project-by-project. No other unscoped route gets this
+      // exception.
+      const collectionAllowed = !checked.ok && p === '/api/projects' && method === 'GET' && !!session.userId &&
+        this.deps.store.listProjects().some((project) => allows(this.deps.authorization?.capabilities(`user:${session.userId}`, project.id) ?? [], required));
+      if (!checked.ok && !collectionAllowed) return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
+      if (checked.ok) authRecord = checked.record;
+      const principal = checked.record?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, scope.projectId ? `project:${scope.projectId}` : 'global', { path: p });
+    }
+
     try {
+      if (p === '/api/logout' && method === 'POST') {
+        const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
+        if (bearer) this.sessions.delete(bearer);
+        if (this.deps.identity) return this.sendWebResponse(res, await this.deps.identity.signOut(requestHeaders(req.headers)));
+        return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
+      // Multiple human accounts + karmax authorization. Better Auth owns the
+      // account/session records; these routes only attach karmax grants.
+      if (p === '/api/users' && method === 'GET') {
+        return this.json(res, 200, (this.deps.identity?.listUsers() ?? []).map((u) => ({ ...u, grants: this.deps.authorization?.grants(`user:${u.id}`) ?? [] })));
+      }
+      if (p === '/api/users' && method === 'POST') {
+        if (!this.deps.identity) return this.json(res, 400, { error: 'identity service unavailable' });
+        const b = await this.body(req);
+        const user = await this.deps.identity.createUser({ name: String(b.name ?? ''), email: String(b.email ?? ''), password: String(b.password ?? '') });
+        if (b.profileId) this.deps.authorization?.grant(`user:${session.userId}`, { principalId: `user:${user.id}`, scopeKey: b.projectId ? `project:${b.projectId}` : 'global', profileId: String(b.profileId) });
+        return this.json(res, 200, user);
+      }
+      const userMatch = p.match(/^\/api\/users\/([^/]+)$/);
+      if (userMatch && method === 'DELETE') {
+        if (userMatch[1] === session.userId) return this.json(res, 400, { error: 'cannot delete the current account' });
+        await this.deps.identity?.removeUser(userMatch[1]!);
+        for (const g of this.deps.authorization?.grants(`user:${userMatch[1]}`) ?? []) this.deps.authorization?.revoke(`user:${session.userId}`, g.principalId, g.scopeKey);
+        return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/authorization/profiles' && method === 'GET') {
+        const projectId = url.searchParams.get('projectId') ?? undefined;
+        return this.json(res, 200, {
+          profiles: this.deps.authorization?.profiles(projectId) ?? [],
+          defaultProfile: this.deps.authorization?.defaultProfile(projectId),
+          capabilityGroups: CAPABILITY_GROUPS,
+        });
+      }
+      if (p === '/api/authorization/profiles' && method === 'PUT') {
+        const b = await this.body(req);
+        const scopeKey = (b.projectId ? `project:${b.projectId}` : 'global') as import('../platform/authorization.js').AuthorizationScope;
+        return this.json(res, 200, this.deps.authorization?.saveProfile(`user:${session.userId}`, scopeKey, b.profile));
+      }
+      if (p === '/api/authorization/default' && method === 'PUT') {
+        const b = await this.body(req);
+        this.deps.authorization?.setDefault(`user:${session.userId}`, String(b.profileId), b.projectId ? String(b.projectId) : undefined);
+        return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/authorization/grants' && method === 'GET') return this.json(res, 200, this.deps.authorization?.grants() ?? []);
+      if (p === '/api/authorization/grants' && method === 'PUT') {
+        const b = await this.body(req);
+        return this.json(res, 200, this.deps.authorization?.grant(`user:${session.userId}`, {
+          principalId: String(b.principalId), scopeKey: b.projectId ? `project:${b.projectId}` : 'global',
+          profileId: String(b.profileId), ...(Array.isArray(b.capabilities) ? { capabilities: b.capabilities } : {}),
+        }));
+      }
+      if (p === '/api/audit' && method === 'GET') return this.json(res, 200, store.auditSince(Number(url.searchParams.get('since') ?? 0), Number(url.searchParams.get('limit') ?? 500)));
+
       // Host diagnostics + agent-turn admission state (SPEC §12): loadavg,
       // free/total memory, and whether either pressure gate is currently holding
       // new agent leases back. Reporting only — the gate itself lives in
       // src/activities/agent-slots.ts (same process as the worker).
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
-        return this.json(res, 200, { host: hostStats(), agentSlots: agentSlotStats(), ts: Date.now() });
+        const safety = agentSlotStats();
+        const queue = await api.agentQueueView(token);
+        return this.json(res, 200, {
+          host: hostStats(),
+          agentSlots: { ...safety, capacity: queue.capacity, inUse: queue.current.length, waiting: queue.queue.length },
+          ts: Date.now(),
+        });
       }
 
       // Task manager (dashboard Processes panel): every process karmax is
@@ -353,6 +578,7 @@ export class Gateway {
             const buf = await this.rawBody(req, MAX_IMAGE_BYTES);
             ref = this.attachments.put(buf, ctype || undefined);
           }
+          if (requestedScope.projectId) store.grantAttachment(ref.id, requestedScope.projectId);
           return this.json(res, 200, ref);
         } catch (e) {
           if (e instanceof AttachmentError) return this.json(res, 400, { error: e.message });
@@ -361,7 +587,15 @@ export class Gateway {
       }
 
       // projects
-      if (p === '/api/projects' && method === 'GET') return this.json(res, 200, store.listProjects());
+      if (p === '/api/projects' && method === 'GET') {
+        const projects = store.listProjects();
+        if (authRecord?.projectId) return this.json(res, 200, projects.filter((x) => x.id === authRecord!.projectId));
+        if (session.userId && this.deps.authorization) {
+          const principal = `user:${session.userId}`;
+          return this.json(res, 200, projects.filter((x) => allows(this.deps.authorization!.capabilities(principal, x.id), 'project:read')));
+        }
+        return this.json(res, 200, projects);
+      }
       if (p === '/api/projects' && method === 'POST') {
         const b = await this.body(req);
         return this.json(res, 200, store.createProject(b.name ?? 'New project', normalizeConfig(b.config)));
@@ -591,10 +825,13 @@ export class Gateway {
           // removed — a merge would leave the stale override behind. Lifecycle +
           // organizational meta (draft/archived/profiles/priority) is preserved across
           // the edit — priority is set via its own endpoint and must survive a form save.
-          const { draft, archived, profiles, priority } = t.params;
-          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}), ...(priority !== undefined ? { priority } : {}) };
+          const { draft, archived, profiles, priority, _authorization } = t.params;
+          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}), ...(priority !== undefined ? { priority } : {}), ...(_authorization !== undefined ? { _authorization } : {}) };
           const replace = b.replace === true;
-          store.updateTaskParams(id, replace ? { ...meta, ...b.params } : { ...t.params, ...b.params });
+          const next = replace ? { ...meta, ...b.params } : { ...t.params, ...b.params };
+          // Never trust workflow-form JSON for platform authorization metadata.
+          if (_authorization !== undefined) next._authorization = _authorization;
+          store.updateTaskParams(id, next);
           // Keep the title tracking the edited prompt (title was derived from it).
           const prompt = b.params?.prompt;
           if (typeof prompt === 'string' && prompt.trim()) store.setTaskTitle(id, (prompt.split('\n')[0] ?? '').slice(0, 80));
@@ -612,6 +849,11 @@ export class Gateway {
         } catch (e) {
           return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
         }
+      }
+      const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
+      if (taskAuthMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? '')));
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {
@@ -714,7 +956,16 @@ export class Gateway {
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
-        return this.json(res, 200, store.eventsSince(eventsMatch[1]!, since));
+        return this.json(res, 200, await api.taskEvents(token, eventsMatch[1]!, since));
+      }
+      const agentsMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents$/);
+      if (agentsMatch && method === 'GET') return this.json(res, 200, await api.listTaskAgents(token, agentsMatch[1]!));
+      const conversationMatch = p.match(/^\/api\/tasks\/([^/]+)\/conversation$/);
+      if (conversationMatch && method === 'GET') return this.json(res, 200, await api.taskConversation(token, conversationMatch[1]!, url.searchParams.get('role') ?? 'do'));
+      const forkAgentMatch = p.match(/^\/api\/tasks\/([^/]+)\/fork-agent$/);
+      if (forkAgentMatch && method === 'POST') {
+        const b = await this.body(req);
+        return this.json(res, 200, await api.forkTaskAgent(token, { ...b, taskId: forkAgentMatch[1]! }));
       }
       const sessMatch = p.match(/^\/api\/tasks\/([^/]+)\/sessions$/);
       if (sessMatch && method === 'GET') {
@@ -724,7 +975,7 @@ export class Gateway {
         // command targeting the right CONFIG_DIR/CODEX_HOME (provider sessions are
         // home-bound). `home` is omitted for API-key/stateless sessions.
         const out: Record<string, { id: string; home?: string; provider?: string }> = {};
-        for (const role of ['do', 'merge', 'resolve', 'confirm']) {
+        for (const role of ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm']) {
           const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
           const s = store.kvGet(`session:${sessionTaskId}:${role}`);
           if (!s) continue;
@@ -757,7 +1008,7 @@ export class Gateway {
       // merge queue
       if (p === '/api/queue' && method === 'GET') {
         const domain = url.searchParams.get('domain') ?? '';
-        return this.json(res, 200, await api.queueView(token, domain));
+        return this.json(res, 200, await api.queueView(token, domain, url.searchParams.get('projectId') ?? undefined));
       }
       if (p === '/api/queue/prioritize' && method === 'POST') {
         const b = await this.body(req);
@@ -767,6 +1018,14 @@ export class Gateway {
       if (p === '/api/queue/move' && method === 'POST') {
         const b = await this.body(req);
         await api.moveQueueItem(token, b.domain, b.taskId, b.beforeTaskId || undefined);
+        return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/agent-queue' && method === 'GET') {
+        return this.json(res, 200, await api.agentQueueView(token));
+      }
+      if (p === '/api/agent-queue/move' && method === 'POST') {
+        const b = await this.body(req);
+        await api.moveAgentQueueItem(token, String(b.turnId), b.beforeTurnId ? String(b.beforeTurnId) : undefined);
         return this.json(res, 200, { ok: true });
       }
       // platform API surface used by the MCP server (save skill / propose edit)
@@ -809,10 +1068,11 @@ export class Gateway {
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
         const { roleDef } = await import('../contrib/manifests.js');
         const withRole = (pr: any) => ({ ...pr, roleWorkflows: roleDef(pr.role)?.workflows ?? [] });
+        const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
-        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::')).map(withRole));
+        if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr)).map(withRole));
         // effective per-role view: the project override if present, else global (inherited)
-        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::'));
+        const globals = store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr));
         const view = globals.map((g) => {
           const proj = store.getProfile(`${pid}::${g.role}-default`);
           return withRole({ ...(proj ?? g), id: `${pid}::${g.role}-default`, role: g.role, scope: proj ? 'project' : 'inherited', inherited: g });
@@ -828,6 +1088,8 @@ export class Gateway {
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
+        const { roleDef } = await import('../contrib/manifests.js');
+        if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
         const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
         if (!id) return this.json(res, 400, { error: 'profile needs id or projectId' });
         const { projectId: _pid, scope: _s, inherited: _i, ...rest } = b;
@@ -1148,7 +1410,11 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf));
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (wf === 'agent-queue' && (!Number.isFinite(Number(b.values?.capacity)) || Number(b.values.capacity) < 1)) {
+            return this.json(res, 400, { error: 'Concurrent agent turns must be at least 1' });
+          }
           store.setSettings('global', wf, b.values ?? {});
+          if (wf === 'agent-queue') await api.setAgentCapacity(Number(b.values?.capacity));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -1214,7 +1480,9 @@ export class Gateway {
       // activity feed (all events)
       if (p === '/api/activity' && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
-        return this.json(res, 200, store.allEventsSince(since).slice(-300));
+        let events = store.allEventsSince(since).slice(-300);
+        if (authRecord?.projectId) events = events.filter((e) => store.getTask(e.taskId)?.projectId === authRecord?.projectId);
+        return this.json(res, 200, events);
       }
 
       // dashboard
@@ -1423,10 +1691,60 @@ export class Gateway {
   }
 
   // ── helpers ──
-  private auth(req: http.IncomingMessage): Session | undefined {
+  private async auth(req: http.IncomingMessage, projectId?: string): Promise<Session | undefined> {
     const h = req.headers['authorization'];
     const sid = h?.startsWith('Bearer ') ? h.slice(7) : undefined;
-    return sid ? this.sessions.get(sid) : undefined;
+    if (sid) {
+      const legacy = this.sessions.get(sid);
+      if (legacy) return legacy;
+      const agent = this.deps.tokens.verify(sid);
+      if (agent) return { user: agent.principal, apiToken: sid };
+    }
+    if (!this.deps.identity) return undefined;
+    const identity = await this.deps.identity.session(requestHeaders(req.headers));
+    if (!identity) return undefined;
+    const principal = `user:${identity.user.id}`;
+    const caps = this.deps.authorization?.capabilities(principal, projectId) ?? [];
+    const fingerprint = JSON.stringify(caps.slice().sort());
+    const cacheKey = `${identity.session.id}:${projectId ?? 'global'}`;
+    let cached = this.identityTokens.get(cacheKey);
+    if (!cached || cached.fingerprint !== fingerprint || !this.deps.tokens.verify(cached.apiToken)) {
+      if (cached) this.deps.tokens.revoke(cached.apiToken);
+      cached = { apiToken: this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000).token, fingerprint };
+      this.identityTokens.set(cacheKey, cached);
+    }
+    return { user: identity.user.name, userId: identity.user.id, apiToken: cached.apiToken };
+  }
+  /** Browser WebSockets carry Better Auth cookies. The legacy test/embed gateway
+   * instead has a JSON session id, which may be passed explicitly in the query
+   * just like attachment URLs; production task tokens are never synthesized. */
+  private async socketAuth(req: http.IncomingMessage, url: URL, projectId?: string): Promise<Session | undefined> {
+    const token = url.searchParams.get('token') ?? '';
+    if (token) {
+      const legacy = this.sessions.get(token);
+      if (legacy) return legacy;
+      const agent = this.deps.tokens.verify(token);
+      if (agent) return { user: agent.principal, apiToken: token };
+    }
+    return this.auth(req, projectId);
+  }
+  private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string } {
+    const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
+      ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
+      ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1]
+      ?? url.searchParams.get('projectId') ?? undefined;
+    const taskId = pathname.match(/^\/api\/tasks\/([^/]+)/)?.[1] ?? url.searchParams.get('taskId') ?? undefined;
+    const taskProject = taskId ? this.deps.store.getTask(taskId)?.projectId : undefined;
+    return { projectId: projectId ?? taskProject, ...(taskId ? { taskId } : {}) };
+  }
+  private async sendWebResponse(res: http.ServerResponse, response: Response) {
+    const body = Buffer.from(await response.arrayBuffer());
+    const headers: Record<string, string | string[]> = {};
+    response.headers.forEach((value, key) => { headers[key] = value; });
+    const getSetCookie = (response.headers as any).getSetCookie?.bind(response.headers);
+    if (getSetCookie) headers['set-cookie'] = getSetCookie();
+    res.writeHead(response.status, headers);
+    res.end(body);
   }
   private json(res: http.ServerResponse, status: number, obj: unknown) {
     const body = JSON.stringify(obj ?? null);

@@ -15,6 +15,7 @@
  */
 import { TaskRecord, TaskQuery, FilterClause, Tag, SortClause, PRIORITIES } from './types.js';
 import { normalizeTriggers, isRecurring, nextCronFire, TaskTrigger } from './triggers.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 /** A task as seen by search: the stored record, whose `lastView`/`tags` are hydrated. */
 export type SearchTask = TaskRecord;
@@ -88,7 +89,7 @@ const STATUS_OPTIONS: FieldOption[] = [
   { value: 'failed', label: 'Failed' },
   { value: 'cancelled', label: 'Cancelled' },
 ];
-const STAGE_OPTIONS: FieldOption[] = ['setup', 'do', 'review', 'pr', 'merge', 'done', 'resolve', 'escalated', 'cancelled', 'failed'].map((s) => ({ value: s, label: s[0]!.toUpperCase() + s.slice(1) }));
+const STAGE_OPTIONS: FieldOption[] = ['setup', 'do', 'review', 'pr', 'merge', 'done', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'escalated', 'cancelled', 'failed'].map((s) => ({ value: s, label: s[0]!.toUpperCase() + s.slice(1) }));
 const PRIORITY_OPTIONS: FieldOption[] = PRIORITIES.map((p, i) => ({ value: String(i), label: p[0]!.toUpperCase() + p.slice(1) }));
 
 /**

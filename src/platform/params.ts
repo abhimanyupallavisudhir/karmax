@@ -2,6 +2,7 @@ import { FieldSpec, FieldMutable, TaskInput, AgentSpec, ConfirmConfig, ProjectCo
 import { confirmLayersOf } from '../domain/confirm.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { expandPath } from '../util/expand.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 /**
  * Parameter resolution + assembly (SPEC §10.4). A single declared FieldSpec
@@ -39,16 +40,16 @@ export function resolveParamsLayers(manifest: WorkflowManifest, layers: (ValueMa
   return out;
 }
 
-const AGENT_GROUP_ROLES = ['do', 'merge', 'resolve'] as const;
+const AGENT_GROUP_ROLES: readonly string[] = ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : [])];
 
 /**
- * Do/Merge/Resolve have a compact, unified editor by default. The editor shape is
+ * Do/Merge have a compact, unified editor by default. The editor shape is
  * itself an inherited setting: a unified child inherits only its parent's Do
- * agent and applies that identity to all three roles; a separated child inherits
+ * agent and applies that identity to both roles; a separated child inherits
  * each corresponding parent role. Fork/session state is deliberately copied only
  * to Do when a unified value fans out.
  *
- * Older rows predate `separateAgents`; infer their old three-form shape when they
+ * Older rows predate `separateAgents`; infer their old separate form when they
  * contain any role override so existing settings retain their meaning.
  */
 function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undefined)[], out: ValueMap): void {
@@ -73,7 +74,7 @@ function resolveAgentGroup(manifest: WorkflowManifest, layers: (ValueMap | undef
     if (unified !== undefined) {
       resolved.do = unified;
       resolved.merge = withoutResume(unified);
-      resolved.resolve = withoutResume(unified);
+      if (RESOLVE_AGENT_ENABLED) resolved.resolve = withoutResume(unified);
     }
   }
   for (const role of AGENT_GROUP_ROLES) {
