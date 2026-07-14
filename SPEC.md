@@ -301,6 +301,14 @@ A scarce shared resource is owned by a **singleton coordinator workflow** with a
 - **Crash safety:** after granting, the coordinator awaits `release` *or* a lease-timeout; on timeout it checks the grantee's status and reclaims if it died.
 - **continue-as-new:** the coordinator is long-lived and accumulates history (every enqueue/grant/release), so it must periodically continue-as-new, carrying the queue state forward.
 
+### 6.1a Agent-turn queue (host capacity)
+
+- One host-wide singleton, `agent-queue`, leases capacity only around model subprocesses; workflows waiting at Review, on accounts, timers, or I/O do not consume it.
+- Capacity defaults to 3 and is persisted as **Global settings → Host capacity → Concurrent agent turns**. `KARMAX_MAX_ACT` remains a distinct worker-throughput limit for all activities, and per-login concurrency remains an account-pool limit.
+- Waiting turns and active leases are explicit coordinator state. The coordinator contributes the reorderable **Agent queue** to the host-owned **Queues** page alongside the merge queue.
+- The worker applies live free-memory/load gates after lease grant. Those adaptive safety checks are separate from the configured counting-semaphore capacity because only an activity can inspect live host resources.
+- Current turns enroll by stable turn ID at the existing activity boundary, preserving replay compatibility for workflow histories recorded before this coordinator existed. Dead-task leases are reclaimed after a liveness check.
+
 ### 6.2 Token / account coordinator
 
 Same pattern, leasing **agent-account capacity** instead of merge slots:
@@ -310,7 +318,7 @@ Same pattern, leasing **agent-account capacity** instead of merge slots:
 - When the whole pool is exhausted, parks turns until a refresh timer fires.
 - Resolve/auto-resolve consult it to decide when *not* to spawn agents and when to retry turns that failed on rate limits.
 
-**Design note — the unification.** Merge slots, agent-account capacity, and (in v2) spend budgets are all the same coordinator-with-leases pattern at different scopes. External-resource brokering is not new machinery; it is this one primitive pointed at different pools.
+**Design note — the unification.** Merge slots, host agent-turn capacity, agent-account capacity, and (in v2) spend budgets are all the same coordinator-with-leases pattern at different scopes. External-resource brokering is not new machinery; it is this one primitive pointed at different pools.
 
 ---
 
@@ -426,7 +434,7 @@ Profile edits, grants, revocations, defaults, and capability-checked gateway ope
 
 ### 10.1 The contribution system
 
-The host implements a **protocol**, not a catalog of anticipated workflows — like a browser rendering any conforming page. A workflow package contributes typed, declared things into named **slots/extension points** on the host: task-detail panel, task-list item, task-list column, project-settings section, global-nav, merge-queue panel, review area, dashboard widget. Mounting is simple; the design work is keeping the **slot set small, stable, and versioned**, because contributions bind to it.
+The host implements a **protocol**, not a catalog of anticipated workflows — like a browser rendering any conforming page. A workflow package contributes typed, declared things into named **slots/extension points** on the host: task-detail panel, task-list item, task-list column, project-settings section, global-nav, queue panel (with the old merge-queue panel retained as an alias), review area, dashboard widget. Mounting is simple; the design work is keeping the **slot set small, stable, and versioned**, because contributions bind to it.
 
 A **command/keymap registry** is the substrate for keyboard navigation: core and contributions register commands; every declared action is a command; keybindings are a view over the registry. The "extensive keyboard navigation system" is this registry, not a separate mechanism.
 

@@ -76,6 +76,7 @@ export interface UiContribution {
     | 'task-list-column'
     | 'project-settings'
     | 'merge-queue-panel'
+    | 'queue-panel'
     | 'review-area'
     | 'dashboard-widget'
     | 'global-nav';
@@ -430,9 +431,32 @@ export const MANIFESTS: WorkflowManifest[] = [
     requires: [],
     capabilities: [],
     events: [],
-    ui: [{ slot: 'merge-queue-panel', tier: 2, component: 'merge-queue', title: 'Merge queue' }],
+    ui: [{ slot: 'queue-panel', tier: 2, component: 'merge-queue', title: 'Merge queue' }],
     commands: [],
     params: [],
+    kind: 'coordinator',
+  },
+  {
+    name: 'agent-queue',
+    version: '1.0.0',
+    description: 'Orders and leases host capacity for concurrent agent turns (coordinator).',
+    requires: [],
+    capabilities: [],
+    events: [],
+    ui: [{ slot: 'queue-panel', tier: 2, component: 'agent-queue', title: 'Agent queue' }],
+    commands: [],
+    params: [
+      {
+        name: 'capacity',
+        type: 'number',
+        label: 'Concurrent agent turns',
+        help: 'Maximum model subprocesses running at once across all projects. This is distinct from general Temporal activity concurrency and per-login concurrency.',
+        default: 3,
+        required: true,
+        scopes: ['global'],
+        bind: 'top',
+      },
+    ],
     kind: 'coordinator',
   },
   {

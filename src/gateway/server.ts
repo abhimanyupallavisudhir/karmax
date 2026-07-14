@@ -538,7 +538,13 @@ export class Gateway {
       // src/activities/agent-slots.ts (same process as the worker).
       if (p === '/api/diagnostics' && method === 'GET') {
         const { hostStats, agentSlotStats } = await import('../activities/agent-slots.js');
-        return this.json(res, 200, { host: hostStats(), agentSlots: agentSlotStats(), ts: Date.now() });
+        const safety = agentSlotStats();
+        const queue = await api.agentQueueView(token);
+        return this.json(res, 200, {
+          host: hostStats(),
+          agentSlots: { ...safety, capacity: queue.capacity, inUse: queue.current.length, waiting: queue.queue.length },
+          ts: Date.now(),
+        });
       }
 
       // Task manager (dashboard Processes panel): every process karmax is
@@ -1014,6 +1020,14 @@ export class Gateway {
         await api.moveQueueItem(token, b.domain, b.taskId, b.beforeTaskId || undefined);
         return this.json(res, 200, { ok: true });
       }
+      if (p === '/api/agent-queue' && method === 'GET') {
+        return this.json(res, 200, await api.agentQueueView(token));
+      }
+      if (p === '/api/agent-queue/move' && method === 'POST') {
+        const b = await this.body(req);
+        await api.moveAgentQueueItem(token, String(b.turnId), b.beforeTurnId ? String(b.beforeTurnId) : undefined);
+        return this.json(res, 200, { ok: true });
+      }
       // platform API surface used by the MCP server (save skill / propose edit)
       if (p === '/api/skills' && method === 'POST') {
         const b = await this.body(req);
@@ -1396,7 +1410,11 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf));
         if (method === 'PUT') {
           const b = await this.body(req);
+          if (wf === 'agent-queue' && (!Number.isFinite(Number(b.values?.capacity)) || Number(b.values.capacity) < 1)) {
+            return this.json(res, 400, { error: 'Concurrent agent turns must be at least 1' });
+          }
           store.setSettings('global', wf, b.values ?? {});
+          if (wf === 'agent-queue') await api.setAgentCapacity(Number(b.values?.capacity));
           return this.json(res, 200, { ok: true });
         }
       }

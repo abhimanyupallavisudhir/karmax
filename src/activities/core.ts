@@ -10,7 +10,7 @@ import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { ProfileResolver } from '../agent/profiles.js';
 import { AgentAdapter } from '../agent/types.js';
 import { runTurn } from '../agent/runtime.js';
-import { acquireAgentSlot } from './agent-slots.js';
+import { acquireAgentSlot, awaitAgentResources } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
@@ -31,6 +31,15 @@ import { allows, attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
+import {
+  AGENT_QUEUE_WORKFLOW,
+  QRY_AGENT_QUEUE,
+  SIG_CANCEL_AGENT,
+  SIG_LEASE_AGENT,
+  SIG_RELEASE_AGENT,
+  SIG_SET_AGENT_CAPACITY,
+  agentQueueId,
+} from '../coordinators/names.js';
 
 // Old executions without a recorded grant retain the normal developer workflow
 // surface (but no administration). New tasks always carry a creator-attenuated
@@ -119,7 +128,7 @@ function signalKillMessage(raw: string): string {
   const mem = `${h.freeMemMb}MB free of ${h.totalMemMb}MB (${h.usedMemPct}% used, load ${h.loadPerCore}/core)`;
   const diagnosis = hostMemoryTight()
     ? `host out of memory — the agent was likely killed by the OS OOM killer (${mem}). ` +
-      `Reduce concurrency (lower KARMAX_MAX_AGENT_SLOTS / raise KARMAX_AGENT_MIN_FREE_MB) or free RAM.`
+      `Reduce Concurrent agent turns in Global settings (or raise KARMAX_AGENT_MIN_FREE_MB), or free RAM.`
     : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a karmax ` +
       `restart/reload/redeploy tearing down in-flight turns (orphan-sweep or shutdown escalation) or an external kill.`;
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
@@ -151,6 +160,7 @@ export interface CoreActivityDeps {
   adapters: Map<Provider, AgentAdapter>;
   profiles: ProfileResolver;
   client?: Client;
+  taskQueue?: string;
   bus?: KarmaxBus;
   globalInstructions?: string;
   tokens?: TokenAuthority;
@@ -172,6 +182,58 @@ export interface CreateWorldArgs {
   /** The project's git profile selection (PLAN-git-config.md §3); the activity
    *  resolves it (project → global default) and materializes identity/signing. */
   gitProfile?: string;
+}
+
+async function acquireWorkflowAgentSlot(args: {
+  client: Client;
+  taskQueue: string;
+  store: Store;
+  taskId: string;
+  turnId: string;
+  role: string;
+  provider?: string;
+  title?: string;
+  projectId?: string;
+  heartbeat?: () => void;
+  signal?: AbortSignal;
+}): Promise<() => Promise<void>> {
+  const saved = Number(args.store.getSettings('global', 'agent-queue')?.capacity);
+  const capacity = Number.isFinite(saved) && saved > 0
+    ? Math.floor(saved)
+    : 3;
+  const id = agentQueueId();
+  await args.client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
+    workflowId: id,
+    taskQueue: args.taskQueue,
+    args: [{ capacity }],
+    signal: SIG_LEASE_AGENT,
+    signalArgs: [{ taskId: args.taskId, turnId: args.turnId, role: args.role, provider: args.provider, title: args.title, projectId: args.projectId }],
+  });
+  await args.client.workflow.getHandle(id).signal(SIG_SET_AGENT_CAPACITY, { capacity });
+  let lastHeartbeat = 0;
+  try {
+    for (;;) {
+      if (args.signal?.aborted) throw args.signal.reason instanceof Error ? args.signal.reason : new Error('agent queue wait cancelled');
+      const view = (await args.client.workflow.getHandle(id).query(QRY_AGENT_QUEUE)) as {
+        current: Array<{ turnId: string }>;
+      };
+      if (view.current.some((x) => x.turnId === args.turnId)) break;
+      if (Date.now() - lastHeartbeat >= 10_000) {
+        args.heartbeat?.();
+        lastHeartbeat = Date.now();
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+  } catch (e) {
+    await args.client.workflow.getHandle(id).signal(SIG_CANCEL_AGENT, { taskId: args.taskId, turnId: args.turnId }).catch(() => undefined);
+    throw e;
+  }
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    await args.client.workflow.getHandle(id).signal(SIG_RELEASE_AGENT, { taskId: args.taskId, turnId: args.turnId }).catch(() => undefined);
+  };
 }
 
 export interface RunAgentTurnArgs {
@@ -602,12 +664,36 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Host-wide agent-turn admission (SPEC §12): cap concurrent model
       // subprocesses so a burst can't OOM the host. Acquired around the model
       // call ONLY — the setup above is cheap — and released in `finally` below.
-      let releaseSlot = () => {};
+      let releaseSlot: () => void | Promise<void> = () => {};
       let lastEmit: string | undefined;
       let result;
       try {
         publishLegacyAgentState('waiting-slot');
-        releaseSlot = await acquireAgentSlot(heartbeat, signal);
+        // Current workflows carry a stable turn id, so the activity enrolls that
+        // turn in the durable/reorderable coordinator before starting the model.
+        // Historical executions lack the id and retain the replay-safe file gate.
+        if (args.agentTurnId && deps.client && deps.taskQueue) {
+          releaseSlot = await acquireWorkflowAgentSlot({
+            client: deps.client,
+            taskQueue: deps.taskQueue,
+            store,
+            taskId: args.taskId,
+            turnId: args.agentTurnId,
+            role: args.role,
+            provider: profile.provider,
+            title: args.task.title,
+            projectId: args.task.projectId,
+            heartbeat,
+            signal,
+          });
+          try {
+            await awaitAgentResources(heartbeat, signal);
+          } catch (e) {
+            await releaseSlot();
+            releaseSlot = () => {};
+            throw e;
+          }
+        } else releaseSlot = await acquireAgentSlot(heartbeat, signal);
         // The workflow publishes `waiting-slot` immediately after the account grant;
         // only admission itself can truthfully report that the model is now running.
         if (deps.client && args.agentTurnId) {
@@ -725,7 +811,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
         throw classifyTurnError(err, profile.provider);
       } finally {
-        releaseSlot();
+        await releaseSlot();
         releaseConfirm();
         publishLegacyAgentState(undefined);
       }

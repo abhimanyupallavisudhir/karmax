@@ -5,6 +5,7 @@
  * outside the deterministic sandbox).
  */
 export const MERGE_QUEUE_WORKFLOW = 'mergeQueue';
+export const AGENT_QUEUE_WORKFLOW = 'agentQueue';
 export const ACCOUNT_COORDINATOR_WORKFLOW = 'accountCoordinator';
 export const BUDGET_COORDINATOR_WORKFLOW = 'budgetCoordinator';
 
@@ -17,6 +18,12 @@ export const SIG_REORDER = 'reorderQueue';
 export const SIG_CANCEL_MERGE = 'cancelMerge';
 export const SIG_MERGE_GRANTED = 'mergeGranted';
 export const QRY_QUEUE = 'queue';
+
+export const SIG_LEASE_AGENT = 'leaseAgentSlot';
+export const SIG_CANCEL_AGENT = 'cancelAgentSlot';
+export const SIG_RELEASE_AGENT = 'releaseAgentSlot';
+export const SIG_SET_AGENT_CAPACITY = 'setAgentCapacity';
+export const QRY_AGENT_QUEUE = 'agentQueue';
 
 export const SIG_LEASE_ACCOUNT = 'leaseAccount';
 export const SIG_CANCEL_ACCOUNT = 'cancelAccountLease';
@@ -42,6 +49,10 @@ export function mergeQueueId(domain: string): string {
 
 export function accountCoordinatorId(): string {
   return 'account-coordinator';
+}
+
+export function agentQueueId(): string {
+  return 'agent-queue';
 }
 
 /** A login's `maxConcurrent` when the user chooses "unlimited" (empty field in the UI).

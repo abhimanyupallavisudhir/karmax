@@ -7,7 +7,16 @@ import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
-import { mergeQueueId, SIG_PRIORITIZE, SIG_REORDER, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
+import {
+  mergeQueueId,
+  agentQueueId,
+  SIG_PRIORITIZE,
+  SIG_REORDER,
+  SIG_SET_AGENT_CAPACITY,
+  QRY_AGENT_QUEUE,
+  MERGE_QUEUE_WORKFLOW,
+  AGENT_QUEUE_WORKFLOW,
+} from '../coordinators/names.js';
 import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentSpec, Provider } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
@@ -1222,6 +1231,33 @@ export class KarmaxApi {
     }
   }
 
+  async agentQueueView(token: string): Promise<{ capacity: number; queue: any[]; current: any[] }> {
+    this.require(token, 'get_task');
+    const saved = Number(this.deps.store.getSettings('global', 'agent-queue')?.capacity);
+    const fallback = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 3;
+    try {
+      return (await this.deps.client.workflow.getHandle(agentQueueId()).query(QRY_AGENT_QUEUE)) as any;
+    } catch {
+      return { capacity: fallback, queue: [], current: [] };
+    }
+  }
+
+  async moveAgentQueueItem(token: string, turnId: string, beforeTurnId?: string): Promise<void> {
+    this.require(token, 'reorder_queue');
+    await this.deps.client.workflow.getHandle(agentQueueId()).signal(SIG_REORDER, { turnId, beforeTurnId });
+  }
+
+  async setAgentCapacity(capacity: number): Promise<void> {
+    const value = Number.isFinite(capacity) && capacity > 0 ? Math.floor(capacity) : 3;
+    await this.deps.client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
+      workflowId: agentQueueId(),
+      taskQueue: this.deps.taskQueue,
+      args: [{ capacity: value }],
+      signal: SIG_SET_AGENT_CAPACITY,
+      signalArgs: [{ capacity: value }],
+    });
+  }
+
   async saveSkill(token: string, args: { name: string; content: string }): Promise<{ path: string }> {
     this.require(token, 'save_skill');
     const dir = this.deps.contentDir ?? paths().content;
@@ -1308,8 +1344,13 @@ export class KarmaxApi {
    * by the gateway, so it takes no capability (matches the prior inline handler).
    */
   workflowSchemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
-    if (this.deps.workflows) return this.deps.workflows.schemas();
-    return MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
+    const taskSchemas = this.deps.workflows
+      ? this.deps.workflows.schemas()
+      : MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
+    const settingsOnly = MANIFESTS
+      .filter((m) => m.kind === 'coordinator' && m.params.length)
+      .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
+    return [...taskSchemas, ...settingsOnly];
   }
 
   /**

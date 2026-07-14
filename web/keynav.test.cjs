@@ -95,7 +95,7 @@ ok(fuzzyScore('xyz', 'Confirm task') === -1, 'non-subsequence → -1');
 ok(fuzzyScore('ct', 'Confirm task') >= 0, 'subsequence matches');
 ok(fuzzyScore('conf', 'Confirm task') > fuzzyScore('cnf', 'Confirm task'), 'consecutive runs beat scattered letters');
 ok(fuzzyScore('task', 'Confirm task') > 0, 'word-boundary bonus applies');
-ok(fuzzyScore('gq', 'Go to merge queue') >= 0, 'initials-style query matches');
+ok(fuzzyScore('gq', 'Go to queues') >= 0, 'initials-style query matches');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
