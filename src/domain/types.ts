@@ -344,7 +344,8 @@ export interface ReviewAction {
 export interface ReviewInfo {
   /**
    * Terse orientation — WHAT to verify, not a narrative of what was done. One line.
-   * Prose about the work belongs in the conversation/messages, not here.
+   * Prose about the work belongs in the conversation/messages, not here. Agent-authored
+   * captions are limited to 280 characters at the create_review_info tool boundary.
    */
   caption?: string;
   /** Click-to-verify affordances (SPEC §5.5): the primary review payload. */
