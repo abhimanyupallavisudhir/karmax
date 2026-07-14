@@ -4024,6 +4024,20 @@ function paramCurrentValue(f, v, rec) {
   if (f.bind === 'prompt') return own.prompt ?? (v.messages || []).find((m) => m.role === 'user')?.text ?? '';
   if (f.name === 'target') return v.targetBranch ?? own.target ?? '';
   if (f.name === 'base') return v.base ?? own.base ?? '';
+  if (f.type === 'agent' && f.role) {
+    // Queued tasks carry the platform's durable queue-time snapshot: this is the
+    // exact effective provider/model the runtime selected, even if defaults later
+    // change. Legacy tasks predate that snapshot; for those, correctly fan the
+    // compact agent:unified form value back out instead of falling through to an
+    // unrelated role default (the old Claude-label-on-a-Codex-task bug).
+    if (v.agents?.[f.role]) return v.agents[f.role];
+    const unified = own['agent:unified'];
+    if (own.separateAgents === false && unified) {
+      if (f.role === 'do') return unified;
+      const { resumeFrom: _resumeFrom, ...shared } = unified;
+      return shared;
+    }
+  }
   return own[f.name];
 }
 function displayParam(f, val) {

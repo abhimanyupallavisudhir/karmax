@@ -170,6 +170,12 @@ describe('in-flight param edits (SPEC §4.5/§5.5)', () => {
     expect(r.applied).toEqual(['target']);
     expect((await view(handle)).targetBranch).toBe('staging');
 
+    // A workflow-accepted agent retune updates the platform's effective-agent
+    // snapshot too, so the task page cannot keep showing the queue-time model.
+    const tuned = await h.api.updateParams(token, task.id, { 'agent:do': { provider: 'mock', model: 'mock-next', effort: 'high' } });
+    expect(tuned.applied).toEqual(['agent:do']);
+    expect((await h.api.getTaskView(token, task.id, { live: true }))?.agents?.do).toEqual({ provider: 'mock', model: 'mock-next', effort: 'high' });
+
     // a frozen field throws with a readable reason (the gateway maps this to 409)
     await expect(h.api.updateParams(token, task.id, { prompt: 'redirect me' })).rejects.toThrow(/edited now|frozen/i);
 

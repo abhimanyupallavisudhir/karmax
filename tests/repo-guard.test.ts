@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
+import { RESOLVE_AGENT_ENABLED } from '../src/config/features.js';
 
 /**
  * The empty-repo guard. A repo-oriented workflow (its manifest declares a `repos`
@@ -64,6 +65,38 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(task.workflow).toBe('software-dev');
     expect(started).toHaveLength(1); // guard passed → workflow started
     expect((started[0]![1] as any).args[0].resolveAgentEnabled).toBe(false);
+  });
+
+  it('snapshots and reports the exact unified Codex selection for every enabled runtime role', async () => {
+    const p = store.createProject('Codex', { repos: ['/some/repo'] });
+    const selected = { provider: 'codex' as const, model: 'gpt-5.6-sol', effort: 'high' as const };
+    const task = await api.createTask(token, {
+      projectId: p.id,
+      workflow: 'software-dev',
+      prompt: 'x',
+      params: { separateAgents: false, 'agent:unified': selected },
+    });
+
+    const expected = { do: selected, merge: selected, ...(RESOLVE_AGENT_ENABLED ? { resolve: selected } : {}) };
+    const input = startedInput();
+    expect(input.agents).toEqual(expected);
+
+    // Workflows intentionally do not publish execution metadata (their histories
+    // are immutable); the platform enriches any stored/live view with its durable
+    // queue-time snapshot instead.
+    store.saveView(task.id, {
+      taskId: task.id,
+      title: task.title,
+      workflow: task.workflow,
+      stage: 'setup',
+      status: 'active',
+      messages: [],
+      actions: [],
+      state: {},
+      updatedAt: 1,
+    });
+    const view = await api.getTaskView(token, task.id);
+    expect(view?.agents).toEqual(expected);
   });
 
   it('lets a draft be saved without a repo, but blocks queueing it', async () => {

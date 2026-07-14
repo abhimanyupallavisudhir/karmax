@@ -516,6 +516,10 @@ export interface TaskView {
    * stage (SPEC §5.5). Roles with no turns yet are omitted.
    */
   transcripts?: { role: string; label: string; messages: Message[] }[];
+  /** Queue-time effective agent selection per role. Added by the platform from
+   * its durable execution snapshot, so the UI never has to guess from mutable
+   * defaults or from the compact `agent:unified` form representation. */
+  agents?: Record<string, AgentSpec>;
   reviewInfo?: ReviewInfo;
   actions: DeclaredAction[];
   /** Mandatory structured state — keeps search/audit/auto-render working (§10.2). */
