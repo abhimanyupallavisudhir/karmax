@@ -234,6 +234,7 @@ describe('fieldCatalogue', () => {
     const status = cat.find((f) => f.key === 'status')!;
     expect(status.groupable).toBe(true);
     expect(status.options?.map((o) => o.value)).toContain('active');
+    expect(cat.find((f) => f.key === 'stage')!.options?.map((o) => o.value)).not.toContain('resolve');
     expect(cat.find((f) => f.key === 'title')!.sortable).toBe(true);
   });
 

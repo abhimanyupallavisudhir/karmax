@@ -9,10 +9,12 @@ import { createPlatformMcpServer, httpOps } from '../platform/mcp.js';
  * session — so the same permission checks apply.
  *
  * Auth (in priority order):
- *   1. KARMAX_TOKEN            — a session id injected by karmax at agent spawn.
- *   2. GET  /api/session       — an unauthenticated session when no password is set
- *                                (the same thing the web console does on load).
- *   3. POST /api/login         — with KARMAX_PASSWORD, when a password IS set.
+ *   1. KARMAX_TOKEN — the short-lived, task-scoped token injected by karmax.
+ *   2. The legacy single-user gateway handshake, retained for embedders/tests
+ *      that construct a Gateway without the production identity service.
+ * Production Better Auth browser sessions are HttpOnly cookies and are never
+ * converted into a full-power MCP bearer. A manually launched CLI must receive
+ * an explicitly minted KARMAX_TOKEN.
  *
  * We DO NOT exit when no token can be resolved: a bare `process.exit(1)` at
  * startup kills the stdio transport mid-handshake, which the Claude CLI reports
@@ -20,12 +22,12 @@ import { createPlatformMcpServer, httpOps } from '../platform/mcp.js';
  * Instead we always complete the MCP handshake; if auth is unavailable, individual
  * tool calls surface a clear `unauthorized` error while the connection stays up.
  *
- *   env: KARMAX_GATEWAY_URL (default http://localhost:4505), KARMAX_TOKEN, KARMAX_PASSWORD
+ *   env: KARMAX_GATEWAY_URL (default http://localhost:4505), KARMAX_TOKEN
  */
 const DEFAULT_GATEWAY_URL = 'http://localhost:4505';
 
-/** Resolve a gateway Bearer (a session id). Returns undefined if none can be
- *  obtained (gateway unreachable, or a password is required but none is set). */
+/** Resolve a gateway bearer. Returns undefined when the bridge was not spawned
+ * by karmax (or when only production cookie authentication is available). */
 export async function resolveGatewayToken(baseUrl: string): Promise<string | undefined> {
   const injected = process.env.KARMAX_TOKEN;
   if (injected) return injected;

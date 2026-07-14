@@ -2,6 +2,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
 import { taskStatus } from '../domain/search.js';
+import { PLATFORM_API_CATALOG } from './catalog.js';
+import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 /**
  * The platform MCP server (SPEC §3.4) — the single API agents use to act on the
@@ -23,6 +25,13 @@ export interface PlatformOps {
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
   proposeWorkflowEdit(a: { projectId: string; title: string; repo: string; branch: string; target: string }): Promise<{ id: string }>;
+  findTask(projectId: string, num: number): Promise<unknown>;
+  listAgents(taskId: string): Promise<unknown>;
+  getConversation(taskId: string, role?: string): Promise<unknown>;
+  forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<{ id: string }>;
+  listEvents(taskId: string, since?: number): Promise<unknown>;
+  /** Complete escape hatch for the documented gateway API; still authz checked. */
+  platformRequest(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<unknown>;
 }
 
 /** The compact task projection agents get back from search (ids + the human-facing bits). */
@@ -91,6 +100,12 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
     proposeWorkflowEdit: (a) => api.proposeWorkflowEdit(getToken(), a),
+    findTask: (pid, num) => api.findTask(getToken(), pid, num),
+    listAgents: (id) => api.listTaskAgents(getToken(), id),
+    getConversation: (id, role) => api.taskConversation(getToken(), id, role),
+    forkAgent: (a) => api.forkTaskAgent(getToken(), a),
+    listEvents: (id, since) => api.taskEvents(getToken(), id, since),
+    platformRequest: async () => { throw new Error('generic administration requires the gateway-backed platform MCP'); },
   };
 }
 
@@ -106,6 +121,8 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
   const resolve = typeof token === 'string' ? async () => token : token;
   let cached: string | undefined = typeof token === 'string' ? token : undefined;
   const req = async (path: string, init: RequestInit = {}, reauth = true): Promise<unknown> => {
+    if (!path.startsWith('/api/') || path.startsWith('/api/login') || path.startsWith('/api/setup') || path.startsWith('/api/signup') || path.startsWith('/api/session'))
+      throw new Error('platform path must be an authenticated /api/* endpoint');
     if (cached === undefined) cached = await resolve();
     const res = await fetch(`${baseUrl}${path}`, {
       ...init,
@@ -136,6 +153,12 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     reorderQueue: async (domain, taskId) => void (await req(`/api/queue/prioritize`, { method: 'POST', body: JSON.stringify({ domain, taskId }) })),
     saveSkill: (a) => req(`/api/skills`, { method: 'POST', body: JSON.stringify(a) }),
     proposeWorkflowEdit: (a) => req(`/api/projects/${a.projectId}/propose-workflow-edit`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
+    findTask: (pid, num) => req(`/api/projects/${pid}/tasks/by-num/${num}`),
+    listAgents: (id) => req(`/api/tasks/${id}/agents`),
+    getConversation: (id, role) => req(`/api/tasks/${id}/conversation${role ? `?role=${encodeURIComponent(role)}` : ''}`),
+    forkAgent: (a) => req(`/api/tasks/${a.taskId}/fork-agent`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
+    listEvents: (id, since = 0) => req(`/api/tasks/${id}/events?since=${since}`),
+    platformRequest: (method, path, body) => req(path, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }),
   };
 }
 
@@ -156,6 +179,44 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'create_task',
     { description: 'Create a new task on a project task list.', inputSchema: { projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional() } },
     async (a) => wrap(async () => (await ops.createTask(a)).id),
+  );
+  server.registerTool(
+    'find_task',
+    { description: 'Find a task by its project and human-facing project-local number (for example projectId + #100).', inputSchema: { projectId: z.string(), number: z.number().int().positive() } },
+    async (a) => wrap(() => ops.findTask(a.projectId, a.number)),
+  );
+  server.registerTool('list_agents', { description: 'Discover every agent role/session attached to a task and its conversation size.', inputSchema: { taskId: z.string() } }, async (a) => wrap(() => ops.listAgents(a.taskId)));
+  server.registerTool(
+    'get_conversation',
+    { description: 'Read the durable message history for one agent attached to a task (do, merge, resolve, or confirm).', inputSchema: { taskId: z.string(), role: z.string().default('do') } },
+    async (a) => wrap(() => ops.getConversation(a.taskId, a.role)),
+  );
+  server.registerTool(
+    'fork_agent',
+    {
+      description: 'Branch an attached agent into a new independent task and native provider session, preserving the source. Use message_agent for later back-and-forth with the fork.',
+      inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string(), title: z.string().optional(), authorizationProfile: z.string().optional() },
+    },
+    async (a) => wrap(async () => (await ops.forkAgent(a)).id),
+  );
+  server.registerTool(
+    'message_agent',
+    { description: 'Send a follow-up into an attached agent conversation. This works for original or forked tasks and is delivered live when that agent is running.', inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string() } },
+    async (a) => wrap(async () => { await ops.signalTask(a.taskId, 'followUp', a.message, a.role); return 'message delivered'; }),
+  );
+  server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(() => ops.listEvents(a.taskId, a.since)));
+  server.registerTool(
+    'describe_platform',
+    { description: 'Describe the complete administrative API available through platform_request.', inputSchema: {} },
+    async () => wrap(async () => PLATFORM_API_CATALOG),
+  );
+  server.registerTool(
+    'platform_request',
+    {
+      description: 'Call any authenticated karmax gateway API operation, including project/account/payment/settings/user/safe-mode/review administration. Call describe_platform first when unsure. This never bypasses authorization.',
+      inputSchema: { method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']), path: z.string().startsWith('/api/'), body: z.unknown().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest(a.method, a.path, a.body)),
   );
   server.registerTool('get_task', { description: "Get a task's current view-model.", inputSchema: { taskId: z.string() } }, async (a) => wrap(() => ops.getTask(a.taskId)));
   server.registerTool('list_tasks', { description: 'List tasks in a project.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTasks(a.projectId)));
@@ -195,7 +256,15 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   );
   server.registerTool(
     'signal_task',
-    { description: 'Send a signal to a task (confirm, cancel, retry, or followUp with text). For a followUp, `role` optionally addresses a specific agent (do/merge/resolve); it defaults to the Do agent.', inputSchema: { taskId: z.string(), signal: z.enum(['confirm', 'cancel', 'retry', 'followUp']), text: z.string().optional(), role: z.enum(['do', 'merge', 'resolve']).optional() } },
+    {
+      description: `Send a signal to a task (confirm, cancel, retry, or followUp with text). For a followUp, \`role\` optionally addresses the ${RESOLVE_AGENT_ENABLED ? 'Do, Merge, or Resolve' : 'Do or Merge'} agent; it defaults to the Do agent.`,
+      inputSchema: {
+        taskId: z.string(),
+        signal: z.enum(['confirm', 'cancel', 'retry', 'followUp']),
+        text: z.string().optional(),
+        role: z.enum(RESOLVE_AGENT_ENABLED ? ['do', 'merge', 'resolve'] : ['do', 'merge']).optional(),
+      },
+    },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role); return 'signalled'; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));

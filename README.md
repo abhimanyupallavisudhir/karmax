@@ -95,7 +95,7 @@ OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
 - `npm run reset` wipes Temporal's durable state + karmax local state. Use it if
   the dev server wedges after you edit workflow code (running singletons replay
   old history against new code). Worlds/worktrees are preserved.
-- Set `KARMAX_PASSWORD` to require login. **Never** expose karmax on a naked
-  public tunnel — it can drive agents and move money. Keep it behind Tailscale,
-  or Cloudflare Access, and behind karmax's own auth (defense in depth).
+- First boot asks you to create the administrator account; every later browser
+  session uses Better Auth login. **Never** expose karmax on a naked public
+  tunnel — keep it behind Tailscale or Cloudflare Access as defense in depth.
 - `KARMAX_HOME` overrides the data home (default `~/.karmax`).

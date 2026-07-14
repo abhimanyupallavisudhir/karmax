@@ -23,6 +23,8 @@ import { Gateway } from './gateway/server.js';
 import { remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
 import { registerAppInstance } from './util/instance.js';
+import { AuthorizationService } from './platform/authorization.js';
+import { IdentityService } from './auth/identity.js';
 
 const VERSION = '1.0.0';
 
@@ -72,6 +74,14 @@ async function main() {
 
   // ── Core services ──
   const store = new Store(path.join(p.state, 'karmax.db'));
+  const authorization = new AuthorizationService(store);
+  const identity = await IdentityService.open(path.join(p.state, 'auth.db'), {
+    secret: process.env.KARMAX_AUTH_SECRET,
+    baseURL: {
+      allowedHosts: (process.env.KARMAX_AUTH_HOSTS ?? '127.0.0.1,localhost,*.ts.net').split(',').map((x) => x.trim()).filter(Boolean),
+      fallback: `http://127.0.0.1:${process.env.KARMAX_PORT ?? 4505}`,
+    },
+  });
   const worlds = new WorldRegistry();
   worlds.register(new WorktreeProvider(p.worlds));
   const adapters = buildAdapters();
@@ -149,7 +159,7 @@ async function main() {
   // worker once so their tasks — new and in-flight — can run after a restart.
   const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows });
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows, authorization, defaultAgentProvider: provider });
 
   // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
   // dependency completes, a schedule fires, or a matching event occurs. Runs
@@ -212,14 +222,18 @@ async function main() {
     configHomes,
     password: process.env.KARMAX_PASSWORD,
     version: VERSION,
+    identity,
+    authorization,
   });
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
   const { url, port, close: closeGateway } = await gateway.listen(preferred);
+  // Activities read this lazily when an agent invokes the complete platform API.
+  process.env.KARMAX_GATEWAY_URL = url;
 
   console.log(`\n  ✓ karmax is running:  ${url}\n`);
-  if (!process.env.KARMAX_PASSWORD) console.log('  (single-user localhost mode — set KARMAX_PASSWORD to require login)');
+  if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
   try {
-    const remote = await remoteAccessPlan(port, { hasPassword: !!process.env.KARMAX_PASSWORD });
+    const remote = await remoteAccessPlan(port, { hasPassword: true });
     console.log(`\n  Remote access (${remote.method}):\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
   } catch {
     /* ignore */

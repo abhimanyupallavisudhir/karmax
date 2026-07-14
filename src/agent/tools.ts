@@ -1,6 +1,7 @@
 import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
+import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 
 /** Provider-neutral tool descriptor (mapped to OpenAI / MCP shapes per adapter). */
 export interface ToolSchema {
@@ -147,6 +148,50 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'find_task',
+    description: 'Find a task by project id and human-facing project-local number (#100).',
+    parameters: { type: 'object', properties: { project_id: { type: 'string' }, number: { type: 'number' } }, required: ['project_id', 'number'] },
+  },
+  {
+    name: 'list_agents',
+    description: 'Discover the agent roles/sessions attached to a task.',
+    parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'get_conversation',
+    description: 'Read one attached agent conversation (do, merge, resolve, or confirm).',
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'fork_agent',
+    description: 'Branch an attached agent into an independent new task/session. The source remains untouched.',
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, title: { type: 'string' }, message: { type: 'string' }, authorization_profile: { type: 'string' } }, required: ['task_id', 'message'] },
+  },
+  {
+    name: 'message_agent',
+    description: 'Send a follow-up to an original or forked task agent; it is injected live when running.',
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, message: { type: 'string' } }, required: ['task_id', 'message'] },
+  },
+  {
+    name: 'list_events',
+    description: 'Read durable karmax events for a task after an optional sequence number.',
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, since: { type: 'number' } }, required: ['task_id'] },
+  },
+  {
+    name: 'describe_platform',
+    description: 'Describe the complete administrative API exposed by platform_request.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'platform_request',
+    description: 'Call any authenticated karmax /api/* route (projects, settings, users, credentials, payments, review actions, diagnostics, safe mode, and more). Authorization is always enforced. Call describe_platform when unsure.',
+    parameters: {
+      type: 'object',
+      properties: { method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] }, path: { type: 'string' }, body: { type: 'object' } },
+      required: ['method', 'path'],
+    },
+  },
+  {
     name: 'signal_completion',
     description: 'Optionally attach a structured completion summary. A successful provider turn already establishes completion; this tool is not required.',
     parameters: {
@@ -200,6 +245,10 @@ export function platformToolHandlers(
   world: World,
   ctx: PlatformToolContext,
 ): Record<string, (args: any) => Promise<string>> {
+  const platformRequest = (method: string, requestPath: string, body?: unknown) => {
+    if (!ctx.platformRequest) throw new Error('karmax gateway is unavailable to this agent');
+    return ctx.platformRequest(method, requestPath, body);
+  };
   return {
     async bash(args) {
       const cmd = String(args?.command ?? '');
@@ -268,6 +317,41 @@ export function platformToolHandlers(
         why: args?.why ? String(args.why) : undefined,
       });
       return JSON.stringify(r);
+    },
+    async find_task(args) {
+      return JSON.stringify(await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tasks/by-num/${Number(args?.number)}`));
+    },
+    async list_agents(args) {
+      return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/agents`));
+    },
+    async get_conversation(args) {
+      const role = encodeURIComponent(String(args?.role ?? 'do'));
+      return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/conversation?role=${role}`));
+    },
+    async fork_agent(args) {
+      const taskId = encodeURIComponent(String(args?.task_id ?? ''));
+      return JSON.stringify(await platformRequest('POST', `/api/tasks/${taskId}/fork-agent`, {
+        role: args?.role ?? 'do', title: args?.title, message: args?.message,
+        authorizationProfile: args?.authorization_profile,
+      }));
+    },
+    async message_agent(args) {
+      const taskId = encodeURIComponent(String(args?.task_id ?? ''));
+      await platformRequest('POST', `/api/tasks/${taskId}/signal`, { signal: 'followUp', role: args?.role ?? 'do', text: args?.message });
+      return 'message delivered';
+    },
+    async list_events(args) {
+      return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/events?since=${Number(args?.since ?? 0)}`));
+    },
+    async describe_platform() {
+      return JSON.stringify(PLATFORM_API_CATALOG);
+    },
+    async platform_request(args) {
+      const method = String(args?.method ?? 'GET').toUpperCase();
+      const requestPath = String(args?.path ?? '');
+      if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) return 'error: invalid method';
+      if (!requestPath.startsWith('/api/') || requestPath.startsWith('/api/login') || requestPath.startsWith('/api/setup')) return 'error: authenticated /api/* path required';
+      return JSON.stringify(await platformRequest(method, requestPath, args?.body));
     },
     async signal_completion(args) {
       ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);

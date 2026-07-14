@@ -20,8 +20,7 @@ import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED } from '../coordinators/names.js
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { classifyLimitError } from '../agent/limits.js';
-import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
+import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS } from './failures.js';
 import {
   TaskInput,
   TaskView,
@@ -196,7 +195,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   const msgs: Message[] = recovery
     ? recovery.messages.map((m) => ({ ...m }))
     : input.prompt || input.images?.length
-      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}) }]
       : [];
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';
@@ -239,8 +238,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   let mergeGranted = false;
   let seen = recovery?.seen ?? 0; // messages the Do agent has already processed
   // Per-role transcripts surfaced in the view-model (SPEC §5.5): the Do agent's
-  // conversation is `msgs`; the merge/resolve agents run on their own message
-  // arrays whose input+output we accumulate here so all three are inspectable.
+  // conversation is `msgs`; auxiliary agents run on their own message arrays.
+  // `resolveMsgs` remains only for historical executions created before the
+  // process-wide Resolve-agent flag was disabled.
   const recoveredTranscript = (role: string): Message[] =>
     recovery?.transcripts?.find((t) => t.role === role)?.messages.map((m) => ({ ...m })) ?? [];
   const mergeMsgs: Message[] = recoveredTranscript('merge');
@@ -271,7 +271,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   // (e.g. a Do follow-up, a merge retry, or the next resolve attempt).
   const liveInput: SoftwareDevInput = { ...input, agents: { ...(input.agents ?? {}) } };
   // Params the workflow has already consumed (value now load-bearing). `target` is
-  // consumed once locked (PR open / merge enqueue); a merge/resolve agent's IDENTITY
+  // consumed once locked (PR open / merge enqueue); an auxiliary agent's IDENTITY
   // (provider/session) once its turn runs — its model/effort stay retunable after.
   const consumed = new Set<string>();
   const isConsumed = (name: string): boolean => (name === 'target' ? targetLocked : consumed.has(name));
@@ -283,7 +283,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   const agentRoleOf = (name: string): string | undefined => (name.startsWith('agent:') ? name.slice('agent:'.length) : undefined);
   /** Whether a role's IDENTITY (provider / resumed session) may still be swapped now.
    *  The Do agent runs on a live resumable session from turn one, so its identity is
-   *  frozen in-flight; merge/resolve can be swapped until their own turn runs. Model
+   *  frozen in-flight; auxiliary agents can be swapped until their own turn runs. Model
    *  and effort are NOT gated here — they retune whenever `paramEditable` allows. */
   const agentIdentityEditable = (role: string): boolean =>
     role !== 'do' && paramEditable(`agent:${role}`) && !isConsumed(`agent:${role}`);
@@ -494,7 +494,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     // next turn (each turn is fed its own accumulated transcript). A turn currently
     // running polls `pendingMessagesQuery` and injects it live (in-flight).
     const target = conversationFor(role);
-    target.push({ ...m, ts: target.length });
+    target.push({ ...m, ts: m.ts || target.length });
   });
   setHandler(confirmSignal, () => {
     confirmed = true;
@@ -586,22 +586,26 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
           }
           lastError = describeError(err);
           error = lastError;
+          const providerLimit = limitFailureClassification(err);
           const prevStage = stage;
           // v1 command order is recorded in existing histories: publish Resolve,
           // then invoke autoResolve. The improved no-flicker order belongs to the
           // distinct v1.1 Temporal type and must never rewrite v1 replay.
           let auto;
-          if (behaviorVersion === '1.0.0') {
+          if (behaviorVersion === '1.0.0' && input.resolveAgentEnabled !== false) {
             stage = 'resolve';
             await publish();
-            auto = await core.autoResolve({ taskId, stage: stageName, error });
+            auto = await core.autoResolve({ taskId, stage: stageName, error, ...(providerLimit ? { limit: providerLimit } : {}) });
           } else {
-            auto = await core.autoResolve({ taskId, stage: stageName, error });
+            auto = await core.autoResolve({ taskId, stage: stageName, error, ...(providerLimit ? { limit: providerLimit } : {}) });
             if (auto.resolved) {
               log.info('auto-resolve matched', { stage: stageName, action: auto.action, note: auto.note });
               error = undefined;
               continue;
             }
+            // Scripted recovery missed. With the process-wide Resolve-agent flag
+            // off, go directly to the existing parent/human escalation path.
+            if (input.resolveAgentEnabled === false) break;
             stage = 'resolve';
             await publish();
           }
@@ -809,10 +813,10 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       // credential: a transient window arms a refresh timer; a HARD billing/auth
       // failure is flagged needs-attention (won't self-refresh → a human must act).
       if (grant && !passthrough && !cancelled && !isCancellation(err)) {
-        const cls = classifyLimitError(describeError(err));
-        if (cls.hard) {
+        const cls = limitFailureClassification(err);
+        if (cls?.hard) {
           await coord.setAccountAvailability({ accountId: grant.accountId, status: 'needs-attention' }).catch(() => undefined);
-        } else if (cls.limited) {
+        } else if (cls?.limited) {
           await coord
             .reportAccountExhausted({ accountId: grant.accountId, window: cls.window ?? '5h', resetHint: cls.resetHint, note: cls.note })
             .catch(() => undefined);
@@ -992,6 +996,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
         target: world!.branch,
         project: input.project,
         profiles: input.profiles,
+        resolveAgentEnabled: input.resolveAgentEnabled,
         // Branch-scoped, least-privilege grant for the child (SPEC §8.2).
         parentBranch: world!.branch,
         parentGrant: input.grant,
