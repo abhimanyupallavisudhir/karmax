@@ -36,6 +36,9 @@ eval(extractFn('stepMatches'));
 eval(extractFn('chordCandidates'));
 eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
+eval(extractFn('adjacentCheckinPane'));
+eval(extractConst('firstLine').replace('const firstLine =', 'global.firstLine ='));
+eval(extractFn('quickTaskPayload'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
@@ -50,6 +53,7 @@ ok(JSON.stringify(parseKeybinding('Escape')) === JSON.stringify([{ key: 'escape'
 ok(JSON.stringify(parseKeybinding('ArrowDown')) === JSON.stringify([{ key: 'arrowdown' }]), 'arrow key normalizes');
 ok(JSON.stringify(parseKeybinding('?')) === JSON.stringify([{ key: '?' }]), 'shifted punctuation is its own key');
 ok(JSON.stringify(parseKeybinding('[')) === JSON.stringify([{ key: '[' }]), 'bracket binds as a plain key (task-page tab cycling)');
+ok(JSON.stringify(parseKeybinding('}')) === JSON.stringify([{ key: '}' }]), 'brace binds as a plain key (Check-in pane cycling)');
 ok(parseKeybinding('').length === 0, 'empty binding → no steps');
 
 // ── stepMatches ──
@@ -96,6 +100,18 @@ ok(fuzzyScore('ct', 'Confirm task') >= 0, 'subsequence matches');
 ok(fuzzyScore('conf', 'Confirm task') > fuzzyScore('cnf', 'Confirm task'), 'consecutive runs beat scattered letters');
 ok(fuzzyScore('task', 'Confirm task') > 0, 'word-boundary bonus applies');
 ok(fuzzyScore('gq', 'Go to queues') >= 0, 'initials-style query matches');
+
+// ── Check-in sidebar cycling ──
+const panes = ['do', 'merge', 'terminal'];
+ok(adjacentCheckinPane(panes, 'do', 1) === 'merge', 'Check-in moves to the next pane');
+ok(adjacentCheckinPane(panes, 'terminal', 1) === 'do', 'Check-in next wraps to the first pane');
+ok(adjacentCheckinPane(panes, 'do', -1) === 'terminal', 'Check-in previous wraps to the terminal');
+
+// ── Quick-add submission modes ──
+const sent = quickTaskPayload('run it', 'script-exec', [], false);
+const draft = quickTaskPayload('save it', 'software-dev', ['image-1'], true);
+ok(sent.quick === true && sent.command === 'run it' && sent.draft === undefined, 'quick send starts immediately');
+ok(draft.quick === true && draft.draft === true && draft.images[0] === 'image-1', 'quick draft uses the same payload plus draft=true');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
