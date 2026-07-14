@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { allRoles, roleDef, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
-import { makeDefaultProfiles } from '../src/agent/profiles.js';
+import { applyAgentSpec, defaultModel, makeDefaultProfiles } from '../src/agent/profiles.js';
 import { assemblePrompt } from '../src/agent/prompt.js';
 import { autoResolve } from '../src/resolve/cases.js';
 
@@ -48,6 +48,26 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
     expect(merge.role).toBe('merge');
     expect(merge.capabilities).toContain('merge-into:*');
     expect(merge.model).toBeTruthy(); // provider/model resolved at seed time
+  });
+
+  it('resets provider-scoped model and credentials on a per-task provider switch', () => {
+    const switched = applyAgentSpec(
+      profile({
+        provider: 'claude',
+        model: 'claude-opus-4-8',
+        effort: 'high',
+        auth: { kind: 'configHome', configHome: '/claude' },
+        allowedAccounts: ['login:claude:work'],
+      }),
+      { provider: 'codex' },
+    );
+    expect(switched.provider).toBe('codex');
+    expect(switched.model).toBe(defaultModel('codex'));
+    expect(switched.effort).toBeUndefined();
+    expect(switched.auth).toBeUndefined();
+    expect(switched.allowedAccounts).toBeUndefined();
+
+    expect(applyAgentSpec(profile({ model: 'claude-opus-4-8' }), { provider: 'codex', model: 'gpt-5.6-sol' }).model).toBe('gpt-5.6-sol');
   });
 });
 

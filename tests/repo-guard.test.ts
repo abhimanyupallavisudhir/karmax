@@ -65,6 +65,37 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(started).toHaveLength(1); // guard passed → workflow started
   });
 
+  it('snapshots and reports the exact unified Codex selection for every runtime role', async () => {
+    const p = store.createProject('Codex', { repos: ['/some/repo'] });
+    const selected = { provider: 'codex' as const, model: 'gpt-5.6-sol', effort: 'high' as const };
+    const task = await api.createTask(token, {
+      projectId: p.id,
+      workflow: 'software-dev',
+      prompt: 'x',
+      params: { separateAgents: false, 'agent:unified': selected },
+    });
+
+    const input = startedInput();
+    expect(input.agents).toEqual({ do: selected, merge: selected, resolve: selected });
+
+    // Workflows intentionally do not publish execution metadata (their histories
+    // are immutable); the platform enriches any stored/live view with its durable
+    // queue-time snapshot instead.
+    store.saveView(task.id, {
+      taskId: task.id,
+      title: task.title,
+      workflow: task.workflow,
+      stage: 'setup',
+      status: 'active',
+      messages: [],
+      actions: [],
+      state: {},
+      updatedAt: 1,
+    });
+    const view = await api.getTaskView(token, task.id);
+    expect(view?.agents).toEqual({ do: selected, merge: selected, resolve: selected });
+  });
+
   it('lets a draft be saved without a repo, but blocks queueing it', async () => {
     const p = store.createProject('Draft', {});
     const draft = await api.createTask(token, {

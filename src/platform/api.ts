@@ -8,7 +8,7 @@ import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import { mergeQueueId, SIG_PRIORITIZE, SIG_REORDER, MERGE_QUEUE_WORKFLOW } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentSpec, Provider } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -20,7 +20,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
-import { defaultModel, defaultEffort } from '../agent/profiles.js';
+import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -40,6 +40,7 @@ export interface TriggerArmer {
 }
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
+const agentSnapshotKey = (taskId: string) => `task-agents:${taskId}`;
 
 /** Deepest cause message — unwraps Temporal's WorkflowUpdateFailedError → the
  *  validator's ApplicationFailure so the user sees the real "why". */
@@ -315,6 +316,7 @@ export class KarmaxApi {
           `Nothing was queued — check that Temporal is healthy and try again.`,
       );
     }
+    this.saveAgentSnapshot(task.id, manifest, input);
     // These attempts were explicitly requested as part of creation, so start all
     // of them. addAttempt() remains intentionally different: it creates one draft
     // for inspection/editing and never queues it implicitly.
@@ -373,6 +375,78 @@ export class KarmaxApi {
     const { resumeFrom: _resumeFrom, ...shared } = spec;
     resolved['agent:merge'] = shared;
     resolved['agent:resolve'] = shared;
+  }
+
+  /** Capture the exact provider/model/effort selection that the activity runtime
+   * will use for every declared agent role. This is execution metadata, kept in
+   * KV rather than task params: task params remain sparse/inheritable until queue,
+   * while a queued task's UI and audit trail stay pinned to what actually ran. */
+  private effectiveAgents(manifest: WorkflowManifest, input: TaskInput): Record<string, AgentSpec> {
+    const resolver = new ProfileResolver(this.deps.store, defaultProvider().provider);
+    const out: Record<string, AgentSpec> = {};
+    const seen = new Set<string>();
+    for (const field of manifest.params) {
+      if (field.type !== 'agent' || !field.role || seen.has(field.role)) continue;
+      seen.add(field.role);
+      const role = field.role as AgentRole;
+      const selected = input.agents?.[role];
+      const base = resolver.resolve(role, input.profiles, undefined, input.projectId);
+      const profile = applyAgentSpec(base, selected);
+      out[role] = {
+        provider: profile.provider,
+        ...(profile.model ? { model: profile.model } : {}),
+        ...(profile.effort ? { effort: profile.effort } : {}),
+        ...(selected?.resumeFrom ? { resumeFrom: selected.resumeFrom } : {}),
+      };
+    }
+    return out;
+  }
+
+  private saveAgentSnapshot(taskId: string, manifest: WorkflowManifest, input: TaskInput): void {
+    const agents = this.effectiveAgents(manifest, input);
+    if (Object.keys(agents).length) this.deps.store.kvSet(agentSnapshotKey(taskId), JSON.stringify(agents));
+  }
+
+  private readAgentSnapshot(taskId: string): Record<string, AgentSpec> | undefined {
+    const raw = this.deps.store.kvGet(agentSnapshotKey(taskId));
+    if (!raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Keep the execution snapshot aligned with a workflow-accepted in-flight
+   * agent retune. Rejected fields never reach here, so the stored display cannot
+   * claim a change that the running workflow refused. */
+  private updateAgentSnapshot(taskId: string, patch: Record<string, unknown>, applied: string[]): void {
+    const agents = this.readAgentSnapshot(taskId);
+    if (!agents) return; // legacy task: the UI still has the stored-override fallback
+    let changed = false;
+    for (const name of applied) {
+      if (!name.startsWith('agent:')) continue;
+      const role = name.slice('agent:'.length);
+      const raw = patch[name];
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const incoming = raw as Partial<AgentSpec>;
+      const current = agents[role];
+      if (!current) continue;
+      const provider = incoming.provider ?? current.provider;
+      const providerChanged = provider !== current.provider;
+      const model = incoming.model ?? (providerChanged ? defaultModel(provider) : current.model);
+      const effort = incoming.effort ?? (providerChanged ? undefined : current.effort);
+      agents[role] = {
+        provider,
+        ...(model ? { model } : {}),
+        ...(effort ? { effort } : {}),
+        ...(!providerChanged && current.resumeFrom ? { resumeFrom: current.resumeFrom } : {}),
+        ...(incoming.resumeFrom ? { resumeFrom: incoming.resumeFrom } : {}),
+      };
+      changed = true;
+    }
+    if (changed) this.deps.store.kvSet(agentSnapshotKey(taskId), JSON.stringify(agents));
   }
 
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
@@ -498,6 +572,8 @@ export class KarmaxApi {
           `It's still saved as a draft — check that Temporal is healthy and try again.`,
       );
     }
+    const started = this.resolveStart(task.workflow, task.workflowVersion);
+    if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
     return this.deps.store.getTask(taskId)!;
   }
 
@@ -530,6 +606,8 @@ export class KarmaxApi {
       this.deps.store.deleteTask(run.id); // no orphan run row on a wedged engine
       throw e;
     }
+    const started = this.resolveStart(run.workflow, run.workflowVersion);
+    if (started) this.saveAgentSnapshot(run.id, started.manifest, input);
     return run;
   }
 
@@ -560,6 +638,8 @@ export class KarmaxApi {
         this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
         START_TIMEOUT_MS,
       );
+      const started = this.resolveStart(task.workflow, task.workflowVersion);
+      if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
     } catch (e) {
       this.deps.store.updateTaskParams(taskId, { ...(task.params as Record<string, unknown>), triggerState: 'armed' } as any);
       throw e;
@@ -643,18 +723,21 @@ export class KarmaxApi {
   ): Promise<TaskView | undefined> {
     this.require(token, 'get_task');
     const snapshot = () => this.deps.store.getTask(taskId)?.lastView;
-    // Cosmetic human notes live on the record (never on the workflow), so mirror
-    // them onto whichever view we return — the UI shows/edits them at any stage.
-    const withNotes = (view: TaskView | undefined): TaskView | undefined =>
-      view
-        ? {
-            ...view,
-            notes: this.deps.store.getTask(taskId)?.notes,
-            ...(view.status === 'failed' && view.workflow === 'software-dev' && !view.pointOfNoReturnPassed
-              ? { actions: FAILED_RECOVERY_ACTIONS() }
-              : {}),
-          }
-        : view;
+    // Cosmetic notes and the queue-time effective agent snapshot live outside the
+    // workflow history, so mirror both onto whichever view we return. Keeping the
+    // agent snapshot platform-side avoids changing immutable workflow replay payloads.
+    const enrich = (view: TaskView | undefined): TaskView | undefined => {
+      if (!view) return view;
+      const agents = this.readAgentSnapshot(taskId);
+      return {
+        ...view,
+        notes: this.deps.store.getTask(taskId)?.notes,
+        ...(agents ? { agents } : {}),
+        ...(view.status === 'failed' && view.workflow === 'software-dev' && !view.pointOfNoReturnPassed
+          ? { actions: FAILED_RECOVERY_ACTIONS() }
+          : {}),
+      };
+    };
     // Snapshot-first (the default). The workflow persists `lastView` to the store on
     // every change via the `publishView` activity AND pushes a `view.updated` event
     // over the bus/WebSocket in the same call — so the stored snapshot is kept fresh
@@ -675,7 +758,7 @@ export class KarmaxApi {
       this.deps.store.getTask(taskId)?.workflowVersion === '1.0.0' &&
       snap?.waitingFor?.kind === 'account' &&
       !snap.agentTurn;
-    if (snap && !opts?.live && !legacyAccountWait) return withNotes(snap);
+    if (snap && !opts?.live && !legacyAccountWait) return enrich(snap);
     // Live path — bound it: a wedged workflow (e.g. stuck in a workflow-task-failure
     // loop) makes a query hang without rejecting, which would otherwise freeze the
     // caller. Fall back fast to whatever snapshot we have.
@@ -683,9 +766,9 @@ export class KarmaxApi {
       const q = this.deps.client.workflow.getHandle(taskId).query('view') as Promise<TaskView>;
       q.catch(() => undefined); // swallow the late rejection if we time out first
       const view = await withTimeout(q, QUERY_TIMEOUT_MS);
-      return withNotes((view as TaskView) ?? snapshot());
+      return enrich((view as TaskView) ?? snapshot());
     } catch {
-      return withNotes(snapshot());
+      return enrich(snapshot());
     }
   }
 
@@ -953,6 +1036,8 @@ export class KarmaxApi {
       START_TIMEOUT_MS,
     );
     this.deps.store.setTaskWorkflowVersion(taskId, version);
+    const started = this.resolveStart(task.workflow, version);
+    if (started) this.saveAgentSnapshot(taskId, started.manifest, input);
     // Close the short acceptance→first-publish window so the UI cannot offer a
     // second recovery while the replacement run is already starting.
     this.deps.store.saveView(taskId, {
@@ -1055,7 +1140,9 @@ export class KarmaxApi {
   async updateParams(token: string, taskId: string, patch: Record<string, unknown>): Promise<{ applied: string[] }> {
     this.require(token, 'edit_task');
     try {
-      return (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
+      const result = (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
+      this.updateAgentSnapshot(taskId, patch, result.applied);
+      return result;
     } catch (e) {
       throw new Error(unwrapCause(e));
     }
@@ -1129,23 +1216,22 @@ export class KarmaxApi {
       // from `repo@target` once this merge completes (§4.4).
       params: { prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true },
     });
+    const input = {
+      taskId: task.id,
+      projectId: args.projectId,
+      title: args.title,
+      prompt: args.title,
+      branch: args.branch,
+      target: args.target,
+      project: { ...project.config, repos: [args.repo] },
+      workflowEdit: true,
+    } as TaskInput;
     try {
       await withTimeout(
         this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, mergeOnlyVersion), {
           taskQueue: this.deps.taskQueue,
           workflowId: task.id,
-          args: [
-            {
-              taskId: task.id,
-              projectId: args.projectId,
-              title: args.title,
-              prompt: args.title,
-              branch: args.branch,
-              target: args.target,
-              project: { ...project.config, repos: [args.repo] },
-              workflowEdit: true,
-            },
-          ],
+          args: [input],
         }),
         START_TIMEOUT_MS,
       );
@@ -1153,9 +1239,11 @@ export class KarmaxApi {
       this.deps.store.deleteTask(task.id);
       throw new Error(
         `Could not start the workflow-edit task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
-          `Nothing was queued — check that Temporal is healthy and try again.`,
+        `Nothing was queued — check that Temporal is healthy and try again.`,
       );
     }
+    const started = this.resolveStart(task.workflow, task.workflowVersion);
+    if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
     return task;
   }
 

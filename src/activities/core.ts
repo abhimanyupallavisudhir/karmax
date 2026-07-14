@@ -7,7 +7,7 @@ import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
 import { WorldHandle, WorldKind } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
-import { ProfileResolver } from '../agent/profiles.js';
+import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import { AgentAdapter } from '../agent/types.js';
 import { runTurn } from '../agent/runtime.js';
 import { acquireAgentSlot } from './agent-slots.js';
@@ -279,14 +279,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId, args.task.projectId);
       // Apply the per-role agent override from the task form (SPEC §10.5).
       const spec = args.task.agents?.[args.role];
-      const profile = spec
-        ? {
-            ...baseProfile,
-            provider: spec.provider ?? baseProfile.provider,
-            ...(spec.model ? { model: spec.model } : {}),
-            ...(spec.effort ? { effort: spec.effort } : {}),
-          }
-        : baseProfile;
+      const profile = applyAgentSpec(baseProfile, spec);
       const world = await worlds.open(args.worldHandle);
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since

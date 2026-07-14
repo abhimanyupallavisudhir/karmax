@@ -1,4 +1,4 @@
-import { AgentProfile, AgentRole, Provider } from '../domain/types.js';
+import { AgentProfile, AgentRole, AgentSpec, Provider } from '../domain/types.js';
 import { Store } from '../store/db.js';
 import { allRoles } from '../contrib/manifests.js';
 
@@ -34,6 +34,33 @@ export function defaultModel(provider: Provider): string | undefined {
 export function defaultEffort(provider: Provider): string | undefined {
   if (provider === 'codex' || provider === 'claude') return 'medium';
   return undefined;
+}
+
+/** Apply a per-task agent spec without carrying provider-scoped settings across
+ * providers. A profile's model/auth/account allow-list belongs to its provider:
+ * changing Claude → Codex (or vice versa) must not leave the old provider's
+ * model or credentials attached to the new adapter. */
+export function applyAgentSpec(base: AgentProfile, spec?: AgentSpec): AgentProfile {
+  if (!spec) return base;
+  const provider = spec.provider ?? base.provider;
+  const sameProvider = provider === base.provider;
+  const model = spec.model ?? (sameProvider ? base.model : defaultModel(provider));
+  const effort = spec.effort ?? (sameProvider ? base.effort : undefined);
+  const {
+    model: _model,
+    effort: _effort,
+    auth: _auth,
+    allowedAccounts: _allowedAccounts,
+    ...common
+  } = base;
+  return {
+    ...common,
+    provider,
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+    ...(sameProvider && base.auth ? { auth: base.auth } : {}),
+    ...(sameProvider && base.allowedAccounts ? { allowedAccounts: base.allowedAccounts } : {}),
+  };
 }
 
 /** Resolves the profile for a role, honoring explicit/task/default precedence. */
