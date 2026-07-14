@@ -17,6 +17,11 @@ export interface ToolSchema {
 const MAX_OUTPUT = 12_000;
 const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + '\n…(truncated)' : s);
 
+/** Review captions are orientation, not a second place for the agent's final answer. */
+export const MAX_REVIEW_TEXT_LENGTH = 280;
+
+const reviewTextLength = (value: string) => [...value].length;
+
 /**
  * The tools every real agent gets: do real work in the world (bash/read/write)
  * plus the platform tools (SPEC §5.2). signal_completion is an optional structured
@@ -53,11 +58,15 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_review_info',
     description:
-      "Attach click-to-verify affordances for the Review stage — the exact things a human clicks to check your work, NOT a prose summary of what you did (that belongs in your messages). Provide `actions`: each is either a `run` (a shell command executed in the task's world — e.g. start a server or app; set `server: true` for a long-lived process and list `openUrls` to open once it's up) or an `open` (a produced artifact to open: a world-relative file path — PDF, notebook, image, video — or an absolute URL, in `target`). Add a one-line `caption` saying what to verify. The changed-files list is added automatically.",
+      "Optional. Attach click-to-verify affordances only when they are relevant: `run` actions for useful verification commands (including starting an app/server; set `server: true` and use `openUrls` to open it), and `open` actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output and must not be attached as an `open` action. `caption` is optional, at most 280 characters, and says WHAT to verify. Put summaries of changes/answers in your normal response, or in a file only when the task requests one. The changed-files list is added automatically.",
     parameters: {
       type: 'object',
       properties: {
-        caption: { type: 'string', description: 'One line: WHAT to verify (not a narrative of what you did).' },
+        caption: {
+          type: 'string',
+          maxLength: MAX_REVIEW_TEXT_LENGTH,
+          description: 'Optional, at most 280 characters: WHAT to verify (not a summary of what you did).',
+        },
         actions: {
           type: 'array',
           items: {
@@ -68,16 +77,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
               command: { type: 'string', description: 'run: the shell command executed in the world.' },
               server: { type: 'boolean', description: 'run: command is a long-lived server/watcher (stream logs + Stop).' },
               openUrls: { type: 'array', items: { type: 'string' }, description: 'run: URLs to open once it is up.' },
-              target: { type: 'string', description: 'open: a world-relative file path or an absolute URL.' },
+              target: { type: 'string', description: 'open: a human-readable output (not source code), as a world-relative path or absolute URL.' },
             },
             required: ['kind', 'label'],
           },
         },
-        // Legacy free-form fields, still accepted for back-compat.
-        summary: { type: 'string' },
-        links: { type: 'array', items: { type: 'object', properties: { label: { type: 'string' }, url: { type: 'string' } } } },
-        diff: { type: 'string' },
-        html: { type: 'string' },
       },
     },
   },
@@ -270,6 +274,17 @@ export function platformToolHandlers(
       return `wrote ${args?.path}`;
     },
     async create_review_info(args) {
+      // `summary` is no longer advertised, but validate it too for old/resumed
+      // sessions which may still call the legacy shape. Both fields occupy the
+      // same textual orientation slot in Review.
+      for (const field of ['caption', 'summary'] as const) {
+        const value = args?.[field];
+        if (typeof value !== 'string') continue;
+        const length = reviewTextLength(value);
+        if (length > MAX_REVIEW_TEXT_LENGTH) {
+          return `review info rejected: ${field} is ${length} characters; the maximum is ${MAX_REVIEW_TEXT_LENGTH}. Shorten it and retry.`;
+        }
+      }
       ctx.createReviewInfo({
         caption: args?.caption,
         actions: Array.isArray(args?.actions) ? args.actions : undefined,

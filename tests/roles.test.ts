@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { allRoles, roleDef, manifest, agentMcpToConfig, WorkflowManifest } from '../src/contrib/manifests.js';
 import { applyAgentSpec, defaultModel, makeDefaultProfiles } from '../src/agent/profiles.js';
 import { assemblePrompt } from '../src/agent/prompt.js';
+import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
 import { autoResolve } from '../src/resolve/cases.js';
 
 const world = { id: 'w', root: '/tmp/w', branch: 'karmax/t', base: 'main', target: 'main' } as any;
@@ -153,6 +154,16 @@ describe('prompt preamble (SPEC §5.4)', () => {
   it('uses the platform preamble when the workflow declares no override', () => {
     const out = assemblePrompt({ profile: profile(), role: 'do', task: { ...task, workflow: 'software-dev' } as any, world });
     expect(out).toContain('running inside karmax'); // platform TOOLS_PREAMBLE
+    expect(out).toMatch(/create_review_info.*optional/i);
+    expect(out).toContain('limited to 280 characters');
+    expect(out).toContain('Source code is not a human-readable output');
     expect(manifest('software-dev')!.promptPreamble).toBeUndefined();
+  });
+
+  it('repeats the optional, verification-only review guidance in global instructions', () => {
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/Review info is optional/i);
+    expect(GLOBAL_INSTRUCTIONS).toContain('at most 280 characters');
+    expect(GLOBAL_INSTRUCTIONS).toContain('Source code is not a human-readable output');
+    expect(GLOBAL_INSTRUCTIONS).toMatch(/summaries of changes\/answers in your final response/i);
   });
 });

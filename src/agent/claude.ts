@@ -645,6 +645,14 @@ function jsonPropToZod(zod: any, prop: any): any {
       default:
         base = zod.string();
     }
+  // JSON Schema measures maxLength in Unicode code points, while Zod's `.max()`
+  // currently uses JavaScript UTF-16 code units. Refine explicitly so the SDK
+  // path agrees with the provider schemas and the shared tool handler.
+  if (prop?.type === 'string' && Number.isInteger(prop?.maxLength)) {
+    base = base.refine((value: string) => [...value].length <= prop.maxLength, {
+      message: `Too big: expected string to have <=${prop.maxLength} characters`,
+    });
+  }
   if (typeof prop?.description === 'string') base = base.describe(prop.description);
   return base;
 }

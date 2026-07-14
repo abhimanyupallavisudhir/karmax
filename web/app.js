@@ -6,6 +6,16 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Small, code-native icons used by icon-only controls. Keeping them inline makes
+// the no-build-step console self-contained while still giving every button a
+// proper text alternative through its aria-label/title.
+const ICON = {
+  draft: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="m9 17 1.5-.3 5.2-5.2a1.4 1.4 0 0 0-2-2l-5.2 5.2L8 17z"/></svg>',
+  more: '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
+  send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+};
+
 const S = {
   token: null,
   meta: null,
@@ -1526,8 +1536,9 @@ function tasksView() {
     <div class="composer">
       <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
-      <button class="btn" id="expand-task" title="Full task form ( N or ↵ )">⋯ More</button>
-      <button class="btn primary" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )">Add</button>
+      <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.draft}</button>
+      <button class="btn icon-only" id="expand-task" title="More fields ( N or ↵ )" aria-label="More fields">${ICON.more}</button>
+      <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
     <div class="img-chips" id="new-task-chips" style="display:none"></div>
     <div class="organizer">
@@ -2152,41 +2163,37 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-unarchive]').forEach((b) =>
     b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.unarchive, false); }),
   );
-  const add = async () => {
+  const add = async (draft = false) => {
     const input = $('#new-task');
     const title = input.value.trim();
     const images = S.newTaskImages || [];
     if (!title && !images.length) return;
     const workflow = $('#new-wf').value;
-    input.value = '';
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify({
-          title: firstLine(title || 'Image task'),
-          prompt: title,
-          command: workflow === 'script-exec' ? title : undefined,
-          workflow,
-          // Added from the quick box → apply the Quick task defaults overlay (SPEC §10.4).
-          quick: true,
-          ...(images.length ? { images } : {}),
-        }),
+        body: JSON.stringify(quickTaskPayload(title, workflow, images, draft)),
       });
+      input.value = '';
       S.newTaskImages = [];
       renderImageChips($('#new-task-chips'), S.newTaskImages);
-      toast('Task created');
+      toast(draft ? 'Draft saved' : 'Task created');
       await refreshTasks();
     } catch (e) {
       toast(e.message, true);
     }
   };
-  $('#add-task')?.addEventListener('click', add);
+  $('#draft-task')?.addEventListener('click', () => add(true));
+  $('#add-task')?.addEventListener('click', () => add(false));
   // Enter opens the FULL form (carrying the typed text into its prompt field) so
-  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly.
+  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly;
+  // Alt+Enter saves it as an editable draft.
   $('#new-task')?.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter') return;
+    const mode = quickTaskSubmitMode(e);
+    if (!mode) return;
     e.preventDefault();
-    if (e.metaKey || e.ctrlKey) add();
+    if (mode === 'draft') add(true);
+    else if (mode === 'add') add(false);
     else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
   });
   // Paste / drag-drop an image into the quick-add box to attach it (SPEC — image prompts).
@@ -2201,6 +2208,29 @@ function wireTasksView() {
   $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
+
+// Keyboard modes for the quick composer. Keep this separate from the event
+// listener so the shortcut behavior stays easy to verify without a browser.
+function quickTaskSubmitMode(e) {
+  if (e.key !== 'Enter') return null;
+  if (e.altKey) return 'draft';
+  if (e.metaKey || e.ctrlKey) return 'add';
+  return 'form';
+}
+
+// The quick composer has two submission modes (start now / save draft), but both
+// must use the exact same sparse quick-defaults payload.
+function quickTaskPayload(title, workflow, images, draft = false) {
+  return {
+    title: firstLine(title || 'Image task'),
+    prompt: title,
+    command: workflow === 'script-exec' ? title : undefined,
+    workflow,
+    quick: true,
+    ...(draft ? { draft: true } : {}),
+    ...(images.length ? { images } : {}),
+  };
+}
 
 // The task-scope field that consumes the quick-add "Describe a task" text: the
 // workflow's prompt field, else its primary required text/string input (e.g.
@@ -3612,6 +3642,36 @@ function checkinSelection(v) {
   return liveRoleFor(v);
 }
 
+// Return the adjacent sidebar key with wraparound. Kept pure so the keyboard
+// navigation behavior is easy to verify independently of rendering.
+function adjacentCheckinPane(panes, current, delta) {
+  if (!panes.length) return null;
+  const i = panes.indexOf(current);
+  const at = i < 0 ? (delta > 0 ? -1 : 0) : i;
+  return panes[(at + delta + panes.length) % panes.length];
+}
+
+function selectCheckinPane(v, key, openShell = false) {
+  if (!key) return;
+  const changed = key !== checkinSelection(v);
+  S.checkinSel = key;
+  if (changed) renderTaskPage();
+  // Selecting the sidebar's "Open terminal" action is deliberately enough to
+  // start the PTY; no second click inside the terminal pane is required.
+  if (openShell && key === 'terminal' && v.worldPath && !termIsOpenFor(v.taskId)) {
+    document.getElementById('ck-term-hint')?.remove();
+    openTerminal(v.taskId);
+  }
+}
+
+function cycleCheckinPane(delta) {
+  const v = S.view;
+  if (!v || S.taskTab !== 'checkin') return;
+  const panes = [...taskTranscripts(v).map((t) => t.role), 'terminal'];
+  const key = adjacentCheckinPane(panes, checkinSelection(v), delta);
+  selectCheckinPane(v, key, key === 'terminal');
+}
+
 function checkinTab(v) {
   const transcripts = taskTranscripts(v);
   const sel = checkinSelection(v);
@@ -3628,9 +3688,12 @@ function checkinTab(v) {
       <div class="ck-side-h">Agents</div>
       ${items}
       <div class="ck-side-h">Shell</div>
-      <div class="ck-item ${sel === 'terminal' ? 'sel' : ''}" data-checkin="terminal" id="ck-term-item">
-        <span class="ck-name">Terminal</span>
-        <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
+      <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
+        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${v.worldPath ? '' : 'disabled'} title="${v.worldPath ? 'Open a terminal in this task world' : 'No world yet'}">
+          <span class="ck-name">${v.worldPath ? 'Open terminal' : 'No world yet'}</span>
+          <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
+        </button>
+        ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
       </div>
     </div>
     <div class="ck-pane">${sel === 'terminal' ? terminalPane(v) : conversationPane(v, transcripts.find((t) => t.role === sel))}</div>
@@ -3798,9 +3861,7 @@ function terminalPane(v) {
 function wireCheckinSidebar(v) {
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
     el.addEventListener('click', () => {
-      if (el.dataset.checkin === checkinSelection(v)) return;
-      S.checkinSel = el.dataset.checkin;
-      renderTaskPage();
+      selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
   $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
@@ -4043,9 +4104,9 @@ function wireCopyButtons() {
       e.preventDefault();
       e.stopPropagation();
       copyToClipboard(btn.dataset.cmd || '').then(() => {
-        const prev = btn.textContent;
-        btn.textContent = '✓ copied';
-        setTimeout(() => { btn.textContent = prev; }, 1200);
+        const prev = btn.innerHTML;
+        btn.textContent = btn.dataset.copyIcon === '1' ? '✓' : '✓ copied';
+        setTimeout(() => { btn.innerHTML = prev; }, 1200);
       });
     });
   });
@@ -6213,6 +6274,8 @@ function allCommands() {
   add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
   add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
+  add({ id: 'task.checkin.prev', title: 'Previous Check-in pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
+  add({ id: 'task.checkin.next', title: 'Next Check-in pane', keybinding: '}', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(1) });
   // Workflow-contributed task commands: `task.<action>` binds to the selected
   // task's DECLARED action of that name — available only when the selected
   // task runs the contributing workflow and the action is currently enabled.
@@ -6491,6 +6554,7 @@ function openHelp() {
       <div class="section-h">On a task page</div>
       ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
       ${row('[ / ]', 'Previous / next tab')}
+      ${row('{ / }', 'Previous / next Check-in pane')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
       ${row('Esc', 'Close the topmost panel / leave a text field')}
