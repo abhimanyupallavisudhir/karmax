@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { CodexAdapter } from '../src/agent/codex.js';
+import { ProviderFailure } from '../src/agent/limits.js';
 import { AttachmentStore } from '../src/store/attachments.js';
 
 const PNG = Buffer.from(
@@ -87,7 +88,12 @@ describe('CodexAdapter subscription path (codex exec)', () => {
 
   it('throws a usage-limit error carrying the reset on a turn.failed limit event', async () => {
     process.env.STUB_MODE = 'limit';
-    await expect(adapter.runTurn(makeInput() as any, ctx)).rejects.toThrow(/usage limit reached.*1800s/i);
+    const failure = await adapter.runTurn(makeInput() as any, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderFailure);
+    expect(failure.message).toMatch(/usage limit reached.*1800s/i);
+    expect(failure.metadata).toMatchObject({
+      kind: 'quota', permanence: 'transient', provider: 'codex', source: 'structured', resetHint: 'in 1800s',
+    });
   });
 
   it('rejects a nonzero exit even when Codex wrote a partial final-message file', async () => {

@@ -235,7 +235,7 @@ Assembled per role by an activity that fills the **role template** (owned by the
 The task UI is the view-model the workflow projects (§10). Always present: title, message history, stage indicator, and two **cheap check-in** affordances:
 
 - **Open a terminal in the world** — a PTY spawned on demand against the on-disk worktree / via the world provider's PTY. Ephemeral; nothing persistent.
-- **Open the conversation** — renders the *stored session transcript*. It does **not** resume the agent (the agent only runs during a turn). This is what keeps check-in cheap.
+- **Open the conversation** — renders the *stored session transcript*. It does **not** resume the agent (the agent only runs during a turn). This is what keeps check-in cheap. The transcript is an ordered, timestamped timeline: human/agent messages plus provider-native work items normalized into stable kinds (reasoning, command, file change, tool/search, sub-agent, and lifecycle status). Item updates retain their provider id so `started → completed/failed` renders as one evolving row. These presentation events never enter the model's `Message[]` input history.
 
 Stage-gated actions:
 
@@ -372,16 +372,20 @@ The philosophy is maximal autonomy within bounded, auditable controls:
 
 ### 8.1 Capability model
 
-A flat set of named capabilities (`create-task`, `edit-task`, `create-review-info`, `signal-task`, `reorder-queue`, `merge-into:<repo>:<branch>`, `edit-workflow`, ...). Principals are **humans** and **agent profiles**, each with a granted capability set scoped global/project/task.
+A flat set of namespaced capabilities (`task:create`, `task:conversation:fork`, `project:settings:write`, `credential:write`, `merge-into:<repo>:<branch>`, ...). Principals are **humans, tasks, and system services**. Grants are scoped global/project; a token records its originating task for provenance but that id is not itself an object ACL. Project scope controls visibility across tasks, which lets an authorized agent discover and coordinate peer tasks without receiving global access.
+
+Humans choose one of four job-shaped authorization profiles rather than a permission checklist: **Developer**, **Project maintainer**, **Automation operator**, and **Administrator**. The profiles and the default for new tasks are ordinary configurable policy at global scope with project overlays. See `PLAN-authorization.md` for the capability matrix.
 
 ### 8.2 Attenuation
 
-An agent acts on behalf of the user/task that spawned it. Its **effective capabilities = intersection(profile-declared ceiling, granting principal's capabilities)**. A profile declares the most it may ever attempt; the spawning context grants a subset; the agent can never exceed its grantor. (Least privilege / capability attenuation.)
+An agent acts on behalf of the user/task that spawned it. Its **effective capabilities = intersection(role-profile ceiling, task authorization profile, granting principal's capabilities)**. The task stores that result and its grantor when it is created. Every workflow-spawned agent — retries, Resolve/Confirm/Merge roles, replacement runs, and children — derives from that stored grant, so retry topology cannot escalate privilege. If a requested profile exceeds the creator, it is capped and the task records `attenuated: true`; approval-based elevation may be added later without changing the token model.
 
 ### 8.3 Enforcement
 
 - **The workflow mints the agent's credential** — it alone knows the task, the profile, and the granting user — issuing a scoped token when it spawns the agent.
 - **The platform MCP server checks** each call's action against the token's effective capability set before executing.
+- **The gateway checks the same mapping** before every human or agent HTTP operation, including routes implemented directly by host services (credentials, payments, processes, review actions, users, safe mode). Authentication is not authorization.
+- **Human authentication is delegated to Better Auth** (password hashing, database sessions, HttpOnly cookies, rotation, rate limiting, account lifecycle). Karmax consumes only its verified user id and owns project/task policy.
 - **The merge capability** (`merge-into:...`) is granted only to merge-agent profiles and authorized humans. Do agents get write to their own world/branch only, so every merge into a protected target (including workflow repos) is forced through the merge agent under the queue.
 - **The most dangerous action — publishing workflow/infra changes — is gated not by a runtime check but by the PR-test-approve flow (§4.4).** That gate covers the real blast radius; a minimal capability check covers the rest.
 
@@ -396,9 +400,9 @@ Agents never see raw secrets in prompt/context. A vault-backed broker provides:
 
 Agent profiles and workflow repos store **credential handles** (pointers), never raw keys — a key committed into an agent-editable, git-versioned workflow repo is a guaranteed leak.
 
-### 8.5 v1 scope
+### 8.5 Audit and policy administration
 
-Build the **token + capability-check skeleton** and the **PR gate** — do not skip them; retrofitting auth onto a system where agents edit infrastructure is dangerous. Defer the policy engine, fine-grained per-field permissions, delegation chains, and deep audit tooling to v2.
+Profile edits, grants, revocations, defaults, and capability-checked gateway operations append to the durable audit log. The same administration is available to authorized agents through the platform MCP. Workflow/infra publication still requires both the runtime capability and the merge-only reviewed path: authorization permits proposing and reviewing an edit, never bypassing the protected merge queue.
 
 ---
 
@@ -447,6 +451,13 @@ The host shell and core modules are **first-party**, built on the same contribut
 - **Merge queue UI** — ordered queue, reorder, position, cancel.
 - **Settings** — project and global settings, including each active workflow's project-level UI (e.g. for software-dev: repo directories with folder pickers, default agent profiles per role, default merge-to branch, gitignored-files-to-copy, GitHub PR toggle).
 - **User page & notifications.**
+
+Human/agent responsibility is specified in `PLAN-collaboration.md`. In short,
+identity and authorization do not by themselves make tasks multi-user: tasks
+need immutable creator provenance, one accountable assignee, an optional agent
+delegate, explicit subscribers, and named user/team confirmation policies. The
+per-user inbox is a materialized projection of task events and resolved
+responsibility—not a project-wide list of every task needing attention.
 - **Dashboard** — agent runs, token/limit status across accounts, resources used.
 - **The final composed app UI** with the keyboard-navigation registry.
 
@@ -590,7 +601,7 @@ Invariants: dependents bind to the **task**, never to an attempt; at most one at
 
 ### 13.2 Other deferred items
 
-- Permission **policy engine**, fine-grained per-field permissions, delegation chains, deep audit tooling.
+- Approval-based privilege elevation and fine-grained per-field/data-row policy beyond global/project scope.
 - A workflow **distribution/marketplace**.
 - **Broadcast agent comms** beyond simple fan-out; **mid-turn interruption** (turn cancellation).
 - **Agentic payment protocols** (e.g. mandate-based / tokenized agent payment rails) layered behind the v1 budget-lease abstraction.

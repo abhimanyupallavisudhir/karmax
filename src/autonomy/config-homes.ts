@@ -121,11 +121,9 @@ export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
 
 /**
  * The karmax platform MCP server entry for a config home (SPEC §3.4). Points at
- * the stdio entrypoint and carries only the gateway URL. The bridge resolves its
- * own gateway session at startup (see `src/mcp/stdio.ts`) — an injected
- * KARMAX_TOKEN if karmax spawned the agent, otherwise an unauthenticated
- * `/api/session` (or `/api/login` with KARMAX_PASSWORD) — so a manually-launched
- * CLI agent can connect without karmax minting a per-turn token for it.
+ * the stdio entrypoint and carries only the gateway URL. Karmax injects a
+ * short-lived KARMAX_TOKEN for each actual turn; the bridge never borrows a
+ * human's Better Auth cookie or silently upgrades itself to a browser session.
  */
 export function platformMcpSpec(gatewayUrl: string): McpServerSpec {
   const entry = fileURLToPath(new URL('../mcp/stdio.ts', import.meta.url));

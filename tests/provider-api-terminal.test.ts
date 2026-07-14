@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { CodexAdapter } from '../src/agent/codex.js';
+import { ProviderFailure } from '../src/agent/limits.js';
 
 const world: any = { handle: { id: 'w', root: '/tmp', branch: 'task', base: 'main' } };
 const messages: any[] = [{ id: 'm', role: 'user', text: 'do the task', ts: 0 }];
@@ -34,6 +35,22 @@ describe('metered provider API terminal outcomes', () => {
       profile: { id: 'p', name: 'c', provider: 'claude', role: 'do', capabilities: [] },
       world, messages, systemPrompt: 'Do it.', role: 'do', maxTurns: 1, resolvedAuth: { apiKey: 'test' },
     } as any, ctx)).rejects.toThrow(/backstop without a successful terminal response/i);
+  });
+
+  it('types an Anthropic HTTP quota response as structured provider metadata', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 402,
+      text: async () => '{"error":{"message":"Your prepaid balance has been depleted"}}',
+    }));
+    const failure = await new ClaudeAdapter().runTurn({
+      profile: { id: 'p', name: 'c', provider: 'claude', role: 'do', capabilities: [] },
+      world, messages, systemPrompt: 'Do it.', role: 'do', resolvedAuth: { apiKey: 'test' },
+    } as any, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderFailure);
+    expect(failure.metadata).toMatchObject({
+      kind: 'quota', permanence: 'hard', provider: 'claude', source: 'structured',
+    });
   });
 
   it('accepts an OpenAI completed response without requiring signal_completion', async () => {

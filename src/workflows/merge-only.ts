@@ -66,7 +66,7 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = input.prompt || input.images?.length
-    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: 0, ...(input.images?.length ? { images: input.images } : {}) }]
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}) }]
     : [];
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let target = input.target ?? input.project.defaultTarget ?? base;
@@ -182,7 +182,7 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
     confirmed = true;
   });
   setHandler(followUpSignal, (m) => {
-    msgs.push({ ...m, ts: msgs.length });
+    msgs.push({ ...m, ts: m.ts || msgs.length });
   });
   setHandler(cancelSignal, () => {
     if (!pointOfNoReturnPassed) {
