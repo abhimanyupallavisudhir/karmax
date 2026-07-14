@@ -2702,7 +2702,7 @@ function taskAttempts(v) {
       <span class="status-dot ${esc(status)}"></span>
       <b>Attempt ${a.attemptNumber || 1}</b>
       ${principal ? '<span class="chip">principal</span>' : ''}
-      ${committed ? '<span class="chip done">committed</span>' : ''}
+      ${committed ? '<span class="chip done" title="Attempt has been irrevocably selected as the winner; sibling attempts will not be allowed to pass">jayadratha</span>' : ''}
       <span class="attempt-stage">${esc(a.params?.draft ? 'draft' : stageLabel(av))}</span>
     </button>`;
   }).join('');
