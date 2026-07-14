@@ -3,7 +3,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult } from './types.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath } from './types.js';
+import { openLocalPty, startLocalProcess } from './local-execution.js';
 
 const pexec = promisify(execFile);
 
@@ -14,7 +15,7 @@ const pexec = promisify(execFile);
  */
 export class MemoryWorldProvider implements WorldProvider {
   readonly kind = 'memory' as const;
-  readonly parkable = true;
+  readonly parkable = false;
   private roots = new Map<string, string>();
 
   async create(spec: WorldSpec): Promise<World> {
@@ -54,12 +55,26 @@ class MemoryWorld implements World {
   }
 
   async readFile(relPath: string): Promise<string> {
-    return fs.promises.readFile(path.join(this.handle.root, relPath), 'utf8');
+    return fs.promises.readFile(this.filePath(relPath), 'utf8');
+  }
+  async readFileBuffer(relPath: string): Promise<Buffer> {
+    return fs.promises.readFile(this.filePath(relPath));
   }
   async writeFile(relPath: string, content: string): Promise<void> {
-    const abs = path.join(this.handle.root, relPath);
+    const abs = this.filePath(relPath);
     await fs.promises.mkdir(path.dirname(abs), { recursive: true });
     await fs.promises.writeFile(abs, content);
+  }
+  async writeFileBuffer(relPath: string, content: Buffer): Promise<void> {
+    const abs = this.filePath(relPath);
+    await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+    await fs.promises.writeFile(abs, content);
+  }
+  async startProcess(spec: WorldProcessSpec): Promise<WorldProcess> {
+    return startLocalProcess(this.handle.root, spec);
+  }
+  async openPty(spec: WorldPtySpec = {}): Promise<WorldPty> {
+    return openLocalPty(this.handle.root, spec);
   }
   async listFiles(): Promise<string[]> {
     const out: string[] = [];
@@ -75,5 +90,10 @@ class MemoryWorld implements World {
   }
   async destroy(): Promise<void> {
     if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
+  }
+  private filePath(relPath: string): string {
+    const safe = worldRelativePath(relPath);
+    if (safe === '.') throw new Error('path is a directory');
+    return path.join(this.handle.root, ...safe.split('/'));
   }
 }

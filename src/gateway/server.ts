@@ -2,8 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { WebSocketServer } from 'ws';
+import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
 import { Store } from '../store/db.js';
@@ -21,7 +20,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { Provider, ProjectConfig } from '../domain/types.js';
+import { Provider, ProjectConfig, PrincipalRef } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -30,6 +29,13 @@ import type { AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { WorldRegistry } from '../world/registry.js';
+import { worldHandleForView } from '../world/resolve.js';
+import type { ObjectStore } from '../store/objects.js';
+import { newId } from '../util/id.js';
+import { DurableEventFanout } from './fanout.js';
+import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
+  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -51,19 +57,42 @@ export interface GatewayDeps {
   version?: string;
   identity?: IdentityService;
   authorization?: AuthorizationService;
+  worlds: WorldRegistry;
+  githubApp?: import('../integrations/github-app.js').GitHubAppService;
+  providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  handoffs?: import('../world/handoff.js').WorldHandoffService;
+  runners?: import('../world/runners.js').RunnerPoolService;
+  objects?: ObjectStore;
+  cellId?: string;
+  hosted?: boolean;
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
  * again for task operations; this layer covers the direct administrative routes. */
 function capabilityForRequest(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
-  if (p === '/api/meta' || p === '/api/session') return undefined;
+  if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return undefined;
   if (p === '/api/platform') return 'workflow:read';
   if (p === '/api/logout') return undefined;
   if (p === '/api/dashboard') return 'diagnostic:read';
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
+  if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
+  if (p === '/api/invitations/accept') return undefined;
+  if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
+  if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
+  if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
+  if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
+  if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
+  if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
   if (p.startsWith('/api/authorization') || p.startsWith('/api/audit')) return read ? 'authorization:read' : 'authorization:write';
   if (p.startsWith('/api/accounts') || p.startsWith('/api/git-profiles')) return read ? 'credential:read' : 'credential:write';
@@ -87,6 +116,8 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
@@ -97,7 +128,9 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
   if (/\/(sessions|agents|conversation)$/.test(p)) return 'task:conversation:read';
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
-  if (/\/review-action/.test(p) || /\/artifact$/.test(p)) return 'task:review:execute';
+  if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p)) return 'task:review:execute';
+  if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
+  if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/signal$/.test(p)) return 'task:signal';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
   if (p === '/api/skills') return 'skill:write';
@@ -113,11 +146,87 @@ function requestHeaders(headers: Record<string, string | string[] | undefined>):
   return out;
 }
 
+function principalFromBody(value: unknown): PrincipalRef {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('principal is required');
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind === 'user' && typeof candidate.userId === 'string' && candidate.userId) return { kind: 'user', userId: candidate.userId };
+  if (candidate.kind === 'team' && typeof candidate.teamId === 'string' && candidate.teamId) return { kind: 'team', teamId: candidate.teamId };
+  if (candidate.kind === 'task-agent' && typeof candidate.taskId === 'string' && typeof candidate.role === 'string' && candidate.taskId && candidate.role)
+    return { kind: 'task-agent', taskId: candidate.taskId, role: candidate.role };
+  throw new Error('invalid principal reference');
+}
+
+function isWorldHandle(value: unknown): value is Record<string, unknown> & { kind: string; id: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.kind === 'string' && candidate.kind.length > 0
+    && typeof candidate.id === 'string'
+    && typeof candidate.root === 'string'
+    && typeof candidate.branch === 'string'
+    && typeof candidate.base === 'string';
+}
+
+function worldHandleIsRemote(handle: { kind: string; provider?: unknown }): boolean {
+  const provider = typeof handle.provider === 'string' ? handle.provider : handle.kind;
+  return !['worktree', 'container', 'memory'].includes(provider);
+}
+
+function isTaskView(value: Record<string, unknown>): boolean {
+  return typeof value.taskId === 'string'
+    && typeof value.workflow === 'string'
+    && typeof value.stage === 'string'
+    && typeof value.status === 'string'
+    && Array.isArray(value.actions)
+    && !!value.state
+    && typeof value.state === 'object';
+}
+
+/**
+ * Build the public wire projection of gateway data. Provider handles are
+ * capabilities: even though they contain no API key, exposing sandbox ids,
+ * repository locations, or recovery metadata creates an unnecessary second
+ * interface to the execution plane. Clients get only availability + provider;
+ * every operation remains an authenticated gateway request scoped to a task.
+ */
+export function toPublicPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(toPublicPayload);
+  if (!value || typeof value !== 'object' || Buffer.isBuffer(value)) return value;
+  if (isWorldHandle(value)) return { kind: value.kind };
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return value;
+
+  const input = value as Record<string, unknown>;
+  const taskView = isTaskView(input);
+  const state = input.state && typeof input.state === 'object' && !Array.isArray(input.state)
+    ? input.state as Record<string, unknown>
+    : undefined;
+  const handle = isWorldHandle(input.world)
+    ? input.world
+    : isWorldHandle(state?.recoveryWorld) ? state.recoveryWorld : undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(input)) {
+    if (key === 'recoveryWorld' && isWorldHandle(item)) continue;
+    if (taskView && key === 'world') continue;
+    if (taskView && key === 'worldPath' && handle && worldHandleIsRemote(handle)) continue;
+    out[key] = toPublicPayload(item);
+  }
+  if (taskView) {
+    out.worldAvailable = Boolean(handle || input.worldPath);
+    if (handle) out.worldProvider = handle.provider ?? handle.kind;
+  }
+  return out;
+}
+
 /** Conventional gateway port. If it's taken we walk upward (findFreePortFrom),
  *  so the UI URL stays stable across restarts. Override with KARMAX_PORT. */
 export const DEFAULT_GATEWAY_PORT = 4505;
 
 const USER_CAPS = ['*'];
+const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+const MAX_PREVIEW_REQUEST_BYTES = 16 * 1024 * 1024;
+const PREVIEW_REQUEST_HEADERS = new Set([
+  'accept', 'accept-language', 'content-type', 'if-match', 'if-modified-since',
+  'if-none-match', 'if-unmodified-since', 'range', 'user-agent',
+]);
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -150,6 +259,7 @@ interface Session {
   user: string;
   apiToken: string;
   userId?: string;
+  email?: string;
 }
 
 export class Gateway {
@@ -157,14 +267,26 @@ export class Gateway {
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
-  private reviewActions = new ReviewActionRunner();
+  private reviewActions: ReviewActionRunner;
   private attachments = new AttachmentStore();
   private modelCatalog?: { at: number; value: ModelCatalog };
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
+  private fanout: DurableEventFanout;
 
-  constructor(private deps: GatewayDeps) {}
+  constructor(private deps: GatewayDeps) {
+    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners);
+    this.fanout = new DurableEventFanout(deps.store, deps.bus);
+  }
 
   private newSession(user = 'me'): { sid: string; session: Session } {
+    // Passwordless/password-only local mode predates Better Auth, but still uses
+    // the same tenant invariants as hosted mode. Materialize its stable local
+    // principal as owner of the migrated personal organization.
+    this.deps.store.claimPersonalOrganization(user, user === 'me' ? undefined : user);
+    for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
+      if (!this.deps.store.userIsProjectMember(project.id, user))
+        this.deps.store.setProjectMembership(project.id, { kind: 'user', userId: user }, 'owner');
+    }
     const sid = `s_${crypto.randomBytes(18).toString('hex')}`;
     const apiToken = this.deps.tokens.mintPrincipal(`user:${user}`, USER_CAPS).token;
     const session: Session = { user, apiToken };
@@ -172,8 +294,9 @@ export class Gateway {
     return { sid, session };
   }
 
-  async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; port: number; close: () => Promise<void> }> {
+  async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
+    const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
     const server = http.createServer((req, res) => this.handle(req, res).catch((e) => this.fail(res, e)));
     this.server = server;
 
@@ -183,11 +306,20 @@ export class Gateway {
     const wssEvents = new WebSocketServer({ noServer: true });
     const wssTerm = new WebSocketServer({ noServer: true });
     const wssAction = new WebSocketServer({ noServer: true });
+    const wssPreview = new WebSocketServer({ noServer: true });
     server.on('upgrade', (req, socket, head) => {
       const { pathname } = new URL(req.url ?? '/', 'http://localhost');
-      if (pathname === '/ws') wssEvents.handleUpgrade(req, socket, head, (ws) => wssEvents.emit('connection', ws, req));
+      const isolatedPreview = Boolean(configuredPreviewOrigin());
+      const onPreviewOrigin = isolatedPreview && this.requestIsPreviewOrigin(req);
+      if (onPreviewOrigin && pathname.startsWith('/preview/'))
+        wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
+      else if (onPreviewOrigin) socket.destroy();
+      else if (pathname === '/ws') wssEvents.handleUpgrade(req, socket, head, (ws) => wssEvents.emit('connection', ws, req));
       else if (pathname === '/ws/terminal') wssTerm.handleUpgrade(req, socket, head, (ws) => wssTerm.emit('connection', ws, req));
       else if (pathname === '/ws/review-action') wssAction.handleUpgrade(req, socket, head, (ws) => wssAction.emit('connection', ws, req));
+      else if ((!isolatedPreview && pathname.startsWith('/preview/')) ||
+        (!isolatedPreview && /^\/api\/tasks\/[^/]+\/preview\/\d+/.test(pathname)))
+        wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
       else socket.destroy();
     });
     wssEvents.on('connection', async (ws, req) => {
@@ -195,14 +327,14 @@ export class Gateway {
       const auth = await this.socketAuth(req, url);
       if (!auth) { ws.close(4401, 'unauthorized'); return; }
       const scoped = this.deps.tokens.verify(auth.apiToken);
-      const off = this.deps.bus.onAny((ev) => {
+      const off = this.fanout.on((ev) => {
         const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
         if (scoped?.projectId && projectId !== scoped.projectId) return;
         if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
           const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
           if (!allows(humanCaps ?? [], 'task:event:read')) return;
         }
-        try { ws.send(JSON.stringify(ev)); } catch { /* ignore */ }
+        try { ws.send(JSON.stringify(toPublicPayload(ev))); } catch { /* ignore */ }
       });
       ws.on('close', off);
       ws.on('error', off);
@@ -212,11 +344,15 @@ export class Gateway {
       void this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
     });
     wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
+    wssPreview.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
+    });
 
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       server.once('error', onError);
-      server.listen(port, '127.0.0.1', () => {
+      server.listen(port, bindHost, () => {
         server.off('error', onError);
         // Keep an operational listener after the startup race; errors are exposed
         // by endpoint-specific handling instead of becoming uncaught events.
@@ -224,30 +360,36 @@ export class Gateway {
         resolve();
       });
     });
+    const internalUrl = `http://127.0.0.1:${port}`;
+    const directHost = bindHost === '0.0.0.0' || bindHost === '::' ? '127.0.0.1' : bindHost;
+    const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '') || `http://${directHost}:${port}`;
     return {
-      url: `http://127.0.0.1:${port}`,
+      url: publicUrl,
+      internalUrl,
       port,
       close: () =>
         new Promise<void>((resolve) => {
           this.reviewActions.stopAll();
+          this.fanout.close();
           // `WebSocketServer.close()` does not terminate existing upgraded
           // sockets, and `http.Server.close()` waits for them forever. A stale
           // browser/test connection therefore used to wedge shutdown and leave
           // the Temporal worker/runtime installed. Close clients explicitly,
           // then force any remaining HTTP keep-alive sockets to drain.
-          for (const wss of [wssEvents, wssTerm, wssAction]) {
+          for (const wss of [wssEvents, wssTerm, wssAction, wssPreview]) {
             for (const ws of wss.clients) ws.terminate();
           }
           wssEvents.close();
           wssTerm.close();
           wssAction.close();
+          wssPreview.close();
           server.close(() => resolve());
           server.closeAllConnections();
         }),
     };
   }
 
-  /** PTY check-in (SPEC §5.5): an ephemeral terminal in the task's on-disk world. */
+  /** PTY check-in (SPEC §5.5): an ephemeral provider-owned terminal in the task world. */
   private async terminal(ws: import('ws').WebSocket, req: http.IncomingMessage) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const taskId = url.searchParams.get('taskId') ?? '';
@@ -257,28 +399,41 @@ export class Gateway {
     if (!this.deps.tokens.check(auth.apiToken, 'task:edit', { projectId: task?.projectId, taskId }).ok) {
       ws.close(4403, 'forbidden'); return;
     }
-    const cwd = task?.lastView?.worldPath;
-    if (!cwd) {
+    const project = task ? this.deps.store.getProject(task.projectId)?.config : undefined;
+    const handle = worldHandleForView(task?.lastView, taskId, project);
+    if (!handle) {
       ws.send(JSON.stringify({ type: 'data', data: 'No world for this task yet.\r\n' }));
       ws.close();
       return;
     }
-    let pty: any;
+    const projectRecord = task ? this.deps.store.getProject(task.projectId) : undefined;
+    if (!task || !projectRecord?.organizationId) { ws.close(4404, 'task project unavailable'); return; }
+    let term: import('../world/types.js').WorldPty;
+    let worldLeaseId: string | undefined;
+    const executionId = newId('execution');
     try {
-      pty = await import('node-pty');
-    } catch {
-      ws.send(JSON.stringify({ type: 'data', data: 'PTY unavailable (node-pty not installed).\r\n' }));
+      if (this.deps.worlds.get(handle.kind).capabilities?.remote && projectRecord && this.deps.runners) {
+        const lease = await this.deps.runners.acquire({ project: projectRecord, taskId, worldId: handle.id, provider: handle.kind });
+        worldLeaseId = lease.leaseId;
+      }
+      this.deps.store.createExecution({ id: executionId, organizationId: projectRecord.organizationId,
+        projectId: projectRecord.id, taskId, worldId: handle.id, generation: handle.generation ?? 1,
+        kind: 'terminal', label: 'Interactive terminal', command: '$SHELL', server: false,
+        openUrls: [], runnerLeaseId: worldLeaseId });
+      const world = await this.deps.worlds.open(handle);
+      term = await world.openPty({ cols: 80, rows: 24 });
+      this.deps.store.setExecutionRunning(executionId);
+      this.deps.store.appendExecutionFrame(executionId, 'Terminal opened.\n', 'system');
+    } catch (error) {
+      if (this.deps.store.execution(executionId)) {
+        this.deps.store.appendExecutionFrame(executionId, `${String((error as Error)?.message ?? error)}\n`, 'system');
+        this.deps.store.finishExecution(executionId, null, 'failed');
+      }
+      if (worldLeaseId) this.deps.runners?.release(worldLeaseId, handle.kind);
+      ws.send(JSON.stringify({ type: 'data', data: `Terminal unavailable: ${String((error as Error)?.message ?? error)}\r\n` }));
       ws.close();
       return;
     }
-    // Use bash with a clean prompt for a predictable check-in terminal.
-    const term = pty.spawn('bash', ['--norc', '-i'], {
-      name: 'xterm-color',
-      cols: 80,
-      rows: 24,
-      cwd,
-      env: { ...process.env, PS1: 'karmax:\\W$ ' },
-    });
     // Task-manager registry: the PTY (and anything the user runs in it) shows up
     // in the dashboard Processes panel under its task, and can be killed there.
     const { trackProcess } = await import('../util/processes.js');
@@ -289,25 +444,39 @@ export class Gateway {
           label: 'task terminal (bash)',
           taskId,
           startedAt: Date.now(),
-          kill: () => { try { term.kill(); } catch { /* already gone */ } },
+          kill: () => { try { void term.close(); } catch { /* already gone */ } },
         })
       : () => {};
-    term.onData((d: string) => { try { ws.send(JSON.stringify({ type: 'data', data: d })); } catch {} });
-    term.onExit(() => { untrack(); try { ws.close(); } catch {} });
+    let finalized = false;
+    let clientClosed = false;
+    const heartbeat = setInterval(() => this.deps.store.heartbeatExecution(executionId), 30_000);
+    heartbeat.unref();
+    const finish = (code: number | null, cancelled = false) => {
+      if (finalized) return;
+      finalized = true;
+      clearInterval(heartbeat);
+      untrack();
+      this.deps.store.finishExecution(executionId, code, cancelled ? 'cancelled' : undefined);
+      if (worldLeaseId) this.deps.runners?.release(worldLeaseId, handle.kind);
+    };
+    term.onData((d: string) => {
+      this.deps.store.appendExecutionFrame(executionId, d);
+      try { ws.send(JSON.stringify({ type: 'data', data: d })); } catch {}
+    });
+    term.onExit((code) => { finish(code, clientClosed); try { ws.close(); } catch {} });
     ws.on('message', (raw) => {
       let msg: any;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'input') term.write(msg.data);
       else if (msg.type === 'resize') term.resize(msg.cols || 80, msg.rows || 24);
     });
-    // Closing the socket (navigating away OR the user hitting "Kill terminal")
-    // tears the whole thing down — not just the shell, but every process it
-    // spawned. node-pty runs the shell as a session leader (its pid == the
-    // session id), so we kill the entire session: `pkill -s` reaps foreground
-    // AND background jobs, which a bare process-group kill would miss (bash job
-    // control puts each pipeline in its own group). The group kill + term.kill()
-    // are belt-and-suspenders fallbacks.
-    ws.on('close', () => killPtySession(term));
+    // The provider owns complete teardown (including descendants in a local PTY
+    // session, or the remote PTY lease in a cloud sandbox).
+    ws.on('close', () => {
+      clientClosed = true;
+      finish(null, true);
+      void term.close();
+    });
   }
 
   /** Stream a running review action's output to the UI. `procId` names a process
@@ -316,7 +485,7 @@ export class Gateway {
   private async reviewActionStream(ws: import('ws').WebSocket, req: http.IncomingMessage) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const procId = url.searchParams.get('procId') ?? '';
-    const rec = this.reviewActions.get(procId);
+    const rec = this.reviewActions.status(procId);
     if (!rec) {
       try { ws.send(JSON.stringify({ type: 'exit', code: -1, data: 'No such action process.\n' })); } catch {}
       ws.close();
@@ -347,6 +516,29 @@ export class Gateway {
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
+    const previewOrigin = configuredPreviewOrigin();
+    const onPreviewOrigin = Boolean(previewOrigin && this.requestIsPreviewOrigin(req));
+    // Repository applications are untrusted. In hosted mode they get an origin
+    // that exposes only opaque preview leases, never Karmax API/static routes or
+    // the reviewer's authenticated application cookies.
+    if (onPreviewOrigin && !p.startsWith('/preview/')) return this.json(res, 404, { error: 'not found' });
+    if (previewOrigin && !onPreviewOrigin && p.startsWith('/preview/')) {
+      const leaseId = p.match(/^\/preview\/([^/]+)/)?.[1];
+      if (!leaseId) return this.json(res, 404, { error: 'not found' });
+      res.writeHead(307, { location: `${previewLeaseOrigin(decodeURIComponent(leaseId))}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
+      return void res.end();
+    }
+    if (p.startsWith('/preview/')) return this.serveLeasedPreview(req, res, url);
+    // Caddy's on-demand TLS policy asks only for the exact opaque hostname of a
+    // live preview lease. This replaces manual wildcard certificates while
+    // preventing arbitrary public certificate issuance through the catch-all.
+    if (p === '/api/tls/preview-allow' && req.method === 'GET') {
+      const domain = (url.searchParams.get('domain') ?? '').trim().toLowerCase();
+      res.writeHead(this.deps.store.previewHostnameAllowed(domain) ? 204 : 403,
+        { 'cache-control': 'no-store', 'content-length': '0' });
+      return void res.end();
+    }
+    if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/api/')) return this.api(req, res, url);
     if (p === '/ws') return; // handled by ws
     return this.static(p, res);
@@ -360,12 +552,14 @@ export class Gateway {
     if (p === '/api/session' && method === 'GET') {
       if (this.deps.identity) {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
-        if (current) return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user });
+        if (current) return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user,
+          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null });
         return this.json(res, 200, {
           authRequired: true,
           authenticated: false,
           setupRequired: !this.deps.identity.hasUsers(),
           signupAvailable: this.deps.identity.hasUsers(),
+          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
         });
       }
       const authRequired = !!this.deps.password;
@@ -374,6 +568,86 @@ export class Gateway {
         return this.json(res, 200, { authRequired: false, token: sid, user: 'me' });
       }
       return this.json(res, 200, { authRequired: true });
+    }
+    if (p.startsWith('/api/auth/') && this.deps.identity) {
+      const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim();
+      const origin = process.env.KARMAX_PUBLIC_URL || `${forwardedProto || 'http'}://${req.headers.host || 'localhost'}`;
+      const body = method === 'GET' || method === 'HEAD' ? undefined : await this.rawBody(req, 2 * 1024 * 1024);
+      const response = await this.deps.identity.auth.handler(new Request(new URL(`${p}${url.search}`, origin), {
+        method, headers: requestHeaders(req.headers), ...(body ? { body } : {}),
+      }));
+      return this.sendWebResponse(res, response);
+    }
+    if (p === '/api/sso/start' && method === 'POST' && this.deps.identity) {
+      try {
+        const b = await this.body(req);
+        return this.sendWebResponse(res, await this.deps.identity.beginSso(String(b.callbackURL ?? '/'), requestHeaders(req.headers)));
+      } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
+    if (p === '/api/github/webhook' && method === 'POST' && this.deps.githubApp) {
+      try {
+        const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const result = await this.deps.githubApp.handleWebhook(
+          String(req.headers['x-github-event'] ?? ''), String(req.headers['x-github-delivery'] ?? ''), raw,
+          typeof req.headers['x-hub-signature-256'] === 'string' ? req.headers['x-hub-signature-256'] : undefined,
+        );
+        return this.json(res, 200, result);
+      } catch (error) {
+        return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    if (p === '/api/github/manifest/callback' && method === 'GET' && this.deps.githubApp && this.deps.identity) {
+      const code = url.searchParams.get('code') ?? '';
+      const state = url.searchParams.get('state') ?? '';
+      const identity = await this.deps.identity.session(requestHeaders(req.headers));
+      if (!identity || !code || !state) return this.githubCallbackPage(res, 400, 'The GitHub App setup callback is incomplete.');
+      const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
+      if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub App setup link is invalid, expired, or belongs to another user.');
+      try {
+        await this.deps.githubApp.convertManifest(code);
+        const installState = this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id);
+        res.writeHead(303, { location: this.deps.githubApp.installationUrl(installState) });
+        return void res.end();
+      } catch (error) {
+        return this.githubCallbackPage(res, 502, `GitHub App setup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (p === '/api/github/oauth/callback' && method === 'GET' && this.deps.githubApp && this.deps.identity) {
+      const code = url.searchParams.get('code') ?? '';
+      const state = url.searchParams.get('state') ?? '';
+      const identity = await this.deps.identity.session(requestHeaders(req.headers));
+      if (!identity || !code || !state) return this.githubCallbackPage(res, 400, 'The GitHub authorization callback is incomplete.');
+      const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
+      if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub authorization link is invalid, expired, or belongs to another user.');
+      try {
+        await this.deps.githubApp.authorizeUser(identity.user.id, code, this.publicUrl(req));
+        res.writeHead(303, { location: `/organization?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
+        return void res.end();
+      } catch (error) {
+        return this.githubCallbackPage(res, 502, `GitHub authorization failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (p === '/api/github/callback' && method === 'GET' && this.deps.githubApp && this.deps.identity) {
+      const installationId = url.searchParams.get('installation_id') ?? '';
+      const state = url.searchParams.get('state') ?? '';
+      const identity = await this.deps.identity.session(requestHeaders(req.headers));
+      if (!identity || !installationId || !state) return this.githubCallbackPage(res, 400, 'The GitHub installation callback is incomplete.');
+      const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
+      if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub installation link is invalid, expired, or belongs to another user.');
+      try {
+        await this.deps.githubApp.connectInstallation(pending.organizationId, installationId);
+        const status = this.deps.githubApp.status(identity.user.id);
+        if (status.oauthConfigured && !status.userAuthorized) {
+          const oauthState = this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id);
+          const publicUrl = this.publicUrl(req);
+          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl) });
+          return void res.end();
+        }
+        res.writeHead(303, { location: `/organization?github=connected&organizationId=${encodeURIComponent(pending.organizationId)}` });
+        return void res.end();
+      } catch (error) {
+        return this.githubCallbackPage(res, 502, `GitHub could not be connected: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     if (p === '/api/login' && method === 'POST') {
       const b = await this.body(req);
@@ -398,6 +672,10 @@ export class Gateway {
           requestHeaders(req.headers),
         );
         this.deps.authorization?.bootstrapAdministrator(user.id);
+        this.deps.store.claimPersonalOrganization(user.id, user.name);
+        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
+          this.deps.store.setProjectMembership(project.id, { kind: 'user', userId: user.id }, 'owner');
+        }
         return this.sendWebResponse(res, response);
       } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
     }
@@ -421,7 +699,21 @@ export class Gateway {
         version: this.deps.version ?? '1.0.0',
         safeMode: this.safeMode,
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
+        cellId: this.deps.cellId ?? 'local',
+        hosted: this.deps.hosted ?? false,
+        worldProviders: this.deps.worlds.catalog(),
+        sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
       });
+    }
+    if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
+    if (p === '/api/health/ready' && method === 'GET') {
+      try {
+        this.deps.store.db.prepare('SELECT 1').get();
+        await withTimeout(this.deps.client.workflowService.getSystemInfo({}), 2_000);
+        return this.json(res, 200, { ok: true, database: 'ready', temporal: 'ready', ts: Date.now() });
+      } catch {
+        return this.json(res, 503, { ok: false, ts: Date.now() });
+      }
     }
 
     // Serve an image attachment. Auth via `?token=` (session id) because a plain
@@ -455,7 +747,7 @@ export class Gateway {
 
     // ── authenticated endpoints ──
     const requestedScope = this.requestScope(p, url);
-    const session = await this.auth(req, requestedScope.projectId);
+    const session = await this.auth(req, requestedScope.projectId, requestedScope.organizationId);
     if (!session) return this.json(res, 401, { error: 'unauthorized' });
     const token = session.apiToken;
     const { api, store } = this.deps;
@@ -471,10 +763,15 @@ export class Gateway {
       // exception.
       const collectionAllowed = !checked.ok && p === '/api/projects' && method === 'GET' && !!session.userId &&
         this.deps.store.listProjects().some((project) => allows(this.deps.authorization?.capabilities(`user:${session.userId}`, project.id) ?? [], required));
-      if (!checked.ok && !collectionAllowed) return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
+      const organizationCollectionAllowed = !checked.ok && p === '/api/organizations' && !!session.userId && (
+        method === 'POST' || this.deps.store.listOrganizations(session.userId).some((organization) =>
+          allows(this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, organization.id) ?? [], required))
+      );
+      if (!checked.ok && !collectionAllowed && !organizationCollectionAllowed) return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
       if (checked.ok) authRecord = checked.record;
       const principal = checked.record?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
-      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, scope.projectId ? `project:${scope.projectId}` : 'global', { path: p });
+      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`,
+        scope.projectId ? `project:${scope.projectId}` : scope.organizationId ? `organization:${scope.organizationId}` : 'global', { path: p });
     }
 
     try {
@@ -485,6 +782,317 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
+
+      // Organization is the hosted tenant boundary. Collection discovery is
+      // filtered by membership; every nested request was minted an
+      // organization-scoped token above, so identifiers cannot cross tenants.
+      if (p === '/api/organizations' && method === 'GET') {
+        const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
+        return this.json(res, 200, canAuditAll ? store.listOrganizations() : store.listOrganizations(session.userId));
+      }
+      if (p === '/api/organizations' && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const b = await this.body(req);
+        const organization = store.createOrganization({ name: String(b.name ?? 'My organization'),
+          slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: session.userId });
+        this.deps.authorization?.bootstrapOrganizationOwner(`user:${session.userId}`, session.userId, organization.id);
+        return this.json(res, 200, organization);
+      }
+      if (p === '/api/invitations/accept' && method === 'POST') {
+        if (!session.userId || !session.email) return this.json(res, 400, { error: 'a verified account is required' });
+        const b = await this.body(req);
+        const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
+        this.deps.authorization?.grant(`user:${session.userId}`, {
+          principalId: `user:${session.userId}`, scopeKey: `organization:${membership.organizationId}`,
+          profileId: 'developer', capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'],
+        });
+        return this.json(res, 200, membership);
+      }
+
+      const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
+      if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
+      const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
+      if (organizationExport && method === 'GET') {
+        const value = store.exportOrganization(organizationExport[1]!);
+        res.setHeader('Content-Disposition', `attachment; filename="karmax-${organizationExport[1]!}-export.json"`);
+        return this.json(res, 200, value);
+      }
+      if (organizationMatch && method === 'DELETE') {
+        const organizationId = organizationMatch[1]!;
+        const organization = store.getOrganization(organizationId);
+        if (!organization) return this.json(res, 404, { error: 'organization not found' });
+        if (organization.kind === 'personal' || organization.id === 'org_personal')
+          return this.json(res, 400, { error: 'the installation personal organization cannot be deleted' });
+        const b = await this.body(req);
+        if (String(b.confirmSlug ?? '') !== organization.slug)
+          return this.json(res, 400, { error: `type the organization slug (${organization.slug}) to confirm deletion` });
+
+        // External resources go first. These operations are idempotent, so an
+        // outage never commits a deceptively successful partial deletion.
+        const resources = store.organizationResources(organizationId);
+        const projects = store.listProjects().filter((project) => project.organizationId === organizationId);
+        for (const project of projects) await this.removeProjectExternalResources(project.id, 'organization deleted');
+        await this.deps.githubApp?.disconnectOrganization(organizationId);
+        for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
+          this.deps.providerConnections?.delete(organizationId, connection.provider);
+        store.deleteOrganization(organizationId);
+        for (const attachmentId of resources.attachmentIds)
+          if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
+        return this.json(res, 200, { deleted: true, organizationId });
+      }
+      const identityPolicy = p.match(/^\/api\/organizations\/([^/]+)\/identity-policy$/);
+      if (identityPolicy) {
+        if (method === 'GET') return this.json(res, 200, store.getOrganizationIdentityPolicy(identityPolicy[1]!));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setOrganizationIdentityPolicy({ organizationId: identityPolicy[1]!,
+            oidcProviderId: b.oidcProviderId ? String(b.oidcProviderId) : undefined,
+            verifiedDomains: Array.isArray(b.verifiedDomains) ? b.verifiedDomains.map(String) : [], enforceSso: Boolean(b.enforceSso) }));
+        }
+      }
+      const scimToken = p.match(/^\/api\/organizations\/([^/]+)\/scim-token$/);
+      if (scimToken && method === 'POST') return this.json(res, 200, store.rotateScimToken(scimToken[1]!));
+      const organizationMembers = p.match(/^\/api\/organizations\/([^/]+)\/members$/);
+      if (organizationMembers) {
+        const organizationId = organizationMembers[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listOrganizationMemberships(organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const role = ['owner', 'admin', 'billing'].includes(String(b.role)) ? String(b.role) as any : 'member';
+          const membership = store.setOrganizationMembership(organizationId, String(b.userId), role);
+          this.deps.authorization?.grant(`user:${session.userId}`, {
+            principalId: `user:${membership.userId}`, scopeKey: `organization:${organizationId}`,
+            profileId: role === 'owner' || role === 'admin' ? 'administrator' : 'developer',
+            ...(role === 'member' || role === 'billing' ? { capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] } : {}),
+          });
+          return this.json(res, 200, membership);
+        }
+      }
+      const organizationMember = p.match(/^\/api\/organizations\/([^/]+)\/members\/([^/]+)$/);
+      if (organizationMember && method === 'DELETE') {
+        store.deprovisionOrganizationUser(organizationMember[1]!, organizationMember[2]!);
+        this.deps.authorization?.revoke(`user:${session.userId}`, `user:${organizationMember[2]!}`, `organization:${organizationMember[1]!}`);
+        return this.json(res, 200, { ok: true });
+      }
+      const invitations = p.match(/^\/api\/organizations\/([^/]+)\/invitations$/);
+      if (invitations) {
+        const organizationId = invitations[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listOrganizationInvitations(organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
+            role: ['owner', 'admin', 'billing'].includes(String(b.role)) ? b.role : 'member', invitedBy: `user:${session.userId}` }));
+        }
+      }
+      const organizationTeams = p.match(/^\/api\/organizations\/([^/]+)\/teams$/);
+      if (organizationTeams) {
+        const organizationId = organizationTeams[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listTeams(organizationId, url.searchParams.get('projectId') ?? undefined));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.createTeam({ organizationId, name: String(b.name ?? ''),
+            projectId: b.projectId ? String(b.projectId) : undefined, slug: b.slug ? String(b.slug) : undefined }));
+        }
+      }
+      const teamMembers = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)\/members$/);
+      if (teamMembers) {
+        if (store.getTeam(teamMembers[2]!)?.organizationId !== teamMembers[1]) return this.json(res, 404, { error: 'team not found' });
+        if (method === 'GET') return this.json(res, 200, store.listTeamMemberships(teamMembers[2]!));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setTeamMembership(teamMembers[2]!, String(b.userId), b.role === 'lead' ? 'lead' : 'member'));
+        }
+      }
+      const teamMember = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)\/members\/([^/]+)$/);
+      if (teamMember && method === 'DELETE') {
+        if (store.getTeam(teamMember[2]!)?.organizationId !== teamMember[1]) return this.json(res, 404, { error: 'team not found' });
+        store.removeTeamMembership(teamMember[2]!, teamMember[3]!);
+        return this.json(res, 200, { ok: true });
+      }
+      const gitConnections = p.match(/^\/api\/organizations\/([^/]+)\/git-connections$/);
+      if (gitConnections) {
+        const organizationId = gitConnections[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listGitConnections(organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub App is not configured' });
+          return this.json(res, 200, await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? '')));
+        }
+      }
+      const githubAppSetup = p.match(/^\/api\/organizations\/([^/]+)\/github\/app$/);
+      if (githubAppSetup) {
+        if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
+        if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(session.userId));
+        if (method === 'PUT') {
+          if (!this.deps.tokens.check(token, 'user:write').ok)
+            return this.json(res, 403, { error: 'Only a Karmax installation administrator can configure the shared GitHub App' });
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, this.deps.githubApp.configure({ appId: b.appId, appSlug: String(b.appSlug ?? ''),
+              privateKey: String(b.privateKey ?? '').replace(/\\n/g, '\n'), webhookSecret: b.webhookSecret ? String(b.webhookSecret) : undefined,
+              clientId: b.clientId ? String(b.clientId) : undefined, clientSecret: b.clientSecret ? String(b.clientSecret) : undefined }));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
+      const githubManifest = p.match(/^\/api\/organizations\/([^/]+)\/github\/app-manifest$/);
+      if (githubManifest && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
+        if (!this.deps.tokens.check(token, 'user:write').ok)
+          return this.json(res, 403, { error: 'Only a Karmax installation administrator can create the shared GitHub App' });
+        if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
+        const state = store.createGithubInstallState(githubManifest[1]!, session.userId);
+        return this.json(res, 200, this.deps.githubApp.manifest(this.publicUrl(req), state));
+      }
+      const githubAuthorize = p.match(/^\/api\/organizations\/([^/]+)\/github\/authorize$/);
+      if (githubAuthorize && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
+        const state = store.createGithubInstallState(githubAuthorize[1]!, session.userId);
+        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.publicUrl(req)) }); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
+      if (githubInstallUrl && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
+        const state = store.createGithubInstallState(githubInstallUrl[1]!, session.userId);
+        return this.json(res, 200, { url: this.deps.githubApp.installationUrl(state) });
+      }
+      const organizationRepositories = p.match(/^\/api\/organizations\/([^/]+)\/repositories$/);
+      if (organizationRepositories) {
+        const organizationId = organizationRepositories[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listRepositories(organizationId));
+        if (method === 'POST') {
+          if (this.deps.hosted) return this.json(res, 400, { error: 'Hosted repositories must be imported through the GitHub App' });
+          const b = await this.body(req);
+          return this.json(res, 200, store.upsertRepository({ organizationId, provider: 'github',
+            providerId: b.providerId ? String(b.providerId) : undefined, owner: String(b.owner ?? ''), name: String(b.name ?? ''),
+            sshUrl: String(b.sshUrl ?? ''), defaultBranch: String(b.defaultBranch ?? 'main'), private: b.private !== false,
+            gitConnectionId: b.gitConnectionId ? String(b.gitConnectionId) : undefined }));
+        }
+      }
+      const createOrganizationRepository = p.match(/^\/api\/organizations\/([^/]+)\/repositories\/create$/);
+      if (createOrganizationRepository && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        const b = await this.body(req);
+        const connection = store.getGitConnection(String(b.gitConnectionId ?? ''));
+        if (!connection || connection.organizationId !== createOrganizationRepository[1])
+          return this.json(res, 404, { error: 'GitHub connection not found in this organization' });
+        try {
+          return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, session.userId,
+            { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined, private: b.private !== false }));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
+      if (organizationProjects) {
+        const organizationId = organizationProjects[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config, true), organizationId);
+          if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
+          return this.json(res, 200, project);
+        }
+      }
+      const runnerPools = p.match(/^\/api\/organizations\/([^/]+)\/runner-pools$/);
+      if (runnerPools) {
+        const organizationId = runnerPools[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listRunnerPools(organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.createRunnerPool({ organizationId, name: String(b.name ?? 'Runner pool'),
+            provider: String(b.provider ?? 'e2b'), region: b.region ? String(b.region) : undefined,
+            mode: b.mode === 'customer' ? 'customer' : 'managed', enabled: b.enabled !== false,
+            capacity: { activeWorlds: Math.max(1, Number(b.capacity?.activeWorlds ?? 20)),
+              cpu: Math.max(1, Number(b.capacity?.cpu ?? 40)), memoryMb: Math.max(128, Number(b.capacity?.memoryMb ?? 81920)),
+              gpu: Math.max(0, Number(b.capacity?.gpu ?? 0)) } }));
+        }
+      }
+      const runnerPool = p.match(/^\/api\/organizations\/([^/]+)\/runner-pools\/([^/]+)$/);
+      if (runnerPool) {
+        const current = store.getRunnerPool(runnerPool[2]!);
+        if (!current || current.organizationId !== runnerPool[1]) return this.json(res, 404, { error: 'runner pool not found' });
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, store.createRunnerPool({ ...current,
+              name: b.name == null ? current.name : String(b.name),
+              region: b.region === null ? undefined : b.region == null ? current.region : String(b.region),
+              enabled: b.enabled == null ? current.enabled : Boolean(b.enabled),
+              capacity: b.capacity && typeof b.capacity === 'object' ? {
+                activeWorlds: Math.max(1, Number(b.capacity.activeWorlds ?? current.capacity.activeWorlds)),
+                cpu: Math.max(1, Number(b.capacity.cpu ?? current.capacity.cpu)),
+                memoryMb: Math.max(128, Number(b.capacity.memoryMb ?? current.capacity.memoryMb)),
+                gpu: Math.max(0, Number(b.capacity.gpu ?? current.capacity.gpu)),
+              } : current.capacity }));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+        if (method === 'DELETE') {
+          try { return this.json(res, 200, { deleted: Boolean(store.deleteRunnerPool(current.id)) }); }
+          catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
+      const worldProviders = p.match(/^\/api\/organizations\/([^/]+)\/world-providers$/);
+      if (worldProviders && method === 'GET') {
+        return this.json(res, 200, this.deps.providerConnections?.list(worldProviders[1]!) ?? []);
+      }
+      const worldProvider = p.match(/^\/api\/organizations\/([^/]+)\/world-providers\/([^/]+)$/);
+      if (worldProvider) {
+        const organizationId = worldProvider[1]!;
+        const provider = worldProvider[2]!;
+        if (!this.deps.providerConnections) return this.json(res, 503, { error: 'provider connections are unavailable' });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, this.deps.providerConnections.save({ organizationId, provider,
+              apiKey: b.apiKey ? String(b.apiKey) : undefined, name: b.name ? String(b.name) : undefined,
+              config: b.config && typeof b.config === 'object' ? b.config as any : {}, enabled: b.enabled !== false }));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+        if (method === 'DELETE') {
+          const active = store.organizationResources(organizationId).worlds
+            .filter((handle) => (handle.provider ?? handle.kind) === provider);
+          if (active.length) return this.json(res, 409, { error: `${active.length} task world(s) still use ${provider}; finish or delete them first` });
+          return this.json(res, 200, { deleted: Boolean(this.deps.providerConnections.delete(organizationId, provider)) });
+        }
+      }
+      const testWorldProvider = p.match(/^\/api\/organizations\/([^/]+)\/world-providers\/([^/]+)\/test$/);
+      if (testWorldProvider && method === 'POST') {
+        if (!this.deps.providerConnections) return this.json(res, 503, { error: 'provider connections are unavailable' });
+        try { return this.json(res, 200, await this.deps.providerConnections.test(testWorldProvider[1]!, testWorldProvider[2]!)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const usage = p.match(/^\/api\/organizations\/([^/]+)\/usage$/);
+      if (usage && method === 'GET') return this.json(res, 200, store.usageSummary(usage[1]!,
+        Number(url.searchParams.get('from') ?? 0), Number(url.searchParams.get('to') ?? Date.now())));
+
+      if (p === '/api/inbox' && method === 'GET') {
+        if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        const items = store.listInbox(session.userId, requestedScope.organizationId,
+          { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) });
+        return this.json(res, 200, items.map((item) => {
+          const task = store.getTask(item.taskId);
+          return { ...item, task: task ? { id: task.id, num: task.num, title: task.title, projectId: task.projectId } : undefined };
+        }));
+      }
+      const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
+      if (inboxItem && method === 'PATCH') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const b = await this.body(req);
+        return this.json(res, 200, store.markInbox(session.userId, inboxItem[1]!, b.unread !== false) ?? null);
+      }
+      if (p === '/api/inbox/preferences') {
+        if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        if (method === 'GET') return this.json(res, 200, store.getDeliveryPreferences(session.userId, requestedScope.organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setDeliveryPreferences({ userId: session.userId, organizationId: requestedScope.organizationId,
+            browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false }));
+        }
+      }
+
       // Multiple human accounts + karmax authorization. Better Auth owns the
       // account/session records; these routes only attach karmax grants.
       if (p === '/api/users' && method === 'GET') {
@@ -543,8 +1151,16 @@ export class Gateway {
         return this.json(res, 200, {
           host: hostStats(),
           agentSlots: { ...safety, capacity: queue.capacity, inUse: queue.current.length, waiting: queue.queue.length },
+          controlPlane: store.operationalSnapshot(),
+          providers: this.deps.worlds.catalog(),
           ts: Date.now(),
         });
+      }
+      if (p === '/api/metrics' && method === 'GET') {
+        const value = prometheusMetrics(store.operationalSnapshot());
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+          'content-length': String(Buffer.byteLength(value)), 'cache-control': 'no-store' });
+        return void res.end(value);
       }
 
       // Task manager (dashboard Processes panel): every process karmax is
@@ -597,8 +1213,10 @@ export class Gateway {
         return this.json(res, 200, projects);
       }
       if (p === '/api/projects' && method === 'POST') {
+        if (this.deps.hosted)
+          return this.json(res, 400, { error: 'hosted projects must be created inside an organization' });
         const b = await this.body(req);
-        return this.json(res, 200, store.createProject(b.name ?? 'New project', normalizeConfig(b.config)));
+        return this.json(res, 200, store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true)));
       }
       const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
       if (projMatch) {
@@ -606,12 +1224,74 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.getProject(id) ?? null);
         if (method === 'PATCH') {
           const b = await this.body(req);
-          return this.json(res, 200, store.updateProjectConfig(id, normalizeConfig(b.config)));
+          try {
+            const config = normalizeConfig(b.config);
+            const project = store.getProject(id);
+            if (this.deps.hosted && config.worldProvider && project?.organizationId &&
+                !this.deps.providerConnections?.available(project.organizationId, config.worldProvider)) {
+              throw new Error(`${config.worldProvider} is not connected. Connect and verify it in Organization settings first.`);
+            }
+            if (config.runnerPoolId) {
+              const pool = store.getRunnerPool(config.runnerPoolId);
+              if (!pool || pool.organizationId !== project?.organizationId) throw new Error('runner pool does not belong to this project organization');
+              if (config.worldProvider && pool.provider !== config.worldProvider) throw new Error('runner pool provider must match the execution provider');
+            }
+            return this.json(res, 200, store.updateProjectConfig(id, config));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
         if (method === 'DELETE') {
+          if (!store.getProject(id)) return this.json(res, 404, { error: 'project not found' });
+          const resources = await this.removeProjectExternalResources(id, 'project deleted');
           store.deleteProject(id);
-          return this.json(res, 200, { ok: true });
+          for (const attachmentId of resources.attachmentIds)
+            if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
+          return this.json(res, 200, { deleted: true, projectId: id });
         }
+      }
+      const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
+      if (projectMembers) {
+        const projectId = projectMembers[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listProjectMemberships(projectId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const principal = principalFromBody(b.principal);
+          const role = ['owner', 'admin', 'reviewer'].includes(String(b.role)) ? String(b.role) : 'member';
+          const membership = store.setProjectMembership(projectId, principal, role);
+          if (principal.kind === 'user') {
+            const profileId = role === 'owner' || role === 'admin' ? 'maintainer' : 'developer';
+            this.deps.authorization?.grant(`user:${session.userId}`, { principalId: `user:${principal.userId}`,
+              scopeKey: `project:${projectId}`, profileId,
+              ...(role === 'reviewer' ? { capabilities: ['project:read', 'task:read', 'task:event:read', 'task:signal', 'task:review:execute', 'inbox:*'] } : {}) });
+          }
+          return this.json(res, 200, membership);
+        }
+      }
+      const projectMember = p.match(/^\/api\/projects\/([^/]+)\/members\/(user|team)\/([^/]+)$/);
+      if (projectMember && method === 'DELETE') {
+        const principal = projectMember[2] === 'user'
+          ? { kind: 'user' as const, userId: projectMember[3]! }
+          : { kind: 'team' as const, teamId: projectMember[3]! };
+        store.removeProjectMembership(projectMember[1]!, principal);
+        if (principal.kind === 'user') this.deps.authorization?.revoke(`user:${session.userId}`,
+          `user:${principal.userId}`, `project:${projectMember[1]!}`);
+        return this.json(res, 200, { ok: true });
+      }
+      const projectRepositories = p.match(/^\/api\/projects\/([^/]+)\/repositories$/);
+      if (projectRepositories) {
+        const projectId = projectRepositories[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listProjectRepositories(projectId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.attachProjectRepository({ projectId, repositoryId: String(b.repositoryId),
+            baseBranch: b.baseBranch ? String(b.baseBranch) : undefined,
+            targetBranch: b.targetBranch ? String(b.targetBranch) : undefined,
+            order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined }));
+        }
+      }
+      const projectRepository = p.match(/^\/api\/projects\/([^/]+)\/repositories\/([^/]+)$/);
+      if (projectRepository && method === 'DELETE') {
+        store.detachProjectRepository(projectRepository[1]!, projectRepository[2]!);
+        return this.json(res, 200, { ok: true });
       }
       const tasksMatch = p.match(/^\/api\/projects\/([^/]+)\/tasks$/);
       if (tasksMatch) {
@@ -742,6 +1422,33 @@ export class Gateway {
         const b = await this.body(req);
         await api.setTaskPriority(token, priorityMatch[1]!, Number(b.priority ?? 0));
         return this.json(res, 200, { ok: true });
+      }
+      const responsibilityMatch = p.match(/^\/api\/tasks\/([^/]+)\/responsibility$/);
+      if (responsibilityMatch) {
+        if (method === 'GET') {
+          const task = store.getTask(responsibilityMatch[1]!);
+          return this.json(res, 200, task ? { createdBy: task.createdBy, assignee: task.assignee,
+            delegate: task.delegate, confirmationPolicy: task.confirmationPolicy, subscribers: task.subscribers } : null);
+        }
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setTaskResponsibility(responsibilityMatch[1]!, {
+            assignee: b.assignee === null ? null : b.assignee === undefined ? undefined : principalFromBody(b.assignee),
+            delegate: b.delegate === null ? null : b.delegate === undefined ? undefined : principalFromBody(b.delegate),
+            confirmationPolicy: b.confirmationPolicy === null ? null : b.confirmationPolicy,
+          }));
+        }
+      }
+      const subscribersMatch = p.match(/^\/api\/tasks\/([^/]+)\/subscribers$/);
+      if (subscribersMatch) {
+        if (method === 'GET') return this.json(res, 200, store.subscribersFor(subscribersMatch[1]!));
+        if (method === 'POST' || method === 'DELETE') {
+          const b = await this.body(req);
+          const principal = principalFromBody(b.principal);
+          if (method === 'POST') store.subscribeTask(subscribersMatch[1]!, principal);
+          else store.unsubscribeTask(subscribersMatch[1]!, principal);
+          return this.json(res, 200, { subscribers: store.subscribersFor(subscribersMatch[1]!) });
+        }
       }
 
       // tasks
@@ -905,6 +1612,25 @@ export class Gateway {
       if (runsMatch && method === 'GET') {
         return this.json(res, 200, store.runsOf(runsMatch[1]!));
       }
+      const executionsMatch = p.match(/^\/api\/tasks\/([^/]+)\/executions$/);
+      if (executionsMatch && method === 'GET') {
+        return this.json(res, 200, store.listExecutions(executionsMatch[1]!));
+      }
+      const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
+      if (checkoutMatch && method === 'GET') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        try { return this.json(res, 200, this.deps.handoffs.checkout(checkoutMatch[1]!)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const refreshFromGithub = p.match(/^\/api\/tasks\/([^/]+)\/refresh-from-github$/);
+      if (refreshFromGithub && method === 'POST') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        const taskId = refreshFromGithub[1]!;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
+        try { return this.json(res, 200, await this.deps.handoffs.refresh(taskId, view)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       // ── review actions (SPEC §5.5): click-to-verify affordances ──
       // Start a "run" action (or resolve an "open" one). The command is looked up
       // from the task's stored review info by index — the client only sends the
@@ -919,7 +1645,8 @@ export class Gateway {
         const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
-        const worldPath = view?.worldPath;
+        const task = store.getTask(taskId);
+        const handle = worldHandleForView(view, taskId, task ? store.getProject(task.projectId)?.config : undefined);
         if (action.kind === 'open') {
           const target = String(action.target ?? '');
           if (/^https?:\/\//i.test(target)) return this.json(res, 200, { kind: 'open', url: target, external: true });
@@ -929,10 +1656,10 @@ export class Gateway {
         }
         // kind: 'run'
         if (!action.command) return this.json(res, 400, { error: 'run action has no command' });
-        if (!worldPath) return this.json(res, 400, { error: 'no world for this task yet' });
-        const rec = this.reviewActions.start({
+        if (!handle) return this.json(res, 400, { error: 'no world for this task yet' });
+        const rec = await this.reviewActions.start({
           taskId,
-          cwd: worldPath,
+          world: handle,
           label: action.label,
           command: action.command,
           server: action.server,
@@ -952,6 +1679,129 @@ export class Gateway {
       const artifactMatch = p.match(/^\/api\/tasks\/([^/]+)\/artifact$/);
       if (artifactMatch && method === 'GET') {
         return this.serveArtifact(res, artifactMatch[1]!, url.searchParams.get('path') ?? '');
+      }
+      const artifactList = p.match(/^\/api\/tasks\/([^/]+)\/artifacts$/);
+      if (artifactList && method === 'GET') return this.json(res, 200, store.listPromotedArtifacts(artifactList[1]!));
+      const artifactPromote = p.match(/^\/api\/tasks\/([^/]+)\/artifacts\/promote$/);
+      if (artifactPromote && method === 'POST') {
+        if (!this.deps.objects) return this.json(res, 503, { error: 'promoted artifact storage is not configured' });
+        const taskId = artifactPromote[1]!;
+        const task = store.getTask(taskId);
+        const project = task ? store.getProject(task.projectId) : undefined;
+        const b = await this.body(req);
+        const relPath = String(b.path ?? '');
+        if (!task || !project?.organizationId || !relPath) return this.json(res, 400, { error: 'task and artifact path are required' });
+        const handle = worldHandleForView(task.lastView, taskId, project.config);
+        if (!handle) return this.json(res, 404, { error: 'no world for this task' });
+        const world = await this.deps.worlds.open(handle);
+        const data = await world.readFileBuffer(relPath);
+        if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
+        const id = newId('artifact');
+        const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
+        const mediaType = String(b.mediaType ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream');
+        const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
+        await this.deps.objects.put(objectKey, data, mediaType);
+        const ttlMs = b.ttlMs == null ? undefined : Math.max(60_000, Math.min(Number(b.ttlMs), 365 * 24 * 60 * 60 * 1000));
+        const artifact = store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
+          taskId, objectKey, sha256: crypto.createHash('sha256').update(data).digest('hex'), bytes: data.length,
+          mediaType, name, createdAt: Date.now(), ...(ttlMs ? { expiresAt: Date.now() + ttlMs } : {}) });
+        return this.json(res, 200, artifact);
+      }
+      const promotedArtifact = p.match(/^\/api\/artifacts\/([^/]+)$/);
+      if (promotedArtifact) {
+        const artifact = store.getPromotedArtifact(promotedArtifact[1]!);
+        if (!artifact || (artifact.expiresAt != null && artifact.expiresAt <= Date.now())) return this.json(res, 404, { error: 'artifact not found' });
+        if (method === 'GET') {
+          if (!this.deps.objects) return this.json(res, 503, { error: 'artifact storage is unavailable' });
+          const data = await this.deps.objects.get(artifact.objectKey);
+          if (crypto.createHash('sha256').update(data).digest('hex') !== artifact.sha256)
+            return this.json(res, 502, { error: 'artifact integrity check failed' });
+          res.writeHead(200, { 'content-type': artifact.mediaType, 'content-length': String(data.length),
+            'content-disposition': `inline; filename="${artifact.name.replace(/["\\\r\n]/g, '_')}"`,
+            'cache-control': 'private, no-store' });
+          return void res.end(data);
+        }
+        if (method === 'DELETE') {
+          store.deletePromotedArtifact(artifact.id);
+          await this.deps.objects?.delete(artifact.objectKey);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const previewMatch = p.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
+      if (previewMatch && PREVIEW_METHODS.has(method)) {
+        const taskId = previewMatch[1]!;
+        const port = Number(previewMatch[2]);
+        const task = store.getTask(taskId);
+        const project = task ? store.getProject(task.projectId) : undefined;
+        const handle = worldHandleForView(task?.lastView, taskId, project?.config);
+        if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
+        if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
+        const isolatedOrigin = configuredPreviewOrigin();
+        if (isolatedOrigin) {
+          const rawToken = newPreviewToken();
+          let runnerLeaseId: string | undefined;
+          if (this.deps.worlds.get(handle.kind).capabilities?.remote && this.deps.runners)
+            runnerLeaseId = (await this.deps.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind })).leaseId;
+          let lease: import('../domain/types.js').PreviewLease;
+          try {
+            lease = store.createPreviewLease({ id: newId('preview'), organizationId: project.organizationId,
+              projectId: project.id, taskId, worldId: handle.id, generation: handle.generation ?? 1, port,
+              public: false, tokenHash: hashPreviewToken(rawToken), runnerLeaseId, provider: handle.kind,
+              createdBy: authRecord?.principal ?? session.user, createdAt: Date.now(),
+              expiresAt: Date.now() + previewAccessTtlMs() });
+          } catch (error) {
+            if (runnerLeaseId) this.deps.runners?.release(runnerLeaseId, handle.kind);
+            throw error;
+          }
+          res.writeHead(307, { location: previewLeaseUrl(lease.id,
+            `${previewMatch[3] ?? '/'}${url.search}`, rawToken), 'referrer-policy': 'no-referrer' });
+          return void res.end();
+        }
+        return this.servePreview(req, res, taskId, port,
+          `${previewMatch[3] ?? '/'}${url.search}`, `/api/tasks/${encodeURIComponent(taskId)}/preview/${port}`);
+      }
+      const previewLeases = p.match(/^\/api\/tasks\/([^/]+)\/preview-leases$/);
+      if (previewLeases && method === 'GET') return this.json(res, 200, store.listPreviewLeases(previewLeases[1]!));
+      if (previewLeases && method === 'POST') {
+        const taskId = previewLeases[1]!;
+        const task = store.getTask(taskId);
+        const project = task ? store.getProject(task.projectId) : undefined;
+        const handle = worldHandleForView(task?.lastView, taskId, project?.config);
+        const b = await this.body(req);
+        const port = Number(b.port);
+        if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
+        if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
+        if (!reviewPorts(task.lastView).has(port)) return this.json(res, 400, { error: 'port was not declared by a review action' });
+        const ttlMs = Math.max(60_000, Math.min(Number(b.ttlMs ?? 60 * 60_000), 24 * 60 * 60_000));
+        const isPublic = b.public === true;
+        // Isolated previews cannot use the main-app session cookie by design,
+        // so private and public leases both get a scoped bearer. Locally, a
+        // private lease keeps the convenient authenticated-session behavior.
+        const tokenRequired = isPublic || Boolean(configuredPreviewOrigin());
+        const rawToken = tokenRequired ? newPreviewToken() : undefined;
+        let runnerLeaseId: string | undefined;
+        if (this.deps.worlds.get(handle.kind).capabilities?.remote && this.deps.runners)
+          runnerLeaseId = (await this.deps.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind })).leaseId;
+        let lease: import('../domain/types.js').PreviewLease;
+        try {
+          lease = store.createPreviewLease({ id: newId('preview'), organizationId: project.organizationId,
+            projectId: project.id, taskId, worldId: handle.id, generation: handle.generation ?? 1, port,
+            public: isPublic, ...(rawToken ? { tokenHash: hashPreviewToken(rawToken) } : {}),
+            runnerLeaseId, provider: handle.kind, createdBy: authRecord?.principal ?? session.user,
+            createdAt: Date.now(), expiresAt: Date.now() + ttlMs });
+        } catch (error) {
+          if (runnerLeaseId) this.deps.runners?.release(runnerLeaseId, handle.kind);
+          throw error;
+        }
+        return this.json(res, 200, { ...lease, tokenHash: undefined,
+          url: previewLeaseUrl(lease.id, '/', rawToken) });
+      }
+      const previewLease = p.match(/^\/api\/preview-leases\/([^/]+)$/);
+      if (previewLease && method === 'DELETE') {
+        const lease = store.revokePreviewLease(previewLease[1]!);
+        if (!lease) return this.json(res, 404, { error: 'preview lease not found' });
+        if (lease.runnerLeaseId) this.deps.runners?.release(lease.runnerLeaseId, lease.provider);
+        return this.json(res, 200, { ok: true });
       }
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
@@ -1666,32 +2516,323 @@ export class Gateway {
     }
   }
 
-  /** Serve a produced artifact (an `open` action's file target) from the task's
-   *  world, so the UI can open a PDF/image/video/notebook it generated. Path is
-   *  confined to the world root — no traversal outside it. */
+  /** Serve an artifact through its world provider. The browser never receives a
+   * host/sandbox path and remote worlds need no public filesystem endpoint. */
   private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string) {
-    const worldPath = this.deps.store.getTask(taskId)?.lastView?.worldPath;
-    if (!worldPath) return this.json(res, 404, { error: 'no world for this task' });
+    const task = this.deps.store.getTask(taskId);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
-    const root = path.resolve(worldPath);
-    const file = path.resolve(root, relPath);
-    if (file !== root && !file.startsWith(root + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
     try {
-      const stat = await fs.promises.stat(file);
-      if (stat.isDirectory()) return this.json(res, 400, { error: 'path is a directory' });
-      const data = await fs.promises.readFile(file);
+      const world = await this.deps.worlds.open(handle);
+      const data = await world.readFileBuffer(relPath);
       res.writeHead(200, {
-        'content-type': ARTIFACT_MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
+        'content-type': ARTIFACT_MIME[path.extname(relPath).toLowerCase()] ?? 'application/octet-stream',
         'content-length': String(data.length),
       });
       res.end(data);
-    } catch {
-      this.json(res, 404, { error: 'artifact not found' });
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error);
+      this.json(res, /escape|relative/i.test(message) ? 400 : 404, { error: /escape|relative/i.test(message) ? message : 'artifact not found' });
     }
   }
 
+  /** Reverse proxy for services inside a remote world. Provider traffic tokens
+   * stay server-side. Request credentials are deliberately not forwarded: the
+   * repository application receives only a small HTTP header allowlist. */
+  private async servePreview(req: http.IncomingMessage, res: http.ServerResponse, taskId: string,
+    port: number, requestPath: string, proxyBase: string) {
+    const task = this.deps.store.getTask(taskId);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    if (!handle) return this.json(res, 404, { error: 'no world for this task' });
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
+    const method = req.method ?? 'GET';
+    if (!PREVIEW_METHODS.has(method)) {
+      res.writeHead(405, { allow: [...PREVIEW_METHODS].join(', ') });
+      return void res.end();
+    }
+    try {
+      const body = method === 'GET' || method === 'HEAD' ? undefined : await this.rawBody(req, MAX_PREVIEW_REQUEST_BYTES);
+      const world = await this.deps.worlds.open(handle);
+      if (!world.fetchPort) return this.json(res, 400, { error: 'this world provider does not expose remote previews' });
+      const forwarded: Record<string, string> = {};
+      for (const name of PREVIEW_REQUEST_HEADERS) {
+        const value = req.headers[name];
+        if (typeof value === 'string') forwarded[name] = value;
+        else if (Array.isArray(value)) forwarded[name] = value.join(', ');
+      }
+      const response = await world.fetchPort(port, requestPath, { method, headers: forwarded, body });
+      const headers: Record<string, string> = {};
+      for (const name of ['content-type', 'cache-control', 'etag', 'last-modified', 'location',
+        'content-range', 'accept-ranges', 'vary']) {
+        if (response.headers[name]) headers[name] = response.headers[name]!;
+      }
+      if (headers.location) headers.location = previewLocation(taskId, port, headers.location, proxyBase) ?? '';
+      if (!headers.location) delete headers.location;
+      headers['content-length'] = String(response.body.length);
+      headers['referrer-policy'] = 'no-referrer';
+      headers['x-content-type-options'] = 'nosniff';
+      res.writeHead(response.status, headers);
+      res.end(method === 'HEAD' ? undefined : response.body);
+    } catch (error) {
+      const tooLarge = error instanceof AttachmentError && /too large/i.test(error.message);
+      this.json(res, tooLarge ? 413 : 502,
+        { error: tooLarge ? error.message : `preview unavailable: ${String((error as Error)?.message ?? error)}` });
+    }
+  }
+
+  private async serveLeasedPreview(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+    const match = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
+    const lease = match ? this.deps.store.previewLease(match[1]!) : undefined;
+    if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.json(res, 404, { error: 'preview not found or expired' });
+    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase())
+      return this.json(res, 404, { error: 'preview not found or expired' });
+    const current = this.deps.store.currentWorld(lease.worldId);
+    if (!current || (current.generation ?? 1) !== lease.generation) return this.json(res, 410, { error: 'preview world generation is no longer current' });
+    if (lease.tokenHash) {
+      const queryToken = url.searchParams.get('token') ?? '';
+      const cookieToken = previewCookieValue(typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined, lease.id);
+      const supplied = queryToken || cookieToken;
+      if (!previewTokenMatches(lease.tokenHash, supplied))
+        return this.json(res, 401, { error: 'invalid preview token' });
+      // Exchange the URL bearer for an HttpOnly, lease-path-scoped cookie. This
+      // makes relative CSS/JS and HMR sockets work without leaking the token via
+      // Referer, browser history, or application JavaScript.
+      if (queryToken && (req.method === 'GET' || req.method === 'HEAD')) {
+        const query = new URLSearchParams(url.searchParams);
+        query.delete('token');
+        res.writeHead(303, { location: `${url.pathname}${query.size ? `?${query}` : ''}`,
+          'set-cookie': previewCookieHeader(lease.id, queryToken, lease.expiresAt),
+          'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+        return void res.end();
+      }
+      if (queryToken) res.setHeader('set-cookie', previewCookieHeader(lease.id, queryToken, lease.expiresAt));
+    } else {
+      const session = await this.auth(req, lease.projectId, lease.organizationId);
+      if (!session || !this.deps.tokens.check(session.apiToken, 'task:read', { projectId: lease.projectId, taskId: lease.taskId }).ok)
+        return this.json(res, 401, { error: 'unauthorized' });
+    }
+    const requestPath = `${match?.[2] ?? '/'}${url.searchParams.has('token')
+      ? (() => { const q = new URLSearchParams(url.searchParams); q.delete('token'); return q.size ? `?${q}` : ''; })()
+      : url.search}`;
+    return this.servePreview(req, res, lease.taskId, lease.port, requestPath,
+      `/preview/${encodeURIComponent(lease.id)}`);
+  }
+
+  /** Authenticated bidirectional proxy for HMR/live-reload sockets in a task
+   * preview. The browser sees only Karmax; provider URLs and access tokens stay
+   * on this side of the trust boundary. */
+  private async previewWebSocket(browser: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    let taskId: string;
+    let port: number;
+    let requestPath: string;
+    const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
+    if (taskMatch) {
+      if (configuredPreviewOrigin()) { browser.close(4403, 'use isolated preview origin'); return; }
+      taskId = decodeURIComponent(taskMatch[1]!);
+      port = Number(taskMatch[2]);
+      const task = this.deps.store.getTask(taskId);
+      const auth = await this.socketAuth(req, url, task?.projectId);
+      if (!task || !auth || !this.deps.tokens.check(auth.apiToken, 'task:review:execute', { projectId: task.projectId, taskId }).ok) {
+        browser.close(4403, 'forbidden'); return;
+      }
+      const query = new URLSearchParams(url.searchParams); query.delete('token');
+      requestPath = `${taskMatch[3] ?? '/'}${query.size ? `?${query}` : ''}`;
+    } else {
+      const leaseMatch = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
+      const lease = leaseMatch ? this.deps.store.previewLease(leaseMatch[1]!) : undefined;
+      if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
+        browser.close(4404, 'preview expired'); return;
+      }
+      const current = this.deps.store.currentWorld(lease.worldId);
+      if (!current || (current.generation ?? 1) !== lease.generation) { browser.close(4410, 'world changed'); return; }
+      if (lease.tokenHash) {
+        const queryToken = url.searchParams.get('token') ?? '';
+        const cookieToken = previewCookieValue(typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined, lease.id);
+        if (!previewTokenMatches(lease.tokenHash, queryToken || cookieToken)) {
+          browser.close(4401, 'invalid token'); return;
+        }
+      } else {
+        const auth = await this.auth(req, lease.projectId, lease.organizationId);
+        if (!auth || !this.deps.tokens.check(auth.apiToken, 'task:read', { projectId: lease.projectId, taskId: lease.taskId }).ok) {
+          browser.close(4401, 'unauthorized'); return;
+        }
+      }
+      taskId = lease.taskId;
+      port = lease.port;
+      const query = new URLSearchParams(url.searchParams); query.delete('token');
+      requestPath = `${leaseMatch?.[2] ?? '/'}${query.size ? `?${query}` : ''}`;
+    }
+    const task = this.deps.store.getTask(taskId);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    if (!handle) { browser.close(4404, 'world unavailable'); return; }
+    const world = await this.deps.worlds.open(handle);
+    if (!world.previewSocketTarget) { browser.close(4400, 'provider has no WebSocket previews'); return; }
+    const target = await world.previewSocketTarget(port, requestPath);
+    const protocols = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map((value) => value.trim()).filter(Boolean);
+    const upstream = new WebSocketClient(target.url, protocols, { headers: target.headers });
+    const pending: Array<{ data: import('ws').RawData; binary: boolean }> = [];
+    browser.on('message', (data, binary) => {
+      if (upstream.readyState === WebSocketClient.OPEN) upstream.send(data, { binary });
+      else if (upstream.readyState === WebSocketClient.CONNECTING && pending.length < 100) pending.push({ data, binary });
+    });
+    browser.on('close', (code, reason) => {
+      if (upstream.readyState === WebSocketClient.CONNECTING) upstream.terminate();
+      else if (upstream.readyState === WebSocketClient.OPEN) upstream.close(code || 1000, reason.toString());
+    });
+    browser.on('error', () => upstream.terminate());
+    upstream.on('open', () => {
+      for (const message of pending.splice(0)) upstream.send(message.data, { binary: message.binary });
+    });
+    upstream.on('message', (data, binary) => { if (browser.readyState === browser.OPEN) browser.send(data, { binary }); });
+    upstream.on('close', (code, reason) => { if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
+    upstream.on('error', () => { if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
+  }
+
+  /** SCIM 2.0 provisioning boundary. A tenant-scoped bearer token is stored only
+   * as a hash; deprovisioning removes every org/team/project grant and revokes
+   * browser + platform sessions without deleting an identity used by another org. */
+  private async scim(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+    const match = url.pathname.match(/^\/scim\/v2\/([^/]+)\/(Users|Groups)(?:\/([^/]+))?$/);
+    if (!match || !this.deps.identity) return this.scimJson(res, 404, { detail: 'resource not found' });
+    const organizationId = decodeURIComponent(match[1]!);
+    const token = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+    if (!this.deps.store.verifyScimToken(organizationId, token)) return this.scimJson(res, 401, { detail: 'invalid bearer token' });
+    const resource = match[2]!;
+    const id = match[3] ? decodeURIComponent(match[3]) : undefined;
+    const method = req.method ?? 'GET';
+    try {
+      const body = method === 'GET' || method === 'DELETE' ? {} : await this.body(req);
+      if (resource === 'Users') {
+        if (method === 'GET' && id) {
+          const user = this.deps.identity.listUsers().find((candidate) => candidate.id === id);
+          if (!user || !this.deps.store.organizationMembership(organizationId, id)) return this.scimJson(res, 404, { detail: 'user not found' });
+          return this.scimJson(res, 200, scimUser(user));
+        }
+        if (method === 'GET') {
+          const filter = url.searchParams.get('filter')?.match(/^userName\s+eq\s+"([^"]+)"$/i)?.[1]?.toLowerCase();
+          const members = new Set(this.deps.store.listOrganizationMemberships(organizationId).map((member) => member.userId));
+          const users = this.deps.identity.listUsers().filter((user) => members.has(user.id) && (!filter || user.email.toLowerCase() === filter));
+          return this.scimJson(res, 200, scimList(users.map((user) => scimUser(user))));
+        }
+        if (method === 'POST') {
+          const email = String(body.userName ?? body.emails?.find((entry: any) => entry.primary)?.value ?? '').trim().toLowerCase();
+          if (!email) return this.scimJson(res, 400, { detail: 'userName is required' });
+          let user = this.deps.identity.listUsers().find((candidate) => candidate.email.toLowerCase() === email);
+          if (!user) user = await this.deps.identity.createUser({ name: String(body.displayName ?? body.name?.formatted ?? email.split('@')[0]),
+            email, password: crypto.randomBytes(24).toString('base64url') });
+          this.deps.store.setOrganizationMembership(organizationId, user.id, 'member');
+          this.deps.authorization?.grant('system:scim', { principalId: `user:${user.id}`,
+            scopeKey: `organization:${organizationId}`, profileId: 'developer',
+            capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] });
+          return this.scimJson(res, 201, scimUser(user));
+        }
+        if ((method === 'PATCH' || method === 'PUT') && id) {
+          const activeOperation = body.Operations?.find((operation: any) => String(operation.path ?? '').toLowerCase() === 'active');
+          const active = activeOperation ? activeOperation.value !== false : body.active !== false;
+          if (!active) {
+            this.deps.store.deprovisionOrganizationUser(organizationId, id);
+            this.deps.identity.revokeUserSessions(id);
+          } else if (!this.deps.store.organizationMembership(organizationId, id)) this.deps.store.setOrganizationMembership(organizationId, id, 'member');
+          const user = this.deps.identity.listUsers().find((candidate) => candidate.id === id);
+          return this.scimJson(res, 200, user ? scimUser(user, active) : { id, active });
+        }
+        if (method === 'DELETE' && id) {
+          this.deps.store.deprovisionOrganizationUser(organizationId, id);
+          this.deps.identity.revokeUserSessions(id);
+          res.writeHead(204); return void res.end();
+        }
+      }
+      if (resource === 'Groups') {
+        if (method === 'GET' && id) {
+          const team = this.deps.store.getTeam(id);
+          if (!team || team.organizationId !== organizationId) return this.scimJson(res, 404, { detail: 'group not found' });
+          return this.scimJson(res, 200, scimGroup(team, this.deps.store.listTeamMemberships(team.id)));
+        }
+        if (method === 'GET') return this.scimJson(res, 200, scimList(this.deps.store.listTeams(organizationId)
+          .map((team) => scimGroup(team, this.deps.store.listTeamMemberships(team.id)))));
+        if (method === 'POST') {
+          const team = this.deps.store.createTeam({ organizationId, name: String(body.displayName ?? 'Team') });
+          for (const member of body.members ?? []) if (this.deps.store.organizationMembership(organizationId, String(member.value)))
+            this.deps.store.setTeamMembership(team.id, String(member.value));
+          return this.scimJson(res, 201, scimGroup(team, this.deps.store.listTeamMemberships(team.id)));
+        }
+        if ((method === 'PUT' || method === 'PATCH') && id) {
+          const team = this.deps.store.getTeam(id);
+          if (!team || team.organizationId !== organizationId) return this.scimJson(res, 404, { detail: 'group not found' });
+          const members = body.members ?? body.Operations?.find((operation: any) => String(operation.path ?? '').toLowerCase() === 'members')?.value;
+          if (Array.isArray(members)) {
+            this.deps.store.db.prepare('DELETE FROM team_memberships WHERE teamId=?').run(team.id);
+            for (const member of members) if (this.deps.store.organizationMembership(organizationId, String(member.value)))
+              this.deps.store.setTeamMembership(team.id, String(member.value));
+          }
+          return this.scimJson(res, 200, scimGroup(team, this.deps.store.listTeamMemberships(team.id)));
+        }
+      }
+      return this.scimJson(res, 405, { detail: 'method not supported' });
+    } catch (error) {
+      return this.scimJson(res, /owner/i.test(String((error as Error)?.message)) ? 409 : 400,
+        { detail: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  private scimJson(res: http.ServerResponse, status: number, body: unknown) {
+    const value = JSON.stringify(body);
+    res.writeHead(status, { 'content-type': 'application/scim+json', 'content-length': String(Buffer.byteLength(value)) });
+    res.end(value);
+  }
+
   // ── helpers ──
-  private async auth(req: http.IncomingMessage, projectId?: string): Promise<Session | undefined> {
+  private async removeProjectExternalResources(projectId: string, reason: string) {
+    const project = this.deps.store.getProject(projectId);
+    if (!project) throw new Error('project not found');
+    const resources = this.deps.store.projectResources(projectId);
+    for (const task of this.deps.store.listTasks(projectId)) {
+      try { await this.deps.client.workflow.getHandle(task.id).terminate(reason); }
+      catch (error) { if (!isWorkflowGone(error)) throw error; }
+    }
+    // Finalize billing before metadata disappears. Queued leases produce zero
+    // usage; active leases keep the elapsed provider cost in the org ledger.
+    for (const lease of resources.leases) {
+      if (this.deps.runners) this.deps.runners.release(lease.id, lease.provider);
+      else this.deps.store.releaseWorldLease(lease.id);
+    }
+    for (const handle of resources.worlds) {
+      try {
+        // Do not use registry recovery here: deletion must never restore a cold
+        // checkpoint merely to destroy the newly restored generation.
+        const world = await this.deps.worlds.get(handle.kind).open(handle as import('../world/types.js').WorldHandle);
+        await world.destroy();
+      } catch (error) { if (!isWorldGone(error)) throw error; }
+    }
+    if (resources.objectKeys.length && !this.deps.objects)
+      throw new Error('object store is unavailable; project resources were not fully deleted');
+    for (const key of resources.objectKeys) await this.deps.objects!.delete(key);
+    return resources;
+  }
+
+  private requestIsPreviewOrigin(req: http.IncomingMessage): boolean {
+    const origin = configuredPreviewOrigin();
+    if (!origin) return false;
+    try {
+      const requested = new URL(`http://${String(req.headers.host ?? '').trim()}`);
+      const base = new URL(origin);
+      return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
+        && requested.port === base.port;
+    } catch { return false; }
+  }
+
+  private publicUrl(req: http.IncomingMessage): string {
+    const configured = process.env.KARMAX_PUBLIC_URL?.trim();
+    if (configured) return new URL(configured).origin;
+    const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() || 'http';
+    const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? 'localhost').split(',')[0]?.trim();
+    return new URL(`${proto}://${host}`).origin;
+  }
+
+  private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
     const h = req.headers['authorization'];
     const sid = h?.startsWith('Bearer ') ? h.slice(7) : undefined;
     if (sid) {
@@ -1704,16 +2845,26 @@ export class Gateway {
     const identity = await this.deps.identity.session(requestHeaders(req.headers));
     if (!identity) return undefined;
     const principal = `user:${identity.user.id}`;
-    const caps = this.deps.authorization?.capabilities(principal, projectId) ?? [];
+    const resolvedOrganizationId = organizationId ?? (projectId ? this.deps.store.getProject(projectId)?.organizationId : undefined);
+    if (resolvedOrganizationId) {
+      const policy = this.deps.store.getOrganizationIdentityPolicy(resolvedOrganizationId);
+      if (policy.enforceSso && (!policy.oidcProviderId
+        || !this.deps.identity.providersForUser(identity.user.id).includes(policy.oidcProviderId))) return undefined;
+      if (policy.enforceSso && policy.verifiedDomains.length && this.deps.store.organizationMembership(resolvedOrganizationId, identity.user.id)) {
+        const domain = identity.user.email.split('@')[1]?.toLowerCase();
+        if (!domain || !policy.verifiedDomains.includes(domain)) return undefined;
+      }
+    }
+    const caps = this.deps.authorization?.capabilities(principal, projectId, resolvedOrganizationId) ?? [];
     const fingerprint = JSON.stringify(caps.slice().sort());
-    const cacheKey = `${identity.session.id}:${projectId ?? 'global'}`;
+    const cacheKey = `${identity.session.id}:${resolvedOrganizationId ?? 'global'}:${projectId ?? '*'}`;
     let cached = this.identityTokens.get(cacheKey);
     if (!cached || cached.fingerprint !== fingerprint || !this.deps.tokens.verify(cached.apiToken)) {
       if (cached) this.deps.tokens.revoke(cached.apiToken);
-      cached = { apiToken: this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000).token, fingerprint };
+      cached = { apiToken: this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000, resolvedOrganizationId).token, fingerprint };
       this.identityTokens.set(cacheKey, cached);
     }
-    return { user: identity.user.name, userId: identity.user.id, apiToken: cached.apiToken };
+    return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken };
   }
   /** Browser WebSockets carry Better Auth cookies. The legacy test/embed gateway
    * instead has a JSON session id, which may be passed explicitly in the query
@@ -1728,14 +2879,23 @@ export class Gateway {
     }
     return this.auth(req, projectId);
   }
-  private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string } {
+  private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {
     const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1]
       ?? url.searchParams.get('projectId') ?? undefined;
-    const taskId = pathname.match(/^\/api\/tasks\/([^/]+)/)?.[1] ?? url.searchParams.get('taskId') ?? undefined;
+    const artifact = pathname.match(/^\/api\/artifacts\/([^/]+)/)?.[1];
+    const artifactRecord = artifact ? this.deps.store.getPromotedArtifact(artifact) : undefined;
+    const previewId = pathname.match(/^\/api\/preview-leases\/([^/]+)/)?.[1];
+    const previewRecord = previewId ? this.deps.store.previewLease(previewId) : undefined;
+    const taskId = pathname.match(/^\/api\/tasks\/([^/]+)/)?.[1] ?? artifactRecord?.taskId ?? previewRecord?.taskId
+      ?? url.searchParams.get('taskId') ?? undefined;
     const taskProject = taskId ? this.deps.store.getTask(taskId)?.projectId : undefined;
-    return { projectId: projectId ?? taskProject, ...(taskId ? { taskId } : {}) };
+    const resolvedProjectId = projectId ?? taskProject;
+    const organizationId = pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1]
+      ?? url.searchParams.get('organizationId')
+      ?? (resolvedProjectId ? this.deps.store.getProject(resolvedProjectId)?.organizationId : undefined);
+    return { projectId: resolvedProjectId, organizationId, ...(taskId ? { taskId } : {}) };
   }
   private async sendWebResponse(res: http.ServerResponse, response: Response) {
     const body = Buffer.from(await response.arrayBuffer());
@@ -1747,60 +2907,149 @@ export class Gateway {
     res.end(body);
   }
   private json(res: http.ServerResponse, status: number, obj: unknown) {
-    const body = JSON.stringify(obj ?? null);
-    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+    const body = JSON.stringify(toPublicPayload(obj ?? null));
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8',
+      'x-karmax-cell': this.deps.cellId ?? 'local' });
+    res.end(body);
+  }
+  private githubCallbackPage(res: http.ServerResponse, status: number, message: string) {
+    const body = `<!doctype html><meta charset="utf-8"><title>Karmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Karmax</a></p></main>`;
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
+      'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private async body(req: http.IncomingMessage): Promise<any> {
-    const chunks: Buffer[] = [];
-    for await (const c of req) chunks.push(c as Buffer);
-    if (!chunks.length) return {};
+    const value = await this.rawBody(req, 2 * 1024 * 1024);
+    if (!value.length) return {};
     try {
-      return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      return JSON.parse(value.toString('utf8'));
     } catch {
       return {};
     }
   }
-  /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`
-   *  (the JSON `body()` reader is unbounded — binary uploads must be capped). */
+  /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`. */
   private async rawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
     const chunks: Buffer[] = [];
     let total = 0;
+    let exceeded = false;
     for await (const c of req) {
       total += (c as Buffer).length;
       if (total > maxBytes) {
-        req.destroy();
-        throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
+        exceeded = true;
+        continue;
       }
-      chunks.push(c as Buffer);
+      if (!exceeded) chunks.push(c as Buffer);
     }
+    if (exceeded) throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
     return Buffer.concat(chunks);
   }
   private fail(res: http.ServerResponse, e: unknown) {
     try {
-      this.json(res, 500, { error: String((e as Error)?.message ?? e) });
+      this.json(res, e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500,
+        { error: String((e as Error)?.message ?? e) });
     } catch {
       /* ignore */
     }
   }
 }
 
-/** Tear down a check-in PTY and everything running inside it. The interactive
- *  shell node-pty spawned is a session leader (pid == session id), so killing
- *  the whole session reaps its children — foreground and background jobs alike.
- *  `pkill -s` is the thorough path; the process-group kill and `term.kill()` are
- *  fallbacks for platforms without pkill or if the session id trick misses. */
-function killPtySession(term: { pid?: number; kill?: () => void }): void {
-  const pid = term?.pid;
-  if (typeof pid === 'number') {
-    try { spawn('pkill', ['-KILL', '-s', String(pid)], { stdio: 'ignore' }).on('error', () => {}); } catch { /* no pkill */ }
-    try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+/** Keep a service's loopback redirect inside the authenticated preview proxy.
+ * External HTTP(S) redirects remain explicit; non-web schemes are discarded. */
+export function previewLocation(taskId: string, port: number, value: string,
+  proxyBase = `/api/tasks/${encodeURIComponent(taskId)}/preview/${port}`): string | undefined {
+  try {
+    const target = new URL(value, `http://localhost:${port}`);
+    if (!['http:', 'https:'].includes(target.protocol)) return undefined;
+    if (['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(target.hostname)) {
+      return `${proxyBase}${target.pathname}${target.search}${target.hash}`;
+    }
+    return target.toString();
+  } catch {
+    return undefined;
   }
-  try { term.kill?.(); } catch { /* already dead */ }
+}
+
+function previewAccessTtlMs(): number {
+  const value = Number(process.env.KARMAX_REVIEW_PREVIEW_TTL_MS);
+  return Number.isFinite(value) && value >= 60_000 ? Math.min(value, 24 * 60 * 60_000) : 8 * 60 * 60_000;
+}
+
+function reviewPorts(view: import('../domain/types.js').TaskView | undefined): Set<number> {
+  const ports = new Set<number>();
+  for (const action of view?.reviewInfo?.actions ?? []) {
+    for (const value of action.openUrls ?? []) {
+      try {
+        const url = new URL(value);
+        if (!['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(url.hostname)) continue;
+        const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+        if (Number.isInteger(port) && port > 0 && port <= 65_535) ports.add(port);
+      } catch { /* non-URL review text is not a preview declaration */ }
+    }
+  }
+  return ports;
+}
+
+const SCIM_USER_SCHEMA = 'urn:ietf:params:scim:schemas:core:2.0:User';
+const SCIM_GROUP_SCHEMA = 'urn:ietf:params:scim:schemas:core:2.0:Group';
+function scimUser(user: { id: string; email: string; name: string }, active = true) {
+  return { schemas: [SCIM_USER_SCHEMA], id: user.id, userName: user.email, displayName: user.name,
+    name: { formatted: user.name }, emails: [{ value: user.email, primary: true }], active };
+}
+function scimGroup(team: { id: string; name: string }, members: Array<{ userId: string }>) {
+  return { schemas: [SCIM_GROUP_SCHEMA], id: team.id, displayName: team.name,
+    members: members.map((member) => ({ value: member.userId })) };
+}
+function scimList(Resources: unknown[]) {
+  return { schemas: ['urn:ietf:params:scim:api:messages:2.0:ListResponse'], totalResults: Resources.length,
+    startIndex: 1, itemsPerPage: Resources.length, Resources };
+}
+
+function prometheusMetrics(snapshot: Record<string, unknown>): string {
+  const lines = ['# HELP karmax_info Karmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
+  const scalar = (name: string, help: string, value: unknown) => {
+    lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${Number(value ?? 0)}`);
+  };
+  scalar('karmax_organizations', 'Organizations in this cell.', snapshot.organizations);
+  scalar('karmax_projects', 'Projects in this cell.', snapshot.projects);
+  scalar('karmax_event_cursor', 'Latest durable gateway event sequence.', snapshot.eventCursor);
+  scalar('karmax_database_bytes', 'SQLite control-plane database bytes.', snapshot.databaseBytes);
+  const grouped = (metric: string, help: string, values: unknown) => {
+    lines.push(`# HELP ${metric} ${help}`, `# TYPE ${metric} gauge`);
+    for (const [state, count] of Object.entries((values ?? {}) as Record<string, unknown>))
+      lines.push(`${metric}{state="${state.replace(/["\\]/g, '_')}"} ${Number(count)}`);
+  };
+  grouped('karmax_tasks', 'Tasks by durable status.', snapshot.tasks);
+  grouped('karmax_worlds', 'World generations by lifecycle state.', snapshot.worlds);
+  grouped('karmax_runner_leases', 'Runner leases by state.', snapshot.runnerLeases);
+  grouped('karmax_executions', 'Interactive executions by state.', snapshot.executions);
+  grouped('karmax_deliveries', 'Notification outbox rows by state.', snapshot.deliveries);
+  return `${lines.join('\n')}\n`;
+}
+
+function isWorkflowGone(error: unknown): boolean {
+  const value = error as { name?: string; message?: string };
+  return value?.name === 'WorkflowNotFoundError' || /workflow.*(?:not found|already (?:closed|completed|terminated))/i.test(value?.message ?? '');
+}
+
+function isWorldGone(error: unknown): boolean {
+  const value = error as { message?: string };
+  return /(?:not found|does not exist|already (?:destroyed|removed)|no such sandbox|no world)/i.test(value?.message ?? '');
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
 }
 
 /** Expand ~ / $HOME in repo paths so a configured repo resolves to a real dir. */
-function normalizeConfig(config: ProjectConfig = {}): ProjectConfig {
+function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = false): ProjectConfig {
+  if (process.env.KARMAX_DEPLOYMENT === 'hosted') {
+    const worldProvider = config.worldProvider ?? (defaultHostedProvider
+      ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
+      : undefined);
+    if (worldProvider && ['worktree', 'container', 'memory'].includes(worldProvider))
+      throw new Error('hosted projects require a remote world provider');
+    if (worldProvider) config = { ...config, worldProvider };
+  }
   if (Array.isArray(config.repos)) {
     return { ...config, repos: config.repos.filter(Boolean).map(expandPath) };
   }

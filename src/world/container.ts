@@ -2,9 +2,10 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
-import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult } from './types.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath } from './types.js';
 import { WorktreeProvider } from './worktree.js';
 import { paths } from '../config/paths.js';
+import { openSpawnedPty, startSpawnedProcess } from './local-execution.js';
 
 const pexec = promisify(execFile);
 const IMAGE = process.env.KARMAX_CONTAINER_IMAGE ?? 'node:22-slim';
@@ -75,7 +76,33 @@ export class ContainerWorldProvider implements WorldProvider {
   }
 
   async open(handle: WorldHandle): Promise<World> {
+    const name = String(handle.meta?.container ?? '');
+    if (!name) throw new Error('container world handle has no container id');
+    const state = await this.status(handle);
+    if (state === 'missing') throw new Error(`container world "${handle.id}" no longer exists`);
+    if (state === 'parked') {
+      const started = await docker(['start', name]);
+      if (started.code !== 0) throw new Error(`failed to resume container world: ${started.stderr}`);
+    }
     return new ContainerWorld(handle);
+  }
+
+  async park(handle: WorldHandle): Promise<WorldHandle> {
+    const name = String(handle.meta?.container ?? '');
+    if (!name) return handle;
+    const stopped = await docker(['stop', '-t', '10', name]);
+    if (stopped.code !== 0 && !(await this.status(handle) === 'missing')) {
+      throw new Error(`failed to park container world: ${stopped.stderr}`);
+    }
+    return handle;
+  }
+
+  async status(handle: WorldHandle): Promise<WorldLifecycleState> {
+    const name = String(handle.meta?.container ?? '');
+    if (!name) return 'missing';
+    const inspected = await docker(['inspect', '-f', '{{.State.Running}}', name], { timeoutMs: 10_000 });
+    if (inspected.code !== 0) return 'missing';
+    return inspected.stdout.trim() === 'true' ? 'ready' : 'parked';
   }
 }
 
@@ -88,18 +115,40 @@ class ContainerWorld implements World {
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const inner = [cmd, ...args].map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
     const dArgs = ['exec'];
+    if (opts.cwd) dArgs.push('-w', this.containerCwdFromAny(opts.cwd));
     for (const [k, v] of Object.entries(opts.env ?? {})) dArgs.push('-e', `${k}=${v}`);
     dArgs.push(this.name, 'bash', '-lc', inner);
     return docker(dArgs, { timeoutMs: opts.timeoutMs });
   }
   // file ops use the host bind-mount (fast, and visible inside the container)
   async readFile(rel: string): Promise<string> {
-    return fs.promises.readFile(path.join(this.handle.root, rel), 'utf8');
+    return fs.promises.readFile(this.filePath(rel), 'utf8');
+  }
+  async readFileBuffer(rel: string): Promise<Buffer> {
+    return fs.promises.readFile(this.filePath(rel));
   }
   async writeFile(rel: string, content: string): Promise<void> {
-    const abs = path.join(this.handle.root, rel);
+    const abs = this.filePath(rel);
     await fs.promises.mkdir(path.dirname(abs), { recursive: true });
     await fs.promises.writeFile(abs, content);
+  }
+  async writeFileBuffer(rel: string, content: Buffer): Promise<void> {
+    const abs = this.filePath(rel);
+    await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+    await fs.promises.writeFile(abs, content);
+  }
+  async startProcess(spec: WorldProcessSpec): Promise<WorldProcess> {
+    const args = ['exec'];
+    if (spec.cwd) args.push('-w', this.containerCwd(spec.cwd));
+    for (const [key, value] of Object.entries(spec.env ?? {})) args.push('-e', `${key}=${value}`);
+    args.push(this.name, 'bash', '-lc', spec.command);
+    return startSpawnedProcess('docker', args, { env: process.env, detached: true });
+  }
+  async openPty(spec: WorldPtySpec = {}): Promise<WorldPty> {
+    const args = ['exec', '-it', '-w', this.containerCwd(spec.cwd)];
+    for (const [key, value] of Object.entries(spec.env ?? {})) args.push('-e', `${key}=${value}`);
+    args.push(this.name, 'bash', '--norc', '-i');
+    return openSpawnedPty('docker', args, spec);
   }
   async listFiles(): Promise<string[]> {
     const out: string[] = [];
@@ -123,5 +172,21 @@ class ContainerWorld implements World {
       await git(r.repo, ['worktree', 'prune']);
     }
     if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
+  }
+  private filePath(relPath: string): string {
+    const safe = worldRelativePath(relPath);
+    if (safe === '.') throw new Error('path is a directory');
+    return path.join(this.handle.root, ...safe.split('/'));
+  }
+  private containerCwd(relPath = '.'): string {
+    const safe = worldRelativePath(relPath);
+    return safe === '.' ? '/work' : `/work/${safe}`;
+  }
+  private containerCwdFromAny(value: string): string {
+    if (value === this.handle.root) return '/work';
+    if (value.startsWith(`${this.handle.root}${path.sep}`)) {
+      return `/work/${value.slice(this.handle.root.length + 1).split(path.sep).join('/')}`;
+    }
+    return this.containerCwd(value);
   }
 }

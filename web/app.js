@@ -11,6 +11,13 @@ const S = {
   meta: null,
   contributions: null,
   projects: [],
+  organizations: [],
+  organizationId: null,
+  organizationMembers: [],
+  teams: [],
+  users: [],
+  inbox: [],
+  deliveryPreferences: null,
   projectId: null,
   tasks: [],
   attemptGroup: null, // logical-task group for the open task page
@@ -45,6 +52,7 @@ const S = {
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   agentQueue: { capacity: 3, queue: [], current: [] }, // workflow-owned host admission queue
   modelCatalog: null, // provider-native model metadata loaded from the gateway
+  inviteNotice: null,
 };
 
 // Non-principal attempts are intentionally absent from S.tasks because the list
@@ -83,6 +91,9 @@ function parseRoute(pathname) {
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard' };
   if (seg[0] === 'settings') return { name: 'global', tab: 'global' };
+  if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox' };
+  if (seg[0] === 'organization') return { name: 'global', tab: 'organization' };
+  if (seg[0] === 'invite') return { name: 'invite' };
   if (seg[0] === 'projects' && seg[1]) {
     const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
@@ -131,6 +142,7 @@ async function applyRoute() {
     renderRail();
     renderMain();
     if (r.tab === 'dashboard') renderDashboard();
+    if (r.tab === 'organization') hydrateOrganizationView();
     return;
   }
   // project / task routes → resolve the project (by name-slug) + optional open task
@@ -214,6 +226,13 @@ function wireTaskNav(el, getId, open = goToTask) {
 function numLabel(taskId) {
   const t = (S.tasks || []).find((x) => x.id === taskId);
   return t && t.num != null ? `#${t.num}` : String(taskId || '').slice(0, 8);
+}
+
+function principalLabel(principal) {
+  if (!principal) return 'Unassigned';
+  if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
+  if (principal.kind === 'team') return S.teams.find((t) => t.id === principal.teamId)?.name || principal.teamId;
+  return `Task agent · ${principal.role}`;
 }
 
 const WORKFLOWS = [
@@ -939,11 +958,28 @@ function toast(msg, err = false, action) {
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   const session = await (await fetch('/api/session')).json();
+  S.sso = session.sso || null;
   if (session.setupRequired) return renderSetup();
   if (session.authRequired && !session.authenticated && !session.token) return renderLogin();
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
+  const route = parseRoute(location.pathname);
+  if (route.name === 'invite') {
+    const invitationToken = new URLSearchParams(location.search).get('token');
+    if (invitationToken) {
+      try {
+        const membership = await api('/api/invitations/accept', { method: 'POST', body: JSON.stringify({ token: invitationToken }) });
+        S.organizationId = membership.organizationId;
+        S.inviteNotice = 'Invitation accepted. A project administrator can now add you to a project.';
+        history.replaceState({ kx: 1 }, '', '/organization');
+      } catch (error) {
+        S.inviteNotice = error.message;
+        history.replaceState({ kx: 1 }, '', '/organization');
+      }
+    }
+  }
   S.meta = await api('/api/meta');
+  await loadOrganizations().catch(() => {});
   try { await loadProjects(); }
   catch (e) {
     // A self-registered identity is real but intentionally starts with no
@@ -952,6 +988,8 @@ async function boot() {
     if (e.status === 403) return renderAccessPending();
     throw e;
   }
+  if (!S.organizationId) S.organizationId = S.projects.find((p) => p.organizationId)?.organizationId || S.organizations[0]?.id || null;
+  await loadCollaboration().catch(() => {});
   const projectScope = S.projectId ? `?projectId=${encodeURIComponent(S.projectId)}` : '';
   try {
     S.contributions = await api(`/api/contributions${projectScope}`);
@@ -968,6 +1006,30 @@ async function boot() {
 async function loadProjects() {
   S.projects = await api('/api/projects');
   if (!S.projectId && S.projects[0]) S.projectId = S.projects[0].id;
+  if (S.projectId) S.organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
+}
+
+async function loadOrganizations() {
+  S.organizations = await api('/api/organizations').catch(() => []);
+  if (!S.organizationId) S.organizationId = S.organizations[0]?.id || null;
+}
+
+async function loadCollaboration() {
+  if (!S.organizationId) return;
+  const q = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  const [members, teams, users, inbox, prefs] = await Promise.all([
+    api(`/api/organizations/${S.organizationId}/members`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/teams`).catch(() => []),
+    api('/api/users').catch(() => []),
+    api(`/api/inbox${q}`).catch(() => []),
+    api(`/api/inbox/preferences${q}`).catch(() => null),
+  ]);
+  S.organizationMembers = members || [];
+  S.teams = teams || [];
+  S.users = users || [];
+  S.inbox = inbox || [];
+  S.deliveryPreferences = prefs;
+  updateBell();
 }
 
 async function loadTasks() {
@@ -1106,6 +1168,8 @@ function connectWs() {
     }
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => { if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks(); }, 350);
+    if (S.organizationId && ['view.updated', 'task.responsibility-changed', 'task.mentioned'].includes(ev.type))
+      setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
 }
@@ -1126,6 +1190,10 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <div class="brand"><span class="mark">◇</span> karmax</div>
+      <select class="org-switcher" id="org-switcher" title="Organization">
+        ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
+        <option value="__new">＋ New organization</option>
+      </select>
       <div class="spacer"></div>
       <button class="icon-btn" id="topbar-palette" title="Search everything ( ${esc(fmtKeys('meta+k'))} )">⌕</button>
       <button class="icon-btn has-badge" id="bell" title="Needs attention">🔔<span class="badge hidden" id="bell-badge">0</span></button>
@@ -1140,6 +1208,14 @@ function renderShell() {
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#theme').addEventListener('click', toggleTheme);
   $('#bell').addEventListener('click', toggleNotifications);
+  $('#org-switcher')?.addEventListener('change', async (e) => {
+    if (e.target.value === '__new') return createOrganization();
+    S.organizationId = e.target.value;
+    const project = S.projects.find((p) => p.organizationId === S.organizationId);
+    S.projectId = project?.id || null;
+    await loadCollaboration().catch(() => {});
+    return go(project ? projectRoute(project.id) : '/organization');
+  });
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
 }
@@ -1148,8 +1224,12 @@ function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
   rail.innerHTML = `
+    <div class="label">${esc(S.organizations.find((o) => o.id === S.organizationId)?.name || 'Projects')}</div>
+    <div class="nav-item" id="rail-my-work" tabindex="0">◎ My work</div>
+    <div class="nav-item" id="rail-my-review" tabindex="0">✓ Needs my review</div>
+    <div class="nav-item ${S.tab === 'inbox' ? 'active' : ''}" id="rail-inbox" tabindex="0">◉ Inbox <span class="count">${S.inbox.filter((x) => x.unread).length || ''}</span></div>
     <div class="label">Projects</div>
-    ${S.projects
+    ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
       .map(
         (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" tabindex="0">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
@@ -1160,6 +1240,7 @@ function renderRail() {
     <div class="grow"></div>
     <div class="label">Global</div>
     <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
+    <div class="nav-item ${S.tab === 'organization' ? 'active' : ''}" id="rail-organization" tabindex="0">♙ Organization</div>
     <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
     <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
     <div class="nav-item" id="rail-palette" tabindex="0" title="Every command, task, and project — searchable">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
@@ -1167,6 +1248,10 @@ function renderRail() {
     e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
+  $('#rail-my-work')?.addEventListener('click', async () => { const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id; if (!pid) return; await go(projectRoute(pid)); await setQuery('is:mine'); });
+  $('#rail-my-review')?.addEventListener('click', async () => { const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id; if (!pid) return; await go(projectRoute(pid)); await setQuery('needs:my-review'); });
+  $('#rail-inbox')?.addEventListener('click', () => go('/inbox'));
+  $('#rail-organization')?.addEventListener('click', () => go('/organization'));
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
   $('#rail-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
@@ -1178,6 +1263,8 @@ function renderRail() {
 function switchTab(tab) {
   if (tab === 'dashboard') return go('/dashboard');
   if (tab === 'global') return go('/settings');
+  if (tab === 'inbox') return go('/inbox');
+  if (tab === 'organization') return go('/organization');
   const pid = S.projectId || S.projects[0]?.id;
   return go(pid ? projectRoute(pid, tab) : '/dashboard');
 }
@@ -1242,6 +1329,8 @@ function renderMain() {
   else if (S.tab === 'queue') content = queuesView();
   else if (S.tab === 'activity') content = activityView();
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
+  else if (S.tab === 'inbox') content = inboxView();
+  else if (S.tab === 'organization') content = organizationView();
   else if (S.tab === 'settings') content = settingsView(proj);
   else if (S.tab === 'global') content = globalSettingsView();
 
@@ -1257,6 +1346,8 @@ function renderMain() {
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
+  if (S.tab === 'inbox') wireInboxView();
+  if (S.tab === 'organization') hydrateOrganizationView();
 
   restoreFocus(main, focusState);
   updateBell();
@@ -1291,6 +1382,9 @@ function effectiveQuery(q, facets = ['archived', 'run']) {
 // repeatable series) first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
 const BUILTIN_VIEWS = [
+  { id: 'builtin:mine', name: 'My work', icon: '◎', query: 'is:mine' },
+  { id: 'builtin:my-review', name: 'Needs my review', icon: '✓', query: 'needs:my-review' },
+  { id: 'builtin:unassigned', name: 'Unassigned', icon: '○', query: 'is:unassigned' },
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
@@ -1558,6 +1652,7 @@ function taskRow(t) {
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
   const archived = t.params?.archived;
+  const responsibility = t.assignee ? `<span class="principal-chip">${esc(principalLabel(t.assignee))}</span>` : '';
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
@@ -1572,7 +1667,7 @@ function taskRow(t) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
-          ${priorityFlag(t)}${tagChips(t)}
+          ${responsibility}${priorityFlag(t)}${tagChips(t)}
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
@@ -2853,7 +2948,34 @@ function orgEditorHtml(rec) {
     </label>
     <div class="org-tags">${tags || '<span class="pal-sub">no tags</span>'}
       <button class="btn sm org-add-tag" title="Add a tag">＋ tag</button>
-    </div>
+    </div>${responsibilityEditorHtml(rec)}
+  </div>`;
+}
+
+function principalOptions(selected) {
+  const key = selected?.kind === 'user' ? `user:${selected.userId}` : selected?.kind === 'team' ? `team:${selected.teamId}` : '';
+  return `<option value="" ${!key ? 'selected' : ''}>Unassigned</option>`
+    + S.organizationMembers.map((m) => `<option value="user:${esc(m.userId)}" ${key === `user:${m.userId}` ? 'selected' : ''}>${esc(principalLabel({ kind: 'user', userId: m.userId }))}</option>`).join('')
+    + S.teams.map((t) => `<option value="team:${esc(t.id)}" ${key === `team:${t.id}` ? 'selected' : ''}>Team · ${esc(t.name)}</option>`).join('');
+}
+function principalFromValue(value) {
+  if (value.startsWith('user:')) return { kind: 'user', userId: value.slice(5) };
+  if (value.startsWith('team:')) return { kind: 'team', teamId: value.slice(5) };
+  return null;
+}
+function responsibilityEditorHtml(rec) {
+  const target = rec?.confirmationPolicy?.targets?.[0];
+  const rule = rec?.confirmationPolicy?.rule;
+  const selectedRule = typeof rule === 'object' ? 'quorum' : rule || 'any';
+  const me = S.user?.id;
+  const subscribed = !!(me && (rec?.subscribers || []).some((p) => p.kind === 'user' && p.userId === me));
+  return `<div class="responsibility-editor">
+    <label>Assignee<select class="q-sel resp-assignee">${principalOptions(rec?.assignee)}</select></label>
+    <label>Delegate<select class="q-sel resp-delegate">${principalOptions(rec?.delegate)}</select></label>
+    <label>Reviewer<select class="q-sel resp-reviewer">${principalOptions(target?.kind === 'project-role' ? null : target)}</select></label>
+    <label>Approval<select class="q-sel resp-rule"><option ${selectedRule === 'any' ? 'selected' : ''}>any</option><option ${selectedRule === 'all' ? 'selected' : ''}>all</option></select></label>
+    ${me ? `<label class="switch"><input type="checkbox" class="resp-subscribe" ${subscribed ? 'checked' : ''}/>Following</label>` : ''}
+    <span class="pal-sub">Created by ${esc(principalLabel(rec?.createdBy))}</span>
   </div>`;
 }
 
@@ -2891,6 +3013,26 @@ function wireOrgEditor(rootEl, rec, opts) {
     setTags((rec.tags || []).filter((id) => id !== el.dataset.untag)).catch((e) => toast(e.message, true));
   }));
   box.querySelector('.org-add-tag')?.addEventListener('click', () => openTagPicker(rec, setTags));
+  const saveResponsibility = async (field) => {
+    const id = await ensureId(); if (!id) return;
+    const assignee = principalFromValue(box.querySelector('.resp-assignee')?.value || '');
+    const delegate = principalFromValue(box.querySelector('.resp-delegate')?.value || '');
+    const reviewer = principalFromValue(box.querySelector('.resp-reviewer')?.value || '');
+    const confirmationPolicy = reviewer ? { targets: [reviewer], rule: box.querySelector('.resp-rule')?.value || 'any' } : null;
+    const patch = field === 'assignee' ? { assignee } : field === 'delegate' ? { delegate } : { confirmationPolicy };
+    const updated = await api(`/api/tasks/${id}/responsibility`, { method: 'PATCH', body: JSON.stringify(patch) });
+    Object.assign(rec, updated); afterChange();
+  };
+  box.querySelector('.resp-assignee')?.addEventListener('change', () => saveResponsibility('assignee').catch((e) => toast(e.message, true)));
+  box.querySelector('.resp-delegate')?.addEventListener('change', () => saveResponsibility('delegate').catch((e) => toast(e.message, true)));
+  box.querySelectorAll('.resp-reviewer,.resp-rule').forEach((el) => el.addEventListener('change', () => saveResponsibility('confirmation').catch((e) => toast(e.message, true))));
+  box.querySelector('.resp-subscribe')?.addEventListener('change', async (e) => {
+    const id = await ensureId(); if (!id || !S.user?.id) return;
+    try {
+      const result = await api(`/api/tasks/${id}/subscribers`, { method: e.target.checked ? 'POST' : 'DELETE', body: JSON.stringify({ principal: { kind: 'user', userId: S.user.id } }) });
+      rec.subscribers = result.subscribers; afterChange();
+    } catch (error) { e.target.checked = !e.target.checked; toast(error.message, true); }
+  });
 }
 
 // The task page's copy of the priority/tags editor (Parameters tab). NOTE: the task
@@ -3637,17 +3779,19 @@ function conversationPresence(v, t) {
 // (module state) and dies when you leave the task.
 function terminalPane(v) {
   const open = termIsOpenFor(v.taskId);
+  const hasWorld = !!(v.worldAvailable || v.worldPath);
   return `
     <div class="ck-pane-head">
       <b>Ephemeral terminal</b>
       <span class="pal-sub">a shell in the task's world — killed when you leave the task</span>
       <span style="flex:1"></span>
       ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+      ${S.meta?.hosted && v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
+      <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No world yet'}</button>
     </div>
     <div class="ck-term">
       <pre class="raw ${open ? '' : 'hidden'} term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell"></pre>
-      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${v.worldPath ? '“Open terminal” starts one in the task\'s world.' : 'This task has no world yet.'}</div>`}
+      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? '“Open terminal” starts one in the task\'s world.' : 'This task has no world yet.'}</div>`}
     </div>`;
 }
 
@@ -3659,6 +3803,38 @@ function wireCheckinSidebar(v) {
       renderTaskPage();
     }),
   );
+  $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
+}
+
+async function openLocalCheckout(v) {
+  let plan;
+  try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
+  catch (error) { return toast(error.message, true); }
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <p class="task-sub">The task branch is the handoff boundary. Karmax never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
+    <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
+    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
+    <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
+    <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
+    <p class="task-sub">Karmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
+    <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
+  </div></div>`;
+  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
+  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
+  $('#local-refresh', host)?.addEventListener('click', async (event) => {
+    const button = event.currentTarget; const result = $('#local-refresh-result', host); button.disabled = true; result.textContent = 'Importing the pushed branch…';
+    try {
+      const refreshed = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/refresh-from-github`, { method: 'POST', body: '{}' });
+      result.textContent = `${refreshed.updated.length} repositor${refreshed.updated.length === 1 ? 'y' : 'ies'} refreshed${refreshed.parked ? ' and world parked' : ''}.${refreshed.warning ? ` ${refreshed.warning}` : ''}`;
+      await refreshTask();
+    } catch (error) { result.textContent = error.message; button.disabled = false; }
+  });
 }
 
 // Parameters: everything the human configured on this task, in one place —
@@ -3681,7 +3857,7 @@ function advancedTab(v) {
     <div class="section-h">Live events</div>
     <div class="events" id="tp-events"></div>
     <div class="section-h">Structured state (the view-model floor)</div>
-    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>`;
+    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, world: { available: v.worldAvailable, provider: v.worldProvider, localPath: v.worldPath }, pr: v.pr }, null, 2))}</pre>`;
 }
 
 function renderDiff(d) {
@@ -4893,6 +5069,8 @@ function settingsView(proj) {
   return `
     <div class="page-title">Project settings — ${esc(proj.name)}</div>
     <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
+    <div class="card"><div class="section-h">People &amp; repositories</div><div id="project-access">Loading…</div></div>
+    ${cloudEnvironmentCard(proj)}
     ${settingsForms('project', proj.id)}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box in this project (not the full “⋯ More” form). Each field inherits from your <b>global quick defaults</b> (↺ Global quick) or this project's <b>general defaults</b> above (↺ Project default) until you set it here.`)}
     ${quickSettingsForms('project', proj.id)}
@@ -4926,6 +5104,65 @@ function settingsView(proj) {
       <button class="btn danger" id="delete-project">Delete project</button>
     </div>`;
 }
+function cloudEnvironmentCard(proj) {
+  const config = proj.config || {};
+  const remoteProviders = (S.meta?.worldProviders || []).filter((entry) => !S.meta?.hosted || entry.capabilities?.remote);
+  const providers = remoteProviders.length ? remoteProviders.map((entry) => entry.provider) : ['worktree', 'container', 'e2b', 'daytona'];
+  const selected = config.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
+  return `<div class="card"><div class="section-h">Execution environment</div>
+    <p class="task-sub">One isolated world per task attempt. Network access is denied unless declared here; GitHub access for enrolled repositories is always included.</p>
+    <div class="settings-grid">
+      <label class="form-row">Runner provider<select id="cloud-provider">${providers.map((provider) => `<option value="${esc(provider)}" ${provider === selected ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
+      <label class="form-row">Runner pool ID<input id="cloud-runner-pool" value="${esc(config.runnerPoolId || '')}" placeholder="managed default" /></label>
+      <label class="form-row">Image<input id="cloud-image" value="${esc(config.environment?.image || '')}" placeholder="provider default" /></label>
+      <label class="form-row">Snapshot/template<input id="cloud-snapshot" value="${esc(config.environment?.snapshot || '')}" placeholder="provider default" /></label>
+      <label class="form-row">CPU<input id="cloud-cpu" type="number" min="1" value="${esc(config.resources?.cpu || 2)}" /></label>
+      <label class="form-row">Memory (MiB)<input id="cloud-memory" type="number" min="128" step="128" value="${esc(config.resources?.memoryMb || 2048)}" /></label>
+      <label class="form-row">Monthly budget (USD)<input id="cloud-budget" type="number" min="0" step="0.01" value="${config.monthlyBudgetMicros == null ? '' : esc(config.monthlyBudgetMicros / 1e6)}" placeholder="unlimited" /></label>
+      <label class="form-row">Hibernate after (days)<input id="cloud-hibernate" type="number" min="1" value="${esc(Math.round((config.hibernateAfterMs || 7 * 86400000) / 86400000))}" /></label>
+    </div>
+    <label class="form-row">Allowed outbound domains<input id="cloud-domains" value="${esc((config.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label>
+    <label class="form-row">Allowed outbound CIDRs<input id="cloud-cidrs" value="${esc((config.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label>
+    <label class="switch"><input id="cloud-unrestricted" type="checkbox" ${config.network?.unrestricted ? 'checked' : ''}/><span>Allow unrestricted outbound network (high exfiltration risk)</span></label>
+    <button class="btn sm primary" id="cloud-save">Save environment</button>
+  </div>`;
+}
+async function hydrateProjectAccess(proj) {
+  const box = $('#project-access');
+  if (!box) return;
+  try {
+    const [repositories, attached, members] = await Promise.all([
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
+      api(`/api/projects/${encodeURIComponent(proj.id)}/repositories`),
+      api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
+    ]);
+    const linkedIds = new Set(attached.map((entry) => entry.repositoryId));
+    const userName = (id) => S.users.find((user) => user.id === id)?.name || id;
+    const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
+      : S.teams.find((team) => team.id === principal.teamId)?.name || principal.teamId;
+    const candidates = [
+      ...S.organizationMembers.map((member) => ({ value: `user:${member.userId}`, label: userName(member.userId) })),
+      ...S.teams.map((team) => ({ value: `team:${team.id}`, label: `${team.name} (team)` })),
+    ];
+    box.innerHTML = `<div class="section-h">Project access</div>
+      ${members.map((member) => `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(member.principal.userId || member.principal.teamId)}"><span>${esc(principalName(member.principal))}</span><span class="chip">${esc(member.role)}</span><button class="btn sm project-member-remove">Remove</button></div>`).join('') || '<p class="task-sub">No project members.</p>'}
+      <div class="inline-form"><select id="project-member-principal">${candidates.map((candidate) => `<option value="${esc(candidate.value)}">${esc(candidate.label)}</option>`).join('')}</select><select id="project-member-role"><option>member</option><option>reviewer</option><option>admin</option><option>owner</option></select><button class="btn sm" id="project-member-add">Add</button></div>
+      <div class="section-h" style="margin-top:18px">Repositories</div>
+      ${attached.map((entry) => { const base = entry.baseBranch || entry.repository.defaultBranch; const target = entry.targetBranch || base; return `<div class="member-row"><span>${esc(entry.repository.owner)}/${esc(entry.repository.name)}</span><span class="chip">${esc(base)} → ${esc(target)}</span><button class="btn sm project-repo-remove" data-repository="${esc(entry.repositoryId)}">Remove</button></div>`; }).join('') || '<p class="task-sub">No repository attached. Connect GitHub from Organization, then attach one here.</p>'}
+      <div class="inline-form"><select id="project-repository">${repositories.filter((repository) => !linkedIds.has(repository.id)).map((repository) => `<option value="${esc(repository.id)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</select><input id="project-repo-base" placeholder="Base (repository default)"/><input id="project-repo-target" placeholder="Target (same as base)"/><button class="btn sm" id="project-repo-add">Attach repository</button></div>`;
+    $('#project-member-add')?.addEventListener('click', async () => {
+      const [kind, id] = ($('#project-member-principal')?.value || '').split(':'); if (!id) return;
+      try { await api(`/api/projects/${proj.id}/members`, { method: 'POST', body: JSON.stringify({ principal: kind === 'team' ? { kind, teamId: id } : { kind: 'user', userId: id }, role: $('#project-member-role').value }) }); await hydrateProjectAccess(proj); }
+      catch (error) { toast(error.message, true); }
+    });
+    box.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
+      try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
+      catch (error) { toast(error.message, true); }
+    }));
+    $('#project-repo-add')?.addEventListener('click', async () => { const repositoryId = $('#project-repository')?.value; if (!repositoryId) return; try { await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId, baseBranch: $('#project-repo-base')?.value || undefined, targetBranch: $('#project-repo-target')?.value || undefined }) }); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
+    box.querySelectorAll('.project-repo-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/repositories/${encodeURIComponent(button.dataset.repository)}`, { method: 'DELETE' }); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } }));
+  } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
+}
 async function hydrateWorkflowPins(projectId) {
   const box = $('#wf-pins-list');
   if (!box) return;
@@ -4951,6 +5188,26 @@ async function hydrateWorkflowPins(projectId) {
   }));
 }
 function wireSettingsView(proj) {
+  hydrateProjectAccess(proj);
+  hydrateExecutionProviders(proj);
+  $('#cloud-save')?.addEventListener('click', async () => {
+    if ($('#cloud-unrestricted').checked && !confirm('Allow this project unrestricted outbound network access? Repository code and agents could send data anywhere.')) return;
+    const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+    const budget = $('#cloud-budget').value.trim();
+    const image = $('#cloud-image').value.trim(); const snapshot = $('#cloud-snapshot').value.trim();
+    const runnerPoolId = $('#cloud-runner-pool').value.trim();
+    const config = {
+      worldProvider: $('#cloud-provider').value,
+      runnerPoolId: runnerPoolId || null,
+      resources: { cpu: Number($('#cloud-cpu').value), memoryMb: Number($('#cloud-memory').value) },
+      network: { allowDomains: split('#cloud-domains'), allowCidrs: split('#cloud-cidrs'), unrestricted: $('#cloud-unrestricted').checked },
+      environment: { ...(image ? { image } : {}), ...(snapshot ? { snapshot } : {}) },
+      monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
+      hibernateAfterMs: Math.round(Number($('#cloud-hibernate').value) * 86400000),
+    };
+    try { await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ config }) }); await loadProjects(); toast('Execution environment saved'); renderMain(); }
+    catch (error) { toast(error.message, true); }
+  });
   hydrateSettingsForms('project', proj.id);
   hydrateQuickSettingsForms('project', proj.id);
   wireQuickSettingsSave('project', proj.id);
@@ -5011,6 +5268,29 @@ function wireSettingsView(proj) {
       renderMain();
     } catch (e) { toast(e.message, true); }
   });
+}
+async function hydrateExecutionProviders(proj) {
+  if (!S.meta?.hosted || !$('#cloud-provider')) return;
+  try {
+    const [connections, pools] = await Promise.all([
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
+    ]);
+    const available = new Set(connections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider));
+    $('#cloud-provider').querySelectorAll('option').forEach((option) => {
+      option.disabled = !available.has(option.value);
+      option.textContent = `${option.value}${available.has(option.value) ? '' : ' — connect in Organization settings'}`;
+    });
+    const selected = $('#cloud-provider').value;
+    const poolInput = $('#cloud-runner-pool');
+    if (poolInput) {
+      const matching = pools.filter((pool) => pool.provider === selected && pool.enabled);
+      poolInput.setAttribute('list', 'cloud-runner-pools');
+      const list = document.createElement('datalist'); list.id = 'cloud-runner-pools';
+      list.innerHTML = matching.map((pool) => `<option value="${esc(pool.id)}">${esc(pool.name)}</option>`).join('');
+      poolInput.after(list);
+    }
+  } catch (error) { toast(`Could not load compute providers: ${error.message}`, true); }
 }
 
 // ── global settings (user scope) ─────────────────────────────────────────────
@@ -5571,30 +5851,202 @@ function wireGlobalSettings() {
   });
 }
 
-// ── notifications ────────────────────────────────────────────────────────────
-function needsAttention() {
-  return S.tasks.filter((t) => ['review', 'escalated'].includes(t.lastView?.stage) && t.lastView?.status !== 'done' && !t.parentTaskId && !t.params?.archived);
-}
+// ── inbox + collaboration ───────────────────────────────────────────────────
 function updateBell() {
   const badge = $('#bell-badge');
   if (!badge) return;
-  const n = needsAttention().length;
+  const n = S.inbox.filter((item) => item.unread).length;
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
 }
-function toggleNotifications() {
+async function toggleNotifications() {
   const existing = $('#notif-pop');
   if (existing) return existing.remove();
-  const items = needsAttention();
+  await loadCollaboration().catch(() => {});
+  const items = S.inbox.filter((item) => item.unread).slice(0, 8);
   const pop = document.createElement('div');
   pop.className = 'popover';
   pop.id = 'notif-pop';
-  pop.innerHTML = `<div class="ph">Needs attention (${items.length})</div>${
-    items.length ? items.map((t) => `<div class="pi" data-id="${t.id}"><b>${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</b><div class="task-sub"><span class="chip ${t.lastView.status}">${esc(t.lastView.stage)}</span></div></div>`).join('') : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'
-  }`;
+  pop.innerHTML = `<div class="ph">Inbox (${items.length})</div>${items.length
+    ? items.map((item) => `<div class="pi" data-inbox="${item.id}"><b>${item.task?.num != null ? `<span class="task-num">#${item.task.num}</span> ` : ''}${esc(item.task?.title || item.kind)}</b><div class="task-sub"><span class="chip">${esc(item.kind.replaceAll('-', ' '))}</span></div></div>`).join('')
+    : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'}<div class="pi" id="open-inbox"><b>Open inbox →</b></div>`;
   $('#overlay-root').appendChild(pop);
-  pop.querySelectorAll('.pi[data-id]').forEach((e) => e.addEventListener('click', () => { pop.remove(); goToTask(e.dataset.id); }));
+  pop.querySelectorAll('[data-inbox]').forEach((e) => e.addEventListener('click', () => { const item = S.inbox.find((x) => x.id === e.dataset.inbox); pop.remove(); openInboxItem(item); }));
+  $('#open-inbox')?.addEventListener('click', () => { pop.remove(); go('/inbox'); });
   setTimeout(() => document.addEventListener('click', function h(ev) { if (!pop.contains(ev.target) && ev.target.id !== 'bell') { pop.remove(); document.removeEventListener('click', h); } }), 10);
+}
+
+function inboxView() {
+  const prefs = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
+  return `<h1 class="page-title">Inbox</h1>
+    <div class="inbox-toolbar"><span>${S.inbox.filter((x) => x.unread).length} unread</span><button class="btn sm" id="inbox-read-all">Mark all read</button></div>
+    <div class="inbox-list">${S.inbox.length ? S.inbox.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
+      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.kind)}</b>
+      <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(item.kind.replaceAll('-', ' '))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
+      <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : '<div class="empty"><div class="big">Inbox zero</div>Only updates meant for you appear here.</div>'}</div>
+    <div class="card delivery-card"><div class="section-h">Delivery</div>
+      ${['browser', 'email', 'slack', 'routine'].map((key) => `<label class="switch"><input type="checkbox" data-delivery="${key}" ${prefs[key] ? 'checked' : ''}/><span>${key === 'routine' ? 'Routine subscribed updates' : key[0].toUpperCase() + key.slice(1)}</span></label>`).join('')}
+      <button class="btn sm primary" id="save-delivery">Save preferences</button></div>`;
+}
+
+function wireInboxView() {
+  $('#main').querySelectorAll('[data-inbox]').forEach((row) => row.addEventListener('click', (e) => {
+    if (e.target.closest('[data-inbox-toggle]')) return;
+    openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
+  }));
+  $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
+    const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
+    await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
+    item.unread = !item.unread; renderMain(); renderRail();
+  }));
+  $('#inbox-read-all')?.addEventListener('click', async () => {
+    await Promise.all(S.inbox.filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
+    await loadCollaboration(); renderMain(); renderRail();
+  });
+  $('#save-delivery')?.addEventListener('click', async () => {
+    const values = Object.fromEntries([...$('#main').querySelectorAll('[data-delivery]')].map((el) => [el.dataset.delivery, el.checked]));
+    S.deliveryPreferences = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PUT', body: JSON.stringify(values) });
+    toast('Delivery preferences saved');
+  });
+}
+
+async function openInboxItem(item) {
+  if (!item?.task) return;
+  if (item.unread) await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) }).catch(() => {});
+  const project = projectById(item.task.projectId); if (!project) return;
+  S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
+  await loadTasks().catch(() => {});
+  return go(`/projects/${projectSlug(project)}/tasks/${item.task.num ?? item.task.id}`);
+}
+
+function organizationView() {
+  const org = S.organizations.find((o) => o.id === S.organizationId);
+  return `<h1 class="page-title">${esc(org?.name || 'Organization')}</h1>
+    ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
+    <div class="inline-form" style="margin-bottom:12px"><button class="btn sm" id="create-organization">＋ New organization</button></div>
+    <div class="org-grid"><div class="card"><div class="section-h">Members</div><div id="org-members">Loading…</div>
+      <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-role"><option>member</option><option>admin</option><option>owner</option><option>billing</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div></div>
+    <div class="card"><div class="section-h">Teams</div><div id="org-teams">Loading…</div><div class="inline-form"><input id="team-name" placeholder="Security review"><button class="btn sm" id="create-team">Create team</button></div></div>
+    <div class="card"><div class="section-h">GitHub</div><p class="task-sub">Karmax can create its own private GitHub App, install it, discover repositories, and provision isolated SSH keys. No server shell or personal access token is needed.</p><div id="org-github">Loading…</div><div id="org-repos"></div></div>
+    <div class="card"><div class="section-h">Compute providers</div><p class="task-sub">Connect E2B or Daytona once. Keys are encrypted and write-only; projects choose a provider without handling its credential.</p><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:18px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
+    <div class="card"><div class="section-h">Data &amp; deletion</div><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></div></div>`;
+}
+
+async function hydrateOrganizationView() {
+  if (!$('#org-members') || !S.organizationId) return;
+  await loadCollaboration().catch(() => {});
+  const userName = (id) => S.users.find((u) => u.id === id)?.name || id;
+  $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => `<div class="member-row" data-org-member="${esc(m.userId)}"><span>${esc(userName(m.userId))}</span><select class="q-sel org-member-role">${['member', 'admin', 'owner', 'billing'].map((role) => `<option ${role === m.role ? 'selected' : ''}>${role}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`).join('') : '<span class="task-sub">No members.</span>';
+  if (!$('#org-identity')) { const identityCard = document.createElement('div'); identityCard.className = 'card'; identityCard.innerHTML = `<div class="section-h">Enterprise identity</div><div id="org-identity">Loading…</div>`; $('.org-grid')?.appendChild(identityCard); }
+  const [repos, gitConnections, githubApp, runners, providerConnections, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
+    api(`/api/organizations/${S.organizationId}/repositories`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/git-connections`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/github/app`).catch(() => ({ configured: false })),
+    api(`/api/organizations/${S.organizationId}/runner-pools`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/world-providers`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/usage`).catch(() => null),
+    api(`/api/organizations/${S.organizationId}/identity-policy`).catch(() => null),
+    api(`/api/organizations/${S.organizationId}/invitations`).catch(() => []),
+    Promise.all(S.teams.map((team) => api(`/api/organizations/${S.organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
+  ]);
+  if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(invitation.role)}</span></div>`).join('')}`);
+  $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="member-row"><b>${esc(team.name)}</b><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span></div>${members.map((m) => `<div class="member-row"><span>${esc(userName(m.userId))}</span><span class="chip">${esc(m.role)}</span><button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><select class="team-user">${S.organizationMembers.filter((m) => !members.some((x) => x.userId === m.userId)).map((m) => `<option value="${esc(m.userId)}">${esc(userName(m.userId))}</option>`).join('')}</select><button class="btn sm team-member-add">Add</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
+  $('#org-github').innerHTML = githubApp.configured ? `
+    <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
+    ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
+    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="authorize-github">Authorize repository creation</button>' : ''}</div>
+    ${gitConnections.length && githubApp.userAuthorized ? `<div class="section-h" style="margin-top:18px">Create repository</div><div class="inline-form"><select id="new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="new-repo-name" placeholder="new-repository"><input id="new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm" id="create-github-repo">Create</button></div>` : ''}` : `
+    <p class="task-sub">One guided GitHub confirmation creates and configures the App, then takes you directly to installation.</p>
+    <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
+    <details style="margin-top:12px"><summary class="task-sub">Use an existing enterprise GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
+  $('#org-repos').innerHTML = `<div class="section-h" style="margin-top:18px">Available repositories</div>${repos.length ? repos.map((r) => `<div class="member-row"><span>${esc(r.owner)}/${esc(r.name)}</span><span class="chip">${esc(r.defaultBranch)}</span></div>`).join('') : '<span class="task-sub">No repositories connected.</span>'}`;
+  const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
+  $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
+    const connection = connectionFor(provider); const config = connection?.config || {};
+    const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
+    return `<div class="team-block provider-connection" data-provider="${provider}">
+      <div class="member-row"><b>${provider === 'e2b' ? 'E2B' : 'Daytona'}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
+      ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
+      <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
+      ${provider === 'e2b' ? `<label class="form-row">Template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-node22" /></label>`
+        : `<label class="form-row">Snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="provider default" /></label><label class="form-row">Image<input class="provider-image" value="${esc(config.image || '')}" placeholder="provider default" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
+      </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
+  }).join('');
+  $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${r.capacity.activeWorlds} worlds</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
+    <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select><input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds"><button class="btn sm" id="runner-create">Add pool</button></div>`;
+  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">This query period · ${usage.events} metered events</div></div>` : 'Usage unavailable.';
+  if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
+    <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
+    <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
+    <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
+    <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
+  $('#invite-member')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email: $('#invite-email').value, role: $('#invite-role').value }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
+  $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  $('#setup-github-app')?.addEventListener('click', async () => {
+    try {
+      const result = await api(`/api/organizations/${S.organizationId}/github/app-manifest`, { method: 'POST', body: '{}' });
+      const form = document.createElement('form'); form.method = 'POST'; form.action = result.action;
+      const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest);
+      form.appendChild(manifest); document.body.appendChild(form); form.submit();
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#save-github-app')?.addEventListener('click', async () => {
+    try {
+      await api(`/api/organizations/${S.organizationId}/github/app`, { method: 'PUT', body: JSON.stringify({
+        appId: $('#github-app-id').value, appSlug: $('#github-app-slug').value, privateKey: $('#github-private-key').value,
+        webhookSecret: $('#github-webhook-secret').value, clientId: $('#github-client-id').value, clientSecret: $('#github-client-secret').value,
+      }) }); toast('GitHub App saved'); await hydrateOrganizationView();
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (e) { toast(e.message, true); } });
+  $('#authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (e) { toast(e.message, true); } });
+  $('#create-github-repo')?.addEventListener('click', async () => {
+    const name = $('#new-repo-name').value.trim(); if (!name) return toast('Repository name is required', true);
+    try { await api(`/api/organizations/${S.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#new-repo-connection').value, name, description: $('#new-repo-description').value, private: $('#new-repo-private').checked }) }); toast('Repository created and enrolled'); await hydrateOrganizationView(); }
+    catch (e) { toast(e.message, true); }
+  });
+  $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
+    const provider = row.dataset.provider;
+    row.querySelector('.provider-save')?.addEventListener('click', async () => {
+      const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
+        ? { template: row.querySelector('.provider-template').value }
+        : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
+            apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
+      try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await hydrateOrganizationView(); }
+      catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
+    });
+    row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); await hydrateOrganizationView(); } });
+    row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  });
+  $('#runner-create')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, capacity: { activeWorlds: Number($('#runner-worlds').value) } }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
+  $('#save-identity')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+  $('#rotate-scim')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
+  $('#create-organization')?.addEventListener('click', createOrganization);
+  $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
+    row.querySelector('.org-member-role')?.addEventListener('change', async (event) => { try { await api(`/api/organizations/${S.organizationId}/members`, { method: 'POST', body: JSON.stringify({ userId: row.dataset.orgMember, role: event.target.value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+    row.querySelector('.org-member-remove')?.addEventListener('click', async () => { if (!confirm('Remove this member from the organization?')) return; try { await api(`/api/organizations/${S.organizationId}/members/${encodeURIComponent(row.dataset.orgMember)}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  });
+  $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {
+    block.querySelector('.team-member-add')?.addEventListener('click', async () => { const userId = block.querySelector('.team-user')?.value; if (!userId) return; try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+    block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
+  });
+  $('#export-organization')?.addEventListener('click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
+  $('#delete-organization')?.addEventListener('click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+}
+
+async function createOrganization() {
+  const name = prompt('Organization name');
+  if (!name) { if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; return; }
+  try {
+    const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name }) });
+    await loadOrganizations();
+    S.organizationId = organization.id;
+    S.projectId = null;
+    await loadCollaboration().catch(() => {});
+    renderShell();
+    await go('/organization');
+  } catch (error) { toast(error.message, true); if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; }
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────
@@ -5619,7 +6071,8 @@ async function newProject() {
     // from global settings. Hardcoding defaultBase/defaultTarget here would bake
     // a project-scope override that shadows the global default (e.g. "master"),
     // which is exactly the inheritance bug this avoids.
-    const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: {} }) });
+    const endpoint = S.organizationId ? `/api/organizations/${encodeURIComponent(S.organizationId)}/projects` : '/api/projects';
+    const p = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {} }) });
     await loadProjects();
     // Route into the new project so its tasks, tags, saved views and search all
     // load fresh — setting S.projectId + re-rendering alone leaves the previous
@@ -6056,6 +6509,7 @@ function renderLogin() {
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
+    ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
@@ -6066,6 +6520,14 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
+  $('#sso-btn')?.addEventListener('click', async () => {
+    try {
+      const response = await fetch('/api/sso/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callbackURL: location.href }) });
+      const result = await response.json();
+      if (!response.ok || !result.url) throw new Error(result.error || 'SSO unavailable');
+      location.href = result.url;
+    } catch (error) { $('#login-err').textContent = error.message; }
+  });
   $('#signup-open').addEventListener('click', renderSignup);
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -6096,12 +6558,23 @@ function renderSignup() {
 function renderAccessPending() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Account created</div>
+    ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
     <p>Your identity is active, but it does not have access to a project yet.</p>
     <p class="task-sub">Ask a karmax administrator to grant this account a global or project authorization profile. Signing in again will pick up the grant immediately.</p>
     <button class="btn primary" id="pending-retry" style="width:100%">Check again</button>
+    <button class="btn" id="pending-workspace" style="width:100%;margin-top:8px">Create my own organization</button>
     <button class="btn" id="pending-logout" style="width:100%;margin-top:8px">Sign out</button>
   </div></div>`;
   $('#pending-retry').addEventListener('click', () => boot());
+  $('#pending-workspace').addEventListener('click', async () => {
+    const organizationName = prompt('Organization name'); if (!organizationName) return;
+    const projectName = prompt('First project name', 'My project'); if (!projectName) return;
+    try {
+      const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name: organizationName }) });
+      await api(`/api/organizations/${organization.id}/projects`, { method: 'POST', body: JSON.stringify({ name: projectName, config: {} }) });
+      location.href = '/';
+    } catch (error) { alert(error.message); }
+  });
   $('#pending-logout').addEventListener('click', async () => {
     await fetch('/api/logout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
     location.reload();

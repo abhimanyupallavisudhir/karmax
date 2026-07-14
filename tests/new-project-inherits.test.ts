@@ -26,12 +26,15 @@ describe('new projects inherit branch defaults (no baked "main")', () => {
     expect(fn).not.toMatch(/defaultTarget\s*:/);
   });
 
-  it('the first-run seed project is created with an empty config', () => {
+  it('the first-run seed project never bakes in branch overrides', () => {
     const main = read('../src/main.ts');
     const m = main.match(/createProject\('My project',[^)]*\)/);
     expect(m, "seed createProject('My project', ...) should exist").toBeTruthy();
     const call = m![0];
-    expect(call).toMatch(/createProject\('My project',\s*\{\s*\}\s*\)/);
+    // Hosted cells pin only their remote world provider; local installs still
+    // pass an empty config. Neither deployment profile may pin branch defaults.
+    expect(call).toMatch(/deployment\.hosted\s*\?\s*\{\s*worldProvider:/);
+    expect(call).toMatch(/:\s*\{\s*\}\s*\)/);
     expect(call).not.toMatch(/defaultBase\s*:/);
     expect(call).not.toMatch(/defaultTarget\s*:/);
   });

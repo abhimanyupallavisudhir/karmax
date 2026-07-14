@@ -8,6 +8,9 @@ dist/
 # karmax runtime data (workflow repos, worlds, config homes, vault, temporal db, state)
 .karmax/
 .karmax-data/
+deploy/.turnkey.env
+deploy/.secrets/
+deploy/backups/
 
 # logs / coverage / caches
 *.log

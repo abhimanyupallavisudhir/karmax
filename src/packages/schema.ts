@@ -8,7 +8,7 @@ import type { WorkflowManifest } from '../contrib/manifests.js';
  * strict; optional/deep shapes are lenient with `.passthrough()` so a newer
  * package with extra keys still validates (forward-compat).
  */
-const event = z.object({ type: z.string(), description: z.string().optional(), fields: z.record(z.string()).optional() }).passthrough();
+const event = z.object({ type: z.string(), description: z.string().optional(), fields: z.record(z.string(), z.string()).optional() }).passthrough();
 const command = z.object({ id: z.string(), title: z.string(), keybinding: z.string().optional() }).passthrough();
 const ui = z.object({ slot: z.string(), tier: z.number().int().min(1).max(4), component: z.string().optional(), title: z.string().optional() }).passthrough();
 const role = z.object({
@@ -18,7 +18,7 @@ const role = z.object({
   capabilities: z.array(z.string()).optional(),
   defaults: z.object({ effort: z.string().optional(), maxTurns: z.number().optional() }).passthrough().optional(),
 }).passthrough();
-const agentMcp = z.object({ name: z.string().min(1), command: z.string().min(1), args: z.array(z.string()).optional(), env: z.record(z.string()).optional() }).passthrough();
+const agentMcp = z.object({ name: z.string().min(1), command: z.string().min(1), args: z.array(z.string()).optional(), env: z.record(z.string(), z.string()).optional() }).passthrough();
 const resolveRule = z.object({ name: z.string(), match: z.string(), flags: z.string().optional(), action: z.literal('retry').optional(), note: z.string().optional() }).passthrough();
 const stage = z.object({ key: z.string().min(1), label: z.string(), ponr: z.boolean().optional(), aliases: z.array(z.string()).optional() }).passthrough();
 const field = z.object({ name: z.string().min(1), type: z.string(), label: z.string().optional(), scopes: z.array(z.string()) }).passthrough();

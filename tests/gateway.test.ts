@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import http from 'node:http';
+import fs from 'node:fs';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 
@@ -25,6 +27,28 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(meta.version).toBeTruthy();
     expect(meta.agent.provider).toBeTruthy();
     expect(meta.resolveAgentEnabled).toBe(false);
+  });
+
+  it('keeps untrusted preview hosts outside the app/API origin', async () => {
+    const previous = process.env.KARMAX_PREVIEW_ORIGIN;
+    process.env.KARMAX_PREVIEW_ORIGIN = 'http://preview.invalid';
+    try {
+      const target = new URL(base);
+      const blocked = await new Promise<number>((resolve, reject) => {
+        const request = http.request({ hostname: target.hostname, port: target.port, path: '/api/meta',
+          headers: { host: 'p-deadbeef.preview.invalid' } }, (response) => {
+          response.resume(); resolve(response.statusCode ?? 0);
+        });
+        request.on('error', reject); request.end();
+      });
+      expect(blocked).toBe(404);
+      const redirected = await fetch(`${base}/preview/lease-1/`, { redirect: 'manual' });
+      expect(redirected.status).toBe(307);
+      expect(redirected.headers.get('location')).toMatch(/^http:\/\/p-[a-f0-9]{24}\.preview\.invalid\/preview\/lease-1\/$/);
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_PREVIEW_ORIGIN;
+      else process.env.KARMAX_PREVIEW_ORIGIN = previous;
+    }
   });
 
   it('exposes contributions (slots, commands, event schemas)', async () => {
@@ -81,6 +105,23 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   it('rejects unauthenticated API calls', async () => {
     const res = await fetch(`${base}/api/projects`);
     expect(res.status).toBe(401);
+  });
+
+  it('deletes provider worlds before committing project deletion', async () => {
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Disposable' }) })).json();
+    const task = h.store.createTask({ projectId: project.id, title: 'Draft', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'x', draft: true } });
+    const world = await h.worlds.create('memory', { taskId: task.id, base: 'main' });
+    await world.writeFile('private.txt', 'private');
+    h.store.registerWorld(world.handle, project.id);
+    expect(fs.existsSync(world.handle.root)).toBe(true);
+
+    const deleted = await fetch(`${base}/api/projects/${project.id}`, { method: 'DELETE', headers: auth() });
+    expect(deleted.status).toBe(200);
+    expect(fs.existsSync(world.handle.root)).toBe(false);
+    expect(h.store.getProject(project.id)).toBeUndefined();
+    expect(h.store.getTask(task.id)).toBeUndefined();
   });
 
   it('drives a full task lifecycle over HTTP and lands work', async () => {

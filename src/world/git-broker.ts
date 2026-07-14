@@ -1,0 +1,274 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import type { World, WorldGitIdentity, WorldRepo } from './types.js';
+import { worldRepos } from './types.js';
+import { ensureIdentity, git } from './git.js';
+import type { MergeResult } from './merge.js';
+
+const pexec = promisify(execFile);
+
+export interface GitBrokerCredential {
+  /** Private key is materialized to a 0600 file only for one broker operation. */
+  sshKey?: string;
+  env?: Record<string, string>;
+}
+export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promise<GitBrokerCredential>);
+
+/**
+ * Trusted Git handoff for cloud worlds. The untrusted sandbox never receives a
+ * write credential: it emits a git bundle, the broker downloads that bundle,
+ * performs the authenticated push/merge in a short-lived host checkout, then
+ * removes the checkout. Credentials remain JIT host process environment only.
+ */
+export async function brokerPublishBranch(world: World, auth: GitBrokerAuth): Promise<{ pushed: string[]; skipped: string[] }> {
+  const pushed: string[] = [];
+  const skipped: string[] = [];
+  for (const repo of worldRepos(world.handle)) {
+    try {
+      await withTransferredRepo(world, repo, auth, async (clone, env) => {
+        const result = await git(clone, ['push', 'origin', `refs/heads/${repo.branch}:refs/heads/${repo.branch}`], { env });
+        if (result.code !== 0) throw new Error(result.stderr || result.stdout || 'push failed');
+      });
+      pushed.push(repo.name);
+    } catch {
+      skipped.push(repo.name);
+    }
+  }
+  return { pushed, skipped };
+}
+
+/** Pull a human's pushed task-branch commits into a cloud world without ever
+ * putting GitHub credentials in that world. The control plane clones through
+ * the broker, uploads a credential-free bundle, and accepts only a clean
+ * fast-forward. This is the reverse half of brokerPublishBranch. */
+export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Promise<{
+  updated: Array<{ repo: string; branch: string; sha: string }>;
+}> {
+  const repos = worldRepos(world.handle);
+  const updated: Array<{ repo: string; branch: string; sha: string }> = [];
+  for (const repo of repos) {
+    if (!/^(?:ssh:\/\/|git@)/.test(repo.repo)) throw new Error(`repo "${repo.name}" is not an SSH remote`);
+    if (!safeBranch(repo.branch)) throw new Error(`repo "${repo.name}" has an invalid task branch`);
+    const dirty = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+    if (dirty.code !== 0) throw new Error(`could not inspect repo "${repo.name}": ${dirty.stderr || dirty.stdout}`);
+    if (dirty.stdout.trim()) throw new Error(`repo "${repo.name}" has uncommitted cloud changes; commit or discard them before refreshing`);
+
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-refresh-'));
+    const bundleName = `.karmax-incoming-${repo.name.replace(/[^a-zA-Z0-9_.-]/g, '-')}.bundle`;
+    const bundleRelative = repos.length > 1 ? `${repo.name}/${bundleName}` : bundleName;
+    try {
+      const credential = await resolveCredential(auth, repo);
+      const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
+      if (credential.sshKey) {
+        const keyPath = path.join(temp, 'repository.key');
+        fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
+        env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+      }
+      const clone = path.join(temp, 'repo');
+      const cloned = await git(temp, ['clone', '-q', '--branch', repo.branch, '--single-branch', repo.repo, clone],
+        { env, timeoutMs: 10 * 60_000 });
+      if (cloned.code !== 0) throw new Error(`could not fetch pushed branch "${repo.branch}": ${cloned.stderr || cloned.stdout}`);
+      const bundlePath = path.join(temp, 'incoming.bundle');
+      const bundled = await git(clone, ['bundle', 'create', bundlePath, `refs/heads/${repo.branch}`]);
+      if (bundled.code !== 0) throw new Error(`could not package pushed branch: ${bundled.stderr || bundled.stdout}`);
+      const data = fs.readFileSync(bundlePath);
+      const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
+      if (data.length > maxBytes) throw new Error(`incoming branch bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
+      if (!world.writeFileBuffer) throw new Error('world provider cannot receive binary Git handoffs');
+      await world.writeFileBuffer(bundleRelative, data);
+      const fetched = await world.exec('git', ['fetch', bundleName,
+        `refs/heads/${repo.branch}:refs/karmax/handoff`], { cwd: repo.root, timeoutMs: 10 * 60_000 });
+      if (fetched.code !== 0) throw new Error(`cloud world could not import the branch: ${fetched.stderr || fetched.stdout}`);
+      const ancestor = await world.exec('git', ['merge-base', '--is-ancestor', 'HEAD', 'refs/karmax/handoff'], { cwd: repo.root });
+      if (ancestor.code !== 0)
+        throw new Error(`pushed branch for "${repo.name}" diverged from the cloud world; pull the task branch locally and push a non-destructive fast-forward`);
+      const merged = await world.exec('git', ['merge', '--ff-only', 'refs/karmax/handoff'], { cwd: repo.root });
+      if (merged.code !== 0) throw new Error(`could not fast-forward repo "${repo.name}": ${merged.stderr || merged.stdout}`);
+      const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
+      if (head.code !== 0) throw new Error(`could not read refreshed commit for "${repo.name}"`);
+      updated.push({ repo: repo.name, branch: repo.branch, sha: head.stdout.trim() });
+    } finally {
+      await world.exec('git', ['update-ref', '-d', 'refs/karmax/handoff'], { cwd: repo.root }).catch(() => undefined);
+      await world.exec('rm', ['-f', bundleName], { cwd: repo.root }).catch(() => undefined);
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  }
+  return { updated };
+}
+
+export async function brokerFinalizeMerge(
+  world: World,
+  target: string,
+  identity: WorldGitIdentity | undefined,
+  auth: GitBrokerAuth,
+): Promise<MergeResult> {
+  const repos = worldRepos(world.handle);
+  if (!repos.length) return { merged: false, landedFiles: [], note: 'cloud scratch world has no remote repository' };
+  const landedFiles: string[] = [];
+  let sha: string | undefined;
+  for (const repo of repos) {
+    const repoTarget = repo.target ?? target;
+    const dirty = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+    if (dirty.code !== 0) return { merged: false, landedFiles, note: `repo "${repo.name}": could not inspect worktree: ${dirty.stderr || dirty.stdout}` };
+    if (dirty.stdout.trim()) {
+      return {
+        merged: false,
+        landedFiles,
+        dirty: dirty.stdout.split('\n').map((line) => line.slice(3).trim()).filter(Boolean).map((file) => repos.length > 1 ? `${repo.name}/${file}` : file).join('\n'),
+        note: `repo "${repo.name}": uncommitted changes — commit what belongs in the change; gitignore or delete what does not`,
+      };
+    }
+    try {
+      const one = await withTransferredRepo(world, repo, auth, async (clone, env) => {
+        const fetched = await git(clone, ['fetch', 'origin', repoTarget], { env });
+        if (fetched.code !== 0) throw new Error(`target "${repoTarget}" is unavailable: ${fetched.stderr || fetched.stdout}`);
+        const changed = await git(clone, ['diff', '--name-only', `origin/${repoTarget}...${repo.branch}`]);
+        const files = changed.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+        const marked = await conflictMarkerFiles(clone, repo.branch, files);
+        if (marked.length) return { merged: false, landedFiles: files, conflict: marked.join('\n'), note: 'conflict markers are committed in the branch' } satisfies MergeResult;
+        const checkout = await git(clone, ['checkout', '-q', '-B', repoTarget, `origin/${repoTarget}`]);
+        if (checkout.code !== 0) throw new Error(checkout.stderr || checkout.stdout);
+        if (!identity) await ensureIdentity(clone);
+        const merge = await git(clone, [
+          ...identityArgs(identity),
+          'merge', '--no-ff', '--no-edit', '-m', `karmax: merge ${repo.branch} into ${repoTarget}`, repo.branch,
+        ]);
+        if (merge.code !== 0) {
+          const conflicts = await git(clone, ['diff', '--name-only', '--diff-filter=U']);
+          await git(clone, ['merge', '--abort']);
+          return { merged: false, landedFiles: files, conflict: conflicts.stdout.trim() || merge.stderr || merge.stdout } satisfies MergeResult;
+        }
+        const pushBranch = await git(clone, ['push', 'origin', `refs/heads/${repo.branch}:refs/heads/${repo.branch}`], { env });
+        if (pushBranch.code !== 0) throw new Error(`branch push failed: ${pushBranch.stderr || pushBranch.stdout}`);
+        // A concurrent target update becomes a safe non-fast-forward failure; no
+        // remote history is overwritten and Temporal can retry through Resolve.
+        const pushTarget = await git(clone, ['push', 'origin', `refs/heads/${repoTarget}:refs/heads/${repoTarget}`], { env });
+        if (pushTarget.code !== 0) throw new Error(`target push failed (protected or advanced concurrently): ${pushTarget.stderr || pushTarget.stdout}`);
+        const head = await git(clone, ['rev-parse', 'HEAD']);
+        return { merged: true, sha: head.stdout.trim(), landedFiles: files } satisfies MergeResult;
+      });
+      landedFiles.push(...one.landedFiles.map((file) => repos.length > 1 ? `${repo.name}/${file}` : file));
+      if (!one.merged) return { ...one, landedFiles };
+      sha = one.sha;
+    } catch (error) {
+      return { merged: false, landedFiles, note: `repo "${repo.name}": ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+  return { merged: true, sha, landedFiles, note: `landed by the trusted Git broker${repos.length > 1 ? ` across ${repos.length} repos` : ''}` };
+}
+
+export async function brokerOpenGithubPr(
+  world: World,
+  target: string,
+  auth: GitBrokerAuth,
+): Promise<{ url: string; number: number } | null> {
+  const repos = worldRepos(world.handle);
+  const primary = repos[0];
+  if (!primary) return null;
+  const primaryTarget = primary.target ?? target;
+  const published = await brokerPublishBranch(world, auth);
+  if (!published.pushed.includes(primary.name)) return null;
+  const slug = githubSlug(primary.repo);
+  if (!slug) return null;
+  const credential = await resolveCredential(auth, primary);
+  const env = credential.env ?? {};
+  try {
+    // `gh pr create` prints a URL and deliberately has no `--json` flag. Create
+    // first, then query the PR through `pr view` for the stable structured shape.
+    await pexec('gh', [
+      'pr', 'create', '--repo', slug, '--base', primaryTarget, '--head', primary.branch, '--fill',
+    ], { env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' }, timeout: 60_000, maxBuffer: 4 * 1024 * 1024 });
+    return await viewGithubPr(slug, primary.branch, env);
+  } catch {
+    return viewGithubPr(slug, primary.branch, env).catch(() => null);
+  }
+}
+
+async function viewGithubPr(slug: string, branch: string, env: Record<string, string>): Promise<{ url: string; number: number }> {
+  const { stdout } = await pexec('gh', ['pr', 'view', branch, '--repo', slug, '--json', 'url,number'], {
+    env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
+  });
+  return JSON.parse(stdout);
+}
+
+async function withTransferredRepo<T>(
+  world: World,
+  repo: WorldRepo,
+  auth: GitBrokerAuth,
+  use: (clone: string, env: Record<string, string>) => Promise<T>,
+): Promise<T> {
+  if (!/^(?:ssh:\/\/|git@)/.test(repo.repo)) throw new Error('Git broker requires an SSH remote');
+  if (!safeBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
+  const transferName = `.karmax-transfer-${repo.name.replace(/[^a-zA-Z0-9_.-]/g, '-')}.bundle`;
+  const transferRel = worldRepos(world.handle).length > 1 ? `${repo.name}/${transferName}` : transferName;
+  const bundle = await world.exec('git', ['bundle', 'create', transferName, 'HEAD'], { cwd: repo.root, timeoutMs: 10 * 60_000 });
+  if (bundle.code !== 0) throw new Error(`could not package cloud branch: ${bundle.stderr || bundle.stdout}`);
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
+  try {
+    const credential = await resolveCredential(auth, repo);
+    const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
+    if (credential.sshKey) {
+      const keyPath = path.join(temp, 'repository.key');
+      fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
+      env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+    }
+    const bundlePath = path.join(temp, 'world.bundle');
+    const transferred = await world.readFileBuffer(transferRel);
+    const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
+    if (transferred.length > maxBytes) throw new Error(`world bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
+    await fs.promises.writeFile(bundlePath, transferred, { mode: 0o600 });
+    const clone = path.join(temp, 'repo');
+    const cloned = await git(temp, ['clone', '-q', '--no-checkout', repo.repo, clone], { env, timeoutMs: 10 * 60_000 });
+    if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
+    const fetched = await git(clone, ['fetch', bundlePath, `HEAD:refs/heads/${repo.branch}`]);
+    if (fetched.code !== 0) throw new Error(`bundle import failed: ${fetched.stderr || fetched.stdout}`);
+    if (repo.baseSha) {
+      const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
+      if (ancestor.code !== 0) throw new Error('world branch is not descended from its recorded base commit');
+    }
+    return await use(clone, env);
+  } finally {
+    await world.exec('rm', ['-f', transferName], { cwd: repo.root }).catch(() => undefined);
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+async function resolveCredential(auth: GitBrokerAuth, repo: WorldRepo): Promise<GitBrokerCredential> {
+  return typeof auth === 'function' ? auth(repo) : { env: auth };
+}
+
+function identityArgs(identity?: WorldGitIdentity): string[] {
+  if (!identity) return [];
+  const args = ['-c', `user.name=${identity.name}`, '-c', `user.email=${identity.email}`];
+  if (identity.signingKeyPath) args.push('-c', 'gpg.format=ssh', '-c', `user.signingKey=${identity.signingKeyPath}`, '-c', 'commit.gpgsign=true');
+  return args;
+}
+
+async function conflictMarkerFiles(dir: string, branch: string, files: string[]): Promise<string[]> {
+  if (!files.length) return [];
+  const grep = async (pattern: string): Promise<Set<string>> => {
+    const result = await git(dir, ['grep', '-l', '-E', pattern, branch, '--', ...files]);
+    return new Set(result.stdout.split('\n').map((line) => line.replace(new RegExp(`^${escapeRegExp(branch)}:`), '').trim()).filter(Boolean));
+  };
+  const open = await grep('^<{7}( |$)');
+  const close = await grep('^>{7}( |$)');
+  return [...open].filter((file) => close.has(file));
+}
+
+function githubSlug(remote: string): string | undefined {
+  const match = remote.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/i);
+  return match?.[1];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function safeBranch(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/.test(value)
+    && !value.includes('..') && !value.includes('@{') && !value.endsWith('/')
+    && !value.endsWith('.lock') && !value.includes('//');
+}

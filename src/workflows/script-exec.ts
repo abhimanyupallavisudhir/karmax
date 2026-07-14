@@ -7,7 +7,8 @@ import {
   workflowInfo,
 } from '@temporalio/workflow';
 import type { coreActivities } from '../activities/core.js';
-import { TaskInput, TaskView, Stage, Message, DeclaredAction, WorldHandleLike } from './contract.js';
+import { TaskInput, TaskView, Stage, Message, DeclaredAction, WorldHandleLike,
+  releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 const long = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', retry: { maximumAttempts: 1 } });
@@ -38,7 +39,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'script-exec', stage, status, messages: msgs, actions: actions(),
-      state: { code }, branch: world?.branch, base, worldPath: world?.root,
+      state: { code }, branch: world?.branch, base, world, worldPath: world?.root,
       parentTaskId: input.parentTaskId, updatedAt: workflowInfo().historyLength,
     };
   }
@@ -53,7 +54,8 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   });
 
   await publish();
-  world = (await core.createWorld({ taskId, repos: input.project.repos, base, gitProfile: input.project.gitProfile, kind: 'worktree' })) as WorldHandleLike;
+  const worldKind = input.project.worldProvider ?? 'worktree';
+  world = (await core.createWorld({ taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
 
   stage = 'do';
   await publish();
@@ -69,5 +71,10 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   stage = cancelled ? 'cancelled' : 'done';
   status = cancelled ? 'cancelled' : 'done';
   await publish();
+  if (world && releaseWorldOnCompletion(world)) {
+    await core.destroyWorld(world as any);
+    world = undefined;
+    await publish();
+  }
   return { stage, code };
 }

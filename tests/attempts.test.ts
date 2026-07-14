@@ -9,6 +9,7 @@ import { ProfileResolver } from '../src/agent/profiles.js';
 describe('multiple task attempts', () => {
   it('creates and queues every up-front attempt', async () => {
     const store = new Store(':memory:');
+    store.claimPersonalOrganization('test');
     const project = store.createProject('Acme', { repos: ['/tmp'], defaultBase: 'main' });
     const tokens = new TokenAuthority();
     const token = tokens.mintPrincipal('user:test', ['*'], project.id).token;
@@ -35,6 +36,7 @@ describe('multiple task attempts', () => {
 
   it('allows another draft after cancellation but rejects one after commitment', async () => {
     const store = new Store(':memory:');
+    store.claimPersonalOrganization('test');
     const project = store.createProject('Acme', { repos: ['/tmp'], defaultBase: 'main' });
     const tokens = new TokenAuthority();
     const token = tokens.mintPrincipal('user:test', ['*'], project.id).token;
@@ -50,6 +52,7 @@ describe('multiple task attempts', () => {
 
   it('projects an unqueued attempt as a selectable draft view', async () => {
     const store = new Store(':memory:');
+    store.claimPersonalOrganization('test');
     const project = store.createProject('Acme');
     const tokens = new TokenAuthority();
     const token = tokens.mintPrincipal('user:test', ['*'], project.id).token;
@@ -70,6 +73,7 @@ describe('multiple task attempts', () => {
 
   it('arms every up-front attempt together when creation is trigger-gated', async () => {
     const store = new Store(':memory:');
+    store.claimPersonalOrganization('test');
     const project = store.createProject('Acme', { repos: ['/tmp'], defaultBase: 'main' });
     const tokens = new TokenAuthority();
     const token = tokens.mintPrincipal('user:test', ['*'], project.id).token;

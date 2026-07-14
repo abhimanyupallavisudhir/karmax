@@ -30,6 +30,8 @@ export interface EvalContext {
   now: number;
   /** Project tag catalogue, for hierarchy expansion + name/path resolution. */
   tags?: Tag[];
+  /** Authenticated user, used only for caller-relative facets such as `is:mine`. */
+  userId?: string;
 }
 export interface FieldContext extends EvalContext {
   /** task id → per-project number, so deps can be shown/matched as `#num`. */
@@ -111,6 +113,9 @@ export const FACET_OPTIONS: FieldOption[] = [
   { value: 'tagged', label: 'Tagged' },
   { value: 'untagged', label: 'Untagged' },
   { value: 'prioritized', label: 'Prioritized' },
+  { value: 'mine', label: 'Assigned to me' },
+  { value: 'unassigned', label: 'Unassigned' },
+  { value: 'my-review', label: 'Needs my review' },
   // ── trigger / schedule / series facets (dependencies, cron, repeatable) ──
   { value: 'triggered', label: 'Has a trigger' },
   { value: 'armed', label: 'Armed (waiting for a trigger)' },
@@ -121,7 +126,7 @@ export const FACET_OPTIONS: FieldOption[] = [
   { value: 'run', label: 'A run of a repeatable task' },
 ];
 
-function facetsOf(t: SearchTask): string[] {
+function facetsOf(t: SearchTask, ctx?: FieldContext): string[] {
   const f: string[] = [];
   const st = status(t);
   if (t.params?.draft) f.push('draft');
@@ -134,6 +139,10 @@ function facetsOf(t: SearchTask): string[] {
   if (t.lastView?.pr) f.push('pr');
   f.push(t.tags?.length ? 'tagged' : 'untagged');
   if (typeof t.params?.priority === 'number' && t.params.priority > 0) f.push('prioritized');
+  if (!t.assignee) f.push('unassigned');
+  if (ctx?.userId && t.assignee?.kind === 'user' && t.assignee.userId === ctx.userId) f.push('mine');
+  if (ctx?.userId && t.reviewers?.includes(ctx.userId)
+    && stage(t) === 'review' && status(t) === 'waiting') f.push('my-review');
   // Trigger/series facets — read straight off params (already loaded on the record).
   const triggers = normalizeTriggers(t.params);
   if (triggers.length) f.push('triggered');
@@ -179,6 +188,16 @@ const dependencyIds = (t: SearchTask): string[] =>
 const refBlob = (ids: string[], idToNum?: Map<string, number>): string =>
   ids.map((id) => `${id} #${idToNum?.get(id) ?? ''}`).join(' ');
 
+/** Stable, searchable principal spelling shared by filters, URLs, and audit events. */
+const principalValue = (principal: TaskRecord['assignee']): string | undefined => {
+  if (!principal) return undefined;
+  switch (principal.kind) {
+    case 'user': return `user:${principal.userId}`;
+    case 'team': return `team:${principal.teamId}`;
+    case 'task-agent': return `task-agent:${principal.taskId}:${principal.role}`;
+  }
+};
+
 // ─── the searchable-field registry ───────────────────────────────────────────
 export const FIELDS: FieldDef[] = [
   { key: 'title', label: 'Title', type: 'text', get: (t) => t.title, sortable: true, sortKey: (t) => lc(t.title) },
@@ -194,13 +213,19 @@ export const FIELDS: FieldDef[] = [
   { key: 'branch', label: 'Branch', type: 'text', get: (t) => t.lastView?.branch },
   { key: 'target', label: 'Target', type: 'text', aliases: ['targetBranch'], get: (t) => t.lastView?.targetBranch },
   { key: 'parent', label: 'Parent', type: 'text', get: (t) => t.parentTaskId },
+  { key: 'creator', label: 'Creator', type: 'text', aliases: ['createdBy'], get: (t) => principalValue(t.createdBy), groupable: true },
+  { key: 'assignee', label: 'Assignee', type: 'text', aliases: ['assigned'], get: (t) => principalValue(t.assignee), groupable: true },
+  { key: 'delegate', label: 'Delegate', type: 'text', get: (t) => principalValue(t.delegate), groupable: true },
+  { key: 'subscriber', label: 'Subscriber', type: 'text', aliases: ['subscribed'], get: (t) => (t.subscribers ?? []).map((p) => principalValue(p)!).filter(Boolean), groupable: true },
+  { key: 'reviewer', label: 'Reviewer', type: 'text', aliases: ['reviewers'], get: (t) => (t.reviewers ?? []).map((id) => `user:${id}`), groupable: true },
+  { key: 'participant', label: 'Participant', type: 'text', get: (t) => [t.createdBy, t.assignee, t.delegate, ...(t.subscribers ?? [])].map((p) => principalValue(p)).filter((p): p is string => Boolean(p)), groupable: true },
   // ── trigger / schedule / dependency fields (this feature) ──
   { key: 'trigger', label: 'Trigger', type: 'enum', options: TRIGGER_OPTIONS, get: primaryTriggerKind, groupable: true, sortable: true, sortKey: (t) => primaryTriggerKind(t) },
   { key: 'schedule', label: 'Schedule', type: 'text', aliases: ['cron'], get: (t) => cronOf(t) },
   { key: 'nextRun', label: 'Next run', type: 'date', aliases: ['next', 'nextrun'], get: (t, ctx) => nextRunOf(t, ctx?.now ?? 0), sortable: true, sortKey: (t, ctx) => nextRunOf(t, ctx?.now ?? 0) ?? Number.MAX_SAFE_INTEGER },
   { key: 'dependsOn', label: 'Depends on', type: 'text', aliases: ['dependson', 'dep', 'after'], get: (t, ctx) => refBlob(dependencyIds(t), ctx?.idToNum) },
   { key: 'blocks', label: 'Blocks', type: 'text', get: (t, ctx) => refBlob((ctx?.blockedBy?.get(t.id) ?? []).map((d) => d.id), ctx?.idToNum) },
-  { key: 'is', label: 'Is', type: 'facet', aliases: ['has'], options: FACET_OPTIONS, get: facetsOf },
+  { key: 'is', label: 'Is', type: 'facet', aliases: ['has', 'needs'], options: FACET_OPTIONS, get: facetsOf },
 ];
 
 const BY_KEY = new Map<string, FieldDef>();

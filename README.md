@@ -18,6 +18,18 @@ npm start          # boots Temporal (SQLite) + worker + gateway, prints a URL
 Then open the printed `http://127.0.0.1:<port>` (ports are chosen dynamically —
 nothing is hardcoded).
 
+To host the complete HTTPS control plane on a VPS, install Docker and run:
+
+```bash
+./deploy/karmax up karmax.example.com
+```
+
+It generates and retains all deployment secrets and starts PostgreSQL, Temporal,
+Karmax, and Caddy. GitHub, E2B, and Daytona are connected from Organization
+settings after the first login—no environment-file editing or SSH-based repo
+setup. See [the hosted deployment guide](deploy/README.md) for DNS, backups,
+upgrades, remote-world cost policy, and the laptop↔cloud Git handoff.
+
 **Requirements**
 
 - Node ≥ 22 (uses the built-in `node:sqlite`).
@@ -42,7 +54,7 @@ merged into your target branch.
 | Workflows: **software-dev, just-do, script-exec, goal, merge-only** | ✅ |
 | Coordinators (lease pattern, crash-safe, continue-as-new): **merge-queue, token/account, budget** | ✅ |
 | Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK + Messages API), Codex (OpenAI), mock** | ✅ |
-| Worlds: **local git worktree** + **Docker container**, swappable provider interface | ✅ |
+| Worlds: **local git worktree**, **Docker**, **E2B**, and **Daytona**, with checkpoint/park/hibernate lifecycle | ✅ |
 | Capability model + attenuation + **workflow-minted scoped tokens**; **platform MCP server** (permission-checked) | ✅ |
 | **Credential broker** (vault-backed, AES-GCM at rest, JIT, scoped, audited; handles only) | ✅ |
 | **PR-test-approve gate** via merge-only (dogfooded) | ✅ |
@@ -53,7 +65,7 @@ merged into your target branch.
 | Virtual-card **budget lease** (hard cap + review-gate threshold) | ✅ |
 | Cheap check-in: **PTY terminal** in the world (WebSocket) + transcript view | ✅ |
 | Immutable defaults + overlay resolution + **global safe mode** + per-workflow fallback | ✅ |
-| Remote access guidance (Tailscale / Cloudflare Tunnel) | ✅ |
+| Hosted control plane: organizations/teams/RBAC, GitHub App onboarding, runner pools, isolated previews, backup/restore, one-command VPS stack | ✅ |
 
 ## Architecture
 
@@ -74,7 +86,7 @@ merged into your target branch.
 ## Testing
 
 ```bash
-npm test          # 55 tests: real Temporal, real git, mock agent (hermetic)
+npm test          # real Temporal, real git, mock agent (hermetic)
 npm run typecheck
 ```
 

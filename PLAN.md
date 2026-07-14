@@ -62,16 +62,12 @@ input — one model, not two.
 > **Status:** Phases A–E ✅. Phase F done: **(a)** profile/account UI, **(b)**
 > declarative widget tier, **(c)-1** payments lease, **(d)** connect-accounts/
 > multi-login, **(e)** per-profile MCP baseline, **22** account-coordinator-into-
-> turn-loop, **24** task archiving + pagination + draft hard-delete (100 tests;
-> verified live incl. real Claude + Codex agents). Version-pinning per execution
-> is recorded + surfaced in the UI. Remaining Phase F is the long tail that needs
-> external resources or is a large bet: **21** dynamic version-pinned repo loading
-> (self-healing substrate), **23** GitHub PR webhooks (needs a public endpoint),
-> **(c)-2** real Stripe rail, **(c)-3** agent registration + MFA (browser),
-> instant mid-turn cancel, richer observability.
->
-> Small leftovers (not yet done): instant mid-turn cancel (cancel currently lands
-> between turns); a real draft `DELETE` endpoint (today drafts soft-delete in the UI).
+> turn-loop, **21** dynamic workflow packages, **23** GitHub App/webhook/PR
+> delivery, and **24** lifecycle deletion, pagination, and observability. Mid-turn
+> cancellation and draft hard-delete are implemented and covered by integration
+> tests. The remaining payment/automation expansion is **(c)-2** completing the
+> external Stripe Issuing rail and **(c)-3** agent registration/MFA through browser
+> automation; neither is required by the hosted project-management baseline.
 
 **Phase A ✅ — the parameter foundation (unblocks 1, 2, 3 + several gaps)**
 1. `FieldSpec` type; generalize `ActionArg`. Manifest `params` for each workflow.
@@ -103,13 +99,12 @@ input — one model, not two.
 19. Live agent-output streaming into the thread + cancel-a-running-turn.
 20. Restart/resume verification + store↔Temporal reconciliation; persist sessions.
 
-**Phase F — deeper spec features (later)**
-21. Dynamically-loaded, version-pinned workflow repos + replay-compat (real
-    self-healing). This is the substrate the others below lean on for editability.
-    **Implementation plan written: see `PLAN-dynamic-repos.md`** (Option B —
-    version-qualified workflow types in one worker, pinned per execution; the
-    determinism constraint is workflow-code-only; most surrounding machinery
-    already exists). Ready to build in phases 21a–21e.
+**Phase F — deeper spec features**
+21. ✅ Dynamically-loaded, version-pinned workflow repositories + replay
+    compatibility. Git packages are validated and SHA-pinned, bundled under
+    version-qualified workflow names, installed through the product API, and
+    picked up by a managed worker roll without changing in-flight executions.
+    See `PLAN-dynamic-repos.md`.
 22. ✅ Token/account coordinator wired into the turn loop. The built coordinator
     (lease/park/window-refresh, SPEC §6.2) now drives real per-turn leasing:
     `registerAccounts` upserts connected logins into the pool; software-dev probes
@@ -120,16 +115,19 @@ input — one model, not two.
     the profile home. Boot + connect register logged-in homes. End-to-end test
     proves a task leases + returns. *Open:* per-account real token metering (the
     dev model approximates windows) and rotation policy tuning.
-23. Real GitHub PR lifecycle + webhook dispatcher.
-24. ◑ Archive/delete + world/branch pruning; pagination; observability.
-    - Task **archiving** ✅ — `POST /api/tasks/:id/archive` (refused while a task is
-      live: running or awaiting review); archived tasks are hidden from the default
-      list, shown via `?includeArchived=1`; UI archive/unarchive controls + a "Show
-      archived" toggle; archived tasks drop out of the attention bell.
+23. ✅ GitHub App installation, repository reconciliation, signed idempotent
+    webhook dispatcher, protected PR delivery, and SSH Git broker.
+24. ✅ Archive/delete + world/branch pruning; pagination; observability.
+    - Task **archiving** ✅ — `POST /api/tasks/:id/archive`; archived tasks are
+      hidden from the default list, shown via `?includeArchived=1`; UI
+      archive/unarchive controls + a "Show archived" toggle; archived tasks drop
+      out of the attention bell. Archiving is organizational and does not stop a
+      live durable task.
     - Draft hard-**delete** ✅ (done earlier).
     - **Pagination** ✅ — `?limit=&offset=` returns `{tasks, total, offset}`.
-    - World pruning is already handled (worktrees `destroyWorld` at end/abort;
-      branches kept by design). *Open:* richer observability/metrics.
+    - World pruning is handled at completion/abort and by park/hibernate/release
+      lifecycle sweeps. Diagnostics, Prometheus metrics, bounded durable execution
+      output, backup/restore, and deletion cleanup cover the operator surface.
 25. **(a) ✅ Profile + account management UI** — edit role profiles
     (provider/model/effort/capabilities/maxTurns/auth) and connect accounts /
     register API keys from Global settings. Backend (ProfileStore, broker,
@@ -220,13 +218,17 @@ These were in the original gap assessment / the accounts+MCP discussion; they we
 triaged below the three explicit demands + the trust pass (Phase E), not cut.
 (a)/(b)/(c)/(d)/(e) above are the concrete line items.
 
-## Next up (current implementation target)
+## Current state
 
-Per the conversation: **(a)** profile/account management UI, then **(c)-1** — the
-`request_spend` four-outcome budget lease + review-packet funding + a
-MockPaymentProvider (no external accounts, end-to-end testable). Then (b) the
-declarative widget renderer; real Stripe rail, agent registration, and dynamic
-version-pinned workflow repos (21) are the larger Phase-F push.
+The core and hosted baselines are implemented. Remaining roadmap work is
+explicitly optional provider expansion: finish a production Stripe Issuing rail,
+agent-driven third-party registration/MFA, native customer runners, and a
+workflow distribution marketplace.
 
-Phases A–D deliver the user's three demands; E is the "make it trustworthy"
-pass; F is the long tail. Each phase is independently shippable and tested.
+## Hosted evolution
+
+The collaborative hosted baseline is implemented and specified in
+`PLAN-cloud.md`: provider-neutral Environment/Runner pool/World/Execution
+contracts, E2B and Daytona worlds, GitHub/SSH brokerage, park/hibernate economics,
+single-writer hosted cells, organization tenancy, and `PLAN-collaboration.md`.
+The native local/VPC runner handoff remains an optional enterprise expansion.

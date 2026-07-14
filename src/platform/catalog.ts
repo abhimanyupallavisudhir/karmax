@@ -14,6 +14,7 @@ export const PLATFORM_API_CATALOG = {
     'PATCH /api/tasks/:taskId/params|notes|authorization',
     'PUT /api/tasks/:taskId/tags|priority', 'POST /api/tasks/:taskId/tag|archive|signal|target',
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
+    'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/refresh-from-github',
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
@@ -45,6 +46,13 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/users', 'DELETE /api/users/:id',
     'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',
+  ],
+  cloud: [
+    'GET /api/organizations/:organizationId/world-providers',
+    'PUT|DELETE /api/organizations/:organizationId/world-providers/:provider',
+    'POST /api/organizations/:organizationId/world-providers/:provider/test',
+    'GET|POST /api/organizations/:organizationId/runner-pools',
+    'PATCH|DELETE /api/organizations/:organizationId/runner-pools/:runnerPoolId',
   ],
   operations: [
     'GET /api/activity?projectId=&since=', 'GET /api/dashboard', 'GET /api/diagnostics',

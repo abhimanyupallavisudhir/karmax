@@ -36,7 +36,7 @@ import {
   ParentResponse,
   SubTaskResponse,
 } from './contract.js';
-import { remotePolicyOf } from './contract.js';
+import { releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
@@ -149,8 +149,10 @@ const MAX_SHELL_NUDGES = 3;
  * scratch or single-repo world yields one domain, exactly as before.)
  */
 function mergeDomains(world: WorldHandleLike | undefined, target: string, projectId: string): string[] {
-  const repos = world?.repos?.length ? world.repos.map((r) => r.repo) : world?.repo ? [world.repo] : [projectId];
-  return [...new Set(repos.map((r) => `${r}:${target}`))].sort();
+  const domains = world?.repos?.length
+    ? world.repos.map((repo) => `${repo.repo}:${repo.target ?? target}`)
+    : [`${world?.repo ?? projectId}:${target}`];
+  return [...new Set(domains)].sort();
 }
 
 /**
@@ -261,7 +263,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
 
-  const kind = input.project.worldProvider === 'container' ? 'container' : 'worktree';
+  const kind = input.project.worldProvider ?? 'worktree';
 
   // ── in-flight param edits (SPEC §4.5/§5.5) ──
   // A working copy of the per-role agent overrides that later turns re-read, so a
@@ -448,6 +450,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       branch: world?.branch,
       base,
       targetBranch: target,
+      world,
       worldPath: world?.root,
       pr,
       mergeQueue: mergeQueuePos,
@@ -1101,7 +1104,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   await publish();
   if (!world) {
     world = (await withResolve('setup', () =>
-      core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
+      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
     )) as WorldHandleLike;
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
@@ -1526,7 +1529,12 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   status = 'done';
   reviewInfo = { ...reviewInfo, summary: `Merged into ${target} at ${world!.repo ?? '(scratch repo)'} as ${sha?.slice(0, 8)}.` };
   await publish();
+  const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
   await core.destroyWorld(world as any);
+  if (remoteWorld) {
+    world = undefined;
+    await publish();
+  }
   return { stage, sha };
   } catch (e) {
     if (e instanceof Cancelled || (isCancellation(e) && cancelled)) return await abort();
@@ -1539,7 +1547,14 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     status = 'cancelled';
     await cancelChildren(liveAgentStates); // don't strand children when we go away
     await publish();
-    if (world) await core.destroyWorld(world as any);
+    if (world) {
+      const remoteWorld = releaseWorldOnCompletion(world);
+      await core.destroyWorld(world as any);
+      if (remoteWorld) {
+        world = undefined;
+        await publish();
+      }
+    }
     return { stage } as { stage: Stage };
   }
 }

@@ -101,6 +101,20 @@ describe('evaluateQuery — filtering', () => {
     expect(evaluateQuery(tasks, parseQuery('is:untagged'), ctx).tasks.map((t) => t.num)).toEqual([4]);
   });
 
+  it('searches responsibility and caller-relative work/review facets', () => {
+    const owned = task({ title: 'Owned', num: 20, assignee: { kind: 'user', userId: 'u1' },
+      createdBy: { kind: 'user', userId: 'u2' }, subscribers: [{ kind: 'team', teamId: 'design' }],
+      lastView: view('active') });
+    const review = task({ title: 'Review', num: 21, reviewers: ['u1'], lastView: view('waiting', 'review') });
+    const other = task({ title: 'Other', num: 22, assignee: { kind: 'user', userId: 'u2' }, lastView: view('active') });
+    const mine = { ...ctx, userId: 'u1' };
+    expect(evaluateQuery([owned, review, other], parseQuery('is:mine'), mine).tasks.map((t) => t.num)).toEqual([20]);
+    expect(evaluateQuery([owned, review, other], parseQuery('needs:my-review'), mine).tasks.map((t) => t.num)).toEqual([21]);
+    expect(evaluateQuery([owned, review, other], parseQuery('is:unassigned'), mine).tasks.map((t) => t.num)).toEqual([21]);
+    expect(evaluateQuery([owned, review, other], parseQuery('creator:user:u2'), mine).tasks.map((t) => t.num)).toEqual([20]);
+    expect(evaluateQuery([owned, review, other], parseQuery('participant:team:design'), mine).tasks.map((t) => t.num)).toEqual([20]);
+  });
+
   it('AND-s multiple clauses together', () => {
     const r = evaluateQuery(tasks, parseQuery('status:active priority:>=1'), ctx);
     expect(r.tasks.map((t) => t.num)).toEqual([1]);

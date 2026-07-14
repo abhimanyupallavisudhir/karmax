@@ -1,3 +1,5 @@
+import type { WorldHandleRef } from '../domain/types.js';
+
 /**
  * The world provider interface (SPEC §11.1). A world is the environment a
  * task's work happens in. Workflows talk only to this interface so the backend
@@ -8,7 +10,10 @@
  * live world from the handle via the provider registry.
  */
 
-export type WorldKind = 'worktree' | 'container' | 'memory';
+/** Stable provider id persisted in Temporal history. Additive only: a handle
+ * keeps naming the provider that created it for the lifetime of the task. */
+/** Provider registry id. Kept as an alias because it is persisted in workflow state. */
+export type WorldKind = string;
 
 /**
  * One repository checked out inside a (possibly multi-repo) world. A project may
@@ -28,9 +33,13 @@ export interface WorldRepo {
   branch: string;
   /** Base branch this repo forked from. */
   base: string;
+  /** Protected branch this repo lands on. Defaults to the world's target. */
+  target?: string;
+  /** Immutable commit from which this attempt started. */
+  baseSha?: string;
 }
 
-export interface WorldHandle {
+export interface WorldHandle extends WorldHandleRef {
   kind: WorldKind;
   id: string;
   /** Absolute working directory (for worktree/container-mounted). For a
@@ -68,6 +77,9 @@ export interface WorldGitIdentity {
 
 export interface WorldSpec {
   taskId: string;
+  /** Tenant used to resolve the provider connection inside the trusted activity.
+   * It is non-secret and is sealed into remote handles for later resume. */
+  organizationId?: string;
   /** Source repo (worktree). When absent (and `repos` is empty) a scratch repo is created. */
   repo?: string;
   /** Source repos for a multi-repo world. Takes precedence over `repo`. Empty ⇒ scratch. */
@@ -81,6 +93,21 @@ export interface WorldSpec {
   /** Worktree-scoped identity/signing for every commit made in this world
    *  (PLAN-git-config.md §4A). Absent ⇒ host identity, else karmax@localhost. */
   gitIdentity?: WorldGitIdentity;
+  /** Ephemeral clone credentials resolved inside the create-world activity.
+   * Providers may install them into the isolated world, but must never persist
+   * their values in WorldHandle or logs. */
+  gitCredentials?: {
+    /** Compatibility key for one repository/local profiles. */
+    sshKey?: string;
+    /** SSH URL -> distinct read-only clone key for hosted repository records. */
+    repositories?: Record<string, string>;
+  };
+  /** Per-repository branch policy supplied by first-class hosted repository
+   * attachments. Keys are the exact SSH URLs in `repos`. */
+  repositoryBranches?: Record<string, { base: string; target: string }>;
+  network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
+  environment?: { image?: string; snapshot?: string };
+  resources?: { cpu?: number; memoryMb?: number; gpu?: number };
 }
 
 /**
@@ -92,7 +119,8 @@ export interface WorldSpec {
 export function worldRepos(handle: WorldHandle): WorldRepo[] {
   if (handle.repos?.length) return handle.repos;
   if (handle.repo) {
-    return [{ name: handle.repo.split('/').filter(Boolean).pop() ?? handle.id, repo: handle.repo, root: handle.root, branch: handle.branch, base: handle.base }];
+    return [{ name: handle.repo.split('/').filter(Boolean).pop() ?? handle.id, repo: handle.repo, root: handle.root,
+      branch: handle.branch, base: handle.base, target: handle.target }];
   }
   return [];
 }
@@ -110,20 +138,105 @@ export interface ExecOptions {
   input?: string;
 }
 
+/** A streaming process started inside a world. The gateway owns only this
+ * opaque lease; providers decide whether the process is local, in Docker, or in
+ * a remote sandbox. */
+export interface WorldProcess {
+  /** Present for host-visible processes, absent for remote provider processes. */
+  readonly pid?: number;
+  onOutput(listener: (chunk: string) => void): () => void;
+  onExit(listener: (code: number | null) => void): () => void;
+  kill(signal?: 'SIGTERM' | 'SIGKILL'): void | Promise<void>;
+}
+
+export interface WorldProcessSpec {
+  command: string;
+  cwd?: string;
+  env?: Record<string, string>;
+}
+
+/** A provider-owned interactive terminal. This deliberately mirrors the tiny
+ * subset the browser terminal needs instead of leaking node-pty into callers. */
+export interface WorldPty {
+  readonly pid?: number;
+  onData(listener: (chunk: string) => void): () => void;
+  onExit(listener: (code: number | null) => void): () => void;
+  write(data: string): void | Promise<void>;
+  resize(cols: number, rows: number): void | Promise<void>;
+  close(): void | Promise<void>;
+}
+
+export interface WorldPtySpec {
+  cwd?: string;
+  cols?: number;
+  rows?: number;
+  env?: Record<string, string>;
+}
+
+export type WorldLifecycleState = 'ready' | 'parked' | 'missing';
+
+export interface WorldHttpResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+export interface WorldHttpRequest {
+  method: string;
+  headers?: Record<string, string>;
+  body?: Buffer;
+}
+
+export interface WorldPreviewSocketTarget {
+  url: string;
+  headers?: Record<string, string>;
+}
+
 export interface World {
   handle: WorldHandle;
   exec(cmd: string, args: string[], opts?: ExecOptions): Promise<ExecResult>;
   readFile(relPath: string): Promise<string>;
+  readFileBuffer(relPath: string): Promise<Buffer>;
   writeFile(relPath: string, content: string): Promise<void>;
+  writeFileBuffer?(relPath: string, content: Buffer): Promise<void>;
   listFiles(): Promise<string[]>;
+  startProcess(spec: WorldProcessSpec): Promise<WorldProcess>;
+  openPty(spec?: WorldPtySpec): Promise<WorldPty>;
+  /** Authenticated control-plane proxy to a service bound inside this world.
+   * Remote providers implement it without exposing provider credentials. */
+  fetchPort?(port: number, requestPath: string, request?: WorldHttpRequest): Promise<WorldHttpResponse>;
+  /** Short-lived, server-side upstream for an authenticated preview WebSocket.
+   * Provider traffic credentials are returned only to the gateway. */
+  previewSocketTarget?(port: number, requestPath: string): Promise<WorldPreviewSocketTarget>;
   destroy(): Promise<void>;
 }
 
 export interface WorldProvider {
   readonly kind: WorldKind;
+  readonly capabilities?: {
+    remote: boolean;
+    pty: boolean;
+    snapshots: boolean;
+    ports: boolean;
+    networkPolicy: boolean;
+  };
   /** Whether this provider supports snapshot-on-park (SPEC §11.3). */
   readonly parkable: boolean;
   create(spec: WorldSpec): Promise<World>;
   /** Reconstruct a live world from a persisted handle. */
   open(handle: WorldHandle): Promise<World>;
+  /** Release metered compute while retaining the world's durable state. */
+  park?(handle: WorldHandle): Promise<WorldHandle>;
+  status?(handle: WorldHandle): Promise<WorldLifecycleState>;
+}
+
+/** Provider-independent confinement for every file/process cwd crossing the
+ * gateway boundary. Providers may map this path to any physical location. */
+export function worldRelativePath(relPath: string): string {
+  const normalized = relPath.replace(/\\/g, '/');
+  if (!normalized || normalized === '.') return '.';
+  if (normalized.startsWith('/') || /^[a-zA-Z]:\//.test(normalized)) throw new Error('path must be relative to the world');
+  const parts = normalized.split('/').filter((p) => p && p !== '.');
+  if (parts.some((p) => p === '..')) throw new Error('path escapes world');
+  return parts.join('/') || '.';
 }

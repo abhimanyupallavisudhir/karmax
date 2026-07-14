@@ -28,29 +28,21 @@ export type {
   RaiseType,
   SubTaskAction,
   RemotePolicy,
+  WorldHandleRef,
 } from '../domain/types.js';
 
 // Pure, deterministic helper (no Node imports) — safe inside the workflow sandbox.
 export { remotePolicyOf } from '../domain/types.js';
 
-/** One repo checked out in a (possibly multi-repo) world, as carried in state. */
-export interface WorldRepoLike {
-  name: string;
-  repo: string;
-  root: string;
-  branch: string;
-  base: string;
+/** Pure provider classification, safe in Temporal's deterministic sandbox. */
+export function remoteWorldProvider(provider: string | undefined): boolean {
+  return !!provider && !['worktree', 'container', 'memory'].includes(provider);
 }
 
-/** Plain (method-free) world handle as carried in workflow state. */
-export interface WorldHandleLike {
-  kind: 'worktree' | 'container' | 'memory';
-  id: string;
-  root: string;
-  branch: string;
-  base: string;
-  repo?: string;
-  target?: string;
-  repos?: WorldRepoLike[];
-  meta?: Record<string, unknown>;
+export function releaseWorldOnCompletion(handle: import('../domain/types.js').WorldHandleRef): boolean {
+  return remoteWorldProvider(handle.provider ?? handle.kind) || handle.meta?.releaseOnCompletion === true;
 }
+
+/** One repo checked out in a (possibly multi-repo) world, as carried in state. */
+/** Back-compatible workflow name for the domain's provider-neutral handle. */
+export type WorldHandleLike = import('../domain/types.js').WorldHandleRef;
