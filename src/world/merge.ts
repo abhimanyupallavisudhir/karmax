@@ -36,12 +36,12 @@ export interface MergeResult {
 export async function finalizeMerge(world: World, target: string, identity?: WorldGitIdentity): Promise<MergeResult> {
   const repos = worldRepos(world.handle);
   if (!repos.length) return { merged: false, landedFiles: [], note: 'no source repo (non-git world)' };
-  if (repos.length === 1) return finalizeMergeRepo(repos[0]!, target, world.handle.id, identity);
+  if (repos.length === 1) return finalizeMergeRepo(repos[0]!, repos[0]!.target ?? target, world.handle.id, identity);
 
   const landedFiles: string[] = [];
   let sha: string | undefined;
   for (const r of repos) {
-    const res = await finalizeMergeRepo(r, target, world.handle.id, identity);
+    const res = await finalizeMergeRepo(r, r.target ?? target, world.handle.id, identity);
     landedFiles.push(...res.landedFiles.map((f) => `${r.name}/${f}`));
     if (!res.merged) {
       return {
@@ -54,7 +54,9 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
     }
     sha = res.sha;
   }
-  return { merged: true, sha, landedFiles, note: `merged ${repos.length} repos into ${target}` };
+  const targets = [...new Set(repos.map((repo) => repo.target ?? target))];
+  return { merged: true, sha, landedFiles,
+    note: targets.length === 1 ? `merged ${repos.length} repos into ${targets[0]}` : `merged ${repos.length} repos into their configured targets` };
 }
 
 /** Merge one repo's attempt branch into `target` (the per-repo primitive). */

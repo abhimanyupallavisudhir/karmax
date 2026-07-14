@@ -2,7 +2,7 @@ import { Store } from '../store/db.js';
 import { Capability, CAPABILITIES, allows, attenuate } from './capabilities.js';
 
 export type AuthorizationProfileId = 'developer' | 'maintainer' | 'operator' | 'administrator' | string;
-export type AuthorizationScope = 'global' | `project:${string}`;
+export type AuthorizationScope = 'global' | `organization:${string}` | `project:${string}`;
 
 export interface AuthorizationProfile {
   id: AuthorizationProfileId;
@@ -25,17 +25,18 @@ export interface PrincipalGrant {
 
 const developer = [
   'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read', 'credential:read', 'skill:write',
+  'organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*',
   // Workflow-internal decisions and merges are still narrowed by the role
   // profile and the workflow's exact branch target at execution time.
   'resolve-decision', 'confirm-decision', 'merge-into:*',
 ] satisfies Capability[];
 const maintainer = [
   ...developer, 'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
-  'workflow:install', 'workflow:edit',
+  'workflow:install', 'workflow:edit', 'team:write', 'repository:write',
 ] satisfies Capability[];
 const operator = [
   ...maintainer, 'project:create', 'diagnostic:read', 'process:*', 'credential:*',
-  'payment:*', 'settings:*', 'safe-mode:write',
+  'payment:*', 'settings:*', 'safe-mode:write', 'organization:*',
 ] satisfies Capability[];
 
 // A project grant can never turn into authority over unrelated projects or the
@@ -46,6 +47,14 @@ const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+  'organization:read', 'organization:member:read', 'team:*', 'repository:*', 'inbox:*',
+];
+
+const ORGANIZATION_GRANT_CEILING: Capability[] = [
+  'organization:*', 'team:*', 'repository:*', 'inbox:*',
+  'project:read', 'project:create', 'project:edit', 'project:settings:*',
+  'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
+  'credential:read', 'skill:write', 'payment:read',
 ];
 
 /**
@@ -77,6 +86,7 @@ export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
 ];
 
 export const projectScope = (projectId: string): AuthorizationScope => `project:${projectId}`;
+export const organizationScope = (organizationId: string): AuthorizationScope => `organization:${organizationId}`;
 
 export class AuthorizationService {
   constructor(private store: Store) {
@@ -159,15 +169,19 @@ export class AuthorizationService {
     this.audit(actor, 'authorization.grant.revoked', scopeKey, { principalId });
   }
 
-  capabilities(principalId: string, projectId?: string): Capability[] {
+  capabilities(principalId: string, projectId?: string, organizationId?: string): Capability[] {
     const out = new Set<Capability>();
-    const relevant = this.grants(principalId).filter((g) => g.scopeKey === 'global' || (projectId && g.scopeKey === projectScope(projectId)));
+    const resolvedOrganizationId = organizationId ?? (projectId ? this.store.getProject(projectId)?.organizationId : undefined);
+    const relevant = this.grants(principalId).filter((g) => g.scopeKey === 'global'
+      || (resolvedOrganizationId && g.scopeKey === organizationScope(resolvedOrganizationId))
+      || (projectId && g.scopeKey === projectScope(projectId)));
     for (const grant of relevant) {
       // A project overlay must not silently redefine an account's global grant.
       const p = grant.scopeKey === 'global' ? this.profile(grant.profileId) : this.profile(grant.profileId, projectId);
       if (!p) continue;
       let caps = grant.capabilities ? attenuate(p.capabilities, grant.capabilities) : p.capabilities;
-      if (grant.scopeKey !== 'global') caps = attenuate(caps, PROJECT_GRANT_CEILING);
+      if (grant.scopeKey.startsWith('project:')) caps = attenuate(caps, PROJECT_GRANT_CEILING);
+      else if (grant.scopeKey.startsWith('organization:')) caps = attenuate(caps, ORGANIZATION_GRANT_CEILING);
       for (const cap of caps) out.add(cap);
     }
     return [...out];
@@ -189,6 +203,10 @@ export class AuthorizationService {
   bootstrapAdministrator(userId: string): void {
     if (this.store.listPrincipalGrants().length) return;
     this.grant('system:bootstrap', { principalId: `user:${userId}`, scopeKey: 'global', profileId: 'administrator' });
+  }
+
+  bootstrapOrganizationOwner(actor: string, userId: string, organizationId: string): void {
+    this.grant(actor, { principalId: `user:${userId}`, scopeKey: organizationScope(organizationId), profileId: 'administrator' });
   }
 
   audit(principalId: string, action: string, scopeKey: AuthorizationScope | string = 'global', detail: Record<string, unknown> = {}): number {

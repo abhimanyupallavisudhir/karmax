@@ -1,5 +1,5 @@
 import { betterAuth } from 'better-auth';
-import { admin } from 'better-auth/plugins';
+import { admin, genericOAuth } from 'better-auth/plugins';
 import { getMigrations } from 'better-auth/db/migration';
 import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
@@ -39,8 +39,11 @@ export class IdentityService {
   readonly auth: any;
   private db: DatabaseSync;
 
-  private constructor(dbFile: string, opts: { baseURL?: string | { allowedHosts: string[]; fallback?: string }; secret?: string } = {}) {
+  readonly oidcProviderId?: string;
+  private constructor(dbFile: string, opts: { baseURL?: string | { allowedHosts: string[]; fallback?: string }; secret?: string;
+    oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] } } = {}) {
     this.db = new DatabaseSync(dbFile);
+    this.oidcProviderId = opts.oidc?.providerId;
     this.auth = betterAuth({
       appName: 'karmax',
       database: this.db,
@@ -48,11 +51,16 @@ export class IdentityService {
       ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
       emailAndPassword: { enabled: true, minPasswordLength: 10 },
       session: { expiresIn: 60 * 60 * 24 * 14, updateAge: 60 * 60 * 24 },
-      plugins: [admin({ defaultRole: 'user', adminRoles: ['admin'] })],
+      plugins: [admin({ defaultRole: 'user', adminRoles: ['admin'] }),
+        ...(opts.oidc ? [genericOAuth({ config: [{ providerId: opts.oidc.providerId,
+          discoveryUrl: opts.oidc.discoveryUrl, issuer: opts.oidc.issuer, clientId: opts.oidc.clientId,
+          clientSecret: opts.oidc.clientSecret, scopes: opts.oidc.scopes ?? ['openid', 'profile', 'email'],
+          pkce: true, requireIssuerValidation: true }] })] : [])],
     });
   }
 
-  static async open(dbFile: string, opts: { baseURL?: string | { allowedHosts: string[]; fallback?: string }; secret?: string } = {}): Promise<IdentityService> {
+  static async open(dbFile: string, opts: { baseURL?: string | { allowedHosts: string[]; fallback?: string }; secret?: string;
+    oidc?: { providerId: string; discoveryUrl: string; issuer?: string; clientId: string; clientSecret: string; scopes?: string[] } } = {}): Promise<IdentityService> {
     const service = new IdentityService(dbFile, opts);
     const { runMigrations } = await getMigrations(service.auth.options);
     await runMigrations();
@@ -89,6 +97,19 @@ export class IdentityService {
 
   async signOut(headers: Headers): Promise<Response> {
     return this.auth.api.signOut({ headers, asResponse: true });
+  }
+
+  async beginSso(callbackURL: string, headers?: Headers): Promise<Response> {
+    if (!this.oidcProviderId) throw new Error('enterprise SSO is not configured');
+    return this.auth.api.signInWithOAuth2({ body: { providerId: this.oidcProviderId, callbackURL }, headers, asResponse: true });
+  }
+
+  providersForUser(userId: string): string[] {
+    return (this.db.prepare('SELECT providerId FROM account WHERE userId=?').all(userId) as any[]).map((row) => String(row.providerId));
+  }
+
+  revokeUserSessions(userId: string): void {
+    this.db.prepare('DELETE FROM session WHERE userId=?').run(userId);
   }
 
   /** First-account setup. The route calling this is available only while empty. */

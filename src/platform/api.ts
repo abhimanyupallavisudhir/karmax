@@ -17,7 +17,8 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, ConfirmConfig } from '../domain/types.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -52,6 +53,26 @@ export interface TriggerArmer {
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
 const agentSnapshotKey = (taskId: string) => `task-agents:${taskId}`;
+
+function principalRefOf(principal: string): PrincipalRef | undefined {
+  if (principal.startsWith('user:')) return { kind: 'user', userId: principal.slice(5) };
+  const taskAgent = principal.match(/^task-agent:([^:]+):(.+)$/);
+  return taskAgent ? { kind: 'task-agent', taskId: taskAgent[1]!, role: taskAgent[2]! } : undefined;
+}
+
+/** Legacy human confirmers become an explicit, immutable review audience. This
+ * prevents a hosted task from being approvable by whichever logged-in user
+ * happens to click first. Explicit API policy always wins. */
+function defaultConfirmationPolicy(store: Store, projectId: string, confirm: ConfirmConfig | undefined,
+  creator: PrincipalRef | undefined): ConfirmationPolicy | undefined {
+  if (!confirmLayersOf(confirm).some((layer) => layer.kind === 'human')) return undefined;
+  const memberships = store.listProjectMemberships(projectId);
+  for (const role of ['reviewer', 'admin', 'owner']) {
+    if (memberships.some((membership) => membership.role === role))
+      return { targets: [{ kind: 'project-role', projectId, role }], rule: 'any' };
+  }
+  return creator?.kind === 'user' ? { targets: [creator], rule: 'any' } : undefined;
+}
 
 /** Deepest cause message — unwraps Temporal's WorkflowUpdateFailedError → the
  *  validator's ApplicationFailure so the user sees the real "why". */
@@ -107,6 +128,11 @@ export interface KarmaxApiDeps {
   authorization?: AuthorizationService;
   /** Provider selected by the host/harness; avoids re-detecting ambient creds. */
   defaultAgentProvider?: Provider;
+  /** Enforce hosted control-plane invariants without consulting mutable ambient env. */
+  hosted?: boolean;
+  /** Organization-scoped cloud provider credentials. Kept optional for the
+   * small unit-test API harnesses; production always supplies it. */
+  providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
 }
 
 /**
@@ -124,7 +150,40 @@ export class KarmaxApi {
     this.armer = armer;
   }
 
-  private require(token: string, tool: string, scope?: { projectId?: string; taskId?: string }) {
+  listWorldProviderConnections(token: string, organizationId: string) {
+    this.require(token, 'organization:read', { organizationId });
+    return this.deps.providerConnections?.list(organizationId) ?? [];
+  }
+
+  saveWorldProviderConnection(token: string, input: {
+    organizationId: string;
+    provider: string;
+    apiKey?: string;
+    name?: string;
+    config?: import('../domain/types.js').WorldProviderConnection['config'];
+    enabled?: boolean;
+  }) {
+    this.require(token, 'organization:edit', { organizationId: input.organizationId });
+    if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
+    return this.deps.providerConnections.save(input);
+  }
+
+  async testWorldProviderConnection(token: string, organizationId: string, provider: string) {
+    this.require(token, 'organization:edit', { organizationId });
+    if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
+    return this.deps.providerConnections.test(organizationId, provider);
+  }
+
+  deleteWorldProviderConnection(token: string, organizationId: string, provider: string) {
+    this.require(token, 'organization:edit', { organizationId });
+    if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
+    const active = this.deps.store.organizationResources(organizationId).worlds
+      .filter((handle) => (handle.provider ?? handle.kind) === provider);
+    if (active.length) throw new Error(`${active.length} task world(s) still use ${provider}; finish or delete them first`);
+    return { deleted: Boolean(this.deps.providerConnections.delete(organizationId, provider)) };
+  }
+
+  private require(token: string, tool: string, scope?: { projectId?: string; taskId?: string; organizationId?: string }) {
     const cap = TOOL_CAPABILITY[tool] ?? tool;
     const r = this.deps.tokens.check(token, cap, scope);
     if (!r.ok) throw new CapabilityError(r.reason ?? `denied: ${cap}`);
@@ -142,6 +201,18 @@ export class KarmaxApi {
   private assertRepoConfigured(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
     if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
+    if (this.deps.hosted) {
+      const linked = this.deps.store.listProjectRepositories(project.id);
+      if (!linked.length) {
+        throw new Error(
+          `Workflow "${manifest.name}" works on a repository, but hosted project "${project.name}" has no attached ` +
+            `GitHub repository. Connect the organization GitHub App and attach a repository to this project before running the task.`,
+        );
+      }
+      const enrolled = new Set(linked.map((candidate) => candidate.repository.sshUrl));
+      const outside = effectiveRepos(resolved, project.config).filter((repository) => !enrolled.has(repository));
+      if (outside.length) throw new Error(`Hosted project "${project.name}" references a repository that is not attached to it: ${outside[0]}`);
+    }
     // Guard on the EFFECTIVE repo list the world will be built from (the resolved
     // settings overlay, falling back to project config) — the same value that
     // reaches createWorld — not project.config alone. Those two can diverge (an
@@ -185,6 +256,9 @@ export class KarmaxApi {
       authorizationProfile?: string;
       /** Total mutually-exclusive attempts to create and queue up front. */
       attempts?: number;
+      assignee?: PrincipalRef;
+      delegate?: PrincipalRef;
+      confirmationPolicy?: ConfirmationPolicy;
     },
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'create_task', { projectId: args.projectId });
@@ -215,6 +289,11 @@ export class KarmaxApi {
     if (!args.draft) this.assertRepoConfigured(manifest, project, resolved);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
+    const confirmerField = manifest.params.find((field) => field.type === 'confirmer');
+    const confirmationPolicy = args.confirmationPolicy ?? (confirmerField ? defaultConfirmationPolicy(
+      this.deps.store, args.projectId, resolved[confirmerField.name] as ConfirmConfig | undefined,
+      principalRefOf(caller.principal),
+    ) : undefined);
     // A repeatable "series" (Model A) — forced on by a cron/recurring trigger.
     const repeatable = !!taskOverrides.repeatable || forcesRepeatable(normalizeTriggers(taskOverrides));
     // Persist only the task's OWN overrides (sparse), not the resolved snapshot.
@@ -239,6 +318,10 @@ export class KarmaxApi {
         const field = manifest.params.find((f) => f.type === 'confirmer');
         return field ? resolved[field.name] : undefined;
       })(),
+      createdBy: principalRefOf(caller.principal),
+      assignee: args.assignee,
+      delegate: args.delegate,
+      confirmationPolicy,
     });
     // Cosmetic human notes live in a dedicated column, never in `params`, so they
     // are structurally incapable of reaching the agent (SPEC §10). Persist them the
@@ -263,7 +346,8 @@ export class KarmaxApi {
       for (let n = 1; n < attemptCount; n++) {
         const alt = this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
           workflow: task.workflow, workflowVersion: task.workflowVersion, params: { ...copied, draft: true, archived: false },
-          parentTaskId: task.parentTaskId, intentId: task.intentId });
+          parentTaskId: task.parentTaskId, intentId: task.intentId, createdBy: task.createdBy,
+          assignee: task.assignee, delegate: task.delegate, confirmationPolicy: task.confirmationPolicy });
         if (task.notes) this.deps.store.setTaskNotes(alt.id, task.notes);
         createdAlternates.push(alt);
       }
@@ -640,7 +724,7 @@ export class KarmaxApi {
    * each trigger fire of a repeatable series, and by "Run again".
    */
   async spawnRun(token: string, seriesId: string): Promise<TaskRecord> {
-    this.require(token, 'create_task');
+    const caller = this.require(token, 'create_task');
     const series = this.deps.store.getTask(seriesId);
     if (!series) throw new Error(`no task ${seriesId}`);
     const run = this.deps.store.createTask({
@@ -651,6 +735,10 @@ export class KarmaxApi {
       workflowVersion: series.workflowVersion,
       params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId },
       parentTaskId: series.parentTaskId,
+      createdBy: principalRefOf(caller.principal) ?? series.createdBy,
+      assignee: series.assignee,
+      delegate: series.delegate,
+      confirmationPolicy: series.confirmationPolicy,
     });
     const { startType, input } = await this.buildStart(run);
     try {
@@ -882,6 +970,10 @@ export class KarmaxApi {
       params: { ...workflowParams, draft: true, archived: false },
       parentTaskId: source.parentTaskId,
       intentId: group.intentId,
+      createdBy: source.createdBy,
+      assignee: source.assignee,
+      delegate: source.delegate,
+      confirmationPolicy: source.confirmationPolicy,
     });
     if (source.notes) this.deps.store.setTaskNotes(attempt.id, source.notes);
     if (source.tags?.length) this.deps.store.setTaskTags(attempt.id, source.tags);
@@ -964,11 +1056,12 @@ export class KarmaxApi {
    * `TaskQuery`. Returns the filtered+sorted list, optional groups, and total.
    */
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
-    this.require(token, 'search_tasks', { projectId });
+    const caller = this.require(token, 'search_tasks', { projectId });
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
     const tasks = this.deps.store.listPrincipalTasks(projectId);
     const tags = this.deps.store.listTags(projectId);
-    return evaluateQuery(tasks, q, { now, tags });
+    const principal = principalRefOf(caller.principal);
+    return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });
   }
 
   /** The searchable-field registry the UI reads to build its filter/sort/group menus. */
@@ -1173,7 +1266,16 @@ export class KarmaxApi {
 
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
     const scopedTask = this.deps.store.getTask(taskId);
-    this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
+    const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
+    if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
+      const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
+      if (!userId) throw new CapabilityError('only an explicitly targeted human can satisfy this confirmation policy');
+      const vote = this.deps.store.voteConfirmation(taskId, userId);
+      if (!vote.authorized) throw new CapabilityError('you are not a reviewer for this task');
+      this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
+        payload: { userId, votes: vote.votes, required: vote.required, satisfied: vote.satisfied } });
+      if (!vote.satisfied) return;
+    }
     const terminal = this.deps.store.getTask(taskId)?.lastView;
     if (terminal?.status === 'failed' && terminal.workflow === 'software-dev' && !terminal.pointOfNoReturnPassed) {
       if (signal === SIG.retry) return await this.recoverFailedTask(taskId);
@@ -1383,6 +1485,7 @@ export class KarmaxApi {
         prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true,
         _authorization: { ...authorization, principal: caller.principal },
       },
+      createdBy: principalRefOf(caller.principal),
     });
     const input = {
       taskId: task.id,

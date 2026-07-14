@@ -1,12 +1,19 @@
 # Human and agent collaboration
 
+> Status: implemented as part of the Karmax Cloud baseline, 2026-07-14.
+
 ## Finding
 
 Authentication and authorization are necessary but not a collaboration model.
-Karmax now has real user identities and project/global grants, but tasks do not
-yet model people as owners, reviewers, subscribers, or notification recipients.
-Until the model below lands, the UI's notification bell is merely a project-wide
-projection of tasks at Review/escalation; it is not a per-user inbox.
+Karmax has real user identities and scoped grants, and tasks now model creators,
+assignees, delegates, reviewers, subscribers, and notification recipients. The
+notification bell is a per-user durable inbox projection, with browser/email/
+Slack delivery derived from that source of truth.
+
+For hosted Karmax, an **Organization** is the tenant and collaboration root
+(`PLAN-cloud.md`). Every principal reference below is resolved inside that
+organization; today's installation-global records migrate into a personal
+organization rather than becoming implicitly visible to every hosted tenant.
 
 The useful common shape across mature task systems is:
 
@@ -51,9 +58,10 @@ assignment edit from becoming a privilege-escalation path.
 
 ## Teams and confirmation routing
 
-Use first-class teams, not free-form “categories of humans”. Teams may be global
-or project-local and have members plus optional semantic roles (project owner,
-triage, security review, billing approver). A confirmation target is a selector:
+Use first-class teams, not free-form “categories of humans”. Teams may be
+organization-wide or project-local and have members plus optional semantic roles
+(project owner, triage, security review, billing approver). A confirmation target
+is a selector:
 
 ```ts
 type ConfirmationTarget =
@@ -121,15 +129,16 @@ boundary), while karmax capabilities enforce server/MCP operations. A cosmetic
 `worktree:write` server capability would not sandbox a host process and would
 therefore promise security it cannot provide.
 
-## Delivery order
+## Delivered layers
 
-1. Add teams/project membership and immutable principal references.
-2. Persist task creator, assignee, delegate, and subscribers; expose them in task
+1. Organizations, organization/project membership, teams, and immutable
+   principal references.
+2. Task creator, assignee, delegate, and subscribers are exposed in task
    create/edit, MCP, event history, and search.
-3. Replace naked human confirmation with explicit confirmation policies.
-4. Materialize the per-user inbox and delivery preferences from task events.
-5. Add “My work”, “Needs my review”, workload, and audit views as saved queries.
+3. Naked human confirmation is replaced by explicit confirmation policies.
+4. The per-user inbox and delivery preferences are materialized from task events.
+5. “My work”, “Needs my review”, and audit are query projections.
 
-These steps require a domain migration and workflow compatibility layer. They
-should land together by layer rather than adding UI-only owner fields that the
-workflow, search engine, and notification resolver cannot honor.
+The migration and workflow compatibility layer preserve older executions while
+new tasks use explicit principal references throughout workflow, search, UI,
+notification, and authorization paths.

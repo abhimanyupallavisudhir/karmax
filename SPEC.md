@@ -42,7 +42,8 @@ A fourth principle governs all three: **declare, don't guess.** Events, actions,
 
 | Concept | Definition |
 |---|---|
-| **Project** | A namespace owning task lists, settings, active workflows, and configuration. The top-level container. |
+| **Organization** | The tenant boundary owning memberships, teams, projects, repository connections, runner pools, identity policy, usage, and audit. |
+| **Project** | An organization-scoped namespace owning task lists, settings, active workflows, and configuration. |
 | **Task list** | An ordered list of tasks within a project. The primary surface a user interacts with. |
 | **Task** | A unit of intent. Has a workflow, parameters, a message history, a stage, and a view-model. In v1 a task runs exactly one execution. |
 | **Workflow** | A durable orchestration *definition* (code) describing how a task is carried out. Versioned, tested, agent-editable. See §4. |
@@ -540,13 +541,13 @@ The `/projects/` prefix keeps project names out of the top-level namespace, so a
 A world is accessed through a small interface so the backend is swappable without touching workflows:
 
 ```
-create()        # provision the environment
-exec(cmd)       # run a command
-fs              # read/write files
-pty()           # interactive terminal (powers cheap check-in)
-snapshot()      # checkpoint (powers resume-while-parked)
+create()/open()             # provision or reconnect from a durable handle
+exec()/startProcess()       # bounded commands and streaming executions
+read/write/list files       # provider-confined filesystem operations
+openPty()                   # interactive terminal (powers cheap check-in)
+fetchPort()                 # authenticated service preview via the gateway
+park()/status()             # sleep inactive compute and inspect lifecycle
 destroy()
-events          # lifecycle webhooks -> signals (ready, died, ...)
 ```
 
 `createWorld` dispatches to the configured provider. The workflow talks only to this interface, so local-worktree → container → remote sandbox changes nothing upstream.
@@ -558,29 +559,58 @@ A multi-repo task must serialize against *every* repo it touches, not just one �
 ### 11.2 Backends
 
 - **Local (default):** git worktree; or a local container / devcontainer for isolation on the host.
-- **Sandboxed/remote (pluggable):**
-  - microVM, strong isolation for untrusted code: **E2B** (Firecracker, agent-native, SSH/PTY, lifecycle webhooks, snapshots), **Northflank** (Kata/Firecracker/gVisor, bring-your-own-cloud).
-  - container, faster/persistent "agent lives inside it": **Daytona**, **Cloudflare Sandboxes** (PTY, snapshots, egress-proxy credential injection).
-  - GPU-heavy: **Modal**.
-- **Remote dev env / your own infra:** the container provider pointed at a remote Docker host, or self-hosted Coder/Gitpod.
+- **Sandboxed/remote (pluggable):** a managed microVM/container provider behind
+  the same provider contract. The first target is E2B; Daytona is the second
+  conformance implementation; Modal is reserved for GPU/special workloads.
+- **Remote dev env / your own infra:** an outbound-connected Karmax runner pool
+  on a local machine, customer VPC, or (later) Kubernetes/Kata fleet.
+
+The hosted design deliberately distinguishes an immutable project **Environment**
+(what runs), a **Runner pool** (where it runs), a per-attempt **World** (mutable
+workspace), and an ephemeral **Execution** (agent/command/PTY/service). A logical
+world belongs to one attempt, but it does not keep one VM running: compute is
+leased only while an execution is active. See `PLAN-cloud.md` for provider
+selection, pricing, lifecycle, GitHub/SSH, runner, and multi-tenant design.
 
 ### 11.3 Ties to the rest of the spec
 
 - The provider **PTY** powers the "open a terminal in the world" check-in against remote worlds.
-- The provider **snapshot** powers the resume-while-parked model: when a workflow parks, snapshot the world and let it sleep to zero; restore on the next turn. This is the cloud equivalent of tearing the agent down between turns and keeps remote worlds cheap while idle.
-- Provider **lifecycle events** become signals into the workflow.
+- Provider **park/open** powers resume-while-parked: when a workflow waits on a
+  human, the provider pauses compute while retaining the filesystem, and the
+  next provider operation reconnects and resumes it. E2B's inactivity timeout
+  is a second backstop if an explicit park is missed.
+- Provider lifecycle state is projected through workflow events; webhook-driven
+  failure signals are a future contract extension, not required for the first
+  hosted backend.
 - A provider's secure credential injection feeds scoped secrets (§8) into a world without putting them in the agent's context.
 
-**v1 scope:** ship local-worktree + one container provider, with the interface designed so a managed sandbox is a drop-in.
+**Implemented scope:** local worktrees, local Docker containers, E2B, and Daytona
+all implement the same execution contract. Remote worlds park while a task waits,
+resume on demand, proxy HTTP/WebSocket previews through the authenticated gateway,
+checkpoint portably, and return Git changes through the host-side broker without
+retaining write credentials after provisioning. Organization-scoped runner pools,
+capacity/budget leases, usage attribution, portable restore, and generation fencing
+complete the managed-runner baseline described in `PLAN-cloud.md`.
 
 ---
 
 ## 12. Remote access (phone / off-laptop)
 
-karmax serves its web UI on localhost; a mesh or tunnel makes it reachable. This is purely an access layer, orthogonal to the core.
+For a self-hosted/local installation, karmax serves its web UI on localhost; a
+mesh or tunnel makes it reachable. This is purely an access layer, orthogonal to
+the core. Karmax Cloud instead serves the authenticated gateway directly; its
+control/execution split is specified in `PLAN-cloud.md`.
+
+The gateway binds to loopback by default. A hosted deployment sets
+`KARMAX_HOST=0.0.0.0` behind a TLS reverse proxy and
+`KARMAX_PUBLIC_URL=https://karmax.example.com`. Browser/auth URLs use the public
+origin, while agent/MCP service traffic remains on the loopback control-plane
+URL and never hairpins through the public proxy.
 
 - **Default (private, just you):** **Tailscale** — phone joins the tailnet and reaches the laptop directly; use **Tailscale Serve** for a private `https://*.ts.net` URL (HTTPS is required for some phone-browser features). Nothing is exposed publicly.
-- **Public URL with auth (business / multiple people):** **Cloudflare Tunnel** (outbound-only `cloudflared`, no open ports, no public IP) **with Cloudflare Access** (SSO/OTP) and WAF in front.
+- **Public URL with auth (business / multiple people):** the hosted cell image
+  behind Caddy or a managed TLS load balancer, with Karmax identity/authorization
+  always enabled; an edge access proxy/WAF is optional defense in depth.
 - **Quick one-off:** ngrok (random URL; demos only).
 
 **Non-negotiable:** never put a naked public tunnel in front of karmax — it can move money and drive agents. Keep it private behind Tailscale, or public only behind Cloudflare Access, **and** give karmax its own auth regardless (defense in depth).
@@ -611,7 +641,7 @@ Invariants: dependents bind to the **task**, never to an attempt; at most one at
 
 - Approval-based privilege elevation and fine-grained per-field/data-row policy beyond global/project scope.
 - A workflow **distribution/marketplace**.
-- **Broadcast agent comms** beyond simple fan-out; **mid-turn interruption** (turn cancellation).
+- **Broadcast agent comms** beyond the implemented simple fan-out.
 - **Agentic payment protocols** (e.g. mandate-based / tokenized agent payment rails) layered behind the v1 budget-lease abstraction.
 - Additional world providers and richer dashboard analytics.
 
@@ -619,20 +649,20 @@ Invariants: dependents bind to the **task**, never to an attempt; at most one at
 
 ## 14. v1 build checklist
 
-- [ ] Temporal cluster + worker scaffold; deterministic workflow / activity split.
-- [ ] Gateway (HTTP → signal/query/update) + the platform MCP server with scoped-token checks.
-- [ ] Projects, task lists, tasks; the task view-model contract.
-- [ ] Workflow package format (manifest, repo layout, `requires`, `onActivate`); version-pinning per execution.
-- [ ] Workflows: software-dev, just-do, script-exec, goal, merge-only; merge-queue and token/account coordinators (lease pattern + continue-as-new + crash-safe leases).
-- [ ] Per-turn agent loop with session resume; provider adapters for Claude and Codex; per-(account×profile) config homes with scrubbed env.
-- [ ] Capability model + attenuation + workflow-minted scoped tokens; PR-test-approve gate via merge-only.
-- [ ] Credential broker (vault-backed, JIT, scoped, audited); credential handles only.
-- [ ] Contribution system: slots, declared event schemas, command/keymap registry; the generic auto-render floor + declarative tier + sandboxed-iframe escape hatch.
-- [ ] Core UI: task list, merge-queue UI, settings (incl. per-workflow project UI), user/notifications, dashboard, keyboard navigation.
-- [ ] World provider interface + local-worktree + one container provider; cheap PTY check-in + transcript view.
-- [ ] Immutable defaults + overlay resolution + global safe mode + per-workflow fallback.
-- [ ] Remote access via Tailscale (default) / Cloudflare Tunnel + Access; karmax's own auth.
-- [ ] Virtual-card budget per profile/task with hard cap + review-gate threshold.
+- [x] Temporal cluster + worker scaffold; deterministic workflow / activity split.
+- [x] Gateway (HTTP → signal/query/update) + the platform MCP server with scoped-token checks.
+- [x] Projects, task lists, tasks; the task view-model contract.
+- [x] Workflow package format (manifest, repo layout, `requires`, `onActivate`); version-pinning per execution.
+- [x] Workflows: software-dev, just-do, script-exec, goal, merge-only; merge-queue and token/account coordinators (lease pattern + continue-as-new + crash-safe leases).
+- [x] Per-turn agent loop with session resume; provider adapters for Claude and Codex; per-(account×profile) config homes with scrubbed env.
+- [x] Capability model + attenuation + workflow-minted scoped tokens; PR-test-approve gate via merge-only.
+- [x] Credential broker (vault-backed, JIT, scoped, audited); credential handles only.
+- [x] Contribution system: slots, declared event schemas, command/keymap registry; the generic auto-render floor + declarative tier + sandboxed-iframe escape hatch.
+- [x] Core UI: task list, merge-queue UI, settings (incl. per-workflow project UI), user/notifications, dashboard, keyboard navigation.
+- [x] World provider interface + local-worktree + one container provider; cheap PTY check-in + transcript view.
+- [x] Immutable defaults + overlay resolution + global safe mode + per-workflow fallback.
+- [x] Remote access via Tailscale (default) / Cloudflare Tunnel + Access; karmax's own auth.
+- [x] Virtual-card budget per profile/task with hard cap + review-gate threshold.
 
 ---
 

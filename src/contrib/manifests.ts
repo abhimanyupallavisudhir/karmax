@@ -40,14 +40,14 @@ const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
-const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directories', help: 'One per line — absolute path, or starting with ~. Multiple repos are each checked out in their own subdirectory of the task world.', scopes: ['project'], bind: 'project' });
+const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repositories', help: 'One per line. Local worlds accept filesystem paths; E2B accepts SSH Git URLs (git@github.com:org/repo.git). Multiple repos are checked out in separate world subdirectories.', scopes: ['project'], bind: 'project' });
 const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
-const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', options: ['worktree', 'container'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
+const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', help: 'Worktree and Docker run locally; E2B and Daytona are isolated, auto-parking cloud worlds.', options: ['worktree', 'container', 'e2b', 'daytona'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
 const remoteField = (): FieldSpec => ({
   name: 'remote',
   type: 'select',
   label: 'Remote policy',
-  help: 'What leaves the machine: none — merges stay local; push — push the target branch after a merge lands; pr — open a GitHub PR at Review and push the target after merge (PLAN-git-config.md §5).',
+  help: 'What leaves a local machine: none — merges stay local; push — push the target after merge; pr — also open a GitHub PR at Review. In E2B, the SSH repository is necessarily the durable source of truth, so confirmed merges are broker-pushed even when this is none.',
   options: ['none', 'push', 'pr'],
   default: 'none',
   scopes: ['project', 'global'],
@@ -499,7 +499,8 @@ export const PLATFORM_EVENTS: EventSchemaDecl[] = [
   { type: 'pr.opened', description: 'A pull request was opened for a task.', fields: { number: 'number', url: 'string' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },
-  { type: 'world.created', description: "A task's world (worktree/container) was provisioned.", fields: {} },
+  { type: 'world.created', description: "A task's local or cloud world was provisioned.", fields: {} },
+  { type: 'world.parked', description: "A waiting task's metered world compute was paused while durable state was retained.", fields: {} },
   { type: 'world.destroyed', description: "A task's world was torn down.", fields: {} },
   { type: 'spend.requested', description: 'An agent requested spend above the auto-approve threshold.', fields: { status: 'string', reason: 'string' } },
 ];

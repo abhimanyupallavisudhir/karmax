@@ -1,0 +1,38 @@
+{
+	on_demand_tls {
+		ask http://app:4505/api/tls/preview-allow
+	}
+}
+
+(karmax_security) {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+{$KARMAX_DOMAIN} {
+	import karmax_security
+	reverse_proxy app:4505
+}
+
+# Each live preview gets an opaque, isolated origin. Caddy asks Karmax whether
+# the lease is currently valid before obtaining a certificate, so this catch-all
+# cannot be abused to mint certificates for arbitrary names.
+https:// {
+	tls {
+		on_demand
+	}
+	@preview host *.{$KARMAX_PREVIEW_DOMAIN}
+	handle @preview {
+		import karmax_security
+		header Referrer-Policy no-referrer
+		reverse_proxy app:4505
+	}
+	handle {
+		abort
+	}
+}

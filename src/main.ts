@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensurePaths, paths } from './config/paths.js';
 import { startDevServer, watchDevServer } from './temporal/dev-server.js';
@@ -25,10 +26,23 @@ import { withTimeout } from './util/timeout.js';
 import { registerAppInstance } from './util/instance.js';
 import { AuthorizationService } from './platform/authorization.js';
 import { IdentityService } from './auth/identity.js';
+import { GitHubAppService, GITHUB_APP_PRIVATE_KEY_HANDLE, GITHUB_APP_WEBHOOK_SECRET_HANDLE,
+  GITHUB_APP_CLIENT_SECRET_HANDLE } from './integrations/github-app.js';
+import { LocalObjectStore, S3ObjectStore } from './store/objects.js';
+import { WorldCheckpointService } from './world/checkpoint.js';
+import { RunnerPoolService, WorldLifecycleManager } from './world/runners.js';
+import { BrowserDeliveryAdapter, DeliveryDispatcher, WebhookDeliveryAdapter } from './collaboration/delivery.js';
+import { hydrateSecretFiles, validateDeployment } from './config/deployment.js';
+import { WorldProviderConnectionService } from './world/connections.js';
+import { E2BWorldProvider } from './world/e2b.js';
+import { DaytonaWorldProvider } from './world/daytona.js';
+import { WorldHandoffService } from './world/handoff.js';
 
 const VERSION = '1.0.0';
 
 async function main() {
+  hydrateSecretFiles(process.env, (filename) => fs.readFileSync(filename, 'utf8'));
+  const deployment = validateDeployment();
   const p = ensurePaths();
   const { provider, reason } = defaultProvider();
 
@@ -60,36 +74,96 @@ async function main() {
   // spawning a fresh one per reload against the same SQLite file is what wedges
   // Temporal. A wedged/dead server is auto-replaced here.
   console.log('  • Connecting to Temporal…');
+  const externalTemporal = temporalConnectionFromEnv();
   const temporalDb = path.join(p.temporal, 'temporal.db');
-  const server = await startDevServer({ dbFilename: temporalDb, logLevel: 'error' });
-  const conn = { address: server.address, namespace: server.namespace };
-  console.log(`  • Temporal ${server.reused ? 'reused (already running)' : 'started'} at ${server.address}`);
-  if (server.uiUrl) console.log(`    Temporal UI: ${server.uiUrl}`);
-  // If the shared server dies mid-run (terminal scope stopped, pkill, crash),
-  // respawn it at the same address so the worker/client pollers reconnect on
-  // their own — otherwise the app spins on gRPC retries while serving nothing.
-  const serverWatch = watchDevServer(server, { dbFilename: temporalDb, logLevel: 'error' });
+  const server = externalTemporal ? undefined : await startDevServer({ dbFilename: temporalDb, logLevel: 'error' });
+  const conn = externalTemporal ?? { address: server!.address, namespace: server!.namespace };
+  if (externalTemporal) console.log(`  • Temporal production service at ${conn.address} (${conn.namespace})`);
+  else {
+    console.log(`  • Temporal ${server!.reused ? 'reused (already running)' : 'started'} at ${server!.address}`);
+    if (server!.uiUrl) console.log(`    Temporal UI: ${server!.uiUrl}`);
+  }
+  // External Temporal is supervised by its operator. The embedded local server
+  // retains karmax's same-address health watcher and restart behavior.
+  const serverWatch = server ? watchDevServer(server, { dbFilename: temporalDb, logLevel: 'error' }) : { stop() {} };
 
   const { client, close: closeClient } = await makeClient(conn);
 
   // ── Core services ──
   const store = new Store(path.join(p.state, 'karmax.db'));
   const authorization = new AuthorizationService(store);
+  const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '');
+  const publicHost = (() => { try { return publicUrl ? new URL(publicUrl).hostname : undefined; } catch { return undefined; } })();
   const identity = await IdentityService.open(path.join(p.state, 'auth.db'), {
     secret: process.env.KARMAX_AUTH_SECRET,
     baseURL: {
-      allowedHosts: (process.env.KARMAX_AUTH_HOSTS ?? '127.0.0.1,localhost,*.ts.net').split(',').map((x) => x.trim()).filter(Boolean),
-      fallback: `http://127.0.0.1:${process.env.KARMAX_PORT ?? 4505}`,
+      allowedHosts: [
+        ...(process.env.KARMAX_AUTH_HOSTS ?? '127.0.0.1,localhost,*.ts.net').split(',').map((x) => x.trim()).filter(Boolean),
+        ...(publicHost ? [publicHost] : []),
+      ],
+      fallback: publicUrl ?? `http://127.0.0.1:${process.env.KARMAX_PORT ?? 4505}`,
     },
+    ...(process.env.KARMAX_OIDC_DISCOVERY_URL && process.env.KARMAX_OIDC_CLIENT_ID && process.env.KARMAX_OIDC_CLIENT_SECRET
+      ? { oidc: { providerId: process.env.KARMAX_OIDC_PROVIDER_ID ?? 'enterprise',
+          discoveryUrl: process.env.KARMAX_OIDC_DISCOVERY_URL, issuer: process.env.KARMAX_OIDC_ISSUER,
+          clientId: process.env.KARMAX_OIDC_CLIENT_ID, clientSecret: process.env.KARMAX_OIDC_CLIENT_SECRET,
+          scopes: process.env.KARMAX_OIDC_SCOPES?.split(',').map((value) => value.trim()).filter(Boolean) } }
+      : {}),
   });
+  const installationOwner = identity.listUsers()[0];
+  if (installationOwner) store.claimPersonalOrganization(installationOwner.id, installationOwner.name);
   const worlds = new WorldRegistry();
   worlds.register(new WorktreeProvider(p.worlds));
   const adapters = buildAdapters();
   const profiles = new ProfileResolver(store, provider);
   seedProfiles(store, provider);
   const bus = new KarmaxBus();
-  const tokens = new TokenAuthority();
+  const tokens = new TokenAuthority(store);
   const broker = new CredentialBroker(new Vault(p.vault));
+  const providerConnections = new WorldProviderConnectionService(store, broker);
+  providerConnections.importEnvironment();
+  worlds.register(new E2BWorldProvider(undefined, undefined, undefined,
+    (organizationId, kind) => providerConnections.resolve(organizationId, kind)));
+  worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
+    (organizationId, kind) => providerConnections.resolve(organizationId, kind)));
+  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
+    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'));
+  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
+    broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET);
+  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
+    broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET);
+  // The service is always present. A fresh hosted instance configures it from
+  // the browser through GitHub's App Manifest flow; environment values are only
+  // an upgrade/enterprise bootstrap path.
+  const githubApp = new GitHubAppService(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
+    appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID });
+  const objectStore = process.env.KARMAX_OBJECT_STORE === 's3'
+    ? new S3ObjectStore({
+        endpoint: requiredEnv('KARMAX_S3_ENDPOINT'), bucket: requiredEnv('KARMAX_S3_BUCKET'),
+        region: process.env.KARMAX_S3_REGION ?? 'us-east-1', accessKeyId: requiredEnv('KARMAX_S3_ACCESS_KEY_ID'),
+        secretAccessKey: requiredEnv('KARMAX_S3_SECRET_ACCESS_KEY'), sessionToken: process.env.KARMAX_S3_SESSION_TOKEN,
+      })
+    : new LocalObjectStore(p.objects);
+  const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp);
+  const runners = new RunnerPoolService(store);
+  const handoffs = new WorldHandoffService(store, worlds, githubApp, runners);
+  const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners);
+  const delivery = new DeliveryDispatcher(store, {
+    browser: new BrowserDeliveryAdapter(),
+    ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? { email: new WebhookDeliveryAdapter(process.env.KARMAX_EMAIL_DELIVERY_URL, 'email') } : {}),
+    ...(process.env.KARMAX_SLACK_DELIVERY_URL ? { slack: new WebhookDeliveryAdapter(process.env.KARMAX_SLACK_DELIVERY_URL, 'slack') } : {}),
+  }, (id) => {
+    const user = identity.listUsers().find((candidate) => candidate.id === id);
+    return user ? { id: user.id, name: user.name, email: user.email } : undefined;
+  });
+  worlds.setHandleResolver((handle) => store.currentWorld(handle.id) as import('./world/types.js').WorldHandle | undefined);
+  worlds.setRecoveryHandler(async (handle) => {
+    if (store.worldState(handle.id) === 'released') return undefined;
+    const checkpoint = store.latestWorldCheckpoint(handle.id);
+    if (!checkpoint) return undefined;
+    store.setWorldState((store.currentWorld(handle.id) ?? handle) as import('./world/types.js').WorldHandle, 'degraded');
+    return checkpoints.restore(checkpoint.id, handle.kind);
+  });
   const { MockPaymentProvider, StripeIssuingProvider, PaymentRegistry } = await import('./autonomy/payments.js');
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry();
@@ -111,6 +185,9 @@ async function main() {
     client,
     tokens,
     broker,
+    githubApp,
+    checkpoints,
+    runners,
     payments,
     configHomes,
     taskQueue: TASK_QUEUE,
@@ -159,7 +236,8 @@ async function main() {
   // worker once so their tasks — new and in-flight — can run after a restart.
   const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows, authorization, defaultAgentProvider: provider });
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
+    authorization, defaultAgentProvider: provider, hosted: deployment.hosted, providerConnections });
 
   // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
   // dependency completes, a schedule fires, or a matching event occurs. Runs
@@ -175,6 +253,8 @@ async function main() {
   });
   api.setTriggerArmer(triggerScheduler);
   triggerScheduler.start();
+  worldLifecycle.start();
+  delivery.start();
 
   // Self-healing loop (SPEC §4.4): when a workflow-edit PR merges (its merge-only
   // task reaches done), reload the edited workflow from its repo so new tasks pick
@@ -200,7 +280,13 @@ async function main() {
   // branch) instead of baking a project-scope "main" override that would shadow
   // a global default like "master".
   if (store.listProjects().length === 0) {
-    store.createProject('My project', {});
+    store.createProject('My project', deployment.hosted ? { worldProvider: deployment.cloudWorldProvider } : {});
+  }
+  if (installationOwner) {
+    for (const project of store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
+      if (!store.userIsProjectMember(project.id, installationOwner.id))
+        store.setProjectMembership(project.id, { kind: 'user', userId: installationOwner.id }, 'owner');
+    }
   }
 
   const staticDir = fileURLToPath(new URL('../web', import.meta.url));
@@ -224,11 +310,21 @@ async function main() {
     version: VERSION,
     identity,
     authorization,
+    worlds,
+    githubApp,
+    providerConnections,
+    handoffs,
+    runners,
+    objects: objectStore,
+    cellId: deployment.cellId,
+    hosted: deployment.hosted,
   });
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
-  const { url, port, close: closeGateway } = await gateway.listen(preferred);
+  const { url, internalUrl, port, close: closeGateway } = await gateway.listen(preferred);
   // Activities read this lazily when an agent invokes the complete platform API.
-  process.env.KARMAX_GATEWAY_URL = url;
+  // Keep service-to-service agent/MCP traffic on the control plane's loopback,
+  // even when browsers use a public TLS URL through a reverse proxy.
+  process.env.KARMAX_GATEWAY_URL = internalUrl;
 
   console.log(`\n  ✓ karmax is running:  ${url}\n`);
   if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
@@ -254,11 +350,15 @@ async function main() {
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
+    worldLifecycle.stop();
+    delivery.stop();
     await step(closeGateway());
     await step(workerManager.stop());
     await step(closeClient());
-    await step(server.stop()); // no-op for the shared server — it persists for a fast restart
-    console.log('  (Temporal left running for a fast restart — `npm run reset` stops it)');
+    if (server) {
+      await step(server.stop()); // no-op for the shared server — it persists for a fast restart
+      console.log('  (Temporal left running for a fast restart — `npm run reset` stops it)');
+    }
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
@@ -269,3 +369,25 @@ main().catch((e) => {
   console.error('karmax failed to start:', e);
   process.exit(1);
 });
+
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
+function temporalConnectionFromEnv(): import('./temporal/config.js').TemporalConn | undefined {
+  const address = process.env.KARMAX_TEMPORAL_ADDRESS?.trim();
+  if (!address) return undefined;
+  const read = (name: string) => process.env[name]?.trim() ? fs.readFileSync(process.env[name]!.trim()) : undefined;
+  const ca = read('KARMAX_TEMPORAL_TLS_CA');
+  const crt = read('KARMAX_TEMPORAL_TLS_CERT');
+  const key = read('KARMAX_TEMPORAL_TLS_KEY');
+  if (Boolean(crt) !== Boolean(key)) throw new Error('KARMAX_TEMPORAL_TLS_CERT and KARMAX_TEMPORAL_TLS_KEY must be set together');
+  const tls = ca || crt || process.env.KARMAX_TEMPORAL_TLS_SERVER_NAME
+    ? { ...(ca ? { serverRootCACertificate: ca } : {}), ...(crt && key ? { clientCertPair: { crt, key } } : {}),
+        ...(process.env.KARMAX_TEMPORAL_TLS_SERVER_NAME ? { serverNameOverride: process.env.KARMAX_TEMPORAL_TLS_SERVER_NAME } : {}) }
+    : process.env.KARMAX_TEMPORAL_API_KEY ? {} : undefined;
+  return { address, namespace: process.env.KARMAX_TEMPORAL_NAMESPACE?.trim() || 'default',
+    ...(process.env.KARMAX_TEMPORAL_API_KEY ? { apiKey: process.env.KARMAX_TEMPORAL_API_KEY } : {}), ...(tls ? { tls } : {}) };
+}

@@ -46,6 +46,13 @@ describe('AttachmentStore', () => {
     expect(files.length).toBe(1);
   });
 
+  it('deletes content idempotently', () => {
+    const ref = store.put(PNG);
+    expect(store.delete(ref.id)).toBe(true);
+    expect(store.read(ref.id)).toBeUndefined();
+    expect(store.delete(ref.id)).toBe(false);
+  });
+
   it('accepts a base64 data URL', () => {
     const ref = store.putDataUrl(`data:image/png;base64,${PNG.toString('base64')}`);
     expect(ref.mediaType).toBe('image/png');

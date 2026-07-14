@@ -91,6 +91,19 @@ interface GitProfile {
   auth, key storable in the vault. GPG is out of scope — anyone who needs it
   has host git config, which the host-fallback tier already honors.
 
+### Hosted refinement
+
+The implemented `GitProfile` remains the correct local/self-hosted model. The
+first E2B slice can use that profile's SSH key during trusted clone provisioning,
+removes it before the agent starts, and performs every later write through the
+host Git broker. Production Karmax Cloud has a stronger trust boundary
+(`PLAN-cloud.md`): a GitHub App installation owns repository discovery/API/
+webhooks; per-repository SSH credentials own Git transport; and a trusted Git
+broker outside the untrusted world holds the write credential. A production
+cloud world gets at most read-only SSH clone access. `GitProfile` then supplies
+commit identity/signing policy and local compatibility, not a shared write key
+mounted into every task sandbox. There is no host fallback in managed cloud.
+
 ## 4. Materialization (two hook points, both existing)
 
 **A. World creation** (`worktree.ts`, next to the `ensureIdentity` call):
@@ -257,4 +270,6 @@ global, selection per project, secrets as vault handles); materialize it
 statelessly — worktree-scoped git config for identity/signing, per-subprocess
 env (`GIT_SSH_COMMAND`, `GH_TOKEN`) for auth — and gate remotes behind an
 explicit per-project `none|push|pr` policy. The cloud story is the same model
-with the host-fallback tier empty, not a second code path.
+at the policy layer, but its credential source is an organization repository
+connection plus trusted Git broker, with the host-fallback tier empty and no
+write credential inside the agent world (`PLAN-cloud.md`).

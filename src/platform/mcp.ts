@@ -30,6 +30,11 @@ export interface PlatformOps {
   getConversation(taskId: string, role?: string): Promise<unknown>;
   forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
+  listWorldProviders(organizationId: string): Promise<unknown>;
+  connectWorldProvider(a: { organizationId: string; provider: 'e2b' | 'daytona'; apiKey?: string;
+    name?: string; template?: string; snapshot?: string; image?: string; apiUrl?: string; target?: string }): Promise<unknown>;
+  testWorldProvider(organizationId: string, provider: 'e2b' | 'daytona'): Promise<unknown>;
+  disconnectWorldProvider(organizationId: string, provider: 'e2b' | 'daytona'): Promise<unknown>;
   /** Complete escape hatch for the documented gateway API; still authz checked. */
   platformRequest(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<unknown>;
 }
@@ -105,6 +110,13 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     getConversation: (id, role) => api.taskConversation(getToken(), id, role),
     forkAgent: (a) => api.forkTaskAgent(getToken(), a),
     listEvents: (id, since) => api.taskEvents(getToken(), id, since),
+    listWorldProviders: (organizationId) => Promise.resolve(api.listWorldProviderConnections(getToken(), organizationId)),
+    connectWorldProvider: (a) => Promise.resolve(api.saveWorldProviderConnection(getToken(), {
+      organizationId: a.organizationId, provider: a.provider, apiKey: a.apiKey, name: a.name,
+      config: { template: a.template, snapshot: a.snapshot, image: a.image, apiUrl: a.apiUrl, target: a.target },
+    })),
+    testWorldProvider: (organizationId, provider) => api.testWorldProviderConnection(getToken(), organizationId, provider),
+    disconnectWorldProvider: (organizationId, provider) => Promise.resolve(api.deleteWorldProviderConnection(getToken(), organizationId, provider)),
     platformRequest: async () => { throw new Error('generic administration requires the gateway-backed platform MCP'); },
   };
 }
@@ -158,6 +170,13 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     getConversation: (id, role) => req(`/api/tasks/${id}/conversation${role ? `?role=${encodeURIComponent(role)}` : ''}`),
     forkAgent: (a) => req(`/api/tasks/${a.taskId}/fork-agent`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
     listEvents: (id, since = 0) => req(`/api/tasks/${id}/events?since=${since}`),
+    listWorldProviders: (organizationId) => req(`/api/organizations/${organizationId}/world-providers`),
+    connectWorldProvider: (a) => req(`/api/organizations/${a.organizationId}/world-providers/${a.provider}`, {
+      method: 'PUT', body: JSON.stringify({ apiKey: a.apiKey, name: a.name,
+        config: { template: a.template, snapshot: a.snapshot, image: a.image, apiUrl: a.apiUrl, target: a.target } }),
+    }),
+    testWorldProvider: (organizationId, provider) => req(`/api/organizations/${organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }),
+    disconnectWorldProvider: (organizationId, provider) => req(`/api/organizations/${organizationId}/world-providers/${provider}`, { method: 'DELETE' }),
     platformRequest: (method, path, body) => req(path, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }),
   };
 }
@@ -179,6 +198,33 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'create_task',
     { description: 'Create a new task on a project task list.', inputSchema: { projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional() } },
     async (a) => wrap(async () => (await ops.createTask(a)).id),
+  );
+  server.registerTool(
+    'list_world_providers',
+    { description: 'List the cloud sandbox providers connected to an organization. Credentials are write-only and are never returned.', inputSchema: { organizationId: z.string() } },
+    async (a) => wrap(() => ops.listWorldProviders(a.organizationId)),
+  );
+  server.registerTool(
+    'connect_world_provider',
+    {
+      description: 'Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted Karmax vault and never returned.',
+      inputSchema: {
+        organizationId: z.string(), provider: z.enum(['e2b', 'daytona']), apiKey: z.string().optional(), name: z.string().optional(),
+        template: z.string().optional(), snapshot: z.string().optional(), image: z.string().optional(),
+        apiUrl: z.string().url().optional(), target: z.string().optional(),
+      },
+    },
+    async (a) => wrap(() => ops.connectWorldProvider(a)),
+  );
+  server.registerTool(
+    'test_world_provider',
+    { description: 'Verify an organization cloud provider credential without creating a billable task world.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
+    async (a) => wrap(() => ops.testWorldProvider(a.organizationId, a.provider)),
+  );
+  server.registerTool(
+    'disconnect_world_provider',
+    { description: 'Remove an organization cloud provider credential after all worlds using it are gone.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
+    async (a) => wrap(() => ops.disconnectWorldProvider(a.organizationId, a.provider)),
   );
   server.registerTool(
     'find_task',

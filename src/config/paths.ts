@@ -22,6 +22,8 @@ export interface KarmaxPaths {
   temporal: string; // temporal dev-server db
   overlays: string; // user/project overlays (safe-mode resolution)
   attachments: string; // content-addressed user image attachments (image prompts)
+  objects: string; // encrypted checkpoints and promoted artifacts
+  backups: string; // operator-created, integrity-checked control-plane snapshots
 }
 
 export function paths(home = karmaxHome()): KarmaxPaths {
@@ -36,6 +38,8 @@ export function paths(home = karmaxHome()): KarmaxPaths {
     temporal: path.join(home, 'temporal'),
     overlays: path.join(home, 'overlays'),
     attachments: path.join(home, 'attachments'),
+    objects: path.join(home, 'objects'),
+    backups: path.join(home, 'backups'),
   };
 }
 

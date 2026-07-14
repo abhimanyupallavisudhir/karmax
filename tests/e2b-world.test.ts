@@ -1,0 +1,210 @@
+import { describe, expect, it } from 'vitest';
+import { E2BWorldProvider, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
+
+describe('E2B cloud world provider', () => {
+  it('creates an auto-pausing world and routes files, processes, PTYs, park, and resume through the SDK', async () => {
+    const files = new Map<string, string | Uint8Array>();
+    let paused = 0;
+    let killed = 0;
+    let connected = 0;
+    let processKilled = 0;
+    let ptyKilled = 0;
+    let ptyInput = '';
+    let ptySize = { cols: 0, rows: 0 };
+    let ptyData: ((data: unknown) => void) | undefined;
+    let createdOptions: any;
+
+    const sandbox: E2BSandboxLike = {
+      sandboxId: 'sbx_test',
+      trafficAccessToken: 'provider-secret',
+      commands: {
+        async run(command, options: any = {}) {
+          if (options.background) {
+            options.onStdout?.('booted\n'); // deliberately before caller attaches
+            return {
+              wait: () => new Promise(() => {}),
+              async kill() { processKilled++; },
+            };
+          }
+          if (command.includes('find . -type f')) return { stdout: 'a.txt\n', stderr: '', exitCode: 0 };
+          if (command.includes("'printf'")) return { stdout: 'hello', stderr: '', exitCode: 0 };
+          if (command.includes('rev-parse')) return { stdout: `${'a'.repeat(40)}\n`, stderr: '', exitCode: 0 };
+          return { stdout: '', stderr: '', exitCode: 0 };
+        },
+      },
+      files: {
+        async read(file, options: any = {}) {
+          const value = files.get(file);
+          if (value === undefined) throw new Error('not found');
+          if (options.format === 'bytes') return typeof value === 'string' ? new TextEncoder().encode(value) : value;
+          return typeof value === 'string' ? value : new TextDecoder().decode(value);
+        },
+        async write(file, data) { files.set(file, data); },
+      },
+      pty: {
+        async create(options: any) {
+          ptyData = options.onData;
+          return { pid: 41, wait: () => new Promise(() => {}), async kill() { ptyKilled++; } };
+        },
+        async sendInput(_pid, data) { ptyInput += new TextDecoder().decode(data); },
+        async resize(_pid, size) { ptySize = size; },
+        async kill() { ptyKilled++; },
+      },
+      async pause() { paused++; },
+      async kill() { killed++; },
+    };
+    const factory: E2BFactory = {
+      async create(options) { createdOptions = options; return sandbox; },
+      async connect(id) { expect(id).toBe('sbx_test'); connected++; return sandbox; },
+    };
+    const provider = new E2BWorldProvider(factory, 123_000, 'karmax-template');
+    const world = await provider.create({ taskId: 'task-cloud', base: 'main' });
+
+    expect(createdOptions).toMatchObject({
+      template: 'karmax-template',
+      timeoutMs: 123_000,
+      lifecycle: { onTimeout: 'pause', autoResume: true },
+      metadata: { karmaxTaskId: 'task-cloud' },
+      network: { allowOut: expect.arrayContaining(['github.com']), denyOut: [], allowPublicTraffic: false },
+    });
+    expect(createdOptions.allowInternetAccess).toBeUndefined();
+    expect(world.handle).toMatchObject({ version: 2, kind: 'e2b', provider: 'e2b', root: '/home/user/karmax' });
+    expect(world.handle.sealedProviderRef).toBeTruthy();
+    expect(JSON.stringify(world.handle)).not.toContain('sbx_test');
+
+    await world.writeFile('a.txt', 'cloud data');
+    expect(await world.readFile('a.txt')).toBe('cloud data');
+    expect((await world.readFileBuffer('a.txt')).toString()).toBe('cloud data');
+    await expect(world.readFile('../secret')).rejects.toThrow('escapes world');
+    expect(await world.listFiles()).toEqual(['a.txt']);
+    expect(await world.exec('printf', ['hello'])).toMatchObject({ stdout: 'hello', code: 0 });
+
+    const proc = await world.startProcess({ command: 'npm start' });
+    let output = '';
+    proc.onOutput((chunk) => { output += chunk; });
+    expect(output).toBe('booted\n');
+    await proc.kill();
+    expect(processKilled).toBe(1);
+
+    const terminal = await world.openPty();
+    let terminalOutput = '';
+    terminal.onData((chunk) => { terminalOutput += chunk; });
+    ptyData?.(new TextEncoder().encode('ready'));
+    await terminal.write('pwd\n');
+    await terminal.resize(120, 40);
+    await terminal.close();
+    expect(terminal.pid).toBeUndefined(); // remote pid must never enter the host process registry
+    expect(terminalOutput).toBe('ready');
+    expect(ptyInput).toBe('pwd\n');
+    expect(await world.previewSocketTarget!(3000, '/hmr?x=1')).toMatchObject({
+      url: 'wss://3000-sbx_test.e2b.app/hmr?x=1', headers: { 'x-access-token': 'provider-secret' },
+    });
+    const originalFetch = globalThis.fetch;
+    let proxyRequest: { url: string; method?: string; token?: string; body?: string } | undefined;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      proxyRequest = { url: String(input), method: init?.method,
+        token: new Headers(init?.headers).get('x-access-token') ?? undefined,
+        body: init?.body ? Buffer.from(init.body as any).toString() : undefined };
+      return new Response('ok');
+    }) as typeof fetch;
+    try {
+      await world.fetchPort!(3000, '/save?x=1', { method: 'POST', body: Buffer.from('data') });
+      expect(proxyRequest).toEqual({ url: 'https://3000-sbx_test.e2b.app/save?x=1', method: 'POST',
+        token: 'provider-secret', body: 'data' });
+    } finally { globalThis.fetch = originalFetch; }
+    expect(ptySize).toEqual({ cols: 120, rows: 40 });
+    expect(ptyKilled).toBe(1);
+
+    await provider.park(world.handle);
+    expect(paused).toBe(1);
+    expect(await provider.status(world.handle)).toBe('parked');
+    await provider.open(world.handle);
+    expect(connected).toBe(1);
+    expect(await provider.status(world.handle)).toBe('ready');
+    await world.destroy();
+    expect(killed).toBe(1);
+  });
+
+  it('rejects local and HTTPS repositories before a cloud checkout is exposed', async () => {
+    let killed = 0;
+    const sandbox = fakeSandbox(() => { killed++; });
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    await expect(provider.create({ taskId: 'bad', base: 'main', repo: '/tmp/repo' })).rejects.toThrow('SSH Git URLs');
+    await expect(provider.create({ taskId: 'bad2', base: 'main', repo: 'https://github.com/acme/repo.git' })).rejects.toThrow('SSH Git URLs');
+    expect(killed).toBe(2);
+  });
+
+  it('uses an SSH credential only for clone and never persists it in the handle', async () => {
+    const commands: string[] = [];
+    const writes = new Map<string, string>();
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.commands.run = async (command) => {
+      commands.push(command);
+      return { stdout: command.includes('rev-parse') ? `${'b'.repeat(40)}\n` : '', stderr: '', exitCode: 0 };
+    };
+    sandbox.files.write = async (file, data) => { writes.set(file, String(data)); };
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({
+      taskId: 'private',
+      base: 'main',
+      repo: 'git@github.com:acme/private.git',
+      gitCredentials: { sshKey: 'PRIVATE CLONE KEY' },
+    });
+
+    expect(writes.get('/home/user/.ssh/karmax-auth-0')).toContain('PRIVATE CLONE KEY');
+    expect(commands.some((command) => command.includes('GIT_SSH_COMMAND=') && command.includes('git clone'))).toBe(true);
+    expect(commands.at(-1)).toContain('rm -f /home/user/.ssh/karmax-auth*');
+    expect(JSON.stringify(world.handle)).not.toContain('PRIVATE CLONE KEY');
+  });
+
+  it('fails rather than silently reviewing the wrong branch', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.commands.run = async (command) => ({
+      stdout: '', stderr: '', exitCode: command.includes('show-ref --verify') ? 1 : 0,
+    });
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    await expect(provider.create({
+      taskId: 'review',
+      base: 'main',
+      branch: 'feature/missing',
+      repo: 'git@github.com:acme/private.git',
+    })).rejects.toThrow('no remote branch "feature/missing"');
+  });
+
+  it('honors each hosted repository attachment\'s base and target branches', async () => {
+    const commands: string[] = [];
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.commands.run = async (command) => {
+      commands.push(command);
+      return { stdout: command.includes('rev-parse') ? `${'c'.repeat(40)}\n` : '', stderr: '', exitCode: 0 };
+    };
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const api = 'git@github.com:acme/api.git';
+    const web = 'git@github.com:acme/web.git';
+    const world = await provider.create({ taskId: 'multi', repos: [api, web], base: 'main', target: 'main',
+      repositoryBranches: { [api]: { base: 'trunk', target: 'production' },
+        [web]: { base: 'develop', target: 'release' } } });
+    expect(world.handle.repos).toEqual([
+      expect.objectContaining({ repo: api, base: 'trunk', target: 'production' }),
+      expect.objectContaining({ repo: web, base: 'develop', target: 'release' }),
+    ]);
+    expect(commands.some((command) => command.includes('origin/trunk'))).toBe(true);
+    expect(commands.some((command) => command.includes('origin/develop'))).toBe(true);
+  });
+});
+
+function fakeSandbox(onKill: () => void): E2BSandboxLike {
+  return {
+    sandboxId: Math.random().toString(),
+    commands: { run: async () => ({ stdout: '', stderr: '', exitCode: 0 }) },
+    files: { read: async () => '', write: async () => undefined },
+    pty: {
+      create: async () => ({ pid: 1 }),
+      sendInput: async () => undefined,
+      resize: async () => undefined,
+      kill: async () => undefined,
+    },
+    pause: async () => undefined,
+    kill: async () => { onKill(); },
+  };
+}

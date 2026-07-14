@@ -114,6 +114,14 @@ export class AttachmentStore {
     return { base64: r.buf.toString('base64'), mediaType: r.mediaType };
   }
 
+  /** Remove a content-addressed attachment once no project scope references it. */
+  delete(id: string): boolean {
+    const resolved = this.resolve(id);
+    if (!resolved) return false;
+    fs.rmSync(resolved.path, { force: true });
+    return true;
+  }
+
   private pathFor(id: string, mediaType: string, ext = ALLOWED_IMAGE_TYPES[mediaType]!): string {
     return path.join(this.dir, `${id}.${ext}`);
   }
