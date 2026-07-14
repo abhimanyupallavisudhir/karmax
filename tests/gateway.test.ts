@@ -31,6 +31,24 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);
+    expect(c.slots.some((s: any) => s.workflow === 'agent-queue' && s.contribution.slot === 'queue-panel')).toBe(true);
+  });
+
+  it('persists host capacity and applies it to the agent-queue workflow', async () => {
+    const saved = await fetch(`${base}/api/settings/global/agent-queue`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { capacity: 2 } }),
+    });
+    expect(saved.status).toBe(200);
+    expect(await (await fetch(`${base}/api/settings/global/agent-queue`, { headers: auth() })).json()).toEqual({ capacity: 2 });
+    await expect.poll(async () => {
+      const q: any = await (await fetch(`${base}/api/agent-queue`, { headers: auth() })).json();
+      return q.capacity;
+    }, { timeout: 10_000 }).toBe(2);
+
+    const invalid = await fetch(`${base}/api/settings/global/agent-queue`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { capacity: 0 } }),
+    });
+    expect(invalid.status).toBe(400);
   });
 
   it('rejects unauthenticated API calls', async () => {

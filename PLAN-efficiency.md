@@ -15,10 +15,10 @@ DONE already (verified in-tree, no action needed):
   • #3 Docker resource limits — container.ts:18 `containerLimitArgs()` already sets
     --memory/--memory-swap/--cpus/--pids-limit (all env-tunable). Fully covered.
   • #9 reuseV8Context — worker.ts:55 already `true`. Covered.
-  • #1 (the hard part) — a host-wide agent-turn cap already exists as a per-process
-    semaphore, agent-slots.ts (`KARMAX_MAX_AGENT_SLOTS`, default 3), acquired around
-    the model call in core.ts:301 including the empty-pool path. It already backs off
-    on low free memory. See the evaluation of "lease coordinator vs semaphore" below.
+  • #1 (the hard part) — a host-wide agent-turn cap is owned by the durable
+    `agent-queue` coordinator. Its capacity is persisted in Global settings and its
+    waiting order is projected on the Queues page. agent-slots.ts retains the live
+    memory/load safety gates and the legacy file semaphore for old workflow histories.
   • #2 (graceful half) — claude.ts AbortController + both adapters' heartbeats +
     the 1s bounded shutdown all landed (05f9802 / 30f2a7c), as the file already notes.
 
@@ -44,12 +44,6 @@ IMPLEMENTED NOW (this change):
     already did). Added a 10s heartbeat timer to that path — real parity fix.
 
 DEFERRED with rationale (deliberately NOT implemented):
-  • "Promote the agent-slot cap to a Temporal lease coordinator" (#1's literal wording).
-    The existing per-process semaphore is the right level for a single worker on one
-    host; a coordinator buys nothing until there are multiple workers, and duplicating
-    working code adds replay surface for no benefit. agent-slots.ts already documents
-    this and the call sites `await` an async acquire, so the swap stays localized IF a
-    fleet ever appears. Revisit only then.
   • "Add heartbeatTimeout to the 45-minute long-activity proxies" (#2, second bullet).
     This is a TRAP as written. The adapters heartbeat on a TIMER, not on progress, so a
     heartbeatTimeout would not detect a wedged subprocess (the timer keeps beating from
@@ -106,4 +100,3 @@ Tier 5 — housekeeping (lower urgency)
 - Small unbounded maps: gateway sessions (no TTL, server.ts:64), healed set in main.ts:128, memory-provider roots never deleted on destroy; in the UI, drawerEvents and the liveOutput string grow unbounded while a drawer is open.
 
 If you want a suggested order of work: #1 + #2 together are one coherent "host agent capacity + kill custody" change and directly prevent a repeat of the OOM; #9 and #3 are near-free wins you could land the same day; #4–#6 are a second project ("bound the growth paths") worth doing before any long goal-mode task runs for days. I've saved the full ranked findings to memory so we can work through them across sessions. Want me to start on the agent-slot lease + kill custody?
-

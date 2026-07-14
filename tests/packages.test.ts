@@ -41,7 +41,7 @@ describe('PackageStore (name@version resolution)', () => {
   it('seeds from the bundled workflows and resolves them', () => {
     const store = PackageStore.withBundled();
     const names = new Set(store.list().map((p) => p.name));
-    expect(names).toEqual(new Set(['software-dev', 'just-do', 'script-exec', 'goal', 'merge-only', 'merge-queue', 'account-coordinator']));
+    expect(names).toEqual(new Set(['software-dev', 'just-do', 'script-exec', 'goal', 'merge-only', 'merge-queue', 'agent-queue', 'account-coordinator']));
     expect(store.resolve('software-dev')!.version).toBe('1.2.0');
     expect(store.resolve('just-do')!.version).toBe('1.1.0');
     expect(store.resolve('merge-only')!.version).toBe('1.1.0');

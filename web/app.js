@@ -43,6 +43,7 @@ const S = {
   cursorId: null, // the list cursor (roving selection) on the tasks/queue views
   returnRoute: null, // where closing the task page returns to (the list/queue we opened from)
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
+  agentQueue: { capacity: 3, queue: [], current: [] }, // workflow-owned host admission queue
   modelCatalog: null, // provider-native model metadata loaded from the gateway
 };
 
@@ -1202,7 +1203,7 @@ function renderMain() {
   }
   const proj = S.projects.find((p) => p.id === S.projectId);
   const tabs = ['tasks', 'queue', 'activity', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Merge queue', activity: 'Activity', settings: 'Project settings' };
+  const labels = { tasks: 'Tasks', queue: 'Queues', activity: 'Activity', settings: 'Project settings' };
   const projectScoped = ['tasks', 'queue', 'activity', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
@@ -1212,7 +1213,7 @@ function renderMain() {
 
   let content = '';
   if (S.tab === 'tasks') content = tasksView();
-  else if (S.tab === 'queue') content = queueView();
+  else if (S.tab === 'queue') content = queuesView();
   else if (S.tab === 'activity') content = activityView();
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
   else if (S.tab === 'settings') content = settingsView(proj);
@@ -4080,6 +4081,7 @@ async function seedQueue() {
       } catch {}
     }),
   );
+  try { S.agentQueue = await api('/api/agent-queue'); } catch {}
   S.queueOrders = orders;
   if (S.tab === 'queue') renderMain();
 }
@@ -4095,9 +4097,9 @@ function queueRank(t) {
   return p > 0 ? p : 1e6 - 1;
 }
 
-function queueView() {
+function mergeQueuePanel() {
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
-  if (!inMerge.length) return `<div class="empty"><div class="big">Merge queue is empty</div>Tasks appear here when they reach the merge stage.</div>`;
+  if (!inMerge.length) return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks appear here when they reach the merge stage.</div></div>`;
   // Group by merge domain — reordering is only meaningful within a single serialization
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
@@ -4131,6 +4133,40 @@ function queueView() {
     .join('');
 }
 
+function agentQueuePanel() {
+  const q = S.agentQueue || { capacity: 3, queue: [], current: [] };
+  const active = q.current || [];
+  const waiting = q.queue || [];
+  const rows = [...active.map((x) => ({ ...x, active: true })), ...waiting.map((x) => ({ ...x, active: false }))]
+    .map((x, i) => {
+      const task = taskRecord(x.taskId);
+      const title = x.title || task?.title || `Task ${String(x.taskId || '').slice(0, 8)}`;
+      const num = task?.num != null ? `<span class="task-num">#${task.num}</span> ` : '';
+      return `<div class="queue-item ${x.active ? 'current' : ''}" data-agent-turn="${esc(x.turnId)}" data-id="${esc(x.taskId)}" tabindex="0" ${x.active ? '' : 'draggable="true"'}>
+        ${x.active ? '<span class="drag-handle placeholder"></span>' : '<span class="drag-handle" title="Drag to reorder">⠿</span>'}
+        <span class="pos">${x.active ? '▶' : `#${i - active.length + 1}`}</span>
+        <div style="flex:1"><div class="task-title">${num}${esc(title)} <span class="chip">${x.active ? 'active lease' : 'queued'}</span></div>
+          <div class="task-sub">${esc(x.role || 'agent')} agent${x.provider ? ` · ${esc(x.provider)}` : ''}</div></div>
+        ${x.active ? '' : `<div class="queue-actions"><button class="btn sm" data-agent-move="top" data-turn="${esc(x.turnId)}">Move to top</button><button class="btn sm" data-agent-move="bottom" data-turn="${esc(x.turnId)}">Move to bottom</button></div>`}
+      </div>`;
+    }).join('');
+  return rows
+    ? `<div class="queue-list agent-queue-list">${rows}</div>`
+    : `<div class="card"><div class="empty"><div class="big">Agent queue is empty</div>Agent turns appear here while running or waiting for host capacity.</div></div>`;
+}
+
+function queuesView() {
+  const contributions = (S.contributions?.slots || []).filter((x) => ['queue-panel', 'merge-queue-panel'].includes(x.contribution?.slot));
+  const renderers = { 'merge-queue': mergeQueuePanel, 'agent-queue': agentQueuePanel };
+  return contributions.map((x) => {
+    const component = x.contribution?.component;
+    const render = renderers[component];
+    if (!render) return '';
+    const suffix = component === 'agent-queue' ? ` <span class="pill">${(S.agentQueue?.current || []).length}/${S.agentQueue?.capacity ?? 3}</span>` : '';
+    return `<div class="section-h">${esc(x.contribution.title || x.workflow)}${suffix}</div>${render()}`;
+  }).join('') || `<div class="empty">No workflows contribute a queue.</div>`;
+}
+
 // Optimistically mutate the cached order for a domain so the reorder shows instantly,
 // before the coordinator signal round-trips. Missing orders are seeded from the
 // current DOM/rank so a move still animates while the first fetch is in flight.
@@ -4147,9 +4183,9 @@ function localQueue(domain) {
 }
 
 function wireQueueView() {
-  $('#main').querySelectorAll('.queue-item').forEach((e) =>
-    wireTaskNav(e, (ev) => (ev.target.closest('[data-move]') || ev.target.closest('.drag-handle') ? null : e.dataset.id)),
-  );
+  $('#main').querySelectorAll('.queue-item').forEach((e) => {
+    if (taskRecord(e.dataset.id)) wireTaskNav(e, (ev) => (ev.target.closest('[data-move]') || ev.target.closest('.drag-handle') ? null : e.dataset.id));
+  });
   $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
@@ -4169,9 +4205,60 @@ function wireQueueView() {
       } catch (e) { toast(e.message, true); seedQueue(); }
     }),
   );
-  $('#main').querySelectorAll('.queue-list').forEach(wireQueueDrag);
+  $('#main').querySelectorAll('[data-agent-move]').forEach((b) =>
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const turnId = b.dataset.turn;
+      const rest = (S.agentQueue.queue || []).filter((x) => x.turnId !== turnId);
+      const item = (S.agentQueue.queue || []).find((x) => x.turnId === turnId);
+      if (!item) return;
+      S.agentQueue.queue = b.dataset.agentMove === 'top' ? [item, ...rest] : [...rest, item];
+      renderMain();
+      const beforeTurnId = b.dataset.agentMove === 'top' ? rest[0]?.turnId : undefined;
+      try {
+        await api('/api/agent-queue/move', { method: 'POST', body: JSON.stringify({ turnId, beforeTurnId }) });
+        toast(b.dataset.agentMove === 'top' ? 'Moved to top' : 'Moved to bottom');
+        setTimeout(seedQueue, 300);
+      } catch (e) { toast(e.message, true); seedQueue(); }
+    }),
+  );
+  $('#main').querySelectorAll('.queue-list:not(.agent-queue-list)').forEach(wireQueueDrag);
+  wireAgentQueueDrag($('#main').querySelector('.agent-queue-list'));
   applyCursor();
   $('#main').querySelectorAll('.queue-item').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
+}
+
+function wireAgentQueueDrag(list) {
+  if (!list) return;
+  let dragging = null;
+  list.querySelectorAll('.queue-item[draggable="true"]').forEach((row) => {
+    row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+  });
+  list.addEventListener('dragover', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    let before = null;
+    for (const row of list.querySelectorAll('.queue-item[draggable="true"]:not(.dragging)')) {
+      const box = row.getBoundingClientRect();
+      if (e.clientY < box.top + box.height / 2) { before = row; break; }
+    }
+    before ? list.insertBefore(dragging, before) : list.appendChild(dragging);
+  });
+  list.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    if (!dragging) return;
+    const turnId = dragging.dataset.agentTurn;
+    const rows = [...list.querySelectorAll('.queue-item[draggable="true"]')];
+    const at = rows.findIndex((r) => r.dataset.agentTurn === turnId);
+    const beforeTurnId = at >= 0 ? rows[at + 1]?.dataset.agentTurn : undefined;
+    const byId = new Map((S.agentQueue.queue || []).map((x) => [x.turnId, x]));
+    S.agentQueue.queue = rows.map((r) => byId.get(r.dataset.agentTurn)).filter(Boolean);
+    try {
+      await api('/api/agent-queue/move', { method: 'POST', body: JSON.stringify({ turnId, beforeTurnId }) });
+      setTimeout(seedQueue, 300);
+    } catch (err) { toast(err.message, true); seedQueue(); }
+  });
 }
 
 // HTML5 drag-and-drop reordering within one domain's queue list. On drop we send the
@@ -4560,15 +4647,19 @@ function fmtReset(epoch) {
 // ── settings (schema-driven, SPEC §10.4) ─────────────────────────────────────
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 function settingsForms(scope, projectId) {
-  const wfs = S.schema.filter((s) => WORKFLOWS.some((w) => w.id === s.name));
+  const wfs = S.schema
+    .filter((s) => WORKFLOWS.some((w) => w.id === s.name) || (scope === 'global' && s.name === 'agent-queue'))
+    .sort((a, b) => Number(b.name === 'agent-queue') - Number(a.name === 'agent-queue'));
   return wfs
     .map((s) => {
       const fields = s.params.filter((f) => f.scopes.includes(scope));
       if (!fields.length) return '';
-      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
-        <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— defaults</span></summary>
+      const label = s.name === 'agent-queue' ? 'Host capacity' : s.name;
+      const suffix = s.name === 'agent-queue' ? '— agent-turn admission' : '— defaults';
+      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' || s.name === 'agent-queue' ? 'open' : ''}>
+        <summary style="cursor:pointer;font-weight:600">${esc(label)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">${suffix}</span></summary>
         <div class="wf-form" style="margin-top:10px">${renderFields(fields)}</div>
-        <button class="btn primary sm" data-save="${esc(s.name)}">Save ${esc(s.name)} defaults</button>
+        <button class="btn primary sm" data-save="${esc(s.name)}">${s.name === 'agent-queue' ? 'Save host capacity' : `Save ${esc(s.name)} defaults`}</button>
       </details>`;
     })
     .join('');
@@ -5179,7 +5270,10 @@ function wireGlobalSettings() {
       const sec = b.closest('[data-wf]');
       const fields = schemaFor(wf).filter((f) => f.scopes.includes('global'));
       const values = collectForm(sec.querySelector('.wf-form'), fields);
-      try { await api(`/api/settings/global/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) }); toast(`${wf} global defaults saved`); } catch (e) { toast(e.message, true); }
+      try {
+        await api(`/api/settings/global/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) });
+        toast(wf === 'agent-queue' ? 'Host capacity saved' : `${wf} global defaults saved`);
+      } catch (e) { toast(e.message, true); }
     }),
   );
   $('#gs-theme')?.addEventListener('click', toggleTheme);
@@ -5332,7 +5426,7 @@ const HOST_COMMANDS = [
   { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm($('#new-wf')?.value, undefined, $('#new-task')?.value.trim()); } },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (S.tab !== 'tasks') switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
-  { id: 'nav.queue', title: 'Go to merge queue', key: 'g q', run: () => switchTab('queue') },
+  { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
   { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
   { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g d', run: () => switchTab('dashboard') },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
