@@ -12,7 +12,7 @@ import { World } from '../world/types.js';
 export interface PlatformToolContext {
   /** Optional structured completion summary; provider terminal success is authoritative. */
   signalCompletion(summary?: string): void;
-  /** Attach review info (links, diff, polished output) for the Review stage. */
+  /** Optionally attach terse, click-to-verify actions/outputs for the Review stage. */
   createReviewInfo(info: ReviewInfo): void;
   /** Spawn a child task the parent manages (branches off + merges back into the
    *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
