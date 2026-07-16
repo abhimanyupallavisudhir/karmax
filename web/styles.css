@@ -116,6 +116,15 @@ a { color: var(--accent); text-decoration: none; }
 }
 .topbar .search input { border: 0; background: transparent; outline: none; width: 100%; }
 .topbar .spacer { flex: 1; }
+.global-search-trigger {
+  min-width: 230px; max-width: 320px; height: 34px;
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 8px 0 11px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface-2); color: var(--ink-3); cursor: pointer; text-align: left;
+}
+.global-search-trigger:hover { border-color: var(--line-strong); color: var(--ink-2); background: var(--surface); }
+.global-search-trigger .global-search-label { flex: 1; }
+.global-search-trigger .kbd { margin-left: auto; background: var(--surface); }
 .topbar .agent-chip {
   display: flex; align-items: center; gap: 7px;
   font-size: 12px; color: var(--ink-2);
@@ -547,6 +556,29 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .pal-sub { margin-left: 8px; font-size: 11px; color: var(--ink-3); }
 .pal-empty { padding: 14px 16px; color: var(--ink-3); font-size: 13px; }
 
+/* Global search is a finder, not a command surface. It reuses the palette shell
+   but gives results a two-line identity with their project/status context. */
+.global-search { width: min(680px, 92vw); }
+.global-search-head { display: flex; align-items: center; gap: 4px; padding-left: 16px; border-bottom: 1px solid var(--line); }
+.global-search-head > span { color: var(--ink-3); font-size: 17px; }
+.global-search-head input { border: 0; min-width: 0; }
+.global-search-head .icon-btn { flex: none; margin-right: 7px; }
+.global-search-context, .global-search-foot { padding: 8px 16px; color: var(--ink-3); background: var(--surface-2); font-size: 11px; }
+.global-search-context { border-bottom: 1px solid var(--line); }
+.global-search-foot { border-top: 1px solid var(--line); }
+.global-search-foot code { color: var(--ink-2); }
+#gs-list { min-height: 180px; max-height: 52vh; overflow: auto; padding-bottom: 6px; }
+.global-search-result { align-items: flex-start !important; }
+.global-search-kind { width: 22px; color: var(--ink-3); text-align: center; font-size: 16px; line-height: 20px; flex: none; }
+.global-search-copy { display: grid; gap: 2px; min-width: 0; }
+.global-search-copy b { color: var(--ink); font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.global-search-copy span { color: var(--ink-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.global-search-empty { min-height: 180px; display: grid; place-content: center; justify-items: center; gap: 6px; padding: 24px; color: var(--ink-3); text-align: center; }
+.global-search-empty b { color: var(--ink-2); font-size: 14px; }
+.global-search-loading::before { content: ''; display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1s ease-in-out infinite alternate; }
+.global-search-summary { padding: 8px 16px 3px; color: var(--ink-3); font-size: 11px; text-align: center; }
+@keyframes pulse { to { opacity: .3; transform: scale(.75); } }
+
 /* keyboard navigation: list cursor, digit hints on action buttons, "?" help */
 .task-row.cursor, .queue-item.cursor { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
 .task-row:focus-visible, .queue-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -594,6 +626,11 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   .tp-foot { padding: 10px 0; }
   .tp-foot-inner { padding: 0 16px; }
   .ck-layout { grid-template-columns: 148px 1fr; }
+  .global-search-trigger { min-width: 34px; width: 34px; padding: 0; justify-content: center; }
+  .global-search-trigger .global-search-label, .global-search-trigger .kbd { display: none; }
+}
+@media (min-width: 721px) and (max-width: 900px) {
+  .global-search-trigger { min-width: 170px; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
