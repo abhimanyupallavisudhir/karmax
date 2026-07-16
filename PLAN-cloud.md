@@ -638,6 +638,16 @@ Mirrors and dependency caches may exist in the execution plane but are disposabl
    cache purge, and project health warnings. Reconciliation catches missed
    webhooks.
 
+The manifest is deployment-aware. A publicly reachable HTTPS control plane
+registers its webhook URL. A localhost, LAN, or other private installation omits
+the webhook because GitHub cannot deliver to it and refreshes every installation
+through the API on demand instead. `installation` and
+`installation_repositories` are not requested in `default_events`: GitHub sends
+those App lifecycle events automatically and rejects manual subscription to the
+latter. Organization settings owns only this shared connection. Repository
+discovery, creation, and attachment live together in project settings, where a
+new repository is created and attached in one action.
+
 GitHub documents that deploy keys are SSH keys scoped to a single repository,
 that a write deploy key is powerful, and that GitHub Apps are preferred for
 fine-grained service authorization
@@ -709,9 +719,10 @@ remains only as an internal schema/backward-compatibility key. Settings are:
 
 - user settings: theme, personal notification delivery, connected personal
   agent accounts;
-- organization settings: execution policy, provider connections/templates,
-  people/teams, GitHub, compute, task/agent defaults, installation resources,
-  and advanced identity/data controls, in that order and on one column;
+- organization settings: people/teams, the shared GitHub connection, execution
+  policy and provider connections/templates, task/agent defaults, installation
+  resources, and advanced identity/data controls, in one column beside a sticky
+  section rail;
 - project settings: repositories, workflows, access, and sparse execution
   exceptions (another connected provider/pool or a tighter cloud budget);
 - task parameters: one execution's overrides.

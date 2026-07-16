@@ -129,6 +129,11 @@ export class Store {
         teamId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
         joinedAt INTEGER NOT NULL, PRIMARY KEY (teamId, userId)
       );
+      CREATE TABLE IF NOT EXISTS team_aliases (
+        teamId TEXT NOT NULL, organizationId TEXT NOT NULL, projectId TEXT,
+        slug TEXT NOT NULL, createdAt INTEGER NOT NULL,
+        PRIMARY KEY (teamId, slug)
+      );
       CREATE TABLE IF NOT EXISTS project_memberships (
         projectId TEXT NOT NULL, principalKey TEXT NOT NULL, principal TEXT NOT NULL,
         role TEXT NOT NULL, joinedAt INTEGER NOT NULL, PRIMARY KEY (projectId, principalKey)
@@ -567,6 +572,7 @@ export class Store {
       deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
       deleteRows(this.db, 'execution_frames', 'executionId', executionIds);
       deleteRows(this.db, 'team_memberships', 'teamId', teamIds);
+      deleteRows(this.db, 'team_aliases', 'teamId', teamIds);
       deleteRows(this.db, 'task_subscribers', 'taskId', taskIds);
       deleteRows(this.db, 'task_confirmation', 'taskId', taskIds);
       deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds);
@@ -650,6 +656,7 @@ export class Store {
         .map(({ tokenHash: _secret, ...row }) => row),
       teams: selectRows(this.db, 'teams', 'organizationId=?', [organizationId]),
       team_memberships: rowsFor(this.db, 'team_memberships', 'teamId', teamIds),
+      team_aliases: rowsFor(this.db, 'team_aliases', 'teamId', teamIds),
       projects: rowsFor(this.db, 'projects', 'id', projectIds),
       project_memberships: rowsFor(this.db, 'project_memberships', 'projectId', projectIds),
       task_lists: rowsFor(this.db, 'task_lists', 'projectId', projectIds),
@@ -762,6 +769,7 @@ export class Store {
       deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds);
       deleteRows(this.db, 'execution_frames', 'executionId', executionIds);
       deleteRows(this.db, 'team_memberships', 'teamId', teamIds);
+      deleteRows(this.db, 'team_aliases', 'teamId', teamIds);
       deleteRows(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds);
       deleteRows(this.db, 'task_subscribers', 'taskId', taskIds);
       deleteRows(this.db, 'task_confirmation', 'taskId', taskIds);
@@ -961,6 +969,8 @@ export class Store {
     const organization = this.getOrganization(input.organizationId);
     if (!organization) throw new Error(`no organization ${input.organizationId}`);
     if (input.projectId && this.getProject(input.projectId)?.organizationId !== organization.id) throw new Error('team project belongs to another organization');
+    const name = input.name.trim();
+    if (!name) throw new Error('team name is required');
     const slug = slugify(input.slug ?? input.name);
     // SQLite UNIQUE treats NULLs as distinct, so the table constraint alone
     // does not protect organization-wide teams (whose projectId is NULL). Make
@@ -971,7 +981,7 @@ export class Store {
       .get(organization.id, input.projectId ?? null, input.projectId ?? null, slug) as any;
     if (existing) return rowToTeam(existing);
     const team: Team = { id: newId('team'), organizationId: organization.id, projectId: input.projectId,
-      name: input.name.trim(), slug, createdAt: Date.now() };
+      name, slug, createdAt: Date.now() };
     this.db.prepare('INSERT INTO teams (id, organizationId, projectId, name, slug, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
       .run(team.id, team.organizationId, team.projectId ?? null, team.name, team.slug, team.createdAt);
     return team;
@@ -996,6 +1006,80 @@ export class Store {
   getTeam(id: string): Team | undefined {
     const r = this.db.prepare('SELECT * FROM teams WHERE id=?').get(id) as any;
     return r ? rowToTeam(r) : undefined;
+  }
+
+  updateTeam(id: string, input: { name: string }): Team {
+    const team = this.getTeam(id);
+    if (!team) throw new Error('team not found');
+    const name = input.name.trim();
+    if (!name) throw new Error('team name is required');
+    const slug = slugify(name);
+    const conflict = this.db.prepare(`SELECT id FROM teams WHERE organizationId=? AND id<>?
+      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      .get(team.organizationId, team.id, team.projectId ?? null, team.projectId ?? null, slug) as any;
+    const aliasConflict = this.db.prepare(`SELECT teamId FROM team_aliases WHERE organizationId=? AND teamId<>?
+      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      .get(team.organizationId, team.id, team.projectId ?? null, team.projectId ?? null, slug) as any;
+    if (conflict || aliasConflict) throw new Error(`a team already uses @team:${slug}`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (slug !== team.slug) this.db.prepare(`INSERT OR IGNORE INTO team_aliases
+        (teamId, organizationId, projectId, slug, createdAt) VALUES (?, ?, ?, ?, ?)`)
+        .run(team.id, team.organizationId, team.projectId ?? null, team.slug, Date.now());
+      this.db.prepare('UPDATE teams SET name=?, slug=? WHERE id=?').run(name, slug, team.id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return { ...team, name, slug };
+  }
+
+  deleteTeam(id: string): void {
+    const team = this.getTeam(id);
+    if (!team) throw new Error('team not found');
+    const selectors = [`team:${team.id}`, `@team:${team.slug}`,
+      ...(this.db.prepare('SELECT slug FROM team_aliases WHERE teamId=?').all(team.id) as any[])
+        .map((row) => `@team:${String(row.slug)}`)];
+    const projectUse = this.db.prepare('SELECT COUNT(*) count FROM project_memberships WHERE principalKey=?')
+      .get(`team:${team.id}`) as any;
+    const projectIds = (this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(team.organizationId) as any[])
+      .map((row) => String(row.id));
+    const settingScopes = new Set([`organization:${team.organizationId}`, `quick:organization:${team.organizationId}`,
+      ...projectIds, ...projectIds.map((projectId) => `quick:${projectId}`)]);
+    const settingUse = (this.db.prepare('SELECT scopeKey, json FROM settings').all() as any[])
+      .some((row) => settingScopes.has(String(row.scopeKey)) && selectors.some((selector) => String(row.json).includes(selector)));
+    const unfinishedUse = (this.db.prepare(`SELECT params, lastView FROM tasks t JOIN projects p ON p.id=t.projectId
+      WHERE p.organizationId=?`).all(team.organizationId) as any[]).some((row) => {
+        let done = false;
+        try { done = ['done', 'failed', 'cancelled'].includes(String(JSON.parse(row.lastView ?? '{}').status)); } catch {}
+        return !done && selectors.some((selector) => String(row.params).includes(selector) || String(row.lastView).includes(selector));
+      });
+    if (Number(projectUse?.count ?? 0) || settingUse || unfinishedUse)
+      throw new Error('This team is still used by project access or a workflow route. Remove those references before deleting it.');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM task_subscribers WHERE principalKey=?').run(`team:${team.id}`);
+      this.db.prepare('DELETE FROM team_memberships WHERE teamId=?').run(team.id);
+      this.db.prepare('DELETE FROM team_aliases WHERE teamId=?').run(team.id);
+      this.db.prepare('DELETE FROM teams WHERE id=?').run(team.id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private teamByRoute(organizationId: string, projectId: string, slug: string): Team | undefined {
+    const current = this.db.prepare(`SELECT * FROM teams WHERE organizationId=? AND slug=? AND (projectId=? OR projectId IS NULL)
+      ORDER BY CASE WHEN projectId=? THEN 0 ELSE 1 END, createdAt LIMIT 1`)
+      .get(organizationId, slug, projectId, projectId) as any;
+    if (current) return rowToTeam(current);
+    const alias = this.db.prepare(`SELECT t.* FROM team_aliases a JOIN teams t ON t.id=a.teamId
+      WHERE a.organizationId=? AND a.slug=? AND (a.projectId=? OR a.projectId IS NULL)
+      ORDER BY CASE WHEN a.projectId=? THEN 0 ELSE 1 END, a.createdAt DESC LIMIT 1`)
+      .get(organizationId, slug, projectId, projectId) as any;
+    return alias ? rowToTeam(alias) : undefined;
   }
 
   setTeamMembership(teamId: string, userId: string): TeamMembership {
@@ -1214,6 +1298,19 @@ export class Store {
     this.syncProjectRepositoryConfig(projectId);
   }
 
+  /** Canonical local/self-hosted repository editor. Workflow settings retain a
+   * repos field on the wire for old clients, but the product UI edits repository
+   * sources once at project scope. Keep existing workflow rows synchronized so
+   * a stale per-workflow overlay cannot override the project source list. */
+  setProjectRepositorySources(projectId: string, repos: string[]): Project {
+    if (this.listProjectRepositories(projectId).length)
+      throw new Error('remove attached GitHub repositories before using local repository paths');
+    const sources = [...new Set(repos.map((repo) => repo.trim()).filter(Boolean))];
+    const project = this.updateProjectConfig(projectId, { repos: sources });
+    this.syncProjectRepositorySettings(projectId, sources);
+    return project;
+  }
+
   private syncProjectRepositoryConfig(projectId: string): void {
     const linked = this.listProjectRepositories(projectId);
     const project = this.getProject(projectId);
@@ -1222,12 +1319,25 @@ export class Store {
     const base = first?.baseBranch ?? first?.repository.defaultBranch;
     const target = first?.targetBranch ?? base;
     const { defaultBase: _oldBase, defaultTarget: _oldTarget, ...config } = project.config;
+    const repos = linked.map((x) => x.repository.sshUrl);
     this.updateProjectConfig(projectId, {
       ...config,
-      repos: linked.map((x) => x.repository.sshUrl),
+      repos,
       ...(base ? { defaultBase: base } : {}),
       ...(target ? { defaultTarget: target } : {}),
     });
+    this.syncProjectRepositorySettings(projectId, repos);
+  }
+
+  private syncProjectRepositorySettings(projectId: string, repos: string[]): void {
+    for (const row of this.db.prepare('SELECT scopeKey, workflow, json FROM settings WHERE scopeKey IN (?, ?)')
+      .all(projectId, `quick:${projectId}`) as any[]) {
+      const values = JSON.parse(String(row.json)) as Record<string, unknown>;
+      if (repos.length) values.repos = repos;
+      else delete values.repos;
+      this.db.prepare('UPDATE settings SET json=? WHERE scopeKey=? AND workflow=?')
+        .run(JSON.stringify(values), String(row.scopeKey), String(row.workflow));
+    }
   }
 
   // ─── Task lists ──────────────────────────────────────────────────────────────
@@ -1744,7 +1854,7 @@ export class Store {
         if (this.listOrganizationMemberships(project.organizationId).some((member) => member.userId === userId)) users.add(userId);
       } else if (selector.startsWith('@team:')) {
         const slug = selector.slice(6);
-        const team = this.listTeams(project.organizationId).find((candidate) => candidate.slug === slug);
+        const team = this.teamByRoute(project.organizationId, task.projectId, slug);
         if (team) for (const member of this.listTeamMemberships(team.id)) users.add(member.userId);
       } else if (selector.startsWith('team:')) {
         const team = this.getTeam(selector.slice(5));
