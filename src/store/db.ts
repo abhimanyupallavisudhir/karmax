@@ -21,6 +21,7 @@ import {
   SavedView,
   TaskQuery,
   Organization,
+  OrganizationExecutionPolicy,
   OrganizationMembership,
   OrganizationInvitation,
   Team,
@@ -432,6 +433,103 @@ export class Store {
     );
   }
 
+  /** One organization-level execution policy. Provider-specific template/image
+   * details stay with the provider connection; this is the provider-neutral
+   * policy every project inherits. */
+  getOrganizationExecutionPolicy(organizationId: string): OrganizationExecutionPolicy {
+    if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+    const fallback: OrganizationExecutionPolicy = {
+      worldProvider: process.env.KARMAX_DEPLOYMENT === 'hosted'
+        ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
+        : 'worktree',
+      resources: { cpu: 2, memoryMb: 2048, gpu: 0 },
+      // General-purpose coding agents need package registries, documentation,
+      // web search, and arbitrary APIs. Restriction is an explicit hardening mode.
+      network: { unrestricted: true },
+      hibernateAfterMs: 7 * 24 * 60 * 60 * 1000,
+    };
+    const raw = this.kvGet(`organization-execution:${organizationId}`);
+    if (!raw) return fallback;
+    const saved = JSON.parse(raw) as OrganizationExecutionPolicy;
+    return {
+      ...fallback,
+      ...saved,
+      resources: { ...fallback.resources, ...saved.resources },
+      network: saved.network ? { ...saved.network } : fallback.network,
+    };
+  }
+
+  setOrganizationExecutionPolicy(organizationId: string, policy: OrganizationExecutionPolicy): OrganizationExecutionPolicy {
+    if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+    const current = this.getOrganizationExecutionPolicy(organizationId);
+    const next: OrganizationExecutionPolicy = {
+      ...current, ...policy,
+      resources: policy.resources ? { ...current.resources, ...policy.resources } : current.resources,
+      network: policy.network ? { ...policy.network } : current.network,
+    };
+    validateProjectExecutionConfig(next as ProjectConfig);
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(next.worldProvider ?? 'e2b'))
+      throw new Error('hosted organizations require a remote world provider');
+    for (const project of this.listProjects().filter((candidate) => candidate.organizationId === organizationId)) {
+      if (next.monthlyBudgetMicros != null && project.config.monthlyBudgetMicros != null
+        && project.config.monthlyBudgetMicros > next.monthlyBudgetMicros)
+        throw new Error(`project "${project.name}" has a cloud budget above the new organization budget`);
+      const provider = project.config.worldProvider ?? next.worldProvider;
+      const providerChanged = Boolean(project.config.worldProvider && project.config.worldProvider !== next.worldProvider);
+      const runnerPoolId = project.config.runnerPoolId ?? (providerChanged ? undefined : next.runnerPoolId);
+      if (runnerPoolId) {
+        const pool = this.getRunnerPool(runnerPoolId);
+        if (!pool || pool.organizationId !== organizationId || pool.provider !== provider)
+          throw new Error(`project "${project.name}" would inherit an incompatible runner pool`);
+      }
+    }
+    this.kvSet(`organization-execution:${organizationId}`, JSON.stringify(next));
+    return this.getOrganizationExecutionPolicy(organizationId);
+  }
+
+  /** Effective config used by workflows and provider activities. Project values
+   * are sparse overrides; nested resource/network objects remain atomic enough
+   * that choosing "organization default" really removes project infrastructure. */
+  effectiveProjectConfig(project: Project | string): ProjectConfig {
+    const value = typeof project === 'string' ? this.getProject(project) : project;
+    if (!value) throw new Error(`no project ${project}`);
+    const organization = this.getOrganizationExecutionPolicy(value.organizationId ?? 'org_personal');
+    const providerChanged = Boolean(value.config.worldProvider
+      && value.config.worldProvider !== organization.worldProvider);
+    return {
+      ...organization,
+      ...value.config,
+      // A pool belongs to one provider. Selecting a different provider at the
+      // project level therefore falls back to that provider's managed pool
+      // unless the project explicitly selects a compatible pool of its own.
+      runnerPoolId: value.config.runnerPoolId ?? (providerChanged ? undefined : organization.runnerPoolId),
+      resources: { ...organization.resources, ...value.config.resources },
+      network: value.config.network ? { ...value.config.network } : organization.network,
+    };
+  }
+
+  setProjectExecutionPolicy(id: string, override: Partial<Record<keyof OrganizationExecutionPolicy, unknown>>): Project {
+    const existing = this.getProject(id);
+    if (!existing) throw new Error(`no project ${id}`);
+    const config: Record<string, unknown> = { ...existing.config };
+    for (const key of ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const) {
+      if (!Object.prototype.hasOwnProperty.call(override, key)) continue;
+      const value = override[key];
+      if (value == null) delete config[key];
+      else config[key] = value;
+    }
+    const candidate = { ...existing, config: config as ProjectConfig };
+    const effective = this.effectiveProjectConfig(candidate);
+    validateProjectExecutionConfig(effective);
+    const organizationBudget = this.getOrganizationExecutionPolicy(existing.organizationId ?? 'org_personal').monthlyBudgetMicros;
+    if (organizationBudget != null && effective.monthlyBudgetMicros != null && effective.monthlyBudgetMicros > organizationBudget)
+      throw new Error('project cloud budget cannot exceed the organization budget');
+    if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(effective.worldProvider ?? 'e2b'))
+      throw new Error('hosted projects require a remote world provider');
+    this.db.prepare('UPDATE projects SET config = ? WHERE id = ?').run(JSON.stringify(config), id);
+    return candidate;
+  }
+
   updateProjectConfig(id: string, config: ProjectConfig): Project {
     const existing = this.getProject(id);
     if (!existing) throw new Error(`no project ${id}`);
@@ -536,7 +634,10 @@ export class Store {
     const inboxIds = (this.db.prepare('SELECT id FROM inbox WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const intentIds = rowsFor(this.db, 'tasks', 'projectId', projectIds).map((r) => String(r.intentId)).filter(Boolean);
     const identityPolicy = this.getOrganizationIdentityPolicy(organizationId);
-    const projectSettingKeys = [...projectIds, ...projectIds.map((id) => `quick:${id}`)];
+    const projectSettingKeys = [
+      `organization:${organizationId}`, `quick:organization:${organizationId}`,
+      ...projectIds, ...projectIds.map((id) => `quick:${id}`),
+    ];
     const tables: Record<string, unknown[]> = {
       organization_memberships: selectRows(this.db, 'organization_memberships', 'organizationId=?', [organizationId]),
       organization_invitations: selectRows(this.db, 'organization_invitations', 'organizationId=?', [organizationId])
@@ -586,7 +687,8 @@ export class Store {
       attachment_scopes: rowsFor(this.db, 'attachment_scopes', 'projectId', projectIds),
     };
     return { format: 'karmax-organization-export', version: 1, exportedAt: new Date().toISOString(),
-      organization, identityPolicy: { ...identityPolicy, scimTokenId: undefined }, tables };
+      organization, executionPolicy: this.getOrganizationExecutionPolicy(organizationId),
+      identityPolicy: { ...identityPolicy, scimTokenId: undefined }, tables };
   }
 
   projectResources(projectId: string): { worlds: WorldHandleRef[]; objectKeys: string[];
@@ -643,7 +745,10 @@ export class Store {
     const executionIds = (this.db.prepare('SELECT id FROM executions WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const inboxIds = (this.db.prepare('SELECT id FROM inbox WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const scopeKeys = [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)];
-    const projectSettingKeys = [...projectIds, ...projectIds.map((id) => `quick:${id}`)];
+    const projectSettingKeys = [
+      `organization:${organizationId}`, `quick:organization:${organizationId}`,
+      ...projectIds, ...projectIds.map((id) => `quick:${id}`),
+    ];
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.revokeScopedTokens({ organizationId });
@@ -682,6 +787,7 @@ export class Store {
       this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM git_connections WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM github_install_states WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
       deleteRows(this.db, 'repositories', 'id', repositoryIds);
       deleteRows(this.db, 'teams', 'id', teamIds);
       deleteRows(this.db, 'tasks', 'id', taskIds);
@@ -1573,7 +1679,58 @@ export class Store {
     return [];
   }
 
+  /** Resolve the audience declared by the workflow's current human wait. */
+  humanAudience(taskId: string, requested?: string[]): string[] {
+    const task = this.getTaskShallow(taskId);
+    if (!task) return [];
+    const project = this.getProject(task.projectId);
+    if (!project?.organizationId) return [];
+    const audience = requested?.length ? requested : task.lastView?.waitingFor?.audience?.length
+      ? task.lastView.waitingFor.audience : ['@creator'];
+    const users = new Set<string>();
+    const addHumanCreator = (candidate: TaskRecord | undefined, visited = new Set<string>()): void => {
+      if (!candidate || visited.has(candidate.id)) return;
+      visited.add(candidate.id);
+      if (candidate.createdBy?.kind === 'user') users.add(candidate.createdBy.userId);
+      else if (candidate.createdBy?.kind === 'task-agent')
+        addHumanCreator(this.getTaskShallow(candidate.createdBy.taskId), visited);
+    };
+    for (const selector of audience) {
+      if (selector === '@creator') {
+        // Agent-created subtasks route back through their parent chain to the
+        // human who initiated the work, rather than creating an impossible gate.
+        // A top-level task created by an automation has no human ancestor; its
+        // organization's owners are the deterministic escalation destination.
+        const before = users.size;
+        addHumanCreator(task);
+        if (users.size === before)
+          for (const member of this.listOrganizationMemberships(project.organizationId))
+            if (member.role === 'owner') users.add(member.userId);
+      } else if (selector === '@all') {
+        for (const member of this.listOrganizationMemberships(project.organizationId)) users.add(member.userId);
+      } else if (selector === '@owners') {
+        for (const member of this.listOrganizationMemberships(project.organizationId)) if (member.role === 'owner') users.add(member.userId);
+      } else if (selector === '@project') {
+        for (const member of this.listProjectMemberships(task.projectId))
+          for (const userId of this.expandPrincipal(member.principal, task.projectId)) users.add(userId);
+      } else if (selector.startsWith('user:')) {
+        const userId = selector.slice(5);
+        if (this.listOrganizationMemberships(project.organizationId).some((member) => member.userId === userId)) users.add(userId);
+      } else if (selector.startsWith('team:')) {
+        const team = this.getTeam(selector.slice(5));
+        if (team?.organizationId === project.organizationId)
+          for (const member of this.listTeamMemberships(team.id)) users.add(member.userId);
+      }
+    }
+    return [...users];
+  }
+
+  humanMayAct(taskId: string, userId: string): boolean {
+    return this.humanAudience(taskId).includes(userId);
+  }
+
   private reviewAudience(task: TaskRecord): string[] {
+    if (task.lastView?.waitingFor?.kind === 'human') return this.humanAudience(task.id, task.lastView.waitingFor.audience);
     const users = new Set<string>();
     for (const target of task.confirmationPolicy?.targets ?? []) {
       if (target.kind === 'project-role') {
@@ -2221,7 +2378,7 @@ export class Store {
     const leases = Number((this.db.prepare("SELECT COUNT(*) n FROM world_leases WHERE runnerPoolId=? AND state!='released'")
       .get(id) as any).n);
     if (leases) throw new Error('runner pool still has active or queued leases');
-    const projects = this.listProjects().filter((project) => project.config.runnerPoolId === id);
+    const projects = this.listProjects().filter((project) => this.effectiveProjectConfig(project).runnerPoolId === id);
     if (projects.length) throw new Error(`runner pool is selected by ${projects.length} project(s)`);
     this.db.prepare('DELETE FROM runner_pools WHERE id=?').run(id);
     return value;
@@ -2302,9 +2459,12 @@ export class Store {
     return value;
   }
 
-  usageSummary(organizationId: string, from = 0, to = Date.now()): { costMicros: number; events: number; byKind: Record<string, number> } {
-    const rows = this.db.prepare('SELECT kind, costMicros FROM usage_events WHERE organizationId=? AND startedAt>=? AND startedAt<?')
-      .all(organizationId, from, to) as any[];
+  usageSummary(organizationId: string, from = 0, to = Date.now(), projectId?: string): { costMicros: number; events: number; byKind: Record<string, number> } {
+    const rows = (projectId
+      ? this.db.prepare('SELECT kind, costMicros FROM usage_events WHERE organizationId=? AND projectId=? AND startedAt>=? AND startedAt<?')
+        .all(organizationId, projectId, from, to)
+      : this.db.prepare('SELECT kind, costMicros FROM usage_events WHERE organizationId=? AND startedAt>=? AND startedAt<?')
+        .all(organizationId, from, to)) as any[];
     const byKind: Record<string, number> = {};
     for (const row of rows) byKind[row.kind] = (byKind[row.kind] ?? 0) + Number(row.costMicros);
     return { costMicros: rows.reduce((sum, row) => sum + Number(row.costMicros), 0), events: rows.length, byKind };

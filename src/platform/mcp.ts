@@ -35,6 +35,8 @@ export interface PlatformOps {
     name?: string; template?: string; snapshot?: string; image?: string; apiUrl?: string; target?: string }): Promise<unknown>;
   testWorldProvider(organizationId: string, provider: 'e2b' | 'daytona'): Promise<unknown>;
   disconnectWorldProvider(organizationId: string, provider: 'e2b' | 'daytona'): Promise<unknown>;
+  getExecutionPolicy(organizationId: string, projectId?: string): Promise<unknown>;
+  setExecutionPolicy(a: { organizationId: string; projectId?: string; policy: Record<string, unknown> }): Promise<unknown>;
   /** Complete escape hatch for the documented gateway API; still authz checked. */
   platformRequest(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<unknown>;
 }
@@ -117,6 +119,8 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     })),
     testWorldProvider: (organizationId, provider) => api.testWorldProviderConnection(getToken(), organizationId, provider),
     disconnectWorldProvider: (organizationId, provider) => Promise.resolve(api.deleteWorldProviderConnection(getToken(), organizationId, provider)),
+    getExecutionPolicy: (organizationId, projectId) => Promise.resolve(api.getExecutionPolicy(getToken(), { organizationId, projectId })),
+    setExecutionPolicy: (a) => Promise.resolve(api.setExecutionPolicy(getToken(), a)),
     platformRequest: async () => { throw new Error('generic administration requires the gateway-backed platform MCP'); },
   };
 }
@@ -177,6 +181,14 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     }),
     testWorldProvider: (organizationId, provider) => req(`/api/organizations/${organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }),
     disconnectWorldProvider: (organizationId, provider) => req(`/api/organizations/${organizationId}/world-providers/${provider}`, { method: 'DELETE' }),
+    getExecutionPolicy: (organizationId, projectId) => req(projectId
+      ? `/api/projects/${encodeURIComponent(projectId)}/execution-policy`
+      : `/api/organizations/${encodeURIComponent(organizationId)}/execution-policy`),
+    setExecutionPolicy: (a) => req(a.projectId
+      ? `/api/projects/${encodeURIComponent(a.projectId)}/execution-policy`
+      : `/api/organizations/${encodeURIComponent(a.organizationId)}/execution-policy`, {
+      method: 'PUT', body: JSON.stringify(a.projectId ? { override: a.policy } : { policy: a.policy }),
+    }),
     platformRequest: (method, path, body) => req(path, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }),
   };
 }
@@ -225,6 +237,35 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'disconnect_world_provider',
     { description: 'Remove an organization cloud provider credential after all worlds using it are gone.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
     async (a) => wrap(() => ops.disconnectWorldProvider(a.organizationId, a.provider)),
+  );
+  server.registerTool(
+    'get_execution_policy',
+    { description: 'Read an organization execution policy, or a project override plus its effective inherited policy.', inputSchema: {
+      organizationId: z.string(), projectId: z.string().optional(),
+    } },
+    async (a) => wrap(() => ops.getExecutionPolicy(a.organizationId, a.projectId)),
+  );
+  server.registerTool(
+    'set_execution_policy',
+    { description: 'Set organization execution defaults or sparse project overrides. Null project values restore organization inheritance.', inputSchema: {
+      organizationId: z.string(), projectId: z.string().optional(),
+      worldProvider: z.string().nullish(), runnerPoolId: z.string().nullish(),
+      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), gpu: z.number().nonnegative().optional(),
+      unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
+      monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
+    } },
+    async (a) => wrap(() => {
+      const policy: Record<string, unknown> = {};
+      if (a.worldProvider !== undefined) policy.worldProvider = a.worldProvider;
+      if (a.runnerPoolId !== undefined) policy.runnerPoolId = a.runnerPoolId;
+      if (a.cpu !== undefined || a.memoryMb !== undefined || a.gpu !== undefined)
+        policy.resources = { cpu: a.cpu, memoryMb: a.memoryMb, gpu: a.gpu };
+      if (a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined)
+        policy.network = { unrestricted: a.unrestrictedInternet ?? false, allowDomains: a.allowDomains, allowCidrs: a.allowCidrs };
+      if (a.monthlyBudgetUsd !== undefined) policy.monthlyBudgetMicros = a.monthlyBudgetUsd == null ? null : Math.round(a.monthlyBudgetUsd * 1e6);
+      if (a.hibernateAfterDays !== undefined) policy.hibernateAfterMs = a.hibernateAfterDays == null ? null : Math.round(a.hibernateAfterDays * 86_400_000);
+      return ops.setExecutionPolicy({ organizationId: a.organizationId, projectId: a.projectId, policy });
+    }),
   );
   server.registerTool(
     'find_task',

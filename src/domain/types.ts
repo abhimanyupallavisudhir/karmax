@@ -351,8 +351,8 @@ export interface ProjectConfig {
   /** Hosted execution pool and declared resources. */
   runnerPoolId?: string;
   resources?: { cpu?: number; memoryMb?: number; gpu?: number };
-  /** Remote-world egress is deny-by-default. Expanding this list is an
-   * organization-visible data-exfiltration decision. */
+  /** Remote-world egress policy. Normal coding uses unrestricted internet;
+   * allowlists are an explicit organization-level hardening mode. */
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
   /** Immutable remote environment selector. Provider adapters resolve this to
    * their image/snapshot primitive and stamp the result on the world handle. */
@@ -360,6 +360,18 @@ export interface ProjectConfig {
   /** Hard monthly provider-cost ceiling; provisioning queues once exhausted. */
   monthlyBudgetMicros?: number;
   /** Parked-world retention before portable hibernation (default seven days). */
+  hibernateAfterMs?: number;
+}
+
+/** Organization-owned defaults for task execution. Projects may select another
+ * connected provider/pool or set a tighter budget, but sandbox shape, lifecycle,
+ * and network posture have one obvious home. */
+export interface OrganizationExecutionPolicy {
+  worldProvider?: string;
+  runnerPoolId?: string;
+  resources?: ProjectConfig['resources'];
+  network?: ProjectConfig['network'];
+  monthlyBudgetMicros?: number;
   hibernateAfterMs?: number;
 }
 
@@ -763,7 +775,8 @@ export interface AgentSpec {
  * for the task to proceed to PR/merge; a revise verdict or a follow-up sends the
  * task back to Do, and the next Review replays the sequence from the first layer.
  * Zero layers ⇒ auto-confirm (e.g. "agent review, then a final human confirmation"
- * is `[{ kind: 'agent', … }, { kind: 'human' }]`; auto-confirm is `[]`).
+ * is `[{ kind: 'agent', … }, { kind: 'human', audience: ['@creator'] }]`;
+ * auto-confirm is `[]`).
  *
  * A `human` layer waits for a person to click Confirm. An `agent` layer runs a
  * Confirm-agent turn that reviews the work and returns a structured verdict
@@ -777,8 +790,15 @@ export interface AgentSpec {
  * layer, agent ⇒ one agent layer.
  */
 export type ConfirmMode = 'human' | 'auto' | 'agent';
+/** Stable workflow-owned audience selectors. Human-readable names are resolved
+ * at the UI edge; workflows persist ids/special selectors so renames are safe. */
+export type HumanAudience = string[];
 export interface ConfirmLayer extends Partial<AgentSpec> {
   kind: 'human' | 'agent';
+  /** Human layers only. Supported selectors are @creator, @all, @owners,
+   * @project, user:<id>, and team:<id>. Multiple selectors mean any matching
+   * person may satisfy this layer; use sequential layers for sequential gates. */
+  audience?: HumanAudience;
   /** Agent layers: the review-request message template sent each time the task
    *  reaches Review — optional instructions/guidance ("ensure X, Y and Z"), with
    *  {{prompt}} / {{response}} placeholders for the task prompt and the Do agent's
@@ -872,7 +892,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;

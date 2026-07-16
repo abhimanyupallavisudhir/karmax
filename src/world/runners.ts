@@ -13,7 +13,7 @@ export class RunnerPoolService {
 
   ensureDefaultPool(project: Project, provider: string): RunnerPool {
     const organizationId = project.organizationId!;
-    const requested = project.config.runnerPoolId;
+    const requested = this.store.effectiveProjectConfig(project).runnerPoolId;
     if (requested) {
       const pool = this.store.getRunnerPool(requested);
       if (!pool || pool.organizationId !== organizationId || !pool.enabled) throw new Error('configured runner pool is unavailable');
@@ -29,15 +29,20 @@ export class RunnerPoolService {
 
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;
     heartbeat?: () => void; signal?: AbortSignal; pollMs?: number }): Promise<{ leaseId: string; runnerPoolId: string }> {
+    const config = this.store.effectiveProjectConfig(input.project);
     const pool = this.ensureDefaultPool(input.project, input.provider);
     const month = monthWindow(Date.now());
-    const spent = this.store.usageSummary(input.project.organizationId!, month.from, month.to).costMicros;
-    if (input.project.config.monthlyBudgetMicros != null && spent >= input.project.config.monthlyBudgetMicros)
+    const organizationPolicy = this.store.getOrganizationExecutionPolicy(input.project.organizationId!);
+    const organizationSpent = this.store.usageSummary(input.project.organizationId!, month.from, month.to).costMicros;
+    if (organizationPolicy.monthlyBudgetMicros != null && organizationSpent >= organizationPolicy.monthlyBudgetMicros)
+      throw new Error('organization monthly cloud budget is exhausted');
+    const projectSpent = this.store.usageSummary(input.project.organizationId!, month.from, month.to, input.project.id).costMicros;
+    if (input.project.config.monthlyBudgetMicros != null && projectSpent >= input.project.config.monthlyBudgetMicros)
       throw new Error('project monthly cloud budget is exhausted');
     const requested = this.store.requestWorldLease({ runnerPoolId: pool.id, organizationId: input.project.organizationId!,
       projectId: input.project.id, taskId: input.taskId, worldId: input.worldId,
-      cpu: input.project.config.resources?.cpu, memoryMb: input.project.config.resources?.memoryMb,
-      gpu: input.project.config.resources?.gpu, priority: input.priority });
+      cpu: config.resources?.cpu, memoryMb: config.resources?.memoryMb,
+      gpu: config.resources?.gpu, priority: input.priority });
     while (!this.store.worldLease(requested.id)?.acquiredAt) {
       if (input.signal?.aborted) {
         this.store.releaseWorldLease(requested.id);
@@ -96,7 +101,7 @@ export class WorldLifecycleManager {
     for (const candidate of this.store.listWorldInstances('parked')) {
       const projectId = String(candidate.handle.meta?.projectId ?? '');
       const project = this.store.getProject(projectId);
-      const after = project?.config.hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000;
+      const after = project ? this.store.effectiveProjectConfig(project).hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
       if (!project || candidate.updatedAt > now - after) continue;
       const checkpoint = this.store.latestWorldCheckpoint(candidate.handle.id)
         ?? await this.checkpoints.checkpoint(candidate.handle);

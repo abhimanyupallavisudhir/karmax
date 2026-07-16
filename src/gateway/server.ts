@@ -115,6 +115,7 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
@@ -399,14 +400,14 @@ export class Gateway {
     if (!this.deps.tokens.check(auth.apiToken, 'task:edit', { projectId: task?.projectId, taskId }).ok) {
       ws.close(4403, 'forbidden'); return;
     }
-    const project = task ? this.deps.store.getProject(task.projectId)?.config : undefined;
+    const projectRecord = task ? this.deps.store.getProject(task.projectId) : undefined;
+    const project = projectRecord ? this.deps.store.effectiveProjectConfig(projectRecord) : undefined;
     const handle = worldHandleForView(task?.lastView, taskId, project);
     if (!handle) {
       ws.send(JSON.stringify({ type: 'data', data: 'No world for this task yet.\r\n' }));
       ws.close();
       return;
     }
-    const projectRecord = task ? this.deps.store.getProject(task.projectId) : undefined;
     if (!task || !projectRecord?.organizationId) { ws.close(4404, 'task project unavailable'); return; }
     let term: import('../world/types.js').WorldPty;
     let worldLeaseId: string | undefined;
@@ -811,6 +812,26 @@ export class Gateway {
 
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
       if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
+      const organizationExecution = p.match(/^\/api\/organizations\/([^/]+)\/execution-policy$/);
+      if (organizationExecution) {
+        const organizationId = organizationExecution[1]!;
+        if (method === 'GET') return this.json(res, 200, store.getOrganizationExecutionPolicy(organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
+          try {
+            if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
+              && !this.deps.providerConnections?.available(organizationId, String(policy.worldProvider)))
+              throw new Error(`${policy.worldProvider} is not connected and verified`);
+            if (policy.runnerPoolId) {
+              const pool = store.getRunnerPool(String(policy.runnerPoolId));
+              if (!pool || pool.organizationId !== organizationId) throw new Error('runner pool does not belong to this organization');
+              if (policy.worldProvider && pool.provider !== policy.worldProvider) throw new Error('runner pool provider must match the default provider');
+            }
+            return this.json(res, 200, store.setOrganizationExecutionPolicy(organizationId, policy));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
       const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
       if (organizationExport && method === 'GET') {
         const value = store.exportOrganization(organizationExport[1]!);
@@ -991,7 +1012,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
-          const project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config, true), organizationId);
+          const project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
           if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
           return this.json(res, 200, project);
         }
@@ -1227,7 +1248,7 @@ export class Gateway {
           try {
             const config = normalizeConfig(b.config);
             const project = store.getProject(id);
-            if (this.deps.hosted && config.worldProvider && project?.organizationId &&
+            if (config.worldProvider && !['worktree', 'container', 'memory'].includes(config.worldProvider) && project?.organizationId &&
                 !this.deps.providerConnections?.available(project.organizationId, config.worldProvider)) {
               throw new Error(`${config.worldProvider} is not connected. Connect and verify it in Organization settings first.`);
             }
@@ -1246,6 +1267,34 @@ export class Gateway {
           for (const attachmentId of resources.attachmentIds)
             if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
           return this.json(res, 200, { deleted: true, projectId: id });
+        }
+      }
+      const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
+      if (projectExecution) {
+        const project = store.getProject(projectExecution[1]!);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        if (method === 'GET') return this.json(res, 200, {
+          override: pickExecutionConfig(project.config),
+          organization: store.getOrganizationExecutionPolicy(project.organizationId!),
+          effective: pickExecutionConfig(store.effectiveProjectConfig(project)),
+        });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const override = b.override && typeof b.override === 'object' ? b.override : {};
+          try {
+            const candidate = { ...project, config: applyExecutionOverride(project.config, override) };
+            const effective = store.effectiveProjectConfig(candidate);
+            if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
+              && !this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider))
+              throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
+            if (effective.runnerPoolId) {
+              const pool = store.getRunnerPool(effective.runnerPoolId);
+              if (!pool || pool.organizationId !== project.organizationId) throw new Error('runner pool does not belong to this organization');
+              if (pool.provider !== effective.worldProvider) throw new Error('runner pool provider must match the execution provider');
+            }
+            const saved = store.setProjectExecutionPolicy(project.id, override);
+            return this.json(res, 200, { override: pickExecutionConfig(saved.config), organization: store.getOrganizationExecutionPolicy(project.organizationId!), effective: pickExecutionConfig(effective) });
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
       const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
@@ -1646,7 +1695,7 @@ export class Gateway {
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
         const task = store.getTask(taskId);
-        const handle = worldHandleForView(view, taskId, task ? store.getProject(task.projectId)?.config : undefined);
+        const handle = worldHandleForView(view, taskId, task ? store.effectiveProjectConfig(task.projectId) : undefined);
         if (action.kind === 'open') {
           const target = String(action.target ?? '');
           if (/^https?:\/\//i.test(target)) return this.json(res, 200, { kind: 'open', url: target, external: true });
@@ -1691,7 +1740,7 @@ export class Gateway {
         const b = await this.body(req);
         const relPath = String(b.path ?? '');
         if (!task || !project?.organizationId || !relPath) return this.json(res, 400, { error: 'task and artifact path are required' });
-        const handle = worldHandleForView(task.lastView, taskId, project.config);
+        const handle = worldHandleForView(task.lastView, taskId, store.effectiveProjectConfig(project));
         if (!handle) return this.json(res, 404, { error: 'no world for this task' });
         const world = await this.deps.worlds.open(handle);
         const data = await world.readFileBuffer(relPath);
@@ -1733,7 +1782,7 @@ export class Gateway {
         const port = Number(previewMatch[2]);
         const task = store.getTask(taskId);
         const project = task ? store.getProject(task.projectId) : undefined;
-        const handle = worldHandleForView(task?.lastView, taskId, project?.config);
+        const handle = worldHandleForView(task?.lastView, taskId, project ? store.effectiveProjectConfig(project) : undefined);
         if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
         if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
         const isolatedOrigin = configuredPreviewOrigin();
@@ -1766,7 +1815,7 @@ export class Gateway {
         const taskId = previewLeases[1]!;
         const task = store.getTask(taskId);
         const project = task ? store.getProject(task.projectId) : undefined;
-        const handle = worldHandleForView(task?.lastView, taskId, project?.config);
+        const handle = worldHandleForView(task?.lastView, taskId, project ? store.effectiveProjectConfig(project) : undefined);
         const b = await this.body(req);
         const port = Number(b.port);
         if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
@@ -2218,7 +2267,8 @@ export class Gateway {
         if (!m) return this.json(res, 404, { error: 'no workflow' });
         const gs = (s: string, w: string) => store.getSettings(s, w);
         const project = store.getProject(projectId);
-        const globalVals = globalSettingsFor(gs, wf);
+        const organizationId = url.searchParams.get('organizationId') ?? project?.organizationId;
+        const globalVals = globalSettingsFor(gs, wf, organizationId ?? undefined);
         const projectVals = project ? projectSettingsFor(gs, project, wf) : {};
         // Detect the repo's real default branch so placeholders show it (not "main").
         const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
@@ -2235,7 +2285,7 @@ export class Gateway {
         // tasks added from the quick box. Global-quick inherits from global-general;
         // project-quick inherits from global-quick (primary) with project-general as
         // the alternative source (the two "Reset to inherited" buttons in the UI).
-        const globalQuickVals = quickGlobalSettingsFor(gs, wf);
+        const globalQuickVals = quickGlobalSettingsFor(gs, wf, organizationId ?? undefined);
         const projectQuickVals = project ? quickProjectSettingsFor(gs, project.id, wf) : {};
         return this.json(res, 200, {
           task: { own: {}, inherited: enrich(resolveParams(m, { project: projectVals, global: globalVals }), {}) },
@@ -2254,6 +2304,26 @@ export class Gateway {
       }
 
       // settings (global + per-project, per workflow)
+      const organizationSettings = p.match(/^\/api\/organizations\/([^/]+)\/settings\/([^/]+)$/);
+      if (organizationSettings) {
+        const [_, organizationId, wf] = organizationSettings;
+        if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          store.setSettings(`organization:${organizationId}`, wf!, b.values ?? {});
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const organizationQuickSettings = p.match(/^\/api\/organizations\/([^/]+)\/quick-settings\/([^/]+)$/);
+      if (organizationQuickSettings) {
+        const [_, organizationId, wf] = organizationQuickSettings;
+        if (method === 'GET') return this.json(res, 200, quickGlobalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          store.setSettings(`quick:organization:${organizationId}`, wf!, b.values ?? {});
+          return this.json(res, 200, { ok: true });
+        }
+      }
       const gset = p.match(/^\/api\/settings\/global\/([^/]+)$/);
       if (gset) {
         const wf = gset[1]!;
@@ -2520,7 +2590,7 @@ export class Gateway {
    * host/sandbox path and remote worlds need no public filesystem endpoint. */
   private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string) {
     const task = this.deps.store.getTask(taskId);
-    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
     try {
@@ -2543,7 +2613,7 @@ export class Gateway {
   private async servePreview(req: http.IncomingMessage, res: http.ServerResponse, taskId: string,
     port: number, requestPath: string, proxyBase: string) {
     const task = this.deps.store.getTask(taskId);
-    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
     const method = req.method ?? 'GET';
@@ -2666,7 +2736,7 @@ export class Gateway {
       requestPath = `${leaseMatch?.[2] ?? '/'}${query.size ? `?${query}` : ''}`;
     }
     const task = this.deps.store.getTask(taskId);
-    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) { browser.close(4404, 'world unavailable'); return; }
     const world = await this.deps.worlds.open(handle);
     if (!world.previewSocketTarget) { browser.close(4400, 'provider has no WebSocket previews'); return; }
@@ -3054,4 +3124,20 @@ function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = fal
     return { ...config, repos: config.repos.filter(Boolean).map(expandPath) };
   }
   return config;
+}
+
+const EXECUTION_CONFIG_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
+
+function pickExecutionConfig(config: ProjectConfig): Partial<ProjectConfig> {
+  return Object.fromEntries(EXECUTION_CONFIG_KEYS.filter((key) => config[key] !== undefined).map((key) => [key, config[key]])) as Partial<ProjectConfig>;
+}
+
+function applyExecutionOverride(config: ProjectConfig, override: Record<string, unknown>): ProjectConfig {
+  const next: Record<string, unknown> = { ...config };
+  for (const key of EXECUTION_CONFIG_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(override, key)) continue;
+    if (override[key] == null) delete next[key];
+    else next[key] = override[key];
+  }
+  return next as ProjectConfig;
 }

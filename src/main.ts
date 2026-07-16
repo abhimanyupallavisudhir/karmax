@@ -280,7 +280,7 @@ async function main() {
   // branch) instead of baking a project-scope "main" override that would shadow
   // a global default like "master".
   if (store.listProjects().length === 0) {
-    store.createProject('My project', deployment.hosted ? { worldProvider: deployment.cloudWorldProvider } : {});
+    store.createProject('My project');
   }
   if (installationOwner) {
     for (const project of store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {

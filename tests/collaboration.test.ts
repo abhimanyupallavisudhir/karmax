@@ -113,6 +113,36 @@ describe('organization and collaboration domain', () => {
     expect(store.voteConfirmation(task.id, 'b')).toMatchObject({ satisfied: true, votes: 2, required: 2 });
   });
 
+  it('routes each human workflow gate to its declared people', () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Routing', ownerUserId: 'owner' });
+    for (const userId of ['developer', 'designer', 'outsider'])
+      store.setOrganizationMembership(organization.id, userId, 'member');
+    const project = store.createProject('Product', {}, organization.id);
+    store.setProjectMembership(project.id, { kind: 'user', userId: 'developer' }, 'member');
+    const design = store.createTeam({ organizationId: organization.id, name: 'Design' });
+    store.setTeamMembership(design.id, 'designer');
+    const task = store.createTask({ projectId: project.id, title: 'Ship', workflow: 'software-dev',
+      workflowVersion: '1', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
+    store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review',
+      status: 'waiting', messages: [], actions: [], state: {}, waitingFor: {
+        kind: 'human', audience: ['@creator', '@project', `team:${design.id}`, 'user:outsider'],
+      }, updatedAt: Date.now() });
+
+    expect(store.humanAudience(task.id)).toEqual(expect.arrayContaining(['owner', 'developer', 'designer', 'outsider']));
+    expect(store.humanMayAct(task.id, 'designer')).toBe(true);
+    expect(store.humanMayAct(task.id, 'unknown')).toBe(false);
+
+    const child = store.createTask({ projectId: project.id, title: 'Child', workflow: 'software-dev',
+      workflowVersion: '1', params: { prompt: 'x' },
+      createdBy: { kind: 'task-agent', taskId: task.id, role: 'do' } });
+    expect(store.humanAudience(child.id, ['@creator'])).toEqual(['owner']);
+
+    const automated = store.createTask({ projectId: project.id, title: 'Scheduled', workflow: 'software-dev',
+      workflowVersion: '1', params: { prompt: 'x' } });
+    expect(store.humanAudience(automated.id, ['@creator'])).toEqual(['owner']);
+  });
+
   it('exports a complete redacted tenant and deletes it atomically', () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Delete me', ownerUserId: 'owner' });
@@ -121,6 +151,8 @@ describe('organization and collaboration domain', () => {
       workflowVersion: '1', params: { prompt: 'important customer data' } });
     store.createOrganizationInvitation({ organizationId: organization.id, email: 'new@example.com', invitedBy: 'owner' });
     store.setOrganizationIdentityPolicy({ organizationId: organization.id, oidcProviderId: 'enterprise' });
+    store.setOrganizationExecutionPolicy(organization.id, { worldProvider: 'e2b', network: { unrestricted: true } });
+    store.setSettings(`organization:${organization.id}`, 'software-dev', { confirm: { mode: 'auto' } });
     store.rotateScimToken(organization.id);
     store.registerWorld({ version: 2, id: task.id, kind: 'memory', provider: 'memory', generation: 1,
       runnerPoolId: 'local', environmentDigest: 'test', root: '/opaque', branch: 'task/test', base: 'main', meta: {} }, project.id);
@@ -130,6 +162,8 @@ describe('organization and collaboration domain', () => {
     expect(exported.tables.tasks[0].title).toBe('Private task');
     expect(exported.tables.organization_invitations[0].tokenHash).toBeUndefined();
     expect(exported.identityPolicy.scimTokenId).toBeUndefined();
+    expect(exported.executionPolicy).toMatchObject({ worldProvider: 'e2b', network: { unrestricted: true } });
+    expect(exported.tables.settings).toHaveLength(1);
     expect(exported.tables.world_instances[0].handle).toMatchObject({ provider: 'memory', generation: 1 });
     expect(exported.tables.world_instances[0].handle.meta).toBeUndefined();
 
@@ -138,6 +172,7 @@ describe('organization and collaboration domain', () => {
     expect(store.getProject(project.id)).toBeUndefined();
     expect(store.getTask(task.id)).toBeUndefined();
     expect(store.db.prepare('SELECT COUNT(*) n FROM world_instances').get()).toMatchObject({ n: 0 });
+    expect(store.kvGet(`organization-execution:${organization.id}`)).toBeUndefined();
     expect(() => store.deleteOrganization('org_personal')).toThrow(/cannot be deleted/);
   });
 

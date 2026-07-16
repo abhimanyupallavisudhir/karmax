@@ -1319,7 +1319,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       // would push a zero-/partial-work diff straight through to merge unseen: a stall
       // degrades to a single human gate. (In goal mode the loop above already
       // guarantees completed|raise here, so the guard changes no reachable goal path.)
-      const gates: ConfirmLayer[] = confirmLayers.length || turnFinished || turn.raise ? confirmLayers : [{ kind: 'human' }];
+      const gates: ConfirmLayer[] = confirmLayers.length || turnFinished || turn.raise
+        ? confirmLayers : [{ kind: 'human', audience: ['@creator'] }];
       let backToDo = false;
       for (let li = 0; li < gates.length && !backToDo; li++) {
         const layer = gates[li]!;
@@ -1350,7 +1351,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
         }
         // A human layer: wait for the Confirm click — one click passes ONE layer — or a
         // follow-up, which sends the task back to Do.
-        if (gateDetail) waitingFor = { kind: 'human', detail: gateDetail };
+        waitingFor = { kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
+          audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
         await condition(() => confirmed || cancelled || msgs.length > seen);
         waitingFor = undefined;

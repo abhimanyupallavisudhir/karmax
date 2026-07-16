@@ -34,7 +34,7 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // review-request prompt template (pre-filled with `promptDefault`, editable per
 // task/project/global). Chosen at task creation (queue-time), like the other agent
 // selections.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm layers', help: 'Played in order at Review — each layer is a human confirmation or a review agent; every layer must approve. No layers ⇒ auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human' }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
@@ -42,7 +42,6 @@ const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repositories', help: 'One per line. Local worlds accept filesystem paths; E2B accepts SSH Git URLs (git@github.com:org/repo.git). Multiple repos are checked out in separate world subdirectories.', scopes: ['project'], bind: 'project' });
 const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
-const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', help: 'Worktree and Docker run locally; E2B and Daytona are isolated, auto-parking cloud worlds.', options: ['worktree', 'container', 'e2b', 'daytona'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
 const remoteField = (): FieldSpec => ({
   name: 'remote',
   type: 'select',
@@ -57,7 +56,7 @@ const gitProfileField = (): FieldSpec => ({
   name: 'gitProfile',
   type: 'string',
   label: 'Git profile',
-  help: 'Named git identity/credentials (Global settings → Git accounts) this project commits, signs and pushes as. Empty ⇒ the default profile, else the host’s own git setup.',
+  help: 'Named git identity/credentials (Organization settings → Git accounts) this project commits, signs and pushes as. Empty ⇒ the organization default, else the host’s own git setup.',
   scopes: ['project', 'global'],
   bind: 'project',
 });
@@ -329,7 +328,6 @@ export const MANIFESTS: WorkflowManifest[] = [
       targetField(),
       reposField(),
       copyGlobsField(),
-      worldProviderField(),
       remoteField(),
       gitProfileField(),
       agentField('merge', 'Merge agent', 'always'),
@@ -362,7 +360,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), worldProviderField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), confirmerField()],
   },
   {
     name: 'script-exec',
@@ -397,7 +395,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Merge/Review machinery.
     roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), remoteField(), gitProfileField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), remoteField(), gitProfileField(), confirmerField()],
   },
   {
     name: 'merge-only',
