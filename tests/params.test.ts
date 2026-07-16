@@ -159,6 +159,12 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
     expect(s).toBe(stored);
   });
 
+  it('merges shared defaults beneath workflow-specific settings', () => {
+    const get = (_scope: string, workflow: string) => workflow === '__common__'
+      ? { base: 'shared', target: 'main' } : workflow === 'software-dev' ? { base: 'workflow' } : undefined;
+    expect(projectSettingsFor(get, project, 'software-dev')).toMatchObject({ base: 'workflow', target: 'main' });
+  });
+
   it('globalSettingsFor returns {} when absent', () => {
     expect(globalSettingsFor(() => undefined, 'software-dev')).toEqual({});
   });
@@ -228,6 +234,11 @@ describe('quick-task defaults (separate overlay for the quick-add box)', () => {
     expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({ base: 'qb' });
     expect(quickGlobalSettingsFor(() => undefined, 'software-dev')).toEqual({});
     expect(quickProjectSettingsFor(() => undefined, 'p1', 'software-dev')).toEqual({});
+  });
+
+  it('can disable the shared Quick overlay without deleting its values', () => {
+    const get = (_scope: string, workflow: string) => workflow === '__common__' ? { _enabled: false, base: 'quick' } : undefined;
+    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({});
   });
 });
 

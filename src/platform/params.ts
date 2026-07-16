@@ -13,6 +13,21 @@ import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
  */
 
 export type ValueMap = Record<string, unknown>;
+/** Shared settings are declared once and consumed by every workflow that has a
+ * field with the same name. Workflow rows now contain only genuinely unique
+ * settings; the merge keeps historical per-workflow rows working. */
+export const COMMON_SETTINGS_WORKFLOW = '__common__';
+
+function withCommon(
+  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
+  scopeKey: string,
+  workflow: string,
+): ValueMap | undefined {
+  const common = getSettings(scopeKey, COMMON_SETTINGS_WORKFLOW);
+  const specific = getSettings(scopeKey, workflow);
+  if (common === specific) return specific;
+  return common || specific ? { ...(common ?? {}), ...(specific ?? {}) } : undefined;
+}
 
 export function resolveParams(
   manifest: WorkflowManifest,
@@ -205,7 +220,7 @@ export function projectSettingsFor(
   project: Project,
   workflow: string,
 ): ValueMap {
-  const stored = getSettings(project.id, workflow);
+  const stored = withCommon(getSettings, project.id, workflow);
   if (stored) return stored;
   const c = project.config ?? {};
   const derived: ValueMap = {};
@@ -226,14 +241,14 @@ export function globalSettingsFor(
   organizationId?: string,
 ): ValueMap {
   if (organizationId) {
-    return getSettings(`organization:${organizationId}`, workflow)
+    return withCommon(getSettings, `organization:${organizationId}`, workflow)
       // Only the migration-created personal tenant may read historical global
       // rows. A newly-created organization must never inherit another tenant's
       // old installation settings.
-      ?? (organizationId === 'org_personal' ? getSettings('global', workflow) : undefined)
+      ?? (organizationId === 'org_personal' ? withCommon(getSettings, 'global', workflow) : undefined)
       ?? {};
   }
-  return getSettings('global', workflow) ?? {};
+  return withCommon(getSettings, 'global', workflow) ?? {};
 }
 
 /**
@@ -259,11 +274,16 @@ export function quickGlobalSettingsFor(
   organizationId?: string,
 ): ValueMap {
   if (organizationId) {
-    return getSettings(`quick:organization:${organizationId}`, workflow)
-      ?? (organizationId === 'org_personal' ? getSettings(quickScopeKey('global'), workflow) : undefined)
+    const key = `quick:organization:${organizationId}`;
+    const common = getSettings(key, COMMON_SETTINGS_WORKFLOW);
+    if (common?._enabled === false) return {};
+    return withCommon(getSettings, key, workflow)
+      ?? (organizationId === 'org_personal' ? withCommon(getSettings, quickScopeKey('global'), workflow) : undefined)
       ?? {};
   }
-  return getSettings(quickScopeKey('global'), workflow) ?? {};
+  const key = quickScopeKey('global');
+  if (getSettings(key, COMMON_SETTINGS_WORKFLOW)?._enabled === false) return {};
+  return withCommon(getSettings, key, workflow) ?? {};
 }
 
 export function quickProjectSettingsFor(
@@ -271,7 +291,9 @@ export function quickProjectSettingsFor(
   projectId: string,
   workflow: string,
 ): ValueMap {
-  return getSettings(quickScopeKey(projectId), workflow) ?? {};
+  const key = quickScopeKey(projectId);
+  if (getSettings(key, COMMON_SETTINGS_WORKFLOW)?._enabled === false) return {};
+  return withCommon(getSettings, key, workflow) ?? {};
 }
 
 /** When project settings are saved, mirror bound-project fields into ProjectConfig (back-compat). */

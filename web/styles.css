@@ -266,7 +266,7 @@ a { color: var(--accent); text-decoration: none; }
 .organization-settings { max-width:1080px; margin:0 auto; }
 .main-inner:has(> .organization-settings) { max-width:1160px; }
 .organization-settings .card { margin-bottom:12px; }
-.organization-settings .settings-grid { grid-template-columns:1fr; gap:10px; }
+.organization-settings .settings-grid { grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px 14px; }
 .settings-intro { color:var(--ink-2); margin:-8px 0 14px; }
 .settings-layout { display:grid; grid-template-columns:170px minmax(0,1fr); gap:34px; align-items:start; }
 .settings-content { min-width:0; }
