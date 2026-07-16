@@ -4993,13 +4993,15 @@ function fmtReset(epoch) {
 
 // ── settings (schema-driven, SPEC §10.4) ─────────────────────────────────────
 // One renderer for both scopes; `scope` decides which fields show + where they save.
+const settingsFields = (workflow, scope) => schemaFor(workflow)
+  .filter((field) => field.scopes.includes(scope) && !(scope === 'project' && field.name === 'repos'));
 function settingsForms(scope, projectId) {
   const wfs = S.schema
     .filter((s) => WORKFLOWS.some((w) => w.id === s.name) || (scope === 'global' && s.name === 'agent-queue'))
     .sort((a, b) => Number(b.name === 'agent-queue') - Number(a.name === 'agent-queue'));
   return wfs
     .map((s) => {
-      const fields = s.params.filter((f) => f.scopes.includes(scope));
+      const fields = settingsFields(s.name, scope);
       if (!fields.length) return '';
       const label = s.name === 'agent-queue' ? 'Host capacity' : s.name;
       const suffix = s.name === 'agent-queue' ? '— installation-wide agent-turn admission' : '— organization defaults';
@@ -5024,7 +5026,7 @@ async function hydrateSettingsForms(scope, projectId, organizationId) {
       own = d[scope].own;
       inherited = d[scope].inherited;
     } catch {}
-    const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
+    const fields = settingsFields(wf, scope);
     sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
@@ -5042,7 +5044,7 @@ function quickSettingsForms(scope, projectId) {
   const wfs = S.schema.filter((s) => WORKFLOWS.some((w) => w.id === s.name));
   return wfs
     .map((s) => {
-      const fields = s.params.filter((f) => f.scopes.includes(scope));
+      const fields = settingsFields(s.name, scope);
       if (!fields.length) return '';
       return `<details class="card" data-qwf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— quick-task defaults</span></summary>
@@ -5062,7 +5064,7 @@ async function hydrateQuickSettingsForms(scope, projectId, organizationId) {
     const own = d?.[key]?.own || {};
     const inherited = d?.[key]?.inherited || {};
     const inheritedAlt = d?.[key]?.inheritedAlt || {};
-    const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
+    const fields = settingsFields(wf, scope);
     const altFor = scope === 'project'
       ? (f) => ({ primaryLabel: 'Organization quick', altLabel: 'Project default', value: inheritedAlt[f.name] })
       : undefined;
@@ -5078,7 +5080,7 @@ function wireQuickSettingsSave(scope, projectId, organizationId) {
     b.addEventListener('click', async () => {
       const wf = b.dataset.qsave;
       const sec = b.closest('[data-qwf]');
-      const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
+      const fields = settingsFields(wf, scope);
       const values = collectForm(sec.querySelector('.wf-form'), fields);
       const url = scope === 'global' && organizationId ? `/api/organizations/${organizationId}/quick-settings/${wf}`
         : scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
@@ -5141,13 +5143,16 @@ async function hydrateProjectAccess(proj) {
   const box = $('#project-access');
   if (!box) return;
   try {
-    const [repositories, attached, members] = await Promise.all([
+    const [repositories, attached, members, gitConnections, githubApp] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
     ]);
     const linkedIds = new Set(attached.map((entry) => entry.repositoryId));
-    const userName = (id) => S.users.find((user) => user.id === id)?.name || id;
+    const userName = (id) => S.organizationMembers.find((member) => member.userId === id)?.user?.name
+      || S.users.find((user) => user.id === id)?.name || 'Unnamed member';
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
       : S.teams.find((team) => team.id === principal.teamId)?.name || principal.teamId;
     const candidates = [
@@ -5158,8 +5163,14 @@ async function hydrateProjectAccess(proj) {
       ${members.map((member) => `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(member.principal.userId || member.principal.teamId)}"><span>${esc(principalName(member.principal))}</span><span class="chip">${esc(member.role)}</span><button class="btn sm project-member-remove">Remove</button></div>`).join('') || '<p class="task-sub">No project members.</p>'}
       <div class="inline-form"><select id="project-member-principal">${candidates.map((candidate) => `<option value="${esc(candidate.value)}">${esc(candidate.label)}</option>`).join('')}</select><select id="project-member-role"><option>member</option><option>admin</option><option>owner</option></select><button class="btn sm" id="project-member-add">Add</button></div>
       <div class="section-h" style="margin-top:18px">Repositories</div>
-      ${attached.map((entry) => { const base = entry.baseBranch || entry.repository.defaultBranch; const target = entry.targetBranch || base; return `<div class="member-row"><span>${esc(entry.repository.owner)}/${esc(entry.repository.name)}</span><span class="chip">${esc(base)} → ${esc(target)}</span><button class="btn sm project-repo-remove" data-repository="${esc(entry.repositoryId)}">Remove</button></div>`; }).join('') || '<p class="task-sub">No repository attached. Connect GitHub from Organization, then attach one here.</p>'}
-      <div class="inline-form"><select id="project-repository">${repositories.filter((repository) => !linkedIds.has(repository.id)).map((repository) => `<option value="${esc(repository.id)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</select><input id="project-repo-base" placeholder="Base (repository default)"/><input id="project-repo-target" placeholder="Target (same as base)"/><button class="btn sm" id="project-repo-add">Attach repository</button></div>`;
+      <p class="task-sub">The repositories this project's cloud worlds may clone and push. Local-path repositories entered in a workflow keep using their configured git remote.</p>
+      ${attached.map((entry) => { const base = entry.baseBranch || entry.repository.defaultBranch; const target = entry.targetBranch || base; return `<div class="member-row"><span>${esc(entry.repository.owner)}/${esc(entry.repository.name)}</span><span class="chip">${esc(base)} → ${esc(target)}</span><button class="btn sm project-repo-remove" data-repository="${esc(entry.repositoryId)}">Remove</button></div>`; }).join('') || '<p class="task-sub">No repository attached yet.</p>'}
+      ${repositories.some((repository) => !linkedIds.has(repository.id)) ? `<div class="inline-form"><select id="project-repository">${repositories.filter((repository) => !linkedIds.has(repository.id)).map((repository) => `<option value="${esc(repository.id)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</select><input id="project-repo-base" placeholder="Base (repository default)"/><input id="project-repo-target" placeholder="Target (same as base)"/><button class="btn sm" id="project-repo-add">Attach repository</button></div>` : ''}
+      ${!S.meta?.hosted && !attached.length ? `<details class="settings-disclosure compact"><summary><b>Use an existing local repository or Git SSH URL</b></summary><p class="task-sub">One source per line. A local path with a remote automatically uses that SSH remote when this project runs in a cloud world.</p><textarea id="project-local-repos" rows="3" placeholder="/home/me/code/app">${esc((proj.config.repos || []).join('\n'))}</textarea><div class="inline-form"><button class="btn sm primary" id="project-local-repos-save">Save repository sources</button></div></details>` : ''}
+      ${!githubApp.configured ? '<div class="inline-form"><button class="btn sm primary" id="project-setup-github">Connect GitHub</button></div>'
+        : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
+        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="project-authorize-github">Authorize repository creation</button>' : ''}</div>
+          ${githubApp.userAuthorized ? `<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b></summary><div class="inline-form"><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="project-new-repo-name" placeholder="new-repository"><input id="project-new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="project-new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm primary" id="project-new-repo-create">Create and attach</button></div></details>` : ''}`}`;
     $('#project-member-add')?.addEventListener('click', async () => {
       const [kind, id] = ($('#project-member-principal')?.value || '').split(':'); if (!id) return;
       try { await api(`/api/projects/${proj.id}/members`, { method: 'POST', body: JSON.stringify({ principal: kind === 'team' ? { kind, teamId: id } : { kind: 'user', userId: id }, role: $('#project-member-role').value }) }); await hydrateProjectAccess(proj); }
@@ -5170,6 +5181,12 @@ async function hydrateProjectAccess(proj) {
       catch (error) { toast(error.message, true); }
     }));
     $('#project-repo-add')?.addEventListener('click', async () => { const repositoryId = $('#project-repository')?.value; if (!repositoryId) return; try { await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId, baseBranch: $('#project-repo-base')?.value || undefined, targetBranch: $('#project-repo-target')?.value || undefined }) }); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
+    $('#project-local-repos-save')?.addEventListener('click', async () => { const repos = $('#project-local-repos').value.split('\n').map((repo) => repo.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repository sources saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
+    $('#project-setup-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) }); const form = document.createElement('form'); form.method = 'POST'; form.action = result.action; const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest); form.appendChild(manifest); document.body.appendChild(form); form.submit(); } catch (error) { toast(error.message, true); } });
+    $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
+    $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
+    $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
+    $('#project-new-repo-create')?.addEventListener('click', async () => { const name = $('#project-new-repo-name')?.value.trim(); if (!name) return toast('Repository name is required', true); try { const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#project-new-repo-connection').value, name, description: $('#project-new-repo-description').value, private: $('#project-new-repo-private').checked }) }); await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) }); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
     box.querySelectorAll('.project-repo-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/repositories/${encodeURIComponent(button.dataset.repository)}`, { method: 'DELETE' }); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } }));
   } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
 }
@@ -5211,7 +5228,7 @@ function wireSettingsView(proj) {
     b.addEventListener('click', async () => {
       const wf = b.dataset.save;
       const sec = b.closest('[data-wf]');
-      const fields = schemaFor(wf).filter((f) => f.scopes.includes('project'));
+      const fields = settingsFields(wf, 'project');
       const values = collectForm(sec.querySelector('.wf-form'), fields);
       try { await api(`/api/settings/project/${proj.id}/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) }); await loadProjects(); toast(`${wf} defaults saved`); } catch (e) { toast(e.message, true); }
     }),
@@ -5303,7 +5320,7 @@ async function hydrateExecutionProviders(proj) {
 // ── organization defaults (legacy APIs still call this global scope) ─────────
 function globalSettingsView(embedded = false) {
   return `
-    ${embedded ? '<div class="section-title" id="settings-defaults">Task defaults</div>' : '<div class="page-title">Organization settings</div>'}
+    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><span>04</span><div>Task defaults<small>How new work begins</small></div></div>' : '<div class="page-title">Organization settings</div>'}
     <p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>
     ${settingsForms('global')}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
@@ -5311,7 +5328,7 @@ function globalSettingsView(embedded = false) {
     ${profilesCard('global')}
     ${authorizationCard('global')}
     ${paymentsCard('global')}
-    <div class="section-title" id="settings-agents">Agents &amp; credentials</div>
+    <div class="settings-section-title" id="settings-agents"><span>05</span><div>Agents<small>Models, credentials, and authority</small></div></div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The installation's logins and API keys, with organization defaults controlling how tasks use them. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
@@ -5364,7 +5381,7 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Re-saving a profile with a blank secret keeps the stored one. Interactive auth (password prompts at push) is never supported — configure a profile, or pre-authorize the host non-interactively.</div>
       </div>
     </div>
-    <div class="section-title" id="settings-installation">Installation</div>
+    <div class="settings-section-title" id="settings-installation"><span>06</span><div>Installation<small>Workflows, appearance, and resilience</small></div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
@@ -5618,8 +5635,8 @@ function profilesCard(scope) {
 
 function authorizationCard(scope) {
   return `<div class="card" id="authorization-card-${scope}">
-    <div class="section-h">Authorization</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Job-shaped permissions inherited by new task agents. A task can never receive more than its creator has.</p>
+    <div class="section-h">Agent permissions</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Job-shaped permissions inherited by new task agents. People and teams are managed separately; a task agent can never receive more authority than its creator.</p>
     <div id="authorization-${scope}">Loading…</div>
   </div>`;
 }
@@ -5688,15 +5705,14 @@ async function hydrateAuthorization(scope, projectId) {
     const suffix = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
     const data = await api(`/api/authorization/profiles${suffix}`);
     const options = data.profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === data.defaultProfile ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
-    box.innerHTML = `<div class="form-row"><label>Default for new tasks</label><select class="authz-default">${options}</select></div>
+    box.innerHTML = `<p class="task-sub">These profiles limit what task agents may do. Human membership and project access are managed in People and each project's Access section.</p>
+      <div class="form-row"><label>Default for new task agents</label><select class="authz-default">${options}</select></div>
       <div style="display:grid;gap:6px">${data.profiles.map((p) => `<details class="advanced authz-profile" data-profile-id="${esc(p.id)}">
         <summary><b>${esc(p.name)}</b> — ${esc(p.description)}</summary>
         <div class="form-row"><label>Description</label><input class="authz-description" value="${esc(p.description)}"></div>
         ${capabilityChecklist(p, data.capabilityGroups || [])}
         <button class="btn sm authz-save-profile">Save ${scope === 'project' ? 'project override' : 'profile'}</button>
-      </details>`).join('')}</div>
-      <div class="authz-accounts" style="margin-top:14px"><b>${scope === 'global' ? 'Human accounts' : 'Project access'}</b><div id="authz-users-${scope}" style="margin:6px 0">Loading…</div>
-        ${scope === 'global' ? `<div style="display:flex;gap:6px;flex-wrap:wrap"><input id="new-user-name" placeholder="Name"><input id="new-user-email" type="email" placeholder="Email"><input id="new-user-password" type="password" placeholder="Temporary password"><select id="new-user-profile">${options}</select><button class="btn sm" id="new-user-add">Add account</button></div>` : ''}</div>`;
+      </details>`).join('')}</div>`;
     box.querySelector('.authz-default')?.addEventListener('change', async (e) => {
       await api('/api/authorization/default', { method: 'PUT', body: JSON.stringify({ profileId: e.target.value, ...(projectId ? { projectId } : {}) }) });
       toast('Authorization default saved');
@@ -5722,36 +5738,6 @@ async function hydrateAuthorization(scope, projectId) {
         hydrateAuthorization(scope, projectId);
       } catch (e) { toast(e.message, true); }
     }));
-    try {
-      const users = await api('/api/users');
-      const scopeKey = projectId ? `project:${projectId}` : 'global';
-      const usersBox = $(`#authz-users-${scope}`);
-      usersBox.innerHTML = users.map((u) => {
-        const current = (u.grants || []).find((grant) => grant.scopeKey === scopeKey);
-        const grantOptions = data.profiles.map((profile) => `<option value="${esc(profile.id)}" ${profile.id === (current?.profileId || data.defaultProfile) ? 'selected' : ''}>${esc(profile.name)}</option>`).join('');
-        return `<div class="queue-item"><div style="flex:1;min-width:180px"><b>${esc(u.name)}</b><div class="task-sub">${esc(u.email)} · ${current ? esc(current.profileId) : 'no access in this scope'}</div></div>
-          <select class="authz-user-profile" data-user-id="${esc(u.id)}">${grantOptions}</select><button class="btn sm authz-user-grant" data-user-id="${esc(u.id)}">${current ? 'Update' : 'Grant'} access</button></div>`;
-      }).join('') || 'No accounts.';
-      usersBox.querySelectorAll('.authz-user-grant').forEach((button) => button.addEventListener('click', async () => {
-        const principalId = `user:${button.dataset.userId}`;
-        const profileId = button.closest('.queue-item').querySelector('.authz-user-profile').value;
-        try {
-          await api('/api/authorization/grants', { method: 'PUT', body: JSON.stringify({ principalId, profileId, ...(projectId ? { projectId } : {}) }) });
-          toast('Account access saved');
-          hydrateAuthorization(scope, projectId);
-        } catch (e) { toast(e.message, true); }
-      }));
-    } catch (e) {
-      $(`#authz-users-${scope}`).innerHTML = `<span class="task-sub">Account grants require user and authorization administration access.</span>`;
-    }
-    if (scope === 'global') {
-      $('#new-user-add')?.addEventListener('click', async () => {
-        try {
-          await api('/api/users', { method: 'POST', body: JSON.stringify({ name: $('#new-user-name').value, email: $('#new-user-email').value, password: $('#new-user-password').value, profileId: $('#new-user-profile').value }) });
-          toast('Account created'); hydrateAuthorization('global');
-        } catch (e) { toast(e.message, true); }
-      });
-    }
   } catch (e) { box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; }
 }
 
@@ -5913,44 +5899,64 @@ async function openInboxItem(item) {
   return go(`/projects/${projectSlug(project)}/tasks/${item.task.num ?? item.task.id}`);
 }
 
+let settingsSectionObserver;
+function wireSettingsNavigation() {
+  settingsSectionObserver?.disconnect();
+  const links = [...document.querySelectorAll('.settings-nav a[href^="#settings-"]')];
+  const sections = links.map((link) => document.querySelector(link.getAttribute('href'))).filter(Boolean);
+  const activate = (id) => links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${id}`));
+  if (!sections.length) return;
+  activate(sections[0].id);
+  settingsSectionObserver = new IntersectionObserver((entries) => {
+    const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+    if (visible[0]) activate(visible[0].target.id);
+  }, { rootMargin: '-10% 0px -72% 0px', threshold: 0 });
+  sections.forEach((section) => settingsSectionObserver.observe(section));
+  links.forEach((link) => link.addEventListener('click', () => activate(link.getAttribute('href').slice(1))));
+}
+
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   return `<div class="organization-settings"><h1 class="page-title">Settings</h1>
     <p class="settings-intro">${esc(org?.name || 'Organization')} · Everything this organization needs, in one place.</p>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
-    <nav class="settings-nav"><a href="#settings-people">People</a><a href="#settings-code">Code</a><a href="#settings-compute">Compute</a><a href="#settings-defaults">Task defaults</a><a href="#settings-agents">Agents</a><a href="#settings-installation">Installation</a><a href="#settings-advanced">Advanced</a></nav>
-    <div class="inline-form settings-new-org"><button class="btn sm" id="create-organization">＋ New organization</button></div>
+    <div class="settings-layout">
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-people">People</a><a href="#settings-code">GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-defaults">Task defaults</a><a href="#settings-agents">Agents</a><a href="#settings-installation">Installation</a><a href="#settings-advanced">Advanced</a><button class="btn sm settings-new-org" id="create-organization">＋ New organization</button></nav>
+    <div class="settings-content">
 
-    <div class="section-title" id="settings-people">People</div>
+    <div class="settings-section-title" id="settings-people"><span>01</span><div>People<small>Members and review teams</small></div></div>
     <div class="card"><div class="section-h">Members</div><p class="task-sub">Members do the work. Admins manage organization settings. Owners can do both and protect the organization from losing its final administrator.</p><div id="org-members">Loading…</div>
       <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-role"><option value="member">Member</option><option value="admin">Admin</option><option value="owner">Owner</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
 
-    <div class="section-title" id="settings-code">Code</div>
-    <div class="card"><div class="section-h">GitHub</div><p class="task-sub">Optional for local repositories. Connect GitHub when Karmax should discover and create repositories, receive repository changes, or issue repository-scoped SSH keys to hosted cloud worlds. A local repo with an SSH-capable git remote works directly.</p><div id="org-github">Loading…</div><div id="org-repos"></div></div>
+    <div class="settings-section-title" id="settings-code"><span>02</span><div>GitHub<small>One connection for the organization</small></div></div>
+    <div class="card"><div class="section-h">GitHub connection</div><p class="task-sub">Connect GitHub once so Karmax can clone and push private repositories from cloud worlds. Repository selection belongs to each project, not organization settings. Local repositories with an SSH-capable remote work without this connection.</p><div id="org-github">Loading…</div></div>
 
-    <div class="section-title" id="settings-compute">Compute</div>
+    <div class="settings-section-title" id="settings-compute"><span>03</span><div>Compute<small>Where tasks run and what they may spend</small></div></div>
     <div class="card"><div class="section-h">Task execution</div><p class="task-sub">Choose where tasks run, how large each world is, when idle worlds pause, and the monthly cost ceiling. Provider credentials and templates are configured directly below the policy that uses them.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
     ${globalSettingsView(true)}
 
-    <div class="section-title" id="settings-advanced">Advanced</div>
+    <div class="settings-section-title" id="settings-advanced"><span>07</span><div>Advanced<small>Enterprise identity and data controls</small></div></div>
     <details class="card settings-disclosure"><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
     <details class="card settings-disclosure"><summary><b>Export or delete organization</b><span>Data portability and permanent removal</span></summary><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></details>
-    </div>`;
+    </div></div></div>`;
 }
 
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
+  wireSettingsNavigation();
   await loadCollaboration().catch(() => {});
-  const userName = (id) => S.users.find((u) => u.id === id)?.name || id;
+  const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
+  const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
+  const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
+  const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name"><b>${esc(userName(id, embedded))}</b>${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
   const memberRoles = [['member', 'Member'], ['admin', 'Admin'], ['owner', 'Owner']];
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
     const current = m.role === 'billing' ? 'member' : m.role;
-    return `<div class="member-row" data-org-member="${esc(m.userId)}"><span>${esc(userName(m.userId))}</span><select class="q-sel org-member-role">${memberRoles.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`;
+    return `<div class="member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}<select class="q-sel org-member-role">${memberRoles.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`;
   }).join('') : '<span class="task-sub">No members.</span>';
-  const [repos, gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
-    api(`/api/organizations/${S.organizationId}/repositories`).catch(() => []),
+  const [gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
     api(`/api/organizations/${S.organizationId}/git-connections`).catch(() => []),
     api(`/api/organizations/${S.organizationId}/github/app`).catch(() => ({ configured: false })),
     api(`/api/organizations/${S.organizationId}/runner-pools`).catch(() => []),
@@ -5962,17 +5968,16 @@ async function hydrateOrganizationView() {
     Promise.all(S.teams.map((team) => api(`/api/organizations/${S.organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
   ]);
   if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(invitation.role)}</span></div>`).join('')}`);
-  $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(member.userId)}">${esc(userName(member.userId))}</option>`).join('');
-  $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="member-row"><span><b>${esc(team.name)}</b><span class="task-sub mono"> · @team:${esc(team.slug)}</span></span><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span></div>${members.map((m) => `<div class="member-row"><span>${esc(userName(m.userId))}</span><button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" placeholder="Type a person's name"><button class="btn sm team-member-add">Add</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
+  $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
+  $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
   $('#org-github').innerHTML = githubApp.configured ? `
     <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
-    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="authorize-github">Authorize repository creation</button>' : ''}</div>
-    ${gitConnections.length && githubApp.userAuthorized ? `<div class="section-h" style="margin-top:18px">Create repository</div><div class="inline-form"><select id="new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="new-repo-name" placeholder="new-repository"><input id="new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm" id="create-github-repo">Create</button></div>` : ''}` : `
-    <p class="task-sub">This creates a private GitHub App for this Karmax installation, then lets you choose exactly which repositories it may access. Callback URL: <span class="mono">${esc(location.origin)}</span></p>
+    <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so Karmax refreshes repository access when you ask instead of using webhooks.'}</p>
+    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="authorize-github">Authorize repository creation</button>' : ''}</div>` : `
+    <p class="task-sub">This creates a private GitHub App for this Karmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
-  $('#org-repos').innerHTML = `<div class="section-h" style="margin-top:18px">Available repositories</div>${repos.length ? repos.map((r) => `<div class="member-row"><span>${esc(r.owner)}/${esc(r.name)}</span><span class="chip">${esc(r.defaultBranch)}</span></div>`).join('') : '<span class="task-sub">No repositories connected.</span>'}`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
   const connectedProviders = providerConnections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider);
   const executionProviders = [...new Set([executionPolicy.worldProvider, ...(S.meta?.hosted ? [] : ['worktree', 'container']), ...connectedProviders].filter(Boolean))];
@@ -6027,11 +6032,7 @@ async function hydrateOrganizationView() {
   });
   $('#connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (e) { toast(e.message, true); } });
   $('#authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (e) { toast(e.message, true); } });
-  $('#create-github-repo')?.addEventListener('click', async () => {
-    const name = $('#new-repo-name').value.trim(); if (!name) return toast('Repository name is required', true);
-    try { await api(`/api/organizations/${S.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#new-repo-connection').value, name, description: $('#new-repo-description').value, private: $('#new-repo-private').checked }) }); toast('Repository created and enrolled'); await hydrateOrganizationView(); }
-    catch (e) { toast(e.message, true); }
-  });
+  $('#refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); } catch (e) { toast(e.message, true); } });
   $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
     const provider = row.dataset.provider;
     row.querySelector('.provider-save')?.addEventListener('click', async () => {
@@ -6078,9 +6079,23 @@ async function hydrateOrganizationView() {
   $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {
     block.querySelector('.team-member-add')?.addEventListener('click', async () => {
       const entered = block.querySelector('.team-user')?.value.trim();
-      const member = S.organizationMembers.find((candidate) => candidate.userId === entered || userName(candidate.userId).toLowerCase() === entered?.toLowerCase());
+      const member = S.organizationMembers.find((candidate) => personChoice(candidate).toLowerCase() === entered?.toLowerCase()
+        || userName(candidate.userId, candidate.user).toLowerCase() === entered?.toLowerCase()
+        || userRecord(candidate.userId, candidate.user)?.email?.toLowerCase() === entered?.toLowerCase());
       if (!member) return toast('Choose a person in this organization', true);
       try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId: member.userId }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
+    });
+    block.querySelector('.team-rename')?.addEventListener('click', () => { const form = block.querySelector('.team-rename-form'); form.hidden = false; form.querySelector('.team-name-edit').focus(); form.querySelector('.team-name-edit').select(); });
+    block.querySelector('.team-rename-cancel')?.addEventListener('click', () => { block.querySelector('.team-rename-form').hidden = true; });
+    block.querySelector('.team-rename-save')?.addEventListener('click', async () => {
+      const name = block.querySelector('.team-name-edit')?.value.trim(); if (!name) return toast('Team name is required', true);
+      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
+    });
+    block.querySelector('.team-name-edit')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); block.querySelector('.team-rename-save').click(); } if (event.key === 'Escape') block.querySelector('.team-rename-cancel').click(); });
+    block.querySelector('.team-delete')?.addEventListener('click', async () => {
+      const team = S.teams.find((candidate) => candidate.id === block.dataset.team);
+      if (!confirm(`Delete “${team?.name || 'this team'}”? This is only allowed when no project or workflow still uses it.`)) return;
+      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
     });
     block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
   });

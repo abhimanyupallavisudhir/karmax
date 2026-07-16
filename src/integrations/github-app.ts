@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -17,6 +18,21 @@ const GITHUB_APP_SLUG_KEY = 'github-app:slug';
 const GITHUB_APP_CLIENT_ID_KEY = 'github-app:client-id';
 export const GITHUB_APP_PUBLIC_URL_KEY = 'github-app:public-url';
 const githubUserTokenHandle = (userId: string) => `github-app:user:${userId}:authorization`;
+
+function publicWebhookOrigin(url: URL): boolean {
+  if (url.protocol !== 'https:') return false;
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) return false;
+  if (net.isIP(hostname) === 4) {
+    const [a = 0, b = 0] = hostname.split('.').map(Number);
+    return !(a === 10 || a === 127 || a === 0 || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168));
+  }
+  if (net.isIP(hostname) === 6)
+    return !(hostname === '::1' || hostname === '::' || hostname.startsWith('fc') || hostname.startsWith('fd')
+      || hostname.startsWith('fe8') || hostname.startsWith('fe9') || hostname.startsWith('fea') || hostname.startsWith('feb'));
+  return hostname.includes('.');
+}
 
 export const repositoryKeyHandle = (repositoryId: string, mode: 'clone' | 'write') =>
   `github:repository:${repositoryId}:${mode}`;
@@ -71,13 +87,19 @@ export class GitHubAppService {
   }
 
   status(userId?: string): { configured: boolean; appId?: string; appSlug?: string; oauthConfigured: boolean;
-    webhookConfigured: boolean; userAuthorized: boolean } {
+    webhookConfigured: boolean; syncMode: 'webhook' | 'on-demand'; userAuthorized: boolean } {
+    let syncMode: 'webhook' | 'on-demand' = 'on-demand';
+    try {
+      const publicUrl = this.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY);
+      if (publicUrl && publicWebhookOrigin(new URL(publicUrl))) syncMode = 'webhook';
+    } catch {}
     return {
       configured: this.configured(),
       ...(this.options.appId ? { appId: this.options.appId } : {}),
       ...(this.options.appSlug ? { appSlug: this.options.appSlug } : {}),
       oauthConfigured: Boolean(this.options.clientId && this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)),
       webhookConfigured: this.broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE),
+      syncMode,
       userAuthorized: Boolean(userId && this.broker.hasHandle(githubUserTokenHandle(userId))),
     };
   }
@@ -111,23 +133,29 @@ export class GitHubAppService {
       throw new Error('Karmax needs an http(s) browser URL to set up GitHub');
     const origin = parsed.origin;
     const hostname = new URL(origin).hostname.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 35) || 'host';
+    const manifest: Record<string, unknown> = {
+      name: `Karmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
+      url: origin,
+      public: false,
+      // Keep the CSRF state in the path. GitHub's manifest validator is
+      // needlessly strict about some otherwise-valid callback query strings,
+      // while the path form is still a full URL and survives the round trip.
+      redirect_url: `${origin}/api/github/manifest/callback/${encodeURIComponent(state)}`,
+      setup_url: `${origin}/api/github/callback`,
+      setup_on_update: true,
+      callback_urls: [`${origin}/api/github/oauth/callback`],
+      default_permissions: { administration: 'write', contents: 'write', metadata: 'read', pull_requests: 'write' },
+    };
+    // GitHub rejects loopback/private webhook URLs because its delivery service
+    // cannot reach them. Local Karmax instances reconcile installations on
+    // demand instead. Installation lifecycle events are deliberately omitted:
+    // GitHub Apps receive them automatically and GitHub rejects attempts to
+    // subscribe to installation_repositories explicitly.
+    if (publicWebhookOrigin(parsed))
+      manifest.hook_attributes = { url: `${origin}/api/github/webhook`, active: true };
     return {
       action: 'https://github.com/settings/apps/new',
-      manifest: {
-        name: `Karmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
-        url: origin,
-        public: false,
-        // Keep the CSRF state in the path. GitHub's manifest validator is
-        // needlessly strict about some otherwise-valid callback query strings,
-        // while the path form is still a full URL and survives the round trip.
-        redirect_url: `${origin}/api/github/manifest/callback/${encodeURIComponent(state)}`,
-        setup_url: `${origin}/api/github/callback`,
-        setup_on_update: true,
-        callback_urls: [`${origin}/api/github/oauth/callback`],
-        hook_attributes: { url: `${origin}/api/github/webhook`, active: true },
-        default_permissions: { administration: 'write', contents: 'write', metadata: 'read', pull_requests: 'write' },
-        default_events: ['installation', 'installation_repositories', 'repository'],
-      },
+      manifest,
     };
   }
 

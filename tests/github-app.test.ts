@@ -42,6 +42,8 @@ describe('GitHub App integration', () => {
     expect(manifest.manifest).toMatchObject({ setup_url: 'https://karmax.example/api/github/callback',
       redirect_url: 'https://karmax.example/api/github/manifest/callback/state',
       setup_on_update: true, callback_urls: ['https://karmax.example/api/github/oauth/callback'] });
+    expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
+    expect(manifest.manifest).not.toHaveProperty('default_events');
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');
     expect(service.status('owner')).toMatchObject({ configured: true, appSlug: 'karmax-acme', oauthConfigured: true,
@@ -58,6 +60,19 @@ describe('GitHub App integration', () => {
     expect(store.repositoryDeployKeys(repository.id)).toBeTruthy();
     expect(calls.some((call) => call.path === '/user/installations/42/repositories/77' && call.method === 'PUT')).toBe(true);
     expect(calls.find((call) => call.path === '/login/oauth/access_token')?.body).toContain('redirect_uri=');
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('creates a valid webhook-free manifest for local and private instances', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-local-manifest-'));
+    const store = new Store(':memory:');
+    const service = new GitHubAppService(store, new CredentialBroker(new Vault(dir)));
+    for (const origin of ['http://localhost:4343', 'https://127.0.0.1:4343', 'https://192.168.1.20']) {
+      const manifest = service.manifest(origin, 'state').manifest;
+      expect(manifest).not.toHaveProperty('hook_attributes');
+      expect(manifest).not.toHaveProperty('default_events');
+      expect(manifest.redirect_url).toBe(`${origin}/api/github/manifest/callback/state`);
+    }
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 

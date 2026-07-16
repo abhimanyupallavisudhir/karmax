@@ -88,7 +88,7 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
   if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
-  if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url|refresh)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
@@ -119,7 +119,7 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
-  if (/^\/api\/projects\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
@@ -880,7 +880,13 @@ export class Gateway {
       const organizationMembers = p.match(/^\/api\/organizations\/([^/]+)\/members$/);
       if (organizationMembers) {
         const organizationId = organizationMembers[1]!;
-        if (method === 'GET') return this.json(res, 200, store.listOrganizationMemberships(organizationId));
+        if (method === 'GET') {
+          const users = new Map((this.deps.identity?.listUsers() ?? []).map((user) => [user.id, user]));
+          return this.json(res, 200, store.listOrganizationMemberships(organizationId).map((membership) => {
+            const user = users.get(membership.userId);
+            return { ...membership, ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
+          }));
+        }
         if (method === 'POST') {
           const b = await this.body(req);
           const role = ['owner', 'admin'].includes(String(b.role)) ? String(b.role) as 'owner' | 'admin' : 'member';
@@ -919,10 +925,31 @@ export class Gateway {
             projectId: b.projectId ? String(b.projectId) : undefined, slug: b.slug ? String(b.slug) : undefined }));
         }
       }
+      const organizationTeam = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)$/);
+      if (organizationTeam) {
+        const team = store.getTeam(organizationTeam[2]!);
+        if (!team || team.organizationId !== organizationTeam[1]) return this.json(res, 404, { error: 'team not found' });
+        try {
+          if (method === 'PATCH') {
+            const b = await this.body(req);
+            return this.json(res, 200, store.updateTeam(team.id, { name: String(b.name ?? '') }));
+          }
+          if (method === 'DELETE') {
+            store.deleteTeam(team.id);
+            return this.json(res, 200, { ok: true });
+          }
+        } catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       const teamMembers = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)\/members$/);
       if (teamMembers) {
         if (store.getTeam(teamMembers[2]!)?.organizationId !== teamMembers[1]) return this.json(res, 404, { error: 'team not found' });
-        if (method === 'GET') return this.json(res, 200, store.listTeamMemberships(teamMembers[2]!));
+        if (method === 'GET') {
+          const users = new Map((this.deps.identity?.listUsers() ?? []).map((user) => [user.id, user]));
+          return this.json(res, 200, store.listTeamMemberships(teamMembers[2]!).map((membership) => {
+            const user = users.get(membership.userId);
+            return { ...membership, ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
+          }));
+        }
         if (method === 'POST') {
           const b = await this.body(req);
           return this.json(res, 200, store.setTeamMembership(teamMembers[2]!, String(b.userId)));
@@ -988,6 +1015,16 @@ export class Gateway {
         if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
         const state = store.createGithubInstallState(githubInstallUrl[1]!, session.userId);
         return this.json(res, 200, { url: this.deps.githubApp.installationUrl(state) });
+      }
+      const githubRefresh = p.match(/^\/api\/organizations\/([^/]+)\/github\/refresh$/);
+      if (githubRefresh && method === 'POST') {
+        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        try {
+          const repositories: import('../domain/types.js').Repository[] = [];
+          for (const connection of store.listGitConnections(githubRefresh[1]!))
+            repositories.push(...await this.deps.githubApp.reconcile(connection));
+          return this.json(res, 200, { repositories, count: repositories.length });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationRepositories = p.match(/^\/api\/organizations\/([^/]+)\/repositories$/);
       if (organizationRepositories) {
@@ -1344,6 +1381,19 @@ export class Gateway {
             baseBranch: b.baseBranch ? String(b.baseBranch) : undefined,
             targetBranch: b.targetBranch ? String(b.targetBranch) : undefined,
             order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined }));
+        }
+      }
+      const projectRepositorySources = p.match(/^\/api\/projects\/([^/]+)\/repository-sources$/);
+      if (projectRepositorySources) {
+        const project = store.getProject(projectRepositorySources[1]!);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        if (method === 'GET') return this.json(res, 200, { repos: project.config.repos ?? [] });
+        if (method === 'PUT') {
+          if (this.deps.hosted) return this.json(res, 400, { error: 'hosted projects use attached GitHub repositories' });
+          const b = await this.body(req);
+          try { return this.json(res, 200, store.setProjectRepositorySources(project.id,
+            Array.isArray(b.repos) ? b.repos.map(String) : [])); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
       const projectRepository = p.match(/^\/api\/projects\/([^/]+)\/repositories\/([^/]+)$/);

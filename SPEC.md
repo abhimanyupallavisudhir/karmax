@@ -458,7 +458,7 @@ The host shell and core modules are **first-party**, built on the same contribut
 
 - **Task list** — the primary surface (per project / task list).
 - **Merge queue UI** — ordered queue, reorder, position, cancel.
-- **Settings** — one single-column organization surface, ordered People → Code → Compute → Task defaults → Agents → Installation → Advanced, plus project settings. The organization owns provider connections, execution policy, workflow defaults, members, teams, GitHub, and identity. A project inherits that execution policy and may select another connected provider/pool or a tighter budget; workflow-specific forms never duplicate infrastructure settings.
+- **Settings** — one single-column organization surface with a sticky section rail, ordered People → GitHub → Compute → Task defaults → Agents → Installation → Advanced, plus project settings. The organization owns provider connections, execution policy, workflow defaults, members, teams, the GitHub connection, and identity. Repository selection/creation belongs to the project that will use it. People is the sole human membership surface; Agent permissions only configures task-agent profiles and never presents a second human-account list. A project inherits the organization execution policy and may select another connected provider/pool or a tighter budget; workflow-specific forms never duplicate infrastructure settings.
 - **Inbox** — one full page opened from the top-bar attention icon; never a second sidebar destination or notification popover.
 
 Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
@@ -473,7 +473,7 @@ the per-user inbox is a materialized projection of those workflow events.
 Just as a workflow declares its events (§5), capabilities (§8), and UI slots (§10.1), it declares its **parameters**: a typed `params` schema in the manifest. This single declaration drives three surfaces, so there is exactly one source of truth and no per-surface guessing (the "declare, don't guess" rule, §0):
 
 1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, copy-globs, PR toggle, and workflow-owned Review route).
-2. **The project-settings form** — per-enabled-workflow defaults at the project scope.
+2. **The project-settings form** — per-enabled-workflow defaults at the project scope. Repository sources are the one deliberate lift-out: they are a project resource shared by repo-oriented workflows and render once beside project access, not once per workflow.
 3. **The organization-settings form** — the same per-workflow form at organization scope (the schema retains the historical `global` scope spelling on the wire).
 
 **Field model.** Each parameter is a `FieldSpec`: `{ name, type, label, help?, required?, options?, default?, scopes, bind, role? }`.
@@ -483,6 +483,12 @@ Just as a workflow declares its events (§5), capabilities (§8), and UI slots (
 - `bind` tells the host where a resolved value lands in the workflow input (`prompt | top | project | profile`), so the same generic assembler maps any workflow's fields into its `TaskInput` with no per-workflow code.
 
 This generalizes the §10.2 declared-action argument descriptor — the same renderer draws action forms and parameter forms.
+The `repos` declaration also tells Karmax that the workflow requires project
+source code. Its wire shape remains a project-bound list for compatibility, but
+the first-party UI edits the canonical project sources once: attached GitHub
+repository records for hosted/cloud use, or local paths/SSH URLs for self-hosted
+use. Karmax synchronizes historical per-workflow rows so they cannot override
+that canonical set.
 
 **Defaults resolution is the overlay model (§9).** A field's effective value is `task override → project setting → organization setting → field default`. Settings forms write to project and organization overlays; the task form reads resolved defaults and lets the user override per-task. Safe mode resolves field defaults only.
 
@@ -562,6 +568,10 @@ world provider, `createWorld` resolves the repository's existing `origin` (or
 sole remote) and normalizes ordinary HTTP(S) git URLs to SSH. The local path is
 not sent to the provider. A GitHub App is optional for this path; it exists for
 hosted repository discovery/creation, webhooks, and repository-scoped keys.
+GitHub App manifests include a webhook only when Karmax is on a publicly
+reachable HTTPS origin. Local/private instances reconcile repository access on
+demand; installation lifecycle events are received automatically and are never
+listed as manifest subscriptions.
 
 **Multi-repo worlds.** A project may configure several `repos`; a task's world then checks out **one worktree per repo**, each on the same `karmax/<taskId>` branch off its own base. A single repo keeps the flat layout (the world root *is* the worktree); with several, the world root is a parent directory holding one subdirectory per repo (named after it, deduped on collision), so the agent sees `frontend/`, `backend/`, … side by side and works across them. The finalize-merge lands the branch in **every** repo, stopping at the first conflict for the merge agent to resolve — a re-run re-merges already-landed repos as no-ops (partial-merge recoverable, not atomic). The world handle carries the full `repos[]`; older single-repo handles are read through a compatibility shim (`worldRepos`).
 

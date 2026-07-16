@@ -33,14 +33,31 @@ describe('organization and collaboration domain', () => {
     const repository = store.upsertRepository({ organizationId: acme.id, provider: 'github', providerId: '100',
       owner: 'acme', name: 'product', sshUrl: 'git@github.com:acme/product.git', defaultBranch: 'main',
       private: true, gitConnectionId: connection.id });
+    store.setSettings(project.id, 'software-dev', { repos: ['/stale/local/path'], remote: 'none' });
     store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id, baseBranch: 'main', targetBranch: 'main' });
     expect(store.getProject(project.id)?.config.repos).toEqual(['git@github.com:acme/product.git']);
+    expect(store.getSettings(project.id, 'software-dev')).toMatchObject({ repos: ['git@github.com:acme/product.git'], remote: 'none' });
     expect(() => store.attachProjectRepository({ projectId: project.id, repositoryId:
       store.upsertRepository({ organizationId: other.id, provider: 'github', owner: 'other', name: 'secret',
         sshUrl: 'git@github.com:other/secret.git', defaultBranch: 'main', private: true }).id })).toThrow(/same organization/);
     store.setProjectMembership(project.id, { kind: 'user', userId: 'owner' }, 'owner');
     expect(() => store.setProjectMembership(project.id, { kind: 'user', userId: 'owner' }, 'member')).toThrow(/retain at least one owner/);
     expect(() => store.setOrganizationMembership(other.id, 'outsider', 'member')).toThrow(/retain at least one owner/);
+  });
+
+  it('keeps self-hosted repository sources at project scope instead of per workflow', () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Local', ownerUserId: 'owner' });
+    const project = store.createProject('App', {}, organization.id);
+    store.setSettings(project.id, 'software-dev', { repos: ['/old'], remote: 'none' });
+    store.setSettings(project.id, 'just-do', { repos: ['/also-old'] });
+    store.setSettings(`quick:${project.id}`, 'software-dev', { repos: ['/stale-quick'] });
+    store.setProjectRepositorySources(project.id, ['/work/app', '/work/app', ' git@github.com:acme/api.git ']);
+    const expected = ['/work/app', 'git@github.com:acme/api.git'];
+    expect(store.getProject(project.id)?.config.repos).toEqual(expected);
+    expect(store.getSettings(project.id, 'software-dev')).toMatchObject({ repos: expected, remote: 'none' });
+    expect(store.getSettings(project.id, 'just-do')).toMatchObject({ repos: expected });
+    expect(store.getSettings(`quick:${project.id}`, 'software-dev')).toMatchObject({ repos: expected });
   });
 
   it('stores immutable responsibility, auto-subscribes participants, and resolves a per-user inbox', () => {
@@ -136,6 +153,17 @@ describe('organization and collaboration domain', () => {
     expect(store.humanMayAct(task.id, 'designer')).toBe(true);
     expect(store.humanMayAct(task.id, 'unknown')).toBe(false);
     expect(store.humanAudience(task.id, ['@team:design'])).toEqual(['designer']);
+    expect(store.updateTeam(design.id, { name: 'Product Design' })).toMatchObject({ name: 'Product Design', slug: 'product-design' });
+    // Renaming a team must not strand workflows that already stored its old route.
+    expect(store.humanAudience(task.id, ['@team:design'])).toEqual(['designer']);
+    expect(store.humanAudience(task.id, ['@team:product-design'])).toEqual(['designer']);
+    expect(() => store.deleteTeam(design.id)).toThrow(/still used/);
+
+    const temporary = store.createTeam({ organizationId: organization.id, name: 'Temporary' });
+    store.setTeamMembership(temporary.id, 'designer');
+    store.deleteTeam(temporary.id);
+    expect(store.getTeam(temporary.id)).toBeUndefined();
+    expect(store.listTeamMemberships(temporary.id)).toEqual([]);
 
     const child = store.createTask({ projectId: project.id, title: 'Child', workflow: 'software-dev',
       workflowVersion: '1', params: { prompt: 'x' },

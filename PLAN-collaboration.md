@@ -64,6 +64,13 @@ Admin (organization configuration), and Owner (Admin plus the protected final
 authority). Teams intentionally have no sub-roles; membership is the routing
 fact. Decorative Billing/Lead roles from early builds migrate to Member.
 
+Team membership editors use account names and email addresses, never durable
+user IDs. Teams may be renamed; the previous slug remains a routing alias so an
+in-flight workflow cannot be stranded. An unused team may be deleted. Deletion
+is rejected while project access, saved defaults, or unfinished work still
+references the team, because silently turning a human gate into an empty
+audience is not an acceptable lifecycle behavior.
+
 When a workflow publishes `waitingFor: { kind: 'human', audience }`, only a
 matching human may send its Confirm signal. The confirming principal and declared
 audience are recorded in the event log. The compatibility API may still read old
@@ -91,6 +98,9 @@ Human routing does not widen authority. The selected user must already be an
 organization/project member with permission to view and signal the task. Agent
 roles remain bounded by the intersection of the workflow role ceiling, selected
 authorization profile, creator's grant, and task scope.
+People is the only UI for organization membership and project Access is the only
+UI for project membership. Agent permissions configure task-agent profiles only;
+they do not repeat human accounts or grants.
 
 Authoring and protected-target merging remain separate trust domains. The Do
 agent edits an isolated world; Merge receives a concrete merge capability only
