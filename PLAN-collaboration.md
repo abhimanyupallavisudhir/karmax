@@ -50,12 +50,19 @@ Selectors are stable ids or explicit workflow vocabulary:
 - `@all` — every member of the organization.
 - `@owners` — organization owners.
 - `@project` — everyone with access to the project.
-- `user:<id>` and `team:<id>` — a specific person or team.
+- `@team:<slug>` — a team through a readable stable route such as
+  `@team:leaders`; `team:<id>` remains a compatibility spelling.
+- `user:<id>` — a specific person.
 
 The schema-driven Confirm editor provides searchable people/teams plus these
 special selectors. Multiple selectors in one layer mean “any”; multiple human
 layers express sequential decisions. Agent and human layers can be interleaved.
 Legacy naked human gates normalize to `@creator`.
+
+Organization roles have exactly three product meanings: Member (ordinary work),
+Admin (organization configuration), and Owner (Admin plus the protected final
+authority). Teams intentionally have no sub-roles; membership is the routing
+fact. Decorative Billing/Lead roles from early builds migrate to Member.
 
 When a workflow publishes `waitingFor: { kind: 'human', audience }`, only a
 matching human may send its Confirm signal. The confirming principal and declared
@@ -75,6 +82,8 @@ The inbox contains only events routed to that user. It is not a saved task query
 and it does not depend on following/subscription state. Agents do not need a
 simulated human inbox: agent-directed work uses durable task signals, child tasks,
 and workflow coordination.
+The UI exposes this as one page reached from the top-bar attention icon; there is
+no competing sidebar item or abbreviated popover.
 
 ## Authorization and execution
 

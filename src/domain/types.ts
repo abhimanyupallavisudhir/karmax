@@ -38,7 +38,7 @@ export interface Organization {
 export interface OrganizationMembership {
   organizationId: string;
   userId: string;
-  role: 'owner' | 'admin' | 'member' | 'billing';
+  role: 'owner' | 'admin' | 'member';
   joinedAt: number;
 }
 
@@ -65,7 +65,7 @@ export interface Team {
 export interface TeamMembership {
   teamId: string;
   userId: string;
-  role: 'lead' | 'member';
+  role: 'member';
   joinedAt: number;
 }
 
@@ -796,7 +796,7 @@ export type HumanAudience = string[];
 export interface ConfirmLayer extends Partial<AgentSpec> {
   kind: 'human' | 'agent';
   /** Human layers only. Supported selectors are @creator, @all, @owners,
-   * @project, user:<id>, and team:<id>. Multiple selectors mean any matching
+   * @project, @team:<slug>, user:<id>, and legacy team:<id>. Multiple selectors mean any matching
    * person may satisfy this layer; use sequential layers for sequential gates. */
   audience?: HumanAudience;
   /** Agent layers: the review-request message template sent each time the task
