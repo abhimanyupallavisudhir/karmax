@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { enumerateCredentials, resolveCredentials, credentialsForProvider, defaultEnabled, isEnabled } from '../src/platform/credentials.js';
+import { agentAccountHandles } from '../src/platform/credential-sources.js';
 
 const sources = {
   logins: [
@@ -16,6 +17,12 @@ const all = enumerateCredentials(sources);
 const keys = (cs: { key: string }[]) => cs.map((c) => c.key);
 
 describe('credential enumeration', () => {
+  it('hides infrastructure vault handles from agent account selection', () => {
+    expect(agentAccountHandles(['claude:work', 'codex:personal', 'checkpoint:encryption-key',
+      'github-app:private-key', 'world-provider:org:e2b:api-key']))
+      .toEqual(['claude:work', 'codex:personal']);
+  });
+
   it('lists logged-in logins, ambient logins, env keys, and broker handles', () => {
     const k = keys(all);
     expect(k).toEqual(

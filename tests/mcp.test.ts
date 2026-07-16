@@ -46,6 +46,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent',
         'list_events', 'describe_platform', 'platform_request', 'list_world_providers',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
+        'get_execution_policy', 'set_execution_policy',
       ]),
     );
     const described: any = await client.callTool({ name: 'describe_platform', arguments: {} });
@@ -53,6 +54,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.administration).toContain('GET|POST /api/users');
     expect(catalog.payments).toContain('GET|POST /api/cards');
     expect(catalog.cloud).toContain('GET /api/organizations/:organizationId/world-providers');
+    expect(catalog.cloud).toContain('GET|PUT /api/organizations/:organizationId/execution-policy');
   });
 
   it('lets an authorized agent connect and disconnect a provider without reading its secret', async () => {
@@ -66,6 +68,15 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     const listed: any = await client.callTool({ name: 'list_world_providers', arguments: { organizationId: organization.id } });
     expect(JSON.parse(listed.content[0].text)[0]).toMatchObject({ provider: 'e2b', credentialConfigured: true });
     expect(listed.content[0].text).not.toContain('write-only-secret');
+    const configured: any = await client.callTool({ name: 'set_execution_policy', arguments: {
+      organizationId: organization.id, worldProvider: 'e2b', unrestrictedInternet: true,
+      cpu: 4, memoryMb: 8192, hibernateAfterDays: 2,
+    } });
+    expect(configured.isError).toBeFalsy();
+    expect(JSON.parse(configured.content[0].text).organization).toMatchObject({
+      worldProvider: 'e2b', resources: { cpu: 4, memoryMb: 8192 }, network: { unrestricted: true },
+      hibernateAfterMs: 2 * 86_400_000,
+    });
     const removed: any = await client.callTool({ name: 'disconnect_world_provider', arguments: { organizationId: organization.id, provider: 'e2b' } });
     expect(JSON.parse(removed.content[0].text)).toEqual({ deleted: true });
   });

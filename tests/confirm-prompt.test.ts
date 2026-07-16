@@ -45,8 +45,8 @@ describe('confirmLayersOf (the Review-gate layer sequence)', () => {
   });
 
   it('normalizes the legacy single-gate modes', () => {
-    expect(confirmLayersOf(undefined)).toEqual([{ kind: 'human' }]);
-    expect(confirmLayersOf({ mode: 'human' })).toEqual([{ kind: 'human' }]);
+    expect(confirmLayersOf(undefined)).toEqual([{ kind: 'human', audience: ['@creator'] }]);
+    expect(confirmLayersOf({ mode: 'human' })).toEqual([{ kind: 'human', audience: ['@creator'] }]);
     expect(confirmLayersOf({ mode: 'auto' })).toEqual([]);
     expect(confirmLayersOf({ mode: 'agent', provider: 'mock', model: 'm', prompt: 'Check.\n{{response}}' })).toEqual([
       { kind: 'agent', provider: 'mock', model: 'm', prompt: 'Check.\n{{response}}' },
@@ -55,14 +55,14 @@ describe('confirmLayersOf (the Review-gate layer sequence)', () => {
 
   it('maps the legacy goal-task autoConfirm flag to zero layers, unless the config speaks', () => {
     expect(confirmLayersOf(undefined, true)).toEqual([]);
-    expect(confirmLayersOf({ mode: 'human' }, true)).toEqual([{ kind: 'human' }]);
+    expect(confirmLayersOf({ mode: 'human' }, true)).toEqual([{ kind: 'human', audience: ['@creator'] }]);
     expect(confirmLayersOf({ layers: [{ kind: 'human' }] }, true)).toEqual([{ kind: 'human' }]);
   });
 
   it('the built-in confirmer fields default to one human layer', () => {
     for (const wf of ['software-dev', 'merge-only', 'goal']) {
       const f = manifest(wf)?.params.find((p) => p.type === 'confirmer');
-      expect(confirmLayersOf(f?.default as any)).toEqual([{ kind: 'human' }]);
+      expect(confirmLayersOf(f?.default as any)).toEqual([{ kind: 'human', audience: ['@creator'] }]);
     }
   });
 });

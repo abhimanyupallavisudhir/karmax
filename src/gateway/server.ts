@@ -36,6 +36,7 @@ import { newId } from '../util/id.js';
 import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
+import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -115,6 +116,7 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
@@ -399,14 +401,14 @@ export class Gateway {
     if (!this.deps.tokens.check(auth.apiToken, 'task:edit', { projectId: task?.projectId, taskId }).ok) {
       ws.close(4403, 'forbidden'); return;
     }
-    const project = task ? this.deps.store.getProject(task.projectId)?.config : undefined;
+    const projectRecord = task ? this.deps.store.getProject(task.projectId) : undefined;
+    const project = projectRecord ? this.deps.store.effectiveProjectConfig(projectRecord) : undefined;
     const handle = worldHandleForView(task?.lastView, taskId, project);
     if (!handle) {
       ws.send(JSON.stringify({ type: 'data', data: 'No world for this task yet.\r\n' }));
       ws.close();
       return;
     }
-    const projectRecord = task ? this.deps.store.getProject(task.projectId) : undefined;
     if (!task || !projectRecord?.organizationId) { ws.close(4404, 'task project unavailable'); return; }
     let term: import('../world/types.js').WorldPty;
     let worldLeaseId: string | undefined;
@@ -596,9 +598,12 @@ export class Gateway {
         return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
       }
     }
-    if (p === '/api/github/manifest/callback' && method === 'GET' && this.deps.githubApp && this.deps.identity) {
+    const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
+    if (githubManifestCallback && method === 'GET' && this.deps.githubApp && this.deps.identity) {
       const code = url.searchParams.get('code') ?? '';
-      const state = url.searchParams.get('state') ?? '';
+      // Query-form state remains accepted for setup links created by the prior
+      // release; new manifests use the validator-safe path form.
+      const state = githubManifestCallback[1] ? decodeURIComponent(githubManifestCallback[1]) : url.searchParams.get('state') ?? '';
       const identity = await this.deps.identity.session(requestHeaders(req.headers));
       if (!identity || !code || !state) return this.githubCallbackPage(res, 400, 'The GitHub App setup callback is incomplete.');
       const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
@@ -620,7 +625,7 @@ export class Gateway {
       const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
       if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub authorization link is invalid, expired, or belongs to another user.');
       try {
-        await this.deps.githubApp.authorizeUser(identity.user.id, code, this.publicUrl(req));
+        await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req));
         res.writeHead(303, { location: `/organization?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
@@ -639,7 +644,7 @@ export class Gateway {
         const status = this.deps.githubApp.status(identity.user.id);
         if (status.oauthConfigured && !status.userAuthorized) {
           const oauthState = this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id);
-          const publicUrl = this.publicUrl(req);
+          const publicUrl = this.githubPublicUrl(req);
           res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl) });
           return void res.end();
         }
@@ -811,6 +816,26 @@ export class Gateway {
 
       const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
       if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
+      const organizationExecution = p.match(/^\/api\/organizations\/([^/]+)\/execution-policy$/);
+      if (organizationExecution) {
+        const organizationId = organizationExecution[1]!;
+        if (method === 'GET') return this.json(res, 200, store.getOrganizationExecutionPolicy(organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
+          try {
+            if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
+              && !this.deps.providerConnections?.available(organizationId, String(policy.worldProvider)))
+              throw new Error(`${policy.worldProvider} is not connected and verified`);
+            if (policy.runnerPoolId) {
+              const pool = store.getRunnerPool(String(policy.runnerPoolId));
+              if (!pool || pool.organizationId !== organizationId) throw new Error('runner pool does not belong to this organization');
+              if (policy.worldProvider && pool.provider !== policy.worldProvider) throw new Error('runner pool provider must match the default provider');
+            }
+            return this.json(res, 200, store.setOrganizationExecutionPolicy(organizationId, policy));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
       const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
       if (organizationExport && method === 'GET') {
         const value = store.exportOrganization(organizationExport[1]!);
@@ -858,12 +883,12 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listOrganizationMemberships(organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
-          const role = ['owner', 'admin', 'billing'].includes(String(b.role)) ? String(b.role) as any : 'member';
+          const role = ['owner', 'admin'].includes(String(b.role)) ? String(b.role) as 'owner' | 'admin' : 'member';
           const membership = store.setOrganizationMembership(organizationId, String(b.userId), role);
           this.deps.authorization?.grant(`user:${session.userId}`, {
             principalId: `user:${membership.userId}`, scopeKey: `organization:${organizationId}`,
             profileId: role === 'owner' || role === 'admin' ? 'administrator' : 'developer',
-            ...(role === 'member' || role === 'billing' ? { capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] } : {}),
+            ...(role === 'member' ? { capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] } : {}),
           });
           return this.json(res, 200, membership);
         }
@@ -881,7 +906,7 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           return this.json(res, 200, store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
-            role: ['owner', 'admin', 'billing'].includes(String(b.role)) ? b.role : 'member', invitedBy: `user:${session.userId}` }));
+            role: ['owner', 'admin'].includes(String(b.role)) ? b.role : 'member', invitedBy: `user:${session.userId}` }));
         }
       }
       const organizationTeams = p.match(/^\/api\/organizations\/([^/]+)\/teams$/);
@@ -900,7 +925,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listTeamMemberships(teamMembers[2]!));
         if (method === 'POST') {
           const b = await this.body(req);
-          return this.json(res, 200, store.setTeamMembership(teamMembers[2]!, String(b.userId), b.role === 'lead' ? 'lead' : 'member'));
+          return this.json(res, 200, store.setTeamMembership(teamMembers[2]!, String(b.userId)));
         }
       }
       const teamMember = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)\/members\/([^/]+)$/);
@@ -941,15 +966,20 @@ export class Gateway {
         if (!this.deps.tokens.check(token, 'user:write').ok)
           return this.json(res, 403, { error: 'Only a Karmax installation administrator can create the shared GitHub App' });
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
+        const b = await this.body(req);
         const state = store.createGithubInstallState(githubManifest[1]!, session.userId);
-        return this.json(res, 200, this.deps.githubApp.manifest(this.publicUrl(req), state));
+        try {
+          const publicUrl = this.githubPublicUrl(req, b.publicUrl);
+          return this.json(res, 200, this.deps.githubApp.manifest(publicUrl, state));
+        }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const githubAuthorize = p.match(/^\/api\/organizations\/([^/]+)\/github\/authorize$/);
       if (githubAuthorize && method === 'POST') {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const state = store.createGithubInstallState(githubAuthorize[1]!, session.userId);
-        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.publicUrl(req)) }); }
+        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.githubPublicUrl(req)) }); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
@@ -991,7 +1021,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
-          const project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config, true), organizationId);
+          const project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
           if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
           return this.json(res, 200, project);
         }
@@ -1227,7 +1257,7 @@ export class Gateway {
           try {
             const config = normalizeConfig(b.config);
             const project = store.getProject(id);
-            if (this.deps.hosted && config.worldProvider && project?.organizationId &&
+            if (config.worldProvider && !['worktree', 'container', 'memory'].includes(config.worldProvider) && project?.organizationId &&
                 !this.deps.providerConnections?.available(project.organizationId, config.worldProvider)) {
               throw new Error(`${config.worldProvider} is not connected. Connect and verify it in Organization settings first.`);
             }
@@ -1246,6 +1276,34 @@ export class Gateway {
           for (const attachmentId of resources.attachmentIds)
             if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
           return this.json(res, 200, { deleted: true, projectId: id });
+        }
+      }
+      const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
+      if (projectExecution) {
+        const project = store.getProject(projectExecution[1]!);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        if (method === 'GET') return this.json(res, 200, {
+          override: pickExecutionConfig(project.config),
+          organization: store.getOrganizationExecutionPolicy(project.organizationId!),
+          effective: pickExecutionConfig(store.effectiveProjectConfig(project)),
+        });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const override = b.override && typeof b.override === 'object' ? b.override : {};
+          try {
+            const candidate = { ...project, config: applyExecutionOverride(project.config, override) };
+            const effective = store.effectiveProjectConfig(candidate);
+            if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
+              && !this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider))
+              throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
+            if (effective.runnerPoolId) {
+              const pool = store.getRunnerPool(effective.runnerPoolId);
+              if (!pool || pool.organizationId !== project.organizationId) throw new Error('runner pool does not belong to this organization');
+              if (pool.provider !== effective.worldProvider) throw new Error('runner pool provider must match the execution provider');
+            }
+            const saved = store.setProjectExecutionPolicy(project.id, override);
+            return this.json(res, 200, { override: pickExecutionConfig(saved.config), organization: store.getOrganizationExecutionPolicy(project.organizationId!), effective: pickExecutionConfig(effective) });
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
       const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
@@ -1646,7 +1704,7 @@ export class Gateway {
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
         const task = store.getTask(taskId);
-        const handle = worldHandleForView(view, taskId, task ? store.getProject(task.projectId)?.config : undefined);
+        const handle = worldHandleForView(view, taskId, task ? store.effectiveProjectConfig(task.projectId) : undefined);
         if (action.kind === 'open') {
           const target = String(action.target ?? '');
           if (/^https?:\/\//i.test(target)) return this.json(res, 200, { kind: 'open', url: target, external: true });
@@ -1691,7 +1749,7 @@ export class Gateway {
         const b = await this.body(req);
         const relPath = String(b.path ?? '');
         if (!task || !project?.organizationId || !relPath) return this.json(res, 400, { error: 'task and artifact path are required' });
-        const handle = worldHandleForView(task.lastView, taskId, project.config);
+        const handle = worldHandleForView(task.lastView, taskId, store.effectiveProjectConfig(project));
         if (!handle) return this.json(res, 404, { error: 'no world for this task' });
         const world = await this.deps.worlds.open(handle);
         const data = await world.readFileBuffer(relPath);
@@ -1733,7 +1791,7 @@ export class Gateway {
         const port = Number(previewMatch[2]);
         const task = store.getTask(taskId);
         const project = task ? store.getProject(task.projectId) : undefined;
-        const handle = worldHandleForView(task?.lastView, taskId, project?.config);
+        const handle = worldHandleForView(task?.lastView, taskId, project ? store.effectiveProjectConfig(project) : undefined);
         if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
         if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
         const isolatedOrigin = configuredPreviewOrigin();
@@ -1766,7 +1824,7 @@ export class Gateway {
         const taskId = previewLeases[1]!;
         const task = store.getTask(taskId);
         const project = task ? store.getProject(task.projectId) : undefined;
-        const handle = worldHandleForView(task?.lastView, taskId, project?.config);
+        const handle = worldHandleForView(task?.lastView, taskId, project ? store.effectiveProjectConfig(project) : undefined);
         const b = await this.body(req);
         const port = Number(b.port);
         if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
@@ -1994,8 +2052,9 @@ export class Gateway {
       // accounts: API-key handles (broker; secrets write-only) + config-home
       // logins (SPEC §7.3 — switchable per-account subscriptions).
       if (p === '/api/accounts' && method === 'GET') {
+        const { agentAccountHandles } = await import('../platform/credential-sources.js');
         return this.json(res, 200, {
-          handles: this.deps.broker?.listHandles() ?? [],
+          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? []),
           // never expose the home's absolute path to the browser
           logins: (this.deps.configHomes?.list() ?? []).map((a) => ({ provider: a.provider, account: a.account, loggedIn: a.loggedIn })),
         });
@@ -2218,7 +2277,8 @@ export class Gateway {
         if (!m) return this.json(res, 404, { error: 'no workflow' });
         const gs = (s: string, w: string) => store.getSettings(s, w);
         const project = store.getProject(projectId);
-        const globalVals = globalSettingsFor(gs, wf);
+        const organizationId = url.searchParams.get('organizationId') ?? project?.organizationId;
+        const globalVals = globalSettingsFor(gs, wf, organizationId ?? undefined);
         const projectVals = project ? projectSettingsFor(gs, project, wf) : {};
         // Detect the repo's real default branch so placeholders show it (not "main").
         const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
@@ -2235,7 +2295,7 @@ export class Gateway {
         // tasks added from the quick box. Global-quick inherits from global-general;
         // project-quick inherits from global-quick (primary) with project-general as
         // the alternative source (the two "Reset to inherited" buttons in the UI).
-        const globalQuickVals = quickGlobalSettingsFor(gs, wf);
+        const globalQuickVals = quickGlobalSettingsFor(gs, wf, organizationId ?? undefined);
         const projectQuickVals = project ? quickProjectSettingsFor(gs, project.id, wf) : {};
         return this.json(res, 200, {
           task: { own: {}, inherited: enrich(resolveParams(m, { project: projectVals, global: globalVals }), {}) },
@@ -2254,6 +2314,26 @@ export class Gateway {
       }
 
       // settings (global + per-project, per workflow)
+      const organizationSettings = p.match(/^\/api\/organizations\/([^/]+)\/settings\/([^/]+)$/);
+      if (organizationSettings) {
+        const [_, organizationId, wf] = organizationSettings;
+        if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          store.setSettings(`organization:${organizationId}`, wf!, b.values ?? {});
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const organizationQuickSettings = p.match(/^\/api\/organizations\/([^/]+)\/quick-settings\/([^/]+)$/);
+      if (organizationQuickSettings) {
+        const [_, organizationId, wf] = organizationQuickSettings;
+        if (method === 'GET') return this.json(res, 200, quickGlobalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          store.setSettings(`quick:organization:${organizationId}`, wf!, b.values ?? {});
+          return this.json(res, 200, { ok: true });
+        }
+      }
       const gset = p.match(/^\/api\/settings\/global\/([^/]+)$/);
       if (gset) {
         const wf = gset[1]!;
@@ -2520,7 +2600,7 @@ export class Gateway {
    * host/sandbox path and remote worlds need no public filesystem endpoint. */
   private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string) {
     const task = this.deps.store.getTask(taskId);
-    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
     try {
@@ -2543,7 +2623,7 @@ export class Gateway {
   private async servePreview(req: http.IncomingMessage, res: http.ServerResponse, taskId: string,
     port: number, requestPath: string, proxyBase: string) {
     const task = this.deps.store.getTask(taskId);
-    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
     const method = req.method ?? 'GET';
@@ -2666,7 +2746,7 @@ export class Gateway {
       requestPath = `${leaseMatch?.[2] ?? '/'}${query.size ? `?${query}` : ''}`;
     }
     const task = this.deps.store.getTask(taskId);
-    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.getProject(task.projectId)?.config : undefined);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) { browser.close(4404, 'world unavailable'); return; }
     const world = await this.deps.worlds.open(handle);
     if (!world.previewSocketTarget) { browser.close(4400, 'provider has no WebSocket previews'); return; }
@@ -2824,12 +2904,34 @@ export class Gateway {
     } catch { return false; }
   }
 
-  private publicUrl(req: http.IncomingMessage): string {
+  private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {
+    // Behind a reverse proxy, the browser is the one component that always
+    // knows the URL the human actually opened. An authenticated setup request
+    // may supply that origin instead of relying on frequently-misconfigured
+    // forwarded headers.
+    if (typeof browserUrl === 'string' && browserUrl.trim()) {
+      const parsed = new URL(browserUrl.trim());
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password)
+        throw new Error('The browser URL for GitHub setup must be an http(s) URL');
+      return parsed.origin;
+    }
     const configured = process.env.KARMAX_PUBLIC_URL?.trim();
     if (configured) return new URL(configured).origin;
     const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() || 'http';
     const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? 'localhost').split(',')[0]?.trim();
     return new URL(`${proto}://${host}`).origin;
+  }
+
+  /** GitHub must see exactly the same origin throughout manifest, install, and
+   * OAuth callbacks. Persist the admin's browser origin during setup so a stale
+   * reverse-proxy/environment value cannot reappear midway through the flow. */
+  private githubPublicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {
+    if (browserUrl != null) {
+      const value = this.publicUrl(req, browserUrl);
+      this.deps.store.kvSet(GITHUB_APP_PUBLIC_URL_KEY, value);
+      return value;
+    }
+    return this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY) ?? this.publicUrl(req);
   }
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
@@ -3054,4 +3156,20 @@ function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = fal
     return { ...config, repos: config.repos.filter(Boolean).map(expandPath) };
   }
   return config;
+}
+
+const EXECUTION_CONFIG_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
+
+function pickExecutionConfig(config: ProjectConfig): Partial<ProjectConfig> {
+  return Object.fromEntries(EXECUTION_CONFIG_KEYS.filter((key) => config[key] !== undefined).map((key) => [key, config[key]])) as Partial<ProjectConfig>;
+}
+
+function applyExecutionOverride(config: ProjectConfig, override: Record<string, unknown>): ProjectConfig {
+  const next: Record<string, unknown> = { ...config };
+  for (const key of EXECUTION_CONFIG_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(override, key)) continue;
+    if (override[key] == null) delete next[key];
+    else next[key] = override[key];
+  }
+  return next as ProjectConfig;
 }

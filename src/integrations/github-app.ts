@@ -15,6 +15,7 @@ export const GITHUB_APP_CLIENT_SECRET_HANDLE = 'github-app:client-secret';
 const GITHUB_APP_ID_KEY = 'github-app:id';
 const GITHUB_APP_SLUG_KEY = 'github-app:slug';
 const GITHUB_APP_CLIENT_ID_KEY = 'github-app:client-id';
+export const GITHUB_APP_PUBLIC_URL_KEY = 'github-app:public-url';
 const githubUserTokenHandle = (userId: string) => `github-app:user:${userId}:authorization`;
 
 export const repositoryKeyHandle = (repositoryId: string, mode: 'clone' | 'write') =>
@@ -105,7 +106,10 @@ export class GitHubAppService {
   /** Payload for GitHub's App Manifest flow. The browser posts this directly to
    * GitHub, so Karmax never needs a pre-created App or a server-side PAT. */
   manifest(publicUrl: string, state: string): { action: string; manifest: Record<string, unknown> } {
-    const origin = new URL(publicUrl).origin;
+    const parsed = new URL(publicUrl);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password)
+      throw new Error('Karmax needs an http(s) browser URL to set up GitHub');
+    const origin = parsed.origin;
     const hostname = new URL(origin).hostname.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 35) || 'host';
     return {
       action: 'https://github.com/settings/apps/new',
@@ -113,9 +117,12 @@ export class GitHubAppService {
         name: `Karmax ${hostname} ${crypto.randomBytes(4).toString('hex')}`,
         url: origin,
         public: false,
-        redirect_url: `${origin}/api/github/manifest/callback?state=${encodeURIComponent(state)}`,
+        // Keep the CSRF state in the path. GitHub's manifest validator is
+        // needlessly strict about some otherwise-valid callback query strings,
+        // while the path form is still a full URL and survives the round trip.
+        redirect_url: `${origin}/api/github/manifest/callback/${encodeURIComponent(state)}`,
         setup_url: `${origin}/api/github/callback`,
-        redirect_on_update: true,
+        setup_on_update: true,
         callback_urls: [`${origin}/api/github/oauth/callback`],
         hook_attributes: { url: `${origin}/api/github/webhook`, active: true },
         default_permissions: { administration: 'write', contents: 'write', metadata: 'read', pull_requests: 'write' },

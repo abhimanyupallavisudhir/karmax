@@ -42,7 +42,7 @@ A fourth principle governs all three: **declare, don't guess.** Events, actions,
 
 | Concept | Definition |
 |---|---|
-| **Organization** | The tenant boundary owning memberships, teams, projects, repository connections, runner pools, identity policy, usage, and audit. |
+| **Organization** | The tenant boundary owning memberships, teams, projects, repository connections, execution policy, runner pools, identity policy, usage, and audit. |
 | **Project** | An organization-scoped namespace owning task lists, settings, active workflows, and configuration. |
 | **Task list** | An ordered list of tasks within a project. The primary surface a user interacts with. |
 | **Task** | A unit of intent. Has a workflow, parameters, a message history, a stage, and a view-model. In v1 a task runs exactly one execution. |
@@ -305,7 +305,7 @@ A scarce shared resource is owned by a **singleton coordinator workflow** with a
 ### 6.1a Agent-turn queue (host capacity)
 
 - One host-wide singleton, `agent-queue`, leases capacity only around model subprocesses; workflows waiting at Review, on accounts, timers, or I/O do not consume it.
-- Capacity defaults to 3 and is persisted as **Global settings → Host capacity → Concurrent agent turns**. `KARMAX_MAX_ACT` remains a distinct worker-throughput limit for all activities, and per-login concurrency remains an account-pool limit.
+- Capacity defaults to 3 and is persisted as **Organization settings → Host capacity → Concurrent agent turns**, explicitly labeled installation-wide. `KARMAX_MAX_ACT` remains a distinct worker-throughput limit for all activities, and per-login concurrency remains an account-pool limit.
 - Waiting turns and active leases are explicit coordinator state. The coordinator contributes the reorderable **Agent queue** to the host-owned **Queues** page alongside the merge queue.
 - The worker applies live free-memory/load gates after lease grant. Those adaptive safety checks are separate from the configured counting-semaphore capacity because only an activity can inspect live host resources.
 - Current turns enroll by stable turn ID at the existing activity boundary, preserving replay compatibility for workflow histories recorded before this coordinator existed. Dead-task leases are reclaimed after a liveness check.
@@ -458,15 +458,13 @@ The host shell and core modules are **first-party**, built on the same contribut
 
 - **Task list** — the primary surface (per project / task list).
 - **Merge queue UI** — ordered queue, reorder, position, cancel.
-- **Settings** — project and global settings, including each active workflow's project-level UI (e.g. for software-dev: repo directories with folder pickers, default agent profiles per role, default merge-to branch, gitignored-files-to-copy, GitHub PR toggle).
-- **User page & notifications.**
+- **Settings** — one single-column organization surface, ordered People → Code → Compute → Task defaults → Agents → Installation → Advanced, plus project settings. The organization owns provider connections, execution policy, workflow defaults, members, teams, GitHub, and identity. A project inherits that execution policy and may select another connected provider/pool or a tighter budget; workflow-specific forms never duplicate infrastructure settings.
+- **Inbox** — one full page opened from the top-bar attention icon; never a second sidebar destination or notification popover.
 
-Human/agent responsibility is specified in `PLAN-collaboration.md`. In short,
-identity and authorization do not by themselves make tasks multi-user: tasks
-need immutable creator provenance, one accountable assignee, an optional agent
-delegate, explicit subscribers, and named user/team confirmation policies. The
-per-user inbox is a materialized projection of task events and resolved
-responsibility—not a project-wide list of every task needing attention.
+Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
+not reproduce issue-tracker assignee/delegate/reviewer/follower state. Each
+workflow human wait declares the exact user/team/special audience for that step;
+the per-user inbox is a materialized projection of those workflow events.
 - **Dashboard** — agent runs, token/limit status across accounts, resources used.
 - **The final composed app UI** with the keyboard-navigation registry.
 
@@ -474,9 +472,9 @@ responsibility—not a project-wide list of every task needing attention.
 
 Just as a workflow declares its events (§5), capabilities (§8), and UI slots (§10.1), it declares its **parameters**: a typed `params` schema in the manifest. This single declaration drives three surfaces, so there is exactly one source of truth and no per-surface guessing (the "declare, don't guess" rule, §0):
 
-1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, world provider, copy-globs, PR toggle).
+1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, copy-globs, PR toggle, and workflow-owned Review route).
 2. **The project-settings form** — per-enabled-workflow defaults at the project scope.
-3. **The global-settings form** — the same per-workflow form at the user scope.
+3. **The organization-settings form** — the same per-workflow form at organization scope (the schema retains the historical `global` scope spelling on the wire).
 
 **Field model.** Each parameter is a `FieldSpec`: `{ name, type, label, help?, required?, options?, default?, scopes, bind, role? }`.
 
@@ -486,7 +484,7 @@ Just as a workflow declares its events (§5), capabilities (§8), and UI slots (
 
 This generalizes the §10.2 declared-action argument descriptor — the same renderer draws action forms and parameter forms.
 
-**Defaults resolution is the overlay model (§9).** A field's effective value is `task override → project setting → global setting → field default`. Settings forms write to the project and global (user) overlays; the task form reads the resolved defaults and lets the user override per-task. Safe mode resolves field defaults only.
+**Defaults resolution is the overlay model (§9).** A field's effective value is `task override → project setting → organization setting → field default`. Settings forms write to project and organization overlays; the task form reads resolved defaults and lets the user override per-task. Safe mode resolves field defaults only.
 
 **Drafts.** The expanded task form can **save as draft** instead of queueing. A draft is a stored task record with its parameters but no started workflow; it can be edited and later **queued** (which starts the workflow with the stored params) or deleted. This makes the task form a first-class composition surface, not a fire-and-forget dialog.
 
@@ -551,6 +549,19 @@ destroy()
 ```
 
 `createWorld` dispatches to the configured provider. The workflow talks only to this interface, so local-worktree → container → remote sandbox changes nothing upstream.
+
+Provider choice, pool, resources, network posture, organization cloud budget,
+and parked-world retention form one organization execution policy. Projects
+inherit it; their sparse override is limited to a provider/pool exception and a
+tighter project budget. Provider-specific template/snapshot/image settings stay
+on that provider connection. General coding defaults to unrestricted outbound
+internet; a domain/CIDR allowlist is an explicit enterprise hardening mode.
+
+When a self-hosted project stores a local repository path but selects a remote
+world provider, `createWorld` resolves the repository's existing `origin` (or
+sole remote) and normalizes ordinary HTTP(S) git URLs to SSH. The local path is
+not sent to the provider. A GitHub App is optional for this path; it exists for
+hosted repository discovery/creation, webhooks, and repository-scoped keys.
 
 **Multi-repo worlds.** A project may configure several `repos`; a task's world then checks out **one worktree per repo**, each on the same `karmax/<taskId>` branch off its own base. A single repo keeps the flat layout (the world root *is* the worktree); with several, the world root is a parent directory holding one subdirectory per repo (named after it, deduped on collision), so the agent sees `frontend/`, `backend/`, … side by side and works across them. The finalize-merge lands the branch in **every** repo, stopping at the first conflict for the merge agent to resolve — a re-run re-merges already-landed repos as no-ops (partial-merge recoverable, not atomic). The world handle carries the full `repos[]`; older single-repo handles are read through a compatibility shim (`worldRepos`).
 

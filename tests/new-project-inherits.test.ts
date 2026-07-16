@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
  * The fix is client-side (web/app.js `newProject`) and in the first-run seed
  * (src/main.ts), neither of which is reachable from the server end-to-end tests,
  * so we assert on the source directly: project creation must NOT inject a branch
- * default — it must pass an empty config so branches inherit from global settings.
+ * default — it must omit/empty config so branches inherit from organization settings.
  */
 describe('new projects inherit branch defaults (no baked "main")', () => {
   const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
@@ -28,13 +28,12 @@ describe('new projects inherit branch defaults (no baked "main")', () => {
 
   it('the first-run seed project never bakes in branch overrides', () => {
     const main = read('../src/main.ts');
-    const m = main.match(/createProject\('My project',[^)]*\)/);
+    const m = main.match(/createProject\('My project'\)/);
     expect(m, "seed createProject('My project', ...) should exist").toBeTruthy();
     const call = m![0];
-    // Hosted cells pin only their remote world provider; local installs still
-    // pass an empty config. Neither deployment profile may pin branch defaults.
-    expect(call).toMatch(/deployment\.hosted\s*\?\s*\{\s*worldProvider:/);
-    expect(call).toMatch(/:\s*\{\s*\}\s*\)/);
+    // Execution provider now comes from the organization policy, so the seed
+    // project needs no infrastructure or branch config at all.
+    expect(call).toBe("createProject('My project')");
     expect(call).not.toMatch(/defaultBase\s*:/);
     expect(call).not.toMatch(/defaultTarget\s*:/);
   });

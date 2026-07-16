@@ -337,10 +337,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     await fetch(`${base}/api/settings/project/${project.id}/software-dev`, {
       method: 'PUT',
       headers: auth(),
-      body: JSON.stringify({ values: { worldProvider: 'container', base: 'develop' } }),
+      body: JSON.stringify({ values: { base: 'develop' } }),
     });
     const defs: any = await (await fetch(`${base}/api/defaults/${project.id}/software-dev`, { headers: auth() })).json();
-    expect(defs.task.inherited.worldProvider).toBe('container');
     expect(defs.task.inherited.base).toBe('develop');
 
     // A project override, in turn, still inherits from a global default it does
@@ -352,7 +351,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
     const defs2: any = await (await fetch(`${base}/api/defaults/${project.id}/software-dev`, { headers: auth() })).json();
     expect(defs2.task.inherited.copyGlobs).toEqual(['.env']); // global reaches the task through the project
-    expect(defs2.task.inherited.worldProvider).toBe('container'); // project override still wins
+    expect(defs2.task.inherited.base).toBe('develop'); // project override still wins
   });
 
   it('stores cosmetic human notes on a task and never mixes them into params/prompt', async () => {

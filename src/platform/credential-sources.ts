@@ -15,8 +15,15 @@ export function gatherCredentialSources(deps: { configHomes?: ConfigHomeManager;
     logins: deps.configHomes?.list() ?? [],
     ambient: { claude: ClaudeAdapter.hasAmbientLogin(), codex: CodexAdapter.hasAmbientSubscription() },
     envKeys: { claude: !!process.env.ANTHROPIC_API_KEY, codex: !!process.env.OPENAI_API_KEY },
-    handles: deps.broker?.listHandles() ?? [],
+    handles: agentAccountHandles(deps.broker?.listHandles() ?? []),
   };
+}
+
+/** The vault also contains infrastructure secrets (checkpoint encryption,
+ * provider keys, GitHub App keys). Only model-provider account handles belong
+ * in agent account selection. */
+export function agentAccountHandles(handles: string[]): string[] {
+  return handles.filter((handle) => /^(?:claude|codex):[^:]+$/.test(handle));
 }
 
 // ── credential-policy persistence (kv, overlay-resolved global→project→task) ──
