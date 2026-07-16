@@ -371,6 +371,12 @@ export class Store {
     const now = Date.now();
     this.db.prepare(`INSERT OR IGNORE INTO organizations (id, name, slug, kind, createdAt)
       VALUES ('org_personal', 'Personal', 'personal', 'personal', ?)`).run(now);
+    // Early collaboration builds exposed decorative Billing and team Lead
+    // labels that carried no distinct policy. Collapse them to the one behavior
+    // they actually had before the simplified UI reads the rows.
+    this.db.exec("UPDATE organization_memberships SET role='member' WHERE role='billing'");
+    this.db.exec("UPDATE organization_invitations SET role='member' WHERE role='billing'");
+    this.db.exec("UPDATE team_memberships SET role='member' WHERE role='lead'");
     this.db.exec("UPDATE projects SET organizationId = 'org_personal' WHERE organizationId IS NULL");
     // Simple human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
     // project's tasks run #1, #2, … A separate integer alongside the opaque `id`
@@ -956,6 +962,14 @@ export class Store {
     if (!organization) throw new Error(`no organization ${input.organizationId}`);
     if (input.projectId && this.getProject(input.projectId)?.organizationId !== organization.id) throw new Error('team project belongs to another organization');
     const slug = slugify(input.slug ?? input.name);
+    // SQLite UNIQUE treats NULLs as distinct, so the table constraint alone
+    // does not protect organization-wide teams (whose projectId is NULL). Make
+    // creation idempotent and prevent double-click/network retries from drawing
+    // the same team twice.
+    const existing = this.db.prepare(`SELECT * FROM teams WHERE organizationId=?
+      AND ((projectId IS NULL AND ? IS NULL) OR projectId=?) AND slug=? LIMIT 1`)
+      .get(organization.id, input.projectId ?? null, input.projectId ?? null, slug) as any;
+    if (existing) return rowToTeam(existing);
     const team: Team = { id: newId('team'), organizationId: organization.id, projectId: input.projectId,
       name: input.name.trim(), slug, createdAt: Date.now() };
     this.db.prepare('INSERT INTO teams (id, organizationId, projectId, name, slug, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
@@ -965,9 +979,18 @@ export class Store {
 
   listTeams(organizationId: string, projectId?: string): Team[] {
     const rows = projectId
-      ? this.db.prepare('SELECT * FROM teams WHERE organizationId=? AND (projectId IS NULL OR projectId=?) ORDER BY name').all(organizationId, projectId)
-      : this.db.prepare('SELECT * FROM teams WHERE organizationId=? ORDER BY name').all(organizationId);
-    return (rows as any[]).map(rowToTeam);
+      ? this.db.prepare('SELECT * FROM teams WHERE organizationId=? AND (projectId IS NULL OR projectId=?) ORDER BY name, createdAt, rowid').all(organizationId, projectId)
+      : this.db.prepare('SELECT * FROM teams WHERE organizationId=? ORDER BY name, createdAt, rowid').all(organizationId);
+    // Deduplicate legacy organization-wide rows created before createTeam was
+    // idempotent. Keep the oldest stable id so existing workflow routes remain
+    // valid; hidden duplicates are harmless and can still resolve by id.
+    const unique = new Map<string, Team>();
+    for (const row of rows as any[]) {
+      const team = rowToTeam(row);
+      const key = `${team.projectId ?? ''}:${team.slug}`;
+      if (!unique.has(key)) unique.set(key, team);
+    }
+    return [...unique.values()];
   }
 
   getTeam(id: string): Team | undefined {
@@ -975,12 +998,15 @@ export class Store {
     return r ? rowToTeam(r) : undefined;
   }
 
-  setTeamMembership(teamId: string, userId: string, role: TeamMembership['role'] = 'member'): TeamMembership {
-    if (!this.getTeam(teamId)) throw new Error(`no team ${teamId}`);
+  setTeamMembership(teamId: string, userId: string): TeamMembership {
+    const team = this.getTeam(teamId);
+    if (!team) throw new Error(`no team ${teamId}`);
+    if (!this.organizationMembership(team.organizationId, userId))
+      throw new Error('a team member must belong to the organization');
     const joinedAt = Date.now();
     this.db.prepare(`INSERT INTO team_memberships (teamId, userId, role, joinedAt) VALUES (?, ?, ?, ?)
-      ON CONFLICT(teamId, userId) DO UPDATE SET role=excluded.role`).run(teamId, userId, role, joinedAt);
-    return { teamId, userId, role, joinedAt };
+      ON CONFLICT(teamId, userId) DO UPDATE SET role=excluded.role`).run(teamId, userId, 'member', joinedAt);
+    return { teamId, userId, role: 'member', joinedAt };
   }
 
   listTeamMemberships(teamId: string): TeamMembership[] {
@@ -1716,6 +1742,10 @@ export class Store {
       } else if (selector.startsWith('user:')) {
         const userId = selector.slice(5);
         if (this.listOrganizationMemberships(project.organizationId).some((member) => member.userId === userId)) users.add(userId);
+      } else if (selector.startsWith('@team:')) {
+        const slug = selector.slice(6);
+        const team = this.listTeams(project.organizationId).find((candidate) => candidate.slug === slug);
+        if (team) for (const member of this.listTeamMemberships(team.id)) users.add(member.userId);
       } else if (selector.startsWith('team:')) {
         const team = this.getTeam(selector.slice(5));
         if (team?.organizationId === project.organizationId)

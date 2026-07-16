@@ -253,12 +253,26 @@ a { color: var(--accent); text-decoration: none; }
 .inbox-row.unread { border-left:3px solid var(--accent); background:var(--surface-2); }
 .inbox-kind { color:var(--accent); }
 .delivery-card { margin-top:22px; }
-.org-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
 .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px 14px; }
+.organization-settings { max-width:900px; margin:0 auto; }
+.organization-settings > .card { margin-bottom:12px; }
+.organization-settings .settings-grid { grid-template-columns:1fr; gap:10px; }
+.settings-intro { color:var(--ink-2); margin:-8px 0 14px; }
+.settings-nav { display:flex; gap:6px; flex-wrap:wrap; margin:0 0 18px; padding-bottom:14px; border-bottom:1px solid var(--line); }
+.settings-nav a { color:var(--ink-2); text-decoration:none; font-size:12px; padding:5px 9px; border-radius:999px; background:var(--surface-2); border:1px solid var(--line); }
+.settings-nav a:hover { color:var(--accent); border-color:var(--accent); }
+.organization-settings .section-title { scroll-margin-top:64px; }
+.settings-new-org { margin:0 0 4px; }
+.settings-divider { height:1px; background:var(--line); margin:22px 0 18px; }
+.settings-disclosure > summary { cursor:pointer; display:flex; justify-content:space-between; gap:16px; align-items:center; list-style:none; }
+.settings-disclosure > summary::-webkit-details-marker { display:none; }
+.settings-disclosure > summary::after { content:'›'; color:var(--ink-3); font-size:20px; }
+.settings-disclosure[open] > summary::after { transform:rotate(90deg); }
+.settings-disclosure > summary span { color:var(--ink-3); font-size:12px; font-weight:400; margin-left:auto; }
 .member-row { display:flex; justify-content:space-between; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); }
 .inline-form { display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }
 .inline-form input, .inline-form select { min-width:0; flex:1; padding:7px 9px; border:1px solid var(--line); background:var(--surface-2); border-radius:7px; }
-@media (max-width: 850px) { .responsibility-editor, .org-grid { grid-template-columns:1fr; } .org-switcher { max-width:140px; } }
+@media (max-width: 850px) { .responsibility-editor { grid-template-columns:1fr; } .org-switcher { max-width:140px; } .settings-disclosure > summary span { display:none; } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 /* big labeled pipeline on the task page (Overview tab) */

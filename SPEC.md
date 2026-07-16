@@ -458,8 +458,8 @@ The host shell and core modules are **first-party**, built on the same contribut
 
 - **Task list** — the primary surface (per project / task list).
 - **Merge queue UI** — ordered queue, reorder, position, cancel.
-- **Settings** — one organization settings surface plus project settings. The organization owns provider connections, execution policy, workflow defaults, members, teams, GitHub, and identity. A project inherits that execution policy and may select another connected provider/pool or a tighter budget; workflow-specific forms never duplicate infrastructure settings.
-- **User page & notifications.**
+- **Settings** — one single-column organization surface, ordered People → Code → Compute → Task defaults → Agents → Installation → Advanced, plus project settings. The organization owns provider connections, execution policy, workflow defaults, members, teams, GitHub, and identity. A project inherits that execution policy and may select another connected provider/pool or a tighter budget; workflow-specific forms never duplicate infrastructure settings.
+- **Inbox** — one full page opened from the top-bar attention icon; never a second sidebar destination or notification popover.
 
 Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
 not reproduce issue-tracker assignee/delegate/reviewer/follower state. Each
@@ -556,6 +556,12 @@ inherit it; their sparse override is limited to a provider/pool exception and a
 tighter project budget. Provider-specific template/snapshot/image settings stay
 on that provider connection. General coding defaults to unrestricted outbound
 internet; a domain/CIDR allowlist is an explicit enterprise hardening mode.
+
+When a self-hosted project stores a local repository path but selects a remote
+world provider, `createWorld` resolves the repository's existing `origin` (or
+sole remote) and normalizes ordinary HTTP(S) git URLs to SSH. The local path is
+not sent to the provider. A GitHub App is optional for this path; it exists for
+hosted repository discovery/creation, webhooks, and repository-scoped keys.
 
 **Multi-repo worlds.** A project may configure several `repos`; a task's world then checks out **one worktree per repo**, each on the same `karmax/<taskId>` branch off its own base. A single repo keeps the flat layout (the world root *is* the worktree); with several, the world root is a parent directory holding one subdirectory per repo (named after it, deduped on collision), so the agent sees `frontend/`, `backend/`, … side by side and works across them. The finalize-merge lands the branch in **every** repo, stopping at the first conflict for the merge agent to resolve — a re-run re-merges already-landed repos as no-ops (partial-merge recoverable, not atomic). The world handle carries the full `repos[]`; older single-repo handles are read through a compatibility shim (`worldRepos`).
 

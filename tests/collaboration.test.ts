@@ -19,6 +19,7 @@ describe('organization and collaboration domain', () => {
     const project = store.createProject('Product', { worldProvider: 'e2b' }, acme.id);
     const team = store.createTeam({ organizationId: acme.id, name: 'Platform' });
     store.setTeamMembership(team.id, 'developer');
+    expect(() => store.setTeamMembership(team.id, 'outsider')).toThrow(/belong to the organization/);
     store.setProjectMembership(project.id, { kind: 'team', teamId: team.id }, 'member');
 
     expect(store.userIsProjectMember(project.id, 'developer')).toBe(true);
@@ -121,6 +122,8 @@ describe('organization and collaboration domain', () => {
     const project = store.createProject('Product', {}, organization.id);
     store.setProjectMembership(project.id, { kind: 'user', userId: 'developer' }, 'member');
     const design = store.createTeam({ organizationId: organization.id, name: 'Design' });
+    expect(store.createTeam({ organizationId: organization.id, name: 'Design' }).id).toBe(design.id);
+    expect(store.listTeams(organization.id)).toHaveLength(1);
     store.setTeamMembership(design.id, 'designer');
     const task = store.createTask({ projectId: project.id, title: 'Ship', workflow: 'software-dev',
       workflowVersion: '1', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } });
@@ -132,6 +135,7 @@ describe('organization and collaboration domain', () => {
     expect(store.humanAudience(task.id)).toEqual(expect.arrayContaining(['owner', 'developer', 'designer', 'outsider']));
     expect(store.humanMayAct(task.id, 'designer')).toBe(true);
     expect(store.humanMayAct(task.id, 'unknown')).toBe(false);
+    expect(store.humanAudience(task.id, ['@team:design'])).toEqual(['designer']);
 
     const child = store.createTask({ projectId: project.id, title: 'Child', workflow: 'software-dev',
       workflowVersion: '1', params: { prompt: 'x' },

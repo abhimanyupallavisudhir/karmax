@@ -20,6 +20,7 @@ import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { worldRepos } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
+import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
@@ -367,6 +368,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" cloud credentials: ${e instanceof Error ? e.message : e}` });
       }
+      const requestedSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
+      const cloudSources = remote ? await Promise.all(requestedSources.map((source) => cloudGitSource(source))) : [];
+      const worldSources = remote ? cloudSources.map((resolved) => resolved.source) : requestedSources;
+      for (let i = 0; i < cloudSources.length; i++) {
+        if (cloudSources[i]!.localPath)
+          record(args.taskId, 'world.repository-resolved', {
+            localPath: cloudSources[i]!.localPath, remote: cloudSources[i]!.source,
+          });
+      }
       const linkedRepositories = args.projectId ? store.listProjectRepositories(args.projectId) : [];
       const repositoryBranches = Object.fromEntries(linkedRepositories.map((candidate) => {
         const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
@@ -374,9 +384,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }));
       if (remote && linkedRepositories.length) {
         if (!deps.githubApp) throw new Error('hosted repositories require the configured GitHub App');
-        const requested = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
         const credentials: Record<string, string> = {};
-        for (const source of requested) {
+        for (const source of worldSources) {
           const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
           if (!linked) throw new Error(`repository ${source} is not enrolled in this project`);
           credentials[source] = deps.githubApp.repositorySshKey(linked.repository.id, 'clone');
@@ -400,8 +409,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         world = await worlds.create(args.kind, {
           taskId: args.taskId,
           organizationId: project?.organizationId,
-          repo: args.repo,
-          repos: args.repos,
+          repo: args.repos?.length ? undefined : worldSources[0],
+          repos: args.repos?.length ? worldSources : undefined,
           base: args.base,
           target: args.target,
           branch: args.branch,

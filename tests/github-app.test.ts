@@ -40,6 +40,7 @@ describe('GitHub App integration', () => {
     const manifest = service.manifest('https://karmax.example', 'state');
     expect(manifest.action).toBe('https://github.com/settings/apps/new');
     expect(manifest.manifest).toMatchObject({ setup_url: 'https://karmax.example/api/github/callback',
+      redirect_url: 'https://karmax.example/api/github/manifest/callback/state',
       setup_on_update: true, callback_urls: ['https://karmax.example/api/github/oauth/callback'] });
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');

@@ -76,7 +76,8 @@ feel more direct, not turn Karmax into a cloud console.
    cache, not the only copy of work. Task branches plus an encrypted filesystem
    delta in object storage allow recovery or movement to another runner.
 8. **Make GitHub a connected service and repositories first-class records.** A
-   hosted control plane has no source checkouts and no repository paths.
+   hosted control plane has no source checkouts and no repository paths. A
+   self-hosted project may instead resolve a local checkout's existing remote.
 9. **Preserve SSH for Git transport without giving agents a write key.** Use a
    GitHub App for discovery, installation authorization, webhooks, and API calls;
    provision repository-scoped SSH credentials for Git; keep write credentials
@@ -709,7 +710,8 @@ remains only as an internal schema/backward-compatibility key. Settings are:
 - user settings: theme, personal notification delivery, connected personal
   agent accounts;
 - organization settings: execution policy, provider connections/templates,
-  teams, GitHub, billing, default profiles/workflows, identity, and data controls;
+  people/teams, GitHub, compute, task/agent defaults, installation resources,
+  and advanced identity/data controls, in that order and on one column;
 - project settings: repositories, workflows, access, and sparse execution
   exceptions (another connected provider/pool or a tighter cloud budget);
 - task parameters: one execution's overrides.
@@ -725,7 +727,7 @@ Implement `PLAN-collaboration.md` as part of hosted readiness:
 
 - immutable `createdBy` provenance;
 - teams and project membership;
-- human Confirm layers naming users, teams, `@creator`, `@owners`, `@project`,
+- human Confirm layers naming users, `@team:<slug>`, `@creator`, `@owners`, `@project`,
   or `@all` at the exact decision point;
 - event-derived per-user inbox and delivery preferences;
 - no generic assignee/delegate/reviewer/follower state competing with workflows.

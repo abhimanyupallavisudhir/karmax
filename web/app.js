@@ -473,7 +473,7 @@ function humanAudienceOptions() {
     ['@creator', 'Task creator'], ['@all', 'Everyone in the organization'],
     ['@owners', 'Organization owners'], ['@project', 'Everyone with project access'],
     ...S.organizationMembers.map((m) => [`user:${m.userId}`, `Person · ${principalLabel({ kind: 'user', userId: m.userId })}`]),
-    ...S.teams.map((t) => [`team:${t.id}`, `Team · ${t.name}`]),
+    ...S.teams.map((t) => [`@team:${t.slug}`, `Team · ${t.name}`]),
   ];
 }
 function cfLayerHtml(f, layer, agentDefault) {
@@ -491,10 +491,10 @@ function cfLayerHtml(f, layer, agentDefault) {
     </div>
     <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
       <label class="form-row">Who confirms
-        <input class="cf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @all, or search for a person/team" />
+        <input class="cf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" />
       </label>
       <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
-      <div class="task-sub">Comma-separated. Use @all for anyone in the organization; add sequential human steps when different people must confirm in order.</div>
+      <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
       <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
@@ -1227,7 +1227,7 @@ function renderShell() {
       </select>
       <div class="spacer"></div>
       <button class="icon-btn" id="topbar-palette" title="Search everything ( ${esc(fmtKeys('meta+k'))} )">⌕</button>
-      <button class="icon-btn has-badge" id="bell" title="Needs attention">🔔<span class="badge hidden" id="bell-badge">0</span></button>
+      <button class="icon-btn has-badge" id="bell" title="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></button>
       <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
     </div>
     <div class="body">
@@ -1238,7 +1238,7 @@ function renderShell() {
   // glass icon opens the global command palette (commands, tasks, projects).
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#theme').addEventListener('click', toggleTheme);
-  $('#bell').addEventListener('click', toggleNotifications);
+  $('#bell').addEventListener('click', () => go('/inbox'));
   $('#org-switcher')?.addEventListener('change', async (e) => {
     if (e.target.value === '__new') return createOrganization();
     S.organizationId = e.target.value;
@@ -1255,8 +1255,6 @@ function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
   rail.innerHTML = `
-    <div class="label">${esc(S.organizations.find((o) => o.id === S.organizationId)?.name || 'Projects')}</div>
-    <div class="nav-item ${S.tab === 'inbox' ? 'active' : ''}" id="rail-inbox" tabindex="0">◉ Inbox <span class="count">${S.inbox.filter((x) => x.unread).length || ''}</span></div>
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
       .map(
@@ -1276,7 +1274,6 @@ function renderRail() {
     e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
-  $('#rail-inbox')?.addEventListener('click', () => go('/inbox'));
   $('#rail-organization')?.addEventListener('click', () => go('/organization'));
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
   $('#rail-logout')?.addEventListener('click', async () => {
@@ -5112,7 +5109,7 @@ function settingsView(proj) {
     ${paymentsCard('project')}
     <div class="card" id="git-preflight-card">
       <div class="section-h">Git setup</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Which git identity/credentials this project's worlds resolve to (its <b>Git profile</b> above, the organization default, or the host's own setup), and whether pushes/PRs can reach the repos' remotes non-interactively. Profiles are managed in <b>Organization settings → Git accounts</b>.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Verify the effective commit identity and confirm that every repository remote can be reached non-interactively.</p>
       <button class="btn sm" id="git-preflight-run">Check git setup</button>
       <div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div>
     </div>
@@ -5304,14 +5301,15 @@ async function hydrateExecutionProviders(proj) {
 // ── organization defaults (legacy APIs still call this global scope) ─────────
 function globalSettingsView(embedded = false) {
   return `
-    ${embedded ? '<div class="section-title">Organization defaults</div>' : '<div class="page-title">Organization settings</div>'}
-    <p style="color:var(--ink-2);margin-top:-8px">The defaults below belong to this organization. Projects can override workflow behavior; tasks override both. Installation-wide resources are explicitly labeled.</p>
+    ${embedded ? '<div class="section-title" id="settings-defaults">Task defaults</div>' : '<div class="page-title">Organization settings</div>'}
+    <p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>
     ${settingsForms('global')}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
     ${profilesCard('global')}
     ${authorizationCard('global')}
     ${paymentsCard('global')}
+    <div class="section-title" id="settings-agents">Agents &amp; credentials</div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The installation's logins and API keys, with organization defaults controlling how tasks use them. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
@@ -5346,7 +5344,7 @@ function globalSettingsView(embedded = false) {
     </div>
     <div class="card" id="git-accounts-card">
       <div class="section-h">Git accounts <span class="chip">installation resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named git identities for the repos karmax works on: who commits are attributed to (and optionally signed by), and the SSH key / GitHub token used to push and open PRs. A project picks one in its settings (<b>Git profile</b>); without one, worlds fall back to the host's own git setup. Secrets go straight to the encrypted vault and are injected per subprocess — never written to any git config.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named commit identities and SSH credentials for repository work. Secrets go straight to the encrypted vault and are injected only into the git subprocess that needs them.</p>
       <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Add / update a profile</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -5364,6 +5362,7 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Re-saving a profile with a blank secret keeps the stored one. Interactive auth (password prompts at push) is never supported — configure a profile, or pre-authorize the host non-interactively.</div>
       </div>
     </div>
+    <div class="section-title" id="settings-installation">Installation</div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
@@ -5869,23 +5868,6 @@ function updateBell() {
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
 }
-async function toggleNotifications() {
-  const existing = $('#notif-pop');
-  if (existing) return existing.remove();
-  await loadCollaboration().catch(() => {});
-  const items = S.inbox.filter((item) => item.unread).slice(0, 8);
-  const pop = document.createElement('div');
-  pop.className = 'popover';
-  pop.id = 'notif-pop';
-  pop.innerHTML = `<div class="ph">Inbox (${items.length})</div>${items.length
-    ? items.map((item) => `<div class="pi" data-inbox="${item.id}"><b>${item.task?.num != null ? `<span class="task-num">#${item.task.num}</span> ` : ''}${esc(item.task?.title || item.kind)}</b><div class="task-sub"><span class="chip">${esc(item.kind.replaceAll('-', ' '))}</span></div></div>`).join('')
-    : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'}<div class="pi" id="open-inbox"><b>Open inbox →</b></div>`;
-  $('#overlay-root').appendChild(pop);
-  pop.querySelectorAll('[data-inbox]').forEach((e) => e.addEventListener('click', () => { const item = S.inbox.find((x) => x.id === e.dataset.inbox); pop.remove(); openInboxItem(item); }));
-  $('#open-inbox')?.addEventListener('click', () => { pop.remove(); go('/inbox'); });
-  setTimeout(() => document.addEventListener('click', function h(ev) { if (!pop.contains(ev.target) && ev.target.id !== 'bell') { pop.remove(); document.removeEventListener('click', h); } }), 10);
-}
-
 function inboxView() {
   const prefs = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
   return `<h1 class="page-title">Inbox</h1>
@@ -5931,24 +5913,40 @@ async function openInboxItem(item) {
 
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
-  return `<h1 class="page-title">${esc(org?.name || 'Organization')}</h1>
+  return `<div class="organization-settings"><h1 class="page-title">Settings</h1>
+    <p class="settings-intro">${esc(org?.name || 'Organization')} · Everything this organization needs, in one place.</p>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
-    <div class="inline-form" style="margin-bottom:12px"><button class="btn sm" id="create-organization">＋ New organization</button></div>
-    <div class="org-grid"><div class="card"><div class="section-h">Members</div><div id="org-members">Loading…</div>
-      <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-role"><option>member</option><option>admin</option><option>owner</option><option>billing</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div></div>
-    <div class="card"><div class="section-h">Teams</div><div id="org-teams">Loading…</div><div class="inline-form"><input id="team-name" placeholder="Security review"><button class="btn sm" id="create-team">Create team</button></div></div>
-    <div class="card"><div class="section-h">GitHub</div><p class="task-sub">Karmax can create its own private GitHub App, install it, discover repositories, and provision isolated SSH keys. No server shell or personal access token is needed.</p><div id="org-github">Loading…</div><div id="org-repos"></div></div>
-    <div class="card"><div class="section-h">Task execution</div><p class="task-sub">One organization policy applies to E2B and Daytona: default provider/pool, machine size, internet access, cost ceiling, and idle-world retention. Provider-specific templates and credentials stay with each connection below.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:18px">Provider connections</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:18px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
-    <div class="card"><div class="section-h">Data &amp; deletion</div><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></div></div>
-    ${globalSettingsView(true)}`;
+    <nav class="settings-nav"><a href="#settings-people">People</a><a href="#settings-code">Code</a><a href="#settings-compute">Compute</a><a href="#settings-defaults">Task defaults</a><a href="#settings-agents">Agents</a><a href="#settings-installation">Installation</a><a href="#settings-advanced">Advanced</a></nav>
+    <div class="inline-form settings-new-org"><button class="btn sm" id="create-organization">＋ New organization</button></div>
+
+    <div class="section-title" id="settings-people">People</div>
+    <div class="card"><div class="section-h">Members</div><p class="task-sub">Members do the work. Admins manage organization settings. Owners can do both and protect the organization from losing its final administrator.</p><div id="org-members">Loading…</div>
+      <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-role"><option value="member">Member</option><option value="admin">Admin</option><option value="owner">Owner</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
+      <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
+
+    <div class="section-title" id="settings-code">Code</div>
+    <div class="card"><div class="section-h">GitHub</div><p class="task-sub">Optional for local repositories. Connect GitHub when Karmax should discover and create repositories, receive repository changes, or issue repository-scoped SSH keys to hosted cloud worlds. A local repo with an SSH-capable git remote works directly.</p><div id="org-github">Loading…</div><div id="org-repos"></div></div>
+
+    <div class="section-title" id="settings-compute">Compute</div>
+    <div class="card"><div class="section-h">Task execution</div><p class="task-sub">Choose where tasks run, how large each world is, when idle worlds pause, and the monthly cost ceiling. Provider credentials and templates are configured directly below the policy that uses them.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
+
+    ${globalSettingsView(true)}
+
+    <div class="section-title" id="settings-advanced">Advanced</div>
+    <details class="card settings-disclosure"><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
+    <details class="card settings-disclosure"><summary><b>Export or delete organization</b><span>Data portability and permanent removal</span></summary><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></details>
+    </div>`;
 }
 
 async function hydrateOrganizationView() {
   if (!$('#org-members') || !S.organizationId) return;
   await loadCollaboration().catch(() => {});
   const userName = (id) => S.users.find((u) => u.id === id)?.name || id;
-  $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => `<div class="member-row" data-org-member="${esc(m.userId)}"><span>${esc(userName(m.userId))}</span><select class="q-sel org-member-role">${['member', 'admin', 'owner', 'billing'].map((role) => `<option ${role === m.role ? 'selected' : ''}>${role}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`).join('') : '<span class="task-sub">No members.</span>';
-  if (!$('#org-identity')) { const identityCard = document.createElement('div'); identityCard.className = 'card'; identityCard.innerHTML = `<div class="section-h">Enterprise identity</div><div id="org-identity">Loading…</div>`; $('.org-grid')?.appendChild(identityCard); }
+  const memberRoles = [['member', 'Member'], ['admin', 'Admin'], ['owner', 'Owner']];
+  $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
+    const current = m.role === 'billing' ? 'member' : m.role;
+    return `<div class="member-row" data-org-member="${esc(m.userId)}"><span>${esc(userName(m.userId))}</span><select class="q-sel org-member-role">${memberRoles.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`;
+  }).join('') : '<span class="task-sub">No members.</span>';
   const [repos, gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
     api(`/api/organizations/${S.organizationId}/repositories`).catch(() => []),
     api(`/api/organizations/${S.organizationId}/git-connections`).catch(() => []),
@@ -5962,15 +5960,16 @@ async function hydrateOrganizationView() {
     Promise.all(S.teams.map((team) => api(`/api/organizations/${S.organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
   ]);
   if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(invitation.role)}</span></div>`).join('')}`);
-  $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="member-row"><b>${esc(team.name)}</b><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span></div>${members.map((m) => `<div class="member-row"><span>${esc(userName(m.userId))}</span><span class="chip">${esc(m.role)}</span><button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><select class="team-user">${S.organizationMembers.filter((m) => !members.some((x) => x.userId === m.userId)).map((m) => `<option value="${esc(m.userId)}">${esc(userName(m.userId))}</option>`).join('')}</select><button class="btn sm team-member-add">Add</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
+  $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(member.userId)}">${esc(userName(member.userId))}</option>`).join('');
+  $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="member-row"><span><b>${esc(team.name)}</b><span class="task-sub mono"> · @team:${esc(team.slug)}</span></span><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span></div>${members.map((m) => `<div class="member-row"><span>${esc(userName(m.userId))}</span><button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" placeholder="Type a person's name"><button class="btn sm team-member-add">Add</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
   $('#org-github').innerHTML = githubApp.configured ? `
     <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
     <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="authorize-github">Authorize repository creation</button>' : ''}</div>
     ${gitConnections.length && githubApp.userAuthorized ? `<div class="section-h" style="margin-top:18px">Create repository</div><div class="inline-form"><select id="new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="new-repo-name" placeholder="new-repository"><input id="new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm" id="create-github-repo">Create</button></div>` : ''}` : `
-    <p class="task-sub">One guided GitHub confirmation creates and configures the App, then takes you directly to installation.</p>
+    <p class="task-sub">This creates a private GitHub App for this Karmax installation, then lets you choose exactly which repositories it may access. Callback URL: <span class="mono">${esc(location.origin)}</span></p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
-    <details style="margin-top:12px"><summary class="task-sub">Use an existing enterprise GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
+    <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   $('#org-repos').innerHTML = `<div class="section-h" style="margin-top:18px">Available repositories</div>${repos.length ? repos.map((r) => `<div class="member-row"><span>${esc(r.owner)}/${esc(r.name)}</span><span class="chip">${esc(r.defaultBranch)}</span></div>`).join('') : '<span class="task-sub">No repositories connected.</span>'}`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
   const connectedProviders = providerConnections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider);
@@ -6010,7 +6009,7 @@ async function hydrateOrganizationView() {
   $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   $('#setup-github-app')?.addEventListener('click', async () => {
     try {
-      const result = await api(`/api/organizations/${S.organizationId}/github/app-manifest`, { method: 'POST', body: '{}' });
+      const result = await api(`/api/organizations/${S.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) });
       const form = document.createElement('form'); form.method = 'POST'; form.action = result.action;
       const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest);
       form.appendChild(manifest); document.body.appendChild(form); form.submit();
@@ -6075,7 +6074,12 @@ async function hydrateOrganizationView() {
     row.querySelector('.org-member-remove')?.addEventListener('click', async () => { if (!confirm('Remove this member from the organization?')) return; try { await api(`/api/organizations/${S.organizationId}/members/${encodeURIComponent(row.dataset.orgMember)}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   });
   $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {
-    block.querySelector('.team-member-add')?.addEventListener('click', async () => { const userId = block.querySelector('.team-user')?.value; if (!userId) return; try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+    block.querySelector('.team-member-add')?.addEventListener('click', async () => {
+      const entered = block.querySelector('.team-user')?.value.trim();
+      const member = S.organizationMembers.find((candidate) => candidate.userId === entered || userName(candidate.userId).toLowerCase() === entered?.toLowerCase());
+      if (!member) return toast('Choose a person in this organization', true);
+      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId: member.userId }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
+    });
     block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
   });
   $('#export-organization')?.addEventListener('click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
@@ -6221,7 +6225,7 @@ const HOST_COMMANDS = [
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g g', run: () => switchTab('global') },
   { id: 'nav.projects', title: 'Go to projects', key: 'g p', run: () => focusRail() },
-  { id: 'nav.notifications', title: 'Go to notifications', key: 'g n', run: () => toggleNotifications() },
+  { id: 'nav.notifications', title: 'Go to inbox', key: 'g n', run: () => go('/inbox') },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -6406,8 +6410,6 @@ function moveRail(delta) {
 
 // -- Escape layering: pop the topmost surface ---------------------------------
 function closeTopOverlay() {
-  const pop = $('#notif-pop');
-  if (pop) return pop.remove();
   // Secondary modals (task picker, filter picker, tags manager, tag picker) stack
   // above the form/page in #modal-root — pop the topmost one first (a filter
   // picker can itself sit on the task-picker overlay).

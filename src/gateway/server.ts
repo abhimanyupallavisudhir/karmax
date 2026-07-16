@@ -36,6 +36,7 @@ import { newId } from '../util/id.js';
 import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
+import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -597,9 +598,12 @@ export class Gateway {
         return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
       }
     }
-    if (p === '/api/github/manifest/callback' && method === 'GET' && this.deps.githubApp && this.deps.identity) {
+    const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
+    if (githubManifestCallback && method === 'GET' && this.deps.githubApp && this.deps.identity) {
       const code = url.searchParams.get('code') ?? '';
-      const state = url.searchParams.get('state') ?? '';
+      // Query-form state remains accepted for setup links created by the prior
+      // release; new manifests use the validator-safe path form.
+      const state = githubManifestCallback[1] ? decodeURIComponent(githubManifestCallback[1]) : url.searchParams.get('state') ?? '';
       const identity = await this.deps.identity.session(requestHeaders(req.headers));
       if (!identity || !code || !state) return this.githubCallbackPage(res, 400, 'The GitHub App setup callback is incomplete.');
       const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
@@ -621,7 +625,7 @@ export class Gateway {
       const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
       if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub authorization link is invalid, expired, or belongs to another user.');
       try {
-        await this.deps.githubApp.authorizeUser(identity.user.id, code, this.publicUrl(req));
+        await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req));
         res.writeHead(303, { location: `/organization?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
@@ -640,7 +644,7 @@ export class Gateway {
         const status = this.deps.githubApp.status(identity.user.id);
         if (status.oauthConfigured && !status.userAuthorized) {
           const oauthState = this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id);
-          const publicUrl = this.publicUrl(req);
+          const publicUrl = this.githubPublicUrl(req);
           res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl) });
           return void res.end();
         }
@@ -879,12 +883,12 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listOrganizationMemberships(organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
-          const role = ['owner', 'admin', 'billing'].includes(String(b.role)) ? String(b.role) as any : 'member';
+          const role = ['owner', 'admin'].includes(String(b.role)) ? String(b.role) as 'owner' | 'admin' : 'member';
           const membership = store.setOrganizationMembership(organizationId, String(b.userId), role);
           this.deps.authorization?.grant(`user:${session.userId}`, {
             principalId: `user:${membership.userId}`, scopeKey: `organization:${organizationId}`,
             profileId: role === 'owner' || role === 'admin' ? 'administrator' : 'developer',
-            ...(role === 'member' || role === 'billing' ? { capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] } : {}),
+            ...(role === 'member' ? { capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] } : {}),
           });
           return this.json(res, 200, membership);
         }
@@ -902,7 +906,7 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           return this.json(res, 200, store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
-            role: ['owner', 'admin', 'billing'].includes(String(b.role)) ? b.role : 'member', invitedBy: `user:${session.userId}` }));
+            role: ['owner', 'admin'].includes(String(b.role)) ? b.role : 'member', invitedBy: `user:${session.userId}` }));
         }
       }
       const organizationTeams = p.match(/^\/api\/organizations\/([^/]+)\/teams$/);
@@ -921,7 +925,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listTeamMemberships(teamMembers[2]!));
         if (method === 'POST') {
           const b = await this.body(req);
-          return this.json(res, 200, store.setTeamMembership(teamMembers[2]!, String(b.userId), b.role === 'lead' ? 'lead' : 'member'));
+          return this.json(res, 200, store.setTeamMembership(teamMembers[2]!, String(b.userId)));
         }
       }
       const teamMember = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)\/members\/([^/]+)$/);
@@ -962,15 +966,20 @@ export class Gateway {
         if (!this.deps.tokens.check(token, 'user:write').ok)
           return this.json(res, 403, { error: 'Only a Karmax installation administrator can create the shared GitHub App' });
         if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
+        const b = await this.body(req);
         const state = store.createGithubInstallState(githubManifest[1]!, session.userId);
-        return this.json(res, 200, this.deps.githubApp.manifest(this.publicUrl(req), state));
+        try {
+          const publicUrl = this.githubPublicUrl(req, b.publicUrl);
+          return this.json(res, 200, this.deps.githubApp.manifest(publicUrl, state));
+        }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const githubAuthorize = p.match(/^\/api\/organizations\/([^/]+)\/github\/authorize$/);
       if (githubAuthorize && method === 'POST') {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         const state = store.createGithubInstallState(githubAuthorize[1]!, session.userId);
-        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.publicUrl(req)) }); }
+        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.githubPublicUrl(req)) }); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
@@ -2043,8 +2052,9 @@ export class Gateway {
       // accounts: API-key handles (broker; secrets write-only) + config-home
       // logins (SPEC §7.3 — switchable per-account subscriptions).
       if (p === '/api/accounts' && method === 'GET') {
+        const { agentAccountHandles } = await import('../platform/credential-sources.js');
         return this.json(res, 200, {
-          handles: this.deps.broker?.listHandles() ?? [],
+          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? []),
           // never expose the home's absolute path to the browser
           logins: (this.deps.configHomes?.list() ?? []).map((a) => ({ provider: a.provider, account: a.account, loggedIn: a.loggedIn })),
         });
@@ -2894,12 +2904,34 @@ export class Gateway {
     } catch { return false; }
   }
 
-  private publicUrl(req: http.IncomingMessage): string {
+  private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {
+    // Behind a reverse proxy, the browser is the one component that always
+    // knows the URL the human actually opened. An authenticated setup request
+    // may supply that origin instead of relying on frequently-misconfigured
+    // forwarded headers.
+    if (typeof browserUrl === 'string' && browserUrl.trim()) {
+      const parsed = new URL(browserUrl.trim());
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password)
+        throw new Error('The browser URL for GitHub setup must be an http(s) URL');
+      return parsed.origin;
+    }
     const configured = process.env.KARMAX_PUBLIC_URL?.trim();
     if (configured) return new URL(configured).origin;
     const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() || 'http';
     const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? 'localhost').split(',')[0]?.trim();
     return new URL(`${proto}://${host}`).origin;
+  }
+
+  /** GitHub must see exactly the same origin throughout manifest, install, and
+   * OAuth callbacks. Persist the admin's browser origin during setup so a stale
+   * reverse-proxy/environment value cannot reappear midway through the flow. */
+  private githubPublicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {
+    if (browserUrl != null) {
+      const value = this.publicUrl(req, browserUrl);
+      this.deps.store.kvSet(GITHUB_APP_PUBLIC_URL_KEY, value);
+      return value;
+    }
+    return this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY) ?? this.publicUrl(req);
   }
 
   private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
