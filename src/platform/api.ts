@@ -33,6 +33,7 @@ import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '..
 import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
+import type { KarmaxBus } from '../contrib/bus.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -123,6 +124,9 @@ export interface KarmaxApiDeps {
   /** Organization-scoped cloud provider credentials. Kept optional for the
    * small unit-test API harnesses; production always supplies it. */
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  /** Wake live gateway subscribers when platform-side actions append events. The
+   * durable event table remains the source of truth when this is absent. */
+  bus?: KarmaxBus;
 }
 
 /**
@@ -1330,7 +1334,7 @@ export class KarmaxApi {
     });
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     if (signal === SIG.confirm && scopedTask?.lastView?.waitingFor?.kind === 'human') {
@@ -1351,7 +1355,10 @@ export class KarmaxApi {
     }
     const terminal = this.deps.store.getTask(taskId)?.lastView;
     if (terminal?.status === 'failed' && terminal.workflow === 'software-dev' && !terminal.pointOfNoReturnPassed) {
-      if (signal === SIG.retry) return await this.recoverFailedTask(taskId);
+      if (signal === SIG.retry) {
+        await this.recoverFailedTask(taskId);
+        return;
+      }
       if (signal === SIG.followUp) {
         const now = Date.now();
         const msg: Message = { id: `u${now}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}) };
@@ -1360,7 +1367,8 @@ export class KarmaxApi {
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
         (target ?? messages).push(msg);
         this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() });
-        return;
+        this.publishConversationMessage(taskId, role, msg);
+        return msg;
       }
       if (signal === SIG.cancel) {
         this.deps.store.saveView(taskId, {
@@ -1375,10 +1383,11 @@ export class KarmaxApi {
       }
     }
     const handle = this.deps.client.workflow.getHandle(taskId);
+    let followUp: Message | undefined;
     try {
       if (signal === SIG.followUp) {
         const now = Date.now();
-        const msg: Message = {
+        followUp = {
           id: `u${now}`,
           role: 'user',
           text: text ?? '',
@@ -1387,7 +1396,12 @@ export class KarmaxApi {
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.
-        await handle.signal(SIG.followUp, msg, role);
+        await handle.signal(SIG.followUp, followUp, role);
+        // A signal mutates workflow memory immediately, but workflows deliberately
+        // publish their full cached view only at lifecycle boundaries. Journal the
+        // accepted message separately so every open conversation can render it
+        // mid-turn without changing replay-sensitive workflow command histories.
+        this.publishConversationMessage(taskId, role, followUp);
       } else {
         await handle.signal(signal);
       }
@@ -1416,6 +1430,18 @@ export class KarmaxApi {
       }
       throw e;
     }
+    return followUp;
+  }
+
+  private publishConversationMessage(taskId: string, role: string | undefined, message: Message): void {
+    const event = {
+      taskId,
+      type: 'conversation.message',
+      ts: message.ts,
+      payload: { role: role ?? 'do', message },
+    };
+    const seq = this.deps.store.appendEvent(event);
+    this.deps.bus?.emit({ ...event, seq });
   }
 
   async setTarget(token: string, taskId: string, branch: string): Promise<boolean> {

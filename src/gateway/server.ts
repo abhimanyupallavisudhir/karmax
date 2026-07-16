@@ -1706,8 +1706,8 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
-        return this.json(res, 200, { ok: true });
+        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
+        return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const targetMatch = p.match(/^\/api\/tasks\/([^/]+)\/target$/);
       if (targetMatch && method === 'POST') {
