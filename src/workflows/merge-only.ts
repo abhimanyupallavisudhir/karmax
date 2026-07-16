@@ -235,15 +235,19 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
         }
       } else {
         // A human layer: one Approve click passes ONE layer.
+        waitingFor = { kind: 'human', audience: layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
         await condition(() => confirmed || cancelled);
+        waitingFor = undefined;
         confirmed = false; // consumed by this layer
       }
     }
     if (!cancelled && !leftToHuman) confirmed = true;
+    if (leftToHuman) waitingFor = { kind: 'human', audience: ['@creator'] };
   }
   await publish();
   await condition(() => confirmed || cancelled);
+  waitingFor = undefined;
   if (cancelled || (input.workflowEdit && !checks?.passed && !confirmed)) {
     stage = 'cancelled';
     status = 'cancelled';

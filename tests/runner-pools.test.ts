@@ -4,6 +4,40 @@ import { RunnerPoolService, WorldLifecycleManager } from '../src/world/runners.j
 import { WorldRegistry } from '../src/world/registry.js';
 
 describe('runner capacity and world lifecycle', () => {
+  it('inherits one organization execution policy and keeps project overrides sparse', () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Infrastructure', ownerUserId: 'owner' });
+    const project = store.createProject('Product', {}, organization.id);
+
+    expect(store.effectiveProjectConfig(project)).toMatchObject({
+      worldProvider: 'worktree', resources: { cpu: 2, memoryMb: 2048, gpu: 0 },
+      network: { unrestricted: true }, hibernateAfterMs: 7 * 24 * 60 * 60 * 1000,
+    });
+    store.createRunnerPool({ id: 'shared', organizationId: organization.id, name: 'Shared', provider: 'daytona',
+      mode: 'managed', capacity: { activeWorlds: 10, cpu: 40, memoryMb: 81920, gpu: 0 }, enabled: true });
+    store.setOrganizationExecutionPolicy(organization.id, {
+      worldProvider: 'daytona', runnerPoolId: 'shared', resources: { cpu: 4, memoryMb: 8192, gpu: 0 },
+      network: { unrestricted: false, allowDomains: ['registry.npmjs.org'] },
+      monthlyBudgetMicros: 25_000_000, hibernateAfterMs: 24 * 60 * 60 * 1000,
+    });
+    expect(store.effectiveProjectConfig(project)).toMatchObject({
+      worldProvider: 'daytona', runnerPoolId: 'shared', resources: { cpu: 4, memoryMb: 8192 },
+      network: { unrestricted: false, allowDomains: ['registry.npmjs.org'] },
+    });
+
+    const overridden = store.setProjectExecutionPolicy(project.id, {
+      worldProvider: 'e2b', runnerPoolId: null, monthlyBudgetMicros: 5_000_000,
+    });
+    expect(overridden.config).toEqual({ worldProvider: 'e2b', monthlyBudgetMicros: 5_000_000 });
+    expect(store.effectiveProjectConfig(overridden)).toMatchObject({
+      worldProvider: 'e2b', resources: { cpu: 4, memoryMb: 8192 }, monthlyBudgetMicros: 5_000_000,
+    });
+    expect(store.effectiveProjectConfig(overridden).runnerPoolId).toBeUndefined();
+    expect(() => store.setProjectExecutionPolicy(project.id, { monthlyBudgetMicros: 30_000_000 }))
+      .toThrow(/cannot exceed/);
+    expect(store.setProjectExecutionPolicy(project.id, { worldProvider: null, monthlyBudgetMicros: null }).config).toEqual({});
+  });
+
   it('queues by durable capacity, activates on release, and attributes provider cost', async () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Capacity', ownerUserId: 'owner' });

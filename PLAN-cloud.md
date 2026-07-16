@@ -21,7 +21,7 @@ The repository now implements the hosted product baseline end to end:
   repository-scoped read-only clone keys, and broker-only write keys;
 - encrypted provider-portable checkpoints in S3-compatible storage, generation
   fencing, runner capacity/budget leases, usage records, and lifecycle sweeps;
-- organizations, teams, project membership, responsibility/review policy,
+- organizations, teams, project membership, workflow-owned human routing,
   per-user inbox/delivery, OIDC/SCIM, export, and idempotent tenant deletion;
 - durable tokens, executions/output, previews, events, production Temporal,
   online backup/verified restore, diagnostics/metrics, and a single-writer
@@ -35,10 +35,10 @@ enterprise expansion points, not holes in the hosted task/review product.
 Karmax Cloud should feel like one thing:
 
 1. Connect a GitHub organization and choose repositories.
-2. Write a task and assign it.
-3. Karmax prepares a private workspace, does the work, and puts the result in
-   front of the right reviewer.
-4. A reviewer can talk to the agent, run the app, open an artifact, or enter a
+2. Write a task; its workflow routes each decision to the right people.
+3. Karmax prepares a private workspace, does the work, and pings the audience
+   declared by the current workflow step.
+4. That person can talk to the agent, run the app, open an artifact, or enter a
    terminal from the task. The workspace wakes automatically and goes back to
    sleep afterward.
 5. The accepted result lands through the repository's normal protected path.
@@ -82,7 +82,7 @@ feel more direct, not turn Karmax into a cloud console.
    provision repository-scoped SSH credentials for Git; keep write credentials
    in a trusted Git broker outside the task world.
 10. **Put an Organization above Project before calling the app multi-user.** Add
-    membership, teams, explicit responsibility, per-user inboxes, and tenant
+    membership, teams, workflow-owned human routing, per-user inboxes, and tenant
     isolation together. Authentication alone is not collaboration.
 
 ## The four runtime nouns
@@ -91,7 +91,7 @@ The design stays understandable if these names never blur together.
 
 | Noun | Lifetime | Mutable? | Meaning |
 | --- | --- | --- | --- |
-| **Environment** | Many tasks | No; versioned | Image digest, toolchain, setup recipe, cache policy, allowed network destinations, and runtime sizes for a project. |
+| **Environment** | Many tasks | No; versioned | A provider-specific image/template/snapshot, toolchain, setup recipe, and cache policy. Runtime size/network/lifecycle live in the provider-neutral organization execution policy. |
 | **Runner pool** | Installation/org | Configuration only | Where environments execute: local host, Karmax-managed E2B, customer VPC, or a later provider. |
 | **World** | One task attempt | Yes | Repositories, working files, branch/base SHAs, and a checkpoint chain. Exactly one active generation may write it. |
 | **Execution** | Seconds to hours | Ephemeral | One agent turn, command, PTY, browser, test, or preview service inside a world. |
@@ -384,7 +384,11 @@ with the execution. No mutable cross-task home is mounted into untrusted worlds.
 
 ## Network and preview security
 
-Default egress is deny. A project's environment declares allowlisted classes:
+General-purpose coding defaults to normal outbound internet. Agents routinely
+need arbitrary package registries, documentation, web search, GitHub, and model
+APIs; pretending that a tiny static allowlist is turnkey only produces fragile
+failures. Organizations that maintain an egress policy can explicitly enable
+restricted mode and declare allowed classes:
 
 - Karmax gateway and runner control channel;
 - selected LLM provider endpoints;
@@ -392,13 +396,9 @@ Default egress is deny. A project's environment declares allowlisted classes:
 - approved package registries/mirrors;
 - task-specific destinations granted by capability/policy.
 
-The UI must make expansion visible because network access is a data-exfiltration
-decision. GitHub Copilot's cloud agent similarly uses an ephemeral firewalled
-environment and permits only GitHub/Copilot hosts by default; OpenAI's Codex cloud
-also defaults network access off and makes project allow/deny configuration
-explicit ([GitHub execution environment](https://docs.github.com/en/copilot/reference/hooks-reference#cloud-agent-execution-environment),
-[GitHub firewall rationale](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/customize-the-agent-firewall),
-[Codex security model](https://deploymentsafety.openai.com/gpt-5-2-codex/cybersecurity)).
+The UI makes restricted mode and every expansion visible because network access
+is a data-exfiltration decision. The allowlist is an enterprise hardening option,
+not the out-of-box coding experience.
 
 `exposePort()` returns an internal provider endpoint. The gateway exchanges it
 for a short-lived, viewer-authorized URL on a unique per-lease wildcard preview
@@ -678,7 +678,8 @@ Do not upload users' personal private SSH keys to Karmax Cloud.
 - Commit and PR provenance is an organization policy. The sensible default is a
   Karmax service author, the initiating human as co-author, and immutable task,
   attempt, world-generation, and audit links in commit/PR metadata. Attribution
-  does not substitute for the separate `createdBy`, executor, and reviewer audit.
+  does not substitute for the separate `createdBy`, executor, and workflow-gate
+  confirming-principal audit.
 - A no-PR direct push is available only when repository policy permits it and the
   Merge role holds the queue lease and exact target capability.
 - The agent never receives the Git write key. A push is a capability-checked
@@ -702,14 +703,15 @@ user <-> organization membership <-> organization
                               lists / tasks / repos
 ```
 
-Add `Organization` now; do not reinterpret today's “global” scope implicitly.
-Settings become explicit:
+The Organization is the product settings root. The historical `global` spelling
+remains only as an internal schema/backward-compatibility key. Settings are:
 
 - user settings: theme, personal notification delivery, connected personal
   agent accounts;
-- organization settings: policy, teams, runner pools, GitHub connections,
-  billing, default profiles/workflows;
-- project settings: repositories, environment, workflows, project roles;
+- organization settings: execution policy, provider connections/templates,
+  teams, GitHub, billing, default profiles/workflows, identity, and data controls;
+- project settings: repositories, workflows, access, and sparse execution
+  exceptions (another connected provider/pool or a tighter cloud budget);
 - task parameters: one execution's overrides.
 
 Every project, task, event, attachment, workflow installation, profile, secret
@@ -717,20 +719,18 @@ handle, repository, runner, checkpoint, saved view, inbox row, and audit record
 has an organization owner. Authorization queries start with organization scope;
 cross-organization identifiers must return not-found rather than reveal existence.
 
-### Responsibility and collaboration
+### Workflow routing and collaboration
 
 Implement `PLAN-collaboration.md` as part of hosted readiness:
 
-- immutable `createdBy`;
-- zero or one accountable `assignee`;
-- optional executing `delegate`;
-- subscribers and participants;
-- teams and project roles;
-- named confirmation policies (`any`, `all`, or quorum);
+- immutable `createdBy` provenance;
+- teams and project membership;
+- human Confirm layers naming users, teams, `@creator`, `@owners`, `@project`,
+  or `@all` at the exact decision point;
 - event-derived per-user inbox and delivery preferences;
-- My work / Needs my review as saved queries.
+- no generic assignee/delegate/reviewer/follower state competing with workflows.
 
-Assignment never grants access. Repository access does not automatically grant
+Routing never grants access. Repository access does not automatically grant
 Karmax project access, and Karmax membership does not silently expand a GitHub
 installation. A review records the human principal, policy target it satisfied,
 world/commit generation, and exact diff/check results approved.
@@ -828,12 +828,14 @@ with zero sandbox CPU/RAM, then resume and merge without manual repair.
 
 ### Phase 5 — collaboration product (complete)
 
-- The full responsibility model and explicit confirmation policies.
-- Per-user inbox and delivery adapters.
-- My work, Needs my review, workload, and audit views.
+- Workflow-owned human routes on every confirmation layer, including named
+  users, teams, `@creator`, `@owners`, `@project`, and `@all`.
+- A per-user attention inbox derived from the workflow's current wait, plus
+  delivery adapters; no parallel assignment or following model.
+- Organization audit and workflow-bottleneck views.
 - SSO/SCIM and enterprise policy after the base model is proven.
 
-This is the hosted multi-user baseline: responsibility, review routing, inbox,
+This is the hosted multi-user baseline: workflow routing, attention inbox,
 organization/repository onboarding, and enterprise identity all share the same
 tenant boundary and audit model.
 

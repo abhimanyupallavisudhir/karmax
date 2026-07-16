@@ -79,6 +79,7 @@ export class WorldCheckpointService {
     if (!checkpoint?.filesystemDelta) throw new Error('checkpoint has no portable filesystem delta');
     const project = this.store.getProject(checkpoint.projectId);
     if (!project?.organizationId) throw new Error('checkpoint project no longer exists');
+    const executionConfig = this.store.effectiveProjectConfig(project);
     const encrypted = await this.objects.get(checkpoint.filesystemDelta.objectKey);
     if (sha256(encrypted) !== checkpoint.filesystemDelta.sha256) throw new Error('checkpoint object hash mismatch');
     const delta = JSON.parse((await gunzip(this.decrypt(encrypted))).toString('utf8')) as PortableDelta;
@@ -86,7 +87,7 @@ export class WorldCheckpointService {
     const repositories = checkpoint.repos.map((repo) => this.store.getRepository(repo.repositoryId));
     const sources = checkpoint.repos.map((repo, index) => repositories[index]?.sshUrl ?? project.config.repos?.[index]);
     if (sources.some((source) => !source)) throw new Error('checkpoint repository enrollment is missing');
-    const selected = provider ?? project.config.worldProvider ?? 'worktree';
+    const selected = provider ?? executionConfig.worldProvider ?? 'worktree';
     const primary = checkpoint.repos[0];
     const linked = this.store.listProjectRepositories(checkpoint.projectId);
     const repositoryBranches = Object.fromEntries(linked.map((candidate) => {
@@ -99,7 +100,7 @@ export class WorldCheckpointService {
       repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
       branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
       ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
-      network: project.config.network, environment: project.config.environment, resources: project.config.resources });
+      network: executionConfig.network, environment: executionConfig.environment, resources: executionConfig.resources });
     for (const file of delta.files) {
       const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
       if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });

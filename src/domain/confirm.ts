@@ -18,5 +18,5 @@ export function confirmLayersOf(c: ConfirmConfig | undefined, legacyAutoConfirm 
     const { mode: _mode, layers: _layers, ...rest } = c ?? {};
     return [{ kind: 'agent', ...rest }];
   }
-  return [{ kind: 'human' }];
+  return [{ kind: 'human', audience: ['@creator'] }];
 }

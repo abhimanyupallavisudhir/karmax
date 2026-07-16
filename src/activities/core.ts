@@ -387,6 +387,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
       const project = projectId ? store.getProject(projectId) : undefined;
+      const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
         const ctx = activityContext.current();
@@ -408,9 +409,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           gitIdentity,
           gitCredentials,
           ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
-          network: project?.config.network,
-          environment: project?.config.environment,
-          resources: project?.config.resources,
+          network: executionConfig?.network,
+          environment: executionConfig?.environment,
+          resources: executionConfig?.resources,
         });
       } catch (error) {
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);

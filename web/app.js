@@ -79,7 +79,7 @@ function taskRecord(id) {
 // Scheme:
 //   /                                    → home (redirects to a project's tasks)
 //   /dashboard                           → global dashboard
-//   /settings                            → global settings
+//   /settings                            → organization settings (legacy alias)
 //   /projects/:name/tasks                → task list (also /queue, /activity, /settings)
 //   /projects/:name/tasks/:num           → the task's own page (permalink)
 //   /projects/:name/tasks/:num/:tab      → the task page pinned to one of its tabs
@@ -100,7 +100,7 @@ function parseRoute(pathname) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard' };
-  if (seg[0] === 'settings') return { name: 'global', tab: 'global' };
+  if (seg[0] === 'settings') return { name: 'global', tab: 'organization' };
   if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox' };
   if (seg[0] === 'organization') return { name: 'global', tab: 'organization' };
   if (seg[0] === 'invite') return { name: 'invite' };
@@ -466,11 +466,20 @@ function cfLayersOf(v) {
   const mode = v?.mode || 'human';
   if (mode === 'auto') return [];
   if (mode === 'agent') { const { mode: _m, layers: _l, agentDefault: _d, ...rest } = v || {}; return [{ kind: 'agent', ...rest }]; }
-  return [{ kind: 'human' }];
+  return [{ kind: 'human', audience: ['@creator'] }];
+}
+function humanAudienceOptions() {
+  return [
+    ['@creator', 'Task creator'], ['@all', 'Everyone in the organization'],
+    ['@owners', 'Organization owners'], ['@project', 'Everyone with project access'],
+    ...S.organizationMembers.map((m) => [`user:${m.userId}`, `Person · ${principalLabel({ kind: 'user', userId: m.userId })}`]),
+    ...S.teams.map((t) => [`team:${t.id}`, `Team · ${t.name}`]),
+  ];
 }
 function cfLayerHtml(f, layer, agentDefault) {
   const isAgent = layer.kind === 'agent';
   const promptVal = (isAgent ? layer.prompt ?? f.promptDefault : f.promptDefault) || '';
+  const audience = (layer.audience?.length ? layer.audience : ['@creator']).join(', ');
   return `<div class="cf-layer" data-kind="${esc(layer.kind)}">
     <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
       <span class="cf-layer-num" style="font-size:11px;color:var(--ink-3);min-width:14px;text-align:right"></span>
@@ -479,6 +488,13 @@ function cfLayerHtml(f, layer, agentDefault) {
       <button type="button" class="btn sm cf-move" data-dir="-1" title="Move layer up">↑</button>
       <button type="button" class="btn sm cf-move" data-dir="1" title="Move layer down">↓</button>
       <button type="button" class="btn sm cf-del" title="Remove this layer">✕</button>
+    </div>
+    <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
+      <label class="form-row">Who confirms
+        <input class="cf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @all, or search for a person/team" />
+      </label>
+      <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+      <div class="task-sub">Comma-separated. Use @all for anyone in the organization; add sequential human steps when different people must confirm in order.</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
       <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
@@ -508,14 +524,17 @@ const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
       ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
-      : { kind: 'human' },
+      : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
 // Read a confirmer box's layer list back out of the DOM (the stored value shape).
 function readConfirmerLayers(box) {
   const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
   return [...box.querySelectorAll('.cf-layer')].map((row) => {
-    if (row.querySelector('.cf-kind')?.value !== 'agent') return { kind: 'human' };
+    if (row.querySelector('.cf-kind')?.value !== 'agent') {
+      const audience = (row.querySelector('.cf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
+      return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
+    }
     const ab = row.querySelector('.agent-field');
     const spec = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
     const model = ab.querySelector('.af-model').value.trim();
@@ -738,6 +757,8 @@ function wireConfirmerField(box) {
     row.setAttribute('data-kind', e.target.value);
     const ab = row.querySelector('.cf-agent');
     if (ab) ab.style.display = e.target.value === 'agent' ? '' : 'none';
+    const hb = row.querySelector('.cf-human');
+    if (hb) hb.style.display = e.target.value === 'human' ? '' : 'none';
   });
   cfSync(box);
 }
@@ -1235,8 +1256,6 @@ function renderRail() {
   if (!rail) return;
   rail.innerHTML = `
     <div class="label">${esc(S.organizations.find((o) => o.id === S.organizationId)?.name || 'Projects')}</div>
-    <div class="nav-item" id="rail-my-work" tabindex="0">◎ My work</div>
-    <div class="nav-item" id="rail-my-review" tabindex="0">✓ Needs my review</div>
     <div class="nav-item ${S.tab === 'inbox' ? 'active' : ''}" id="rail-inbox" tabindex="0">◉ Inbox <span class="count">${S.inbox.filter((x) => x.unread).length || ''}</span></div>
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
@@ -1248,18 +1267,15 @@ function renderRail() {
       .join('')}
     <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
-    <div class="label">Global</div>
+    <div class="label">Organization</div>
     <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
-    <div class="nav-item ${S.tab === 'organization' ? 'active' : ''}" id="rail-organization" tabindex="0">♙ Organization</div>
-    <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
+    <div class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" id="rail-organization" tabindex="0">⚙ Settings</div>
     <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
     <div class="nav-item" id="rail-palette" tabindex="0" title="Every command, task, and project — searchable">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
   rail.querySelectorAll('.proj[data-id]').forEach((e) =>
     e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
-  $('#rail-my-work')?.addEventListener('click', async () => { const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id; if (!pid) return; await go(projectRoute(pid)); await setQuery('is:mine'); });
-  $('#rail-my-review')?.addEventListener('click', async () => { const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id; if (!pid) return; await go(projectRoute(pid)); await setQuery('needs:my-review'); });
   $('#rail-inbox')?.addEventListener('click', () => go('/inbox'));
   $('#rail-organization')?.addEventListener('click', () => go('/organization'));
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
@@ -1272,7 +1288,7 @@ function renderRail() {
 
 function switchTab(tab) {
   if (tab === 'dashboard') return go('/dashboard');
-  if (tab === 'global') return go('/settings');
+  if (tab === 'global') return go('/organization');
   if (tab === 'inbox') return go('/inbox');
   if (tab === 'organization') return go('/organization');
   const pid = S.projectId || S.projects[0]?.id;
@@ -1357,7 +1373,7 @@ function renderMain() {
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
   if (S.tab === 'inbox') wireInboxView();
-  if (S.tab === 'organization') hydrateOrganizationView();
+  if (S.tab === 'organization') { hydrateOrganizationView(); wireGlobalSettings(S.organizationId); }
 
   restoreFocus(main, focusState);
   updateBell();
@@ -1392,9 +1408,6 @@ function effectiveQuery(q, facets = ['archived', 'run']) {
 // repeatable series) first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
 const BUILTIN_VIEWS = [
-  { id: 'builtin:mine', name: 'My work', icon: '◎', query: 'is:mine' },
-  { id: 'builtin:my-review', name: 'Needs my review', icon: '✓', query: 'needs:my-review' },
-  { id: 'builtin:unassigned', name: 'Unassigned', icon: '○', query: 'is:unassigned' },
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
@@ -1663,7 +1676,6 @@ function taskRow(t) {
   const status = v.status || 'active';
   const stage = v.stage || 'setup';
   const archived = t.params?.archived;
-  const responsibility = t.assignee ? `<span class="principal-chip">${esc(principalLabel(t.assignee))}</span>` : '';
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
@@ -1678,7 +1690,7 @@ function taskRow(t) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
-          ${responsibility}${priorityFlag(t)}${tagChips(t)}
+          ${priorityFlag(t)}${tagChips(t)}
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
@@ -2448,7 +2460,7 @@ async function openTaskForm(workflow, draft, seedText) {
           </div>` : ''}
           <details class="advanced" style="margin-top:10px">
             <summary>Credentials — precedence &amp; enable/disable for this task</summary>
-            <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
+            <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the organization/project order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
             <div id="cred-editor-newtask">Loading…</div>
           </details>
           ${triggersSection(values, draft?.id)}
@@ -2978,34 +2990,7 @@ function orgEditorHtml(rec) {
     </label>
     <div class="org-tags">${tags || '<span class="pal-sub">no tags</span>'}
       <button class="btn sm org-add-tag" title="Add a tag">＋ tag</button>
-    </div>${responsibilityEditorHtml(rec)}
-  </div>`;
-}
-
-function principalOptions(selected) {
-  const key = selected?.kind === 'user' ? `user:${selected.userId}` : selected?.kind === 'team' ? `team:${selected.teamId}` : '';
-  return `<option value="" ${!key ? 'selected' : ''}>Unassigned</option>`
-    + S.organizationMembers.map((m) => `<option value="user:${esc(m.userId)}" ${key === `user:${m.userId}` ? 'selected' : ''}>${esc(principalLabel({ kind: 'user', userId: m.userId }))}</option>`).join('')
-    + S.teams.map((t) => `<option value="team:${esc(t.id)}" ${key === `team:${t.id}` ? 'selected' : ''}>Team · ${esc(t.name)}</option>`).join('');
-}
-function principalFromValue(value) {
-  if (value.startsWith('user:')) return { kind: 'user', userId: value.slice(5) };
-  if (value.startsWith('team:')) return { kind: 'team', teamId: value.slice(5) };
-  return null;
-}
-function responsibilityEditorHtml(rec) {
-  const target = rec?.confirmationPolicy?.targets?.[0];
-  const rule = rec?.confirmationPolicy?.rule;
-  const selectedRule = typeof rule === 'object' ? 'quorum' : rule || 'any';
-  const me = S.user?.id;
-  const subscribed = !!(me && (rec?.subscribers || []).some((p) => p.kind === 'user' && p.userId === me));
-  return `<div class="responsibility-editor">
-    <label>Assignee<select class="q-sel resp-assignee">${principalOptions(rec?.assignee)}</select></label>
-    <label>Delegate<select class="q-sel resp-delegate">${principalOptions(rec?.delegate)}</select></label>
-    <label>Reviewer<select class="q-sel resp-reviewer">${principalOptions(target?.kind === 'project-role' ? null : target)}</select></label>
-    <label>Approval<select class="q-sel resp-rule"><option ${selectedRule === 'any' ? 'selected' : ''}>any</option><option ${selectedRule === 'all' ? 'selected' : ''}>all</option></select></label>
-    ${me ? `<label class="switch"><input type="checkbox" class="resp-subscribe" ${subscribed ? 'checked' : ''}/>Following</label>` : ''}
-    <span class="pal-sub">Created by ${esc(principalLabel(rec?.createdBy))}</span>
+    </div>
   </div>`;
 }
 
@@ -3043,26 +3028,6 @@ function wireOrgEditor(rootEl, rec, opts) {
     setTags((rec.tags || []).filter((id) => id !== el.dataset.untag)).catch((e) => toast(e.message, true));
   }));
   box.querySelector('.org-add-tag')?.addEventListener('click', () => openTagPicker(rec, setTags));
-  const saveResponsibility = async (field) => {
-    const id = await ensureId(); if (!id) return;
-    const assignee = principalFromValue(box.querySelector('.resp-assignee')?.value || '');
-    const delegate = principalFromValue(box.querySelector('.resp-delegate')?.value || '');
-    const reviewer = principalFromValue(box.querySelector('.resp-reviewer')?.value || '');
-    const confirmationPolicy = reviewer ? { targets: [reviewer], rule: box.querySelector('.resp-rule')?.value || 'any' } : null;
-    const patch = field === 'assignee' ? { assignee } : field === 'delegate' ? { delegate } : { confirmationPolicy };
-    const updated = await api(`/api/tasks/${id}/responsibility`, { method: 'PATCH', body: JSON.stringify(patch) });
-    Object.assign(rec, updated); afterChange();
-  };
-  box.querySelector('.resp-assignee')?.addEventListener('change', () => saveResponsibility('assignee').catch((e) => toast(e.message, true)));
-  box.querySelector('.resp-delegate')?.addEventListener('change', () => saveResponsibility('delegate').catch((e) => toast(e.message, true)));
-  box.querySelectorAll('.resp-reviewer,.resp-rule').forEach((el) => el.addEventListener('change', () => saveResponsibility('confirmation').catch((e) => toast(e.message, true))));
-  box.querySelector('.resp-subscribe')?.addEventListener('change', async (e) => {
-    const id = await ensureId(); if (!id || !S.user?.id) return;
-    try {
-      const result = await api(`/api/tasks/${id}/subscribers`, { method: e.target.checked ? 'POST' : 'DELETE', body: JSON.stringify({ principal: { kind: 'user', userId: S.user.id } }) });
-      rec.subscribers = result.subscribers; afterChange();
-    } catch (error) { e.target.checked = !e.target.checked; toast(error.message, true); }
-  });
 }
 
 // The task page's copy of the priority/tags editor (Parameters tab). NOTE: the task
@@ -3908,7 +3873,7 @@ function parametersTab(v) {
     ${rec ? orgEditorHtml(rec) : '<div class="task-sub" style="color:var(--ink-3)">Priority + tags load with the task list.</div>'}
     ${paramsSection(v)}
     <div class="section-h">Credentials</div>
-    <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the global/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
+    <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
     <div id="cred-editor-task">Loading…</div>`;
 }
 
@@ -5038,7 +5003,7 @@ function settingsForms(scope, projectId) {
       const fields = s.params.filter((f) => f.scopes.includes(scope));
       if (!fields.length) return '';
       const label = s.name === 'agent-queue' ? 'Host capacity' : s.name;
-      const suffix = s.name === 'agent-queue' ? '— agent-turn admission' : '— defaults';
+      const suffix = s.name === 'agent-queue' ? '— installation-wide agent-turn admission' : '— organization defaults';
       return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' || s.name === 'agent-queue' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(label)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">${suffix}</span></summary>
         <div class="wf-form" style="margin-top:10px">${renderFields(fields)}</div>
@@ -5048,14 +5013,15 @@ function settingsForms(scope, projectId) {
     .join('');
 }
 
-async function hydrateSettingsForms(scope, projectId) {
+async function hydrateSettingsForms(scope, projectId, organizationId) {
   // load saved (own) values + inherited defaults per workflow and fill the inputs
   for (const sec of $('#main').querySelectorAll('[data-wf]')) {
     const wf = sec.dataset.wf;
     let own = {};
     let inherited = {};
     try {
-      const d = await api(`/api/defaults/${projectId || 'global'}/${wf}`);
+      const orgQuery = organizationId && wf !== 'agent-queue' ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+      const d = await api(`/api/defaults/${projectId || 'global'}/${wf}${orgQuery}`);
       own = d[scope].own;
       inherited = d[scope].inherited;
     } catch {}
@@ -5088,18 +5054,18 @@ function quickSettingsForms(scope, projectId) {
     .join('');
 }
 
-async function hydrateQuickSettingsForms(scope, projectId) {
+async function hydrateQuickSettingsForms(scope, projectId, organizationId) {
   const key = scope === 'global' ? 'globalQuick' : 'projectQuick';
   for (const sec of $('#main').querySelectorAll('[data-qwf]')) {
     const wf = sec.dataset.qwf;
     let d = null;
-    try { d = await api(`/api/defaults/${projectId || 'global'}/${wf}`); } catch {}
+    try { d = await api(`/api/defaults/${projectId || 'global'}/${wf}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`); } catch {}
     const own = d?.[key]?.own || {};
     const inherited = d?.[key]?.inherited || {};
     const inheritedAlt = d?.[key]?.inheritedAlt || {};
     const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
     const altFor = scope === 'project'
-      ? (f) => ({ primaryLabel: 'Global quick', altLabel: 'Project default', value: inheritedAlt[f.name] })
+      ? (f) => ({ primaryLabel: 'Organization quick', altLabel: 'Project default', value: inheritedAlt[f.name] })
       : undefined;
     sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited, false, altFor);
     wireAgentFields(sec);
@@ -5108,14 +5074,15 @@ async function hydrateQuickSettingsForms(scope, projectId) {
 }
 
 // Save handlers for the quick-defaults forms (shared by global + project scopes).
-function wireQuickSettingsSave(scope, projectId) {
+function wireQuickSettingsSave(scope, projectId, organizationId) {
   $('#main').querySelectorAll('[data-qsave]').forEach((b) =>
     b.addEventListener('click', async () => {
       const wf = b.dataset.qsave;
       const sec = b.closest('[data-qwf]');
       const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
       const values = collectForm(sec.querySelector('.wf-form'), fields);
-      const url = scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
+      const url = scope === 'global' && organizationId ? `/api/organizations/${organizationId}/quick-settings/${wf}`
+        : scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
       try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); toast(`${wf} quick defaults saved`); } catch (e) { toast(e.message, true); }
     }),
   );
@@ -5129,15 +5096,15 @@ function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `
     <div class="page-title">Project settings — ${esc(proj.name)}</div>
-    <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
+    <p style="color:var(--ink-2);margin-top:-8px">Per-workflow behavior for this project. It overrides organization defaults and can be overridden per task.</p>
     <div class="card"><div class="section-h">People &amp; repositories</div><div id="project-access">Loading…</div></div>
     ${cloudEnvironmentCard(proj)}
     ${settingsForms('project', proj.id)}
-    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box in this project (not the full “⋯ More” form). Each field inherits from your <b>global quick defaults</b> (↺ Global quick) or this project's <b>general defaults</b> above (↺ Project default) until you set it here.`)}
+    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box in this project (not the full “⋯ More” form). Each field inherits from <b>organization quick defaults</b> or this project's <b>general defaults</b> until you set it here.`)}
     ${quickSettingsForms('project', proj.id)}
     <div class="card">
       <div class="section-h">Credentials &amp; precedence</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Override the global credential order/enablement for this project (e.g. enable an API key here that's off globally).</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Override the organization credential order/enablement for this project (for example, enable a key only here).</p>
       <div id="cred-editor-project">Loading…</div>
     </div>
     ${profilesCard('project')}
@@ -5145,7 +5112,7 @@ function settingsView(proj) {
     ${paymentsCard('project')}
     <div class="card" id="git-preflight-card">
       <div class="section-h">Git setup</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Which git identity/credentials this project's worlds resolve to (its <b>Git profile</b> above, the global default, or the host's own setup), and whether pushes/PRs can reach the repos' remotes non-interactively. Profiles are managed in <b>Global settings → Git accounts</b>.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Which git identity/credentials this project's worlds resolve to (its <b>Git profile</b> above, the organization default, or the host's own setup), and whether pushes/PRs can reach the repos' remotes non-interactively. Profiles are managed in <b>Organization settings → Git accounts</b>.</p>
       <button class="btn sm" id="git-preflight-run">Check git setup</button>
       <div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div>
     </div>
@@ -5166,26 +5133,9 @@ function settingsView(proj) {
     </div>`;
 }
 function cloudEnvironmentCard(proj) {
-  const config = proj.config || {};
-  const remoteProviders = (S.meta?.worldProviders || []).filter((entry) => !S.meta?.hosted || entry.capabilities?.remote);
-  const providers = remoteProviders.length ? remoteProviders.map((entry) => entry.provider) : ['worktree', 'container', 'e2b', 'daytona'];
-  const selected = config.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
-  return `<div class="card"><div class="section-h">Execution environment</div>
-    <p class="task-sub">One isolated world per task attempt. Network access is denied unless declared here; GitHub access for enrolled repositories is always included.</p>
-    <div class="settings-grid">
-      <label class="form-row">Runner provider<select id="cloud-provider">${providers.map((provider) => `<option value="${esc(provider)}" ${provider === selected ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
-      <label class="form-row">Runner pool ID<input id="cloud-runner-pool" value="${esc(config.runnerPoolId || '')}" placeholder="managed default" /></label>
-      <label class="form-row">Image<input id="cloud-image" value="${esc(config.environment?.image || '')}" placeholder="provider default" /></label>
-      <label class="form-row">Snapshot/template<input id="cloud-snapshot" value="${esc(config.environment?.snapshot || '')}" placeholder="provider default" /></label>
-      <label class="form-row">CPU<input id="cloud-cpu" type="number" min="1" value="${esc(config.resources?.cpu || 2)}" /></label>
-      <label class="form-row">Memory (MiB)<input id="cloud-memory" type="number" min="128" step="128" value="${esc(config.resources?.memoryMb || 2048)}" /></label>
-      <label class="form-row">Monthly budget (USD)<input id="cloud-budget" type="number" min="0" step="0.01" value="${config.monthlyBudgetMicros == null ? '' : esc(config.monthlyBudgetMicros / 1e6)}" placeholder="unlimited" /></label>
-      <label class="form-row">Hibernate after (days)<input id="cloud-hibernate" type="number" min="1" value="${esc(Math.round((config.hibernateAfterMs || 7 * 86400000) / 86400000))}" /></label>
-    </div>
-    <label class="form-row">Allowed outbound domains<input id="cloud-domains" value="${esc((config.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label>
-    <label class="form-row">Allowed outbound CIDRs<input id="cloud-cidrs" value="${esc((config.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label>
-    <label class="switch"><input id="cloud-unrestricted" type="checkbox" ${config.network?.unrestricted ? 'checked' : ''}/><span>Allow unrestricted outbound network (high exfiltration risk)</span></label>
-    <button class="btn sm primary" id="cloud-save">Save environment</button>
+  return `<div class="card"><div class="section-h">Where tasks run</div>
+    <p class="task-sub">This project inherits the organization's compute, machine size, network policy, and idle-world lifecycle. Override only when this project must use another connected provider or pool.</p>
+    <div id="project-execution">Loading organization execution policy…</div>
   </div>`;
 }
 async function hydrateProjectAccess(proj) {
@@ -5207,7 +5157,7 @@ async function hydrateProjectAccess(proj) {
     ];
     box.innerHTML = `<div class="section-h">Project access</div>
       ${members.map((member) => `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(member.principal.userId || member.principal.teamId)}"><span>${esc(principalName(member.principal))}</span><span class="chip">${esc(member.role)}</span><button class="btn sm project-member-remove">Remove</button></div>`).join('') || '<p class="task-sub">No project members.</p>'}
-      <div class="inline-form"><select id="project-member-principal">${candidates.map((candidate) => `<option value="${esc(candidate.value)}">${esc(candidate.label)}</option>`).join('')}</select><select id="project-member-role"><option>member</option><option>reviewer</option><option>admin</option><option>owner</option></select><button class="btn sm" id="project-member-add">Add</button></div>
+      <div class="inline-form"><select id="project-member-principal">${candidates.map((candidate) => `<option value="${esc(candidate.value)}">${esc(candidate.label)}</option>`).join('')}</select><select id="project-member-role"><option>member</option><option>admin</option><option>owner</option></select><button class="btn sm" id="project-member-add">Add</button></div>
       <div class="section-h" style="margin-top:18px">Repositories</div>
       ${attached.map((entry) => { const base = entry.baseBranch || entry.repository.defaultBranch; const target = entry.targetBranch || base; return `<div class="member-row"><span>${esc(entry.repository.owner)}/${esc(entry.repository.name)}</span><span class="chip">${esc(base)} → ${esc(target)}</span><button class="btn sm project-repo-remove" data-repository="${esc(entry.repositoryId)}">Remove</button></div>`; }).join('') || '<p class="task-sub">No repository attached. Connect GitHub from Organization, then attach one here.</p>'}
       <div class="inline-form"><select id="project-repository">${repositories.filter((repository) => !linkedIds.has(repository.id)).map((repository) => `<option value="${esc(repository.id)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</select><input id="project-repo-base" placeholder="Base (repository default)"/><input id="project-repo-target" placeholder="Target (same as base)"/><button class="btn sm" id="project-repo-add">Attach repository</button></div>`;
@@ -5251,24 +5201,6 @@ async function hydrateWorkflowPins(projectId) {
 function wireSettingsView(proj) {
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
-  $('#cloud-save')?.addEventListener('click', async () => {
-    if ($('#cloud-unrestricted').checked && !confirm('Allow this project unrestricted outbound network access? Repository code and agents could send data anywhere.')) return;
-    const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
-    const budget = $('#cloud-budget').value.trim();
-    const image = $('#cloud-image').value.trim(); const snapshot = $('#cloud-snapshot').value.trim();
-    const runnerPoolId = $('#cloud-runner-pool').value.trim();
-    const config = {
-      worldProvider: $('#cloud-provider').value,
-      runnerPoolId: runnerPoolId || null,
-      resources: { cpu: Number($('#cloud-cpu').value), memoryMb: Number($('#cloud-memory').value) },
-      network: { allowDomains: split('#cloud-domains'), allowCidrs: split('#cloud-cidrs'), unrestricted: $('#cloud-unrestricted').checked },
-      environment: { ...(image ? { image } : {}), ...(snapshot ? { snapshot } : {}) },
-      monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
-      hibernateAfterMs: Math.round(Number($('#cloud-hibernate').value) * 86400000),
-    };
-    try { await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ config }) }); await loadProjects(); toast('Execution environment saved'); renderMain(); }
-    catch (error) { toast(error.message, true); }
-  });
   hydrateSettingsForms('project', proj.id);
   hydrateQuickSettingsForms('project', proj.id);
   wireQuickSettingsSave('project', proj.id);
@@ -5331,43 +5263,58 @@ function wireSettingsView(proj) {
   });
 }
 async function hydrateExecutionProviders(proj) {
-  if (!S.meta?.hosted || !$('#cloud-provider')) return;
+  const box = $('#project-execution'); if (!box) return;
   try {
-    const [connections, pools] = await Promise.all([
+    const [policy, connections, pools] = await Promise.all([
+      api(`/api/projects/${encodeURIComponent(proj.id)}/execution-policy`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
     ]);
-    const available = new Set(connections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider));
-    $('#cloud-provider').querySelectorAll('option').forEach((option) => {
-      option.disabled = !available.has(option.value);
-      option.textContent = `${option.value}${available.has(option.value) ? '' : ' — connect in Organization settings'}`;
+    const available = connections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider);
+    const local = S.meta?.hosted ? [] : ['worktree', 'container'];
+    const providers = [...new Set([...local, ...available])];
+    const selected = policy.override.worldProvider || '';
+    box.innerHTML = `<div class="settings-grid">
+      <label class="form-row">Execution provider<select id="project-execution-provider"><option value="">Organization default — ${esc(policy.organization.worldProvider || 'worktree')}</option>${providers.map((provider) => `<option value="${esc(provider)}" ${provider === selected ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
+      <label class="form-row">Runner pool<select id="project-execution-pool"></select></label>
+      <label class="form-row">Optional tighter project budget (USD/month)<input id="project-execution-budget" type="number" min="0" step="0.01" value="${policy.override.monthlyBudgetMicros == null ? '' : esc(policy.override.monthlyBudgetMicros / 1e6)}" placeholder="Use organization budget" /></label>
+    </div><div class="task-sub">Effective: ${esc(policy.effective.worldProvider)} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
+    <button class="btn sm primary" id="project-execution-save">Save project override</button>`;
+    const syncPools = (keep = '') => {
+      const provider = $('#project-execution-provider').value || policy.organization.worldProvider || 'worktree';
+      const matching = pools.filter((pool) => pool.provider === provider && pool.enabled);
+      $('#project-execution-pool').innerHTML = `<option value="">${provider === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === keep ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+    };
+    syncPools(policy.override.runnerPoolId || '');
+    $('#project-execution-provider')?.addEventListener('change', () => syncPools());
+    $('#project-execution-save')?.addEventListener('click', async () => {
+      const provider = $('#project-execution-provider').value; const pool = $('#project-execution-pool').value;
+      const budget = $('#project-execution-budget').value.trim();
+      try {
+        await api(`/api/projects/${proj.id}/execution-policy`, { method: 'PUT', body: JSON.stringify({ override: {
+          worldProvider: provider || null, runnerPoolId: pool || null,
+          monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
+        } }) });
+        await loadProjects(); toast('Project execution policy saved'); await hydrateExecutionProviders(proj);
+      } catch (error) { toast(error.message, true); }
     });
-    const selected = $('#cloud-provider').value;
-    const poolInput = $('#cloud-runner-pool');
-    if (poolInput) {
-      const matching = pools.filter((pool) => pool.provider === selected && pool.enabled);
-      poolInput.setAttribute('list', 'cloud-runner-pools');
-      const list = document.createElement('datalist'); list.id = 'cloud-runner-pools';
-      list.innerHTML = matching.map((pool) => `<option value="${esc(pool.id)}">${esc(pool.name)}</option>`).join('');
-      poolInput.after(list);
-    }
   } catch (error) { toast(`Could not load compute providers: ${error.message}`, true); }
 }
 
-// ── global settings (user scope) ─────────────────────────────────────────────
-function globalSettingsView() {
+// ── organization defaults (legacy APIs still call this global scope) ─────────
+function globalSettingsView(embedded = false) {
   return `
-    <div class="page-title">Global settings</div>
-    <p style="color:var(--ink-2);margin-top:-8px">Your defaults across all projects. Projects can override these; tasks override both.</p>
+    ${embedded ? '<div class="section-title">Organization defaults</div>' : '<div class="page-title">Organization settings</div>'}
+    <p style="color:var(--ink-2);margin-top:-8px">The defaults below belong to this organization. Projects can override workflow behavior; tasks override both. Installation-wide resources are explicitly labeled.</p>
     ${settingsForms('global')}
-    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from your general global defaults above (↺ Reset to default) until you set it here.`)}
+    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
     ${profilesCard('global')}
     ${authorizationCard('global')}
     ${paymentsCard('global')}
     <div class="card" id="accounts-card">
-      <div class="section-h">Accounts &amp; precedence</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Every login and API key agents can use, in one list. <b>Drag</b> to set precedence (top = tried first); toggle <b>On/Off</b> to enable/disable. API keys are off by default when a subscription exists. Projects and each task override this order + enablement (a task in its own form).</p>
+      <div class="section-h">Agent accounts <span class="chip">installation resource</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The installation's logins and API keys, with organization defaults controlling how tasks use them. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
       <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
@@ -5398,7 +5345,7 @@ function globalSettingsView() {
       </div>
     </div>
     <div class="card" id="git-accounts-card">
-      <div class="section-h">Git accounts</div>
+      <div class="section-h">Git accounts <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named git identities for the repos karmax works on: who commits are attributed to (and optionally signed by), and the SSH key / GitHub token used to push and open PRs. A project picks one in its settings (<b>Git profile</b>); without one, worlds fall back to the host's own git setup. Secrets go straight to the encrypted vault and are injected per subprocess — never written to any git config.</p>
       <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Add / update a profile</label>
@@ -5418,7 +5365,7 @@ function globalSettingsView() {
       </div>
     </div>
     <div class="card" id="workflows-card">
-      <div class="section-h">Workflows</div>
+      <div class="section-h">Workflows <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
       <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Install from a git repo</label>
@@ -5437,7 +5384,7 @@ function globalSettingsView() {
     </div>
     <div class="card">
       <div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
+      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
     </div>`;
 }
 
@@ -5486,7 +5433,7 @@ function paymentsCard(scope) {
     <div class="section-h">Payments — budget & cards</div>
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
       <div style="font-weight:600;margin-bottom:4px">Funding source</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How karmax pays. Cards are shared project/global resources; agents spend against them within your budget policy. karmax never stores card numbers.</p>
+      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this installation pays. Projects can have narrower cards and policies; karmax never stores card numbers.</p>
       <div class="pay-providers-list">Loading…</div>
     </div>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
@@ -5592,7 +5539,7 @@ function profileRow(p, handles, logins, scope) {
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
     <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span> ${usedBy}
-      ${inherited ? '<span class="chip" title="Using the global default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
+      ${inherited ? '<span class="chip" title="Using the organization/installation default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <div class="combo pf-model-combo" style="flex:1;min-width:140px">
@@ -5607,7 +5554,7 @@ function profileRow(p, handles, logins, scope) {
     <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins)}</div></div>
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save profile</button>
-      ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to global</button>` : ''}
+      ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
     </div>
   </div>`;
 }
@@ -5649,7 +5596,7 @@ async function hydrateProfiles(scope, projectId) {
     try { await api('/api/profiles', { method: 'PUT', body: JSON.stringify(profile) }); toast('Profile saved'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
   }));
   list.querySelectorAll('[data-resetprofile]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api(`/api/profiles/${encodeURIComponent(b.dataset.resetprofile)}`, { method: 'DELETE' }); toast('Reset to global'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
+    try { await api(`/api/profiles/${encodeURIComponent(b.dataset.resetprofile)}`, { method: 'DELETE' }); toast('Reset to inherited'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
   }));
 }
 
@@ -5663,7 +5610,7 @@ async function hydrateAccounts() {
 function profilesCard(scope) {
   return `<div class="card" id="profiles-card-${scope}">
     <div class="section-h">Agent profiles</div>
-    <p style="color:var(--ink-2);margin-top:0">Per-role defaults: provider, model, effort, capabilities, turn cap, and which accounts each agent may use.${scope === 'project' ? ' These override your global defaults for this project.' : ''}</p>
+    <p style="color:var(--ink-2);margin-top:0">Per-role defaults: provider, model, effort, capabilities, turn cap, and which accounts each agent may use.${scope === 'project' ? ' These override inherited defaults for this project.' : ''}</p>
     <div id="profiles-list-${scope}">Loading…</div>
   </div>`;
 }
@@ -5807,10 +5754,10 @@ async function hydrateAuthorization(scope, projectId) {
   } catch (e) { box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; }
 }
 
-function wireGlobalSettings() {
-  hydrateSettingsForms('global');
-  hydrateQuickSettingsForms('global');
-  wireQuickSettingsSave('global');
+function wireGlobalSettings(organizationId) {
+  hydrateSettingsForms('global', undefined, organizationId);
+  hydrateQuickSettingsForms('global', undefined, organizationId);
+  wireQuickSettingsSave('global', undefined, organizationId);
   renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
   hydrateProfiles('global');
   hydrateAuthorization('global');
@@ -5901,8 +5848,10 @@ function wireGlobalSettings() {
       const fields = schemaFor(wf).filter((f) => f.scopes.includes('global'));
       const values = collectForm(sec.querySelector('.wf-form'), fields);
       try {
-        await api(`/api/settings/global/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) });
-        toast(wf === 'agent-queue' ? 'Host capacity saved' : `${wf} global defaults saved`);
+        const endpoint = organizationId && wf !== 'agent-queue'
+          ? `/api/organizations/${organizationId}/settings/${wf}` : `/api/settings/global/${wf}`;
+        await api(endpoint, { method: 'PUT', body: JSON.stringify({ values }) });
+        toast(wf === 'agent-queue' ? 'Installation host capacity saved' : `${wf} organization defaults saved`);
       } catch (e) { toast(e.message, true); }
     }),
   );
@@ -5946,7 +5895,7 @@ function inboxView() {
       <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(item.kind.replaceAll('-', ' '))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
       <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : '<div class="empty"><div class="big">Inbox zero</div>Only updates meant for you appear here.</div>'}</div>
     <div class="card delivery-card"><div class="section-h">Delivery</div>
-      ${['browser', 'email', 'slack', 'routine'].map((key) => `<label class="switch"><input type="checkbox" data-delivery="${key}" ${prefs[key] ? 'checked' : ''}/><span>${key === 'routine' ? 'Routine subscribed updates' : key[0].toUpperCase() + key.slice(1)}</span></label>`).join('')}
+      ${['browser', 'email', 'slack'].map((key) => `<label class="switch"><input type="checkbox" data-delivery="${key}" ${prefs[key] ? 'checked' : ''}/><span>${key[0].toUpperCase() + key.slice(1)}</span></label>`).join('')}
       <button class="btn sm primary" id="save-delivery">Save preferences</button></div>`;
 }
 
@@ -5989,8 +5938,9 @@ function organizationView() {
       <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-role"><option>member</option><option>admin</option><option>owner</option><option>billing</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div></div>
     <div class="card"><div class="section-h">Teams</div><div id="org-teams">Loading…</div><div class="inline-form"><input id="team-name" placeholder="Security review"><button class="btn sm" id="create-team">Create team</button></div></div>
     <div class="card"><div class="section-h">GitHub</div><p class="task-sub">Karmax can create its own private GitHub App, install it, discover repositories, and provision isolated SSH keys. No server shell or personal access token is needed.</p><div id="org-github">Loading…</div><div id="org-repos"></div></div>
-    <div class="card"><div class="section-h">Compute providers</div><p class="task-sub">Connect E2B or Daytona once. Keys are encrypted and write-only; projects choose a provider without handling its credential.</p><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:18px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
-    <div class="card"><div class="section-h">Data &amp; deletion</div><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></div></div>`;
+    <div class="card"><div class="section-h">Task execution</div><p class="task-sub">One organization policy applies to E2B and Daytona: default provider/pool, machine size, internet access, cost ceiling, and idle-world retention. Provider-specific templates and credentials stay with each connection below.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:18px">Provider connections</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:18px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
+    <div class="card"><div class="section-h">Data &amp; deletion</div><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></div></div>
+    ${globalSettingsView(true)}`;
 }
 
 async function hydrateOrganizationView() {
@@ -5999,12 +5949,13 @@ async function hydrateOrganizationView() {
   const userName = (id) => S.users.find((u) => u.id === id)?.name || id;
   $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => `<div class="member-row" data-org-member="${esc(m.userId)}"><span>${esc(userName(m.userId))}</span><select class="q-sel org-member-role">${['member', 'admin', 'owner', 'billing'].map((role) => `<option ${role === m.role ? 'selected' : ''}>${role}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`).join('') : '<span class="task-sub">No members.</span>';
   if (!$('#org-identity')) { const identityCard = document.createElement('div'); identityCard.className = 'card'; identityCard.innerHTML = `<div class="section-h">Enterprise identity</div><div id="org-identity">Loading…</div>`; $('.org-grid')?.appendChild(identityCard); }
-  const [repos, gitConnections, githubApp, runners, providerConnections, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
+  const [repos, gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
     api(`/api/organizations/${S.organizationId}/repositories`).catch(() => []),
     api(`/api/organizations/${S.organizationId}/git-connections`).catch(() => []),
     api(`/api/organizations/${S.organizationId}/github/app`).catch(() => ({ configured: false })),
     api(`/api/organizations/${S.organizationId}/runner-pools`).catch(() => []),
     api(`/api/organizations/${S.organizationId}/world-providers`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
     api(`/api/organizations/${S.organizationId}/usage`).catch(() => null),
     api(`/api/organizations/${S.organizationId}/identity-policy`).catch(() => null),
     api(`/api/organizations/${S.organizationId}/invitations`).catch(() => []),
@@ -6022,6 +5973,20 @@ async function hydrateOrganizationView() {
     <details style="margin-top:12px"><summary class="task-sub">Use an existing enterprise GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   $('#org-repos').innerHTML = `<div class="section-h" style="margin-top:18px">Available repositories</div>${repos.length ? repos.map((r) => `<div class="member-row"><span>${esc(r.owner)}/${esc(r.name)}</span><span class="chip">${esc(r.defaultBranch)}</span></div>`).join('') : '<span class="task-sub">No repositories connected.</span>'}`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
+  const connectedProviders = providerConnections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider);
+  const executionProviders = [...new Set([executionPolicy.worldProvider, ...(S.meta?.hosted ? [] : ['worktree', 'container']), ...connectedProviders].filter(Boolean))];
+  $('#org-execution').innerHTML = `<div class="settings-grid">
+    <label class="form-row">Default provider<select id="org-execution-provider">${executionProviders.map((provider) => `<option value="${esc(provider)}" ${provider === executionPolicy.worldProvider ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
+    <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
+    <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
+    <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
+    <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
+    <label class="form-row">Hibernate parked worlds after (days)<input id="org-execution-hibernate" type="number" min="1" value="${esc(Math.round((executionPolicy.hibernateAfterMs || 604800000) / 86400000))}" /></label>
+    <label class="form-row">Outbound network<select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
+  </div>
+  <p class="task-sub">Coding agents normally need arbitrary package registries, documentation, web search, and APIs. Restricted mode is for organizations with a maintained egress policy.</p>
+  <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
+  <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
   $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
     const connection = connectionFor(provider); const config = connection?.config || {};
     const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
@@ -6080,6 +6045,27 @@ async function hydrateOrganizationView() {
     row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   });
   $('#runner-create')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, capacity: { activeWorlds: Number($('#runner-worlds').value) } }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  const syncOrganizationPools = (keep = '') => {
+    const provider = $('#org-execution-provider').value;
+    const matching = runners.filter((pool) => pool.provider === provider && pool.enabled);
+    $('#org-execution-pool').innerHTML = `<option value="">Provider-managed default</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === keep ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+  };
+  syncOrganizationPools(executionPolicy.runnerPoolId || '');
+  $('#org-execution-provider')?.addEventListener('change', () => syncOrganizationPools());
+  $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
+  $('#org-execution-save')?.addEventListener('click', async () => {
+    const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+    const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
+    try {
+      await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
+        worldProvider: $('#org-execution-provider').value, runnerPoolId: $('#org-execution-pool').value || undefined,
+        resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
+        network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
+        monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
+        hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
+      } }) }); toast('Organization execution policy saved'); await hydrateOrganizationView();
+    } catch (error) { toast(error.message, true); }
+  });
   $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
   $('#save-identity')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
   $('#rotate-scim')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
@@ -6233,7 +6219,7 @@ const HOST_COMMANDS = [
   { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
   { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g d', run: () => switchTab('dashboard') },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
-  { id: 'nav.global', title: 'Go to global settings', key: 'g g', run: () => switchTab('global') },
+  { id: 'nav.global', title: 'Go to organization settings', key: 'g g', run: () => switchTab('global') },
   { id: 'nav.projects', title: 'Go to projects', key: 'g p', run: () => focusRail() },
   { id: 'nav.notifications', title: 'Go to notifications', key: 'g n', run: () => toggleNotifications() },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
@@ -6648,7 +6634,7 @@ function renderAccessPending() {
 function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Set up karmax</div>
-    <p class="task-sub">Create the first administrator. Additional accounts are managed from Global settings.</p>
+    <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
     <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="setup-pw" autocomplete="new-password" /></div>

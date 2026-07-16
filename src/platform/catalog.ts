@@ -48,6 +48,8 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',
   ],
   cloud: [
+    'GET|PUT /api/organizations/:organizationId/execution-policy',
+    'GET|PUT /api/projects/:projectId/execution-policy',
     'GET /api/organizations/:organizationId/world-providers',
     'PUT|DELETE /api/organizations/:organizationId/world-providers/:provider',
     'POST /api/organizations/:organizationId/world-providers/:provider/test',

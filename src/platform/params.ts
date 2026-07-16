@@ -151,7 +151,7 @@ export function assembleTaskInput(
                   ...(l.resumeFrom ? { resumeFrom: l.resumeFrom } : {}),
                   ...(l.prompt?.trim() ? { prompt: l.prompt } : {}),
                 }
-              : { kind: l.kind },
+              : { kind: l.kind, audience: l.audience?.length ? [...l.audience] : ['@creator'] },
           );
           input.confirm = { layers };
         }
@@ -223,7 +223,16 @@ export function projectSettingsFor(
 export function globalSettingsFor(
   getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
   workflow: string,
+  organizationId?: string,
 ): ValueMap {
+  if (organizationId) {
+    return getSettings(`organization:${organizationId}`, workflow)
+      // Only the migration-created personal tenant may read historical global
+      // rows. A newly-created organization must never inherit another tenant's
+      // old installation settings.
+      ?? (organizationId === 'org_personal' ? getSettings('global', workflow) : undefined)
+      ?? {};
+  }
   return getSettings('global', workflow) ?? {};
 }
 
@@ -247,7 +256,13 @@ export function quickScopeKey(scope: 'global' | string): string {
 export function quickGlobalSettingsFor(
   getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined,
   workflow: string,
+  organizationId?: string,
 ): ValueMap {
+  if (organizationId) {
+    return getSettings(`quick:organization:${organizationId}`, workflow)
+      ?? (organizationId === 'org_personal' ? getSettings(quickScopeKey('global'), workflow) : undefined)
+      ?? {};
+  }
   return getSettings(quickScopeKey('global'), workflow) ?? {};
 }
 

@@ -17,8 +17,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, ConfirmConfig } from '../domain/types.js';
-import { confirmLayersOf } from '../domain/confirm.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -33,6 +32,7 @@ import { defaultProvider } from '../agent/adapters.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { confirmLayersOf } from '../domain/confirm.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -54,24 +54,14 @@ export interface TriggerArmer {
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
 const agentSnapshotKey = (taskId: string) => `task-agents:${taskId}`;
 
-function principalRefOf(principal: string): PrincipalRef | undefined {
+function principalRefOf(principal: string, kind?: 'agent' | 'human' | 'system'): PrincipalRef | undefined {
   if (principal.startsWith('user:')) return { kind: 'user', userId: principal.slice(5) };
   const taskAgent = principal.match(/^task-agent:([^:]+):(.+)$/);
-  return taskAgent ? { kind: 'task-agent', taskId: taskAgent[1]!, role: taskAgent[2]! } : undefined;
-}
-
-/** Legacy human confirmers become an explicit, immutable review audience. This
- * prevents a hosted task from being approvable by whichever logged-in user
- * happens to click first. Explicit API policy always wins. */
-function defaultConfirmationPolicy(store: Store, projectId: string, confirm: ConfirmConfig | undefined,
-  creator: PrincipalRef | undefined): ConfirmationPolicy | undefined {
-  if (!confirmLayersOf(confirm).some((layer) => layer.kind === 'human')) return undefined;
-  const memberships = store.listProjectMemberships(projectId);
-  for (const role of ['reviewer', 'admin', 'owner']) {
-    if (memberships.some((membership) => membership.role === role))
-      return { targets: [{ kind: 'project-role', projectId, role }], rule: 'any' };
-  }
-  return creator?.kind === 'user' ? { targets: [creator], rule: 'any' } : undefined;
+  if (taskAgent) return { kind: 'task-agent', taskId: taskAgent[1]!, role: taskAgent[2]! };
+  // Older callers used the bare user id as the token principal. Token kind is
+  // authoritative here; retain that human provenance so @creator remains a
+  // useful route for migrated installations and API clients.
+  return kind === 'human' ? { kind: 'user', userId: principal } : undefined;
 }
 
 /** Deepest cause message — unwraps Temporal's WorkflowUpdateFailedError → the
@@ -183,6 +173,50 @@ export class KarmaxApi {
     return { deleted: Boolean(this.deps.providerConnections.delete(organizationId, provider)) };
   }
 
+  getExecutionPolicy(token: string, input: { organizationId: string; projectId?: string }) {
+    if (!input.projectId) {
+      this.require(token, 'organization:read', { organizationId: input.organizationId });
+      return { organization: this.deps.store.getOrganizationExecutionPolicy(input.organizationId) };
+    }
+    const project = this.deps.store.getProject(input.projectId);
+    if (!project || project.organizationId !== input.organizationId) throw new Error('project does not belong to this organization');
+    this.require(token, 'project:settings:read', { organizationId: input.organizationId, projectId: project.id });
+    return {
+      organization: this.deps.store.getOrganizationExecutionPolicy(input.organizationId),
+      override: executionConfigOf(project.config),
+      effective: executionConfigOf(this.deps.store.effectiveProjectConfig(project)),
+    };
+  }
+
+  setExecutionPolicy(token: string, input: { organizationId: string; projectId?: string;
+    policy: Partial<OrganizationExecutionPolicy> & Record<string, unknown> }) {
+    const project = input.projectId ? this.deps.store.getProject(input.projectId) : undefined;
+    if (input.projectId && (!project || project.organizationId !== input.organizationId))
+      throw new Error('project does not belong to this organization');
+    this.require(token, project ? 'project:settings:write' : 'organization:edit',
+      { organizationId: input.organizationId, ...(project ? { projectId: project.id } : {}) });
+    // Null means "inherit" for project overrides. At organization scope it
+    // means "restore the built-in default", so never persist null policy values.
+    const policy = project ? input.policy
+      : Object.fromEntries(Object.entries(input.policy).map(([key, value]) => [key, value == null ? undefined : value]));
+    const candidate = project
+      ? this.deps.store.effectiveProjectConfig({ ...project, config: applyExecutionConfig(project.config, policy) })
+      : policy;
+    const provider = typeof candidate.worldProvider === 'string' ? candidate.worldProvider : undefined;
+    if (provider && !['worktree', 'container', 'memory'].includes(provider)
+      && !this.deps.providerConnections?.available(input.organizationId, provider))
+      throw new Error(`${provider} is not connected and verified`);
+    const runnerPoolId = typeof candidate.runnerPoolId === 'string' ? candidate.runnerPoolId : undefined;
+    if (runnerPoolId) {
+      const pool = this.deps.store.getRunnerPool(runnerPoolId);
+      if (!pool || pool.organizationId !== input.organizationId) throw new Error('runner pool does not belong to this organization');
+      if (provider && pool.provider !== provider) throw new Error('runner pool provider must match the execution provider');
+    }
+    if (project) this.deps.store.setProjectExecutionPolicy(project.id, policy);
+    else this.deps.store.setOrganizationExecutionPolicy(input.organizationId, policy as OrganizationExecutionPolicy);
+    return this.getExecutionPolicy(token, input);
+  }
+
   private require(token: string, tool: string, scope?: { projectId?: string; taskId?: string; organizationId?: string }) {
     const cap = TOOL_CAPABILITY[tool] ?? tool;
     const r = this.deps.tokens.check(token, cap, scope);
@@ -289,11 +323,17 @@ export class KarmaxApi {
     if (!args.draft) this.assertRepoConfigured(manifest, project, resolved);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
-    const confirmerField = manifest.params.find((field) => field.type === 'confirmer');
-    const confirmationPolicy = args.confirmationPolicy ?? (confirmerField ? defaultConfirmationPolicy(
-      this.deps.store, args.projectId, resolved[confirmerField.name] as ConfirmConfig | undefined,
-      principalRefOf(caller.principal),
-    ) : undefined);
+    const callerRef = principalRefOf(caller.principal, caller.kind);
+    // A legacy unscoped human token may predate organization membership. Do not
+    // persist it as an organization principal (which would also auto-subscribe
+    // an outsider); claimed/current installations always retain the creator.
+    const createdBy = callerRef?.kind === 'user'
+      && !this.deps.store.organizationMembership(project.organizationId ?? 'org_personal', callerRef.userId)
+      ? undefined : callerRef;
+    // Human routing belongs to each workflow confirm layer. Keep accepting the
+    // old task-level policy only for API/backward compatibility; the UI never
+    // creates one and new workflows publish their current audience with the wait.
+    const confirmationPolicy = args.confirmationPolicy;
     // A repeatable "series" (Model A) — forced on by a cron/recurring trigger.
     const repeatable = !!taskOverrides.repeatable || forcesRepeatable(normalizeTriggers(taskOverrides));
     // Persist only the task's OWN overrides (sparse), not the resolved snapshot.
@@ -318,11 +358,15 @@ export class KarmaxApi {
         const field = manifest.params.find((f) => f.type === 'confirmer');
         return field ? resolved[field.name] : undefined;
       })(),
-      createdBy: principalRefOf(caller.principal),
+      createdBy,
       assignee: args.assignee,
       delegate: args.delegate,
       confirmationPolicy,
     });
+    if (!args.draft) {
+      try { this.assertHumanRoutes(task, manifest, resolved); }
+      catch (error) { this.deps.store.deleteTask(task.id); throw error; }
+    }
     // Cosmetic human notes live in a dedicated column, never in `params`, so they
     // are structurally incapable of reaching the agent (SPEC §10). Persist them the
     // same way whether the task is queued now or saved as a draft.
@@ -401,7 +445,7 @@ export class KarmaxApi {
       taskId: task.id,
       projectId: args.projectId,
       title,
-      project: project.config,
+      project: this.deps.store.effectiveProjectConfig(project),
     });
     input.createdAt = task.createdAt;
     input.workflow = workflow;
@@ -448,11 +492,11 @@ export class KarmaxApi {
   private async resolveTaskParams(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, quick = false): Promise<ValueMap> {
     const getSettings = (s: string, w: string) => this.deps.store.getSettings(s, w);
     const projectVals = projectSettingsFor(getSettings, project, manifest.name);
-    const globalVals = globalSettingsFor(getSettings, manifest.name);
+    const globalVals = globalSettingsFor(getSettings, manifest.name, project.organizationId);
     // Quick tasks layer the quick-task defaults (project-quick → global-quick) above
     // the general defaults; a full-form task skips them entirely (SPEC §10.4).
     const layers: (ValueMap | undefined)[] = quick
-      ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name), projectVals, globalVals]
+      ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
     this.materializeUnifiedAgents(resolved, project.id);
@@ -616,13 +660,14 @@ export class KarmaxApi {
     const group = this.deps.store.attemptGroup(task.id);
     const confirmerField = manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField && group?.confirmer !== undefined) resolved[confirmerField.name] = group.confirmer;
+    this.assertHumanRoutes(task, manifest, resolved);
     // Same guard as createTask, on the resolved effective repos, before we clear the draft.
     this.assertRepoConfigured(manifest, project, resolved);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,
       title: task.title,
-      project: project.config,
+      project: this.deps.store.effectiveProjectConfig(project),
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
@@ -635,6 +680,27 @@ export class KarmaxApi {
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     return { startType, input, version: manifest.version };
+  }
+
+  private assertHumanRoutes(task: TaskRecord, manifest: WorkflowManifest, resolved: ValueMap): void {
+    const field = manifest.params.find((candidate) => candidate.type === 'confirmer');
+    if (!field) return;
+    const value = resolved[field.name];
+    if (!value || typeof value !== 'object') return;
+    for (const layer of confirmLayersOf(value as import('../domain/types.js').ConfirmConfig)) {
+      if (layer.kind !== 'human') continue;
+      const audience = layer.audience?.length ? layer.audience : ['@creator'];
+      if (!this.deps.store.humanAudience(task.id, audience).length) {
+        const project = this.deps.store.getProject(task.projectId);
+        // A pre-collaboration/local database can contain historical tasks before
+        // its personal organization is claimed. Do not make those tasks
+        // unrecoverable; once an organization has people, every route must
+        // resolve before new work can run.
+        if (project?.organizationId
+          && this.deps.store.listOrganizationMemberships(project.organizationId).length === 0) continue;
+        throw new Error(`Review route ${audience.join(', ')} does not resolve to a human in this organization`);
+      }
+    }
   }
 
   /**
@@ -1267,7 +1333,14 @@ export class KarmaxApi {
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
-    if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
+    if (signal === SIG.confirm && scopedTask?.lastView?.waitingFor?.kind === 'human') {
+      const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
+      if (!userId) throw new CapabilityError('only a human selected by this workflow step can confirm');
+      if (!this.deps.store.humanMayAct(taskId, userId))
+        throw new CapabilityError('this workflow confirmation step is assigned to someone else');
+      this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
+        payload: { userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true } });
+    } else if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
       const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
       if (!userId) throw new CapabilityError('only an explicitly targeted human can satisfy this confirmation policy');
       const vote = this.deps.store.voteConfirmation(taskId, userId);
@@ -1495,7 +1568,7 @@ export class KarmaxApi {
       prompt: args.title,
       branch: args.branch,
       target: args.target,
-      project: { ...project.config, repos: [args.repo] },
+      project: { ...this.deps.store.effectiveProjectConfig(project), repos: [args.repo] },
       workflowEdit: true,
       grant: authorization.capabilities,
       grantPrincipal: caller.principal,
@@ -1562,4 +1635,18 @@ export class KarmaxApi {
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
     return this.deps.workflows.install(args);
   }
+}
+
+const EXECUTION_POLICY_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
+function executionConfigOf(config: import('../domain/types.js').ProjectConfig): Partial<OrganizationExecutionPolicy> {
+  return Object.fromEntries(EXECUTION_POLICY_KEYS.filter((key) => config[key] !== undefined).map((key) => [key, config[key]]));
+}
+function applyExecutionConfig(config: import('../domain/types.js').ProjectConfig, patch: Record<string, unknown>) {
+  const next: Record<string, unknown> = { ...config };
+  for (const key of EXECUTION_POLICY_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    if (patch[key] == null) delete next[key];
+    else next[key] = patch[key];
+  }
+  return next as import('../domain/types.js').ProjectConfig;
 }

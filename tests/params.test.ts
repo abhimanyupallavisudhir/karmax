@@ -23,12 +23,11 @@ describe('resolveParams (overlay: task → project → global → default)', () 
     const r = resolveParams(sd, {
       task: { prompt: 'do it', base: 'feature' },
       project: { base: 'develop', target: 'develop', repos: ['/r'] },
-      global: { target: 'main', worldProvider: 'container' },
+      global: { target: 'main' },
     });
     expect(r.prompt).toBe('do it');
     expect(r.base).toBe('feature'); // task wins
     expect(r.target).toBe('develop'); // project wins over global
-    expect(r.worldProvider).toBe('container'); // global used (no task/project)
     expect(r.remote).toBe('none'); // field default
   });
 
@@ -100,11 +99,10 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
       target: 'release',
       repos: ['~/code/app'],
       copyGlobs: ['.env'],
-      worldProvider: 'container',
       remote: 'pr',
       'agent:do': { provider: 'codex', model: 'gpt-4.1', effort: 'high' },
     };
-    const input = assembleTaskInput(sd, resolved, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
+    const input = assembleTaskInput(sd, resolved, { taskId: 't1', projectId: 'p1', title: 'X', project: { worldProvider: 'container' } });
     expect(input.prompt).toBe('build X');
     expect(input.base).toBe('main');
     expect(input.target).toBe('release');
@@ -133,7 +131,7 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
       { kind: 'human' },
     ];
     const input = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers } }, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
-    expect(input.confirm).toEqual({ layers });
+    expect(input.confirm).toEqual({ layers: [layers[0], { kind: 'human', audience: ['@creator'] }] });
     const auto = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers: [] } }, { taskId: 't2', projectId: 'p1', title: 'X', project: {} });
     expect(auto.confirm).toEqual({ layers: [] });
   });
@@ -164,6 +162,12 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
   it('globalSettingsFor returns {} when absent', () => {
     expect(globalSettingsFor(() => undefined, 'software-dev')).toEqual({});
   });
+
+  it('never leaks legacy installation defaults into a new organization', () => {
+    const get = (scope: string) => scope === 'global' ? { base: 'legacy-secret' } : undefined;
+    expect(globalSettingsFor(get, 'software-dev', 'org_team')).toEqual({});
+    expect(globalSettingsFor(get, 'software-dev', 'org_personal')).toEqual({ base: 'legacy-secret' });
+  });
 });
 
 describe('quick-task defaults (separate overlay for the quick-add box)', () => {
@@ -189,9 +193,9 @@ describe('quick-task defaults (separate overlay for the quick-add box)', () => {
     expect(r.confirm).toEqual({ mode: 'auto' });
   });
 
-  it('global-quick inherits (falls through) to the general global default when unset', () => {
-    const r = chain({ globalQuick: {}, global: { worldProvider: 'container' } });
-    expect(r.worldProvider).toBe('container');
+  it('organization-quick inherits (falls through) to the general organization default when unset', () => {
+    const r = chain({ globalQuick: {}, global: { target: 'release' } });
+    expect(r.target).toBe('release');
   });
 
   it('project-quick overrides global-quick', () => {
@@ -228,11 +232,11 @@ describe('quick-task defaults (separate overlay for the quick-add box)', () => {
 });
 
 describe('settingsToProjectConfig (mirror back to ProjectConfig)', () => {
-  it('maps base/target to defaultBase/defaultTarget and binds project fields', () => {
+  it('maps base/target to defaultBase/defaultTarget and binds workflow project fields', () => {
     const cfg = settingsToProjectConfig(sd, { base: 'main', target: 'prod', repos: ['~/r'], worldProvider: 'container' });
     expect(cfg.defaultBase).toBe('main');
     expect(cfg.defaultTarget).toBe('prod');
     expect(cfg.repos).toEqual([path.join(os.homedir(), 'r')]);
-    expect(cfg.worldProvider).toBe('container');
+    expect(cfg.worldProvider).toBeUndefined(); // infrastructure is organization/project policy, not a workflow field
   });
 });

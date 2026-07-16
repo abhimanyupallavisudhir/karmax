@@ -115,7 +115,7 @@ export class GitHubAppService {
         public: false,
         redirect_url: `${origin}/api/github/manifest/callback?state=${encodeURIComponent(state)}`,
         setup_url: `${origin}/api/github/callback`,
-        redirect_on_update: true,
+        setup_on_update: true,
         callback_urls: [`${origin}/api/github/oauth/callback`],
         hook_attributes: { url: `${origin}/api/github/webhook`, active: true },
         default_permissions: { administration: 'write', contents: 'write', metadata: 'read', pull_requests: 'write' },
