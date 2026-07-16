@@ -1205,7 +1205,9 @@ function renderShell() {
         <option value="__new">＋ New organization</option>
       </select>
       <div class="spacer"></div>
-      <button class="icon-btn" id="topbar-palette" title="Search everything ( ${esc(fmtKeys('meta+k'))} )">⌕</button>
+      <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
+        <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
+      </button>
       <button class="icon-btn has-badge" id="bell" title="Needs attention">🔔<span class="badge hidden" id="bell-badge">0</span></button>
       <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
     </div>
@@ -1213,9 +1215,9 @@ function renderShell() {
       <div class="rail" id="rail"></div>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>`;
-  // Task search now lives at the top of the task list (see tasksView); the topbar
-  // glass icon opens the global command palette (commands, tasks, projects).
-  $('#topbar-palette').addEventListener('click', openPalette);
+  // Project-scoped query/filtering lives in the task list. The topbar finder is
+  // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
+  $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#theme').addEventListener('click', toggleTheme);
   $('#bell').addEventListener('click', toggleNotifications);
   $('#org-switcher')?.addEventListener('change', async (e) => {
@@ -1253,7 +1255,7 @@ function renderRail() {
     <div class="nav-item ${S.tab === 'organization' ? 'active' : ''}" id="rail-organization" tabindex="0">♙ Organization</div>
     <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
     <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
-    <div class="nav-item" id="rail-palette" tabindex="0" title="Every command, task, and project — searchable">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
+    <div class="nav-item" id="rail-palette" tabindex="0" title="Run any available command">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
   rail.querySelectorAll('.proj[data-id]').forEach((e) =>
     e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
@@ -6224,6 +6226,7 @@ function fuzzyScore(q, s) {
 // the server's command registry (S.contributions), so packages can rebind ids.
 const HOST_COMMANDS = [
   { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', run: () => openPalette() },
+  { id: 'nav.globalSearch', title: 'Search everything', key: 'meta+shift+F', run: () => openGlobalSearch() },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
   { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
   { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm($('#new-wf')?.value, undefined, $('#new-task')?.value.trim()); } },
@@ -6479,11 +6482,151 @@ function bindKeys() {
   });
 }
 
-// -- the ⌘K palette: fuzzy over the registry + jump-to-task/project -----------
+// -- global search: read-only discovery across every accessible project -------
+// Keep this separate from the command palette: search finds durable things;
+// the palette invokes actions. The per-project search endpoint gives this the
+// same free-text + field-filter semantics as the task list without loading every
+// project's task collection into browser state.
+function assembleGlobalSearchResults(query, projects, responses, limit = 40) {
+  const q = String(query || '').trim();
+  const hasFilterSyntax = /(?:^|\s)[!-]?[\w.-]+:/.test(q);
+  const textTerms = (q.match(/"[^"]+"|\S+/g) || [])
+    .filter((term) => !/^[!-]?[\w.-]+:/.test(term))
+    .map((term) => term.replace(/^"|"$/g, ''));
+  const projectHits = hasFilterSyntax ? [] : (projects || [])
+    .map((project) => ({ project, score: fuzzyScore(q, project.name) }))
+    .filter((hit) => hit.score >= 0)
+    .sort((a, b) => b.score - a.score || a.project.name.localeCompare(b.project.name))
+    .slice(0, 8);
+
+  const allTasks = (responses || []).flatMap(({ project, result }) =>
+    (result?.tasks || []).map((task) => ({
+      task,
+      project,
+      // Text hits in the title should lead notes-only matches. Structured
+      // queries have no text terms, so their cross-project order falls back to
+      // recency. Score terms independently because task free text is intentionally
+      // order-independent ("login fix" also matches "Fix login redirect").
+      score: textTerms.length
+        ? textTerms.reduce((total, term) => {
+          const termScore = fuzzyScore(term, task.title);
+          return total < 0 || termScore < 0 ? -1 : total + termScore;
+        }, 0)
+        : 0,
+    })),
+  );
+  allTasks.sort((a, b) => b.score - a.score || (b.task.createdAt || 0) - (a.task.createdAt || 0));
+  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: allTasks.length };
+}
+
+function openGlobalSearch() {
+  const root = $('#overlay-root');
+  root.innerHTML = `<div class="palette-scrim" id="gs-scrim"><div class="palette global-search" role="dialog" aria-modal="true" aria-labelledby="gs-title">
+    <div class="global-search-head">
+      <span aria-hidden="true">⌕</span>
+      <input id="gs-in" aria-label="Search everything" aria-controls="gs-list" aria-autocomplete="list" placeholder="Search tasks and projects…" autocomplete="off" spellcheck="false" />
+      <button class="icon-btn" id="gs-close" title="Close" aria-label="Close search">✕</button>
+    </div>
+    <div class="global-search-context" id="gs-title">Every accessible project · title, notes, task number, status, tags, and more</div>
+    <div id="gs-list" role="listbox" aria-label="Search results" aria-live="polite"></div>
+    <div class="global-search-foot">Filter tasks with queries like <code>status:active</code>, <code>tag:frontend</code>, or <code>#42</code>.</div>
+  </div></div>`;
+  const input = $('#gs-in');
+  const list = $('#gs-list');
+  let items = [];
+  let active = 0;
+  let timer = 0;
+  let request = 0;
+  let state = 'prompt';
+  let summary = '';
+  const close = () => { clearTimeout(timer); request++; root.innerHTML = ''; };
+
+  const draw = () => {
+    if (state === 'prompt') {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = `<div class="global-search-empty"><b>Find work anywhere</b><span>Enter words, a task number, or a task filter. Results include archived work.</span></div>`;
+      return;
+    }
+    if (state === 'loading') {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = `<div class="global-search-empty"><span class="global-search-loading">Searching ${S.projects.length} project${S.projects.length === 1 ? '' : 's'}…</span></div>`;
+      return;
+    }
+    if (!items.length) {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = `<div class="global-search-empty"><b>No results</b><span>No accessible task or project matched this search.</span></div>`;
+      return;
+    }
+    let lastGroup = null;
+    list.innerHTML = items.map((item, i) => {
+      const head = item.group !== lastGroup ? `<div class="pal-group">${esc(item.group)}</div>` : '';
+      lastGroup = item.group;
+      return `${head}<div class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}">
+        <span class="global-search-kind" aria-hidden="true">${item.group === 'Projects' ? '◇' : '□'}</span>
+        <span class="global-search-copy"><b>${esc(item.title)}</b><span>${esc(item.sub || '')}</span></span>
+      </div>`;
+    }).join('');
+    input.setAttribute('aria-activedescendant', `gs-result-${active}`);
+    if (summary) list.insertAdjacentHTML('beforeend', `<div class="global-search-summary">${esc(summary)}</div>`);
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+
+  const search = async () => {
+    const q = input.value.trim();
+    const ownRequest = ++request;
+    if (!q) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
+    state = 'loading';
+    draw();
+    const responses = (await Promise.all(S.projects.map(async (project) => {
+      try {
+        const result = await api(`/api/projects/${encodeURIComponent(project.id)}/search?q=${encodeURIComponent(q)}`);
+        return { project, result };
+      } catch { return null; } // project discovery and task-read grants can differ
+    }))).filter(Boolean);
+    if (ownRequest !== request || !root.contains(input)) return;
+    const found = assembleGlobalSearchResults(q, S.projects, responses);
+    items = [
+      ...found.projectHits.map(({ project }) => ({
+        group: 'Projects', title: project.name, sub: 'Open project', run: () => go(projectRoute(project.id)),
+      })),
+      ...found.taskHits.map(({ project, task }) => {
+        const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
+        const number = task.num != null ? `#${task.num} · ` : '';
+        return {
+          group: 'Tasks', title: task.title,
+          sub: `${number}${project.name} · ${stateLabel}`,
+          run: () => go(`/projects/${projectSlug(project)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`),
+        };
+      }),
+    ];
+    summary = found.totalTasks > found.taskHits.length ? `Showing ${found.taskHits.length} of ${found.totalTasks} matching tasks` : '';
+    active = 0;
+    state = 'done';
+    draw();
+  };
+  const schedule = () => { request++; clearTimeout(timer); timer = setTimeout(search, 160); };
+  const run = (i) => { const item = items[i]; if (!item) return; close(); item.run(); };
+
+  input.addEventListener('input', schedule);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(items.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); run(active); }
+  });
+  list.addEventListener('click', (e) => { const row = e.target.closest('.opt'); if (row) run(Number(row.dataset.i)); });
+  list.addEventListener('mousemove', (e) => { const row = e.target.closest('.opt'); if (row && Number(row.dataset.i) !== active) { active = Number(row.dataset.i); draw(); } });
+  $('#gs-close').addEventListener('click', close);
+  $('#gs-scrim').addEventListener('click', (e) => { if (e.target.id === 'gs-scrim') close(); });
+  draw();
+  input.focus();
+}
+
+// -- the ⌘K palette: fuzzy command/action invocation --------------------------
 function openPalette() {
   const root = $('#overlay-root');
   root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
-    <input id="pal-in" placeholder="Type a command, task, or project…" autocomplete="off" />
+    <input id="pal-in" placeholder="Type a command…" autocomplete="off" />
     <div id="pal-list"></div>
   </div></div>`;
   const input = $('#pal-in');
@@ -6491,7 +6634,7 @@ function openPalette() {
   const close = () => (root.innerHTML = '');
   let items = [];
   let active = 0;
-  const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2, Tasks: 3, Projects: 4 };
+  const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2 };
   const build = () => {
     const q = input.value.trim();
     items = [];
@@ -6500,17 +6643,6 @@ function openPalette() {
       const score = fuzzyScore(q, c.title);
       if (score < 0) continue;
       items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.workflow, danger: c.danger, score, run: c.run });
-    }
-    if (q) { // jump-to entries only once there's a query — the empty palette is the command list
-      for (const t of S.tasks) {
-        if (t.params?.archived) continue;
-        const score = fuzzyScore(q, t.title);
-        if (score >= 0) items.push({ group: 'Tasks', title: t.title, sub: `${t.workflow}${t.params?.draft ? ' · draft' : t.lastView?.stage ? ` · ${t.lastView.stage}` : ''}`, score, run: () => (t.params?.draft ? openTaskForm(undefined, t) : goToTask(t.id)) });
-      }
-      for (const p of S.projects) {
-        const score = fuzzyScore(q, p.name);
-        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => go(projectRoute(p.id)) });
-      }
     }
     items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
     items = items.slice(0, 14);

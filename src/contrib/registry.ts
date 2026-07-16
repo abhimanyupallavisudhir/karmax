@@ -61,5 +61,6 @@ export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.notifications', title: 'Go to notifications', keybinding: 'g n' },
   { id: 'nav.close', title: 'Close panel', keybinding: 'Escape' },
   { id: 'nav.commandPalette', title: 'Command palette', keybinding: 'meta+k' },
+  { id: 'nav.globalSearch', title: 'Search everything', keybinding: 'meta+shift+F' },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', keybinding: '?' },
 ];
