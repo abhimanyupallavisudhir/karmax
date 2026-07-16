@@ -1186,7 +1186,7 @@ function connectWs() {
         // Replacing avoids the old "H / He / Hello" cumulative transcript.
         S.liveOutput = ev.payload.text;
         updateLiveBubble();
-      } else if (ev.type === 'agent.activity') {
+      } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message') {
         if (S.taskTab === 'checkin') renderTaskPage();
         else renderTaskEvents();
       }
@@ -3742,7 +3742,20 @@ function conversationEntries(t) {
   const messages = (t.messages || [])
     .filter((message) => message.role !== 'agent' || !providerTexts.has(String(message.text || '').trim()))
     .map((message, index) => ({ type: 'message', message, ts: message.ts, order: index }));
-  const combined = [...messages, ...activities.values()];
+  // Follow-ups are journaled as soon as Temporal accepts their signal, while the
+  // workflow's cached transcript may not be republished until the turn ends.
+  // Merge those durable events into the presentation timeline, keyed by message
+  // id so the later transcript publish (and an optimistic + WS duplicate) cannot
+  // show the same user message twice.
+  const storedIds = new Set((t.messages || []).map((message) => message.id));
+  const posted = new Map();
+  for (const event of (S.taskEvents || [])) {
+    if (event.type !== 'conversation.message' || event.payload?.role !== t.role) continue;
+    const message = event.payload?.message;
+    if (!message?.id || storedIds.has(message.id)) continue;
+    posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, order: event.seq ?? event.ts });
+  }
+  const combined = [...messages, ...posted.values(), ...activities.values()];
   return combined.sort((a, b) => {
     const at = Number(a.ts) > 100000000000 ? Number(a.ts) : -1000000000000 + Number(a.order || 0);
     const bt = Number(b.ts) > 100000000000 ? Number(b.ts) : -1000000000000 + Number(b.order || 0);
@@ -4370,15 +4383,21 @@ function wireFollowups(v) {
       const text = ta.value.trim();
       if (!text && !store.length) return;
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, {
+        const result = await api(`/api/tasks/${v.taskId}/signal`, {
           method: 'POST',
           body: JSON.stringify({ signal: 'followUp', text, role, ...(store.length ? { images: [...store] } : {}) }),
         });
+        // Render immediately even if this browser's event WebSocket is reconnecting.
+        // The durable WS copy is de-duplicated by conversationEntries once it lands.
+        if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
+          S.taskEvents.push({ type: 'conversation.message', taskId: v.taskId, ts: result.message.ts, payload: { role: result.role || role, message: result.message } });
+        }
         ta.value = '';
         delete S.followupDrafts[key];
         store.length = 0;
         paint();
         toast('Follow-up sent');
+        if (S.taskTab === 'checkin') renderTaskPage();
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
