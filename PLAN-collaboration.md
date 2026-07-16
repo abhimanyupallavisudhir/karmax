@@ -59,10 +59,11 @@ special selectors. Multiple selectors in one layer mean “any”; multiple huma
 layers express sequential decisions. Agent and human layers can be interleaved.
 Legacy naked human gates normalize to `@creator`.
 
-Organization roles have exactly three product meanings: Member (ordinary work),
-Admin (organization configuration), and Owner (Admin plus the protected final
-authority). Teams intentionally have no sub-roles; membership is the routing
-fact. Decorative Billing/Lead roles from early builds migrate to Member.
+Membership is only the routing/scope fact. Human authority is selected once
+through Developer, Project maintainer, Automation operator, or Administrator.
+The store retains a hidden protected-owner marker solely to preserve one tenant
+recovery principal; it grants no independent permissions and is not selectable.
+Teams intentionally have no sub-roles.
 
 Team membership editors use account names and email addresses, never durable
 user IDs. Teams may be renamed; the previous slug remains a routing alias so an

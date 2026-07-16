@@ -47,6 +47,9 @@ export interface OrganizationInvitation {
   organizationId: string;
   email: string;
   role: OrganizationMembership['role'];
+  /** Authorization is selected explicitly; membership role is an internal
+   * ownership invariant, not a second permissions system. */
+  profileId?: string;
   invitedBy: string;
   createdAt: number;
   expiresAt: number;

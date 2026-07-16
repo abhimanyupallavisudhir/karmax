@@ -809,7 +809,7 @@ export class Gateway {
         const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
         this.deps.authorization?.grant(`user:${session.userId}`, {
           principalId: `user:${session.userId}`, scopeKey: `organization:${membership.organizationId}`,
-          profileId: 'developer', capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'],
+          profileId: membership.profileId ?? 'developer',
         });
         return this.json(res, 200, membership);
       }
@@ -884,17 +884,19 @@ export class Gateway {
           const users = new Map((this.deps.identity?.listUsers() ?? []).map((user) => [user.id, user]));
           return this.json(res, 200, store.listOrganizationMemberships(organizationId).map((membership) => {
             const user = users.get(membership.userId);
-            return { ...membership, ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
+            const grant = this.deps.authorization?.grants(`user:${membership.userId}`).find((candidate) => candidate.scopeKey === `organization:${organizationId}`);
+            return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'administrator' : 'developer'),
+              protectedOwner: membership.role === 'owner', ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
           }));
         }
         if (method === 'POST') {
           const b = await this.body(req);
-          const role = ['owner', 'admin'].includes(String(b.role)) ? String(b.role) as 'owner' | 'admin' : 'member';
-          const membership = store.setOrganizationMembership(organizationId, String(b.userId), role);
+          const existing = store.organizationMembership(organizationId, String(b.userId));
+          const membership = store.setOrganizationMembership(organizationId, String(b.userId), existing?.role === 'owner' ? 'owner' : 'member');
+          const profileId = String(b.profileId ?? 'developer');
           this.deps.authorization?.grant(`user:${session.userId}`, {
             principalId: `user:${membership.userId}`, scopeKey: `organization:${organizationId}`,
-            profileId: role === 'owner' || role === 'admin' ? 'administrator' : 'developer',
-            ...(role === 'member' ? { capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] } : {}),
+            profileId,
           });
           return this.json(res, 200, membership);
         }
@@ -912,7 +914,7 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           return this.json(res, 200, store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
-            role: ['owner', 'admin'].includes(String(b.role)) ? b.role : 'member', invitedBy: `user:${session.userId}` }));
+            role: 'member', profileId: String(b.profileId ?? 'developer'), invitedBy: `user:${session.userId}` }));
         }
       }
       const organizationTeams = p.match(/^\/api\/organizations\/([^/]+)\/teams$/);
@@ -1346,17 +1348,20 @@ export class Gateway {
       const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
       if (projectMembers) {
         const projectId = projectMembers[1]!;
-        if (method === 'GET') return this.json(res, 200, store.listProjectMemberships(projectId));
+        if (method === 'GET') return this.json(res, 200, store.listProjectMemberships(projectId).map((membership) => {
+          if (membership.principal.kind !== 'user') return { ...membership, profileId: membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer' };
+          const grant = this.deps.authorization?.grants(`user:${membership.principal.userId}`).find((candidate) => candidate.scopeKey === `project:${projectId}`);
+          return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer'), protectedOwner: membership.role === 'owner' };
+        }));
         if (method === 'POST') {
           const b = await this.body(req);
           const principal = principalFromBody(b.principal);
-          const role = ['owner', 'admin', 'reviewer'].includes(String(b.role)) ? String(b.role) : 'member';
-          const membership = store.setProjectMembership(projectId, principal, role);
+          const previous = store.listProjectMemberships(projectId).find((member) => JSON.stringify(member.principal) === JSON.stringify(principal));
+          const membership = store.setProjectMembership(projectId, principal, previous?.role === 'owner' ? 'owner' : 'member');
           if (principal.kind === 'user') {
-            const profileId = role === 'owner' || role === 'admin' ? 'maintainer' : 'developer';
+            const profileId = String(b.profileId ?? 'developer');
             this.deps.authorization?.grant(`user:${session.userId}`, { principalId: `user:${principal.userId}`,
-              scopeKey: `project:${projectId}`, profileId,
-              ...(role === 'reviewer' ? { capabilities: ['project:read', 'task:read', 'task:event:read', 'task:signal', 'task:review:execute', 'inbox:*'] } : {}) });
+              scopeKey: `project:${projectId}`, profileId });
           }
           return this.json(res, 200, membership);
         }
@@ -1389,10 +1394,15 @@ export class Gateway {
         if (!project) return this.json(res, 404, { error: 'project not found' });
         if (method === 'GET') return this.json(res, 200, { repos: project.config.repos ?? [] });
         if (method === 'PUT') {
-          if (this.deps.hosted) return this.json(res, 400, { error: 'hosted projects use attached GitHub repositories' });
           const b = await this.body(req);
-          try { return this.json(res, 200, store.setProjectRepositorySources(project.id,
-            Array.isArray(b.repos) ? b.repos.map(String) : [])); }
+          try {
+            const repos = Array.isArray(b.repos) ? b.repos.map(String) : [];
+            if (this.deps.hosted) {
+              const known = new Set(store.listRepositories(project.organizationId!).map((repository) => repository.sshUrl));
+              const unknown = repos.filter((repo: string) => !known.has(repo));
+              if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
+            }
+            return this.json(res, 200, store.setProjectRepositorySources(project.id, repos)); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
