@@ -5130,11 +5130,36 @@ function fmtReset(epoch) {
 }
 
 // ── settings (schema-driven, SPEC §10.4) ─────────────────────────────────────
+// Confirmation happens where the eye already is: the pressed button itself says
+// Saved for a moment, instead of a toast in the far corner naming wire ids.
+function flashSaved(button) {
+  if (!button || button.dataset.flashing) return;
+  button.dataset.flashing = '1';
+  const label = button.textContent;
+  button.textContent = 'Saved ✓';
+  button.classList.add('saved');
+  setTimeout(() => { button.textContent = label; button.classList.remove('saved'); delete button.dataset.flashing; }, 1400);
+}
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile'].includes(field.name));
 const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
-const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name));
+// `confirm` (the Review route) stays a shared/common value on the wire, but it is
+// edited in the Agents card beside the Do/Merge agents it gates — not here.
+const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
+// The stored `__common__` row is shared by several forms (task defaults here; the
+// Review route and Git profile elsewhere) and a settings PUT replaces the whole
+// row — so every save read-merge-writes: fetch the raw row, drop exactly the keys
+// this form owns, and lay the collected values on top.
+async function saveCommonSettings(scope, projectId, organizationId, ownNames, collected) {
+  const url = scope === 'project' ? `/api/settings/project/${encodeURIComponent(projectId)}/__common__`
+    : organizationId ? `/api/organizations/${encodeURIComponent(organizationId)}/settings/__common__`
+    : '/api/settings/global/__common__';
+  const values = await api(url).catch(() => ({}));
+  for (const name of ownNames) delete values[name];
+  Object.assign(values, collected);
+  await api(url, { method: 'PUT', body: JSON.stringify({ values }) });
+}
 // Agent defaults live in the profile editor, so manifests correctly declare
 // these controls as task-scoped. Quick tasks still need the same Do/Merge picker:
 // read those task fields directly rather than hiding them behind settings scopes.
@@ -5226,7 +5251,7 @@ function wireQuickSettingsSave(scope, projectId, organizationId) {
       const values = { ...collectForm(sec.querySelector('.wf-form'), fields), _enabled: sec.querySelector('.quick-defaults-enabled').checked };
       const url = scope === 'global' && organizationId ? `/api/organizations/${organizationId}/quick-settings/${wf}`
         : scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
-      try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); toast('Quick agent defaults saved'); } catch (e) { toast(e.message, true); }
+      try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); flashSaved(b); } catch (e) { toast(e.message, true); }
     }),
   );
 }
@@ -5235,27 +5260,27 @@ const quickDefaultsHeader = () => '';
 
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
-  return `<div class="organization-settings"><h1 class="page-title">${esc(proj.name)} settings</h1><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-misc">Misc.</a></nav><div class="settings-content">
-    <div class="settings-section-title" id="project-git"><span>01</span><div>Git &amp; GitHub</div></div>
+  return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
-    <div class="settings-section-title" id="project-compute"><span>02</span><div>Compute</div></div>${cloudEnvironmentCard(proj)}
-    <div class="settings-section-title" id="project-agents"><span>03</span><div>Agent logins</div></div>
+    <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
+    <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
-    <div class="settings-section-title" id="project-defaults"><span>04</span><div>Task defaults</div></div>
+    <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
-    ${quickSettingsForms('project', proj.id)}
     ${profilesCard('project')}
-    <div class="settings-section-title" id="project-payments"><span>05</span><div>Payments</div></div>${paymentsCard('project')}
-    <div class="settings-section-title" id="project-people"><span>06</span><div>People &amp; authorization</div></div>
+    ${quickSettingsForms('project', proj.id)}
+    <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
+    <div class="settings-section-title" id="project-people"><div>People &amp; authorization<small>Who can work here, and what they may do</small></div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
     ${authorizationCard('project')}
-    <div class="settings-section-title" id="project-workflows"><span>07</span><div>Workflows</div></div>
+    <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div>
       <button class="btn" id="activate-sd">Activate software-dev</button></div>
-    <div class="settings-section-title" id="project-misc"><span>08</span><div>Misc.</div></div>
+    <div class="settings-section-title" id="project-advanced"><div>Advanced<small>Rarely needed — and hard to undo</small></div></div>
     <div class="card" style="border-color:var(--danger-weak)">
       <div class="section-h" style="color:var(--danger)">Danger zone</div>
       <button class="btn danger" id="delete-project">Delete project</button>
@@ -5376,6 +5401,7 @@ function wireSettingsView(proj) {
   wireQuickSettingsSave('project', proj.id);
   renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
+  hydrateReviewRoute('project', proj.id);
   hydrateAuthorization('project', proj.id);
   hydrateWorkflowPins(proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
@@ -5385,7 +5411,11 @@ function wireSettingsView(proj) {
       const fields = wf === '__common__' ? commonSettingsFields('project')
         : settingsFields(wf, 'project').filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       const values = collectForm(sec.querySelector('.wf-form'), fields);
-      try { await api(`/api/settings/project/${proj.id}/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) }); await loadProjects(); toast(`${wf} defaults saved`); } catch (e) { toast(e.message, true); }
+      try {
+        if (wf === '__common__') await saveCommonSettings('project', proj.id, undefined, fields.map((f) => f.name), values);
+        else await api(`/api/settings/project/${proj.id}/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) });
+        await loadProjects(); flashSaved(b);
+      } catch (e) { toast(e.message, true); }
     }),
   );
   wirePaymentsCard('project', proj.id);
@@ -5475,16 +5505,15 @@ async function hydrateExecutionProviders(proj) {
 // ── organization defaults (legacy APIs still call this global scope) ─────────
 function globalSettingsView(embedded = false) {
   return `
-    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><span>04</span><div>Task defaults<small>How new work begins</small></div></div>' : '<div class="page-title">Organization settings</div>'}
-    <p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>
+    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
+    ${profilesCard('global')}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
-    ${profilesCard('global')}
     ${authorizationCard('global')}
-    <div class="settings-section-title" id="settings-payments"><span>05</span><div>Payments</div></div>
+    <div class="settings-section-title" id="settings-payments"><div>Payments<small>What tasks may spend, and the cards they spend from</small></div></div>
     ${paymentsCard('global')}
-    <div class="settings-section-title" id="settings-agents"><span>03</span><div>Agent logins</div></div>
+    <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The installation's logins and API keys, with organization defaults controlling how tasks use them. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
@@ -5537,7 +5566,7 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Re-saving a profile with a blank secret keeps the stored one. Interactive auth (password prompts at push) is never supported — configure a profile, or pre-authorize the host non-interactively.</div>
       </div>
     </div>
-    <div class="settings-section-title" id="settings-installation"><span>07</span><div>Workflows</div></div>
+    <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
@@ -5726,21 +5755,48 @@ function profileRow(p, handles, logins, scope) {
     </div>
     <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins)}</div></div>
     <div style="display:flex;gap:8px">
-      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save profile</button>
+      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
       ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
     </div>
   </div>`;
 }
 
-// Render + wire the agent-profiles editor for a scope (global or a project).
-async function hydrateProfiles(scope, projectId) {
+// Render + wire the agents editor for a scope (global or a project). One agent
+// runs both Do and Merge unless deliberately separated — the same unified shape
+// the task form and Quick defaults present — so the common case is one choice.
+// The standing Confirm-agent profile is not shown: review agents are configured
+// per layer in the Review route, right below the agents they gate.
+async function hydrateProfiles(scope, projectId, organizationId) {
   let handles = [], logins = [];
   try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
   let profiles = [];
   try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
+  profiles = profiles.filter((p) => p.role !== 'confirm');
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
-  list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles, logins, scope)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
+  const doP = profiles.find((p) => p.role === 'do');
+  const mergeP = profiles.find((p) => p.role === 'merge');
+  const rest = profiles.filter((p) => p !== doP && p !== mergeP);
+  const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
+  // unset/empty allowedAccounts ⇒ all allowed — normalize before comparing roles
+  const normAllowed = (p) => (p.allowedAccounts?.length ? [...p.allowedAccounts].sort() : [...allRefs].sort());
+  const essence = (p) => JSON.stringify({ provider: p.provider, model: p.model || '', effort: p.effort || '', maxTurns: p.maxTurns ?? null, accounts: normAllowed(p) });
+  const separate = !!(doP && mergeP && essence(doP) !== essence(mergeP));
+  const unified = doP && mergeP
+    ? { ...doP, id: '__unified__', name: 'Agent', role: 'do + merge', scope: doP.scope === 'project' || mergeP.scope === 'project' ? 'project' : doP.scope }
+    : null;
+  list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
+    : unified
+      ? `<div class="profiles-group">
+          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, handles, logins, scope)}</div>
+          <label class="agent-separate-toggle"><input type="checkbox" class="profiles-separate" ${separate ? 'checked' : ''}> Separate Do and Merge agent configurations</label>
+          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, handles, logins, scope)).join('')}</div>
+        </div>${rest.map((p) => profileRow(p, handles, logins, scope)).join('')}`
+      : profiles.map((p) => profileRow(p, handles, logins, scope)).join('');
+  list.querySelector('.profiles-separate')?.addEventListener('change', (e) => {
+    list.querySelector('.profiles-unified').hidden = e.target.checked;
+    list.querySelector('.profiles-separated').hidden = !e.target.checked;
+  });
   list.querySelectorAll('[data-profile]').forEach((card) => {
     const combo = card.querySelector('.pf-model-combo');
     const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
@@ -5750,27 +5806,69 @@ async function hydrateProfiles(scope, projectId) {
       refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
     });
   });
-  const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
   list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
     const card = b.closest('[data-profile]');
-    const orig = profiles.find((p) => p.id === b.dataset.saveprofile) || {};
     const checked = [...card.querySelectorAll('.pf-acct:checked')].map((c) => c.value);
     // all checked ⇒ store nothing (means "all", stays correct as accounts are added)
     const allowedAccounts = allRefs.length && checked.length < allRefs.length ? checked : undefined;
-    const profile = {
-      role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined, projectId: scope === 'project' ? projectId : undefined,
+    const knobs = {
       provider: card.querySelector('.pf-provider').value,
       model: card.querySelector('.pf-model').value.trim() || undefined,
       effort: card.querySelector('.pf-effort').value || undefined,
       maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
-      capabilities: orig.capabilities,
       allowedAccounts,
     };
-    try { await api('/api/profiles', { method: 'PUT', body: JSON.stringify(profile) }); toast('Profile saved'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
+    // The unified row IS the Do and Merge defaults: one Save writes both roles.
+    const targets = b.dataset.saveprofile === '__unified__' ? [doP, mergeP] : [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
+    try {
+      for (const orig of targets) {
+        await api('/api/profiles', { method: 'PUT', body: JSON.stringify({
+          role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined,
+          projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities, ...knobs,
+        }) });
+      }
+      await hydrateProfiles(scope, projectId, organizationId);
+      flashSaved($(`#profiles-list-${scope}`)?.querySelector(`[data-saveprofile="${b.dataset.saveprofile}"]`));
+    } catch (e) { toast(e.message, true); }
   }));
   list.querySelectorAll('[data-resetprofile]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api(`/api/profiles/${encodeURIComponent(b.dataset.resetprofile)}`, { method: 'DELETE' }); toast('Reset to inherited'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
+    const ids = b.dataset.resetprofile === '__unified__' ? [doP.id, mergeP.id] : [b.dataset.resetprofile];
+    try {
+      for (const id of ids) await api(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      toast('Reset to inherited');
+      hydrateProfiles(scope, projectId, organizationId);
+    } catch (e) { toast(e.message, true); }
   }));
+}
+
+// The Review route — who checks the work at Review: human layers, agent layers,
+// or none (auto-confirm). Stored with the shared task defaults (__common__/
+// confirm) but edited here, beside the Do/Merge agents it gates.
+async function hydrateReviewRoute(scope, projectId, organizationId) {
+  const box = $(`#review-route-${scope}`);
+  if (!box) return;
+  const field = schemaFor('software-dev').find((f) => f.name === 'confirm');
+  if (!field) { box.innerHTML = ''; return; }
+  let own = {};
+  let inherited = {};
+  try {
+    const orgQuery = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+    const d = await api(`/api/defaults/${projectId || 'global'}/software-dev${orgQuery}`);
+    own = d[scope].own;
+    inherited = d[scope].inherited;
+  } catch {}
+  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
+    <button class="btn primary sm" data-save-review-route>Save review route</button>`;
+  wireAgentFields(box);
+  wireFieldResets(box, [field]);
+  const saveButton = box.querySelector('[data-save-review-route]');
+  saveButton.addEventListener('click', async () => {
+    const values = collectForm(box.querySelector('.wf-form'), [field]);
+    try {
+      await saveCommonSettings(scope, projectId, organizationId, ['confirm'], values);
+      flashSaved(saveButton);
+    } catch (err) { toast(err.message, true); }
+  });
 }
 
 // The logins + API keys now live in the unified credential manager (#cred-editor-global:
@@ -5782,9 +5880,11 @@ async function hydrateAccounts() {
 
 function profilesCard(scope) {
   return `<div class="card agent-profile-settings" id="profiles-card-${scope}">
-    <div class="section-h">Agent profiles</div>
-    <p style="color:var(--ink-2);margin-top:0">Model, turn cap, and account pool for each workflow role.${scope === 'project' ? ' These override inherited defaults for this project.' : ''}</p>
+    <div class="section-h">Agents</div>
+    <p style="color:var(--ink-2);margin-top:0">Who does the work: model, turn cap, and account pool.${scope === 'project' ? ' Overrides the organization defaults for this project.' : ''}</p>
     <div id="profiles-list-${scope}">Loading…</div>
+    <div class="settings-divider"></div>
+    <div id="review-route-${scope}">Loading…</div>
   </div>`;
 }
 
@@ -5901,7 +6001,8 @@ function wireGlobalSettings(organizationId) {
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
   renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
-  hydrateProfiles('global');
+  hydrateProfiles('global', undefined, organizationId);
+  hydrateReviewRoute('global', undefined, organizationId);
   hydrateAuthorization('global');
   hydrateWorkflows();
   hydrateGitProfiles();
@@ -5980,7 +6081,7 @@ function wireGlobalSettings(organizationId) {
       } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
       $('#login-name').value = '';
       hydrateAccounts();
-      hydrateProfiles('global');
+      hydrateProfiles('global', undefined, organizationId);
     } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
   });
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
@@ -5991,10 +6092,14 @@ function wireGlobalSettings(organizationId) {
         : settingsFields(wf, 'global').filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       const values = collectForm(sec.querySelector('.wf-form'), fields);
       try {
-        const endpoint = organizationId && wf !== 'agent-queue'
-          ? `/api/organizations/${organizationId}/settings/${wf}` : `/api/settings/global/${wf}`;
-        await api(endpoint, { method: 'PUT', body: JSON.stringify({ values }) });
-        toast(wf === 'agent-queue' ? 'Installation host capacity saved' : `${wf} organization defaults saved`);
+        if (wf === '__common__') {
+          await saveCommonSettings('global', undefined, organizationId, fields.map((f) => f.name), values);
+        } else {
+          const endpoint = organizationId && wf !== 'agent-queue'
+            ? `/api/organizations/${organizationId}/settings/${wf}` : `/api/settings/global/${wf}`;
+          await api(endpoint, { method: 'PUT', body: JSON.stringify({ values }) });
+        }
+        flashSaved(b);
       } catch (e) { toast(e.message, true); }
     }),
   );
@@ -6055,64 +6160,82 @@ async function openInboxItem(item) {
   return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
 }
 
-let settingsSectionObserver;
+// The settings rail is real navigation, not a scroll-spy: exactly one section is
+// visible at a time, so each pane reads as a page with a single purpose instead
+// of a position in one endless scroll. The URL hash names the open pane (via
+// replaceState, so browsing sections doesn't pollute history) — a deep link like
+// /organization#settings-agents lands on its pane, and background renderMain
+// refreshes restore the same pane because the URL, not DOM state, holds it.
 function wireSettingsNavigation() {
-  settingsSectionObserver?.disconnect();
-  const links = [...document.querySelectorAll('.settings-nav a[href^="#"]')];
-  const sections = links.map((link) => document.querySelector(link.getAttribute('href'))).filter(Boolean);
-  const activate = (id) => links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${id}`));
-  if (!sections.length) return;
-  activate(sections[0].id);
-  settingsSectionObserver = new IntersectionObserver((entries) => {
-    const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-    if (visible[0]) activate(visible[0].target.id);
-  }, { rootMargin: '-10% 0px -72% 0px', threshold: 0 });
-  sections.forEach((section) => settingsSectionObserver.observe(section));
-  links.forEach((link) => link.addEventListener('click', () => activate(link.getAttribute('href').slice(1))));
-}
-
-function scrollToSettingsHash() {
-  if (!location.hash.startsWith('#settings-')) return;
-  requestAnimationFrame(() => requestAnimationFrame(() => document.querySelector(location.hash)?.scrollIntoView({ block: 'start' })));
-}
-
-function reorderSettingsSections(content, ids) {
-  if (!content) return;
-  const children = [...content.children];
-  const groups = new Map();
-  let current;
-  for (const child of children) {
-    if (child.classList.contains('settings-section-title')) current = child.id;
-    if (!current) continue;
-    if (!groups.has(current)) groups.set(current, []);
-    groups.get(current).push(child);
+  const layout = document.querySelector('.settings-layout');
+  if (!layout) return;
+  const content = layout.querySelector('.settings-content');
+  const links = [...layout.querySelectorAll('.settings-nav a[href^="#"]')];
+  if (!links.length || !content) return;
+  if (!content.querySelector('.settings-pane')) {
+    // Group each section title + the cards under it, then wrap the groups into
+    // panes in nav order (nav order is the canonical SPEC order; the templates
+    // may declare sections in any order).
+    const groups = new Map();
+    let current;
+    for (const child of [...content.children]) {
+      if (child.classList.contains('settings-section-title')) current = child.id;
+      if (!current) continue;
+      if (!groups.has(current)) groups.set(current, []);
+      groups.get(current).push(child);
+    }
+    for (const link of links) {
+      const id = link.getAttribute('href').slice(1);
+      const pane = document.createElement('section');
+      pane.className = 'settings-pane';
+      pane.dataset.pane = id;
+      for (const node of groups.get(id) || []) pane.append(node);
+      content.append(pane);
+    }
   }
-  for (const id of ids) for (const node of groups.get(id) || []) content.append(node);
+  const panes = [...content.querySelectorAll('.settings-pane')];
+  const activate = (id) => {
+    const target = panes.some((pane) => pane.dataset.pane === id) ? id : links[0].getAttribute('href').slice(1);
+    panes.forEach((pane) => pane.classList.toggle('active', pane.dataset.pane === target));
+    links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${target}`));
+  };
+  links.forEach((link) => {
+    // onclick assignment (not addEventListener) keeps re-wiring idempotent —
+    // renderMain and hydrateOrganizationView can both land here on one paint.
+    link.onclick = (event) => {
+      event.preventDefault();
+      history.replaceState(history.state, '', location.pathname + link.getAttribute('href'));
+      activate(link.getAttribute('href').slice(1));
+      $('#main')?.scrollTo?.(0, 0);
+      window.scrollTo(0, 0);
+    };
+  });
+  activate(location.hash.slice(1));
 }
 
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
-  return `<div class="organization-settings"><h1 class="page-title">Settings</h1>
-    <p class="settings-intro">${esc(org?.name || 'Organization')}</p>
+  return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">Settings</h1>
+    <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Misc.</a><button class="btn sm settings-new-org" id="create-organization">＋ New organization</button></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
-    <div class="settings-section-title" id="settings-people"><span>06</span><div>People &amp; authorization</div></div>
+    <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div><div id="org-authorization-slot"></div></div>
 
-    <div class="settings-section-title" id="settings-code"><span>01</span><div>Git &amp; GitHub</div></div>
+    <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>The GitHub connection and commit identities your projects share</small></div></div>
     <div class="card"><div class="section-h">GitHub connection</div><div id="org-github">Loading…</div><div id="org-git-accounts-slot"></div></div>
 
-    <div class="settings-section-title" id="settings-compute"><span>02</span><div>Compute<small>Where tasks run and what they may spend</small></div></div>
+    <div class="settings-section-title" id="settings-compute"><div>Compute<small>Where tasks run, how large each world is, and the monthly ceiling</small></div></div>
     <div class="card"><div class="section-h">Task execution</div><p class="task-sub">Choose where tasks run, how large each world is, when idle worlds pause, and the monthly cost ceiling. Provider credentials and templates are configured directly below the policy that uses them.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
     ${globalSettingsView(true)}
 
-    <div class="settings-section-title" id="settings-advanced"><span>08</span><div>Misc.</div></div><div id="org-misc-slot"></div>
+    <div class="settings-section-title" id="settings-advanced"><div>Advanced<small>Rarely needed — appearance, identity, safe mode, export</small></div></div><div id="org-misc-slot"></div>
     <details class="card settings-disclosure"><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
     <details class="card settings-disclosure"><summary><b>Export or delete organization</b><span>Data portability and permanent removal</span></summary><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></details>
     </div></div></div>`;
@@ -6126,9 +6249,7 @@ async function hydrateOrganizationView() {
   if (authorization && $('#org-authorization-slot')) $('#org-authorization-slot').append(authorization);
   for (const card of [$('#main [data-wf="agent-queue"]'), $('#appearance-card'), $('#resilience-card')])
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
-  reorderSettingsSections($('.settings-content'), ['settings-code', 'settings-compute', 'settings-agents', 'settings-defaults', 'settings-payments', 'settings-people', 'settings-installation', 'settings-advanced']);
   wireSettingsNavigation();
-  scrollToSettingsHash();
   await loadCollaboration().catch(() => {});
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
