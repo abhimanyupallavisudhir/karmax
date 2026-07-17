@@ -1,0 +1,128 @@
+// Verifies the organization-scoped URL scheme in app.js: every page lives under
+// its organization's slug, project/task permalinks nest beneath it, and the
+// pre-organization URLs (/dashboard, /organization, /projects/:name/…) still parse
+// so they can be canonicalised to the new form.
+// Run: node web/routing.test.cjs
+const fs = require('fs');
+const path = require('path');
+
+const src = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
+
+// Pull a top-level `function`/`const` definition out of the browser script and eval
+// it here; its free identifiers resolve to the globals defined below.
+function extractFn(name) {
+  const start = src.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`${name} not found`);
+  let depth = 0, i = src.indexOf('{', start);
+  for (let j = i; j < src.length; j++) {
+    if (src[j] === '{') depth++;
+    else if (src[j] === '}' && --depth === 0) return src.slice(start, j + 1);
+  }
+  throw new Error(`unterminated ${name}`);
+}
+// Strip the `const` keyword so a direct sloppy-mode eval assigns the value to a
+// global (block-scoped `const`/`let` would not leak out of the eval).
+function extractConst(name) {
+  const start = src.indexOf(`const ${name} =`);
+  if (start < 0) throw new Error(`${name} not found`);
+  const end = src.indexOf(';', start);
+  return src.slice(start, end + 1).replace(/^const /, '');
+}
+
+// ── State the routing helpers close over ──────────────────────────────────────
+const S = {
+  organizations: [
+    { id: 'org_acme', name: 'Acme Inc', slug: 'acme' },
+    { id: 'org_globex', name: 'Globex', slug: 'globex' },
+  ],
+  projects: [
+    { id: 'P1', name: 'Website Redesign', organizationId: 'org_acme' },
+    { id: 'P2', name: 'Mobile App', organizationId: 'org_globex' },
+    // A project whose slug collides with another org's project name, to prove
+    // slug resolution is org-scoped.
+    { id: 'P3', name: 'Mobile App', organizationId: 'org_acme' },
+  ],
+  organizationId: 'org_acme',
+  projectId: 'P1',
+  attemptGroup: { attempts: [] },
+  tasks: [{ id: 'T9', projectId: 'P1', num: 42 }],
+};
+global.S = S;
+
+// Bring the real declarations into scope.
+eval(extractConst('TASK_TABS'));
+eval(extractConst('ORG_VIEWS'));
+eval(extractFn('slugify'));
+eval(extractFn('projectSlug'));
+eval(extractFn('projectById'));
+eval(extractFn('projectBySlug'));
+eval(extractFn('orgSlug'));
+eval(extractFn('organizationById'));
+eval(extractFn('organizationBySlug'));
+eval(extractFn('currentOrg'));
+eval(extractFn('orgBase'));
+eval(extractFn('parseRoute'));
+eval(extractFn('projectRoute'));
+eval(extractFn('globalRoute'));
+eval(extractFn('taskRecord'));
+eval(extractFn('taskUrl'));
+global.location = { pathname: '/' };
+
+let pass = 0, fail = 0;
+const eq = (actual, expected, msg) => {
+  const a = JSON.stringify(actual), e = JSON.stringify(expected);
+  if (a === e) pass++;
+  else { fail++; console.error(`FAIL: ${msg}\n  expected ${e}\n  got      ${a}`); }
+};
+
+// ── URL builders produce the org-scoped scheme ────────────────────────────────
+eq(projectRoute('P1'), '/acme/website-redesign', 'project tasks route omits the tasks segment');
+eq(projectRoute('P1', 'queue'), '/acme/website-redesign/queue', 'a non-default project tab is appended');
+eq(projectRoute('P1', 'settings'), '/acme/website-redesign/settings', 'project settings route');
+eq(projectRoute('P2'), '/globex/mobile-app', 'project route uses the project’s OWN org, not the current one');
+eq(taskUrl('T9'), '/acme/website-redesign/tasks/42', 'task permalink nests under /<org>/<project>/tasks/:num');
+eq(globalRoute('dashboard'), '/acme/dashboard', 'dashboard route is org-prefixed');
+eq(globalRoute('organization'), '/acme/settings', 'internal tab "organization" → URL segment "settings"');
+eq(globalRoute('inbox'), '/acme/inbox', 'inbox route is org-prefixed');
+eq(globalRoute('organization', organizationById('org_globex')), '/globex/settings', 'globalRoute honours an explicit org');
+
+// ── parseRoute round-trips the new scheme ─────────────────────────────────────
+eq(parseRoute('/acme/dashboard'), { name: 'global', org: 'acme', tab: 'dashboard' }, 'parse /<org>/dashboard');
+eq(parseRoute('/acme/settings'), { name: 'global', org: 'acme', tab: 'organization' }, 'parse /<org>/settings');
+eq(parseRoute('/acme/inbox'), { name: 'global', org: 'acme', tab: 'inbox' }, 'parse /<org>/inbox');
+eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: null }, 'parse bare /<org> as org home');
+eq(parseRoute('/acme/website-redesign'),
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null },
+  'parse /<org>/<project> as the tasks tab');
+eq(parseRoute('/acme/website-redesign/queue'),
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null },
+  'parse a project tab');
+eq(parseRoute('/acme/website-redesign/tasks/42'),
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null },
+  'parse a task permalink');
+eq(parseRoute('/acme/website-redesign/tasks/42/checkin'),
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin' },
+  'parse a task permalink pinned to a tab');
+
+// ── Round-trip: build → parse → resolve ───────────────────────────────────────
+const r = parseRoute(projectRoute('P2'));
+eq(organizationBySlug(r.org)?.id, 'org_globex', 'built project route resolves back to its org');
+eq(projectBySlug(r.slug, organizationBySlug(r.org).id)?.id, 'P2', 'and back to the project within that org');
+
+// ── Org-scoped slug resolution (collision across orgs) ────────────────────────
+eq(projectBySlug('mobile-app', 'org_acme')?.id, 'P3', 'same slug resolves per-org (acme)');
+eq(projectBySlug('mobile-app', 'org_globex')?.id, 'P2', 'same slug resolves per-org (globex)');
+
+// ── Legacy URLs still parse and are flagged for canonicalisation ──────────────
+eq(parseRoute('/dashboard'), { name: 'global', tab: 'dashboard', legacy: true }, 'legacy /dashboard');
+eq(parseRoute('/organization'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /organization');
+eq(parseRoute('/settings'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /settings alias');
+eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', legacy: true }, 'legacy /inbox');
+eq(parseRoute('/projects/website-redesign/tasks/42'),
+  { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, legacy: true },
+  'legacy /projects/:name/tasks/:num');
+eq(parseRoute('/invite'), { name: 'invite' }, 'invite stays a top-level route');
+eq(parseRoute('/'), { name: 'home' }, 'root is home');
+
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);
