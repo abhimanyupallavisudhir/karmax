@@ -36,10 +36,10 @@ upgrades, remote-world cost policy, and the laptop↔cloud Git handoff.
 - The [Temporal CLI](https://temporal.io/setup/install-temporal-cli) at
   `~/.temporalio/bin/temporal` (or set `TEMPORAL_CLI`). `npm start` runs the dev
   server for you.
-- A coding-agent credential for real work (auto-detected, in order):
-  `ANTHROPIC_API_KEY` → a Claude Code login (`~/.claude/.credentials.json`, via
-  the Claude Agent SDK) → `OPENAI_API_KEY` (Codex). With none, karmax runs a
-  **mock agent** and prints a loud warning — it will not do real work.
+- A Claude Code and/or Codex login for real work. Connect and choose agents in
+  **Settings**; each task role can use either provider. API keys are also
+  supported for either provider. A fallback provider is used only when a role
+  has not explicitly selected one.
 - Docker (optional) for the container world provider.
 
 To do real work, open **Settings**, point the project at a git repo directory,
