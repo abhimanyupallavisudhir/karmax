@@ -192,6 +192,14 @@ function isTaskView(value: Record<string, unknown>): boolean {
     && typeof value.state === 'object';
 }
 
+// SPA path for an organization's settings page (/<org>/settings). Falls back to
+// the pre-organization /settings alias, which the client still resolves, when the
+// org (or its slug) is unknown.
+function organizationSettingsPath(store: Store, organizationId: string): string {
+  const slug = store.getOrganization(organizationId)?.slug;
+  return slug ? `/${slug}/settings` : '/settings';
+}
+
 /**
  * Build the public wire projection of gateway data. Provider handles are
  * capabilities: even though they contain no API key, exposing sandbox ids,
@@ -635,7 +643,7 @@ export class Gateway {
       if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub authorization link is invalid, expired, or belongs to another user.');
       try {
         await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req));
-        res.writeHead(303, { location: `/organization?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
+        res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
         return this.githubCallbackPage(res, 502, `GitHub authorization failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -657,7 +665,7 @@ export class Gateway {
           res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl) });
           return void res.end();
         }
-        res.writeHead(303, { location: `/organization?github=connected&organizationId=${encodeURIComponent(pending.organizationId)}` });
+        res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=connected&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
         return this.githubCallbackPage(res, 502, `GitHub could not be connected: ${error instanceof Error ? error.message : String(error)}`);

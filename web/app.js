@@ -73,50 +73,96 @@ function taskRecord(id) {
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
 // Every page is a host-owned route; the browser URL is the single source of truth
-// for {project, tab, open task}. Workflows/coordinators never own a URL — a page
-// like the merge queue is a first-party route that projects coordinator/task state.
-// Projects are addressed by a slug of their name; tasks are numbered per project.
+// for {organization, project, tab, open task}. Workflows/coordinators never own a
+// URL — a page like the merge queue is a first-party route that projects
+// coordinator/task state. Every page lives under its organization's slug; projects
+// are addressed by a slug of their name; tasks are numbered per project.
 // Scheme:
-//   /                                    → home (redirects to a project's tasks)
-//   /dashboard                           → global dashboard
-//   /settings                            → organization settings (legacy alias)
-//   /projects/:name/tasks                → task list (also /queue, /activity, /settings)
-//   /projects/:name/tasks/:num           → the task's own page (permalink)
-//   /projects/:name/tasks/:num/:tab      → the task page pinned to one of its tabs
+//   /                                    → home (redirects into the current org)
+//   /<org>                               → org home (redirects to a project or dashboard)
+//   /<org>/dashboard                     → organization dashboard
+//   /<org>/settings                      → organization settings
+//   /<org>/inbox                         → inbox
+//   /<org>/<project>                     → task list (also /queue, /activity, /settings)
+//   /<org>/<project>/tasks/:num          → the task's own page (permalink)
+//   /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
+// Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
+// parsed and then canonicalised to the org form.
 function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
-// Resolve a URL slug back to a project. Matches the slugified name (the common,
-// human case), falling back to a raw project id for safety. On a slug collision
-// the first-created project wins (names are expected distinct).
-function projectBySlug(slug) {
+// Resolve a URL slug back to a project, optionally scoped to one organization
+// (project slugs need only be unique within their org). Matches the slugified name
+// (the common, human case), falling back to a raw project id for safety. On a slug
+// collision the first-created project wins (names are expected distinct).
+function projectBySlug(slug, organizationId) {
   const s = slugify(slug);
-  return (S.projects || []).find((p) => slugify(p.name) === s) || (S.projects || []).find((p) => p.id === slug);
+  const pool = (S.projects || []).filter((p) => !organizationId || p.organizationId === organizationId);
+  return pool.find((p) => slugify(p.name) === s) || pool.find((p) => p.id === slug)
+    || (S.projects || []).find((p) => p.id === slug);
 }
+
+// Organizations own the top path segment. They carry a persisted slug; fall back
+// to a slug of the name for older records that predate it.
+function orgSlug(o) { return o ? (o.slug || slugify(o.name)) : ''; }
+function organizationById(id) { return (S.organizations || []).find((o) => o.id === id); }
+function organizationBySlug(slug) {
+  const s = slugify(slug);
+  return (S.organizations || []).find((o) => orgSlug(o) === s) || (S.organizations || []).find((o) => o.id === slug);
+}
+// The organization whose slug prefixes every URL — the one selected in the
+// switcher, else the org owning the current project, else the first known org.
+function currentOrg() {
+  return organizationById(S.organizationId)
+    || organizationById(projectById(S.projectId)?.organizationId)
+    || (S.organizations || [])[0];
+}
+// `/<org>` prefix for the current (or a given) organization; '' when none is known.
+function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
+
+// Second-segment words that name an organization-level view rather than a project.
+const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox' };
 
 function parseRoute(pathname) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
-  if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard' };
-  if (seg[0] === 'settings') return { name: 'global', tab: 'organization' };
-  if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox' };
-  if (seg[0] === 'organization') return { name: 'global', tab: 'organization' };
   if (seg[0] === 'invite') return { name: 'invite' };
+  // Pre-organization URLs — resolved, then canonicalised to the org form.
+  if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
+  if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
+  if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
     const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-    return { name: 'project', slug: seg[1], tab, taskKey, taskTab };
+    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, legacy: true };
   }
-  return { name: 'home' };
+  // New scheme: /<org>/… — everything is namespaced under the organization slug.
+  const org = seg[0];
+  if (!seg[1]) return { name: 'global', org, tab: null };            // /<org> → org home
+  if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
+  const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+  const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
+  const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
+  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab };
 }
 
-// The list/tab route for a project (by id), addressed by name-slug.
+// The list/tab route for a project (by id): /<org>/<project> for the default
+// tasks tab, with the tab appended for the others.
 function projectRoute(pid, tab = 'tasks') {
   const p = projectById(pid);
-  return p ? `/projects/${projectSlug(p)}/${tab}` : '/dashboard';
+  if (!p) return globalRoute('dashboard');
+  const base = `${orgBase(organizationById(p.organizationId)) || orgBase()}/${projectSlug(p)}`;
+  return tab === 'tasks' ? base : `${base}/${tab}`;
+}
+
+// An organization-level route (dashboard / settings / inbox) under the current
+// (or a given) org's slug. Internal tab key 'organization' → URL segment 'settings'.
+function globalRoute(tab, org = currentOrg()) {
+  const seg = tab === 'organization' ? 'settings' : tab;
+  return `${orgBase(org)}/${seg}`;
 }
 
 // Navigate: update the URL then reconcile app state to it. `replace` swaps the
@@ -144,9 +190,32 @@ async function applyRoute() {
   const r = parseRoute(location.pathname);
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
-    return go(pid ? projectRoute(pid) : '/dashboard', { replace: true });
+    return go(pid ? projectRoute(pid) : globalRoute('dashboard'), { replace: true });
   }
   if (r.name === 'global') {
+    // Select the organization named in the URL (if any) before painting.
+    if (r.org) {
+      const org = organizationBySlug(r.org);
+      if (org && org.id !== S.organizationId) {
+        S.organizationId = org.id;
+        S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        await loadCollaboration().catch(() => {});
+      }
+    }
+    // Bare /<org> → that org's default project (or its dashboard); pre-org URLs
+    // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
+    // redirect when the canonical path actually differs, so an unresolvable slug
+    // (or a workspace with no organizations yet) renders instead of looping.
+    if (!r.tab) {
+      const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id;
+      const dest = pid ? projectRoute(pid) : globalRoute('dashboard');
+      if (dest !== location.pathname) return go(dest, { replace: true });
+      r.tab = 'dashboard'; // fall through to a real page
+    }
+    if (r.legacy) {
+      const dest = globalRoute(r.tab);
+      if (dest !== location.pathname) return go(dest, { replace: true });
+    }
     closeTaskDom();
     S.tab = r.tab;
     renderRail();
@@ -155,10 +224,22 @@ async function applyRoute() {
     if (r.tab === 'organization') hydrateOrganizationView();
     return;
   }
-  // project / task routes → resolve the project (by name-slug) + optional open task
-  const proj = projectBySlug(r.slug);
+  // project / task routes → resolve the org + project (by name-slug) + optional open task
+  if (r.org) {
+    const org = organizationBySlug(r.org);
+    if (org) S.organizationId = org.id;
+  }
+  const proj = projectBySlug(r.slug, S.organizationId) || projectBySlug(r.slug);
   if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
+  // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
+  if (r.legacy) {
+    const dest = r.taskKey
+      ? `${projectRoute(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
+      : projectRoute(proj.id, r.tab);
+    return go(dest, { replace: true });
+  }
   const pid = proj.id;
+  S.organizationId = proj.organizationId || S.organizationId;
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
@@ -196,13 +277,13 @@ async function applyRoute() {
   if (tab === 'dashboard') renderDashboard();
 }
 
-// The permalink for a task (/projects/:name/tasks/:num) — used for in-place
+// The permalink for a task (/<org>/<project>/tasks/:num) — used for in-place
 // navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click).
 function taskUrl(id) {
   const rec = taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
-  return p ? `/projects/${projectSlug(p)}/tasks/${keyPart}` : location.pathname;
+  return p ? `${projectRoute(p.id)}/tasks/${keyPart}` : location.pathname;
 }
 
 // Push a task permalink and remember where to return on close — but only when
@@ -1279,14 +1360,14 @@ function renderShell() {
   // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
   $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#theme').addEventListener('click', toggleTheme);
-  $('#bell').addEventListener('click', () => go('/inbox'));
+  $('#bell').addEventListener('click', () => go(globalRoute('inbox')));
   $('#org-switcher')?.addEventListener('change', async (e) => {
     if (e.target.value === '__new') return createOrganization();
     S.organizationId = e.target.value;
     const project = S.projects.find((p) => p.organizationId === S.organizationId);
     S.projectId = project?.id || null;
     await loadCollaboration().catch(() => {});
-    return go(project ? projectRoute(project.id) : '/organization');
+    return go(project ? projectRoute(project.id) : globalRoute('organization'));
   });
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
@@ -1315,7 +1396,7 @@ function renderRail() {
     e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
-  $('#rail-organization')?.addEventListener('click', () => go('/organization'));
+  $('#rail-organization')?.addEventListener('click', () => go(globalRoute('organization')));
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
   $('#rail-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
@@ -1325,12 +1406,11 @@ function renderRail() {
 }
 
 function switchTab(tab) {
-  if (tab === 'dashboard') return go('/dashboard');
-  if (tab === 'global') return go('/organization');
-  if (tab === 'inbox') return go('/inbox');
-  if (tab === 'organization') return go('/organization');
+  if (tab === 'dashboard') return go(globalRoute('dashboard'));
+  if (tab === 'global' || tab === 'organization') return go(globalRoute('organization'));
+  if (tab === 'inbox') return go(globalRoute('inbox'));
   const pid = S.projectId || S.projects[0]?.id;
-  return go(pid ? projectRoute(pid, tab) : '/dashboard');
+  return go(pid ? projectRoute(pid, tab) : globalRoute('dashboard'));
 }
 
 // Preserve the focused field (value + caret) across a renderMain() innerHTML
@@ -2755,7 +2835,7 @@ async function openTaskForm(workflow, draft, seedText) {
 }
 
 // ── task page ─────────────────────────────────────────────────────────────────
-// A task opens as a PAGE of its own (route /projects/:name/tasks/:num), rendered
+// A task opens as a PAGE of its own (route /<org>/<project>/tasks/:num), rendered
 // into #main with four tabs — Overview (pipeline, review, widgets, sub-tasks,
 // notes), Check-in (agent conversations + the ephemeral terminal), Parameters
 // (priority/tags, workflow params, credentials) and Advanced (event log,
@@ -2996,7 +3076,7 @@ async function refreshTask() {
 // (the ← button, Esc and the palette all route through here).
 function closeTask() {
   const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
-  const back = S.returnRoute || (pid ? projectRoute(pid) : '/dashboard');
+  const back = S.returnRoute || (pid ? projectRoute(pid) : globalRoute('dashboard'));
   S.returnRoute = null;
   return go(back, { replace: true });
 }
@@ -5183,10 +5263,10 @@ function settingsView(proj) {
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
     <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
-    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="/organization#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
+    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
     <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
-    <div class="card"><a class="btn sm organization-settings-link" href="/organization#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
+    <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
     ${profilesCard('project')}
@@ -5376,7 +5456,7 @@ function wireSettingsView(proj) {
         const next = S.projects[0];
         if (next) return go(projectRoute(next.id));
         S.projectId = null;
-        return go('/dashboard');
+        return go(globalRoute('dashboard'));
       }
       renderRail();
       renderMain();
@@ -6077,7 +6157,7 @@ async function openInboxItem(item) {
   const project = projectById(item.task.projectId); if (!project) return;
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
-  return go(`/projects/${projectSlug(project)}/tasks/${item.task.num ?? item.task.id}`);
+  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
 }
 
 // The settings rail is real navigation, not a scroll-spy: exactly one section is
@@ -6337,7 +6417,7 @@ async function createOrganization() {
     S.projectId = null;
     await loadCollaboration().catch(() => {});
     renderShell();
-    await go('/organization');
+    await go(globalRoute('organization'));
   } catch (error) { toast(error.message, true); if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; }
 }
 
@@ -6467,7 +6547,7 @@ const HOST_COMMANDS = [
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g g', run: () => switchTab('global') },
   { id: 'nav.projects', title: 'Go to projects', key: 'g p', run: () => focusRail() },
-  { id: 'nav.notifications', title: 'Go to inbox', key: 'g n', run: () => go('/inbox') },
+  { id: 'nav.notifications', title: 'Go to inbox', key: 'g n', run: () => go(globalRoute('inbox')) },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -6822,7 +6902,7 @@ function openGlobalSearch() {
         return {
           group: 'Tasks', title: task.title,
           sub: `${number}${project.name} · ${stateLabel}`,
-          run: () => go(`/projects/${projectSlug(project)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`),
+          run: () => go(`${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`),
         };
       }),
     ];
