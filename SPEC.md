@@ -383,7 +383,7 @@ The philosophy is maximal autonomy within bounded, auditable controls:
 
 A flat set of namespaced capabilities (`task:create`, `task:conversation:fork`, `project:settings:write`, `credential:write`, `merge-into:<repo>:<branch>`, ...). Principals are **humans, tasks, and system services**. Grants are scoped global/project; a token records its originating task for provenance but that id is not itself an object ACL. Project scope controls visibility across tasks, which lets an authorized agent discover and coordinate peer tasks without receiving global access.
 
-Humans choose one of four job-shaped authorization profiles rather than a permission checklist: **Developer**, **Project maintainer**, **Automation operator**, and **Administrator**. The profiles and the default for new tasks are ordinary configurable policy at global scope with project overlays. See `PLAN-authorization.md` for the capability matrix.
+Humans choose one of four job-shaped authorization profiles rather than a permission checklist: **Developer**, **Project maintainer**, **Automation operator**, and **Administrator**. Membership establishes scope; it is not a second role system. A hidden protected-owner marker exists solely to preserve one recovery principal and grants no separate authority. Profiles are configurable at organization scope with project overlays. See `PLAN-authorization.md` for the capability matrix.
 
 ### 8.2 Attenuation
 
@@ -458,7 +458,7 @@ The host shell and core modules are **first-party**, built on the same contribut
 
 - **Task list** — the primary surface (per project / task list).
 - **Merge queue UI** — ordered queue, reorder, position, cancel.
-- **Settings** — one single-column organization surface with a sticky section rail, ordered People → GitHub → Compute → Task defaults → Agents → Installation → Advanced, plus project settings. The organization owns provider connections, execution policy, workflow defaults, members, teams, the GitHub connection, and identity. Repository selection/creation belongs to the project that will use it. People is the sole human membership surface; Agent permissions only configures task-agent profiles and never presents a second human-account list. A project inherits the organization execution policy and may select another connected provider/pool or a tighter budget; workflow-specific forms never duplicate infrastructure settings.
+- **Settings** — matching organization and project surfaces with sticky section rails: Task defaults, Git & GitHub, Compute, Agent logins (organization only), Payments, People & authorization, Workflows, and Misc. Shared task fields render once and are consumed by every workflow declaring them; dedicated workflow blocks contain only genuinely unique fields. Repository selection/creation belongs to the project that uses it.
 - **Inbox** — one full page opened from the top-bar attention icon; never a second sidebar destination or notification popover.
 
 Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
@@ -473,8 +473,8 @@ the per-user inbox is a materialized projection of those workflow events.
 Just as a workflow declares its events (§5), capabilities (§8), and UI slots (§10.1), it declares its **parameters**: a typed `params` schema in the manifest. This single declaration drives three surfaces, so there is exactly one source of truth and no per-surface guessing (the "declare, don't guess" rule, §0):
 
 1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, copy-globs, PR toggle, and workflow-owned Review route).
-2. **The project-settings form** — per-enabled-workflow defaults at the project scope. Repository sources are the one deliberate lift-out: they are a project resource shared by repo-oriented workflows and render once beside project access, not once per workflow.
-3. **The organization-settings form** — the same per-workflow form at organization scope (the schema retains the historical `global` scope spelling on the wire).
+2. **The project-settings form** — shared task defaults plus workflow-unique fields at project scope. Repository sources render once as a repeatable datalist accepting connected GitHub SSH URLs or, when self-hosted, local paths.
+3. **The organization-settings form** — the matching shared-default model at organization scope (the schema retains the historical `global` spelling on the wire). Shared values live in `__common__`; historical workflow rows remain compatible overlays.
 
 **Field model.** Each parameter is a `FieldSpec`: `{ name, type, label, help?, required?, options?, default?, scopes, bind, role? }`.
 
@@ -503,7 +503,7 @@ The `agent` field type is the reusable control for choosing the agent that runs 
 
 The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.
 
-**Quick-task defaults.** A task can be created two ways: from the expanded task form (§10.4.1) where every field is set explicitly, or from the **quick one-line composer**, which sets only a prompt and takes everything else from defaults. Those two paths can want *different* defaults — e.g. quick captures should auto-confirm while considered, full-form tasks should not. So alongside the general per-workflow defaults, each of the project- and global-settings pages carries a **"Quick task defaults"** section: the same declared field schema, saved to a separate `quick:`-namespaced overlay that applies **only** to tasks added from the quick box (`create_task({ quick: true })`).
+**Quick-task defaults.** Each scope has one **Different defaults for Quick tasks?** switch. Off means quick tasks use regular defaults. On enables one shared `quick:` overlay; project Quick defaults inherit from the organization Quick defaults.
 
 Quick defaults are purely opt-in and inherit from the general defaults until a field is set, so the overlay stack for a quick task is (highest → lowest precedence):
 
@@ -511,7 +511,7 @@ Quick defaults are purely opt-in and inherit from the general defaults until a f
 task override → project-quick → global-quick → project-general → global-general → field default
 ```
 
-This realizes the two inheritances the settings UI exposes: the **global** quick defaults inherit from the general global defaults (one "Reset to inherited" button per field); the **project** quick defaults inherit from *either* the global quick defaults (their natural parent) *or* the project's general defaults (two "Reset to inherited" buttons per field — ↺ Global quick / ↺ Project default — each snapping the field to that source). Full-form tasks skip the quick layers entirely, so the two paths stay independent.
+Disabling a scope's Quick overlay removes it from this chain without deleting its values. Full-form tasks skip the Quick layers entirely.
 
 ### 10.6 URLs and task numbers — every view is bookmarkable
 

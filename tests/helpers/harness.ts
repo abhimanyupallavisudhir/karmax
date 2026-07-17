@@ -84,7 +84,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   let runPromise = worker.run();
 
   const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider });
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus });
   const gateways: Array<() => Promise<void>> = [];
 
   return {

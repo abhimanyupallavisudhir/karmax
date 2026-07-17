@@ -50,5 +50,19 @@ ok(html.includes('npm test') && html.includes('completed'), 'agent action and it
 ok(html.includes('<time'), 'timestamps are rendered');
 ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown exactly once');
 
+// A follow-up accepted while the agent is still running is journaled before the
+// workflow republishes its transcript, so it must appear from the event alone.
+const followUp = { id: 'u-live', role: 'user', text: 'One more requirement', ts: 1710000005000 };
+S.taskEvents.push({ seq: 5, ts: followUp.ts, type: 'conversation.message', payload: { role: 'do', message: followUp } });
+let liveEntries = conversationEntries(transcript);
+ok(liveEntries.some((entry) => entry.message?.id === 'u-live'), 'mid-turn user messages render from the durable event');
+
+// Optimistic rendering and the WebSocket can both carry the event, then the
+// workflow snapshot eventually catches up. All three copies still render once.
+S.taskEvents.push({ seq: 6, ts: followUp.ts, type: 'conversation.message', payload: { role: 'do', message: followUp } });
+transcript.messages.push(followUp);
+liveEntries = conversationEntries(transcript);
+ok(liveEntries.filter((entry) => entry.message?.id === 'u-live').length === 1, 'event and stored transcript copies are de-duplicated');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
