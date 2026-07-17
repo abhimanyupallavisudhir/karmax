@@ -416,6 +416,7 @@ function renderAgentField(f, spec, inherited) {
   const e = spec || inh; // prefill with the effective spec
   const provider = e.provider || 'claude';
   const role = f.role || f.name;
+  const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div class="agent-controls">
       <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
@@ -426,11 +427,12 @@ function renderAgentField(f, spec, inherited) {
       </div>
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
-    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</summary>
-      <button type="button" class="btn sm af-resume-pick" style="margin-top:6px">⌕ Search tasks to fork from…</button>
+    <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> ${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</label>
+    <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
+      <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
-    </details>
+      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+    </div>
   </div>`;
 }
 
@@ -445,6 +447,7 @@ function resumeChosenInner(rf, task) {
 // Read an agent box's fork/resume choice back out: the picker's {taskId, role}
 // from data-resume, with a pasted provider session id merged on top.
 function readResume(box) {
+  if (!box.querySelector('.af-resume-enabled')?.checked) return undefined;
   let resumeFrom;
   try { resumeFrom = JSON.parse(box.querySelector('.af-resume-chosen')?.dataset.resume || 'null') || undefined; } catch {}
   const sessionId = box.querySelector('.af-resume-session')?.value.trim();
@@ -644,7 +647,7 @@ function wireCombo(combo, getOptions, onChange) {
   });
 }
 
-// Wire one agent box's controls: provider→model combobox + fork search (no toggle).
+// Wire one agent box's controls: provider→model combobox + opt-in fork search.
 function wireAgentBox(box) {
   const combo = box.querySelector('.af-model-combo');
   const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
@@ -656,22 +659,57 @@ function wireAgentBox(box) {
   // Fork-from search: the full task-picker overlay in agent mode (archived tasks
   // included — the completed ones are the ones you most often fork from).
   const chosen = box.querySelector('.af-resume-chosen');
-  const setResume = (rf, task) => {
+  const enabled = box.querySelector('.af-resume-enabled');
+  const panel = box.querySelector('.af-resume-panel');
+  const provider = box.querySelector('.af-provider');
+  const syncForkState = () => {
+    if (panel) panel.hidden = !enabled?.checked;
+    let taskFork;
+    try { taskFork = enabled?.checked && !!JSON.parse(chosen?.dataset.resume || 'null')?.taskId; } catch { taskFork = false; }
+    // Provider/session identity must match for a native fork. Model and effort are
+    // intentionally left editable: both adapters support retuning those knobs.
+    if (provider) provider.disabled = !!taskFork;
+    box.classList.toggle('af-has-task-fork', !!taskFork);
+  };
+  const applySourceAgent = (session) => {
+    if (!session) return;
+    if (session.provider && provider) provider.value = session.provider;
+    if (session.model !== undefined) box.querySelector('.af-model').value = session.model || '';
+    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+    const effort = box.querySelector('.af-effort');
+    if (effort && session.effort && [...effort.options].some((o) => o.value === session.effort)) effort.value = session.effort;
+  };
+  const setResume = (rf, task, session) => {
     if (!chosen) return;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
+    if (rf) applySourceAgent(session);
+    syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
   chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
+  enabled?.addEventListener('change', () => {
+    if (!enabled.checked) {
+      // Turning the feature off is also a real parameter change. Clear the
+      // dormant source so checking it again cannot silently re-lock a provider
+      // the user customized while the fork was off.
+      if (chosen) { chosen.dataset.resume = 'null'; chosen.innerHTML = ''; }
+      const session = box.querySelector('.af-resume-session');
+      if (session) session.value = '';
+    }
+    syncForkState();
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+  });
   box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
     openTaskPicker({
       title: 'Fork a previous agent',
       hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
+      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
     }),
   );
+  syncForkState();
 }
 function wireAgentFields(root) {
   root.querySelectorAll('[data-agent-group]').forEach((group) => {
