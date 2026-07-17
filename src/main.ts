@@ -62,13 +62,6 @@ async function main() {
         `     the exact condition behind the July-5 OOM (karmax#4). Stop the extras unless this is deliberate.\n`,
     );
   }
-  if (provider === 'mock') {
-    console.log('  ⚠  NO AGENT CREDENTIALS DETECTED — running with the MOCK agent (no real work).');
-    console.log('     Set OPENAI_API_KEY or ANTHROPIC_API_KEY, or log in to Claude Code, then restart.\n');
-  } else {
-    console.log(`  • Agent provider: ${provider} (${reason})`);
-  }
-
   // ── Temporal dev server (SQLite-backed, dynamic ports) ──
   // One long-lived server, reused across restarts/reloads (see dev-server.ts):
   // spawning a fresh one per reload against the same SQLite file is what wedges
