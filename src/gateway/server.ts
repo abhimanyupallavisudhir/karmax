@@ -20,7 +20,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { Provider, ProjectConfig, PrincipalRef } from '../domain/types.js';
+import { AgentSpec, Provider, ProjectConfig, PrincipalRef } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -1939,19 +1939,38 @@ export class Gateway {
       if (sessMatch && method === 'GET') {
         const id = sessMatch[1]!;
         const t = store.getTask(id);
-        // Each role → { id, home?, provider? } so the UI can build a CLI resume
-        // command targeting the right CONFIG_DIR/CODEX_HOME (provider sessions are
-        // home-bound). `home` is omitted for API-key/stateless sessions.
-        const out: Record<string, { id: string; home?: string; provider?: string }> = {};
+        // Include the exact effective agent selection captured at queue time (and
+        // kept current after an accepted in-flight retune). Besides powering the
+        // CLI fork command, the expanded task form uses this to prefill a newly
+        // selected fork with the source agent's provider/model/effort.
+        const agents = (await api.getTaskView(token, id).catch(() => undefined))?.agents;
+        const out: Record<string, { id: string; home?: string; provider?: string; model?: string; effort?: AgentSpec['effort'] }> = {};
         for (const role of ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm']) {
           const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
           const s = store.kvGet(`session:${sessionTaskId}:${role}`);
           if (!s) continue;
           let home: string | undefined;
           let provider: string | undefined;
+          let model: string | undefined;
+          let effort: AgentSpec['effort'];
           const meta = store.kvGet(`sessionmeta:${sessionTaskId}:${role}`);
-          if (meta) { try { const m = JSON.parse(meta); home = m.home || undefined; provider = m.provider || undefined; } catch { /* ignore */ } }
-          out[role] = { id: s, ...(home ? { home } : {}), ...(provider ? { provider } : {}) };
+          if (meta) {
+            try {
+              const m = JSON.parse(meta);
+              home = m.home || undefined;
+              provider = m.provider || undefined;
+              model = m.model || undefined;
+              effort = m.effort || undefined;
+            } catch { /* ignore */ }
+          }
+          const spec = agents?.[role];
+          out[role] = {
+            id: s,
+            ...(home ? { home } : {}),
+            ...(spec?.provider || provider ? { provider: spec?.provider ?? provider } : {}),
+            ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
+            ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
+          };
         }
         return this.json(res, 200, out);
       }

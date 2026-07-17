@@ -886,7 +886,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             store.kvSet(`session:${conversationTaskId}:${args.role}`, s);
             store.kvSet(
               `sessionmeta:${conversationTaskId}:${args.role}`,
-              JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
+              JSON.stringify({
+                home: resolvedAuth?.configHome ?? '',
+                provider: profile.provider,
+                ...(profile.model ? { model: profile.model } : {}),
+                ...(profile.effort ? { effort: profile.effort } : {}),
+              }),
             );
             record(args.taskId, 'session.started', { role: args.role });
           },
@@ -947,7 +952,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         store.kvSet(`session:${conversationTaskId}:${args.role}`, result.session);
         store.kvSet(
           `sessionmeta:${conversationTaskId}:${args.role}`,
-          JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
+          JSON.stringify({
+            home: resolvedAuth?.configHome ?? '',
+            provider: profile.provider,
+            ...(profile.model ? { model: profile.model } : {}),
+            ...(profile.effort ? { effort: profile.effort } : {}),
+          }),
         );
       }
 
