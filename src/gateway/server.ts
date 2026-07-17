@@ -1654,30 +1654,18 @@ export class Gateway {
         // A draft has no running workflow — edit its stored params in place; they
         // re-resolve at queue time (SPEC §10.4).
         if (t.params?.draft) {
-          const confirmerField = manifest(t.workflow)?.params.find((f) => f.type === 'confirmer');
-          if (confirmerField && Object.prototype.hasOwnProperty.call(b.params ?? {}, confirmerField.name)) {
-            try {
-              store.setIntentConfirmer(t.intentId ?? t.id, confirmerField.name, b.params[confirmerField.name]);
-            } catch (e) {
-              return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
-            }
+          try {
+            // Use the same full-form replacement path as armed tasks. Besides
+            // preserving platform metadata, it keeps the shared confirmer snapshot
+            // in sync when a reset removes the sparse task-level override.
+            const updated = await api.updateArmedParams(token, id, b.params ?? {}, {
+              replace: b.replace === true,
+              keepArmed: false,
+            });
+            return this.json(res, 200, updated);
+          } catch (e) {
+            return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
           }
-          // Replace the workflow-field overrides wholesale (b.params is the form's
-          // full set of own overrides) so a field reset to its default is actually
-          // removed — a merge would leave the stale override behind. Lifecycle +
-          // organizational meta (draft/archived/profiles/priority) is preserved across
-          // the edit — priority is set via its own endpoint and must survive a form save.
-          const { draft, archived, profiles, priority, _authorization } = t.params;
-          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}), ...(priority !== undefined ? { priority } : {}), ...(_authorization !== undefined ? { _authorization } : {}) };
-          const replace = b.replace === true;
-          const next = replace ? { ...meta, ...b.params } : { ...t.params, ...b.params };
-          // Never trust workflow-form JSON for platform authorization metadata.
-          if (_authorization !== undefined) next._authorization = _authorization;
-          store.updateTaskParams(id, next);
-          // Keep the title tracking the edited prompt (title was derived from it).
-          const prompt = b.params?.prompt;
-          if (typeof prompt === 'string' && prompt.trim()) store.setTaskTitle(id, (prompt.split('\n')[0] ?? '').slice(0, 80));
-          return this.json(res, 200, store.getTask(id) ?? null);
         }
         // Once queued, params are frozen except the ones the workflow declares
         // in-flight-editable (SPEC §4.5/§5.5). Forward to its validated update and

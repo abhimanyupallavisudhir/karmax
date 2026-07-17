@@ -521,6 +521,17 @@ export class KarmaxApi {
     return resolved;
   }
 
+  /** Resolve one full-form field without materializing agents or probing repository
+   * defaults. Used by sparse reset handling, where only the inherited value matters. */
+  private resolveTaskField(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, field: string): unknown {
+    const getSettings = (scope: string, workflow: string) => this.deps.store.getSettings(scope, workflow);
+    return resolveParamsLayers(manifest, [
+      taskOverrides,
+      projectSettingsFor(getSettings, project, manifest.name),
+      globalSettingsFor(getSettings, manifest.name, project.organizationId),
+    ])[field];
+  }
+
   /** Turn the compact Agent setting into concrete per-role input. Profile defaults
    * live outside parameter settings, so this final materialization must happen
    * after the parameter overlays have selected the child scope's form shape. */
@@ -899,14 +910,30 @@ export class KarmaxApi {
     this.require(token, 'edit_task');
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
-    const { profiles, _authorization } = task.params;
+    const { archived, profiles, priority, _authorization } = task.params;
     const meta = {
+      ...(archived !== undefined ? { archived } : {}),
       ...(profiles !== undefined ? { profiles } : {}),
+      ...(priority !== undefined ? { priority } : {}),
       ...(_authorization !== undefined ? { _authorization } : {}),
     };
-    const confirmerField = this.resolveStart(task.workflow, task.workflowVersion)?.manifest.params.find((f) => f.type === 'confirmer');
-    if (confirmerField && Object.prototype.hasOwnProperty.call(params, confirmerField.name)) {
-      this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, params[confirmerField.name]);
+    const start = this.resolveStart(task.workflow, task.workflowVersion);
+    const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
+    if (confirmerField) {
+      let confirmer = Object.prototype.hasOwnProperty.call(params, confirmerField.name)
+        ? params[confirmerField.name]
+        : undefined;
+      // Full-form replacement is sparse: a field reset to its inherited default
+      // is intentionally omitted. The logical task also owns an effective confirmer
+      // snapshot shared by all attempts, so refresh that snapshot from the current
+      // defaults instead of leaving a previously autosaved partial value behind.
+      if (confirmer === undefined && opts.replace && start) {
+        const project = this.deps.store.getProject(task.projectId);
+        if (project) confirmer = this.resolveTaskField(start.manifest, project, params as ValueMap, confirmerField.name);
+      }
+      if (confirmer !== undefined) {
+        this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, confirmer);
+      }
     }
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     // Authorization is platform metadata, never a workflow-form field.

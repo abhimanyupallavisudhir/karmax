@@ -80,6 +80,41 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(onMain.stdout).toContain('from a draft');
   });
 
+  it('resets an autosaved partial review route to the inherited confirmer', async () => {
+    const draft = await post(`/api/projects/${projectId}/tasks`, {
+      title: 'Reset review route',
+      workflow: 'software-dev',
+      draft: true,
+      params: {
+        prompt: '@review route reset',
+        confirm: { layers: [{ kind: 'human', audience: ['@'] }] },
+      },
+    });
+    expect((await get(`/api/tasks/${draft.id}/attempts`)).confirmer).toEqual({
+      layers: [{ kind: 'human', audience: ['@'] }],
+    });
+
+    // Reset-to-default makes the browser's replacement payload sparse: confirm is
+    // absent, rather than explicitly containing @creator.
+    const reset = await fetch(`${base}/api/tasks/${draft.id}/params`, {
+      method: 'PATCH',
+      headers: auth(),
+      body: JSON.stringify({ params: { prompt: '@review route reset' }, replace: true }),
+    });
+    expect(reset.status).toBe(200);
+    expect((await get(`/api/tasks/${draft.id}/attempts`)).confirmer).toEqual({
+      layers: [{ kind: 'human', audience: ['@creator'] }],
+    });
+
+    const queued = await fetch(`${base}/api/tasks/${draft.id}/queue`, {
+      method: 'POST', headers: auth(), body: '{}',
+    });
+    expect(queued.status).toBe(200);
+    await poll(draft.id, 'review');
+    await post(`/api/tasks/${draft.id}/signal`, { signal: 'confirm' });
+    await poll(draft.id, 'done');
+  });
+
   it('hard-deletes a draft (it stays gone on reload) but refuses to delete a running task', async () => {
     const draft = await post(`/api/projects/${projectId}/tasks`, {
       title: 'Disposable draft',
