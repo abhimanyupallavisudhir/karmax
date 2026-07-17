@@ -33,6 +33,7 @@ import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '..
 import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
+import type { KarmaxBus } from '../contrib/bus.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -123,6 +124,9 @@ export interface KarmaxApiDeps {
   /** Organization-scoped cloud provider credentials. Kept optional for the
    * small unit-test API harnesses; production always supplies it. */
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  /** Wake live gateway subscribers when platform-side actions append events. The
+   * durable event table remains the source of truth when this is absent. */
+  bus?: KarmaxBus;
 }
 
 /**
@@ -517,6 +521,17 @@ export class KarmaxApi {
     return resolved;
   }
 
+  /** Resolve one full-form field without materializing agents or probing repository
+   * defaults. Used by sparse reset handling, where only the inherited value matters. */
+  private resolveTaskField(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, field: string): unknown {
+    const getSettings = (scope: string, workflow: string) => this.deps.store.getSettings(scope, workflow);
+    return resolveParamsLayers(manifest, [
+      taskOverrides,
+      projectSettingsFor(getSettings, project, manifest.name),
+      globalSettingsFor(getSettings, manifest.name, project.organizationId),
+    ])[field];
+  }
+
   /** Turn the compact Agent setting into concrete per-role input. Profile defaults
    * live outside parameter settings, so this final materialization must happen
    * after the parameter overlays have selected the child scope's form shape. */
@@ -895,14 +910,30 @@ export class KarmaxApi {
     this.require(token, 'edit_task');
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
-    const { profiles, _authorization } = task.params;
+    const { archived, profiles, priority, _authorization } = task.params;
     const meta = {
+      ...(archived !== undefined ? { archived } : {}),
       ...(profiles !== undefined ? { profiles } : {}),
+      ...(priority !== undefined ? { priority } : {}),
       ...(_authorization !== undefined ? { _authorization } : {}),
     };
-    const confirmerField = this.resolveStart(task.workflow, task.workflowVersion)?.manifest.params.find((f) => f.type === 'confirmer');
-    if (confirmerField && Object.prototype.hasOwnProperty.call(params, confirmerField.name)) {
-      this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, params[confirmerField.name]);
+    const start = this.resolveStart(task.workflow, task.workflowVersion);
+    const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
+    if (confirmerField) {
+      let confirmer = Object.prototype.hasOwnProperty.call(params, confirmerField.name)
+        ? params[confirmerField.name]
+        : undefined;
+      // Full-form replacement is sparse: a field reset to its inherited default
+      // is intentionally omitted. The logical task also owns an effective confirmer
+      // snapshot shared by all attempts, so refresh that snapshot from the current
+      // defaults instead of leaving a previously autosaved partial value behind.
+      if (confirmer === undefined && opts.replace && start) {
+        const project = this.deps.store.getProject(task.projectId);
+        if (project) confirmer = this.resolveTaskField(start.manifest, project, params as ValueMap, confirmerField.name);
+      }
+      if (confirmer !== undefined) {
+        this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, confirmer);
+      }
     }
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     // Authorization is platform metadata, never a workflow-form field.
@@ -1330,7 +1361,7 @@ export class KarmaxApi {
     });
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
     if (signal === SIG.confirm && scopedTask?.lastView?.waitingFor?.kind === 'human') {
@@ -1351,7 +1382,10 @@ export class KarmaxApi {
     }
     const terminal = this.deps.store.getTask(taskId)?.lastView;
     if (terminal?.status === 'failed' && terminal.workflow === 'software-dev' && !terminal.pointOfNoReturnPassed) {
-      if (signal === SIG.retry) return await this.recoverFailedTask(taskId);
+      if (signal === SIG.retry) {
+        await this.recoverFailedTask(taskId);
+        return;
+      }
       if (signal === SIG.followUp) {
         const now = Date.now();
         const msg: Message = { id: `u${now}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}) };
@@ -1360,7 +1394,8 @@ export class KarmaxApi {
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
         (target ?? messages).push(msg);
         this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() });
-        return;
+        this.publishConversationMessage(taskId, role, msg);
+        return msg;
       }
       if (signal === SIG.cancel) {
         this.deps.store.saveView(taskId, {
@@ -1375,10 +1410,11 @@ export class KarmaxApi {
       }
     }
     const handle = this.deps.client.workflow.getHandle(taskId);
+    let followUp: Message | undefined;
     try {
       if (signal === SIG.followUp) {
         const now = Date.now();
-        const msg: Message = {
+        followUp = {
           id: `u${now}`,
           role: 'user',
           text: text ?? '',
@@ -1387,7 +1423,12 @@ export class KarmaxApi {
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.
-        await handle.signal(SIG.followUp, msg, role);
+        await handle.signal(SIG.followUp, followUp, role);
+        // A signal mutates workflow memory immediately, but workflows deliberately
+        // publish their full cached view only at lifecycle boundaries. Journal the
+        // accepted message separately so every open conversation can render it
+        // mid-turn without changing replay-sensitive workflow command histories.
+        this.publishConversationMessage(taskId, role, followUp);
       } else {
         await handle.signal(signal);
       }
@@ -1416,6 +1457,18 @@ export class KarmaxApi {
       }
       throw e;
     }
+    return followUp;
+  }
+
+  private publishConversationMessage(taskId: string, role: string | undefined, message: Message): void {
+    const event = {
+      taskId,
+      type: 'conversation.message',
+      ts: message.ts,
+      payload: { role: role ?? 'do', message },
+    };
+    const seq = this.deps.store.appendEvent(event);
+    this.deps.bus?.emit({ ...event, seq });
   }
 
   async setTarget(token: string, taskId: string, branch: string): Promise<boolean> {

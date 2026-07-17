@@ -184,6 +184,24 @@ export class AuthorizationService {
       else if (grant.scopeKey.startsWith('organization:')) caps = attenuate(caps, ORGANIZATION_GRANT_CEILING);
       for (const cap of caps) out.add(cap);
     }
+    // Team and @all project access are durable principals, not UI aliases.
+    // Their selected profile applies dynamically, including to people added to
+    // the team/organization later, so group authorization is never cosmetic.
+    if (projectId && principalId.startsWith('user:')) {
+      const userId = principalId.slice(5);
+      const project = this.store.getProject(projectId);
+      for (const membership of this.store.listProjectMemberships(projectId)) {
+        const applies = membership.principal.kind === 'user' ? membership.principal.userId === userId
+          : membership.principal.kind === 'team' ? this.store.listTeamMemberships(membership.principal.teamId).some((member) => member.userId === userId)
+          : membership.principal.kind === 'organization' ? membership.principal.organizationId === project?.organizationId
+            && Boolean(project?.organizationId && this.store.organizationMembership(project.organizationId, userId)) : false;
+        if (!applies) continue;
+        const profileId = this.profile(membership.role, projectId) ? membership.role
+          : membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer';
+        const profile = this.profile(profileId, projectId);
+        if (profile) for (const cap of attenuate(profile.capabilities, PROJECT_GRANT_CEILING)) out.add(cap);
+      }
+    }
     return [...out];
   }
 

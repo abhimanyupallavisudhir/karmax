@@ -28,6 +28,7 @@ import {
   TeamMembership,
   ProjectMembership,
   PrincipalRef,
+  ProjectPrincipalRef,
   ConfirmationPolicy,
   Repository,
   ProjectRepository,
@@ -348,6 +349,8 @@ export class Store {
     // installs pick it up without a re-create.
     const cols = this.db.prepare('PRAGMA table_info(tasks)').all() as any[];
     const projectCols = this.db.prepare('PRAGMA table_info(projects)').all() as any[];
+    const invitationCols = this.db.prepare('PRAGMA table_info(organization_invitations)').all() as any[];
+    if (!invitationCols.some((c) => c.name === 'profileId')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN profileId TEXT');
     const previewCols = this.db.prepare('PRAGMA table_info(preview_leases)').all() as any[];
     if (!previewCols.some((c) => c.name === 'hostname')) this.db.exec('ALTER TABLE preview_leases ADD COLUMN hostname TEXT');
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_hostname ON preview_leases(hostname) WHERE hostname IS NOT NULL');
@@ -932,36 +935,36 @@ export class Store {
     }
   }
 
-  createOrganizationInvitation(input: { organizationId: string; email: string; role?: OrganizationMembership['role']; invitedBy: string; ttlMs?: number }): { invitation: OrganizationInvitation; token: string } {
+  createOrganizationInvitation(input: { organizationId: string; email: string; role?: OrganizationMembership['role']; profileId?: string; invitedBy: string; ttlMs?: number }): { invitation: OrganizationInvitation; token: string } {
     if (!this.getOrganization(input.organizationId)) throw new Error(`no organization ${input.organizationId}`);
     const token = `ki_${crypto.randomBytes(24).toString('base64url')}`;
     const invitation: OrganizationInvitation = {
       id: newId('invite'), organizationId: input.organizationId, email: input.email.trim().toLowerCase(),
-      role: input.role ?? 'member', invitedBy: input.invitedBy, createdAt: Date.now(),
+      role: input.role ?? 'member', profileId: input.profileId ?? 'developer', invitedBy: input.invitedBy, createdAt: Date.now(),
       expiresAt: Date.now() + (input.ttlMs ?? 7 * 24 * 60 * 60 * 1000),
     };
     this.db.prepare(`INSERT INTO organization_invitations
-      (id, organizationId, email, role, tokenHash, invitedBy, createdAt, expiresAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      (id, organizationId, email, role, profileId, tokenHash, invitedBy, createdAt, expiresAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         invitation.id, invitation.organizationId, invitation.email, invitation.role,
-        sha256(token), invitation.invitedBy, invitation.createdAt, invitation.expiresAt,
+        invitation.profileId ?? 'developer', sha256(token), invitation.invitedBy, invitation.createdAt, invitation.expiresAt,
       );
     return { invitation, token };
   }
 
-  acceptOrganizationInvitation(token: string, userId: string, email: string): OrganizationMembership {
+  acceptOrganizationInvitation(token: string, userId: string, email: string): OrganizationMembership & { profileId?: string } {
     const r = this.db.prepare('SELECT * FROM organization_invitations WHERE tokenHash=?').get(sha256(token)) as any;
     if (!r || r.acceptedAt) throw new Error('invitation is invalid or already used');
     if (r.expiresAt <= Date.now()) throw new Error('invitation has expired');
     if (String(r.email).toLowerCase() !== email.trim().toLowerCase()) throw new Error('invitation belongs to a different email address');
     const membership = this.setOrganizationMembership(r.organizationId, userId, r.role);
     this.db.prepare('UPDATE organization_invitations SET acceptedAt=? WHERE id=?').run(Date.now(), r.id);
-    return membership;
+    return { ...membership, profileId: r.profileId ?? 'developer' };
   }
 
   listOrganizationInvitations(organizationId: string): OrganizationInvitation[] {
     return (this.db.prepare('SELECT * FROM organization_invitations WHERE organizationId=? ORDER BY createdAt DESC').all(organizationId) as any[])
-      .map((r) => ({ id: r.id, organizationId: r.organizationId, email: r.email, role: r.role, invitedBy: r.invitedBy,
+      .map((r) => ({ id: r.id, organizationId: r.organizationId, email: r.email, role: r.role, profileId: r.profileId ?? 'developer', invitedBy: r.invitedBy,
         createdAt: r.createdAt, expiresAt: r.expiresAt, acceptedAt: r.acceptedAt ?? undefined }));
   }
 
@@ -1101,7 +1104,7 @@ export class Store {
     this.db.prepare('DELETE FROM team_memberships WHERE teamId=? AND userId=?').run(teamId, userId);
   }
 
-  setProjectMembership(projectId: string, principal: PrincipalRef, role: ProjectMembership['role']): ProjectMembership {
+  setProjectMembership(projectId: string, principal: ProjectPrincipalRef, role: ProjectMembership['role']): ProjectMembership {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`no project ${projectId}`);
     this.assertPrincipalInOrganization(principal, project.organizationId!);
@@ -1124,7 +1127,7 @@ export class Store {
       .map((r) => ({ projectId: r.projectId, principal: JSON.parse(r.principal), role: r.role, joinedAt: r.joinedAt }));
   }
 
-  removeProjectMembership(projectId: string, principal: PrincipalRef): void {
+  removeProjectMembership(projectId: string, principal: ProjectPrincipalRef): void {
     const key = principalKey(principal);
     const row = this.db.prepare('SELECT role FROM project_memberships WHERE projectId=? AND principalKey=?')
       .get(projectId, key) as any;
@@ -1138,15 +1141,20 @@ export class Store {
 
   userIsProjectMember(projectId: string, userId: string): boolean {
     if (this.db.prepare('SELECT 1 FROM project_memberships WHERE projectId=? AND principalKey=?').get(projectId, `user:${userId}`)) return true;
+    const organizationId = this.getProject(projectId)?.organizationId;
+    if (organizationId && this.organizationMembership(organizationId, userId)
+      && this.db.prepare('SELECT 1 FROM project_memberships WHERE projectId=? AND principalKey=?').get(projectId, `organization:${organizationId}`)) return true;
     return !!this.db.prepare(`SELECT 1 FROM project_memberships p JOIN team_memberships tm
       ON p.principalKey=('team:' || tm.teamId) WHERE p.projectId=? AND tm.userId=? LIMIT 1`).get(projectId, userId);
   }
 
-  private assertPrincipalInOrganization(principal: PrincipalRef, organizationId: string): void {
+  private assertPrincipalInOrganization(principal: ProjectPrincipalRef, organizationId: string): void {
     if (principal.kind === 'user' && !this.organizationMembership(organizationId, principal.userId))
       throw new Error('user is not a member of the project organization');
     if (principal.kind === 'team' && this.getTeam(principal.teamId)?.organizationId !== organizationId)
       throw new Error('team belongs to another organization');
+    if (principal.kind === 'organization' && principal.organizationId !== organizationId)
+      throw new Error('organization principal belongs to another organization');
     if (principal.kind === 'task-agent') {
       const project = this.getProject(this.getTask(principal.taskId)?.projectId ?? '');
       if (project?.organizationId !== organizationId) throw new Error('task agent belongs to another organization');
@@ -1303,9 +1311,19 @@ export class Store {
    * sources once at project scope. Keep existing workflow rows synchronized so
    * a stale per-workflow overlay cannot override the project source list. */
   setProjectRepositorySources(projectId: string, repos: string[]): Project {
-    if (this.listProjectRepositories(projectId).length)
-      throw new Error('remove attached GitHub repositories before using local repository paths');
     const sources = [...new Set(repos.map((repo) => repo.trim()).filter(Boolean))];
+    const projectBefore = this.getProject(projectId);
+    if (!projectBefore) throw new Error(`no project ${projectId}`);
+    // A catalog SSH URL carries its GitHub connection/deploy-key metadata. Keep
+    // those attachments synchronized automatically; users edit one plain list.
+    const catalog = projectBefore.organizationId ? this.listRepositories(projectBefore.organizationId) : [];
+    const wanted = new Map(catalog.filter((repository) => sources.includes(repository.sshUrl)).map((repository) => [repository.id, repository]));
+    for (const attachment of this.listProjectRepositories(projectId))
+      if (!wanted.has(attachment.repositoryId)) this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, attachment.repositoryId);
+    let order = 0;
+    for (const repository of wanted.values()) this.db.prepare(`INSERT INTO project_repositories
+      (projectId, repositoryId, baseBranch, targetBranch, ord) VALUES (?, ?, NULL, NULL, ?)
+      ON CONFLICT(projectId, repositoryId) DO UPDATE SET ord=excluded.ord`).run(projectId, repository.id, order++);
     const project = this.updateProjectConfig(projectId, { repos: sources });
     this.syncProjectRepositorySettings(projectId, sources);
     return project;
@@ -1809,9 +1827,10 @@ export class Store {
     return r ? rowToTask(r) : undefined;
   }
 
-  private expandPrincipal(principal: PrincipalRef, projectId: string): string[] {
+  private expandPrincipal(principal: ProjectPrincipalRef, projectId: string): string[] {
     if (principal.kind === 'user') return [principal.userId];
     if (principal.kind === 'team') return (this.listTeamMemberships(principal.teamId)).map((m) => m.userId);
+    if (principal.kind === 'organization') return this.listOrganizationMemberships(principal.organizationId).map((member) => member.userId);
     return [];
   }
 
@@ -2938,9 +2957,10 @@ function validGitBranch(value: string): boolean {
     && !value.endsWith('/') && !value.endsWith('.') && !value.endsWith('.lock');
 }
 
-export function principalKey(principal: PrincipalRef): string {
+export function principalKey(principal: ProjectPrincipalRef): string {
   if (principal.kind === 'user') return `user:${principal.userId}`;
   if (principal.kind === 'team') return `team:${principal.teamId}`;
+  if (principal.kind === 'organization') return `organization:${principal.organizationId}`;
   return `task-agent:${principal.taskId}:${principal.role}`;
 }
 

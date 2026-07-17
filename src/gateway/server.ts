@@ -20,7 +20,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { Provider, ProjectConfig, PrincipalRef } from '../domain/types.js';
+import { AgentSpec, Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -156,6 +156,15 @@ function principalFromBody(value: unknown): PrincipalRef {
   if (candidate.kind === 'task-agent' && typeof candidate.taskId === 'string' && typeof candidate.role === 'string' && candidate.taskId && candidate.role)
     return { kind: 'task-agent', taskId: candidate.taskId, role: candidate.role };
   throw new Error('invalid principal reference');
+}
+
+function projectPrincipalFromBody(value: unknown, organizationId: string): ProjectPrincipalRef {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const candidate = value as Record<string, unknown>;
+    if (candidate.kind === 'organization' && candidate.organizationId === organizationId)
+      return { kind: 'organization', organizationId };
+  }
+  return principalFromBody(value);
 }
 
 function isWorldHandle(value: unknown): value is Record<string, unknown> & { kind: string; id: string } {
@@ -809,7 +818,7 @@ export class Gateway {
         const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
         this.deps.authorization?.grant(`user:${session.userId}`, {
           principalId: `user:${session.userId}`, scopeKey: `organization:${membership.organizationId}`,
-          profileId: 'developer', capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'],
+          profileId: membership.profileId ?? 'developer',
         });
         return this.json(res, 200, membership);
       }
@@ -884,17 +893,19 @@ export class Gateway {
           const users = new Map((this.deps.identity?.listUsers() ?? []).map((user) => [user.id, user]));
           return this.json(res, 200, store.listOrganizationMemberships(organizationId).map((membership) => {
             const user = users.get(membership.userId);
-            return { ...membership, ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
+            const grant = this.deps.authorization?.grants(`user:${membership.userId}`).find((candidate) => candidate.scopeKey === `organization:${organizationId}`);
+            return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'administrator' : 'developer'),
+              protectedOwner: membership.role === 'owner', ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
           }));
         }
         if (method === 'POST') {
           const b = await this.body(req);
-          const role = ['owner', 'admin'].includes(String(b.role)) ? String(b.role) as 'owner' | 'admin' : 'member';
-          const membership = store.setOrganizationMembership(organizationId, String(b.userId), role);
+          const existing = store.organizationMembership(organizationId, String(b.userId));
+          const membership = store.setOrganizationMembership(organizationId, String(b.userId), existing?.role === 'owner' ? 'owner' : 'member');
+          const profileId = String(b.profileId ?? 'developer');
           this.deps.authorization?.grant(`user:${session.userId}`, {
             principalId: `user:${membership.userId}`, scopeKey: `organization:${organizationId}`,
-            profileId: role === 'owner' || role === 'admin' ? 'administrator' : 'developer',
-            ...(role === 'member' ? { capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] } : {}),
+            profileId,
           });
           return this.json(res, 200, membership);
         }
@@ -912,7 +923,7 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           return this.json(res, 200, store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
-            role: ['owner', 'admin'].includes(String(b.role)) ? b.role : 'member', invitedBy: `user:${session.userId}` }));
+            role: 'member', profileId: String(b.profileId ?? 'developer'), invitedBy: `user:${session.userId}` }));
         }
       }
       const organizationTeams = p.match(/^\/api\/organizations\/([^/]+)\/teams$/);
@@ -1346,26 +1357,37 @@ export class Gateway {
       const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
       if (projectMembers) {
         const projectId = projectMembers[1]!;
-        if (method === 'GET') return this.json(res, 200, store.listProjectMemberships(projectId));
+        if (method === 'GET') return this.json(res, 200, store.listProjectMemberships(projectId).map((membership) => {
+          if (membership.principal.kind !== 'user') return { ...membership,
+            profileId: this.deps.authorization?.profile(membership.role, projectId)?.id
+              ?? (membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer') };
+          const grant = this.deps.authorization?.grants(`user:${membership.principal.userId}`).find((candidate) => candidate.scopeKey === `project:${projectId}`);
+          return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer'), protectedOwner: membership.role === 'owner' };
+        }));
         if (method === 'POST') {
           const b = await this.body(req);
-          const principal = principalFromBody(b.principal);
-          const role = ['owner', 'admin', 'reviewer'].includes(String(b.role)) ? String(b.role) : 'member';
-          const membership = store.setProjectMembership(projectId, principal, role);
+          const project = store.getProject(projectId);
+          if (!project?.organizationId) return this.json(res, 404, { error: 'project organization not found' });
+          const principal = projectPrincipalFromBody(b.principal, project.organizationId);
+          const profileId = String(b.profileId ?? 'developer');
+          if (this.deps.authorization && !this.deps.authorization.profile(profileId, projectId))
+            return this.json(res, 400, { error: `unknown authorization profile ${profileId}` });
+          const previous = store.listProjectMemberships(projectId).find((member) => JSON.stringify(member.principal) === JSON.stringify(principal));
+          const membership = store.setProjectMembership(projectId, principal, previous?.role === 'owner' ? 'owner'
+            : principal.kind === 'user' ? 'member' : profileId);
           if (principal.kind === 'user') {
-            const profileId = role === 'owner' || role === 'admin' ? 'maintainer' : 'developer';
             this.deps.authorization?.grant(`user:${session.userId}`, { principalId: `user:${principal.userId}`,
-              scopeKey: `project:${projectId}`, profileId,
-              ...(role === 'reviewer' ? { capabilities: ['project:read', 'task:read', 'task:event:read', 'task:signal', 'task:review:execute', 'inbox:*'] } : {}) });
+              scopeKey: `project:${projectId}`, profileId });
           }
           return this.json(res, 200, membership);
         }
       }
-      const projectMember = p.match(/^\/api\/projects\/([^/]+)\/members\/(user|team)\/([^/]+)$/);
+      const projectMember = p.match(/^\/api\/projects\/([^/]+)\/members\/(user|team|organization)\/([^/]+)$/);
       if (projectMember && method === 'DELETE') {
         const principal = projectMember[2] === 'user'
           ? { kind: 'user' as const, userId: projectMember[3]! }
-          : { kind: 'team' as const, teamId: projectMember[3]! };
+          : projectMember[2] === 'team' ? { kind: 'team' as const, teamId: projectMember[3]! }
+          : { kind: 'organization' as const, organizationId: projectMember[3]! };
         store.removeProjectMembership(projectMember[1]!, principal);
         if (principal.kind === 'user') this.deps.authorization?.revoke(`user:${session.userId}`,
           `user:${principal.userId}`, `project:${projectMember[1]!}`);
@@ -1389,10 +1411,15 @@ export class Gateway {
         if (!project) return this.json(res, 404, { error: 'project not found' });
         if (method === 'GET') return this.json(res, 200, { repos: project.config.repos ?? [] });
         if (method === 'PUT') {
-          if (this.deps.hosted) return this.json(res, 400, { error: 'hosted projects use attached GitHub repositories' });
           const b = await this.body(req);
-          try { return this.json(res, 200, store.setProjectRepositorySources(project.id,
-            Array.isArray(b.repos) ? b.repos.map(String) : [])); }
+          try {
+            const repos = Array.isArray(b.repos) ? b.repos.map(String) : [];
+            if (this.deps.hosted) {
+              const known = new Set(store.listRepositories(project.organizationId!).map((repository) => repository.sshUrl));
+              const unknown = repos.filter((repo: string) => !known.has(repo));
+              if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
+            }
+            return this.json(res, 200, store.setProjectRepositorySources(project.id, repos)); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
@@ -1627,30 +1654,18 @@ export class Gateway {
         // A draft has no running workflow — edit its stored params in place; they
         // re-resolve at queue time (SPEC §10.4).
         if (t.params?.draft) {
-          const confirmerField = manifest(t.workflow)?.params.find((f) => f.type === 'confirmer');
-          if (confirmerField && Object.prototype.hasOwnProperty.call(b.params ?? {}, confirmerField.name)) {
-            try {
-              store.setIntentConfirmer(t.intentId ?? t.id, confirmerField.name, b.params[confirmerField.name]);
-            } catch (e) {
-              return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
-            }
+          try {
+            // Use the same full-form replacement path as armed tasks. Besides
+            // preserving platform metadata, it keeps the shared confirmer snapshot
+            // in sync when a reset removes the sparse task-level override.
+            const updated = await api.updateArmedParams(token, id, b.params ?? {}, {
+              replace: b.replace === true,
+              keepArmed: false,
+            });
+            return this.json(res, 200, updated);
+          } catch (e) {
+            return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
           }
-          // Replace the workflow-field overrides wholesale (b.params is the form's
-          // full set of own overrides) so a field reset to its default is actually
-          // removed — a merge would leave the stale override behind. Lifecycle +
-          // organizational meta (draft/archived/profiles/priority) is preserved across
-          // the edit — priority is set via its own endpoint and must survive a form save.
-          const { draft, archived, profiles, priority, _authorization } = t.params;
-          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}), ...(priority !== undefined ? { priority } : {}), ...(_authorization !== undefined ? { _authorization } : {}) };
-          const replace = b.replace === true;
-          const next = replace ? { ...meta, ...b.params } : { ...t.params, ...b.params };
-          // Never trust workflow-form JSON for platform authorization metadata.
-          if (_authorization !== undefined) next._authorization = _authorization;
-          store.updateTaskParams(id, next);
-          // Keep the title tracking the edited prompt (title was derived from it).
-          const prompt = b.params?.prompt;
-          if (typeof prompt === 'string' && prompt.trim()) store.setTaskTitle(id, (prompt.split('\n')[0] ?? '').slice(0, 80));
-          return this.json(res, 200, store.getTask(id) ?? null);
         }
         // Once queued, params are frozen except the ones the workflow declares
         // in-flight-editable (SPEC §4.5/§5.5). Forward to its validated update and
@@ -1696,8 +1711,8 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
-        return this.json(res, 200, { ok: true });
+        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
+        return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const targetMatch = p.match(/^\/api\/tasks\/([^/]+)\/target$/);
       if (targetMatch && method === 'POST') {
@@ -1929,19 +1944,38 @@ export class Gateway {
       if (sessMatch && method === 'GET') {
         const id = sessMatch[1]!;
         const t = store.getTask(id);
-        // Each role → { id, home?, provider? } so the UI can build a CLI resume
-        // command targeting the right CONFIG_DIR/CODEX_HOME (provider sessions are
-        // home-bound). `home` is omitted for API-key/stateless sessions.
-        const out: Record<string, { id: string; home?: string; provider?: string }> = {};
+        // Include the exact effective agent selection captured at queue time (and
+        // kept current after an accepted in-flight retune). Besides powering the
+        // CLI fork command, the expanded task form uses this to prefill a newly
+        // selected fork with the source agent's provider/model/effort.
+        const agents = (await api.getTaskView(token, id).catch(() => undefined))?.agents;
+        const out: Record<string, { id: string; home?: string; provider?: string; model?: string; effort?: AgentSpec['effort'] }> = {};
         for (const role of ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm']) {
           const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
           const s = store.kvGet(`session:${sessionTaskId}:${role}`);
           if (!s) continue;
           let home: string | undefined;
           let provider: string | undefined;
+          let model: string | undefined;
+          let effort: AgentSpec['effort'];
           const meta = store.kvGet(`sessionmeta:${sessionTaskId}:${role}`);
-          if (meta) { try { const m = JSON.parse(meta); home = m.home || undefined; provider = m.provider || undefined; } catch { /* ignore */ } }
-          out[role] = { id: s, ...(home ? { home } : {}), ...(provider ? { provider } : {}) };
+          if (meta) {
+            try {
+              const m = JSON.parse(meta);
+              home = m.home || undefined;
+              provider = m.provider || undefined;
+              model = m.model || undefined;
+              effort = m.effort || undefined;
+            } catch { /* ignore */ }
+          }
+          const spec = agents?.[role];
+          out[role] = {
+            id: s,
+            ...(home ? { home } : {}),
+            ...(spec?.provider || provider ? { provider: spec?.provider ?? provider } : {}),
+            ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
+            ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
+          };
         }
         return this.json(res, 200, out);
       }
@@ -2341,10 +2375,9 @@ export class Gateway {
           }
           return out;
         };
-        // Quick-task defaults (SPEC §10.4): a separate overlay that only applies to
-        // tasks added from the quick box. Global-quick inherits from global-general;
-        // project-quick inherits from global-quick (primary) with project-general as
-        // the alternative source (the two "Reset to inherited" buttons in the UI).
+        // Quick-task agent defaults (SPEC §10.4): an agent-only overlay for tasks
+        // added from the quick box. Project Quick agents inherit through the
+        // organization Quick agents into the regular project/organization agents.
         const globalQuickVals = quickGlobalSettingsFor(gs, wf, organizationId ?? undefined);
         const projectQuickVals = project ? quickProjectSettingsFor(gs, project.id, wf) : {};
         return this.json(res, 200, {
@@ -2354,11 +2387,7 @@ export class Gateway {
           globalQuick: { own: globalQuickVals, inherited: enrich(resolveParams(m, { global: globalVals }), globalQuickVals) },
           projectQuick: {
             own: projectQuickVals,
-            // Primary inherited: the full quick chain minus project-quick itself
-            // (global-quick → project-general → global-general → default).
             inherited: enrich(resolveParamsLayers(m, [globalQuickVals, projectVals, globalVals]), { ...projectVals, ...globalVals, ...globalQuickVals, ...projectQuickVals }),
-            // Alternative inherited source: the project's general defaults.
-            inheritedAlt: enrich(resolveParams(m, { project: projectVals, global: globalVals }), { ...projectVals, ...globalVals, ...projectQuickVals }),
           },
         });
       }
