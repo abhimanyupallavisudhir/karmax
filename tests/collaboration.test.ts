@@ -22,6 +22,12 @@ describe('organization and collaboration domain', () => {
     expect(() => store.setTeamMembership(team.id, 'outsider')).toThrow(/belong to the organization/);
     store.setProjectMembership(project.id, { kind: 'team', teamId: team.id }, 'member');
 
+    store.setProjectMembership(project.id, { kind: 'organization', organizationId: acme.id }, 'member');
+    expect(store.userIsProjectMember(project.id, 'owner')).toBe(true);
+    expect(() => store.setProjectMembership(project.id, { kind: 'organization', organizationId: other.id }, 'member'))
+      .toThrow(/another organization/);
+    store.removeProjectMembership(project.id, { kind: 'organization', organizationId: acme.id });
+
     expect(store.userIsProjectMember(project.id, 'developer')).toBe(true);
     expect(() => store.setProjectMembership(project.id, { kind: 'user', userId: 'outsider' }, 'member'))
       .toThrow(/not a member/);

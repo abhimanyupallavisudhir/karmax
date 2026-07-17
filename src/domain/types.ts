@@ -20,6 +20,10 @@ export type PrincipalRef =
   | { kind: 'team'; teamId: string }
   | { kind: 'task-agent'; taskId: string; role: string };
 
+/** Project access may also target the entire containing organization. This is
+ * deliberately project-specific; @all is not a valid task assignee. */
+export type ProjectPrincipalRef = PrincipalRef | { kind: 'organization'; organizationId: string };
+
 export type ConfirmationTarget = PrincipalRef | { kind: 'project-role'; projectId: string; role: string };
 
 export interface ConfirmationPolicy {
@@ -74,7 +78,7 @@ export interface TeamMembership {
 
 export interface ProjectMembership {
   projectId: string;
-  principal: PrincipalRef;
+  principal: ProjectPrincipalRef;
   role: 'owner' | 'admin' | 'member' | 'reviewer' | (string & {});
   joinedAt: number;
 }
