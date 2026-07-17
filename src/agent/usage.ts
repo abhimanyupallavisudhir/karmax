@@ -5,6 +5,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
 import { trackProcess } from '../util/processes.js';
+import { withTimeout } from '../util/timeout.js';
+import { CodexAppServerClient } from './codex-app-server-client.js';
 
 /**
  * Proactive quota (RESOLVE-PLAN §2 / #6). `claude -p '/usage'` prints a parseable
@@ -12,14 +14,17 @@ import { trackProcess } from '../util/processes.js';
  * and timezone. We shell it out per login and surface real numbers on the dashboard,
  * so the user isn't blind to quota until an agent hits a wall (the reactive path).
  *
- * IMPORTANT feasibility facts (verified 2026-07-04, Claude Code 2.1.201):
+ * IMPORTANT feasibility facts:
  *  - The panel renders ONLY for a login with a full interactive-login
  *    `.credentials.json` (broad OAuth scopes). A `claude setup-token` credential
  *    authenticates inference but its usage query returns nothing (header only) — so
  *    setup-token logins report `unavailable` here and fall back to reactive tracking.
- *  - Codex has NO usage command at all → never pollable (reactive only).
- * The probe runs in a throwaway config dir holding only a COPY of the login's
- * `.credentials.json`, so it never races or mutates a home an agent may be leasing.
+ *  - Current Codex app-server exposes the same information without a model turn
+ *    through the stable `account/rateLimits/read` method. It returns absolute reset
+ *    instants and can include additional per-model limit buckets.
+ * The Claude probe runs in a throwaway config dir holding only a COPY of the
+ * login's `.credentials.json`, so it never races or mutates a leased home. Codex's
+ * app-server account read uses its native CODEX_HOME, as Codex agent turns do.
  */
 
 export interface UsageWindow {
@@ -48,7 +53,7 @@ export interface UsageSnapshot {
 export interface UsageUnavailable {
   ok: false;
   at: number;
-  /** Why no numbers — 'setup-token' | 'logged-out' | 'not-subscription' | 'probe-failed' | 'not-pollable'. */
+  /** Why no numbers — setup-token, logged-out, not-subscription, no-rate-limits, or probe-failed. */
   reason: string;
 }
 
@@ -56,6 +61,9 @@ export type UsageResult = UsageSnapshot | UsageUnavailable;
 
 /** Injectable runner (tests): given the probe args, return combined stdout+stderr. */
 export type UsageRunner = (configDir: string) => Promise<string>;
+
+/** Injectable Codex app-server request (tests); returns account/rateLimits/read. */
+export type CodexUsageRunner = () => Promise<unknown>;
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 // Lines look like (the separator is a middle dot · U+00B7):
@@ -96,6 +104,81 @@ export function parseUsagePanel(text: string, now: number): UsageResult {
     at: now,
     ...(s ? { session: win(s[1]!, s[2]!, s[3]!) } : {}),
     ...(wa ? { week: win(wa[1]!, wa[2]!, wa[3]!) } : {}),
+    ...(models.length ? { models } : {}),
+  };
+}
+
+// Codex app-server returns windows as { usedPercent, windowDurationMins,
+// resetsAt }, where resetsAt is epoch seconds. Keep the dashboard contract
+// provider-neutral by translating those into the same snapshot shape as Claude.
+export function parseCodexRateLimits(payload: any, now: number): UsageResult {
+  const byId = payload?.rateLimitsByLimitId && typeof payload.rateLimitsByLimitId === 'object'
+    ? Object.values(payload.rateLimitsByLimitId).filter(Boolean) as any[]
+    : [];
+  const primary = byId.find((b) => b?.limitId === 'codex') ?? payload?.rateLimits ?? byId[0];
+  const seen = new Set<string>();
+  const extras = byId.filter((b) => {
+    const id = String(b?.limitId ?? b?.limitName ?? '');
+    if (!id || id === String(primary?.limitId ?? '') || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+
+  const convert = (raw: any): UsageWindow | undefined => {
+    if (!raw || !Number.isFinite(Number(raw.usedPercent))) return undefined;
+    const resetSeconds = Number(raw.resetsAt);
+    const resetAt = Number.isFinite(resetSeconds) && resetSeconds > 0
+      ? (resetSeconds < 10_000_000_000 ? resetSeconds * 1000 : resetSeconds)
+      : undefined;
+    return {
+      pct: Math.max(0, Math.min(100, Number(raw.usedPercent))),
+      // Codex gives an absolute instant, so let the browser localize it rather
+      // than baking the gateway host's timezone into a text label.
+      resetLabel: '',
+      ...(resetAt !== undefined ? { resetAt } : {}),
+    };
+  };
+  const rawWindows = (bucket: any) => [bucket?.primary, bucket?.secondary]
+    .filter((w) => w && Number.isFinite(Number(w.usedPercent)));
+  const main = rawWindows(primary).sort((a, b) =>
+    Number(a.windowDurationMins ?? Number.MAX_SAFE_INTEGER) - Number(b.windowDurationMins ?? Number.MAX_SAFE_INTEGER));
+
+  let session: UsageWindow | undefined;
+  let week: UsageWindow | undefined;
+  if (main.length >= 2) {
+    session = convert(main[0]);
+    week = convert(main[main.length - 1]);
+  } else if (main.length === 1) {
+    const duration = Number(main[0].windowDurationMins);
+    // Codex plans do not always expose both windows. A multi-day sole window is
+    // weekly; a shorter/unknown sole window is the rolling session limit.
+    if (Number.isFinite(duration) && duration >= 3 * 24 * 60) week = convert(main[0]);
+    else session = convert(main[0]);
+  }
+
+  const models: NonNullable<UsageSnapshot['models']> = [];
+  for (const bucket of extras) {
+    const wins = rawWindows(bucket);
+    const base = String(bucket.limitName ?? bucket.limitId ?? 'model');
+    for (const raw of wins) {
+      const win = convert(raw);
+      if (!win) continue;
+      const duration = Number(raw.windowDurationMins);
+      const suffix = wins.length > 1 && Number.isFinite(duration)
+        ? duration >= 3 * 24 * 60 ? ' (week)' : ` (${Math.round(duration / 60)}h)`
+        : '';
+      models.push({ name: `${base}${suffix}`, pct: win.pct, resetLabel: win.resetLabel, resetAt: win.resetAt });
+    }
+  }
+
+  if (!session && !week && models.length === 0) {
+    return { ok: false, at: now, reason: 'no-rate-limits' };
+  }
+  return {
+    ok: true,
+    at: now,
+    ...(session ? { session } : {}),
+    ...(week ? { week } : {}),
     ...(models.length ? { models } : {}),
   };
 }
@@ -168,8 +251,12 @@ function tzOffsetMs(instant: number, tz: string): number {
 // ── Probe ──────────────────────────────────────────────────────────────────────
 
 /** Path to the full-login credential for a home (or ambient ~/.claude). */
-function credentialPath(configHome?: string): string {
+function claudeCredentialPath(configHome?: string): string {
   return path.join(configHome ?? path.join(os.homedir(), '.claude'), '.credentials.json');
+}
+
+function codexCredentialPath(configHome?: string): string {
+  return path.join(configHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'), 'auth.json');
 }
 
 /**
@@ -180,7 +267,7 @@ export async function probeClaudeUsage(
   opts: { configHome?: string; now?: number; timeoutMs?: number; run?: UsageRunner } = {},
 ): Promise<UsageResult> {
   const now = opts.now ?? Date.now();
-  const cred = credentialPath(opts.configHome);
+  const cred = claudeCredentialPath(opts.configHome);
   // Only a full-login `.credentials.json` yields usage. setup-token homes (only
   // karmax-oauth.json) or logged-out homes are reported unavailable, not probed.
   if (!fs.existsSync(cred)) {
@@ -198,6 +285,25 @@ export async function probeClaudeUsage(
     return { ok: false, at: now, reason: `probe-failed: ${String((e as Error).message ?? e)}` };
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
+/** Probe a Codex ChatGPT login through app-server. This is an account metadata
+ * request only: it does not create a thread or spend a model turn. */
+export async function probeCodexUsage(
+  opts: { configHome?: string; now?: number; timeoutMs?: number; run?: CodexUsageRunner } = {},
+): Promise<UsageResult> {
+  const now = opts.now ?? Date.now();
+  if (!fs.existsSync(codexCredentialPath(opts.configHome))) {
+    return { ok: false, at: now, reason: opts.configHome ? 'setup-token' : 'logged-out' };
+  }
+  try {
+    const payload = opts.run
+      ? await opts.run()
+      : await runCodexUsageCli(opts.configHome, opts.timeoutMs ?? 30_000);
+    return parseCodexRateLimits(payload, now);
+  } catch (e) {
+    return { ok: false, at: now, reason: `probe-failed: ${String((e as Error).message ?? e)}` };
   }
 }
 
@@ -230,9 +336,36 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
   });
 }
 
-/** A credential is Claude-usage-pollable iff it has a full-login `.credentials.json`. */
+async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number): Promise<unknown> {
+  const cmd = process.env.KARMAX_CODEX_USAGE_CMD ?? process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
+  const env = scrubbedEnv({ provider: 'codex', configHome });
+  const child = spawn(cmd, ['app-server'], { env, stdio: ['pipe', 'pipe', 'ignore'] });
+  const client = new CodexAppServerClient(child.stdin!, child.stdout!);
+  let untrack = () => {};
+  if (child.pid) {
+    untrack = trackProcess({ pid: child.pid, kind: 'probe', label: 'codex usage probe', startedAt: Date.now() });
+  }
+  child.once('error', () => client.close());
+  child.once('exit', untrack);
+  try {
+    await withTimeout(client.request('initialize', {
+      clientInfo: { name: 'karmax-usage-probe', title: 'karmax', version: '1.0.0' },
+      capabilities: null,
+    }), timeoutMs);
+    client.notify('initialized');
+    return await withTimeout(client.request('account/rateLimits/read'), timeoutMs);
+  } finally {
+    client.close();
+    if (!child.killed) child.kill();
+  }
+}
+
+/** A subscription credential is usage-pollable iff it has the provider's full
+ * native login. API keys have billing rather than subscription quota windows. */
 export function isUsagePollable(cred: { provider?: string; kind?: string; configHome?: string }): boolean {
-  if (cred.provider !== 'claude') return false; // codex/keys have no /usage
   if (cred.kind === 'key') return false;
-  return fs.existsSync(credentialPath(cred.kind === 'ambient' ? undefined : cred.configHome));
+  const home = cred.kind === 'ambient' ? undefined : cred.configHome;
+  if (cred.provider === 'claude') return fs.existsSync(claudeCredentialPath(home));
+  if (cred.provider === 'codex') return fs.existsSync(codexCredentialPath(home));
+  return false;
 }
