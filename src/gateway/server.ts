@@ -20,7 +20,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { Provider, ProjectConfig, PrincipalRef } from '../domain/types.js';
+import { Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -156,6 +156,15 @@ function principalFromBody(value: unknown): PrincipalRef {
   if (candidate.kind === 'task-agent' && typeof candidate.taskId === 'string' && typeof candidate.role === 'string' && candidate.taskId && candidate.role)
     return { kind: 'task-agent', taskId: candidate.taskId, role: candidate.role };
   throw new Error('invalid principal reference');
+}
+
+function projectPrincipalFromBody(value: unknown, organizationId: string): ProjectPrincipalRef {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const candidate = value as Record<string, unknown>;
+    if (candidate.kind === 'organization' && candidate.organizationId === organizationId)
+      return { kind: 'organization', organizationId };
+  }
+  return principalFromBody(value);
 }
 
 function isWorldHandle(value: unknown): value is Record<string, unknown> & { kind: string; id: string } {
@@ -1349,28 +1358,36 @@ export class Gateway {
       if (projectMembers) {
         const projectId = projectMembers[1]!;
         if (method === 'GET') return this.json(res, 200, store.listProjectMemberships(projectId).map((membership) => {
-          if (membership.principal.kind !== 'user') return { ...membership, profileId: membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer' };
+          if (membership.principal.kind !== 'user') return { ...membership,
+            profileId: this.deps.authorization?.profile(membership.role, projectId)?.id
+              ?? (membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer') };
           const grant = this.deps.authorization?.grants(`user:${membership.principal.userId}`).find((candidate) => candidate.scopeKey === `project:${projectId}`);
           return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer'), protectedOwner: membership.role === 'owner' };
         }));
         if (method === 'POST') {
           const b = await this.body(req);
-          const principal = principalFromBody(b.principal);
+          const project = store.getProject(projectId);
+          if (!project?.organizationId) return this.json(res, 404, { error: 'project organization not found' });
+          const principal = projectPrincipalFromBody(b.principal, project.organizationId);
+          const profileId = String(b.profileId ?? 'developer');
+          if (this.deps.authorization && !this.deps.authorization.profile(profileId, projectId))
+            return this.json(res, 400, { error: `unknown authorization profile ${profileId}` });
           const previous = store.listProjectMemberships(projectId).find((member) => JSON.stringify(member.principal) === JSON.stringify(principal));
-          const membership = store.setProjectMembership(projectId, principal, previous?.role === 'owner' ? 'owner' : 'member');
+          const membership = store.setProjectMembership(projectId, principal, previous?.role === 'owner' ? 'owner'
+            : principal.kind === 'user' ? 'member' : profileId);
           if (principal.kind === 'user') {
-            const profileId = String(b.profileId ?? 'developer');
             this.deps.authorization?.grant(`user:${session.userId}`, { principalId: `user:${principal.userId}`,
               scopeKey: `project:${projectId}`, profileId });
           }
           return this.json(res, 200, membership);
         }
       }
-      const projectMember = p.match(/^\/api\/projects\/([^/]+)\/members\/(user|team)\/([^/]+)$/);
+      const projectMember = p.match(/^\/api\/projects\/([^/]+)\/members\/(user|team|organization)\/([^/]+)$/);
       if (projectMember && method === 'DELETE') {
         const principal = projectMember[2] === 'user'
           ? { kind: 'user' as const, userId: projectMember[3]! }
-          : { kind: 'team' as const, teamId: projectMember[3]! };
+          : projectMember[2] === 'team' ? { kind: 'team' as const, teamId: projectMember[3]! }
+          : { kind: 'organization' as const, organizationId: projectMember[3]! };
         store.removeProjectMembership(projectMember[1]!, principal);
         if (principal.kind === 'user') this.deps.authorization?.revoke(`user:${session.userId}`,
           `user:${principal.userId}`, `project:${projectMember[1]!}`);
@@ -2351,10 +2368,9 @@ export class Gateway {
           }
           return out;
         };
-        // Quick-task defaults (SPEC §10.4): a separate overlay that only applies to
-        // tasks added from the quick box. Global-quick inherits from global-general;
-        // project-quick inherits from global-quick (primary) with project-general as
-        // the alternative source (the two "Reset to inherited" buttons in the UI).
+        // Quick-task agent defaults (SPEC §10.4): an agent-only overlay for tasks
+        // added from the quick box. Project Quick agents inherit through the
+        // organization Quick agents into the regular project/organization agents.
         const globalQuickVals = quickGlobalSettingsFor(gs, wf, organizationId ?? undefined);
         const projectQuickVals = project ? quickProjectSettingsFor(gs, project.id, wf) : {};
         return this.json(res, 200, {
@@ -2364,11 +2380,7 @@ export class Gateway {
           globalQuick: { own: globalQuickVals, inherited: enrich(resolveParams(m, { global: globalVals }), globalQuickVals) },
           projectQuick: {
             own: projectQuickVals,
-            // Primary inherited: the full quick chain minus project-quick itself
-            // (global-quick → project-general → global-general → default).
             inherited: enrich(resolveParamsLayers(m, [globalQuickVals, projectVals, globalVals]), { ...projectVals, ...globalVals, ...globalQuickVals, ...projectQuickVals }),
-            // Alternative inherited source: the project's general defaults.
-            inheritedAlt: enrich(resolveParams(m, { project: projectVals, global: globalVals }), { ...projectVals, ...globalVals, ...projectQuickVals }),
           },
         });
       }

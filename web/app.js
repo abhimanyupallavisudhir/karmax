@@ -326,9 +326,8 @@ const inhAttr = (val) => `data-inherit='${esc(JSON.stringify(val ?? null))}'`;
 
 // "Reset to default" button — cleared/hidden until the field holds an override,
 // then clicking it drops the override so the field inherits again (SPEC §10.5).
-// `kind` distinguishes the primary reset (→ data-inherit) from an alternate reset
-// (→ data-inherit-alt) — the quick-task project defaults have TWO parents (global
-// quick + project general) and so render two buttons per field (SPEC §10.4).
+// `kind` distinguishes the primary inherited value from an optional alternate
+// source used by fields that explicitly offer one.
 const resetBtn = (name, label = 'Reset to default', kind = 'primary') =>
   `<button type="button" class="field-reset" data-reset="${esc(name)}" data-reset-kind="${esc(kind)}" hidden title="Drop this override and inherit the default">↺ ${esc(label)}</button>`;
 // `alt` (optional): { primaryLabel, altLabel } — when present, render two reset
@@ -418,7 +417,7 @@ function renderAgentField(f, spec, inherited) {
   const provider = e.provider || 'claude';
   const role = f.role || f.name;
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <div class="agent-controls">
       <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
         <input class="af-model" placeholder="model" value="${esc(e.model || '')}" autocomplete="off" />
@@ -769,10 +768,8 @@ function wireConfirmerField(box) {
 function wireFieldResets(root, fields) {
   for (const f of fields) {
     if (f.required) continue; // a required field always stores a value; nothing to inherit
-    // A field can carry >1 reset button (quick-task project defaults have two
-    // parents — global-quick via `data-inherit`, project-general via
-    // `data-inherit-alt`). Each button resets to, and shows/hides against, its own
-    // source, so you can snap the field to either inherited value.
+    // Some inherited fields can expose more than one reset source. Each button
+    // compares and restores against the source named by its data attribute.
     const btns = [...root.querySelectorAll(`.field-reset[data-reset="${CSS.escape(f.name)}"]`)];
     if (!btns.length) continue;
     let box = null;
@@ -2436,7 +2433,7 @@ async function openTaskForm(workflow, draft, seedText) {
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
           <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
         </div>
-        <div style="padding:14px 16px" id="tf-body">${renderFields(fields, values, inherited, true)}
+        <div style="padding:14px 16px" id="tf-body" class="parameter-fields">${renderFields(fields, values, inherited, true)}
           ${promptField ? '' : `<div class="form-row" data-row="__images">
             <div class="label-row"><label>Images</label></div>
             <div class="img-chips" id="tf-chips" style="display:none"></div>
@@ -5016,12 +5013,16 @@ const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile'].includes(field.name));
 const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name));
+// Agent defaults live in the profile editor, so manifests correctly declare
+// these controls as task-scoped. Quick tasks still need the same Do/Merge picker:
+// read those task fields directly rather than hiding them behind settings scopes.
+const quickAgentFields = () => schemaFor('software-dev').filter((field) => field.type === 'agent');
 function settingsForms(scope, projectId) {
   const wfs = S.schema
     .filter((s) => WORKFLOWS.some((w) => w.id === s.name) || (scope === 'global' && s.name === 'agent-queue'))
     .sort((a, b) => Number(b.name === 'agent-queue') - Number(a.name === 'agent-queue'));
   const common = `<div class="card" data-wf="__common__" data-schema-wf="software-dev">
-      <div class="wf-form">${renderFields(commonSettingsFields(scope))}</div>
+      <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
       <button class="btn primary sm" data-save="__common__">Save task defaults</button>
     </div>`;
   const unique = wfs
@@ -5032,7 +5033,7 @@ function settingsForms(scope, projectId) {
       const suffix = s.name === 'agent-queue' ? '' : '— workflow-specific';
       return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' || s.name === 'agent-queue' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(label)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">${suffix}</span></summary>
-        <div class="wf-form" style="margin-top:10px">${renderFields(fields)}</div>
+        <div class="wf-form parameter-fields" style="margin-top:10px">${renderFields(fields)}</div>
         <button class="btn primary sm" data-save="${esc(s.name)}">${s.name === 'agent-queue' ? 'Save host capacity' : `Save ${esc(s.name)} defaults`}</button>
       </details>`;
     })
@@ -5062,17 +5063,14 @@ async function hydrateSettingsForms(scope, projectId, organizationId) {
 }
 
 // ── Quick task defaults (SPEC §10.4) ─────────────────────────────────────────
-// A separate overlay applied ONLY to tasks added from the quick-task box (not the
-// full "⋯ More" form). Same per-workflow fields as the general defaults, saved to
-// a distinct `quick:`-scoped settings row. Global-quick inherits from the general
-// global defaults; project-quick inherits from EITHER global-quick or the project's
-// general defaults — so each project-quick field gets two "Reset to inherited"
-// buttons (↺ Global quick / ↺ Project default).
+// An agent-only overlay applied to tasks added from the quick-task box (not the
+// full "⋯ More" form). All non-agent task defaults continue to use the regular
+// organization/project chain.
 function quickSettingsForms(scope, projectId) {
   return `<div class="card" data-qwf="__common__" data-schema-wf="software-dev">
-    <label class="switch"><input type="checkbox" class="quick-defaults-enabled"> Different defaults for Quick tasks?</label>
-    <div class="quick-defaults-body" hidden><div class="wf-form" style="margin-top:12px"></div>
-      <button class="btn primary sm" data-qsave="__common__">Save Quick task defaults</button></div>
+    <label class="switch"><input type="checkbox" class="quick-defaults-enabled"> Different agents for Quick tasks?</label>
+    <div class="quick-defaults-body" hidden><div class="wf-form parameter-fields" style="margin-top:12px"></div>
+      <button class="btn primary sm" data-qsave="__common__">Save Quick agent defaults</button></div>
   </div>`;
 }
 
@@ -5085,9 +5083,8 @@ async function hydrateQuickSettingsForms(scope, projectId, organizationId) {
     try { d = await api(`/api/defaults/${projectId || 'global'}/${schemaWf}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`); } catch {}
     const own = d?.[key]?.own || {};
     const inherited = d?.[key]?.inherited || {};
-    const inheritedAlt = d?.[key]?.inheritedAlt || {};
-    const fields = commonSettingsFields(scope);
-    const enabled = own._enabled !== false && Object.keys(own).some((name) => name !== '_enabled');
+    const fields = quickAgentFields();
+    const enabled = own._enabled === true || (own._enabled !== false && fields.some((field) => own[field.name] !== undefined));
     sec.querySelector('.quick-defaults-enabled').checked = enabled;
     sec.querySelector('.quick-defaults-body').hidden = !enabled;
     sec.querySelector('.quick-defaults-enabled').addEventListener('change', (event) => { sec.querySelector('.quick-defaults-body').hidden = !event.target.checked; });
@@ -5103,11 +5100,11 @@ function wireQuickSettingsSave(scope, projectId, organizationId) {
     b.addEventListener('click', async () => {
       const wf = b.dataset.qsave;
       const sec = b.closest('[data-qwf]');
-      const fields = commonSettingsFields(scope);
+      const fields = quickAgentFields();
       const values = { ...collectForm(sec.querySelector('.wf-form'), fields), _enabled: sec.querySelector('.quick-defaults-enabled').checked };
       const url = scope === 'global' && organizationId ? `/api/organizations/${organizationId}/quick-settings/${wf}`
         : scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
-      try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); toast('Quick task defaults saved'); } catch (e) { toast(e.message, true); }
+      try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); toast('Quick agent defaults saved'); } catch (e) { toast(e.message, true); }
     }),
   );
 }
@@ -5117,24 +5114,26 @@ const quickDefaultsHeader = () => '';
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><h1 class="page-title">${esc(proj.name)} settings</h1><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-defaults">Task defaults</a><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-payments">Payments</a><a href="#project-misc">Misc.</a></nav><div class="settings-content">
-    <div class="settings-section-title" id="project-defaults"><span>01</span><div>Task defaults</div></div>
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-misc">Misc.</a></nav><div class="settings-content">
+    <div class="settings-section-title" id="project-git"><span>01</span><div>Git &amp; GitHub</div></div>
+    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="/organization#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
+    <div class="settings-section-title" id="project-compute"><span>02</span><div>Compute</div></div>${cloudEnvironmentCard(proj)}
+    <div class="settings-section-title" id="project-agents"><span>03</span><div>Agent logins</div></div>
+    <div class="card"><a class="btn sm organization-settings-link" href="/organization#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
+    <div class="settings-section-title" id="project-defaults"><span>04</span><div>Task defaults</div></div>
     ${settingsForms('project', proj.id)}
     ${quickSettingsForms('project', proj.id)}
     ${profilesCard('project')}
-    <div class="settings-section-title" id="project-git"><span>02</span><div>Git &amp; GitHub</div></div>
-    <div class="card"><div id="project-access">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm" href="/organization#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
-    <div class="settings-section-title" id="project-compute"><span>03</span><div>Compute</div></div>${cloudEnvironmentCard(proj)}
-    <div class="settings-section-title" id="project-people"><span>04</span><div>People &amp; authorization</div></div>
+    <div class="settings-section-title" id="project-payments"><span>05</span><div>Payments</div></div>${paymentsCard('project')}
+    <div class="settings-section-title" id="project-people"><span>06</span><div>People &amp; authorization</div></div>
+    <div class="card"><div id="project-access">Loading…</div></div>
     ${authorizationCard('project')}
-    <div class="card"><div class="section-h">Agent credentials</div><div id="cred-editor-project">Loading…</div></div>
-    <div class="settings-section-title" id="project-workflows"><span>05</span><div>Workflows</div></div>
+    <div class="settings-section-title" id="project-workflows"><span>07</span><div>Workflows</div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
       <div id="wf-pins-list">Loading…</div>
       <button class="btn" id="activate-sd">Activate software-dev</button></div>
-    <div class="settings-section-title" id="project-payments"><span>06</span><div>Payments</div></div>${paymentsCard('project')}
-    <div class="settings-section-title" id="project-misc"><span>07</span><div>Misc.</div></div>
+    <div class="settings-section-title" id="project-misc"><span>08</span><div>Misc.</div></div>
     <div class="card" style="border-color:var(--danger-weak)">
       <div class="section-h" style="color:var(--danger)">Danger zone</div>
       <button class="btn danger" id="delete-project">Delete project</button>
@@ -5163,29 +5162,31 @@ async function hydrateProjectGitProfile(proj) {
   } catch (error) { box.textContent = error.message; }
 }
 async function hydrateProjectAccess(proj) {
-  const box = $('#project-access');
-  if (!box) return;
+  const accessBox = $('#project-access');
+  const repositoryBox = $('#project-repositories');
+  if (!accessBox || !repositoryBox) return;
   try {
-    const [repositories, attached, members, gitConnections, githubApp] = await Promise.all([
+    const [repositories, members, gitConnections, githubApp] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
-      api(`/api/projects/${encodeURIComponent(proj.id)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
     ]);
-    const linkedIds = new Set(attached.map((entry) => entry.repositoryId));
-    const userName = (id) => S.organizationMembers.find((member) => member.userId === id)?.user?.name
-      || S.users.find((user) => user.id === id)?.name || 'Unnamed member';
+    const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
+    const userName = (id) => userRecord(id)?.name || userRecord(id)?.email?.split('@')[0] || 'Unnamed member';
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
-      : S.teams.find((team) => team.id === principal.teamId)?.name || principal.teamId;
+      : principal.kind === 'organization' ? '@all'
+      : `@team:${S.teams.find((team) => team.id === principal.teamId)?.slug || principal.teamId}`;
     const candidates = [
-      ...S.organizationMembers.map((member) => ({ value: `user:${member.userId}`, label: userName(member.userId) })),
-      ...S.teams.map((team) => ({ value: `team:${team.id}`, label: `${team.name} (team)` })),
+      { value: '@all', aliases: ['@all'], principal: { kind: 'organization', organizationId: proj.organizationId } },
+      ...S.teams.map((team) => ({ value: `@team:${team.slug}`, aliases: [`@team:${team.slug}`, team.name], principal: { kind: 'team', teamId: team.id } })),
+      ...S.organizationMembers.map((member) => { const record = userRecord(member.userId); const name = userName(member.userId); const value = record?.email ? `${name} — ${record.email}` : name; return { value, aliases: [value, name, record?.email, `user:${member.userId}`].filter(Boolean), principal: { kind: 'user', userId: member.userId } }; }),
     ];
-    box.innerHTML = `<div class="section-h">Project access</div>
-      ${members.map((member) => `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(member.principal.userId || member.principal.teamId)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`).join('') || '<p class="task-sub">No project access overrides.</p>'}
-      <div class="inline-form"><select id="project-member-principal">${candidates.map((candidate) => `<option value="${esc(candidate.value)}">${esc(candidate.label)}</option>`).join('')}</select><select id="project-member-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="project-member-add">Add</button></div>
-      <div class="section-h" style="margin-top:18px">Repositories</div>
+    accessBox.innerHTML = `<div class="section-h">Project access</div>
+      ${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`; }).join('') || '<p class="task-sub">No project access overrides.</p>'}
+      <datalist id="project-principal-options">${candidates.map((candidate) => `<option value="${esc(candidate.value)}"></option>`).join('')}</datalist>
+      <div class="inline-form"><input id="project-member-principal" list="project-principal-options" placeholder="Type a person, @team:…, or @all"><select id="project-member-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="project-member-add">Add</button></div>`;
+    repositoryBox.innerHTML = `<div class="section-h">Repositories</div>
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
       <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /local/path'}"><button class="btn sm project-repository-remove" aria-label="Remove repository">−</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
@@ -5194,24 +5195,26 @@ async function hydrateProjectAccess(proj) {
         : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="project-authorize-github">Authorize repository creation</button>' : ''}</div>
           ${githubApp.userAuthorized ? `<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b></summary><div class="inline-form"><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="project-new-repo-name" placeholder="new-repository"><input id="project-new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="project-new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm primary" id="project-new-repo-create">Create and attach</button></div></details>` : ''}`}`;
     $('#project-member-add')?.addEventListener('click', async () => {
-      const [kind, id] = ($('#project-member-principal')?.value || '').split(':'); if (!id) return;
-      try { await api(`/api/projects/${proj.id}/members`, { method: 'POST', body: JSON.stringify({ principal: kind === 'team' ? { kind, teamId: id } : { kind: 'user', userId: id }, profileId: $('#project-member-profile').value }) }); await hydrateProjectAccess(proj); }
+      const entered = $('#project-member-principal')?.value.trim().toLowerCase();
+      const candidate = candidates.find((item) => item.aliases.some((alias) => alias.toLowerCase() === entered));
+      if (!candidate) return toast('Choose a person, @team:…, or @all', true);
+      try { await api(`/api/projects/${proj.id}/members`, { method: 'POST', body: JSON.stringify({ principal: candidate.principal, profileId: $('#project-member-profile').value }) }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     });
-    box.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
+    accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     }));
-    const wireRepositoryRemoves = () => box.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
+    const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
     wireRepositoryRemoves();
     $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><input list="project-repository-options" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /local/path'}"><button class="btn sm project-repository-remove" aria-label="Remove repository">−</button></div>`); wireRepositoryRemoves(); });
-    $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...box.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
+    $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
     $('#project-setup-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) }); const form = document.createElement('form'); form.method = 'POST'; form.action = result.action; const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest); form.appendChild(manifest); document.body.appendChild(form); form.submit(); } catch (error) { toast(error.message, true); } });
     $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
     $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
     $('#project-new-repo-create')?.addEventListener('click', async () => { const name = $('#project-new-repo-name')?.value.trim(); if (!name) return toast('Repository name is required', true); try { const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#project-new-repo-connection').value, name, description: $('#project-new-repo-description').value, private: $('#project-new-repo-private').checked }) }); await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) }); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
-  } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
+  } catch (error) { accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
 }
 async function hydrateWorkflowPins(projectId) {
   const box = $('#wf-pins-list');
@@ -5239,6 +5242,10 @@ async function hydrateWorkflowPins(projectId) {
 }
 function wireSettingsView(proj) {
   wireSettingsNavigation();
+  $('#main').querySelectorAll('.organization-settings-link').forEach((link) => link.addEventListener('click', (event) => {
+    event.preventDefault();
+    go(link.getAttribute('href'));
+  }));
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
   hydrateProjectGitProfile(proj);
@@ -5355,7 +5362,7 @@ function globalSettingsView(embedded = false) {
     ${authorizationCard('global')}
     <div class="settings-section-title" id="settings-payments"><span>05</span><div>Payments</div></div>
     ${paymentsCard('global')}
-    <div class="settings-section-title" id="settings-agents"><span>06</span><div>Agent logins</div></div>
+    <div class="settings-section-title" id="settings-agents"><span>03</span><div>Agent logins</div></div>
     <div class="card" id="accounts-card">
       <div class="section-h">Agent accounts <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The installation's logins and API keys, with organization defaults controlling how tasks use them. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
@@ -5423,11 +5430,11 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
       </div>
     </div>
-    <div class="card">
+    <div class="card" id="appearance-card">
       <div class="section-h">Appearance</div>
       <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
     </div>
-    <div class="card">
+    <div class="card" id="resilience-card">
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
     </div>`;
@@ -5585,7 +5592,7 @@ function profileRow(p, handles, logins, scope) {
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
     <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span> ${usedBy}
       ${inherited ? '<span class="chip" title="Using the organization/installation default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <div class="agent-profile-controls">
       <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <div class="combo pf-model-combo" style="flex:1;min-width:140px">
         <input class="pf-model" placeholder="model" value="${esc(p.model || '')}" autocomplete="off" />
@@ -5652,7 +5659,7 @@ async function hydrateAccounts() {
 }
 
 function profilesCard(scope) {
-  return `<div class="card" id="profiles-card-${scope}">
+  return `<div class="card agent-profile-settings" id="profiles-card-${scope}">
     <div class="section-h">Agent profiles</div>
     <p style="color:var(--ink-2);margin-top:0">Model, turn cap, and account pool for each workflow role.${scope === 'project' ? ' These override inherited defaults for this project.' : ''}</p>
     <div id="profiles-list-${scope}">Loading…</div>
@@ -5942,29 +5949,48 @@ function wireSettingsNavigation() {
   links.forEach((link) => link.addEventListener('click', () => activate(link.getAttribute('href').slice(1))));
 }
 
+function scrollToSettingsHash() {
+  if (!location.hash.startsWith('#settings-')) return;
+  requestAnimationFrame(() => requestAnimationFrame(() => document.querySelector(location.hash)?.scrollIntoView({ block: 'start' })));
+}
+
+function reorderSettingsSections(content, ids) {
+  if (!content) return;
+  const children = [...content.children];
+  const groups = new Map();
+  let current;
+  for (const child of children) {
+    if (child.classList.contains('settings-section-title')) current = child.id;
+    if (!current) continue;
+    if (!groups.has(current)) groups.set(current, []);
+    groups.get(current).push(child);
+  }
+  for (const id of ids) for (const node of groups.get(id) || []) content.append(node);
+}
+
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   return `<div class="organization-settings"><h1 class="page-title">Settings</h1>
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-people">People &amp; authorization</a><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-agents">Agent logins</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Misc.</a><button class="btn sm settings-new-org" id="create-organization">＋ New organization</button></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Misc.</a><button class="btn sm settings-new-org" id="create-organization">＋ New organization</button></nav>
     <div class="settings-content">
 
-    <div class="settings-section-title" id="settings-people"><span>01</span><div>People &amp; authorization</div></div>
+    <div class="settings-section-title" id="settings-people"><span>06</span><div>People &amp; authorization</div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div><div id="org-authorization-slot"></div></div>
 
-    <div class="settings-section-title" id="settings-code"><span>02</span><div>Git &amp; GitHub</div></div>
+    <div class="settings-section-title" id="settings-code"><span>01</span><div>Git &amp; GitHub</div></div>
     <div class="card"><div class="section-h">GitHub connection</div><div id="org-github">Loading…</div><div id="org-git-accounts-slot"></div></div>
 
-    <div class="settings-section-title" id="settings-compute"><span>03</span><div>Compute<small>Where tasks run and what they may spend</small></div></div>
+    <div class="settings-section-title" id="settings-compute"><span>02</span><div>Compute<small>Where tasks run and what they may spend</small></div></div>
     <div class="card"><div class="section-h">Task execution</div><p class="task-sub">Choose where tasks run, how large each world is, when idle worlds pause, and the monthly cost ceiling. Provider credentials and templates are configured directly below the policy that uses them.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
 
     ${globalSettingsView(true)}
 
-    <div class="settings-section-title" id="settings-advanced"><span>08</span><div>Misc.</div></div>
+    <div class="settings-section-title" id="settings-advanced"><span>08</span><div>Misc.</div></div><div id="org-misc-slot"></div>
     <details class="card settings-disclosure"><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
     <details class="card settings-disclosure"><summary><b>Export or delete organization</b><span>Data portability and permanent removal</span></summary><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></details>
     </div></div></div>`;
@@ -5976,7 +6002,11 @@ async function hydrateOrganizationView() {
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   const authorization = $('#authorization-card-global');
   if (authorization && $('#org-authorization-slot')) $('#org-authorization-slot').append(authorization);
+  for (const card of [$('#main [data-wf="agent-queue"]'), $('#appearance-card'), $('#resilience-card')])
+    if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
+  reorderSettingsSections($('.settings-content'), ['settings-code', 'settings-compute', 'settings-agents', 'settings-defaults', 'settings-payments', 'settings-people', 'settings-installation', 'settings-advanced']);
   wireSettingsNavigation();
+  scrollToSettingsHash();
   await loadCollaboration().catch(() => {});
   const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
   const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';

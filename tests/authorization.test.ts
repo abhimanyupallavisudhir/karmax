@@ -48,6 +48,22 @@ describe('durable authorization policy', () => {
     ]);
   });
 
+  it('applies team and @all project profiles dynamically', () => {
+    const store = new Store(':memory:');
+    const authz = new AuthorizationService(store);
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    store.setOrganizationMembership(organization.id, 'alice', 'member');
+    const project = store.createProject('App', {}, organization.id);
+    const team = store.createTeam({ organizationId: organization.id, name: 'Leaders' });
+    store.setTeamMembership(team.id, 'alice');
+    store.setProjectMembership(project.id, { kind: 'team', teamId: team.id }, 'maintainer');
+    expect(allows(authz.capabilities('user:alice', project.id), 'project:settings:write')).toBe(true);
+
+    store.removeProjectMembership(project.id, { kind: 'team', teamId: team.id });
+    store.setProjectMembership(project.id, { kind: 'organization', organizationId: organization.id }, 'administrator');
+    expect(allows(authz.capabilities('user:alice', project.id), 'project:delete')).toBe(true);
+  });
+
   it('accepts the workflow-role capabilities exposed by the checklist', () => {
     const authz = new AuthorizationService(new Store(':memory:'));
     expect(() => authz.saveProfile('user:admin', 'global', {

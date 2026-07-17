@@ -458,7 +458,7 @@ The host shell and core modules are **first-party**, built on the same contribut
 
 - **Task list** — the primary surface (per project / task list).
 - **Merge queue UI** — ordered queue, reorder, position, cancel.
-- **Settings** — matching organization and project surfaces with sticky section rails: Task defaults, Git & GitHub, Compute, Agent logins (organization only), Payments, People & authorization, Workflows, and Misc. Shared task fields render once and are consumed by every workflow declaring them; dedicated workflow blocks contain only genuinely unique fields. Repository selection/creation belongs to the project that uses it.
+- **Settings** — matching organization and project surfaces with sticky section rails, ordered Git & GitHub → Compute → Agent logins → Task defaults → Payments → People & authorization → Workflows → Misc. Agent logins are organization-owned; the project section links directly to that organization section and only edits project credential precedence. Shared task fields render once and are consumed by every workflow declaring them; dedicated workflow blocks contain only genuinely unique fields. Repository selection/creation belongs to the project that uses it, while project access belongs under People & authorization.
 - **Inbox** — one full page opened from the top-bar attention icon; never a second sidebar destination or notification popover.
 
 Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
@@ -503,12 +503,12 @@ The `agent` field type is the reusable control for choosing the agent that runs 
 
 The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.
 
-**Quick-task defaults.** Each scope has one **Different defaults for Quick tasks?** switch. Off means quick tasks use regular defaults. On enables one shared `quick:` overlay; project Quick defaults inherit from the organization Quick defaults.
+**Quick-task defaults.** Each scope has one **Different agents for Quick tasks?** switch. Off means quick tasks use the regular agent defaults. On enables one shared, agent-only `quick:` overlay; project Quick agent defaults inherit from the organization Quick agent defaults. Branches, Review route, remote policy, and other task defaults never diverge merely because the Quick composer was used.
 
 Quick defaults are purely opt-in and inherit from the general defaults until a field is set, so the overlay stack for a quick task is (highest → lowest precedence):
 
 ```
-task override → project-quick → global-quick → project-general → global-general → field default
+agent task override → project-quick agent → global-quick agent → project-general agent → global-general agent → agent field default
 ```
 
 Disabling a scope's Quick overlay removes it from this chain without deleting its values. Full-form tasks skip the Quick layers entirely.
