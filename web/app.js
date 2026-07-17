@@ -860,6 +860,10 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
   list.querySelectorAll('.agent-field').forEach(wireAgentBox);
   cfSync(box);
+  // This composite control is rebuilt rather than assigned through an input.
+  // Emit the same event as a user edit so draft auto-save persists the reset;
+  // otherwise the UI can show @creator while the last partial value remains saved.
+  box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
