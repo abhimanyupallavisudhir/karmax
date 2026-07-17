@@ -4511,12 +4511,23 @@ function wireFollowups(v) {
         if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
           S.taskEvents.push({ type: 'conversation.message', taskId: v.taskId, ts: result.message.ts, payload: { role: result.role || role, message: result.message } });
         }
-        ta.value = '';
+        // Clear the persisted draft + image store FIRST, so neither the re-render
+        // below nor a background refresh can repopulate the box from them. The box
+        // content is sourced from S.followupDrafts on every render, so this — not
+        // touching the DOM — is what actually empties it.
         delete S.followupDrafts[key];
         store.length = 0;
+        // The captured `ta`/`chips` may be detached if a background WS refresh
+        // swapped the page during the await above, in which case clearing `ta`
+        // would leave the *live* box untouched. Clear the current DOM textarea by
+        // a fresh lookup so the box is cleared even in that race.
+        const sel = window.CSS && CSS.escape ? CSS.escape(role) : role;
+        const liveTa = $('#main').querySelector(`.followup-box[data-role="${sel}"] .followup-input`);
+        if (liveTa) liveTa.value = '';
+        else if (ta) ta.value = '';
         paint();
         toast('Follow-up sent');
-        if (S.taskTab === 'checkin') renderTaskPage();
+        renderTaskPage();
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
