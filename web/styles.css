@@ -733,6 +733,34 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 }
 .agent-separate-toggle input { width: auto; margin: 0; }
 .agent-group [hidden] { display: none !important; }
+.parameter-fields .agent-field {
+  padding: 10px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface-2);
+}
+.parameter-fields .agent-controls {
+  display: grid; grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr); gap: 8px;
+}
+.parameter-fields .agent-field .agent-controls > select,
+.parameter-fields .agent-field .agent-controls input,
+.parameter-fields .agent-field .af-resume-session {
+  width: 100%; min-width: 0; height: 40px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+  outline: none; font-size: 13px;
+}
+.parameter-fields .agent-field .agent-controls input:focus,
+.parameter-fields .agent-field .agent-controls select:focus,
+.parameter-fields .agent-field .af-resume-session:focus { border-color: var(--accent); }
+.parameter-fields .agent-field .af-resume { margin: 8px 2px 0 !important; }
+.agent-profile-controls {
+  display: grid; grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; gap: 8px;
+}
+.agent-profile-controls > select, .agent-profile-controls > input, .agent-profile-controls .combo > input {
+  width: 100%; min-width: 0; height: 40px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface); outline: none; font-size: 13px;
+}
+.agent-profile-controls input:focus, .agent-profile-controls select:focus { border-color: var(--accent); }
+@media (max-width: 700px) { .parameter-fields .agent-controls { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .agent-profile-controls { grid-template-columns: 1fr; } }
 .branch-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .branch-pair .form-row { min-width: 0; }
 @media (max-width: 700px) { .branch-pair { grid-template-columns: 1fr; } }

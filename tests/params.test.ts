@@ -176,8 +176,8 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
   });
 });
 
-describe('quick-task defaults (separate overlay for the quick-add box)', () => {
-  // The creation-time chain for a quick task in a project (highest → lowest):
+describe('quick-task agent defaults (separate overlay for the quick-add box)', () => {
+  // The creation-time chain for an agent field on a quick task (highest → lowest):
   // task → project-quick → global-quick → project-general → global-general → default.
   const chain = (layers: {
     task?: Record<string, unknown>;
@@ -194,50 +194,54 @@ describe('quick-task defaults (separate overlay for the quick-add box)', () => {
     expect(quickScopeKey('p1')).not.toBe('global');
   });
 
-  it('global-quick overrides the general defaults for a quick task', () => {
-    const r = chain({ globalQuick: { confirm: { mode: 'auto' } }, global: { confirm: { mode: 'human' } } });
-    expect(r.confirm).toEqual({ mode: 'auto' });
+  it('global-quick overrides the regular agent defaults for a quick task', () => {
+    const r = chain({ globalQuick: { 'agent:do': { provider: 'codex' } }, global: { 'agent:do': { provider: 'claude' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'codex' });
   });
 
-  it('organization-quick inherits (falls through) to the general organization default when unset', () => {
-    const r = chain({ globalQuick: {}, global: { target: 'release' } });
-    expect(r.target).toBe('release');
+  it('organization-quick inherits the regular organization agent when unset', () => {
+    const r = chain({ globalQuick: {}, global: { 'agent:do': { provider: 'claude' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
   });
 
   it('project-quick overrides global-quick', () => {
-    const r = chain({ projectQuick: { confirm: { mode: 'human' } }, globalQuick: { confirm: { mode: 'auto' } } });
-    expect(r.confirm).toEqual({ mode: 'human' });
+    const r = chain({ projectQuick: { 'agent:do': { provider: 'claude' } }, globalQuick: { 'agent:do': { provider: 'codex' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
   });
 
   it('project-quick inherits from global-quick before the project general default', () => {
-    const r = chain({ globalQuick: { confirm: { mode: 'auto' } }, project: { confirm: { mode: 'human' } } });
-    expect(r.confirm).toEqual({ mode: 'auto' }); // global-quick wins over project-general
+    const r = chain({ globalQuick: { 'agent:do': { provider: 'codex' } }, project: { 'agent:do': { provider: 'claude' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'codex' });
   });
 
-  it('project-quick falls through to the project general default when neither quick layer sets it', () => {
-    const r = chain({ project: { target: 'prod' }, global: { target: 'main' } });
-    expect(r.target).toBe('prod');
+  it('project-quick falls through to the regular project agent when neither quick layer sets it', () => {
+    const r = chain({ project: { 'agent:do': { provider: 'claude' } }, global: { 'agent:do': { provider: 'codex' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
   });
 
   it('a task override still beats every default layer', () => {
-    const r = chain({ task: { base: 'feature' }, projectQuick: { base: 'pq' }, globalQuick: { base: 'gq' }, project: { base: 'p' }, global: { base: 'g' } });
-    expect(r.base).toBe('feature');
+    const r = chain({
+      task: { 'agent:do': { provider: 'mock' } },
+      projectQuick: { 'agent:do': { provider: 'claude' } },
+      globalQuick: { 'agent:do': { provider: 'codex' } },
+    });
+    expect(r['agent:do']).toMatchObject({ provider: 'mock' });
   });
 
   it('quick*SettingsFor read the namespaced rows and default to {}', () => {
     const rows: Record<string, Record<string, unknown>> = {
-      'quick:global::software-dev': { confirm: { mode: 'auto' } },
-      'quick:p1::software-dev': { base: 'qb' },
+      'quick:global::software-dev': { confirm: { mode: 'auto' }, 'agent:do': { provider: 'codex' } },
+      'quick:p1::software-dev': { base: 'qb', 'agent:merge': { provider: 'claude' } },
     };
     const get = (scopeKey: string, wf: string) => rows[`${scopeKey}::${wf}`];
-    expect(quickGlobalSettingsFor(get, 'software-dev')).toEqual({ confirm: { mode: 'auto' } });
-    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({ base: 'qb' });
+    expect(quickGlobalSettingsFor(get, 'software-dev')).toEqual({ 'agent:do': { provider: 'codex' } });
+    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({ 'agent:merge': { provider: 'claude' } });
     expect(quickGlobalSettingsFor(() => undefined, 'software-dev')).toEqual({});
     expect(quickProjectSettingsFor(() => undefined, 'p1', 'software-dev')).toEqual({});
   });
 
   it('can disable the shared Quick overlay without deleting its values', () => {
-    const get = (_scope: string, workflow: string) => workflow === '__common__' ? { _enabled: false, base: 'quick' } : undefined;
+    const get = (_scope: string, workflow: string) => workflow === '__common__' ? { _enabled: false, 'agent:do': { provider: 'codex' } } : undefined;
     expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({});
   });
 });

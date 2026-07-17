@@ -28,6 +28,7 @@ import {
   TeamMembership,
   ProjectMembership,
   PrincipalRef,
+  ProjectPrincipalRef,
   ConfirmationPolicy,
   Repository,
   ProjectRepository,
@@ -1103,7 +1104,7 @@ export class Store {
     this.db.prepare('DELETE FROM team_memberships WHERE teamId=? AND userId=?').run(teamId, userId);
   }
 
-  setProjectMembership(projectId: string, principal: PrincipalRef, role: ProjectMembership['role']): ProjectMembership {
+  setProjectMembership(projectId: string, principal: ProjectPrincipalRef, role: ProjectMembership['role']): ProjectMembership {
     const project = this.getProject(projectId);
     if (!project) throw new Error(`no project ${projectId}`);
     this.assertPrincipalInOrganization(principal, project.organizationId!);
@@ -1126,7 +1127,7 @@ export class Store {
       .map((r) => ({ projectId: r.projectId, principal: JSON.parse(r.principal), role: r.role, joinedAt: r.joinedAt }));
   }
 
-  removeProjectMembership(projectId: string, principal: PrincipalRef): void {
+  removeProjectMembership(projectId: string, principal: ProjectPrincipalRef): void {
     const key = principalKey(principal);
     const row = this.db.prepare('SELECT role FROM project_memberships WHERE projectId=? AND principalKey=?')
       .get(projectId, key) as any;
@@ -1140,15 +1141,20 @@ export class Store {
 
   userIsProjectMember(projectId: string, userId: string): boolean {
     if (this.db.prepare('SELECT 1 FROM project_memberships WHERE projectId=? AND principalKey=?').get(projectId, `user:${userId}`)) return true;
+    const organizationId = this.getProject(projectId)?.organizationId;
+    if (organizationId && this.organizationMembership(organizationId, userId)
+      && this.db.prepare('SELECT 1 FROM project_memberships WHERE projectId=? AND principalKey=?').get(projectId, `organization:${organizationId}`)) return true;
     return !!this.db.prepare(`SELECT 1 FROM project_memberships p JOIN team_memberships tm
       ON p.principalKey=('team:' || tm.teamId) WHERE p.projectId=? AND tm.userId=? LIMIT 1`).get(projectId, userId);
   }
 
-  private assertPrincipalInOrganization(principal: PrincipalRef, organizationId: string): void {
+  private assertPrincipalInOrganization(principal: ProjectPrincipalRef, organizationId: string): void {
     if (principal.kind === 'user' && !this.organizationMembership(organizationId, principal.userId))
       throw new Error('user is not a member of the project organization');
     if (principal.kind === 'team' && this.getTeam(principal.teamId)?.organizationId !== organizationId)
       throw new Error('team belongs to another organization');
+    if (principal.kind === 'organization' && principal.organizationId !== organizationId)
+      throw new Error('organization principal belongs to another organization');
     if (principal.kind === 'task-agent') {
       const project = this.getProject(this.getTask(principal.taskId)?.projectId ?? '');
       if (project?.organizationId !== organizationId) throw new Error('task agent belongs to another organization');
@@ -1821,9 +1827,10 @@ export class Store {
     return r ? rowToTask(r) : undefined;
   }
 
-  private expandPrincipal(principal: PrincipalRef, projectId: string): string[] {
+  private expandPrincipal(principal: ProjectPrincipalRef, projectId: string): string[] {
     if (principal.kind === 'user') return [principal.userId];
     if (principal.kind === 'team') return (this.listTeamMemberships(principal.teamId)).map((m) => m.userId);
+    if (principal.kind === 'organization') return this.listOrganizationMemberships(principal.organizationId).map((member) => member.userId);
     return [];
   }
 
@@ -2950,9 +2957,10 @@ function validGitBranch(value: string): boolean {
     && !value.endsWith('/') && !value.endsWith('.') && !value.endsWith('.lock');
 }
 
-export function principalKey(principal: PrincipalRef): string {
+export function principalKey(principal: ProjectPrincipalRef): string {
   if (principal.kind === 'user') return `user:${principal.userId}`;
   if (principal.kind === 'team') return `team:${principal.teamId}`;
+  if (principal.kind === 'organization') return `organization:${principal.organizationId}`;
   return `task-agent:${principal.taskId}:${principal.role}`;
 }
 

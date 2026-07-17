@@ -252,20 +252,24 @@ export function globalSettingsFor(
 }
 
 /**
- * Quick-task defaults (SPEC §10.4) — a separate overlay that applies ONLY to tasks
- * added from the quick-task box (not the full task form). Stored under a `quick:`
- * namespaced scope key so it never collides with the general defaults, and starts
- * empty (no legacy back-compat derivation): quick defaults are purely opt-in and
- * inherit from the general defaults until a field is set.
+ * Quick-task agent defaults (SPEC §10.4) — a separate, agent-only overlay that
+ * applies ONLY to tasks added from the quick-task box (not the full task form).
+ * It starts empty and is opt-in. Filtering on read also prevents historical
+ * non-agent values in these rows from changing branch, review, or remote policy.
  *
  * Effective value for a quick task in a project (highest → lowest precedence):
  *   task override → project-quick → global-quick → project-general → global-general → field default.
- * That chain realizes the two inheritances the settings UI exposes: global-quick
- * inherits from global-general, and project-quick inherits from global-quick (its
- * natural parent) with the project-general defaults as the alternative source.
+ * The chain applies to agent fields only: global-quick inherits from
+ * global-general, while project-quick inherits from global-quick and then the
+ * project's regular agent defaults.
  */
 export function quickScopeKey(scope: 'global' | string): string {
   return scope === 'global' ? 'quick:global' : `quick:${scope}`;
+}
+
+function quickAgentsOnly(values: ValueMap | undefined): ValueMap | undefined {
+  if (!values) return undefined;
+  return Object.fromEntries(Object.entries(values).filter(([name]) => name === '_enabled' || name === 'separateAgents' || name.startsWith('agent:')));
 }
 
 export function quickGlobalSettingsFor(
@@ -277,13 +281,13 @@ export function quickGlobalSettingsFor(
     const key = `quick:organization:${organizationId}`;
     const common = getSettings(key, COMMON_SETTINGS_WORKFLOW);
     if (common?._enabled === false) return {};
-    return withCommon(getSettings, key, workflow)
-      ?? (organizationId === 'org_personal' ? withCommon(getSettings, quickScopeKey('global'), workflow) : undefined)
+    return quickAgentsOnly(withCommon(getSettings, key, workflow)
+      ?? (organizationId === 'org_personal' ? withCommon(getSettings, quickScopeKey('global'), workflow) : undefined))
       ?? {};
   }
   const key = quickScopeKey('global');
   if (getSettings(key, COMMON_SETTINGS_WORKFLOW)?._enabled === false) return {};
-  return withCommon(getSettings, key, workflow) ?? {};
+  return quickAgentsOnly(withCommon(getSettings, key, workflow)) ?? {};
 }
 
 export function quickProjectSettingsFor(
@@ -293,7 +297,7 @@ export function quickProjectSettingsFor(
 ): ValueMap {
   const key = quickScopeKey(projectId);
   if (getSettings(key, COMMON_SETTINGS_WORKFLOW)?._enabled === false) return {};
-  return withCommon(getSettings, key, workflow) ?? {};
+  return quickAgentsOnly(withCommon(getSettings, key, workflow)) ?? {};
 }
 
 /** When project settings are saved, mirror bound-project fields into ProjectConfig (back-compat). */
