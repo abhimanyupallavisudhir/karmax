@@ -5049,8 +5049,8 @@ async function renderDashboard() {
 }
 
 // Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,
-// an "unavailable" record, or undefined (never probed). Non-pollable logins (Codex /
-// API keys / setup-token) render nothing here — their reactive status is shown above.
+// an "unavailable" record, or undefined (never probed). Non-pollable logins (API
+// keys / setup-token) render nothing here — their reactive status is shown above.
 function usageBlock(id, snap, isPollable) {
   if (!snap) {
     return isPollable
@@ -5062,6 +5062,7 @@ function usageBlock(id, snap, isPollable) {
       ? 'Usage % needs a full login (this one uses a setup-token) — tracked reactively.'
       : snap.reason === 'logged-out' ? 'Not logged in.'
       : snap.reason === 'not-subscription' ? 'No subscription usage to report.'
+      : snap.reason === 'no-rate-limits' ? 'No subscription rate limits to report.'
       : `Usage unavailable (${esc(snap.reason || '')}).`;
     return `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">${esc(why)}</div>`;
   }
@@ -5083,7 +5084,7 @@ function usageRow(label, win) {
   const expired = win.resetAt && win.resetAt < Date.now();
   const hue = expired ? 'var(--ink-3)' : pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
   const reset = expired
-    ? `window reset ${esc(win.resetLabel || '')}${win.tz ? ` (${esc(win.tz)})` : ''} — % is from the previous window`
+    ? `window reset ${esc(usageResetLabel(win))}${win.tz ? ` (${esc(win.tz)})` : ''} — % is from the previous window`
     : `resets ${esc(fmtUsageReset(win))}`;
   return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px${expired ? ';opacity:.55' : ''}">
     <span style="width:64px;color:var(--ink-2)">${esc(label)}</span>
@@ -5095,9 +5096,16 @@ function usageRow(label, win) {
   </div>`;
 }
 
+function usageResetLabel(win) {
+  if (win.resetLabel) return win.resetLabel;
+  return win.resetAt
+    ? new Date(win.resetAt).toLocaleString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })
+    : '';
+}
+
 function fmtUsageReset(win) {
   const cd = win.resetAt ? ` · ${fmtCountdown(win.resetAt)}` : '';
-  return `${win.resetLabel || ''}${win.tz ? ` (${win.tz})` : ''}${cd}`;
+  return `${usageResetLabel(win)}${win.tz ? ` (${win.tz})` : ''}${cd}`;
 }
 
 function fmtCountdown(epoch) {

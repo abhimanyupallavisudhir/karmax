@@ -2283,9 +2283,9 @@ export class Gateway {
         return this.json(res, 200, { ok: true, maxConcurrent: n });
       }
 
-      // Proactive quota (#6): real usage % + reset for each pollable Claude login.
+      // Proactive quota (#6): real usage % + reset for each pollable subscription.
       // GET returns the cached snapshots; recheck re-probes on demand (the button).
-      // Codex/API-key/setup-token creds aren't pollable → they show reactive status.
+      // API-key/setup-token creds aren't pollable → they show reactive status.
       if (p === '/api/accounts/usage' && method === 'GET') {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
@@ -2305,9 +2305,9 @@ export class Gateway {
             const snap = JSON.parse(cached);
             usage[c.key] = canPoll ? { ...snap, stale: isUsageStale(snap, Date.now()) } : snap;
           }
-          // Explain absence on a Claude login that CAN'T be polled (setup-token, no
-          // full `.credentials.json`) so the dashboard shows a reason, not a blank.
-          else if (!canPoll && c.provider === 'claude' && c.kind !== 'key') usage[c.key] = { ok: false, reason: 'setup-token' };
+          // Explain absence on a login that CAN'T be polled (setup-token, no full
+          // native credential) so the dashboard shows a reason, not a blank.
+          else if (!canPoll && c.kind !== 'key') usage[c.key] = { ok: false, reason: 'setup-token' };
         }
         return this.json(res, 200, { usage, pollable });
       }
@@ -2587,9 +2587,9 @@ export class Gateway {
     await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);
   }
 
-  /** Probe usage for the pollable Claude logins (all, or just `only`) and cache the
+  /** Probe usage for pollable subscription logins (all, or just `only`) and cache the
    *  snapshots in kv under `usage:<credKey>`. Drives the dashboard's real %; a probe
-   *  shells out `claude -p '/usage'` in an isolated dir so it can't race a leased home.
+   *  asks the provider's native CLI for account quota without spending a model turn.
    *  Overlapping rechecks (auto-refresh + button, multiple tabs) share one in-flight
    *  probe per login rather than spawning duplicate CLIs. */
   private usageProbes = new Map<string, Promise<unknown>>();
@@ -2597,15 +2597,16 @@ export class Gateway {
     const { store } = this.deps;
     const { enumerateCredentials } = await import('../platform/credentials.js');
     const { gatherCredentialSources } = await import('../platform/credential-sources.js');
-    const { probeClaudeUsage, isUsagePollable } = await import('../agent/usage.js');
+    const { probeClaudeUsage, probeCodexUsage, isUsagePollable } = await import('../agent/usage.js');
     const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }))
       .filter((c) => isUsagePollable(c) && (!only || c.key === only));
     const out: Record<string, unknown> = {};
     await Promise.all(creds.map(async (c) => {
       let probe = this.usageProbes.get(c.key);
       if (!probe) {
-        // ambient uses ~/.claude (no configHome); a login uses its own home.
-        probe = probeClaudeUsage({ configHome: c.kind === 'ambient' ? undefined : c.configHome })
+        // Ambient uses the provider's default home; a managed login uses its own.
+        const configHome = c.kind === 'ambient' ? undefined : c.configHome;
+        probe = (c.provider === 'codex' ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }))
           .then((snap) => { store.kvSet(`usage:${c.key}`, JSON.stringify(snap)); return snap; })
           .finally(() => this.usageProbes.delete(c.key));
         this.usageProbes.set(c.key, probe);
