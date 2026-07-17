@@ -376,6 +376,53 @@ a { color: var(--accent); text-decoration: none; }
 .tp-foot-inner { max-width: 960px; margin: 0 auto; padding: 0 28px; display: flex; gap: 8px; align-items: center; }
 .tp-foot-inner > .actions { flex: 1; }
 
+/* ── full-page task form (new task / edit draft, SPEC §10.4) ─────────────── */
+/* The expanded form is a PAGE, not a dialog — GitHub-issue-creation shape: a
+   head strip (back · title · workflow), a scrollable two-column body (the big
+   prompt editor + workflow parameters left, organization metadata right) and a
+   foot strip with the actions. Shares the task page's column-and-strip
+   language; sits under palettes/pickers (#modal-root, z 70) and toasts (z 60). */
+.task-form-page {
+  position: fixed; inset: 0; z-index: 40;
+  display: flex; flex-direction: column;
+  background: var(--paper); outline: none;
+  animation: pane-in .16s ease;
+}
+.tf-head { background: var(--surface); border-bottom: 1px solid var(--line); padding: 12px 0; }
+.tf-head-inner, .tf-foot-inner, .tf-columns { max-width: 1120px; margin: 0 auto; padding: 0 28px; }
+.tf-head-inner { display: flex; align-items: center; gap: 10px; }
+.tf-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; white-space: nowrap; }
+.tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tf-savestate { margin-left: auto; color: var(--ink-3); font-size: 12px; flex: none; }
+.tf-savestate:not(:empty)::before { content: '✓ '; color: var(--merged); }
+.tf-head select { flex: none; border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 6px 9px; font-weight: 550; }
+.tf-scroll { flex: 1; overflow-y: auto; }
+.tf-columns {
+  padding-top: 26px; padding-bottom: 56px;
+  display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px 44px;
+  align-items: start;
+}
+.tf-main { min-width: 0; }
+/* The prompt is the body of the "issue" — give it real room. */
+.tf-main .prompt-field > textarea { min-height: 220px; }
+.tf-main > .section-h { margin: 26px 0 14px; padding-top: 20px; border-top: 1px solid var(--line); }
+/* Sidebar: hairline-separated metadata sections, GitHub-issue style. */
+.tf-side { min-width: 0; display: flex; flex-direction: column; }
+.tf-side .form-row { margin-bottom: 0; padding: 16px 0; }
+.tf-side .form-row:first-child { padding-top: 2px; }
+.tf-side .form-row + .form-row { border-top: 1px solid var(--line); }
+.tf-side .org-editor { flex-direction: column; align-items: flex-start; gap: 10px; }
+.tf-foot { border-top: 1px solid var(--line); background: var(--surface); padding: 12px 0; }
+.tf-foot-inner { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
+.tf-foot .tf-hint { margin-right: auto; color: var(--ink-3); font-size: 12px; }
+@media (max-width: 900px) {
+  .tf-columns { grid-template-columns: 1fr; }
+  .tf-head-inner, .tf-foot-inner, .tf-columns { padding-left: 16px; padding-right: 16px; }
+  .tf-columns { padding-top: 18px; padding-bottom: 40px; }
+  .tf-side { margin-top: 10px; border-top: 1px solid var(--line); }
+  .tf-foot .tf-hint { display: none; }
+}
+
 /* Check-in tab: a fixed sidebar (agent conversations + the ephemeral terminal)
    beside a chat-style pane — the thread scrolls, the compose box stays put. */
 .tp-body[data-tab="checkin"] { overflow: hidden; }
