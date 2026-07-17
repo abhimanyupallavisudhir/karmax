@@ -69,18 +69,21 @@ export interface GatewayDeps {
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
- * again for task operations; this layer covers the direct administrative routes. */
-function capabilityForRequest(method: string, p: string, url?: URL): string | undefined {
+ * again for task operations; this layer covers the direct administrative routes.
+ * Returns the required capability, `'none'` for routes that intentionally need
+ * no capability, or undefined for a route this catalog does not know — callers
+ * apply the conservative fallback, and tests assert the catalog stays complete. */
+export function routeCapability(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
-  if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return undefined;
+  if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   if (p === '/api/platform') return 'workflow:read';
-  if (p === '/api/logout') return undefined;
+  if (p === '/api/logout') return 'none';
   if (p === '/api/dashboard') return 'diagnostic:read';
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
-  if (p === '/api/invitations/accept') return undefined;
+  if (p === '/api/invitations/accept') return 'none';
   if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
   if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
@@ -136,7 +139,14 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (/\/signal$/.test(p)) return 'task:signal';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
   if (p === '/api/skills') return 'skill:write';
-  return read ? 'project:read' : 'settings:write';
+  return undefined;
+}
+
+function capabilityForRequest(method: string, p: string, url?: URL): string | undefined {
+  const explicit = routeCapability(method, p, url);
+  if (explicit) return explicit === 'none' ? undefined : explicit;
+  // Uncataloged routes fail toward broad-read / admin-write rather than open.
+  return method === 'GET' ? 'project:read' : 'settings:write';
 }
 
 function requestHeaders(headers: Record<string, string | string[] | undefined>): Headers {
@@ -581,6 +591,9 @@ export class Gateway {
           sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
         });
       }
+      // Legacy sessions are single-user by construction; minting one on a
+      // hosted multi-tenant cell would hand out owner access to a stranger.
+      if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
       const authRequired = !!this.deps.password;
       if (!authRequired) {
         const { sid } = this.newSession();
@@ -679,6 +692,7 @@ export class Gateway {
           return this.sendWebResponse(res, response);
         } catch { return this.json(res, 401, { error: 'invalid email or password' }); }
       }
+      if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
       if (this.deps.password && b.password === this.deps.password) {
         const { sid } = this.newSession();
         return this.json(res, 200, { token: sid, user: 'me' });
@@ -769,8 +783,15 @@ export class Gateway {
 
     // ── authenticated endpoints ──
     const requestedScope = this.requestScope(p, url);
+    const auditScope = requestedScope.projectId ? `project:${requestedScope.projectId}`
+      : requestedScope.organizationId ? `organization:${requestedScope.organizationId}` : 'global';
     const session = await this.auth(req, requestedScope.projectId, requestedScope.organizationId);
-    if (!session) return this.json(res, 401, { error: 'unauthorized' });
+    if (!session) {
+      // Denials are audited too: cross-tenant probing must be visible to an
+      // administrator, not only successful requests.
+      this.deps.authorization?.audit('anonymous', 'http.denied.unauthenticated', auditScope, { path: p, method });
+      return this.json(res, 401, { error: 'unauthorized' });
+    }
     const token = session.apiToken;
     const { api, store } = this.deps;
 
@@ -789,11 +810,14 @@ export class Gateway {
         method === 'POST' || this.deps.store.listOrganizations(session.userId).some((organization) =>
           allows(this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, organization.id) ?? [], required))
       );
-      if (!checked.ok && !collectionAllowed && !organizationCollectionAllowed) return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
-      if (checked.ok) authRecord = checked.record;
       const principal = checked.record?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
-      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`,
-        scope.projectId ? `project:${scope.projectId}` : scope.organizationId ? `organization:${scope.organizationId}` : 'global', { path: p });
+      if (!checked.ok && !collectionAllowed && !organizationCollectionAllowed) {
+        this.deps.authorization?.audit(principal, `http.denied.${required}`, auditScope,
+          { path: p, method, reason: checked.reason ?? `missing capability ${required}` });
+        return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
+      }
+      if (checked.ok) authRecord = checked.record;
+      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, auditScope, { path: p });
     }
 
     try {
@@ -1292,10 +1316,17 @@ export class Gateway {
       if (p === '/api/projects' && method === 'GET') {
         const projects = store.listProjects();
         if (authRecord?.projectId) return this.json(res, 200, projects.filter((x) => x.id === authRecord!.projectId));
+        // An organization-scoped token discovers its own tenant's projects only.
+        if (authRecord?.organizationId) return this.json(res, 200,
+          projects.filter((x) => (x.organizationId ?? 'org_personal') === authRecord!.organizationId));
         if (session.userId && this.deps.authorization) {
           const principal = `user:${session.userId}`;
           return this.json(res, 200, projects.filter((x) => allows(this.deps.authorization!.capabilities(principal, x.id), 'project:read')));
         }
+        // Identity-backed deployments never legitimately reach here: a session
+        // that cannot be attributed to a user or a scoped token sees nothing.
+        // The bare return is single-user legacy mode (no identity service).
+        if (this.deps.identity) return this.json(res, 200, []);
         return this.json(res, 200, projects);
       }
       if (p === '/api/projects' && method === 'POST') {

@@ -33,6 +33,7 @@ Integration test files each boot a **real** Temporal dev server + Worker (via `t
 - Cheap files (no Temporal server, iterate freely): `ports`, `store`, `world`, `merge`, `security`, `mcp`, `overlays`, `repo-path`.
 - Heavy files (boot a Temporal server, one at a time): `temporal`, `pipeline`, `workflows`, `gateway`, `autonomy`, `live-agent`.
 - `tests/live-agent.test.ts` runs only with a real API key and spends real tokens; force-skip with `KARMAX_SKIP_LIVE=1`.
+- `tests/cloud-live.test.ts` runs only with `E2B_API_KEY` / `DAYTONA_API_KEY` and spends real provider credit (one tiny sandbox each); force-skip with `KARMAX_SKIP_LIVE=1`.
 - `tests/container.test.ts` needs Docker (`node:22-slim`); self-skips, or force with `KARMAX_SKIP_DOCKER=1`.
 
 If a test run is interrupted, an ephemeral Temporal dev-server child may be orphaned: `pgrep -af 'temporal server start-dev'`. Careful with `pkill -f 'temporal server start-dev'` — it also kills the app's shared long-lived dev server (a systemd user unit `karmax-temporal-*` when available; a running app auto-respawns it at the same address). Stop the app with Ctrl-C — the shared Temporal server intentionally stays up for the next boot (`npm run reset` stops and wipes it) — never by killing the port.
@@ -60,7 +61,7 @@ Layers around that core:
 
 ## Environment variables
 
-`KARMAX_HOME` (data home, default `~/.karmax`), `KARMAX_PASSWORD` (require login), `KARMAX_SAFE_MODE`, `KARMAX_TEMPORAL_LOG=debug` (worker logs), worker caps `KARMAX_MAX_CACHED_WORKFLOWS` / `KARMAX_MAX_WFT` / `KARMAX_MAX_ACT`, provider overrides `KARMAX_AGENT_PROVIDER` / `KARMAX_CLAUDE_MODEL` / `KARMAX_OPENAI_MODEL`. The test harness isolates all state in `mkdtemp` dirs (worlds, vault, config homes) — never touches the real `~/.karmax`.
+`KARMAX_HOME` (data home, default `~/.karmax`), `KARMAX_PASSWORD` (require login), `KARMAX_SAFE_MODE`, `KARMAX_TEMPORAL_LOG=debug` (worker logs), worker caps `KARMAX_MAX_CACHED_WORKFLOWS` / `KARMAX_MAX_WFT` / `KARMAX_MAX_ACT`, provider overrides `KARMAX_AGENT_PROVIDER` / `KARMAX_CLAUDE_MODEL` / `KARMAX_OPENAI_MODEL`. Cloud-world provisioning/reconciliation: `KARMAX_WORLD_PROVISION_TIMEOUT_MS` (per-command ceiling during trusted provisioning, default 10 min), `KARMAX_WORLD_CLONE_RETRIES` (extra clone attempts on transient failure, default 2) / `KARMAX_WORLD_CLONE_RETRY_MS` (backoff base, default 2 s), `KARMAX_WORLD_RECONCILE_AFTER_MS` (how long a ready remote world may go untouched before the lifecycle sweep probes the provider control plane and marks vanished sandboxes `degraded`; default 10 min, `0` disables). The test harness isolates all state in `mkdtemp` dirs (worlds, vault, config homes) — never touches the real `~/.karmax`.
 
 **Host admission control for agent turns** (memory-based backpressure, karmax#4 — prevents the OOM killer from SIGKILLing an agent under memory pressure; see `src/activities/agent-slots.ts`):
 

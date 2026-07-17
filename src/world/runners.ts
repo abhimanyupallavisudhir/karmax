@@ -72,6 +72,9 @@ export class RunnerPoolService {
 /** Turns old parked provider state into cheap object/Git state. */
 export class WorldLifecycleManager {
   private timer?: NodeJS.Timeout;
+  /** Last provider probe per world generation, so reconciliation does not hit
+   * the provider control plane on every sweep tick. */
+  private probedAt = new Map<string, number>();
   constructor(private store: Store, private worlds: WorldRegistry, private checkpoints: WorldCheckpointService,
     private intervalMs = 60_000, private objects?: ObjectStore, private runners?: RunnerPoolService) {}
 
@@ -96,6 +99,22 @@ export class WorldLifecycleManager {
       if (!execution?.runnerLeaseId) continue;
       const world = this.store.currentWorld(execution.worldId);
       this.runners?.release(execution.runnerLeaseId, world?.provider ?? world?.kind ?? 'unknown');
+    }
+    // Reconciliation: an active remote world whose sandbox disappeared
+    // out-of-band (manual deletion, provider eviction) should surface as
+    // degraded now, not as an opaque failure on the task's next operation.
+    // Local providers have no probe and are skipped.
+    const reconcileAfter = reconcileAfterMs();
+    if (reconcileAfter > 0) {
+      for (const candidate of this.store.listWorldInstances('ready', now - reconcileAfter)) {
+        const key = `${candidate.handle.id}:${candidate.handle.generation ?? 1}`;
+        if ((this.probedAt.get(key) ?? 0) > now - reconcileAfter) continue;
+        this.probedAt.set(key, now);
+        const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
+        if (state !== 'missing') continue;
+        this.store.setWorldState(candidate.handle, 'degraded');
+        this.recordLifecycle(candidate.handle, 'world.providerLost', {});
+      }
     }
     let hibernated = 0;
     for (const candidate of this.store.listWorldInstances('parked')) {
@@ -129,6 +148,13 @@ export class WorldLifecycleManager {
       provider: handle.provider ?? handle.kind, generation: handle.generation ?? 1, ...payload,
     } });
   }
+}
+
+/** How long a ready world may go untouched before its provider is probed.
+ * `0` disables reconciliation entirely. */
+function reconcileAfterMs(): number {
+  const value = Number(process.env.KARMAX_WORLD_RECONCILE_AFTER_MS);
+  return Number.isFinite(value) && value >= 0 ? value : 10 * 60_000;
 }
 
 function costMicrosPerSecond(provider: string, cpu: number, memoryMb: number, gpu: number): number {

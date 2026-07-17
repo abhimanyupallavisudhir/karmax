@@ -72,4 +72,10 @@ export class WorldRegistry {
     const provider = this.get(current.kind);
     return provider.status ? provider.status(current) : 'ready';
   }
+
+  /** Provider-authoritative liveness for reconciliation; undefined = unknown. */
+  async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
+    const current = this.resolveHandle?.(handle) ?? handle;
+    return this.get(current.kind).probe?.(current);
+  }
 }
