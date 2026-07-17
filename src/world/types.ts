@@ -228,6 +228,11 @@ export interface WorldProvider {
   /** Release metered compute while retaining the world's durable state. */
   park?(handle: WorldHandle): Promise<WorldHandle>;
   status?(handle: WorldHandle): Promise<WorldLifecycleState>;
+  /** Ask the provider's control plane for the sandbox's authoritative state
+   * without resuming or otherwise mutating it. `status` reports the local
+   * in-process view; `probe` reconciles against the remote source of truth.
+   * Undefined means the provider cannot say (no probe support, network error). */
+  probe?(handle: WorldHandle): Promise<WorldLifecycleState | undefined>;
 }
 
 /** Provider-independent confinement for every file/process cwd crossing the

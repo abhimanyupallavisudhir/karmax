@@ -1,10 +1,11 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse, WorldLifecycleState,
-  WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldRepo, WorldSpec } from './types.js';
+  WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldSpec } from './types.js';
 import { worldRelativePath } from './types.js';
 import { boundedResponseBody } from './http.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
+import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 
 const DEFAULT_IDLE_MS = 10 * 60_000;
 
@@ -85,9 +86,14 @@ export class DaytonaWorldProvider implements WorldProvider {
     try {
       const home = await sandbox.getUserHomeDir();
       const root = path.posix.join(home, 'karmax');
-      await provisionCredentials(sandbox, spec, home);
-      const provisioned = await provisionRepos(sandbox, spec, root, home);
-      await commandOrThrow(sandbox, `rm -f ${quote(path.posix.join(home, '.ssh'))}/karmax-auth-*`);
+      const provisioner = provisionTarget(sandbox);
+      await provisionGitCredentials(provisioner, spec, home);
+      const provisioned = await provisionGitRepos(provisioner, spec, {
+        root, home,
+        sshUrlError: 'Daytona worlds require repositories as SSH Git URLs, not local paths or HTTPS URLs',
+        copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote Daytona world',
+      });
+      await provisionRun(provisioner, `rm -f ${quote(path.posix.join(home, '.ssh'))}/karmax-auth-*`);
       const handle: WorldHandle = {
         version: 2, kind: this.kind, provider: this.kind, id: spec.taskId, root, workspaceRoot: root,
         branch: spec.branch ?? `karmax/${spec.taskId}`, base: provisioned.repos[0]?.base ?? spec.base,
@@ -130,6 +136,23 @@ export class DaytonaWorldProvider implements WorldProvider {
 
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {
     return this.states.get(this.sandboxId(handle)) ?? 'ready';
+  }
+
+  /** Reconciliation probe: `get()` reads the sandbox record without starting
+   * it, so probing a stopped/archived world stays free of side effects. */
+  async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
+    const reference = this.reference(handle);
+    try {
+      const sandbox = await this.factoryFor(this.connection(reference.organizationId)).get(reference.sandboxId);
+      await sandbox.refreshData?.();
+      const state = String(sandbox.state ?? '').toLowerCase();
+      if (!state) return undefined;
+      if (['destroyed', 'destroying', 'error', 'build_failed'].includes(state)) return 'missing';
+      if (['stopped', 'stopping', 'archived', 'archiving'].includes(state)) return 'parked';
+      return 'ready';
+    } catch (error) {
+      return /not\s*found|does not exist|404/i.test(String((error as Error)?.message ?? error)) ? 'missing' : undefined;
+    }
   }
 
   private reference(handle: WorldHandle): { sandboxId: string; organizationId?: string } {
@@ -305,79 +328,17 @@ function applyPreviewPath(target: URL, requestPath: string): void {
   target.hash = requested.hash;
 }
 
-async function provisionCredentials(sandbox: DaytonaSandboxLike, spec: WorldSpec, home: string): Promise<void> {
-  const values = [spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
-    .filter((value): value is string => Boolean(value));
-  if (!values.length) return;
-  const ssh = path.posix.join(home, '.ssh');
-  await commandOrThrow(sandbox, `mkdir -p ${quote(ssh)} && chmod 700 ${quote(ssh)} && ssh-keyscan github.com >> ${quote(path.posix.join(ssh, 'known_hosts'))} 2>/dev/null || true`);
-  for (const [index, key] of [...new Set(values)].entries()) {
-    const file = keyFile(home, index);
-    await sandbox.fs.uploadFile(Buffer.from(key.endsWith('\n') ? key : `${key}\n`), file);
-    await commandOrThrow(sandbox, `chmod 600 ${quote(file)}`);
-  }
-}
-
-async function provisionRepos(sandbox: DaytonaSandboxLike, spec: WorldSpec, root: string, home: string): Promise<{ repos: WorldRepo[]; warnings: string[] }> {
-  const sources = (spec.repos?.length ? spec.repos : spec.repo ? [spec.repo] : []).map((value) => value.trim()).filter(Boolean);
-  if (sources.some((source) => !/^(?:ssh:\/\/|git@)[^\s]+/.test(source)))
-    throw new Error('Daytona worlds require repositories as SSH Git URLs, not local paths or HTTPS URLs');
-  const branch = spec.branch ?? `karmax/${spec.taskId}`;
-  const warnings: string[] = [];
-  if (!sources.length) {
-    await commandOrThrow(sandbox, `mkdir -p ${quote(root)} && git -C ${quote(root)} init -q -b ${quote(spec.base || 'main')}`);
-    await configureRepo(sandbox, root, spec, branch, false);
-    return { repos: [], warnings };
-  }
-  const multi = sources.length > 1;
-  const names = uniqueNames(sources.map(remoteName));
-  if (multi) await commandOrThrow(sandbox, `mkdir -p ${quote(root)}`);
-  const credentialValues = [spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
-    .filter((value): value is string => Boolean(value));
-  const repos: WorldRepo[] = [];
-  for (let index = 0; index < sources.length; index++) {
-    const source = sources[index]!;
-    const branchPolicy = spec.repositoryBranches?.[source];
-    const base = branchPolicy?.base ?? spec.base;
-    const target = branchPolicy?.target ?? spec.target;
-    const repoRoot = multi ? path.posix.join(root, names[index]!) : root;
-    const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
-    const keyIndex = key ? [...new Set(credentialValues)].indexOf(key) : -1;
-    const auth = keyIndex >= 0 ? `GIT_SSH_COMMAND=${quote(`ssh -i ${keyFile(home, keyIndex)} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`)} ` : '';
-    await commandOrThrow(sandbox, `${auth}git clone -q --origin origin ${quote(source)} ${quote(repoRoot)}`);
-    const requested = spec.branch ?? base;
-    const ref = `refs/remotes/origin/${requested}`;
-    const exists = Number((await sandbox.process.executeCommand(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(ref)}`, undefined, undefined, 120))?.exitCode ?? 0) === 0;
-    if (spec.branch && !exists) throw new Error(`repository "${source}" has no remote branch "${spec.branch}" to review`);
-    if (!spec.branch && !exists) warnings.push(`repo "${names[index]}": base branch "${base}" not found — forked off the remote default branch instead`);
-    const resolved = await commandOrThrow(sandbox, `git -C ${quote(repoRoot)} rev-parse ${quote(exists ? ref : 'refs/remotes/origin/HEAD')}`);
-    const baseSha = String(resolved.result ?? resolved.stdout ?? '').trim();
-    if (!/^[0-9a-f]{40,64}$/i.test(baseSha)) throw new Error(`repository "${source}" has no resolvable base commit`);
-    await configureRepo(sandbox, repoRoot, spec, branch, true, exists, base);
-    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base, target, baseSha });
-  }
-  if (spec.copyGlobs?.length) warnings.push('copyGlobs are host-local and were not copied into the remote Daytona world');
-  return { repos, warnings };
-}
-
-async function configureRepo(sandbox: DaytonaSandboxLike, root: string, spec: WorldSpec, branch: string, hasOrigin: boolean,
-  requestedExists = false, base = spec.base): Promise<void> {
-  const identity = spec.gitIdentity;
-  await commandOrThrow(sandbox, `git -C ${quote(root)} config user.name ${quote(identity?.name ?? 'karmax')} && git -C ${quote(root)} config user.email ${quote(identity?.email ?? 'karmax@localhost')}`);
-  if (!hasOrigin) return;
-  const checkout = spec.branch
-    ? `git -C ${quote(root)} checkout -q -B ${quote(spec.branch)} ${quote(`origin/${spec.branch}`)}`
-    : requestedExists
-      ? `git -C ${quote(root)} checkout -q -B ${quote(base)} ${quote(`origin/${base}`)} && git -C ${quote(root)} checkout -q -b ${quote(branch)}`
-      : `git -C ${quote(root)} checkout -q -b ${quote(branch)}`;
-  await commandOrThrow(sandbox, checkout);
-}
-
-async function commandOrThrow(sandbox: DaytonaSandboxLike, command: string): Promise<any> {
-  const result = await sandbox.process.executeCommand(command, undefined, undefined, 600);
-  const code = Number(result?.exitCode ?? 0);
-  if (code !== 0) throw new Error(String(result?.stderr ?? result?.result ?? `remote command failed (${code})`));
-  return result;
+/** Trusted-provisioning adapter over the sandbox SDK. Never catches: real SDK
+ * errors must reach the caller unchanged. */
+function provisionTarget(sandbox: DaytonaSandboxLike): ProvisionTarget {
+  return {
+    async run(command, timeoutMs) {
+      const result = await sandbox.process.executeCommand(command, undefined, undefined, Math.max(1, Math.ceil(timeoutMs / 1000)));
+      return { stdout: String(result?.result ?? result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
+        code: Number(result?.exitCode ?? 0) };
+    },
+    async writeFile(remotePath, content) { await sandbox.fs.uploadFile(Buffer.from(content), remotePath); },
+  };
 }
 
 function daytonaNetwork(spec: WorldSpec): Record<string, unknown> {
@@ -403,17 +364,7 @@ function defaultDaytonaFactory(connection?: ResolvedWorldProviderConnection): Da
     async get(id) { return (await sdk()).get(id); } };
 }
 
-function keyFile(home: string, index: number): string { return path.posix.join(home, `.ssh/karmax-auth-${index}`); }
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }
-function remoteName(remote: string): string {
-  const value = remote.replace(/\/$/, '').split(/[/:]/).pop()?.replace(/\.git$/, '') || 'repo';
-  const safe = value.replace(/[^a-zA-Z0-9._-]/g, '-');
-  return !safe || /^\.+$/.test(safe) ? 'repo' : safe;
-}
-function uniqueNames(values: string[]): string[] {
-  const seen = new Map<string, number>();
-  return values.map((value) => { const count = seen.get(value) ?? 0; seen.set(value, count + 1); return count ? `${value}-${count + 1}` : value; });
-}
 function remoteEnv(env?: Record<string, string>): Record<string, string> {
   const value = { ...(env ?? {}) };
   delete value.GIT_SSH_COMMAND; delete value.GIT_ASKPASS; delete value.GH_TOKEN;

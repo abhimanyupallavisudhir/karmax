@@ -194,6 +194,14 @@ describe('organization and collaboration domain', () => {
     store.rotateScimToken(organization.id);
     store.registerWorld({ version: 2, id: task.id, kind: 'memory', provider: 'memory', generation: 1,
       runnerPoolId: 'local', environmentDigest: 'test', root: '/opaque', branch: 'task/test', base: 'main', meta: {} }, project.id);
+    store.createRunnerPool({ id: 'doomed-pool', organizationId: organization.id, name: 'Doomed', provider: 'e2b',
+      mode: 'managed', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    store.createExecution({ id: 'doomed-exec', organizationId: organization.id, projectId: project.id,
+      taskId: task.id, worldId: task.id, generation: 1, kind: 'terminal', label: 'Terminal',
+      server: false, openUrls: [], state: 'running', heartbeatAt: 1, startedAt: 1 });
+    store.recordUsage({ id: 'doomed-usage', organizationId: organization.id, projectId: project.id, taskId: task.id,
+      worldId: task.id, provider: 'e2b', kind: 'world.active', quantity: 1, unit: 'second', costMicros: 5,
+      startedAt: 1, endedAt: 2, metadata: {} });
 
     const exported = store.exportOrganization(organization.id) as any;
     expect(exported.organization.name).toBe('Delete me');
@@ -211,6 +219,9 @@ describe('organization and collaboration domain', () => {
     expect(store.getTask(task.id)).toBeUndefined();
     expect(store.db.prepare('SELECT COUNT(*) n FROM world_instances').get()).toMatchObject({ n: 0 });
     expect(store.kvGet(`organization-execution:${organization.id}`)).toBeUndefined();
+    expect(store.getRunnerPool('doomed-pool')).toBeUndefined();
+    expect(store.execution('doomed-exec')).toBeUndefined();
+    expect(store.usageSummary(organization.id).events).toBe(0);
     expect(() => store.deleteOrganization('org_personal')).toThrow(/cannot be deleted/);
   });
 

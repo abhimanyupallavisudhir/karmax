@@ -84,6 +84,35 @@ describe('runner capacity and world lifecycle', () => {
     expect(store.worldState(world.handle.id)).toBe('hibernated');
   });
 
+  it('marks an active world degraded when the provider reports its sandbox missing', async () => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Reconcile', {});
+    const worlds = new WorldRegistry();
+    // Replace the built-in provider with one whose control plane lost the sandbox.
+    worlds.register({ kind: 'e2b', parkable: true, async probe() { return 'missing'; } } as any);
+    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: 'task-reconcile', generation: 1,
+      root: '/w', workspaceRoot: '/w', branch: 'karmax/task-reconcile', base: 'main', meta: {} }, project.id);
+    expect(handle.generation).toBe(1);
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
+    await lifecycle.sweep(Date.now() + 60 * 60_000);
+    expect(store.worldState('task-reconcile')).toBe('degraded');
+  });
+
+  it('leaves ready worlds alone when the provider has no probe or cannot say', async () => {
+    const store = new Store(':memory:');
+    const project = store.createProject('Local', {});
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true, async probe() { return undefined; } } as any);
+    store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: 'task-unknown', generation: 1,
+      root: '/w', workspaceRoot: '/w', branch: 'karmax/task-unknown', base: 'main', meta: {} }, project.id);
+    store.registerWorld({ version: 2, kind: 'memory', provider: 'memory', id: 'task-local', generation: 1,
+      root: '/w', workspaceRoot: '/w', branch: 'karmax/task-local', base: 'main', meta: {} }, project.id);
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
+    await lifecycle.sweep(Date.now() + 60 * 60_000);
+    expect(store.worldState('task-unknown')).toBe('ready');
+    expect(store.worldState('task-local')).toBe('ready');
+  });
+
   it('releases runner capacity held by an execution lost during failover', async () => {
     const store = new Store(':memory:');
     const organization = store.createOrganization({ name: 'Recovery', ownerUserId: 'owner' });
