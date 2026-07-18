@@ -1128,6 +1128,166 @@ function renderMessageImages(images) {
     .join('')}</div>`;
 }
 
+// ── conversation rendering: markdown + math ──────────────────────────────────
+// Messages render as Markdown (with optional MathJax) by default; both can be
+// turned off in Organization settings → Advanced → Appearance. The flags live in
+// localStorage (a per-browser display choice, like the theme toggle), and every
+// reader is defensive about a missing localStorage so the same functions run
+// under the plain-node conversation tests.
+function renderFlag(key, dflt) {
+  try { const v = localStorage.getItem(key); return v == null ? dflt : v === '1'; } catch { return dflt; }
+}
+const markdownEnabled = () => renderFlag('karmax-md-render', true);
+const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
+
+// A message body: Markdown when enabled, otherwise the previous plain-escaped
+// text (the .msg-text pre-wrap handles its newlines). The caller adds the `md`
+// class so the two whitespace models don't collide.
+function renderMessageBody(text) {
+  return markdownEnabled() ? renderMarkdown(text, { math: mathjaxEnabled() }) : esc(text);
+}
+
+// A little copy control for a message bubble — copies the raw source text (the
+// attribute round-trips it: the browser decodes the entities back on read).
+function messageCopyButton(text) {
+  if (!text) return '';
+  return `<button class="msg-copy" data-copy-msg="${esc(text)}" title="Copy message" aria-label="Copy message">${ICON.copy}</button>`;
+}
+
+function wireMessageCopies(root = document) {
+  root.querySelectorAll('.msg-copy').forEach((btn) => {
+    if (btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      copyToClipboard(btn.dataset.copyMsg || '').then(() => {
+        btn.classList.add('copied');
+        setTimeout(() => btn.classList.remove('copied'), 1200);
+      });
+    });
+  });
+}
+
+// A compact, dependency-free Markdown renderer. It escapes first (untrusted
+// agent/user text), then applies a small, common subset: fenced + inline code,
+// headings, lists, blockquotes, rules, bold/italic/strike, links, and — when
+// math is on — $…$ / $$…$$ spans left intact for MathJax to typeset. Code and
+// math are stashed up front so inline formatting can't corrupt their contents;
+// the single stash is restored once at the end (nested blocks recurse through
+// mdBlocks, never renderMarkdown, so indices never clash).
+function renderMarkdown(src, opts = {}) {
+  const withMath = !!opts.math;
+  const stash = [];
+  const keep = (html) => `\u0000${stash.push(html) - 1}\u0000`;
+  let s = String(src ?? '').replace(/\r\n?/g, '\n');
+  // Fenced code blocks first (a blank line around the placeholder keeps it its
+  // own block).
+  s = s.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, body) =>
+    `\n${keep(`<pre class="md-code"><code>${esc(body.replace(/\n$/, ''))}</code></pre>`)}\n`);
+  if (withMath) s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, body) => keep(`<span class="md-math">$$${esc(body)}$$</span>`));
+  s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
+  if (withMath) s = s.replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
+  let html = mdBlocks(s, stash);
+  return html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+}
+
+function mdBlocks(s, stash) {
+  const lines = s.split('\n');
+  const out = [];
+  const bullet = /^\s*([-*+]|\d+[.)])\s+/;
+  const rule = /^\s*([-*_])(\s*\1){2,}\s*$/;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+    let m;
+    if ((m = /^(#{1,6})\s+(.*)$/.exec(line))) {
+      out.push(`<h${m[1].length} class="md-h">${mdInline(m[2].trim())}</h${m[1].length}>`);
+      i++; continue;
+    }
+    if (rule.test(line)) { out.push('<hr class="md-hr"/>'); i++; continue; }
+    if (/^\s*>\s?/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      out.push(`<blockquote class="md-quote">${mdBlocks(buf.join('\n'), stash)}</blockquote>`);
+      continue;
+    }
+    if (bullet.test(line)) {
+      const ordered = /^\s*\d+[.)]\s+/.test(line);
+      const items = [];
+      while (i < lines.length && bullet.test(lines[i])) {
+        let item = lines[i].replace(bullet, '');
+        i++;
+        while (i < lines.length && !/^\s*$/.test(lines[i]) && !bullet.test(lines[i]) && /^\s+/.test(lines[i])) {
+          item += '\n' + lines[i].replace(/^\s+/, ''); i++;
+        }
+        items.push(`<li>${mdInline(item)}</li>`);
+      }
+      out.push(`<${ordered ? 'ol' : 'ul'} class="md-list">${items.join('')}</${ordered ? 'ol' : 'ul'}>`);
+      continue;
+    }
+    const buf = [line];
+    i++;
+    while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^(#{1,6})\s+/.test(lines[i])
+      && !bullet.test(lines[i]) && !/^\s*>\s?/.test(lines[i]) && !rule.test(lines[i])) {
+      buf.push(lines[i]); i++;
+    }
+    const joined = buf.join('\n');
+    const sole = /^\u0000(\d+)\u0000$/.exec(joined.trim());
+    if (sole) { out.push(joined.trim()); continue; } // a lone code/display-math block: no wrapping <p>
+    out.push(`<p class="md-p">${mdInline(joined).replace(/\n/g, '<br>')}</p>`);
+  }
+  return out.join('\n');
+}
+
+// Inline formatting over already-block-split text. Escaping happens here so the
+// stash placeholders (bare digits) survive untouched.
+function mdInline(t) {
+  let x = esc(t);
+  x = x.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, href) => {
+    const safe = /^(https?:|mailto:|\/)/i.test(href) ? href : '#';
+    return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+  });
+  x = x.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
+  x = x.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
+  x = x.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+  x = x.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
+  x = x.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  return x;
+}
+
+// MathJax is loaded lazily from a CDN the first time a rendered message actually
+// contains math, and only while the flag is on. If it can't load (offline), the
+// raw $…$ simply stays visible — a graceful, non-fatal degradation.
+let mathjaxLoad = null;
+function ensureMathJax() {
+  if (mathjaxLoad) return mathjaxLoad;
+  mathjaxLoad = new Promise((resolve) => {
+    window.MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+      startup: { typeset: false, ready: () => { window.MathJax.startup.defaultReady(); resolve(true); } },
+    };
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js';
+    script.async = true;
+    script.onerror = () => resolve(false);
+    document.head.appendChild(script);
+  });
+  return mathjaxLoad;
+}
+function typesetMath(root) {
+  if (!mathjaxEnabled()) return;
+  const scope = root || document.getElementById('ck-thread');
+  if (!scope || !scope.querySelector('.md-math')) return;
+  ensureMathJax().then(() => {
+    if (!window.MathJax || !window.MathJax.typesetPromise) return;
+    try { window.MathJax.typesetClear?.([scope]); } catch {}
+    window.MathJax.typesetPromise([scope]).catch(() => {});
+  });
+}
+
 function toast(msg, err = false, action) {
   const t = document.createElement('div');
   t.className = 'toast' + (err ? ' err' : '');
@@ -3309,6 +3469,11 @@ function renderTaskPage() {
   const threadScroll = prevThread
     ? { top: prevThread.scrollTop, atBottom: prevThread.scrollHeight - prevThread.scrollTop - prevThread.clientHeight < 40 }
     : null;
+  // A background re-render (WS event while an agent streams) rebuilds the whole
+  // pane, which would drop any text the user has selected in the transcript.
+  // Snapshot the selection as character offsets and re-apply it after the swap —
+  // the same treatment scroll/focus already get.
+  const threadSel = prevThread ? captureThreadSelection(prevThread) : null;
   const focusState = captureFocus(main);
   // The per-agent follow-up textareas carry no id (captureFocus skips them), so
   // snapshot the active one by its agent role to re-focus the matching box after
@@ -3374,6 +3539,11 @@ function renderTaskPage() {
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
   const thread = document.getElementById('ck-thread');
   if (thread) thread.scrollTop = threadScroll && !threadScroll.atBottom ? threadScroll.top : thread.scrollHeight;
+  if (thread) {
+    restoreThreadSelection(thread, threadSel);
+    wireMessageCopies(thread);
+    typesetMath(thread);
+  }
   restoreFocus(main, focusState);
   restoreFollowupFocus(main, fuState);
   // The scrollable body is the page's own scroll container (the app shell is
@@ -3384,6 +3554,64 @@ function renderTaskPage() {
   const scroller = thread || newBody;
   const overlayOpen = $('#overlay-root')?.childElementCount > 0 || $('#modal-root')?.childElementCount > 0;
   if (scroller && shouldFocusTaskBody(main, document.activeElement, overlayOpen)) scroller.focus({ preventScroll: true });
+}
+
+// A text walker over the thread that ignores math (its raw `$…$` is replaced by
+// MathJax SVG + hidden MathML asynchronously, so counting it would make the
+// before/after offsets disagree). Skipping it keeps the character map stable
+// regardless of typeset state.
+function threadTextWalker(thread) {
+  return document.createTreeWalker(thread, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => (node.parentElement && node.parentElement.closest('.md-math, mjx-container'))
+      ? NodeFilter.FILTER_REJECT
+      : NodeFilter.FILTER_ACCEPT,
+  });
+}
+
+// The transcript's text selection, captured as absolute character offsets into
+// the thread's concatenated text so it can survive a full innerHTML rebuild
+// (the new nodes are different objects; offsets aren't). Returns null when there
+// is no live selection inside the thread.
+function captureThreadSelection(thread) {
+  const sel = window.getSelection && window.getSelection();
+  if (!thread || !sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!thread.contains(range.startContainer) || !thread.contains(range.endContainer)) return null;
+  const offsetOf = (node, off) => {
+    const walker = threadTextWalker(thread);
+    let total = 0, n;
+    while ((n = walker.nextNode())) {
+      if (n === node) return total + off;
+      total += n.nodeValue.length;
+    }
+    return total;
+  };
+  return { start: offsetOf(range.startContainer, range.startOffset), end: offsetOf(range.endContainer, range.endOffset) };
+}
+
+function restoreThreadSelection(thread, snap) {
+  if (!thread || !snap) return;
+  const locate = (target) => {
+    const walker = threadTextWalker(thread);
+    let total = 0, n;
+    while ((n = walker.nextNode())) {
+      const len = n.nodeValue.length;
+      if (total + len >= target) return { node: n, offset: target - total };
+      total += len;
+    }
+    return n ? { node: n, offset: n.nodeValue.length } : null;
+  };
+  const a = locate(snap.start);
+  const b = locate(snap.end);
+  if (!a || !b) return;
+  try {
+    const range = document.createRange();
+    range.setStart(a.node, a.offset);
+    range.setEnd(b.node, b.offset);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch {}
 }
 
 // Switch the open task page to another of its tabs, pinning the tab in the URL
@@ -3971,14 +4199,15 @@ function conversationTimeHtml(ts) {
 }
 
 function renderConversationEntry(entry) {
+  const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}</div><div class="msg-text">${esc(m.text)}</div>${renderMessageImages(m.images)}</div>`;
+    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${renderMessageBody(m.text)}</div>${renderMessageImages(m.images)}</div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}</div><div class="msg-text">${esc(a.title)}</div></div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderMessageBody(a.title)}</div></div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -5674,6 +5903,9 @@ function globalSettingsView(embedded = false) {
     <div class="card" id="appearance-card">
       <div class="section-h">Appearance</div>
       <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
+      <div class="switch"><input type="checkbox" id="gs-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="gs-md-render">Render conversation messages as Markdown</label></div>
+      <div class="switch"><input type="checkbox" id="gs-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="gs-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
+      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
     <div class="card" id="resilience-card">
       <div class="section-h">Resilience</div>
@@ -6194,6 +6426,16 @@ function wireGlobalSettings(organizationId) {
     }),
   );
   $('#gs-theme')?.addEventListener('click', toggleTheme);
+  $('#gs-md-render')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
+    if (S.taskTab === 'checkin') renderTaskPage();
+    toast(`Markdown rendering ${e.target.checked ? 'on' : 'off'}`);
+  });
+  $('#gs-mathjax')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-mathjax', e.target.checked ? '1' : '0'); } catch {}
+    if (S.taskTab === 'checkin') renderTaskPage();
+    toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
+  });
   $('#safe-mode')?.addEventListener('change', async (e) => {
     try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
   });

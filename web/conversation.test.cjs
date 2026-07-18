@@ -18,6 +18,11 @@ function extractFn(name) {
 
 global.esc = (s) => String(s ?? '').replace(/</g, '&lt;');
 global.renderMessageImages = () => '';
+// Markdown/copy are exercised by markdown.test.cjs; here we pin the plain path so
+// these assertions stay about the timeline, not the message body renderer.
+global.markdownEnabled = () => false;
+global.renderMessageBody = (t) => global.esc(t);
+global.messageCopyButton = () => '';
 global.S = {
   taskEvents: [
     { seq: 1, ts: 1710000001000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' } },
