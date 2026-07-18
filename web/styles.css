@@ -376,6 +376,63 @@ a { color: var(--accent); text-decoration: none; }
 .tp-foot-inner { max-width: 960px; margin: 0 auto; padding: 0 28px; display: flex; gap: 8px; align-items: center; }
 .tp-foot-inner > .actions { flex: 1; }
 
+/* ── full-page task form (new task / edit draft, SPEC §10.4) ─────────────── */
+/* The expanded form is a PAGE, not a dialog — GitHub-issue-creation shape: a
+   head strip (back · title · workflow), a scrollable two-column body (the big
+   prompt editor + workflow parameters left, organization metadata right) and a
+   foot strip with the actions. It covers only the MAIN cell — the topbar (52px)
+   and projects rail (232px, hidden ≤720px) stay visible and live; navigating
+   closes the page (applyRoute clicks #tf-close, which flushes the draft).
+   Shares the task page's column-and-strip language; sits under the topbar
+   popover (z 50), toasts (z 60) and palettes/pickers (#modal-root, z 70). */
+.task-form-page {
+  position: fixed; top: 52px; left: 232px; right: 0; bottom: 0; z-index: 20;
+  display: flex; flex-direction: column;
+  background: var(--paper); outline: none;
+  animation: pane-in .16s ease;
+}
+.tf-head { background: var(--surface); border-bottom: 1px solid var(--line); padding: 12px 0; }
+.tf-head-inner, .tf-foot-inner, .tf-columns { max-width: 1120px; margin: 0 auto; padding: 0 28px; }
+.tf-head-inner { display: flex; align-items: center; gap: 10px; }
+.tf-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; white-space: nowrap; }
+.tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tf-savestate { margin-left: auto; color: var(--ink-3); font-size: 12px; flex: none; }
+.tf-savestate:not(:empty)::before { content: '✓ '; color: var(--merged); }
+.tf-head select { flex: none; border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 6px 9px; font-weight: 550; }
+.tf-scroll { flex: 1; overflow-y: auto; }
+.tf-columns {
+  padding-top: 26px; padding-bottom: 56px;
+  display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px 44px;
+  align-items: start;
+}
+.tf-main { min-width: 0; }
+/* The prompt is the body of the "issue" — give it real room. */
+.tf-main .prompt-field > textarea { min-height: 220px; }
+.tf-main > .section-h { margin: 26px 0 14px; padding-top: 20px; border-top: 1px solid var(--line); }
+/* Sidebar: hairline-separated metadata sections, GitHub-issue style. */
+.tf-side { min-width: 0; display: flex; flex-direction: column; }
+.tf-side .form-row { margin-bottom: 0; padding: 14px 0; }
+.tf-side .form-row:first-child { padding-top: 2px; }
+.tf-side .form-row + .form-row { border-top: 1px solid var(--line); }
+.tf-side .org-editor { flex-direction: column; align-items: flex-start; gap: 10px; margin-top: 4px; }
+/* Compact one-liner rows (Attempts: __) — the label sits inline with a short input. */
+.tf-side .form-row.tf-inline { flex-direction: row; align-items: center; gap: 10px; }
+.tf-side .tf-inline label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.tf-side .tf-inline input { width: 68px; }
+/* The credential chips wrap fine at sidebar width; just keep them off the hairline. */
+.tf-side #cred-editor-newtask { margin-top: 2px; }
+.tf-foot { border-top: 1px solid var(--line); background: var(--surface); padding: 12px 0; }
+.tf-foot-inner { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
+.tf-foot .tf-hint { margin-right: auto; color: var(--ink-3); font-size: 12px; }
+@media (max-width: 900px) {
+  .tf-columns { grid-template-columns: 1fr; }
+  .tf-head-inner, .tf-foot-inner, .tf-columns { padding-left: 16px; padding-right: 16px; }
+  .tf-columns { padding-top: 18px; padding-bottom: 40px; }
+  .tf-side { margin-top: 10px; border-top: 1px solid var(--line); }
+  .tf-foot .tf-hint { display: none; }
+}
+@media (max-width: 720px) { .task-form-page { left: 0; } } /* the rail is hidden */
+
 /* Check-in tab: a fixed sidebar (agent conversations + the ephemeral terminal)
    beside a chat-style pane — the thread scrolls, the compose box stays put. */
 .tp-body[data-tab="checkin"] { overflow: hidden; }
@@ -598,83 +655,6 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .global-search-summary { padding: 8px 16px 3px; color: var(--ink-3); font-size: 11px; text-align: center; }
 @keyframes pulse { to { opacity: .3; transform: scale(.75); } }
 
-/* ── full-page task composer (SPEC §10.4) ─────────────────────────────────────
-   The expanded task form is a page of its own — a GitHub-style issue composer.
-   A fixed top bar (back + workflow) and a fixed action bar bracket a scrollable
-   two-column body: the prompt/agent/confirmer fields on the left, the task's
-   organisation + run options in a sidebar of cards on the right. */
-.taskform-page {
-  position: fixed; inset: 0; z-index: 80; background: var(--paper);
-  display: flex; flex-direction: column; animation: tf-in .18s ease;
-}
-@keyframes tf-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-
-.taskform-topbar {
-  flex: none; display: flex; align-items: center; gap: 12px;
-  padding: 11px 22px; border-bottom: 1px solid var(--line); background: var(--surface);
-}
-.taskform-back {
-  display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-weight: 550;
-  padding: 6px 12px 6px 10px; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--surface); color: var(--ink-2);
-}
-.taskform-back:hover { border-color: var(--line-strong); background: var(--surface-2); color: var(--ink); }
-.taskform-back span { font-size: 15px; line-height: 1; }
-.taskform-topbar-sep { width: 1px; height: 18px; background: var(--line); }
-.taskform-topbar-crumb { color: var(--ink-3); font-size: 13px; }
-.taskform-wf { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--ink-3); }
-.taskform-wf select {
-  padding: 7px 26px 7px 10px; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--surface-2); color: var(--ink); font-weight: 550; outline: none;
-}
-.taskform-wf select:focus { border-color: var(--accent); }
-
-.taskform-scroll { flex: 1; overflow-y: auto; }
-.taskform-grid {
-  max-width: 1040px; margin: 0 auto; padding: 34px 24px 44px;
-  display: grid; grid-template-columns: minmax(0, 1fr) 312px; gap: 30px; align-items: start;
-}
-.taskform-main { min-width: 0; }
-.taskform-hero { margin-bottom: 22px; }
-.taskform-hero h1 { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; margin: 0 0 6px; }
-.taskform-hero p { margin: 0; color: var(--ink-3); font-size: 14px; max-width: 62ch; }
-
-/* The primary prompt/description reads as the hero of the page: a generous box. */
-.taskform-main .prompt-field > textarea,
-.taskform-main .parameter-fields > .form-row[data-row] textarea[rows="4"] { min-height: 150px; }
-
-/* Sidebar of grouped option cards, sticky alongside the scrolling main column. */
-.taskform-side { position: sticky; top: 20px; display: flex; flex-direction: column; gap: 14px; }
-.taskform-card {
-  border: 1px solid var(--line); border-radius: 12px; background: var(--surface);
-  padding: 15px 16px; box-shadow: var(--shadow);
-}
-.taskform-card-h {
-  margin: 0 0 12px; font-size: 11px; font-weight: 650; letter-spacing: .04em;
-  text-transform: uppercase; color: var(--ink-3);
-}
-.taskform-card > .form-row:last-child,
-.taskform-card > .repeat-row:last-child { margin-bottom: 0; }
-.taskform-card .repeat-row { margin-top: 0; }
-.taskform-card .advanced { margin-top: 0; border-top: 0; padding-top: 0; }
-.taskform-card select, .taskform-card input[type="number"] {
-  height: 38px; background: var(--surface-2);
-}
-.field-hint { display: block; margin-top: 5px; color: var(--ink-3); font-size: 12px; }
-
-.taskform-footer { flex: none; border-top: 1px solid var(--line); background: var(--surface); }
-.taskform-footer-inner {
-  max-width: 1040px; margin: 0 auto; padding: 12px 24px;
-  display: flex; align-items: center; gap: 10px;
-}
-.taskform-footer-hint { color: var(--ink-3); font-size: 12px; }
-
-@media (max-width: 880px) {
-  .taskform-grid { grid-template-columns: 1fr; gap: 22px; padding: 24px 18px 40px; }
-  .taskform-side { position: static; }
-  .taskform-topbar, .taskform-footer-inner { padding-left: 16px; padding-right: 16px; }
-}
-
 /* keyboard navigation: list cursor, digit hints on action buttons, "?" help */
 .task-row.cursor, .queue-item.cursor { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
 .task-row:focus-visible, .queue-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -858,9 +838,12 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   background: transparent; color: var(--ink-2); cursor: pointer; font-size: 12px; padding: 0;
 }
 .dow-chip.on { background: var(--accent); color: #fff; border-color: transparent; }
-.cron-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+/* Cron field values are a few characters — compact cells, and minmax(0,1fr) +
+   width:100% so the inputs' intrinsic size can't overflow a narrow container. */
+.cron-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; max-width: 440px; }
 .cron-cell { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--ink-3); }
 .cron-cell input {
+  width: 100%; min-width: 0;
   border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px 6px;
   background: var(--surface); color: var(--ink); font-family: var(--font-mono); font-size: 13px; text-align: center;
 }
