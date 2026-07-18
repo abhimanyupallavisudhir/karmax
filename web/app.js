@@ -707,18 +707,46 @@ function wireCombo(combo, getOptions, onChange) {
   const caret = combo.querySelector('.combo-caret');
   if (!input || !menu || !caret) return;
   let open = false;
+  let active = -1; // index of the arrow-key-highlighted option (-1 = none)
+  const optEls = () => [...menu.querySelectorAll('.combo-opt')];
+  const paint = () => {
+    // Reflect the active index onto the DOM and keep it in view.
+    optEls().forEach((el, i) => {
+      const on = i === active;
+      el.classList.toggle('active', on);
+      if (on) el.scrollIntoView({ block: 'nearest' });
+    });
+  };
   const draw = () => {
     const q = input.value.trim().toLowerCase();
     const opts = (getOptions() || []).filter((o) => !q || o.toLowerCase().includes(q));
     menu.innerHTML = opts.length
       ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o)}">${esc(o)}</div>`).join('')
       : `<div class="combo-empty">No matching presets — free text is allowed</div>`;
+    active = -1; // filtering changes the list; start with nothing highlighted
   };
   const show = () => { draw(); menu.hidden = false; open = true; };
-  const hide = () => { menu.hidden = true; open = false; };
+  const hide = () => { menu.hidden = true; open = false; active = -1; };
+  const choose = (opt) => { input.value = opt.dataset.v; hide(); onChange && onChange(); };
   input.addEventListener('focus', show);
   input.addEventListener('input', () => { show(); onChange && onChange(); });
-  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') { hide(); input.blur(); } });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { hide(); input.blur(); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const els = optEls();
+      if (!els.length) { if (!open) show(); return; }
+      if (!open) show();
+      e.preventDefault();
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      // From no selection, ArrowDown lands on the first option and ArrowUp on the
+      // last; thereafter it wraps around the ends.
+      active = active === -1 ? (step === 1 ? 0 : els.length - 1) : (active + step + els.length) % els.length;
+      paint();
+    } else if (e.key === 'Enter') {
+      const els = optEls();
+      if (open && active >= 0 && els[active]) { e.preventDefault(); choose(els[active]); }
+    }
+  });
   input.addEventListener('blur', () => setTimeout(hide, 150)); // let a menu click land first
   // mousedown (not click) so it fires before the input's blur closes the menu
   caret.addEventListener('mousedown', (e) => {
@@ -726,13 +754,18 @@ function wireCombo(combo, getOptions, onChange) {
     if (open) hide();
     else { input.focus(); show(); }
   });
+  menu.addEventListener('mousemove', (e) => {
+    // Pointer takes over the highlight so it never fights the arrow-key cursor.
+    const opt = e.target.closest('.combo-opt');
+    if (!opt) return;
+    const i = optEls().indexOf(opt);
+    if (i !== active) { active = i; paint(); }
+  });
   menu.addEventListener('mousedown', (e) => {
     const opt = e.target.closest('.combo-opt');
     if (!opt) return;
     e.preventDefault();
-    input.value = opt.dataset.v;
-    hide();
-    onChange && onChange();
+    choose(opt);
   });
 }
 
@@ -2620,7 +2653,7 @@ async function openTaskForm(workflow, draft, seedText) {
           <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
           <button class="btn primary" id="tf-queue">${draft ? (editInPlace ? 'Save' : 'Queue') : 'Add task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
-      </div>
+      </footer>
     </div>`;
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
   let closeForm = () => (root.innerHTML = '');
