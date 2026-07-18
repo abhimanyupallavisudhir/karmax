@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity } from './activity.js';
+import { platformMcpSpec } from '../autonomy/config-homes.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -225,17 +226,24 @@ export class ClaudeAdapter implements AgentAdapter {
     const zod = (await import('zod')).z;
     const handlers = platformToolHandlers(input.world, ctx);
 
-    // Expose EVERY platform tool as an in-process MCP server, derived from the shared
-    // PLATFORM_TOOL_SCHEMAS so this path can never again drift out of sync with the
-    // Messages-API path (the drift that left Claude-Code agents without
-    // respond_to_sub_task / raise_to_parent / wait_for_subtasks — a parent literally
-    // could not confirm a child that raised to it). Read/Write/Bash come from the SDK
-    // natively, so they are excluded upstream.
-    const platform = createSdkMcpServer({
-      name: 'karmax',
+    // Only turn-local controls live in-process. Historically this SDK server and
+    // the config-home stdio bridge were both registered as `karmax`; the SDK
+    // instance shadowed the durable bridge and could lose its transport during a
+    // continuation re-init, surfacing only "Stream closed". Separate names and
+    // disjoint tool sets remove that collision.
+    const controls = createSdkMcpServer({
+      name: 'karmax_control',
       version: '1.0.0',
       tools: buildSdkTools(tool, zod, handlers),
     });
+    const configuredMcp = configHomeMcpServers(input.resolvedAuth?.configHome);
+    const { forwardEnv: _forwardEnv, ...platform } = platformMcpSpec(
+      process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505',
+    );
+    platform.env = {
+      ...(platform.env ?? {}),
+      ...(input.extraEnv?.KARMAX_TOKEN ? { KARMAX_TOKEN: input.extraEnv.KARMAX_TOKEN } : {}),
+    };
 
     // Only the messages new since the resumed session last advanced (the whole
     // conversation on a fresh session) — the session already holds the rest, so
@@ -397,8 +405,16 @@ export class ClaudeAdapter implements AgentAdapter {
         // Resume the session, or (fork) branch a NEW session id from it, leaving the
         // source untouched — SPEC §10.5 (CLI: --resume <id> [--fork-session]).
         ...(session ? { resume: session, ...(input.fork ? { forkSession: true } : {}) } : {}),
-        // The platform MCP (in-process) + any MCP servers the workflow declares (§7.5).
-        mcpServers: { karmax: platform, ...agentMcpToConfig(input.agentMcp) },
+        // Strict mode prevents the same on-disk `karmax` entry from being loaded
+        // again. Re-declare the config home's other servers explicitly so its
+        // selected browser/user servers are preserved.
+        mcpServers: {
+          ...configuredMcp,
+          ...agentMcpToConfig(input.agentMcp),
+          karmax: { ...platform, alwaysLoad: true },
+          karmax_control: controls,
+        },
+        strictMcpConfig: true,
         env,
         // Spawn the agent harness ourselves (same call the SDK makes internally:
         // stdio ['pipe','pipe','ignore'], the SDK's forwarded abort signal) so the
@@ -669,15 +685,28 @@ export function jsonSchemaToZodShape(zod: any, schema: any): Record<string, any>
   return shape;
 }
 
-/** Build the Agent-SDK in-process MCP tool defs for EVERY platform tool, derived from
- *  PLATFORM_TOOL_SCHEMAS + the shared handlers. Exported so a unit test can assert the
- *  SDK path exposes the full platform toolset (no silent drift). */
+/** Read a config home's MCP servers so strict SDK isolation can preserve its
+ * browser/user servers while replacing the on-disk karmax entry for this turn. */
+export function configHomeMcpServers(home: string | undefined): Record<string, any> {
+  if (!home) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
+    if (!parsed?.mcpServers || typeof parsed.mcpServers !== 'object' || Array.isArray(parsed.mcpServers)) return {};
+    const { karmax: _karmax, karmax_control: _karmaxControl, ...others } = parsed.mcpServers;
+    return others;
+  } catch {
+    return {};
+  }
+}
+
+/** Build in-process defs only for turn-local controls. Durable platform tools are
+ * intentionally served by the stdio karmax MCP, never registered a second time. */
 export function buildSdkTools(
   tool: (name: string, description: string, shape: Record<string, any>, run: (a: any) => Promise<any>) => any,
   zod: any,
   handlers: Record<string, (args: any) => Promise<string>>,
 ): any[] {
-  return PLATFORM_TOOL_SCHEMAS.filter((schema) => typeof handlers[schema.name] === 'function').map((schema) =>
+  return SDK_CONTROL_TOOL_SCHEMAS.filter((schema) => typeof handlers[schema.name] === 'function').map((schema) =>
     tool(schema.name, schema.description, jsonSchemaToZodShape(zod, schema.parameters), async (a: any) => ({
       content: [{ type: 'text', text: await handlers[schema.name]!(a) }],
     })),

@@ -17,7 +17,10 @@ const gateway = process.env.KARMAX_GATEWAY_URL || 'http://localhost:4505';
 const env = { ...process.env, KARMAX_GATEWAY_URL: gateway };
 delete env.KARMAX_TOKEN; // the manually-launched-CLI case
 
-const child = spawn('npx', ['tsx', entry], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+// Match platformMcpSpec(): launch one Node process through karmax's own loader,
+// without npx/shell/tsx wrapper processes resolved from the caller's worktree.
+const loader = import.meta.resolve('tsx');
+const child = spawn(process.execPath, ['--import', loader, entry], { env, stdio: ['pipe', 'pipe', 'pipe'] });
 const send = (o) => child.stdin.write(JSON.stringify(o) + '\n');
 let buf = '';
 const responses = new Map();

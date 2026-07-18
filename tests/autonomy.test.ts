@@ -49,15 +49,19 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
   it('writes the karmax platform MCP into a config home with the gateway URL (task #4)', async () => {
     const { platformMcpSpec } = await import('../src/autonomy/config-homes.js');
     const spec = platformMcpSpec('http://127.0.0.1:4505');
-    expect(spec.command).toBe('npx');
+    expect(spec.command).toBe(process.execPath);
+    expect(spec.args).toContain('--import');
+    expect(spec.args.some((a) => a.includes('tsx/dist/loader'))).toBe(true);
     expect(spec.args.some((a) => a.includes('stdio'))).toBe(true);
+    expect(spec.forwardEnv).toEqual(['KARMAX_TOKEN']);
     expect(spec.env?.KARMAX_GATEWAY_URL).toBe('http://127.0.0.1:4505');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-plat-'));
     const mgr = new ConfigHomeManager(dir);
     const home = mgr.ensure('claude', 'work');
     mgr.writeMcpConfig(home, 'claude', { platform: spec });
     const cfg = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
-    expect(cfg.mcpServers.karmax.command).toBe('npx');
+    expect(cfg.mcpServers.karmax.command).toBe(process.execPath);
+    expect(cfg.mcpServers.karmax.forwardEnv).toBeUndefined();
     expect(cfg.mcpServers.karmax.env.KARMAX_GATEWAY_URL).toContain('4505');
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -79,6 +83,35 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(toml).toContain('command = "npx"');
     expect(toml).toContain('model = "custom"');
     expect(toml).toContain('[mcp_servers.keep]');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('forwards the scoped token to Codex MCP and upgrades existing homes without clobbering other servers', async () => {
+    const { platformMcpSpec } = await import('../src/autonomy/config-homes.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mcp-refresh-'));
+    const mgr = new ConfigHomeManager(dir);
+    const codexHome = mgr.ensure('codex', 'work');
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), `model = "custom"\n\n[mcp_servers.keep]\ncommand = "keep"\n\n[mcp_servers.karmax]\ncommand = "npx"\nargs = ["tsx", "old.ts"]\n`);
+    const claudeHome = mgr.ensure('claude', 'work');
+    fs.writeFileSync(path.join(claudeHome, '.claude.json'), JSON.stringify({ mcpServers: { keep: { command: 'keep', args: [] }, karmax: { command: 'npx', args: ['tsx', 'old.ts'] } } }));
+
+    mgr.refreshPlatformMcp('http://127.0.0.1:9876');
+
+    const toml = fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(toml.match(/^\[mcp_servers\.karmax]$/gm)).toHaveLength(1);
+    expect(toml).toContain(`command = ${JSON.stringify(process.execPath)}`);
+    expect(toml).toContain('env_vars = ["KARMAX_TOKEN"]');
+    expect(toml).toContain('KARMAX_GATEWAY_URL = "http://127.0.0.1:9876"');
+    expect(toml).toContain('[mcp_servers.keep]');
+    expect(toml).toContain('model = "custom"');
+
+    const claude = JSON.parse(fs.readFileSync(path.join(claudeHome, '.claude.json'), 'utf8'));
+    expect(claude.mcpServers.keep.command).toBe('keep');
+    expect(claude.mcpServers.karmax).toEqual(expect.objectContaining({
+      command: platformMcpSpec('http://127.0.0.1:9876').command,
+      env: { KARMAX_GATEWAY_URL: 'http://127.0.0.1:9876' },
+    }));
+    expect(claude.mcpServers.karmax.forwardEnv).toBeUndefined();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
