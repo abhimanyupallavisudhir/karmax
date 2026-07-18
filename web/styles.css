@@ -549,7 +549,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 }
 .combo-menu[hidden] { display: none; }
 .combo-opt { padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-.combo-opt:hover, .combo-opt.active { background: var(--accent-weak); }
+.combo-opt.active { background: var(--accent-weak); }
 .combo-empty { padding: 7px 10px; font-size: 12px; color: var(--ink-3); }
 
 /* empty states */
