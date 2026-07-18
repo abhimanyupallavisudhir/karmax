@@ -1197,6 +1197,9 @@ function mdBlocks(s, stash) {
   const out = [];
   const bullet = /^\s*([-*+]|\d+[.)])\s+/;
   const rule = /^\s*([-*_])(\s*\1){2,}\s*$/;
+  // A GFM pipe table: a header row followed by a |---|:--:| delimiter row.
+  const isTableStart = (idx) => idx + 1 < lines.length && lines[idx].includes('|')
+    && mdIsDelimiterRow(lines[idx + 1]) && mdSplitRow(lines[idx]).length > 1;
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
@@ -1227,10 +1230,26 @@ function mdBlocks(s, stash) {
       out.push(`<${ordered ? 'ol' : 'ul'} class="md-list">${items.join('')}</${ordered ? 'ol' : 'ul'}>`);
       continue;
     }
+    if (isTableStart(i)) {
+      const headers = mdSplitRow(lines[i]);
+      const aligns = mdSplitRow(lines[i + 1]).map(mdCellAlign);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && !/^\s*$/.test(lines[i]) && lines[i].includes('|') && !mdIsDelimiterRow(lines[i])) {
+        rows.push(mdSplitRow(lines[i])); i++;
+      }
+      const al = (x) => (aligns[x] ? ` style="text-align:${aligns[x]}"` : '');
+      const head = `<thead><tr>${headers.map((h, x) => `<th${al(x)}>${mdInline(h)}</th>`).join('')}</tr></thead>`;
+      const body = rows.length
+        ? `<tbody>${rows.map((r) => `<tr>${headers.map((_, x) => `<td${al(x)}>${mdInline(r[x] || '')}</td>`).join('')}</tr>`).join('')}</tbody>`
+        : '';
+      out.push(`<table class="md-table">${head}${body}</table>`);
+      continue;
+    }
     const buf = [line];
     i++;
     while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^(#{1,6})\s+/.test(lines[i])
-      && !bullet.test(lines[i]) && !/^\s*>\s?/.test(lines[i]) && !rule.test(lines[i])) {
+      && !bullet.test(lines[i]) && !/^\s*>\s?/.test(lines[i]) && !rule.test(lines[i]) && !isTableStart(i)) {
       buf.push(lines[i]); i++;
     }
     const joined = buf.join('\n');
@@ -1239,6 +1258,37 @@ function mdBlocks(s, stash) {
     out.push(`<p class="md-p">${mdInline(joined).replace(/\n/g, '<br>')}</p>`);
   }
   return out.join('\n');
+}
+
+// Split one pipe-table row into trimmed cells, tolerating optional leading and
+// trailing pipes and backslash-escaped `\|` inside a cell.
+function mdSplitRow(line) {
+  const s = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\' && s[i + 1] === '|') { cur += '|'; i++; continue; }
+    if (s[i] === '|') { cells.push(cur.trim()); cur = ''; continue; }
+    cur += s[i];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+// The row under a table header: every cell is dashes with optional alignment
+// colons (`---`, `:--`, `--:`, `:-:`). The pipe requirement keeps a bare `---`
+// (a horizontal rule) from being mistaken for a one-column delimiter.
+function mdIsDelimiterRow(line) {
+  if (!line.includes('|') || !line.includes('-')) return false;
+  const cells = mdSplitRow(line);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+}
+
+function mdCellAlign(cell) {
+  const s = cell.trim();
+  const left = s.startsWith(':');
+  const right = s.endsWith(':');
+  return left && right ? 'center' : right ? 'right' : left ? 'left' : '';
 }
 
 // Inline formatting over already-block-split text. Escaping happens here so the

@@ -517,6 +517,10 @@ a { color: var(--accent); text-decoration: none; }
 .msg-text.md .md-code { margin: 0 0 8px; padding: 9px 11px; border-radius: 8px; overflow-x: auto; background: rgba(127, 127, 127, .14); }
 .msg-text.md .md-code code { font-family: var(--font-mono); font-size: 12px; line-height: 1.5; white-space: pre; }
 .msg-text.md .md-math { white-space: normal; }
+.msg-text.md .md-table { border-collapse: collapse; margin: 0 0 8px; display: block; overflow-x: auto; max-width: 100%; font-size: .95em; }
+.msg-text.md .md-table th, .msg-text.md .md-table td { border: 1px solid var(--line); padding: 5px 10px; text-align: left; vertical-align: top; }
+.msg-text.md .md-table th { background: rgba(127, 127, 127, .12); font-weight: 600; }
+.msg-text.md .md-table tr:nth-child(even) td { background: rgba(127, 127, 127, .05); }
 
 /* Provider-native work items. Commands, file edits, tools, reasoning and turn
    lifecycle live inline with the messages, but stay visually quieter than chat. */

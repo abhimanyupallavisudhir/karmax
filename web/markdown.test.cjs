@@ -19,7 +19,7 @@ function extractFn(name) {
 }
 
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-for (const fn of ['renderMarkdown', 'mdBlocks', 'mdInline']) eval(extractFn(fn));
+for (const fn of ['renderMarkdown', 'mdBlocks', 'mdInline', 'mdSplitRow', 'mdIsDelimiterRow', 'mdCellAlign']) eval(extractFn(fn));
 
 let pass = 0, fail = 0;
 const ok = (c, m) => c ? pass++ : (fail++, console.error('FAIL:', m));
@@ -55,6 +55,25 @@ ok(withMath.includes('<span class="md-math">$$x+y$$</span>'), 'display math span
 ok(!withMath.includes('<em>'), 'underscores inside math are not italicised');
 const noMath = renderMarkdown('cost $5 and $10 today', { math: false });
 ok(noMath.includes('cost $5 and $10 today'), 'currency $ untouched when math is off');
+
+// GFM pipe tables.
+const table = renderMarkdown('| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |', {});
+ok(/<table class="md-table">/.test(table), 'table element emitted');
+ok(table.includes('<thead><tr><th>A</th><th>B</th></tr></thead>'), 'header row cells');
+ok(table.includes('<tbody><tr><td>1</td><td>2</td></tr><tr><td>3</td><td>4</td></tr></tbody>'), 'body rows');
+// Surrounding paragraphs stay separate; a table needs no blank line to be found.
+const around = renderMarkdown('before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nafter', {});
+ok(around.includes('<p class="md-p">before</p>') && around.includes('<p class="md-p">after</p>') && around.includes('<table'), 'table separated from surrounding paragraphs');
+// Alignment from the delimiter row.
+const aligned = renderMarkdown('| L | C | R |\n|:--|:-:|--:|\n| a | b | c |', {});
+ok(aligned.includes('<th style="text-align:left">L</th>') && aligned.includes('<th style="text-align:center">C</th>') && aligned.includes('<th style="text-align:right">R</th>'), 'per-column alignment');
+// Cells with fewer columns than the header pad to empty; inline formatting works in cells.
+const ragged = renderMarkdown('| A | B |\n| - | - |\n| **x** |', {});
+ok(ragged.includes('<td><strong>x</strong></td><td></td>'), 'ragged row padded, inline formatting applied in cells');
+// A bare rule / non-table pipe content is not a table.
+ok(!renderMarkdown('---', {}).includes('<table'), 'horizontal rule is not a table');
+ok(!renderMarkdown('a | b\nc | d', {}).includes('<table'), 'pipes without a delimiter row are not a table');
+ok(mdIsDelimiterRow('|:--|--:|') && !mdIsDelimiterRow('| a | b |'), 'delimiter-row detection');
 
 console.log(`${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);
