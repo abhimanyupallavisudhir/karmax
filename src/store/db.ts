@@ -85,10 +85,20 @@ export class Store {
     const rows = this.db.prepare("SELECT id, json FROM profiles WHERE id LIKE '%-default'").all() as any[];
     for (const r of rows) {
       const p = JSON.parse(r.json);
+      const legacyDoCapabilities = ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'];
+      const modernDoCapabilities = [
+        ...legacyDoCapabilities, 'task:read', 'task:event:read', 'task:world:read',
+        'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
+      ];
+      if (p.role === 'do' && Array.isArray(p.capabilities)
+        && p.capabilities.length === legacyDoCapabilities.length
+        && legacyDoCapabilities.every((capability) => p.capabilities.includes(capability))) {
+        p.capabilities = modernDoCapabilities;
+      }
       if (p.maxTurns !== undefined) {
         delete p.maxTurns;
-        this.db.prepare('UPDATE profiles SET json = ? WHERE id = ?').run(JSON.stringify(p), r.id);
       }
+      this.db.prepare('UPDATE profiles SET json = ? WHERE id = ?').run(JSON.stringify(p), r.id);
     }
   }
 
@@ -460,6 +470,7 @@ export class Store {
       // General-purpose coding agents need package registries, documentation,
       // web search, and arbitrary APIs. Restriction is an explicit hardening mode.
       network: { unrestricted: true },
+      environment: { flavor: 'headless' },
       hibernateAfterMs: 7 * 24 * 60 * 60 * 1000,
     };
     const raw = this.kvGet(`organization-execution:${organizationId}`);
@@ -470,6 +481,7 @@ export class Store {
       ...saved,
       resources: { ...fallback.resources, ...saved.resources },
       network: saved.network ? { ...saved.network } : fallback.network,
+      environment: { ...fallback.environment, ...saved.environment },
     };
   }
 
@@ -480,6 +492,7 @@ export class Store {
       ...current, ...policy,
       resources: policy.resources ? { ...current.resources, ...policy.resources } : current.resources,
       network: policy.network ? { ...policy.network } : current.network,
+      environment: policy.environment ? { ...current.environment, ...policy.environment } : current.environment,
     };
     validateProjectExecutionConfig(next as ProjectConfig);
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(next.worldProvider ?? 'e2b'))
@@ -519,6 +532,7 @@ export class Store {
       runnerPoolId: value.config.runnerPoolId ?? (providerChanged ? undefined : organization.runnerPoolId),
       resources: { ...organization.resources, ...value.config.resources },
       network: value.config.network ? { ...value.config.network } : organization.network,
+      environment: { ...organization.environment, ...value.config.environment },
     };
   }
 
@@ -526,7 +540,7 @@ export class Store {
     const existing = this.getProject(id);
     if (!existing) throw new Error(`no project ${id}`);
     const config: Record<string, unknown> = { ...existing.config };
-    for (const key of ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const) {
+    for (const key of ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const) {
       if (!Object.prototype.hasOwnProperty.call(override, key)) continue;
       const value = override[key];
       if (value == null) delete config[key];
@@ -2929,6 +2943,8 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
   positive(raw.resources?.memoryMb, 'memory', 128);
   positive(raw.resources?.gpu, 'GPU', 0);
   positive(raw.monthlyBudgetMicros, 'monthly budget', 0);
+  if (raw.environment?.flavor != null && !['headless', 'desktop'].includes(raw.environment.flavor))
+    throw new Error('environment flavor must be headless or desktop');
   // Zero is the explicit "hibernate on the next lifecycle sweep" value. It is
   // useful under hard budget pressure and in deterministic lifecycle tests;
   // positive intervals below one minute are almost certainly configuration

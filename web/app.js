@@ -4017,6 +4017,7 @@ function terminalPane(v) {
       <span style="flex:1"></span>
       ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
       ${S.meta?.hosted && v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
+      ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No world yet'}</button>
     </div>
     <div class="ck-term">
@@ -4032,6 +4033,10 @@ function wireCheckinSidebar(v) {
     }),
   );
   $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
+  $('#desktop-open')?.addEventListener('click', async () => {
+    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`); window.open(session.url, '_blank', 'noopener'); }
+    catch (error) { toast(error.message, true); }
+  });
 }
 
 async function openLocalCheckout(v) {
@@ -5568,8 +5573,9 @@ async function hydrateExecutionProviders(proj) {
     box.innerHTML = `<div class="settings-grid">
       <label class="form-row">Execution provider<select id="project-execution-provider"><option value="">Organization default — ${esc(policy.organization.worldProvider || 'worktree')}</option>${providers.map((provider) => `<option value="${esc(provider)}" ${provider === selected ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
       <label class="form-row">Runner pool<select id="project-execution-pool"></select></label>
+      <label class="form-row">World experience<select id="project-execution-flavor"><option value="">Organization default — ${esc(policy.organization.environment?.flavor || 'headless')}</option><option value="headless" ${policy.override.environment?.flavor === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${policy.override.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
       <label class="form-row">Optional tighter project budget (USD/month)<input id="project-execution-budget" type="number" min="0" step="0.01" value="${policy.override.monthlyBudgetMicros == null ? '' : esc(policy.override.monthlyBudgetMicros / 1e6)}" placeholder="Use organization budget" /></label>
-    </div><div class="task-sub">Effective: ${esc(policy.effective.worldProvider)} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
+    </div><div class="task-sub">Effective: ${esc(policy.effective.worldProvider)} · ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
     <button class="btn sm primary" id="project-execution-save">Save project override</button>`;
     const syncPools = (keep = '') => {
       const provider = $('#project-execution-provider').value || policy.organization.worldProvider || 'worktree';
@@ -5584,6 +5590,7 @@ async function hydrateExecutionProviders(proj) {
       try {
         await api(`/api/projects/${proj.id}/execution-policy`, { method: 'PUT', body: JSON.stringify({ override: {
           worldProvider: provider || null, runnerPoolId: pool || null,
+          environment: $('#project-execution-flavor').value ? { flavor: $('#project-execution-flavor').value } : null,
           monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
         } }) });
         await loadProjects(); toast('Project execution policy saved'); await hydrateExecutionProviders(proj);
@@ -6378,6 +6385,7 @@ async function hydrateOrganizationView() {
   $('#org-execution').innerHTML = `<div class="settings-grid">
     <label class="form-row">Default provider<select id="org-execution-provider">${executionProviders.map((provider) => `<option value="${esc(provider)}" ${provider === executionPolicy.worldProvider ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
     <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
+    <label class="form-row">World experience<select id="org-execution-flavor"><option value="headless" ${(executionPolicy.environment?.flavor || 'headless') === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${executionPolicy.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
     <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
     <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
     <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
@@ -6394,8 +6402,8 @@ async function hydrateOrganizationView() {
       <div class="member-row"><b>${provider === 'e2b' ? 'E2B' : 'Daytona'}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
-      ${provider === 'e2b' ? `<label class="form-row">Template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-node22" /></label>`
-        : `<label class="form-row">Snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="provider default" /></label><label class="form-row">Image<input class="provider-image" value="${esc(config.image || '')}" placeholder="provider default" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
+      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-browser-v1" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
+        : `<label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="recommended" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
       </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${r.capacity.activeWorlds} worlds</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
@@ -6431,8 +6439,9 @@ async function hydrateOrganizationView() {
     const provider = row.dataset.provider;
     row.querySelector('.provider-save')?.addEventListener('click', async () => {
       const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
-        ? { template: row.querySelector('.provider-template').value }
+        ? { template: row.querySelector('.provider-template').value, desktopTemplate: row.querySelector('.provider-desktop-template').value }
         : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
+            desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
             apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
       try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await hydrateOrganizationView(); }
       catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
@@ -6455,6 +6464,7 @@ async function hydrateOrganizationView() {
     try {
       await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
         worldProvider: $('#org-execution-provider').value, runnerPoolId: $('#org-execution-pool').value || undefined,
+        environment: { flavor: $('#org-execution-flavor').value },
         resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
         network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
         monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),

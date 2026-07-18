@@ -36,10 +36,9 @@ export interface RunTurnDeps {
 export const KARMAX_RUNTIME_PROTOCOL = 1 as const;
 export interface RuntimeTurnRequestV1 { version: typeof KARMAX_RUNTIME_PROTOCOL; input: TurnInput }
 
-/** Versioned controller protocol used for every local and cloud turn. The model
- * loop stays in the trusted control plane; its filesystem/process tools cross
- * only the World interface. This keeps LLM credentials and platform tokens out
- * of untrusted sandboxes while giving remote worlds exactly the same tools. */
+/** Versioned controller protocol used for every local and cloud turn. API rails
+ * run in the activity process; subscription SDK/CLI rails are spawned inside a
+ * remote world after its leased config home is seeded there. */
 export async function runRuntimeTurn(request: RuntimeTurnRequestV1, deps: RunTurnDeps): Promise<TurnResult> {
   if (request.version !== KARMAX_RUNTIME_PROTOCOL) throw new Error(`unsupported karmax runtime protocol ${request.version}`);
   return runTurn(request.input, deps);

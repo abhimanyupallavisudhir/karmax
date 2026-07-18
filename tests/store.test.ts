@@ -16,11 +16,13 @@ describe('Store', () => {
     const dbPath = path.join(dir, 'karmax.db');
     // an older build persisted a role default with maxTurns
     const s1 = new Store(dbPath);
-    s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude', capabilities: [], maxTurns: 24 } as any);
+    s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude',
+      capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'], maxTurns: 24 } as any);
     s1.upsertProfile({ id: 'custom-big', name: 'Big', role: 'do', provider: 'claude', capabilities: [], maxTurns: 99 } as any);
     // reopening runs migrateData
     const s2 = new Store(dbPath);
     expect(s2.getProfile('do-default')!.maxTurns).toBeUndefined(); // legacy cap stripped
+    expect(s2.getProfile('do-default')!.capabilities).toContain('task:world:read');
     expect(s2.getProfile('custom-big')!.maxTurns).toBe(99); // non-default profiles untouched
     fs.rmSync(dir, { recursive: true, force: true });
   });

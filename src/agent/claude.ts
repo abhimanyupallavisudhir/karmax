@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
@@ -16,6 +16,7 @@ import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity } from './activity.js';
 import { platformMcpSpec } from '../autonomy/config-homes.js';
+import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess } from './remote-process.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -225,6 +226,10 @@ export class ClaudeAdapter implements AgentAdapter {
     const { query, createSdkMcpServer, tool } = sdk;
     const zod = (await import('zod')).z;
     const handlers = platformToolHandlers(input.world, ctx);
+    const remote = isRemoteAgentWorld(input.world);
+    const remoteHome = remote
+      ? await seedRemoteAgentHome(input.world, 'claude', input.resolvedAuth?.configHome ?? '', input.session)
+      : undefined;
 
     // Only turn-local controls live in-process. Historically this SDK server and
     // the config-home stdio bridge were both registered as `karmax`; the SDK
@@ -234,9 +239,17 @@ export class ClaudeAdapter implements AgentAdapter {
     const controls = createSdkMcpServer({
       name: 'karmax_control',
       version: '1.0.0',
-      tools: buildSdkTools(tool, zod, handlers),
+      // A remote CLI cannot launch the control plane's absolute stdio-MCP path.
+      // Keep every platform/control tool in the SDK host process instead; the
+      // Claude wire protocol already supports SDK MCP servers across custom spawn.
+      tools: buildSdkTools(tool, zod, handlers, remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS),
     });
     const configuredMcp = configHomeMcpServers(input.resolvedAuth?.configHome);
+    if (remoteHome?.browserMcp) {
+      delete configuredMcp['chrome-devtools'];
+      delete configuredMcp.playwright;
+      Object.assign(configuredMcp, remoteHome.browserMcp);
+    }
     const { forwardEnv: _forwardEnv, ...platform } = platformMcpSpec(
       process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505',
     );
@@ -310,7 +323,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
     // Scrubbed, config-home-isolated env (SPEC §7.3).
     const { scrubbedEnv } = await import('../autonomy/config-homes.js');
-    const env = scrubbedEnv({
+    let env = scrubbedEnv({
       provider: 'claude',
       configHome: input.resolvedAuth?.configHome,
       // A captured setup-token login: re-supply it (scrubbedEnv strips it by default),
@@ -319,6 +332,10 @@ export class ClaudeAdapter implements AgentAdapter {
         ...(input.extraEnv ?? {}),
         ...(input.resolvedAuth?.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } : {}),
       },
+    });
+    if (remoteHome) env = remoteAgentEnv('claude', remoteHome.absolute, {
+      ...env,
+      KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
     });
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
@@ -411,7 +428,7 @@ export class ClaudeAdapter implements AgentAdapter {
         mcpServers: {
           ...configuredMcp,
           ...agentMcpToConfig(input.agentMcp),
-          karmax: { ...platform, alwaysLoad: true },
+          ...(!remote ? { karmax: { ...platform, alwaysLoad: true } } : {}),
           karmax_control: controls,
         },
         strictMcpConfig: true,
@@ -426,6 +443,17 @@ export class ClaudeAdapter implements AgentAdapter {
         //  - the live task-manager registry (dashboard Processes panel), with the
         //    task attribution and an escalating kill.
         spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
+          if (remote && remoteHome) {
+            return spawnRemoteAgentProcess({
+              world: input.world,
+              provider: 'claude',
+              command: o.command,
+              args: o.args,
+              cwd: input.world.handle.root,
+              env: remoteAgentEnv('claude', remoteHome.absolute, o.env),
+              signal: o.signal,
+            }) as any;
+          }
           const child = spawn(o.command, o.args, {
             cwd: o.cwd,
             env: o.env,
@@ -705,8 +733,9 @@ export function buildSdkTools(
   tool: (name: string, description: string, shape: Record<string, any>, run: (a: any) => Promise<any>) => any,
   zod: any,
   handlers: Record<string, (args: any) => Promise<string>>,
+  schemas = SDK_CONTROL_TOOL_SCHEMAS,
 ): any[] {
-  return SDK_CONTROL_TOOL_SCHEMAS.filter((schema) => typeof handlers[schema.name] === 'function').map((schema) =>
+  return schemas.filter((schema) => typeof handlers[schema.name] === 'function').map((schema) =>
     tool(schema.name, schema.description, jsonSchemaToZodShape(zod, schema.parameters), async (a: any) => ({
       content: [{ type: 'text', text: await handlers[schema.name]!(a) }],
     })),

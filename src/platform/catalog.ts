@@ -15,6 +15,7 @@ export const PLATFORM_API_CATALOG = {
     'PUT /api/tasks/:taskId/tags|priority', 'POST /api/tasks/:taskId/tag|archive|signal|target',
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
     'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/refresh-from-github',
+    'GET /api/tasks/:taskId/world/files', 'GET /api/tasks/:taskId/world/file?path=',
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
@@ -24,7 +25,7 @@ export const PLATFORM_API_CATALOG = {
   review: [
     'POST /api/tasks/:taskId/review-action', 'GET /api/tasks/:taskId/review-action/:procId',
     'POST /api/tasks/:taskId/review-action/:procId/stop', 'GET /api/tasks/:taskId/artifact?path=',
-    'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
+    'GET /api/tasks/:taskId/desktop', 'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
   ],
   automation: [
     'GET /api/workflows', 'POST /api/workflows/install', 'POST /api/projects/:projectId/propose-workflow-edit',

@@ -12,8 +12,9 @@ The repository now implements the hosted product baseline end to end:
 - provider-owned exec/process/PTY/files/preview/park operations, with local,
   Docker, memory, E2B, and Daytona adapters;
 - auto-pause plus explicit park-on-wait and transparent resume;
-- remote SSH clone provisioning, API-key agent tool loops operating on the remote
-  world, authenticated terminals/artifacts/previews, and a trusted host Git
+- remote SSH clone provisioning, API-key tool loops plus full Claude/Codex
+  subscription agents executing inside the remote world, authenticated
+  terminals/artifacts/previews, and a trusted host Git
   bundle broker for branch/merge/PR handoff;
 - hosted bind/public-origin settings and a public view projection that never
   exposes world handles, sandbox IDs, repository locations, or provider tokens;
@@ -339,11 +340,18 @@ is expected to reach directly.
 
 ### The Karmax runtime boundary
 
-The versioned runtime protocol remains in the trusted activity worker. It runs
-the Claude/Codex model loop and MCP bridge there while every filesystem, command,
-process, PTY, artifact, and port operation is dispatched through the task's
-provider-owned world. This is intentionally safer than copying provider login
-homes or reusable model API keys into untrusted repository compute.
+The versioned runtime protocol remains coordinated by the trusted activity
+worker. Metered API loops run there. Subscription-backed Claude/Codex SDK agents
+run as native subprocesses inside the task's provider-owned world, after the
+leased config home is seeded into a task-private directory. The provider CLI,
+its tools, session files, and repository cwd therefore share the same sandbox,
+matching local execution instead of emulating filesystem calls from the host.
+The stock adapters launch pinned `@anthropic-ai/claude-code` and `@openai/codex`
+packages through `npx` (cached in the sandbox); custom images can override those
+package specs with `KARMAX_REMOTE_CLAUDE_PACKAGE` and
+`KARMAX_REMOTE_CODEX_PACKAGE`. Their PTY transport runs raw so large JSON protocol
+frames are not subject to canonical-line limits. A sandbox-local process-group
+lease reaps a surviving CLI before a Temporal retry starts another writer.
 
 The determinism boundary is unchanged: the workflow awaits one `runAgentTurn`
 activity, the activity emits the typed stream and heartbeats, and cancellation
@@ -356,32 +364,39 @@ short-lived, audience-bound token at the trusted MCP boundary.
 Most of this path already exists. `platformMcpSpec()` configures a stdio bridge
 to the gateway, and the activity injects a capability-scoped token. For cloud:
 
-1. The trusted runtime starts the version-matched MCP bridge; it is never an
-   absolute path stored in a world checkpoint.
-2. The bridge calls the Karmax gateway over loopback/TLS while world tools use
-   the provider API. The sandbox itself does not need broad control-plane access.
+1. The activity bundles and seeds the version-matched MCP bridge on the world's
+   non-checkpointed injection surface.
+2. The bridge calls the Karmax public gateway over TLS. World tools execute
+   directly in the sandbox through the native provider agent.
 3. A turn token carries organization, project, origin task, role, capabilities,
    audience, expiry, and unique ID. Any gateway replica can verify it.
-4. Do not put a refresh credential in the agent environment. The activity may
-   reissue the same attenuated grant while the execution lease remains valid.
+4. The selected Claude/Codex subscription home is copied into the task-private
+   injection directory on first use. Later turns preserve provider-refreshed auth,
+   enforce private file modes, and copy only a specifically requested native
+   session when resuming or forking across worlds. Only the scoped Karmax token is
+   added to the turn env.
 5. Revoke the execution lease on cancellation/end. Keep an auditable token ID,
    never the raw bearer value, in events.
 
-Provider keys, vault roots, Git write keys, Temporal credentials, and runner-pool
-credentials never enter a world. LLM/API credentials should use opaque outbound
-substitution where the provider supports it; otherwise materialize only the
-turn-scoped value in the execution environment and remove it at process end.
+Provider-controller keys, vault roots, Git write keys, Temporal credentials, and
+runner-pool credentials never enter a world. The leased model subscription is
+the intentional exception: its native config files are seeded so the full SDK
+agent can authenticate from inside the sandbox.
 
-The current config home conflates account authentication with conversation state.
-Cloud execution should split them:
+Cloud execution seeds the selected config home into the task sandbox and lets the
+native provider manage its session state there. A later credential-broker
+optimization may split these layers without changing the execution contract:
 
 - **Agent account**: encrypted broker record, organization/user scoped;
 - **Agent profile**: model, behavior, limits, and account-selection policy;
 - **Conversation session**: task × role state/artifact, world-portable where the
   provider permits and transcript-replayable otherwise.
 
-An ephemeral home is assembled for a turn from those three layers and destroyed
-with the execution. No mutable cross-task home is mounted into untrusted worlds.
+A task-private home lives on the non-checkpointed injection surface for that
+world generation, preserving native sessions across turns. The host login home
+is copied, never mounted or shared mutably across task sandboxes. Remote
+subscription turns use provider-world capacity and do not consume the host RAM/load
+agent-slot queue; their account concurrency and world-pool limits still apply.
 
 ## Network and preview security
 

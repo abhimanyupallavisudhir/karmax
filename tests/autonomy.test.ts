@@ -28,7 +28,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
 
   it('resolves a browser + platform MCP baseline (SPEC §7.5)', () => {
     const servers = mcpServerMap({ browser: 'chrome-devtools', platform: { command: 'node', args: ['mcp.js'] } });
-    expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] });
+    expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@1.6.0'] });
     expect(servers['karmax']).toEqual({ command: 'node', args: ['mcp.js'] });
     expect(mcpServerMap({ browser: 'none' })).toEqual({});
   });

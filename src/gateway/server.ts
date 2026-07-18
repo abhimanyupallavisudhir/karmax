@@ -133,7 +133,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
   if (/\/(sessions|agents|conversation)$/.test(p)) return 'task:conversation:read';
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
-  if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p)) return 'task:review:execute';
+  if (/\/world\/(?:files|file)$/.test(p)) return 'task:world:read';
+  if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/signal$/.test(p)) return 'task:signal';
@@ -240,7 +241,13 @@ export function toPublicPayload(value: unknown): unknown {
   }
   if (taskView) {
     out.worldAvailable = Boolean(handle || input.worldPath);
-    if (handle) out.worldProvider = handle.provider ?? handle.kind;
+    if (handle) {
+      out.worldProvider = handle.provider ?? handle.kind;
+      const handleMeta = handle.meta && typeof handle.meta === 'object'
+        ? handle.meta as Record<string, unknown>
+        : undefined;
+      if (handleMeta?.environmentFlavor === 'desktop') out.worldDesktop = true;
+    }
   }
   return out;
 }
@@ -1784,6 +1791,30 @@ export class Gateway {
         try { return this.json(res, 200, this.deps.handoffs.checkout(checkoutMatch[1]!)); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
+      const worldFilesMatch = p.match(/^\/api\/tasks\/([^/]+)\/world\/files$/);
+      if (worldFilesMatch && method === 'GET') {
+        try { return this.json(res, 200, await api.listWorldFiles(token, worldFilesMatch[1]!)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const worldFileMatch = p.match(/^\/api\/tasks\/([^/]+)\/world\/file$/);
+      if (worldFileMatch && method === 'GET') {
+        try { return this.json(res, 200, await api.readWorldFile(token, worldFileMatch[1]!, url.searchParams.get('path') ?? '')); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const desktopMatch = p.match(/^\/api\/tasks\/([^/]+)\/desktop$/);
+      if (desktopMatch && method === 'GET') {
+        const taskId = desktopMatch[1]!;
+        const task = store.getTask(taskId);
+        const handle = worldHandleForView(task?.lastView, taskId, task ? store.effectiveProjectConfig(task.projectId) : undefined);
+        if (!handle) return this.json(res, 404, { error: 'no world for this task' });
+        try {
+          const world = await this.deps.worlds.open(handle);
+          if (!world.desktopSession) return this.json(res, 409, { error: 'this world has no desktop experience' });
+          return this.json(res, 200, await world.desktopSession());
+        } catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       const refreshFromGithub = p.match(/^\/api\/tasks\/([^/]+)\/refresh-from-github$/);
       if (refreshFromGithub && method === 'POST') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
@@ -3277,7 +3308,7 @@ function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = fal
   return config;
 }
 
-const EXECUTION_CONFIG_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
+const EXECUTION_CONFIG_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
 
 function pickExecutionConfig(config: ProjectConfig): Partial<ProjectConfig> {
   return Object.fromEntries(EXECUTION_CONFIG_KEYS.filter((key) => config[key] !== undefined).map((key) => [key, config[key]])) as Partial<ProjectConfig>;

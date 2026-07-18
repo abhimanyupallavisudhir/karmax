@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const sdkState = vi.hoisted(() => ({ messages: [] as any[], options: undefined as any }));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
-  createSdkMcpServer: (config: any) => ({ type: 'sdk', name: config.name, instance: {} }),
+  createSdkMcpServer: (config: any) => ({ type: 'sdk', name: config.name, instance: {}, tools: config.tools }),
   tool: (name: string, description: string, schema: unknown, handler: unknown) => ({ name, description, schema, handler }),
   query: (args: any) => {
     sdkState.options = args.options;
@@ -62,6 +65,34 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     const turn = await new ClaudeAdapter().runTurn(input, ctx);
     expect(turn.termination).toEqual({ kind: 'success', status: 'success', reason: 'end_turn' });
     expect(turn.output).toBe('done');
+  });
+
+  it('selects the remote Claude spawn rail and keeps all platform tools available', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-claude-'));
+    fs.writeFileSync(path.join(home, '.credentials.json'), '{"oauth":"subscription"}');
+    const files = new Map<string, Buffer>();
+    const world: any = {
+      handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'remote',
+        root: '/workspace', branch: 'task', base: 'main' },
+      async exec(_command: string, args: string[]) {
+        if (args[1]?.includes('-type f -print')) return { stdout: '', stderr: '', code: 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      },
+      async writeFileBuffer(name: string, value: Buffer) { files.set(name, Buffer.from(value)); },
+      async readFile(name: string) { const value = files.get(name); if (!value) throw new Error('missing'); return value.toString(); },
+      async readFileBuffer(name: string) { const value = files.get(name); if (!value) throw new Error('missing'); return value; },
+      async writeFile(name: string, value: string) { files.set(name, Buffer.from(value)); },
+      async listFiles() { return [...files.keys()]; }, async destroy() {},
+    };
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 'remote-session', stop_reason: 'end_turn' }];
+    try {
+      await new ClaudeAdapter().runTurn({ ...input, world, resolvedAuth: { configHome: home } }, ctx);
+      expect(sdkState.options.spawnClaudeCodeProcess).toBeTypeOf('function');
+      expect(sdkState.options.mcpServers.karmax).toBeUndefined();
+      expect(sdkState.options.mcpServers.karmax_control.tools.map((tool: any) => tool.name))
+        .toEqual(expect.arrayContaining(['message_agent', 'list_world_files', 'read_world_file']));
+      expect(files.get('.karmax-injection/agent/claude/.credentials.json')?.toString()).toContain('subscription');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
   it('rejects an SDK error result even after partial assistant output', async () => {

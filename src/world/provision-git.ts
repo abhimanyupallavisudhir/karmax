@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fs from 'node:fs';
 import type { WorldRepo, WorldSpec } from './types.js';
 
 /** Minimal command/file surface a cloud sandbox exposes during trusted
@@ -6,7 +7,7 @@ import type { WorldRepo, WorldSpec } from './types.js';
  * the timeout unit; they never catch errors or interpret exit codes. */
 export interface ProvisionTarget {
   run(command: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; code: number }>;
-  writeFile(remotePath: string, content: string): Promise<void>;
+  writeFile(remotePath: string, content: string | Buffer): Promise<void>;
 }
 
 export interface ProvisionRepoOptions {
@@ -16,7 +17,7 @@ export interface ProvisionRepoOptions {
   home: string;
   /** Provider-specific message for repository sources that are not SSH URLs. */
   sshUrlError: string;
-  /** Provider-specific warning when host-local copyGlobs cannot be honored. */
+  /** Provider-specific warning when no corresponding host checkout exists. */
   copyGlobsWarning: string;
 }
 
@@ -94,8 +95,36 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     await configureRepo(target, repoRoot, spec, branch, true, remoteRefExists, base);
     repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base, target: targetBranch, baseSha });
   }
-  if (spec.copyGlobs?.length) warnings.push(options.copyGlobsWarning);
+  if (spec.copyGlobs?.length) {
+    let copied = 0;
+    for (let index = 0; index < repos.length; index++) {
+      const source = spec.copySources?.[index];
+      if (!source) continue;
+      copied += await uploadCopyGlobs(target, source, repos[index]!.root, spec.copyGlobs);
+    }
+    if (!copied) warnings.push(options.copyGlobsWarning);
+  }
   return { root, repos, warnings };
+}
+
+async function uploadCopyGlobs(target: ProvisionTarget, sourceRoot: string, remoteRoot: string, globs: string[]): Promise<number> {
+  if (!fs.existsSync(sourceRoot)) return 0;
+  const entries = fs.readdirSync(sourceRoot, { withFileTypes: true });
+  let copied = 0;
+  for (const glob of globs) {
+    const pattern = globToRegExp(glob);
+    for (const entry of entries) {
+      if (!entry.isFile() || !pattern.test(entry.name)) continue;
+      await target.writeFile(path.posix.join(remoteRoot, entry.name), fs.readFileSync(path.join(sourceRoot, entry.name)));
+      copied++;
+    }
+  }
+  return copied;
+}
+
+function globToRegExp(glob: string): RegExp {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp(`^${escaped}$`);
 }
 
 /** Network clones fail transiently (DNS hiccup, provider egress warm-up); a

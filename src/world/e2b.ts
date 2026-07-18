@@ -47,13 +47,18 @@ export interface E2BSandboxLike {
   pause(): Promise<unknown>;
   kill(): Promise<unknown>;
   getInfo?(): Promise<{ state?: string }>;
+  stream?: {
+    start(options?: { requireAuth?: boolean }): Promise<void>;
+    getAuthKey(): string;
+    getUrl(options?: { authKey?: string; autoConnect?: boolean; resize?: 'off' | 'scale' | 'remote' }): string;
+  };
 }
 
 export interface E2BFactory {
-  create(options: { template?: string; apiKey?: string; timeoutMs: number; lifecycle: { onTimeout: 'pause'; autoResume: true };
+  create(options: { template?: string; desktop?: boolean; apiKey?: string; timeoutMs: number; lifecycle: { onTimeout: 'pause'; autoResume: true };
     metadata: Record<string, string>; allowInternetAccess?: boolean;
     network?: { allowOut: string[]; denyOut: string[]; allowPublicTraffic: false } }): Promise<E2BSandboxLike>;
-  connect(id: string, options: { timeoutMs: number; apiKey?: string }): Promise<E2BSandboxLike>;
+  connect(id: string, options: { timeoutMs: number; apiKey?: string; desktop?: boolean }): Promise<E2BSandboxLike>;
   /** Control-plane state lookup that must not resume a paused sandbox; absent
    * (or undefined result) means the provider cannot answer cheaply. */
   info?(id: string, options: { apiKey?: string }): Promise<{ state?: string } | undefined>;
@@ -74,6 +79,7 @@ export class E2BWorldProvider implements WorldProvider {
     private idleMs = envPositiveInt('KARMAX_E2B_IDLE_MS', DEFAULT_IDLE_MS),
     private template = process.env.KARMAX_E2B_TEMPLATE,
     private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection,
+    private desktopTemplate = process.env.KARMAX_E2B_DESKTOP_TEMPLATE ?? 'desktop',
   ) {
     // Hosted deployments must set KARMAX_WORLD_REF_KEY. E2B_API_KEY is a stable
     // compatibility seed for self-hosted installs; the development constant is
@@ -85,10 +91,13 @@ export class E2BWorldProvider implements WorldProvider {
 
   async create(spec: WorldSpec): Promise<World> {
     const connection = this.connection(spec.organizationId);
+    const flavor = spec.environment?.flavor ?? 'headless';
+    const selectedTemplate = flavor === 'desktop'
+      ? spec.environment?.template ?? spec.environment?.snapshot ?? connection?.config.desktopTemplate ?? this.desktopTemplate
+      : spec.environment?.template ?? spec.environment?.snapshot ?? spec.environment?.image ?? connection?.config.template ?? this.template;
     const sandbox = await this.factory.create({
-      ...(spec.environment?.snapshot ?? spec.environment?.image ?? connection?.config.template ?? this.template
-        ? { template: spec.environment?.snapshot ?? spec.environment?.image ?? connection?.config.template ?? this.template }
-        : {}),
+      ...(selectedTemplate ? { template: selectedTemplate } : {}),
+      ...(flavor === 'desktop' ? { desktop: true } : {}),
       ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}),
       timeoutMs: this.idleMs,
       lifecycle: { onTimeout: 'pause', autoResume: true },
@@ -122,7 +131,8 @@ export class E2BWorldProvider implements WorldProvider {
         repo: repos[0]?.repo,
         repos,
         sealedProviderRef: this.sealRef({ sandboxId: sandbox.sandboxId, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) }),
-        meta: { releaseOnCompletion: true },
+        meta: { releaseOnCompletion: true, environmentFlavor: flavor,
+          ...(selectedTemplate ? { environmentArtifact: selectedTemplate } : {}) },
         ...(warnings.length ? { warnings } : {}),
       };
       return new E2BWorld(handle, sandbox);
@@ -141,6 +151,7 @@ export class E2BWorldProvider implements WorldProvider {
     if (!sandbox || this.states.get(sandboxId) === 'parked') {
       const connection = this.connection(reference.organizationId);
       sandbox = await this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
+        ...(handle.meta?.environmentFlavor === 'desktop' ? { desktop: true } : {}),
         ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) });
       this.sandboxes.set(sandboxId, sandbox);
     }
@@ -154,6 +165,7 @@ export class E2BWorldProvider implements WorldProvider {
     if (this.states.get(sandboxId) === 'parked') return handle;
     const connection = this.connection(reference.organizationId);
     const sandbox = this.sandboxes.get(sandboxId) ?? await this.factory.connect(sandboxId, { timeoutMs: this.idleMs,
+      ...(handle.meta?.environmentFlavor === 'desktop' ? { desktop: true } : {}),
       ...(connection?.apiKey ? { apiKey: connection.apiKey } : {}) });
     await sandbox.pause();
     this.sandboxes.set(sandboxId, sandbox);
@@ -217,7 +229,7 @@ export class E2BWorldProvider implements WorldProvider {
   private connection(organizationId: string | undefined): ResolvedWorldProviderConnection | undefined {
     if (this.resolveConnection) return this.resolveConnection(organizationId, this.kind);
     return process.env.E2B_API_KEY ? { organizationId, provider: this.kind, apiKey: process.env.E2B_API_KEY,
-      config: { template: this.template } } : undefined;
+      config: { template: this.template, desktopTemplate: this.desktopTemplate } } : undefined;
   }
 }
 
@@ -320,6 +332,10 @@ class E2BWorld implements World {
     const sandbox = this.sandbox;
     const outputs = new Set<(chunk: string) => void>();
     const exits = new Set<(code: number | null) => void>();
+    const pending: string[] = [];
+    let attached = false;
+    let exited = false;
+    let exitCode: number | null = null;
     const terminal = await this.sandbox.pty.create({
       cols: spec.cols ?? 80,
       rows: spec.rows ?? 24,
@@ -328,19 +344,33 @@ class E2BWorld implements World {
       timeoutMs: 0,
       onData: (data: unknown) => {
         const chunk = sdkText(data);
+        if (!attached) pending.push(chunk);
         for (const listener of outputs) listener(chunk);
       },
     });
     const remotePid = Number(terminal.pid);
+    if (spec.command) await sandbox.pty.sendInput(remotePid, new TextEncoder().encode(`${spec.command}\n`));
     void Promise.resolve(terminal.wait?.()).then((result) => {
       const code = Number(result?.exitCode ?? result?.code ?? 0);
+      exited = true;
+      exitCode = code;
       for (const listener of exits) listener(code);
     }).catch(() => {
+      exited = true;
+      exitCode = -1;
       for (const listener of exits) listener(-1);
     });
     return {
-      onData(listener) { outputs.add(listener); return () => outputs.delete(listener); },
-      onExit(listener) { exits.add(listener); return () => exits.delete(listener); },
+      onData(listener) {
+        outputs.add(listener);
+        if (!attached) { attached = true; for (const chunk of pending.splice(0)) listener(chunk); }
+        return () => outputs.delete(listener);
+      },
+      onExit(listener) {
+        if (exited) queueMicrotask(() => listener(exitCode));
+        else exits.add(listener);
+        return () => exits.delete(listener);
+      },
       async write(data) { await sandbox.pty.sendInput(remotePid, new TextEncoder().encode(data)); },
       async resize(cols, rows) { await sandbox.pty.resize(remotePid, { cols, rows }); },
       async close() {
@@ -379,6 +409,14 @@ class E2BWorld implements World {
     const safePath = requestPath.startsWith('/') ? requestPath : `/${requestPath}`;
     return { url: `wss://${host}${safePath}`,
       ...(this.sandbox.trafficAccessToken ? { headers: { 'x-access-token': this.sandbox.trafficAccessToken } } : {}) };
+  }
+
+  async desktopSession() {
+    if (this.handle.meta?.environmentFlavor !== 'desktop') throw new Error('this is a headless world');
+    if (!this.sandbox.stream) throw new Error('the selected E2B template does not expose E2B Desktop streaming');
+    await this.sandbox.stream.start({ requireAuth: true });
+    const authKey = this.sandbox.stream.getAuthKey();
+    return { provider: 'e2b', url: this.sandbox.stream.getUrl({ authKey, autoConnect: true, resize: 'scale' }) };
   }
 
   private filePath(relPath: string): string {
@@ -435,13 +473,22 @@ function defaultE2BFactory(): E2BFactory {
   };
   return {
     async create(options) {
+      const { template, desktop, ...opts } = options;
+      if (desktop) {
+        const { Sandbox } = await import('@e2b/desktop');
+        return Sandbox.create(template ?? 'desktop', opts);
+      }
       const { Sandbox } = await sdk();
-      const { template, ...opts } = options;
       return template ? Sandbox.create(template, opts) : Sandbox.create(opts);
     },
     async connect(id, options) {
+      const { desktop, ...opts } = options;
+      if (desktop) {
+        const { Sandbox } = await import('@e2b/desktop');
+        return Sandbox.connect(id, opts);
+      }
       const { Sandbox } = await sdk();
-      return Sandbox.connect(id, options);
+      return Sandbox.connect(id, opts);
     },
     async info(id, options) {
       const { Sandbox } = await sdk();
@@ -476,9 +523,21 @@ function envPositiveInt(name: string, fallback: number): number {
 
 function e2bNetwork(spec: WorldSpec): Pick<Parameters<E2BFactory['create']>[0], 'allowInternetAccess' | 'network'> {
   if (spec.network?.unrestricted) return { allowInternetAccess: true };
-  const allowOut = [...new Set(['github.com', 'api.github.com', 'ssh.github.com',
+  const allowOut = [...new Set(['github.com', 'api.github.com', 'ssh.github.com', 'registry.npmjs.org',
+    'cdn.playwright.dev', 'playwright.download.prss.microsoft.com',
+    'deb.debian.org', 'security.debian.org', 'archive.ubuntu.com', 'security.ubuntu.com', 'dl.google.com',
+    'api.anthropic.com', 'claude.ai', 'api.openai.com', 'chatgpt.com', 'auth.openai.com',
+    ...publicGatewayDomains(),
     ...(spec.network?.allowDomains ?? []), ...(spec.network?.allowCidrs ?? [])])];
   // Supplying allowOut is itself deny-by-default. `allowInternetAccess: false`
   // is equivalent to denyOut=all and would also block these explicit entries.
   return { network: { allowOut, denyOut: [], allowPublicTraffic: false } };
+}
+
+function publicGatewayDomains(): string[] {
+  try {
+    const value = process.env.KARMAX_REMOTE_GATEWAY_URL ?? process.env.KARMAX_PUBLIC_URL;
+    return value ? [new URL(value).hostname] : [];
+  }
+  catch { return []; }
 }

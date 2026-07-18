@@ -34,6 +34,8 @@ import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import type { KarmaxBus } from '../contrib/bus.js';
+import type { WorldRegistry } from '../world/registry.js';
+import type { WorldHandle } from '../world/types.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -124,6 +126,8 @@ export interface KarmaxApiDeps {
   /** Organization-scoped cloud provider credentials. Kept optional for the
    * small unit-test API harnesses; production always supplies it. */
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  /** World access for permission-checked cross-task collaboration tools. */
+  worlds?: WorldRegistry;
   /** Wake live gateway subscribers when platform-side actions append events. The
    * durable event table remains the source of truth when this is absent. */
   bus?: KarmaxBus;
@@ -142,6 +146,34 @@ export class KarmaxApi {
   /** Attach the trigger dispatcher after construction (resolves the ctor cycle). */
   setTriggerArmer(armer: TriggerArmer) {
     this.armer = armer;
+  }
+
+  private async taskWorld(token: string, taskId: string) {
+    const task = this.deps.store.getTask(taskId);
+    if (!task) throw new Error('task not found');
+    this.require(token, 'task:world:read', {
+      organizationId: this.deps.store.getProject(task.projectId)?.organizationId,
+      projectId: task.projectId,
+      taskId,
+    });
+    if (!this.deps.worlds) throw new Error('world access is unavailable');
+    const handle = (this.deps.store.currentWorld(taskId) ?? task.lastView?.world) as WorldHandle | undefined;
+    if (!handle) throw new Error('task has no world');
+    return this.deps.worlds.open(handle);
+  }
+
+  async listWorldFiles(token: string, taskId: string): Promise<{ files: string[]; truncated: boolean }> {
+    const files = await (await this.taskWorld(token, taskId)).listFiles();
+    const limit = 10_000;
+    return { files: files.slice(0, limit), truncated: files.length > limit };
+  }
+
+  async readWorldFile(token: string, taskId: string, filePath: string): Promise<{ path: string; content: string; truncated: boolean }> {
+    if (!filePath.trim()) throw new Error('path is required');
+    const content = await (await this.taskWorld(token, taskId)).readFile(filePath);
+    if (content.includes('\0')) throw new Error('binary files cannot be read through this text tool');
+    const limit = 1_000_000;
+    return { path: filePath, content: content.slice(0, limit), truncated: content.length > limit };
   }
 
   listWorldProviderConnections(token: string, organizationId: string) {

@@ -177,6 +177,16 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, message: { type: 'string' } }, required: ['task_id', 'message'] },
   },
   {
+    name: 'list_world_files',
+    description: "List files in another task's current world. Use this with read_world_file to inspect a collaborator's work without sharing provider credentials.",
+    parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'read_world_file',
+    description: "Read a UTF-8 text file from another task's current world. Paths are relative to that world's workspace root.",
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, path: { type: 'string' } }, required: ['task_id', 'path'] },
+  },
+  {
     name: 'list_events',
     description: 'Read durable karmax events for a task after an optional sequence number.',
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, since: { type: 'number' } }, required: ['task_id'] },
@@ -372,6 +382,16 @@ export function platformToolHandlers(
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       await platformRequest('POST', `/api/tasks/${taskId}/signal`, { signal: 'followUp', role: args?.role ?? 'do', text: args?.message });
       return 'message delivered';
+    },
+    async list_world_files(args) {
+      const taskId = encodeURIComponent(String(args?.task_id ?? ''));
+      return truncate(JSON.stringify(await platformRequest('GET', `/api/tasks/${taskId}/world/files`)));
+    },
+    async read_world_file(args) {
+      const taskId = encodeURIComponent(String(args?.task_id ?? ''));
+      const filePath = encodeURIComponent(String(args?.path ?? ''));
+      const result = await platformRequest('GET', `/api/tasks/${taskId}/world/file?path=${filePath}`) as { content?: unknown };
+      return truncate(String(result?.content ?? ''));
     },
     async list_events(args) {
       return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/events?since=${Number(args?.since ?? 0)}`));
