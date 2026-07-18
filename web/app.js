@@ -2547,49 +2547,75 @@ async function openTaskForm(workflow, draft, seedText) {
     try { formAttemptGroup = await api(`/api/tasks/${draft.id}/attempts`); } catch {}
   }
   const root = $('#overlay-root');
+  const titleText = draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task';
+  const heroText = draft ? (editInPlace ? 'Edit this task' : 'Edit this draft') : 'Create a new task';
+  const submitVerb = draft ? (editInPlace ? 'save' : 'queue') : 'add';
   root.innerHTML = `
-    <div class="palette-scrim" id="tf-scrim">
-      <div class="palette" style="width:min(640px,94vw);max-height:84vh;overflow:auto">
-        <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px">
-          <b>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</b>
+    <div class="taskform-page" id="tf-scrim">
+      <header class="taskform-topbar">
+        <button class="taskform-back" id="tf-close" title="Back to tasks (Esc)"><span aria-hidden="true">←</span> Tasks</button>
+        <span class="taskform-topbar-sep"></span>
+        <span class="taskform-topbar-crumb">${titleText}</span>
+        <span style="flex:1"></span>
+        <label class="taskform-wf">Workflow
           <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
-          <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
+        </label>
+      </header>
+      <div class="taskform-scroll">
+        <div class="taskform-grid">
+          <main class="taskform-main">
+            <div class="taskform-hero">
+              <h1>${heroText}</h1>
+              <p>Describe what needs doing, then fine-tune how the agent runs it. Everything is saved as a draft automatically.</p>
+            </div>
+            <div id="tf-body" class="parameter-fields">${renderFields(fields, values, inherited, true)}
+              ${promptField ? '' : `<div class="form-row" data-row="__images">
+                <div class="label-row"><label>Images</label></div>
+                <div class="img-chips" id="tf-chips" style="display:none"></div>
+                <span class="field-hint">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
+              </div>`}
+              <div class="form-row" data-row="__notes">
+                <div class="label-row"><label>Notes</label></div>
+                <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
+                <span class="field-hint">Only you see this — never sent to the agent.</span>
+              </div>
+            </div>
+          </main>
+          <aside class="taskform-side">
+            <section class="taskform-card" data-row="__org">
+              <h3 class="taskform-card-h">Priority &amp; tags</h3>
+              ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
+              <span class="field-hint">For search / organization only — never sent to the agent. Use / for nested tags.</span>
+            </section>
+            ${authorizationOptions ? `<section class="taskform-card" data-row="__authorization">
+              <h3 class="taskform-card-h">Agent authorization</h3>
+              <select id="tf-authorization" style="width:100%">${authorizationOptions}</select>
+              <span class="field-hint">Applies to every agent and retry in this workflow, capped by your own permissions.</span>
+            </section>` : ''}
+            <section class="taskform-card">
+              <h3 class="taskform-card-h">Run options</h3>
+              ${repeatableToggleHtml(values)}
+              ${!draft ? `<div class="form-row" style="margin:12px 0 0"><div class="label-row"><label>Attempts</label></div><input id="tf-attempt-count" type="number" min="1" max="8" value="1"><span class="field-hint">Attempts created here are queued together. Attempts added later start as editable drafts.</span></div>` : ''}
+              ${triggersSection(values, draft?.id)}
+            </section>
+            <section class="taskform-card">
+              <details class="advanced">
+                <summary>Credentials — precedence &amp; enable/disable</summary>
+                <p class="task-sub" style="color:var(--ink-3);margin-top:6px">Overrides the organization/project order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
+                <div id="cred-editor-newtask">Loading…</div>
+              </details>
+            </section>
+          </aside>
         </div>
-        <div style="padding:14px 16px" id="tf-body" class="parameter-fields">${renderFields(fields, values, inherited, true)}
-          ${promptField ? '' : `<div class="form-row" data-row="__images">
-            <div class="label-row"><label>Images</label></div>
-            <div class="img-chips" id="tf-chips" style="display:none"></div>
-            <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
-          </div>`}
-          <div class="form-row" data-row="__notes">
-            <div class="label-row"><label>Notes</label></div>
-            <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
-            <span style="color:var(--ink-3);font-size:12px">Only you see this — never sent to the agent.</span>
-          </div>
-          <div class="form-row" data-row="__org">
-            <div class="label-row"><label>Priority &amp; tags</label></div>
-            ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
-            <span style="color:var(--ink-3);font-size:12px">For search / organization only — never sent to the agent. Use / for nested tags.</span>
-          </div>
-          ${authorizationOptions ? `<div class="form-row" data-row="__authorization">
-            <div class="label-row"><label>Agent authorization</label></div>
-            <select id="tf-authorization">${authorizationOptions}</select>
-            <span style="color:var(--ink-3);font-size:12px">Applies to every agent and retry in this workflow, capped by your own permissions.</span>
-          </div>` : ''}
-          <details class="advanced" style="margin-top:10px">
-            <summary>Credentials — precedence &amp; enable/disable for this task</summary>
-            <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the organization/project order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
-            <div id="cred-editor-newtask">Loading…</div>
-          </details>
-          ${triggersSection(values, draft?.id)}
-          ${repeatableToggleHtml(values)}
-          ${!draft ? `<div class="form-row"><div class="label-row"><label>Attempts</label></div><input id="tf-attempt-count" type="number" min="1" max="8" value="1"><span style="color:var(--ink-3);font-size:12px">Attempts created here are queued together. Attempts added later start as editable drafts.</span></div>` : ''}
-        </div>
-        <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
+      </div>
+      <footer class="taskform-footer">
+        <div class="taskform-footer-inner">
+          <span class="taskform-footer-hint">⌘/Ctrl-↵ to ${submitVerb} · Esc to close</span>
+          <span style="flex:1"></span>
           <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
           <button class="btn primary" id="tf-queue">${draft ? (editInPlace ? 'Save' : 'Queue') : 'Add task'}</button>
         </div>
-      </div>
+      </footer>
     </div>`;
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
   let closeForm = () => (root.innerHTML = '');
@@ -2607,7 +2633,8 @@ async function openTaskForm(workflow, draft, seedText) {
     if (localCred && draftId) { const id = draftId; draftId = null; try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch {} }
     openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
-  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') closeForm(); });
+  // Full-page form: closing is explicit (the "Tasks" back button or Escape) — a
+  // stray click on the page background must not discard an in-progress task.
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
