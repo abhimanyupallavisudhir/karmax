@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { buildSdkTools, jsonSchemaToZodShape } from '../src/agent/claude.js';
 import {
   MAX_REVIEW_TEXT_LENGTH,
-  PLATFORM_TOOL_SCHEMAS,
+  SDK_CONTROL_TOOL_SCHEMAS,
   TOOL_SCHEMAS,
   SDK_NATIVE_TOOLS,
   platformToolHandlers,
@@ -14,19 +14,21 @@ import {
  * `raise_to_parent` / `wait_for_subtasks`) from Claude-Code agents: the Agent-SDK path
  * used a hand-maintained tool list that fell out of sync with TOOL_SCHEMAS, so a parent
  * literally had no tool to confirm a child that raised to it. The SDK tool defs are now
- * DERIVED from PLATFORM_TOOL_SCHEMAS — this test asserts they cover the full platform set.
+ * derived from the shared schemas. Gateway-backed tools intentionally live only on
+ * the stdio server, avoiding duplicate `karmax` registration.
  */
 describe('Claude Agent-SDK tool exposure (no drift)', () => {
   // Fake SDK `tool()` + handlers so we can build the defs without the real SDK/login.
   const fakeTool = (name: string, description: string, shape: Record<string, any>, run: any) => ({ name, description, shape, run });
   const allHandlers = Object.fromEntries(TOOL_SCHEMAS.map((t) => [t.name, async () => 'ok']));
 
-  it('exposes EVERY platform tool (incl. the ones that were missing)', () => {
+  it('exposes every turn-local control and no gateway-backed platform tools', () => {
     const defs = buildSdkTools(fakeTool as any, z, allHandlers as any);
     const names = defs.map((d: any) => d.name).sort();
-    expect(names).toEqual(PLATFORM_TOOL_SCHEMAS.map((t) => t.name).sort());
+    expect(names).toEqual(SDK_CONTROL_TOOL_SCHEMAS.map((t) => t.name).sort());
     // The specific tools whose absence caused the bug:
     expect(names).toEqual(expect.arrayContaining(['respond_to_sub_task', 'raise_to_parent', 'wait_for_subtasks']));
+    expect(names).not.toEqual(expect.arrayContaining(['find_task', 'platform_request', 'save_skill']));
     // Read/Write/Bash are provided natively by the SDK and must NOT be re-registered:
     for (const native of SDK_NATIVE_TOOLS) expect(names).not.toContain(native);
   });

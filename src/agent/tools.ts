@@ -244,6 +244,24 @@ export const SDK_NATIVE_TOOLS = new Set(['bash', 'read_file', 'write_file']);
  *  never drift — the drift that hid `respond_to_sub_task` from Claude-Code agents. */
 export const PLATFORM_TOOL_SCHEMAS: ToolSchema[] = TOOL_SCHEMAS.filter((t) => !SDK_NATIVE_TOOLS.has(t.name));
 
+/** Turn-local controls that must mutate the current activity result. Durable
+ * platform operations are served by the gateway-backed stdio `karmax` MCP. */
+export const SDK_CONTROL_TOOL_NAMES = new Set([
+  'create_review_info',
+  'create_sub_task',
+  'respond_to_sub_task',
+  'raise_to_parent',
+  'wait_for_subtasks',
+  'request_spend',
+  'signal_completion',
+  'resolve_decision',
+  'confirm_decision',
+]);
+
+export const SDK_CONTROL_TOOL_SCHEMAS: ToolSchema[] = PLATFORM_TOOL_SCHEMAS.filter((tool) =>
+  SDK_CONTROL_TOOL_NAMES.has(tool.name),
+);
+
 /** Returns name → executor for the platform tools, bound to a world + context. */
 export function platformToolHandlers(
   world: World,

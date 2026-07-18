@@ -1,13 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const sdkState = vi.hoisted(() => ({ messages: [] as any[] }));
+const sdkState = vi.hoisted(() => ({ messages: [] as any[], options: undefined as any }));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
-  createSdkMcpServer: () => ({}),
+  createSdkMcpServer: (config: any) => ({ type: 'sdk', name: config.name, instance: {} }),
   tool: (name: string, description: string, schema: unknown, handler: unknown) => ({ name, description, schema, handler }),
-  query: () => (async function* () {
-    for (const message of sdkState.messages) yield message;
-  })(),
+  query: (args: any) => {
+    sdkState.options = args.options;
+    return (async function* () {
+      for (const message of sdkState.messages) yield message;
+    })();
+  },
 }));
 
 import { ClaudeAdapter } from '../src/agent/claude.js';
@@ -37,7 +40,19 @@ const ctx: any = {
 };
 
 describe('Claude Agent SDK terminal outcome contract', () => {
-  beforeEach(() => { sdkState.messages = []; });
+  beforeEach(() => { sdkState.messages = []; sdkState.options = undefined; });
+
+  it('uses one stdio platform server plus a disjoint local-control server', async () => {
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
+    await new ClaudeAdapter().runTurn({ ...input, extraEnv: { KARMAX_TOKEN: 'scoped' } }, ctx);
+    expect(sdkState.options.strictMcpConfig).toBe(true);
+    expect(sdkState.options.mcpServers.karmax).toMatchObject({
+      command: process.execPath,
+      env: expect.objectContaining({ KARMAX_TOKEN: 'scoped' }),
+      alwaysLoad: true,
+    });
+    expect(sdkState.options.mcpServers.karmax_control).toMatchObject({ type: 'sdk', name: 'karmax_control' });
+  });
 
   it('returns only after an explicit SDK success result', async () => {
     sdkState.messages = [
