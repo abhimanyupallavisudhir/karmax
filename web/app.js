@@ -168,10 +168,18 @@ function globalRoute(tab, org = currentOrg()) {
 // Navigate: update the URL then reconcile app state to it. `replace` swaps the
 // current history entry instead of pushing a new one.
 function go(path, opts = {}) {
+  closeTaskFormPage();
   if (path !== location.pathname) {
     history[opts.replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', path);
   }
   return applyRoute();
+}
+
+// The task form page floats over #main with the shell (topbar/rail) still live
+// behind it, so the user can navigate mid-edit. Any navigation closes it like
+// leaving any other page — via its close button, which flushes the draft.
+function closeTaskFormPage() {
+  if ($('#tf-page')) $('#tf-close')?.click();
 }
 
 // Resolve a per-project task URL key (a numeric #num, or a raw task id) → task id.
@@ -1150,7 +1158,7 @@ async function boot() {
   connectWs();
   renderShell();
   bindKeys();
-  window.addEventListener('popstate', () => applyRoute());
+  window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
   await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
 
@@ -2517,6 +2525,11 @@ function wireDepPicker(values, selfId) {
 let activeFormToken = null;
 async function openTaskForm(workflow, draft, seedText) {
   const formToken = (activeFormToken = {});
+  // The shell (topbar/rail) stays live behind the page, so the user can navigate
+  // mid-edit. Pin the project NOW: every later write (auto-save flush, submit)
+  // must land in the project the form was opened in, not wherever S.projectId
+  // points by the time the async chain runs.
+  const projectId = S.projectId;
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   // The prompt/consuming field (a textarea) hosts pasted-image chips inside its
@@ -2533,9 +2546,9 @@ async function openTaskForm(workflow, draft, seedText) {
     if (cf && !values[cf.name]) values[cf.name] = seedText;
   }
   let inherited = {};
-  try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
+  try { inherited = (await api(`/api/defaults/${projectId}/${wf}`)).task.inherited; } catch {}
   let authorization = { profiles: [], defaultProfile: 'developer' };
-  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(S.projectId)}`); } catch {}
+  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(projectId)}`); } catch {}
   const selectedAuthorization = draft?.params?._authorization?.profileId || authorization.defaultProfile;
   const authorizationOptions = (authorization.profiles || []).map((p) =>
     `<option value="${esc(p.id)}" ${p.id === selectedAuthorization ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
@@ -2551,7 +2564,7 @@ async function openTaskForm(workflow, draft, seedText) {
   // prompt editor + workflow parameters fill the main column; organization
   // metadata (priority/tags, authorization, attempts, notes) lives in a sidebar.
   // Everything stays inside #tf-body so collect/auto-save wiring sees one form.
-  const proj = S.projects.find((p) => p.id === S.projectId);
+  const proj = S.projects.find((p) => p.id === projectId);
   const restFields = promptField ? fields.filter((f) => f.name !== promptField.name) : fields;
   root.innerHTML = `
     <div class="task-form-page" id="tf-page" tabindex="-1">
@@ -2574,11 +2587,6 @@ async function openTaskForm(workflow, draft, seedText) {
               <div class="img-chips" id="tf-chips" style="display:none"></div>
               <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
             </div>`}
-            <details class="advanced" style="margin-top:10px">
-              <summary>Credentials — precedence &amp; enable/disable for this task</summary>
-              <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the organization/project order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
-              <div id="cred-editor-newtask">Loading…</div>
-            </details>
             ${triggersSection(values, draft?.id)}
             ${repeatableToggleHtml(values)}
           </div>
@@ -2586,22 +2594,22 @@ async function openTaskForm(workflow, draft, seedText) {
             <div class="form-row" data-row="__org">
               <div class="label-row"><label>Priority &amp; tags</label></div>
               ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
-              <span style="color:var(--ink-3);font-size:12px">For search / organization only — never sent to the agent. Use / for nested tags.</span>
             </div>
             ${authorizationOptions ? `<div class="form-row" data-row="__authorization">
-              <div class="label-row"><label>Agent authorization</label></div>
+              <div class="label-row"><label title="Applies to every agent and retry in this workflow, capped by your own permissions.">Agent authorization</label></div>
               <select id="tf-authorization">${authorizationOptions}</select>
-              <span style="color:var(--ink-3);font-size:12px">Applies to every agent and retry in this workflow, capped by your own permissions.</span>
             </div>` : ''}
-            ${!draft ? `<div class="form-row" data-row="__attempts">
-              <div class="label-row"><label>Attempts</label></div>
+            ${!draft ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
+              <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
-              <span style="color:var(--ink-3);font-size:12px">Attempts created here are queued together. Attempts added later start as editable drafts.</span>
             </div>` : ''}
+            <div class="form-row" data-row="__creds">
+              <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Credentials</label></div>
+              <div id="cred-editor-newtask">Loading…</div>
+            </div>
             <div class="form-row" data-row="__notes">
               <div class="label-row"><label>Notes</label></div>
               <textarea id="tf-notes" rows="4" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
-              <span style="color:var(--ink-3);font-size:12px">Only you see this — never sent to the agent.</span>
             </div>
           </aside>
         </div>
@@ -2670,8 +2678,8 @@ async function openTaskForm(workflow, draft, seedText) {
   // editor runs in `local` mode: changes are held here and applied on create (below).
   let taskCredPolicy = {};
   const localCred = !draft;
-  if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
-  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+  if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
+  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
 
@@ -2734,7 +2742,7 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
@@ -2775,7 +2783,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -2826,13 +2834,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }

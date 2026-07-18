@@ -380,10 +380,13 @@ a { color: var(--accent); text-decoration: none; }
 /* The expanded form is a PAGE, not a dialog — GitHub-issue-creation shape: a
    head strip (back · title · workflow), a scrollable two-column body (the big
    prompt editor + workflow parameters left, organization metadata right) and a
-   foot strip with the actions. Shares the task page's column-and-strip
-   language; sits under palettes/pickers (#modal-root, z 70) and toasts (z 60). */
+   foot strip with the actions. It covers only the MAIN cell — the topbar (52px)
+   and projects rail (232px, hidden ≤720px) stay visible and live; navigating
+   closes the page (applyRoute clicks #tf-close, which flushes the draft).
+   Shares the task page's column-and-strip language; sits under the topbar
+   popover (z 50), toasts (z 60) and palettes/pickers (#modal-root, z 70). */
 .task-form-page {
-  position: fixed; inset: 0; z-index: 40;
+  position: fixed; top: 52px; left: 232px; right: 0; bottom: 0; z-index: 20;
   display: flex; flex-direction: column;
   background: var(--paper); outline: none;
   animation: pane-in .16s ease;
@@ -408,10 +411,16 @@ a { color: var(--accent); text-decoration: none; }
 .tf-main > .section-h { margin: 26px 0 14px; padding-top: 20px; border-top: 1px solid var(--line); }
 /* Sidebar: hairline-separated metadata sections, GitHub-issue style. */
 .tf-side { min-width: 0; display: flex; flex-direction: column; }
-.tf-side .form-row { margin-bottom: 0; padding: 16px 0; }
+.tf-side .form-row { margin-bottom: 0; padding: 14px 0; }
 .tf-side .form-row:first-child { padding-top: 2px; }
 .tf-side .form-row + .form-row { border-top: 1px solid var(--line); }
-.tf-side .org-editor { flex-direction: column; align-items: flex-start; gap: 10px; }
+.tf-side .org-editor { flex-direction: column; align-items: flex-start; gap: 10px; margin-top: 4px; }
+/* Compact one-liner rows (Attempts: __) — the label sits inline with a short input. */
+.tf-side .form-row.tf-inline { flex-direction: row; align-items: center; gap: 10px; }
+.tf-side .tf-inline label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.tf-side .tf-inline input { width: 68px; }
+/* The credential chips wrap fine at sidebar width; just keep them off the hairline. */
+.tf-side #cred-editor-newtask { margin-top: 2px; }
 .tf-foot { border-top: 1px solid var(--line); background: var(--surface); padding: 12px 0; }
 .tf-foot-inner { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
 .tf-foot .tf-hint { margin-right: auto; color: var(--ink-3); font-size: 12px; }
@@ -422,6 +431,7 @@ a { color: var(--accent); text-decoration: none; }
   .tf-side { margin-top: 10px; border-top: 1px solid var(--line); }
   .tf-foot .tf-hint { display: none; }
 }
+@media (max-width: 720px) { .task-form-page { left: 0; } } /* the rail is hidden */
 
 /* Check-in tab: a fixed sidebar (agent conversations + the ephemeral terminal)
    beside a chat-style pane — the thread scrolls, the compose box stays put. */
@@ -828,9 +838,12 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
   background: transparent; color: var(--ink-2); cursor: pointer; font-size: 12px; padding: 0;
 }
 .dow-chip.on { background: var(--accent); color: #fff; border-color: transparent; }
-.cron-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+/* Cron field values are a few characters — compact cells, and minmax(0,1fr) +
+   width:100% so the inputs' intrinsic size can't overflow a narrow container. */
+.cron-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; max-width: 440px; }
 .cron-cell { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--ink-3); }
 .cron-cell input {
+  width: 100%; min-width: 0;
   border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px 6px;
   background: var(--surface); color: var(--ink); font-family: var(--font-mono); font-size: 13px; text-align: center;
 }
