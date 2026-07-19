@@ -3,7 +3,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
-import { fileURLToPath } from 'node:url';
 import type { Provider } from '../domain/types.js';
 import type { World, WorldPty } from '../world/types.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION } from '../autonomy/config-homes.js';
@@ -15,7 +14,6 @@ const CLAUDE_PACKAGE = process.env.KARMAX_REMOTE_CLAUDE_PACKAGE ?? '@anthropic-a
 const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? '@openai/codex@0.144.5';
 const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? '22.16.0';
 const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? '10.9.2';
-const REMOTE_ZOD_VERSION = process.env.KARMAX_REMOTE_ZOD_VERSION ?? '4.4.3';
 const READY = '\u001eKARMAX_AGENT_READY\u001e';
 
 /** A V2 provider world is the execution boundary: native agent subprocesses must
@@ -56,7 +54,7 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
   const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
   const browser = configuredBrowser(localHome, provider);
   const browserMcp = browser ? await ensureRemoteBrowser(world, browser, runtimeBin) : undefined;
-  if (provider === 'codex') await seedRemotePlatformMcp(world, localHome, home, browserMcp);
+  if (provider === 'codex') await seedRemoteCodexConfig(world, localHome, home, browserMcp);
   const permissions = await world.exec('bash', ['-lc',
     `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type d -exec chmod 700 {} + && find ${quote(absolute)} -type f -exec chmod 600 {} +; fi`]);
   if (permissions.code !== 0) throw new Error(`could not protect remote subscription files: ${permissions.stderr || permissions.stdout}`);
@@ -345,36 +343,11 @@ export async function materializeRemoteSession(source: World, destination: World
 
 function claudeCwdSlug(worldPath: string): string { return worldPath.replace(/[^a-zA-Z0-9]/g, '-'); }
 
-let platformBundle: Promise<Buffer> | undefined;
-
-/** Codex discovers MCP from config.toml rather than through an SDK callback. Put
- * the exact same gateway-backed server in the sandbox and replace only karmax's
- * host-specific table, preserving every user/browser MCP entry. */
-async function seedRemotePlatformMcp(world: World, localHome: string, home: RemoteAgentHome,
+/** Browser MCPs execute in the sandbox, while Karmax platform tools cross the
+ * existing app-server stdio channel and execute on the trusted host. Remove the
+ * old host-specific Karmax MCP table and preserve every other user entry. */
+async function seedRemoteCodexConfig(world: World, localHome: string, home: RemoteAgentHome,
   browserMcp?: RemoteAgentHome['browserMcp']): Promise<void> {
-  const gateway = process.env.KARMAX_REMOTE_GATEWAY_URL ?? process.env.KARMAX_PUBLIC_URL;
-  if (!gateway) throw new Error('remote Codex requires KARMAX_REMOTE_GATEWAY_URL or KARMAX_PUBLIC_URL so its platform MCP can reach Karmax');
-  platformBundle ??= bundlePlatformMcp();
-  const bundle = await platformBundle;
-  // Zod v4's initialization graph cannot be flattened safely into the single
-  // esbuild artifact used here (`ZodCustom` initializes after MCP's top-level
-  // schemas and the bridge crashes with "Class2 is not a constructor"). Keep
-  // that one dependency external and install it beside a shared CJS bridge so
-  // ordinary Node resolution is deterministic for every credential home.
-  const toolRelative = `${REMOTE_ROOT}/tools/platform-mcp`;
-  const toolAbsolute = path.posix.join(world.handle.root, toolRelative);
-  const bundleRelative = `${toolRelative}/karmax-mcp.cjs`;
-  const bundleAbsolute = path.posix.join(world.handle.root, bundleRelative);
-  if (!world.writeFileBuffer) throw new Error('remote world cannot receive the platform MCP bundle');
-  const pathEnv = home.runtimeBin ? `${home.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
-  const runtime = await world.exec('bash', ['-lc', [
-    ...(pathEnv ? [`export PATH=${quote(pathEnv)}\${PATH:+:$PATH}`] : []),
-    `mkdir -p ${quote(toolAbsolute)}`,
-    `test -f ${quote(path.posix.join(toolAbsolute, 'node_modules/zod/package.json'))} || npm install --prefix ${quote(toolAbsolute)} --no-audit --no-fund --omit=dev zod@${quote(REMOTE_ZOD_VERSION)}`,
-  ].join(' && ')], { timeoutMs: 5 * 60_000 });
-  if (runtime.code !== 0) throw new Error(`remote Karmax MCP runtime installation failed: ${runtime.stderr || runtime.stdout}`);
-  await world.writeFileBuffer(bundleRelative, bundle);
-
   let config = '';
   // Preserve settings the remote Codex process changed itself; use the host
   // config only for the first seed into a new sandbox.
@@ -388,7 +361,6 @@ async function seedRemotePlatformMcp(world: World, localHome: string, home: Remo
       config += `\n[mcp_servers.${name}.env]\n${Object.entries(server.env).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join('\n')}\n`;
     }
   }
-  config += `\n\n[mcp_servers.karmax]\ncommand = ${JSON.stringify(home.runtimeBin ? path.posix.join(home.runtimeBin, 'node') : 'node')}\nargs = [${JSON.stringify(bundleAbsolute)}]\nenv_vars = ["KARMAX_TOKEN"]\n\n[mcp_servers.karmax.env]\nKARMAX_GATEWAY_URL = ${JSON.stringify(gateway.replace(/\/$/, ''))}\n`;
   await world.writeFile(`${home.relative}/config.toml`, config);
 }
 
@@ -516,23 +488,6 @@ async function ensureRemoteNode(world: World): Promise<string | undefined> {
   ].join(' && ')], { timeoutMs: 5 * 60_000 });
   if (install.code !== 0) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${install.stderr || install.stdout}`);
   return bin;
-}
-
-async function bundlePlatformMcp(): Promise<Buffer> {
-  const { build } = await import('esbuild');
-  const result = await build({
-    entryPoints: [fileURLToPath(new URL('../mcp/stdio.ts', import.meta.url))],
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    target: 'node22',
-    external: ['zod', 'zod/*'],
-    write: false,
-    logLevel: 'silent',
-  });
-  const output = result.outputFiles?.[0]?.contents;
-  if (!output) throw new Error('could not bundle the remote karmax MCP bridge');
-  return Buffer.from(output);
 }
 
 function removeTomlTable(source: string, owned: string): string {

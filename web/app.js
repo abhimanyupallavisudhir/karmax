@@ -3812,7 +3812,7 @@ function selectCheckinPane(v, key, openShell = false) {
   if (changed) renderTaskPage();
   // Selecting the sidebar's "Open terminal" action is deliberately enough to
   // start the PTY; no second click inside the terminal pane is required.
-  if (openShell && key === 'terminal' && v.worldPath && !termIsOpenFor(v.taskId)) {
+  if (openShell && key === 'terminal' && (v.worldAvailable || v.worldPath) && !termIsOpenFor(v.taskId)) {
     document.getElementById('ck-term-hint')?.remove();
     openTerminal(v.taskId);
   }
@@ -3837,14 +3837,15 @@ function checkinTab(v) {
         <span class="ck-count">${conversationEntries(t).length}</span>
       </div>`)
     .join('');
+  const hasWorld = !!(v.worldAvailable || v.worldPath);
   return `<div class="ck-layout">
     <div class="ck-side">
       <div class="ck-side-h">Agents</div>
       ${items}
       <div class="ck-side-h">Shell</div>
       <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
-        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${v.worldPath ? '' : 'disabled'} title="${v.worldPath ? 'Open a terminal in this task world' : 'No world yet'}">
-          <span class="ck-name">${v.worldPath ? 'Open terminal' : 'No world yet'}</span>
+        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? 'Open a terminal in this task world' : 'No world yet'}">
+          <span class="ck-name">${hasWorld ? 'Open terminal' : 'No world yet'}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
         ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
@@ -3869,9 +3870,12 @@ function conversationPane(v, t) {
   // id is published mid-turn (#3), so this appears WHILE the agent runs.
   const sess = S.sessions && S.sessions[t.role];
   const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
+  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && !S.meta?.hosted;
   const copy = forkCmd
     ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
-    : '';
+    : remoteFork
+      ? `<button class="btn sm fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">⑂ fork locally</button>`
+      : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
   // appears only when the workflow currently allows follow-ups.
@@ -4016,7 +4020,8 @@ function terminalPane(v) {
       <span class="pal-sub">a shell in the task's world — killed when you leave the task</span>
       <span style="flex:1"></span>
       ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      ${S.meta?.hosted && v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
+      ${v.worldAvailable && !v.worldPath ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
+      ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No world yet'}</button>
     </div>
@@ -4033,6 +4038,8 @@ function wireCheckinSidebar(v) {
     }),
   );
   $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
+  $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
+  $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
     try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`); window.open(session.url, '_blank', 'noopener'); }
     catch (error) { toast(error.message, true); }
@@ -4040,6 +4047,7 @@ function wireCheckinSidebar(v) {
 }
 
 async function openLocalCheckout(v) {
+  if (!S.meta?.hosted) return materializeLocalCheckout(v);
   let plan;
   try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
   catch (error) { return toast(error.message, true); }
@@ -4068,6 +4076,50 @@ async function openLocalCheckout(v) {
       await refreshTask();
     } catch (error) { result.textContent = error.message; button.disabled = false; }
   });
+}
+
+async function materializeLocalCheckout(v, session) {
+  let checkout;
+  try {
+    checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+  } catch (error) { toast(error.message, true); return null; }
+  const fork = session ? forkCommandFor(session, checkout.cwd) : '';
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <p class="task-sub">Karmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world was parked again.</p>
+    <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
+    <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
+    ${fork ? `<div class="section-h" style="margin-top:14px">Fork this agent locally</div><pre class="raw">${esc(fork)}</pre><button class="btn sm local-copy" data-value="${esc(fork)}">Copy fork command</button>` : ''}
+    <div class="section-h" style="margin-top:14px">Repositories</div>
+    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
+  </div></div>`;
+  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
+  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
+  return checkout;
+}
+
+async function forkCloudSessionLocally(v, button) {
+  button.disabled = true;
+  button.textContent = 'Materializing…';
+  const session = { provider: button.dataset.provider, id: button.dataset.session, home: button.dataset.home };
+  const checkout = await materializeLocalCheckout(v, session);
+  if (checkout) await copyToClipboard(forkCommandFor(session, checkout.cwd)).then(() => toast('Fork command copied'));
+  button.disabled = false;
+  button.textContent = '⑂ fork locally';
+}
+
+async function copyNativeAttachCommand(v) {
+  try {
+    const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/terminal-ticket`, { method: 'POST', body: '{}' });
+    const command = [...(result.attachArgv || ['karmax']), 'attach', v.taskId, '--url', result.gatewayUrl, '--ticket', result.ticket]
+      .map((part) => JSON.stringify(String(part))).join(' ');
+    await copyToClipboard(command);
+    toast('One-time attach command copied');
+  } catch (error) { toast(error.message, true); }
 }
 
 // Parameters: everything the human configured on this task, in one place —

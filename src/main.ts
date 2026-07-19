@@ -141,7 +141,7 @@ async function main() {
   const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp);
   const runners = new RunnerPoolService(store);
   const worldAccess = new WorldAccessService(store, worlds, runners);
-  const handoffs = new WorldHandoffService(store, worlds, githubApp, runners);
+  const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess);
   const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners, worldAccess);
   const delivery = new DeliveryDispatcher(store, {
     browser: new BrowserDeliveryAdapter(),

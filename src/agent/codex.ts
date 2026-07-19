@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { PLATFORM_TOOL_SCHEMAS, TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
@@ -232,6 +232,7 @@ export class CodexAdapter implements AgentAdapter {
       : spawn(cmd, ['app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
+    const platformHandlers = platformToolHandlers(input.world, ctx);
     let stderr = '';
     child.stderr?.on('data', (d: Buffer | string) => { stderr += d.toString(); });
 
@@ -260,7 +261,26 @@ export class CodexAdapter implements AgentAdapter {
     // boundary, so run with approvals off and full access — the app-server analogue
     // of `codex exec --dangerously-bypass-approvals-and-sandbox`. Any approval the
     // server still requests is auto-granted below.
-    client.onServerRequest((method) => (/approval/i.test(method) ? { decision: 'approved_for_session' } : {}));
+    client.onServerRequest(async (method, params) => {
+      if (/approval/i.test(method)) return { decision: 'approved_for_session' };
+      if (method !== 'item/tool/call' || !remote) return {};
+      const tool = String(params?.tool ?? '');
+      const handler = platformHandlers[tool];
+      if (!handler) return { contentItems: [{ type: 'inputText', text: `unknown Karmax tool ${tool}` }], success: false };
+      const id = String(params?.callId ?? tool);
+      ctx.emitActivity({ id, kind: 'tool', phase: 'started', title: tool,
+        ...(activityDetail(params?.arguments) ? { detail: activityDetail(params.arguments) } : {}) });
+      try {
+        const result = await handler(params?.arguments ?? {});
+        ctx.emitActivity({ id, kind: 'tool', phase: 'completed', title: tool,
+          ...(activityDetail(result) ? { detail: activityDetail(result) } : {}) });
+        return { contentItems: [{ type: 'inputText', text: result }], success: true };
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        ctx.emitActivity({ id, kind: 'tool', phase: 'failed', title: tool, detail });
+        return { contentItems: [{ type: 'inputText', text: detail }], success: false };
+      }
+    });
 
     let threadId: string | undefined = input.session;
     let currentTurnId: string | undefined;
@@ -433,15 +453,15 @@ export class CodexAdapter implements AgentAdapter {
 
     try {
       // ── Handshake ──
-      await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' }, capabilities: null });
+      await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' },
+        capabilities: { experimentalApi: true, requestAttestation: false } });
       client.notify('initialized');
-      if (remote) {
-        // A cloud turn without the platform MCP can still produce plausible
-        // prose while silently losing collaboration, review, and completion
-        // tools. Ask app-server for its authoritative post-startup inventory and
-        // fail before the model turn when the generated remote config did not
-        // load. Do the same for any browser MCP we explicitly provisioned.
-        const required = ['karmax', ...Object.keys(remoteHome?.browserMcp ?? {})];
+      if (remote && Object.keys(remoteHome?.browserMcp ?? {}).length) {
+        // Dynamic Karmax tools use this control channel and therefore need no
+        // sandbox startup probe. Browser MCPs really do launch remotely: ask
+        // app-server for its authoritative inventory and fail before the model
+        // turn when an explicitly provisioned browser did not load.
+        const required = Object.keys(remoteHome?.browserMcp ?? {});
         let servers: any[] = [];
         let missing = required;
         const deadline = Date.now() + 30_000;
@@ -454,7 +474,7 @@ export class CodexAdapter implements AgentAdapter {
             const server = servers.find((candidate) => candidate?.name === name);
             if (!server) return true;
             const tools = server.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [];
-            return name === 'karmax' ? !tools.includes('list_events') : tools.length === 0;
+            return tools.length === 0;
           });
           if (!missing.length || Date.now() >= deadline) break;
           await new Promise((resolve) => setTimeout(resolve, 250));
@@ -495,6 +515,9 @@ export class CodexAdapter implements AgentAdapter {
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
           developerInstructions: input.systemPrompt,
+          ...(remote ? { dynamicTools: PLATFORM_TOOL_SCHEMAS.map((tool) => ({
+            type: 'function', name: tool.name, description: tool.description, inputSchema: tool.parameters,
+          })) } : {}),
           ...(model ? { model } : {}),
         });
         threadId = started?.thread?.id ?? threadId;

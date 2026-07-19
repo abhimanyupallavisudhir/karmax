@@ -15,6 +15,7 @@ export interface KarmaxPaths {
   home: string;
   workflows: string; // ~/.karmax/workflows/<name>/  (git repos)
   worlds: string; // worktrees / scratch repos
+  localCheckouts: string; // durable human checkouts materialized from cloud task branches
   configHomes: string; // per-(account×profile) CODEX_HOME/CLAUDE_CONFIG_DIR
   content: string; // prompts/skills/memory content store
   state: string; // local sqlite + json state
@@ -31,6 +32,7 @@ export function paths(home = karmaxHome()): KarmaxPaths {
     home,
     workflows: path.join(home, 'workflows'),
     worlds: path.join(home, 'worlds'),
+    localCheckouts: path.join(home, 'local-checkouts'),
     configHomes: path.join(home, 'config-homes'),
     content: path.join(home, 'content'),
     state: path.join(home, 'state'),

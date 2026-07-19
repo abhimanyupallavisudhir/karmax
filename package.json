@@ -7,6 +7,9 @@
   "engines": {
     "node": ">=22"
   },
+  "bin": {
+    "karmax": "bin/karmax.js"
+  },
   "scripts": {
     "start": "tsx src/main.ts",
     "dev": "tsx watch --clear-screen=false src/main.ts",

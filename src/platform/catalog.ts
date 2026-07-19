@@ -14,7 +14,8 @@ export const PLATFORM_API_CATALOG = {
     'PATCH /api/tasks/:taskId/params|notes|authorization',
     'PUT /api/tasks/:taskId/tags|priority', 'POST /api/tasks/:taskId/tag|archive|signal|target',
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
-    'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/refresh-from-github',
+    'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/materialize-local',
+    'POST /api/tasks/:taskId/terminal-ticket', 'POST /api/tasks/:taskId/refresh-from-github',
     'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
   ],
   conversations: [

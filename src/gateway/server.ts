@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
@@ -302,6 +303,7 @@ interface Session {
 
 export class Gateway {
   private sessions = new Map<string, Session>();
+  private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
@@ -432,7 +434,12 @@ export class Gateway {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const taskId = url.searchParams.get('taskId') ?? '';
     const task = this.deps.store.getTask(taskId);
-    const auth = await this.socketAuth(req, url, task?.projectId);
+    const ticket = url.searchParams.get('ticket') ?? '';
+    const ticketRecord = ticket ? this.terminalTickets.get(ticket) : undefined;
+    if (ticketRecord) this.terminalTickets.delete(ticket); // one connection only
+    const auth = ticketRecord && ticketRecord.taskId === taskId && ticketRecord.expiresAt > Date.now()
+      ? ticketRecord.session
+      : await this.socketAuth(req, url, task?.projectId);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
     if (!this.deps.tokens.check(auth.apiToken, 'task:edit', { projectId: task?.projectId, taskId }).ok) {
       ws.close(4403, 'forbidden'); return;
@@ -1789,11 +1796,32 @@ export class Gateway {
       if (executionsMatch && method === 'GET') {
         return this.json(res, 200, store.listExecutions(executionsMatch[1]!));
       }
+      const terminalTicketMatch = p.match(/^\/api\/tasks\/([^/]+)\/terminal-ticket$/);
+      if (terminalTicketMatch && method === 'POST') {
+        const taskId = terminalTicketMatch[1]!;
+        if (!store.getTask(taskId)) return this.json(res, 404, { error: 'task not found' });
+        const ticket = crypto.randomBytes(24).toString('base64url');
+        const expiresAt = Date.now() + 5 * 60_000;
+        for (const [candidate, record] of this.terminalTickets) if (record.expiresAt <= Date.now()) this.terminalTickets.delete(candidate);
+        this.terminalTickets.set(ticket, { taskId, session, expiresAt });
+        const attachArgv = this.deps.hosted ? ['karmax'] : [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))];
+        return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
+      }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
       if (checkoutMatch && method === 'GET') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
         try { return this.json(res, 200, this.deps.handoffs.checkout(checkoutMatch[1]!)); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const materializeMatch = p.match(/^\/api\/tasks\/([^/]+)\/materialize-local$/);
+      if (materializeMatch && method === 'POST') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        if (this.deps.hosted) return this.json(res, 409, { error: 'use the Git checkout handoff when Karmax is hosted remotely' });
+        const taskId = materializeMatch[1]!;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
+        try { return this.json(res, 200, await this.deps.handoffs.materialize(taskId, view)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/agent/git/publish' && method === 'POST') {
         try { return this.json(res, 200, await api.publishTaskBranch(token)); }

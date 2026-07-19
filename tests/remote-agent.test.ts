@@ -15,7 +15,7 @@ describe('remote subscription agents', () => {
     localHome = undefined;
   });
 
-  it('seeds leased credentials/config and the platform MCP under the task world', async () => {
+  it('seeds leased credentials/config while removing the obsolete remote platform MCP', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-home-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), '{"tokens":{"access_token":"subscription"}}');
     fs.mkdirSync(path.join(localHome, 'skills', 'review'), { recursive: true });
@@ -26,7 +26,6 @@ describe('remote subscription agents', () => {
     fs.writeFileSync(path.join(localHome, 'logs_2.sqlite'), Buffer.alloc(1024));
     fs.writeFileSync(path.join(localHome, 'plugins', 'cache', 'large', 'asset.bin'), Buffer.alloc(1024));
     fs.writeFileSync(path.join(localHome, 'config.toml'), '[mcp_servers.karmax]\ncommand = "/host/node"\n\n[notice]\nkeep = true\n');
-    process.env.KARMAX_REMOTE_GATEWAY_URL = 'https://karmax.example.test/';
     const world = fakeWorld();
 
     const seeded = await seedRemoteAgentHome(world, 'codex', localHome);
@@ -41,25 +40,8 @@ describe('remote subscription agents', () => {
     const config = world.files.get(`${remoteHome}/config.toml`)?.toString() ?? '';
     expect(config).toContain('[notice]');
     expect(config).not.toContain('/host/node');
-    expect(config).toContain('https://karmax.example.test');
-    const platformBundle = world.files.get('.karmax-injection/agent/tools/platform-mcp/karmax-mcp.cjs');
-    expect(platformBundle?.length).toBeGreaterThan(10_000);
-    // Execute the exact seeded artifact. Bundling Zod v4 into this bridge once
-    // produced a syntactically valid file that crashed before MCP initialize,
-    // leaving Codex with a named `karmax` server and zero tools.
-    const probeDir = path.join(localHome, 'bundle-probe');
-    fs.mkdirSync(probeDir);
-    fs.writeFileSync(path.join(probeDir, 'karmax-mcp.cjs'), platformBundle!);
-    fs.symlinkSync(path.resolve('node_modules'), path.join(probeDir, 'node_modules'), 'dir');
-    const handshake = [
-      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'probe', version: '1' } } },
-      { jsonrpc: '2.0', method: 'notifications/initialized', params: {} },
-      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
-    ].map((message) => JSON.stringify(message)).join('\n') + '\n';
-    const probe = spawnSync(process.execPath, [path.join(probeDir, 'karmax-mcp.cjs')],
-      { input: handshake, encoding: 'utf8', timeout: 10_000 });
-    expect(probe.status, probe.stderr).toBe(0);
-    expect(probe.stdout).toContain('"name":"list_events"');
+    expect(config).not.toContain('mcp_servers.karmax');
+    expect(world.files.has('.karmax-injection/agent/tools/platform-mcp/karmax-mcp.cjs')).toBe(false);
     world.files.set(`${remoteHome}/auth.json`, Buffer.from('{"tokens":{"access_token":"refreshed-remotely"}}'));
     await seedRemoteAgentHome(world, 'codex', localHome);
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('refreshed-remotely');
@@ -88,7 +70,6 @@ describe('remote subscription agents', () => {
     localHome = first;
     fs.writeFileSync(path.join(first, 'auth.json'), '{"account":"a-old"}');
     fs.writeFileSync(path.join(second, 'auth.json'), '{"account":"b"}');
-    process.env.KARMAX_REMOTE_GATEWAY_URL = 'https://karmax.example.test';
     const world = fakeWorld();
     const a = await seedRemoteAgentHome(world, 'codex', first);
     const b = await seedRemoteAgentHome(world, 'codex', second);
@@ -132,16 +113,17 @@ describe('remote subscription agents', () => {
   it('runs Codex app-server inside the remote PTY with the seeded subscription', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-codex-'));
     fs.writeFileSync(path.join(localHome, 'auth.json'), '{"auth_mode":"chatgpt"}');
-    process.env.KARMAX_REMOTE_GATEWAY_URL = 'https://karmax.example.test';
     const world = fakeWorld(true);
     const sessions: string[] = [];
+    const platformCalls: string[] = [];
 
     const result = await new CodexAdapter().runTurn({
       profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
       world,
       messages: [{ id: 'm', role: 'user', text: 'edit the repository', ts: 0 }],
       systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
-    } as any, { emit() {}, emitActivity() {}, onSession: (id: string) => sessions.push(id) } as any);
+    } as any, { emit() {}, emitActivity() {}, onSession: (id: string) => sessions.push(id),
+      platformRequest: async (method: string, requestPath: string) => { platformCalls.push(`${method} ${requestPath}`); return [{ type: 'ok' }]; } } as any);
 
     expect(result).toMatchObject({ termination: { kind: 'success', status: 'completed' }, session: 'remote-thread', output: 'done remotely' });
     expect(world.openedPty?.command).toContain('@openai/codex@0.144.5');
@@ -156,15 +138,17 @@ describe('remote subscription agents', () => {
     expect(world.openedPty?.env).toMatchObject({ CODEX_HOME: `/workspace/${remoteHome}` });
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('chatgpt');
     expect(sessions).toContain('remote-thread');
+    expect(platformCalls).toEqual(['GET /api/tasks/task/events?since=0']);
+    expect(world.dynamicTools).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'list_events' })]));
   });
 });
 
 function fakeWorld(appServer = false, browserReady = false): World & {
-  files: Map<string, Buffer>; commands: string[]; openedPty?: WorldPtySpec;
+  files: Map<string, Buffer>; commands: string[]; openedPty?: WorldPtySpec; dynamicTools?: any[];
 } {
   const files = new Map<string, Buffer>();
   const commands: string[] = [];
-  const world: World & { files: Map<string, Buffer>; commands: string[]; openedPty?: WorldPtySpec } = {
+  const world: World & { files: Map<string, Buffer>; commands: string[]; openedPty?: WorldPtySpec; dynamicTools?: any[] } = {
     files, commands,
     handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'task', root: '/workspace', branch: 'task', base: 'main' },
     async exec(command, args) {
@@ -210,14 +194,17 @@ function fakeWorld(appServer = false, browserReady = false): World & {
             if (!line.trim()) continue;
             const request = JSON.parse(line);
             if (request.method === 'initialize') send({ id: request.id, result: {} });
-            else if (request.method === 'mcpServerStatus/list') send({ id: request.id, result: { data: [
-              { name: 'karmax', authStatus: 'unsupported', resourceTemplates: [], resources: [],
-                tools: { list_events: { name: 'list_events', inputSchema: { type: 'object' } } } },
-            ], nextCursor: null } });
-            else if (request.method === 'thread/start') send({ id: request.id, result: { thread: { id: 'remote-thread' } } });
+            else if (request.method === 'mcpServerStatus/list') send({ id: request.id, result: { data: [], nextCursor: null } });
+            else if (request.method === 'thread/start') {
+              world.dynamicTools = request.params.dynamicTools;
+              send({ id: request.id, result: { thread: { id: 'remote-thread' } } });
+            }
             else if (request.method === 'turn/start') {
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });
               send({ method: 'turn/started', params: { turn: { id: 'remote-turn' } } });
+              send({ id: 99, method: 'item/tool/call', params: { threadId: 'remote-thread', turnId: 'remote-turn',
+                callId: 'call-1', namespace: null, tool: 'list_events', arguments: { task_id: 'task', since: 0 } } });
+            } else if (request.id === 99 && request.result?.success) {
               send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done remotely' } } });
               send({ method: 'turn/completed', params: { turn: { id: 'remote-turn', status: 'completed' } } });
             }

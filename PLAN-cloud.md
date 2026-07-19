@@ -871,7 +871,7 @@ world without reading its root path or spawning its processes directly.
 
 - Versioned Karmax environment Dockerfile/template and provider snapshot cache.
 - Provision from a GitHub repository over SSH; run agent and test commands.
-- Cloud MCP connectivity with scoped token renewal and audit.
+- Cloud platform-tool connectivity over the agent protocol channel, with scoped authorization and audit.
 - Browser PTY, review action stream, signed preview, artifact open.
 - Explicit park at Review, resume on follow-up, portable checkpoint fallback.
 - Merge/push/PR, cancellation, cleanup, quotas, and measured cost events.
@@ -882,13 +882,14 @@ with zero sandbox CPU/RAM, then resume and merge without manual repair.
 The explicit billable smoke test for an already-configured installation is:
 
 ```bash
-KARMAX_REMOTE_GATEWAY_URL=https://reachable-karmax.example \
 KARMAX_LIVE_TASK_ID=task_... npx tsx scripts/live-cloud-subscription.ts
 ```
 
 It resolves the E2B credential from Karmax's vault and requires completed scoped
-Karmax and Chrome DevTools screenshot tool events; a model merely claiming success
-does not pass the diagnostic.
+Karmax dynamic-tool and Chrome DevTools screenshot events; a model merely claiming
+success does not pass the diagnostic. The Karmax tool crosses app-server's existing
+PTY transport and executes on the host, so a locally hosted control plane needs no
+public URL or inbound tunnel for cloud-agent platform tools.
 
 ### Phase 4 — hosted control plane (complete)
 
