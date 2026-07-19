@@ -123,7 +123,7 @@ function currentOrg() {
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
 // Second-segment words that name an organization-level view rather than a project.
-const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox' };
+const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', profile: 'profile' };
 
 function parseRoute(pathname) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
@@ -1737,8 +1737,10 @@ function renderShell() {
       <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
         <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
       </button>
+      <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
+      <button class="icon-btn" id="topbar-help" title="Keyboard shortcuts (?)" aria-haspopup="dialog">?</button>
+      <a class="topbar-user" id="topbar-user" data-spa href="${globalRoute('profile')}" title="Your profile">${esc(userDisplayName())}</a>
       <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
-      <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
     </div>
     <div class="body">
       <div class="rail" id="rail"></div>
@@ -1747,8 +1749,9 @@ function renderShell() {
   // Project-scoped query/filtering lives in the task list. The topbar finder is
   // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
   $('#topbar-search').addEventListener('click', openGlobalSearch);
-  $('#theme').addEventListener('click', toggleTheme);
-  // #bell is a real <a> link (open the inbox in a new tab); router handles clicks.
+  $('#topbar-palette').addEventListener('click', openPalette);
+  $('#topbar-help').addEventListener('click', openHelp);
+  // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
   $('#org-switcher')?.addEventListener('change', async (e) => {
     if (e.target.value === '__new') return createOrganization();
     S.organizationId = e.target.value;
@@ -1778,16 +1781,10 @@ function renderRail() {
     <div class="label">Organization</div>
     <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
     <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
-    <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
-    <div class="nav-item" id="rail-palette" tabindex="0" title="Run any available command">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
-  // Project + Dashboard/Settings entries are real <a> links — installLinkRouter()
+    <a class="nav-item ${S.tab === 'profile' ? 'active' : ''}" data-spa href="${globalRoute('profile')}" id="rail-profile" tabindex="0" title="Your profile">◔ Profile${userDisplayName() ? ` · ${esc(userDisplayName())}` : ''}</a>`;
+  // Project + Dashboard/Settings/Profile entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
-  $('#rail-logout')?.addEventListener('click', async () => {
-    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
-    location.reload();
-  });
-  $('#rail-palette')?.addEventListener('click', openPalette);
 }
 
 function switchTab(tab) {
@@ -1860,6 +1857,7 @@ function renderMain() {
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
   else if (S.tab === 'inbox') content = inboxView();
   else if (S.tab === 'organization') content = organizationView();
+  else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
   else if (S.tab === 'global') content = globalSettingsView();
 
@@ -1876,6 +1874,7 @@ function renderMain() {
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
   if (S.tab === 'inbox') wireInboxView();
+  if (S.tab === 'profile') wireProfileView();
   if (S.tab === 'organization') { hydrateOrganizationView(); wireGlobalSettings(S.organizationId); }
 
   restoreFocus(main, focusState);
@@ -6674,6 +6673,63 @@ async function openInboxItem(item) {
   return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
 }
 
+// The signed-in person's display name for the topbar/rail. The legacy single-user
+// session is the string 'me'; real identity sessions carry a Better Auth user.
+function userDisplayName() {
+  const u = S.user;
+  if (u && typeof u === 'object') return u.name || u.email || 'Account';
+  return 'Account';
+}
+
+// A clean profile page: identity, the browser display preference (theme), and the
+// one place to end the session. Sign out lives here rather than in the top bar.
+function profileView() {
+  const u = S.user && typeof S.user === 'object' ? S.user : null;
+  const name = userDisplayName();
+  const email = u?.email || '';
+  const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
+  const orgCount = (S.organizations || []).length;
+  const row = (label, value) => value
+    ? `<div class="profile-row"><span class="profile-row-label">${esc(label)}</span><span class="profile-row-value">${esc(value)}</span></div>`
+    : '';
+  return `<div class="profile-page">
+    <h1 class="page-title">Profile</h1>
+    <div class="card profile-card">
+      <div class="profile-identity">
+        <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
+        <div class="profile-meta">
+          <div class="profile-name">${esc(name)}</div>
+          ${email ? `<div class="profile-email">${esc(email)}</div>` : ''}
+        </div>
+      </div>
+      <div class="profile-rows">
+        ${row('Name', u?.name || '')}
+        ${row('Email', email)}
+        ${row('Account', u?.id || '')}
+        ${row('Organizations', orgCount ? String(orgCount) : '')}
+      </div>
+    </div>
+    <div class="card">
+      <div class="section-h">Appearance</div>
+      <p class="task-sub">The light / dark preference is remembered in this browser.</p>
+      <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
+    </div>
+    <div class="card">
+      <div class="section-h">Session</div>
+      <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
+      <button class="btn danger" id="profile-logout">Sign out</button>
+    </div>
+  </div>`;
+}
+
+function wireProfileView() {
+  $('#profile-theme')?.addEventListener('click', toggleTheme);
+  $('#profile-logout')?.addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
+    location.reload();
+  });
+}
+
 // The settings rail is real navigation, not a scroll-spy: exactly one section is
 // visible at a time, so each pane reads as a page with a single purpose instead
 // of a position in one endless scroll. The URL hash names the open pane (via
@@ -7299,7 +7355,13 @@ function bindKeys() {
     }
     // Enter on a focused button/link is native activation, not the list cursor.
     if (e.key === 'Enter' && t && t.closest && t.closest('button, a, summary, [role="button"]')) return;
-    dispatchKey(e);
+    if (dispatchKey(e)) return;
+    // Fallback: Enter activates whatever custom control has keyboard focus. A div
+    // made Tab-focusable with tabindex="0" (view chips, nav items, task rows, …)
+    // carries a click handler but has no native Enter activation — so synthesize the
+    // click. Native controls returned above; list/rail cursors have their own Enter
+    // commands, which dispatchKey matched first.
+    if (e.key === 'Enter' && t && t.matches && t.matches('[tabindex="0"]')) { e.preventDefault(); t.click(); }
   });
 }
 
