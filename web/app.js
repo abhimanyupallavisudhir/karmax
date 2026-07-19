@@ -294,31 +294,65 @@ function taskUrl(id) {
   return p ? `${projectRoute(p.id)}/tasks/${keyPart}` : location.pathname;
 }
 
-// Push a task permalink and remember where to return on close — but only when
-// coming FROM a list/queue, so j/k-walking between task pages keeps the original
-// list (not the previous task) as the place Esc returns to.
-function goToTask(id) {
-  if (!parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
-  return go(taskUrl(id));
+// True when a click means "open in a new tab/window" by browser convention: any
+// modifier key, or a non-primary mouse button. Real <a> elements honour this
+// natively — we only consult it so JS handlers never hijack such a click.
+function isNewTabClick(ev) {
+  return ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey;
 }
 
-// Make an element open a task like a link: plain click navigates in place;
-// Ctrl/⌘-click and middle-click open the task's permalink in a new browser tab.
-// `getId(ev)` returns the task id, or null to ignore the click (e.g. it landed
-// on an inner button); `open` overrides the in-place action (default goToTask).
-function wireTaskNav(el, getId, open = goToTask) {
-  el.addEventListener('click', (ev) => {
-    const id = getId(ev);
-    if (!id) return;
-    if (ev.ctrlKey || ev.metaKey) return void window.open(taskUrl(id), '_blank', 'noopener');
-    open(id);
-  });
-  el.addEventListener('auxclick', (ev) => {
-    const id = ev.button === 1 ? getId(ev) : null;
-    if (!id) return;
+// Navigate to an in-app path, remembering the list to return to when opening a
+// task from a non-task page (so Esc / j-k walking returns to the list, not the
+// previous task). Generalises the old goToTask logic to any SPA link.
+function spaNavigate(href) {
+  const to = parseRoute(href);
+  if (to && to.taskKey && !parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
+  return go(href);
+}
+
+// Every in-app link is a real `<a data-spa href="/…">` anchor, so the browser
+// hands us every native "open in a new tab/window" affordance for free:
+// Ctrl/⌘-click, middle-click, Shift-click, right-click → "Open link in new tab",
+// drag-to-bookmark and the hover URL preview. This single delegated handler is
+// the *only* thing that keeps a plain left-click fast — it cancels the full-page
+// navigation and routes in place. Every modified or non-primary click falls
+// through untouched, so the browser opens it exactly as it would any web link.
+function installLinkRouter() {
+  document.addEventListener('click', (ev) => {
+    if (isNewTabClick(ev) || ev.defaultPrevented) return;
+    const a = ev.target.closest('a[data-spa]');
+    if (!a) return;
+    const href = a.getAttribute('href');
+    if (!href || href[0] !== '/') return; // only same-origin app routes route in place
     ev.preventDefault();
-    window.open(taskUrl(id), '_blank', 'noopener');
+    spaNavigate(href);
   });
+}
+
+// Push a task permalink (in place), remembering where to return on close.
+function goToTask(id) { return spaNavigate(taskUrl(id)); }
+
+// Make a whole row open its task like a real link. Rather than fake it in JS
+// (which can't offer the right-click "Open in new tab" menu, Shift-click, or a
+// hover preview), we lay a real `<a>` across the row: an absolutely-positioned
+// overlay that the browser treats as an ordinary link for every "new tab"
+// gesture, while installLinkRouter() catches its plain left-click and routes in
+// place — so normal clicking stays exactly as fast as before, with no reload.
+// Inner buttons/handles sit above the overlay (see the .has-row-link CSS) and
+// keep working; the overlay is non-draggable so it never shadows a row's own
+// drag-to-reorder. `getId()` returns the task id (falsy → leave the row inert).
+function wireTaskNav(el, getId) {
+  const id = getId();
+  if (!id) return;
+  el.classList.add('has-row-link');
+  const a = document.createElement('a');
+  a.className = 'row-link';
+  a.href = taskUrl(id);
+  a.dataset.spa = '';
+  a.draggable = false;
+  a.tabIndex = -1;
+  a.setAttribute('aria-hidden', 'true');
+  el.appendChild(a);
 }
 
 // A short human label for a task id: `#num` when known, else a short id.
@@ -1503,6 +1537,7 @@ async function boot() {
   connectWs();
   renderShell();
   bindKeys();
+  installLinkRouter();
   window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
   await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
@@ -1702,7 +1737,7 @@ function renderShell() {
       <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
         <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
       </button>
-      <button class="icon-btn has-badge" id="bell" title="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></button>
+      <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
       <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
     </div>
     <div class="body">
@@ -1713,7 +1748,7 @@ function renderShell() {
   // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
   $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#theme').addEventListener('click', toggleTheme);
-  $('#bell').addEventListener('click', () => go(globalRoute('inbox')));
+  // #bell is a real <a> link (open the inbox in a new tab); router handles clicks.
   $('#org-switcher')?.addEventListener('change', async (e) => {
     if (e.target.value === '__new') return createOrganization();
     S.organizationId = e.target.value;
@@ -1733,24 +1768,21 @@ function renderRail() {
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
       .map(
-        (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" tabindex="0">
+        (p) => `<a class="proj ${p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
-        </div>`,
+        </a>`,
       )
       .join('')}
     <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
     <div class="label">Organization</div>
-    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
-    <div class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" id="rail-organization" tabindex="0">⚙ Settings</div>
+    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
     <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
     <div class="nav-item" id="rail-palette" tabindex="0" title="Run any available command">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
-  rail.querySelectorAll('.proj[data-id]').forEach((e) =>
-    e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
-  );
+  // Project + Dashboard/Settings entries are real <a> links — installLinkRouter()
+  // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
-  $('#rail-organization')?.addEventListener('click', () => go(globalRoute('organization')));
-  rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
   $('#rail-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();
@@ -1817,7 +1849,7 @@ function renderMain() {
   const projectScoped = ['tasks', 'queue', 'activity', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
-        .map((t) => `<div class="tab ${S.tab === t ? 'active' : ''}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</div>`)
+        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
         .join('')}</div>`
     : '';
 
@@ -1837,7 +1869,7 @@ function renderMain() {
   const focusState = captureFocus(main);
 
   main.innerHTML = tabbar + content;
-  main.querySelectorAll('.tab[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
+  // Project tabs are real <a> links; installLinkRouter() handles the plain click.
   if (S.tab === 'tasks') wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'settings') wireSettingsView(proj);
@@ -2626,9 +2658,7 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-delseries]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (!confirm('Delete this repeatable task? Its past runs are kept.')) return; try { await api(`/api/tasks/${b.dataset.delseries}`, { method: 'DELETE' }); toast('Repeatable task deleted'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
-  $('#main').querySelectorAll('[data-series]').forEach((e) =>
-    wireTaskNav(e, (ev) => (ev.target.closest('button') ? null : e.dataset.series)),
-  );
+  $('#main').querySelectorAll('[data-series]').forEach((e) => wireTaskNav(e, () => e.dataset.series));
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
     try {
@@ -4139,7 +4169,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
     : '';
   const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
+    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><a class="branch sub-open" data-spa href="${taskUrl(id)}" style="cursor:pointer">↳ ${esc(numLabel(id))}</a></div>`).join('')}`
     : '';
   return `
     <div class="section-h">Pipeline</div>
@@ -4928,7 +4958,7 @@ function wireActions(v) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
+  // Sub-task references are real <a> permalinks; installLinkRouter() handles them.
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
@@ -5132,7 +5162,7 @@ function localQueue(domain) {
 
 function wireQueueView() {
   $('#main').querySelectorAll('.queue-item').forEach((e) => {
-    if (taskRecord(e.dataset.id)) wireTaskNav(e, (ev) => (ev.target.closest('[data-move]') || ev.target.closest('.drag-handle') ? null : e.dataset.id));
+    if (taskRecord(e.dataset.id)) wireTaskNav(e, () => e.dataset.id);
   });
   $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
@@ -5335,7 +5365,7 @@ function procPanelHtml(sample) {
     .map((g) => {
       const kindChip = `<span class="chip">${esc(PROC_KIND_LABEL[g.kind] || g.kind)}</span>`;
       const taskChip = g.taskId
-        ? `<button class="chip proc-task" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</button>`
+        ? `<a class="chip proc-task" data-spa href="${esc(taskUrl(g.taskId))}" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</a>`
         : '';
       // A group is killable at the root when it's a registered entity (agents,
       // terminals, logins, probes) — its registered killer escalates properly.
@@ -5374,7 +5404,7 @@ function procPanelHtml(sample) {
 }
 
 function wireProcPanel(el) {
-  el.querySelectorAll('.proc-task').forEach((b) => b.addEventListener('click', () => goToTask(b.dataset.task)));
+  // .proc-task chips are real <a> permalinks handled by installLinkRouter().
   el.querySelectorAll('.proc-kill').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       const pid = Number(b.dataset.kill);
@@ -7352,10 +7382,13 @@ function openGlobalSearch() {
     list.innerHTML = items.map((item, i) => {
       const head = item.group !== lastGroup ? `<div class="pal-group">${esc(item.group)}</div>` : '';
       lastGroup = item.group;
-      return `${head}<div class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}">
+      // Each result is a real permalink, so it opens in a new tab with any native
+      // gesture (Ctrl/⌘-click, middle-click, right-click → Open in new tab); a plain
+      // click below still opens it in place and dismisses the palette.
+      return `${head}<a class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}"${item.href ? ` data-spa href="${esc(item.href)}"` : ''}>
         <span class="global-search-kind" aria-hidden="true">${item.group === 'Projects' ? '◇' : '□'}</span>
         <span class="global-search-copy"><b>${esc(item.title)}</b><span>${esc(item.sub || '')}</span></span>
-      </div>`;
+      </a>`;
     }).join('');
     input.setAttribute('aria-activedescendant', `gs-result-${active}`);
     if (summary) list.insertAdjacentHTML('beforeend', `<div class="global-search-summary">${esc(summary)}</div>`);
@@ -7377,16 +7410,18 @@ function openGlobalSearch() {
     if (ownRequest !== request || !root.contains(input)) return;
     const found = assembleGlobalSearchResults(q, S.projects, responses);
     items = [
-      ...found.projectHits.map(({ project }) => ({
-        group: 'Projects', title: project.name, sub: 'Open project', run: () => go(projectRoute(project.id)),
-      })),
+      ...found.projectHits.map(({ project }) => {
+        const href = projectRoute(project.id);
+        return { group: 'Projects', title: project.name, sub: 'Open project', href, run: () => spaNavigate(href) };
+      }),
       ...found.taskHits.map(({ project, task }) => {
         const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
         const number = task.num != null ? `#${task.num} · ` : '';
+        const href = `${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
         return {
           group: 'Tasks', title: task.title,
           sub: `${number}${project.name} · ${stateLabel}`,
-          run: () => go(`${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`),
+          href, run: () => spaNavigate(href),
         };
       }),
     ];
@@ -7405,7 +7440,12 @@ function openGlobalSearch() {
     else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
     else if (e.key === 'Enter') { e.preventDefault(); run(active); }
   });
-  list.addEventListener('click', (e) => { const row = e.target.closest('.opt'); if (row) run(Number(row.dataset.i)); });
+  list.addEventListener('click', (e) => {
+    const row = e.target.closest('.opt'); if (!row) return;
+    if (isNewTabClick(e)) return; // real <a> result → let the browser open it in a new tab (palette stays open)
+    e.preventDefault();
+    run(Number(row.dataset.i));
+  });
   list.addEventListener('mousemove', (e) => { const row = e.target.closest('.opt'); if (row && Number(row.dataset.i) !== active) { active = Number(row.dataset.i); draw(); } });
   $('#gs-close').addEventListener('click', close);
   $('#gs-scrim').addEventListener('click', (e) => { if (e.target.id === 'gs-scrim') close(); });

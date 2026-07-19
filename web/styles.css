@@ -224,6 +224,24 @@ a { color: var(--accent); text-decoration: none; }
 .task-sub .branch { font-family: var(--font-mono); }
 .principal-chip { display:inline-flex; align-items:center; border-radius:999px; padding:2px 7px; background:var(--accent-weak); color:var(--accent); font-weight:600; }
 .task-right { display: flex; align-items: center; gap: 12px; }
+
+/* ── real-link rows ─────────────────────────────────────────────
+   Rows that open a task (task list, run history, merge/agent queues) are real
+   links: wireTaskNav() lays an absolutely-positioned <a> across the row so the
+   browser offers every native "open in new tab/window" gesture (Ctrl/⌘-click,
+   middle-click, Shift-click, right-click → Open in new tab). A plain left-click
+   is caught by installLinkRouter() and routed in place, so ordinary navigation
+   stays instant — no page reload. The overlay is a positive-z layer that sits
+   above the row's static text (so clicking anywhere navigates) but BELOW the
+   row's own controls, which are lifted above it here so buttons, drag handles
+   and drag-to-reorder keep working. */
+.has-row-link { position: relative; }
+.row-link { position: absolute; inset: 0; z-index: 1; border-radius: inherit; }
+.has-row-link button,
+.has-row-link .queue-actions,
+.has-row-link .drag-handle,
+.has-row-link [data-move],
+.has-row-link a:not(.row-link) { position: relative; z-index: 2; }
 .icon-btn svg { display: block; } /* archive/unarchive glyphs sit flush in the icon button */
 
 /* Undo action inside a toast — so an accidental archive is one click to reverse. */
