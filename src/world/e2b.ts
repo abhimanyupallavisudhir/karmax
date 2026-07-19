@@ -46,6 +46,7 @@ export interface E2BSandboxLike {
   };
   pause(): Promise<unknown>;
   kill(): Promise<unknown>;
+  setTimeout?(timeoutMs: number): Promise<unknown>;
   getInfo?(): Promise<{ state?: string }>;
   stream?: {
     start(options?: { requireAuth?: boolean }): Promise<void>;
@@ -135,7 +136,7 @@ export class E2BWorldProvider implements WorldProvider {
           ...(selectedTemplate ? { environmentArtifact: selectedTemplate } : {}) },
         ...(warnings.length ? { warnings } : {}),
       };
-      return new E2BWorld(handle, sandbox);
+      return new E2BWorld(handle, sandbox, this.idleMs);
     } catch (error) {
       await sandbox.kill().catch(() => undefined);
       this.sandboxes.delete(sandbox.sandboxId);
@@ -156,7 +157,7 @@ export class E2BWorldProvider implements WorldProvider {
       this.sandboxes.set(sandboxId, sandbox);
     }
     this.states.set(sandboxId, 'ready');
-    return new E2BWorld(handle, sandbox);
+    return new E2BWorld(handle, sandbox, this.idleMs);
   }
 
   async park(handle: WorldHandle): Promise<WorldHandle> {
@@ -234,7 +235,7 @@ export class E2BWorldProvider implements WorldProvider {
 }
 
 class E2BWorld implements World {
-  constructor(public handle: WorldHandle, private sandbox: E2BSandboxLike) {}
+  constructor(public handle: WorldHandle, private sandbox: E2BSandboxLike, private idleMs: number) {}
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     try {
@@ -300,11 +301,14 @@ class E2BWorld implements World {
     });
     let exited = false;
     let exitCode: number | null = null;
+    const stopKeepAlive = this.keepAlive();
     void Promise.resolve(command?.wait?.()).then((result) => {
+      stopKeepAlive();
       exited = true;
       exitCode = Number(result?.exitCode ?? result?.code ?? 0);
       for (const listener of exits) listener(exitCode);
     }).catch((error) => {
+      stopKeepAlive();
       emit(error?.message ?? error);
       exited = true;
       exitCode = -1;
@@ -324,7 +328,7 @@ class E2BWorld implements World {
         else exits.add(listener);
         return () => exits.delete(listener);
       },
-      async kill() { await command?.kill?.(); },
+      async kill() { stopKeepAlive(); await command?.kill?.(); },
     };
   }
 
@@ -349,13 +353,16 @@ class E2BWorld implements World {
       },
     });
     const remotePid = Number(terminal.pid);
+    const stopKeepAlive = this.keepAlive();
     if (spec.command) await sandbox.pty.sendInput(remotePid, new TextEncoder().encode(`${spec.command}\n`));
     void Promise.resolve(terminal.wait?.()).then((result) => {
+      stopKeepAlive();
       const code = Number(result?.exitCode ?? result?.code ?? 0);
       exited = true;
       exitCode = code;
       for (const listener of exits) listener(code);
     }).catch(() => {
+      stopKeepAlive();
       exited = true;
       exitCode = -1;
       for (const listener of exits) listener(-1);
@@ -374,6 +381,7 @@ class E2BWorld implements World {
       async write(data) { await sandbox.pty.sendInput(remotePid, new TextEncoder().encode(data)); },
       async resize(cols, rows) { await sandbox.pty.resize(remotePid, { cols, rows }); },
       async close() {
+        stopKeepAlive();
         if (typeof terminal.kill === 'function') await terminal.kill();
         else await sandbox.pty.kill(remotePid);
       },
@@ -442,6 +450,19 @@ class E2BWorld implements World {
     delete next.GIT_ASKPASS;
     delete next.GH_TOKEN;
     return next;
+  }
+
+  /** E2B's timeout is a renewable sandbox lease, not process-idle detection.
+   * Refresh it while a PTY/background process is active so a long model turn or
+   * review server cannot be paused underneath its runner lease. */
+  private keepAlive(): () => void {
+    if (!this.sandbox.setTimeout) return () => {};
+    let stopped = false;
+    const refresh = () => { if (!stopped) void this.sandbox.setTimeout!(this.idleMs).catch(() => undefined); };
+    refresh();
+    const timer = setInterval(refresh, Math.max(30_000, Math.min(60_000, Math.floor(this.idleMs / 3))));
+    timer.unref();
+    return () => { if (!stopped) { stopped = true; clearInterval(timer); } };
   }
 }
 

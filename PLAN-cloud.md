@@ -158,11 +158,12 @@ interface EnvironmentSpec {
 ```
 
 Karmax ships curated, digest-pinned base images containing Git, SSH, common
-language toolchains, the agent harnesses, browser support, and the version-matched
-Karmax runtime/MCP bridge. During project onboarding, the existing bootstrap-task
-pattern inspects a devcontainer/Dockerfile and lockfiles and **proposes** an
-environment; it does not silently execute guessed setup forever. The project may
-import its devcontainer or select a custom image and setup commands.
+language toolchains, the agent harnesses, and browser support. Karmax platform
+tools do not require a sandbox-resident runtime or inbound network route. During
+project onboarding, the existing bootstrap-task pattern inspects a
+devcontainer/Dockerfile and lockfiles and **proposes** an environment; it does
+not silently execute guessed setup forever. The project may import its
+devcontainer or select a custom image and setup commands.
 
 Generic provider templates remain a supported compatibility path. World startup
 probes for Node >= 22.12 and installs a pinned sandbox-local Node/npm runtime when
@@ -357,11 +358,17 @@ leased config home is seeded into a task-private directory. The provider CLI,
 its tools, session files, and repository cwd therefore share the same sandbox,
 matching local execution instead of emulating filesystem calls from the host.
 The stock adapters launch pinned `@anthropic-ai/claude-code` and `@openai/codex`
-packages through `npx` (cached in the sandbox); custom images can override those
-package specs with `KARMAX_REMOTE_CLAUDE_PACKAGE` and
+packages through `npx` (cached in the sandbox). Claude's CLI pin is derived from
+the installed Agent SDK's declared `claudeCodeVersion`, and a baked executable is
+used only when its reported version matches. Custom images can override package
+specs with `KARMAX_REMOTE_CLAUDE_PACKAGE` and
 `KARMAX_REMOTE_CODEX_PACKAGE`. Their PTY transport runs raw so large JSON protocol
-frames are not subject to canonical-line limits. A sandbox-local process-group
-lease reaps a surviving CLI before a Temporal retry starts another writer.
+frames are not subject to canonical-line limits. A small Claude relay presents
+pipe-backed stdin to its streaming CLI while retaining the provider PTY as the
+transport. Active E2B PTYs/background processes renew the sandbox deadline, so
+the nominal idle timeout cannot pause a long-running agent or review server. A
+sandbox-local process-group lease reaps a surviving CLI before a Temporal retry
+starts another writer.
 
 The determinism boundary is unchanged: the workflow awaits one `runAgentTurn`
 activity, the activity emits the typed stream and heartbeats, and cancellation
@@ -369,29 +376,32 @@ kills provider-owned processes. Sandboxes need no inbound SSH and receive only
 the repository read key needed during provisioning; platform actions use a
 short-lived, audience-bound token at the trusted MCP boundary.
 
-## Karmax MCP from a cloud world
+## Karmax platform tools from a cloud world
 
-Most of this path already exists. `platformMcpSpec()` configures a stdio bridge
-to the gateway, and the activity injects a capability-scoped token. For cloud:
+Cloud platform calls travel back over the provider's existing control channel;
+they do not call a public Karmax gateway from the sandbox:
 
-1. The activity bundles and seeds the version-matched MCP bridge on the world's
-   non-checkpointed injection surface. The bridge keeps Zod external in a pinned
-   shared runtime (bundling Zod v4 breaks its initialization graph), and Codex's
-   app-server inventory must report `karmax.list_events` plus every configured
-   browser server before the model turn begins.
-2. The bridge calls the Karmax public gateway over TLS. World tools execute
-   directly in the sandbox through the native provider agent.
-3. A turn token carries organization, project, origin task, role, capabilities,
-   audience, expiry, and unique ID. Any gateway replica can verify it.
+1. Remote Claude receives the platform handlers as the Agent SDK's in-process MCP
+   server. Remote Codex receives the same schemas as app-server `dynamicTools`;
+   `item/tool/call` requests cross its already-open PTY and execute in the trusted
+   activity process. The capability-scoped turn context authorizes each handler.
+2. A Codex thread created outside this path has no saved dynamic-tool definitions.
+   Before native resume/fork, Karmax enriches only the task-private sandbox copy
+   of its rollout `session_meta`; Codex then reloads the tools through its native
+   continuation path. The durable source transcript is not modified.
+3. Browser MCPs are different: they launch beside the browser inside the world.
+   Codex's app-server inventory and Claude's SDK configuration must expose every
+   explicitly configured browser server before the model turn begins.
 4. The selected Claude/Codex subscription home is copied into an account-keyed,
    task-private injection directory on first use. Later turns preserve
    provider-refreshed auth, enforce private file modes, and export only native
    auth plus conversation files atomically back to that account's durable config
    home. This makes OAuth rotation, portable hibernation, raw resume, and native
-   cross-task forks survive destruction of the provider world. Only the scoped
-   Karmax token is added to the turn env.
+   cross-task forks survive destruction of the provider world.
 5. Revoke the execution lease on cancellation/end. Keep an auditable token ID,
-   never the raw bearer value, in events.
+   never the raw bearer value, in events. `KARMAX_PUBLIC_URL` remains for genuinely
+   inbound surfaces such as remote human access, OAuth callbacks, and webhooks;
+   it is not a cloud-agent platform-tool prerequisite.
 
 Provider-controller keys, vault roots, Git write keys, Temporal credentials, and
 runner-pool credentials never enter a world. The leased model subscription is

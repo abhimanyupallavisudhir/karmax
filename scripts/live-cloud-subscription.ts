@@ -7,33 +7,44 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 import { E2BWorldProvider } from '../src/world/e2b.js';
 import { CodexAdapter } from '../src/agent/codex.js';
+import { ClaudeAdapter } from '../src/agent/claude.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import type { PlatformToolContext } from '../src/agent/types.js';
 import type { AgentActivity } from '../src/domain/types.js';
 
 /** Explicit, billable smoke test against an already-configured Karmax instance.
  * Unlike tests/cloud-live.test.ts, this resolves the E2B key from Karmax's vault
- * and proves that a subscription Codex process and browser MCP run in the remote
- * sandbox while Karmax dynamic tools traverse the existing app-server channel. */
+ * and proves that a subscription Claude or Codex process and browser MCP run in
+ * the remote sandbox while Karmax tools traverse the provider control channel. */
 async function main() {
   const home = path.resolve(process.env.KARMAX_LIVE_HOME ?? process.env.KARMAX_HOME ?? path.join(os.homedir(), '.karmax'));
   const taskId = process.env.KARMAX_LIVE_TASK_ID;
   if (!taskId) throw new Error('set KARMAX_LIVE_TASK_ID to an existing task whose scoped platform tools should be tested');
+  const agentProvider = process.env.KARMAX_LIVE_AGENT_PROVIDER ?? 'codex';
+  if (agentProvider !== 'codex' && agentProvider !== 'claude')
+    throw new Error('KARMAX_LIVE_AGENT_PROVIDER must be codex or claude');
+  const testBrowser = process.env.KARMAX_LIVE_BROWSER !== '0';
 
   const store = new Store(path.join(home, 'state', 'karmax.db'));
   const task = store.getTask(taskId);
   if (!task) throw new Error(`task not found: ${taskId}`);
   const project = store.getProject(task.projectId);
   if (!project?.organizationId) throw new Error('task project has no organization');
-  const localHome = resolveCodexHome(home);
-  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-live-codex-home-'));
+  const localHome = resolveSubscriptionHome(home, agentProvider);
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-live-${agentProvider}-home-`));
   fs.cpSync(localHome, isolatedHome, { recursive: true });
+  if (!testBrowser && agentProvider === 'claude') {
+    const configFile = path.join(isolatedHome, '.claude.json');
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    if (config.mcpServers) { delete config.mcpServers['chrome-devtools']; delete config.mcpServers.playwright; }
+    fs.writeFileSync(configFile, JSON.stringify(config));
+  }
 
   const broker = new CredentialBroker(new Vault(path.join(home, 'vault')));
   const connections = new WorldProviderConnectionService(store, broker);
   const connection = connections.get(project.organizationId, 'e2b');
   if (!connection?.enabled || !connection.credentialConfigured) throw new Error('E2B is not enabled and credentialed for this organization');
-  const provider = new E2BWorldProvider(undefined, undefined, undefined,
+  const worldProvider = new E2BWorldProvider(undefined, undefined, undefined,
     (organizationId, kind) => connections.resolve(organizationId, kind));
   const tokens = new TokenAuthority(store);
   const minted = tokens.mint({ taskId, profileId: 'live-cloud-smoke', principal: 'system:live-cloud-smoke',
@@ -42,7 +53,7 @@ async function main() {
   let world: Awaited<ReturnType<E2BWorldProvider['create']>> | undefined;
   try {
     console.error('[live-cloud] creating E2B sandbox');
-    world = await provider.create({ taskId: `live-e2b-subscription-${Date.now()}`,
+    world = await worldProvider.create({ taskId: `live-e2b-${agentProvider}-subscription-${Date.now()}`,
       organizationId: project.organizationId, base: 'main',
       network: { allowDomains: ['example.com'] } });
     const basic = await world.exec('bash', ['-lc', 'node --version && git --version']);
@@ -50,20 +61,21 @@ async function main() {
     await world.writeFile('live-roundtrip.txt', 'round-trip');
     if (await world.readFile('live-roundtrip.txt') !== 'round-trip') throw new Error('sandbox file round-trip failed');
 
-    console.error('[live-cloud] seeding subscription/browser runtime and starting remote Codex');
+    console.error(`[live-cloud] seeding subscription/browser runtime and starting remote ${agentProvider}`);
     // Stock templates may need several minutes to install Node, Chromium, and
     // browser OS packages before the model process even starts. Keep the live
     // diagnostic deadline comfortably beyond that one-time bootstrap.
     const turnTimeout = AbortSignal.timeout(12 * 60_000);
     const activities: AgentActivity[] = [];
-    const result = await new CodexAdapter().runTurn({
-      profile: { id: 'live-cloud-smoke', name: 'live cloud smoke', provider: 'codex', role: 'do',
+    const adapter = agentProvider === 'codex' ? new CodexAdapter() : new ClaudeAdapter();
+    const result = await adapter.runTurn({
+      profile: { id: 'live-cloud-smoke', name: 'live cloud smoke', provider: agentProvider, role: 'do',
         effort: 'low', capabilities: ['task:event:read'] },
       world,
       messages: [{ id: 'live', role: 'user', ts: Date.now(), text:
         `First call the Karmax list_events tool for taskId ${JSON.stringify(taskId)} with since 0. ` +
-        'Then use the chrome-devtools MCP to open https://example.com and take a screenshot. ' +
-        'After both tools succeed, reply with exactly READY and do not modify files.' }],
+        (testBrowser ? 'Then use the chrome-devtools MCP to open https://example.com and take a screenshot. ' : '') +
+        `After ${testBrowser ? 'both tools' : 'the tool'} succeeds, reply with exactly READY and do not modify files.` }],
       systemPrompt: 'You are a live integration test. Follow the user request exactly and keep the final response terse.',
       role: 'do', resolvedAuth: { configHome: isolatedHome }, extraEnv: { KARMAX_TOKEN: minted.token },
     }, context(turnTimeout, activities, async (method, requestPath) => {
@@ -80,13 +92,13 @@ async function main() {
     const completedTools = activities.filter((activity) => activity.kind === 'tool' && activity.phase === 'completed');
     const usedPlatform = completedTools.some((activity) => /list_events/i.test(activity.title));
     const usedBrowser = completedTools.some((activity) => /chrome-devtools.*(?:screenshot|take_screenshot)/i.test(activity.title));
-    if (!usedPlatform || !usedBrowser) {
+    if (!usedPlatform || (testBrowser && !usedBrowser)) {
       const observed = activities.map(({ kind, phase, title }) => ({ kind, phase, title }));
       throw new Error(`remote turn did not prove both MCPs completed: ${JSON.stringify(observed)}`);
     }
     const resumedActivities: AgentActivity[] = [];
-    const resumed = await new CodexAdapter().runTurn({
-      profile: { id: 'live-cloud-smoke', name: 'live cloud smoke', provider: 'codex', role: 'do',
+    const resumed = await adapter.runTurn({
+      profile: { id: 'live-cloud-smoke', name: 'live cloud smoke', provider: agentProvider, role: 'do',
         effort: 'low', capabilities: ['task:event:read'] },
       world, session: result.session,
       messages: [{ id: 'resume', role: 'user', ts: Date.now(), text:
@@ -102,11 +114,11 @@ async function main() {
     }));
     if (!/RESUMED/i.test(resumed.output) || !resumedActivities.some((activity) =>
       activity.kind === 'tool' && activity.phase === 'completed' && /list_events/i.test(activity.title))) {
-      throw new Error(`resumed remote session lost its Karmax dynamic tools: ${JSON.stringify(resumedActivities)}`);
+      throw new Error(`resumed remote session lost its Karmax platform tools: ${JSON.stringify(resumedActivities)}`);
     }
-    console.log(JSON.stringify({ ok: true, provider: 'e2b', template: connection.config.template,
+    console.log(JSON.stringify({ ok: true, worldProvider: 'e2b', agentProvider, template: connection.config.template,
       sandboxToolchain: true, fileRoundTrip: true, subscriptionAgent: true,
-      platformDynamicTools: true, resumedPlatformDynamicTools: true, browserMcp: 'chrome-devtools', session: true }));
+      platformTools: true, resumedPlatformTools: true, browserMcp: testBrowser ? 'chrome-devtools' : false, session: true }));
   } catch (error) {
     if (world) {
       const diagnostics = await world.exec('bash', ['-lc',
@@ -133,15 +145,16 @@ async function main() {
   }
 }
 
-function resolveCodexHome(home: string): string {
-  const explicit = process.env.KARMAX_LIVE_CODEX_HOME;
-  if (explicit && fs.existsSync(path.join(explicit, 'auth.json'))) return path.resolve(explicit);
+function resolveSubscriptionHome(home: string, provider: 'codex' | 'claude'): string {
+  const explicit = process.env[provider === 'codex' ? 'KARMAX_LIVE_CODEX_HOME' : 'KARMAX_LIVE_CLAUDE_HOME'];
+  const authFile = provider === 'codex' ? 'auth.json' : '.credentials.json';
+  if (explicit && fs.existsSync(path.join(explicit, authFile))) return path.resolve(explicit);
   const root = path.join(home, 'config-homes');
   const selected = fs.readdirSync(root, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith('codex-'))
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(`${provider}-`))
     .map((entry) => path.join(root, entry.name))
-    .find((candidate) => fs.existsSync(path.join(candidate, 'auth.json')));
-  if (!selected) throw new Error('no logged-in Codex config home found; set KARMAX_LIVE_CODEX_HOME');
+    .find((candidate) => fs.existsSync(path.join(candidate, authFile)));
+  if (!selected) throw new Error(`no logged-in ${provider} config home found; set KARMAX_LIVE_${provider.toUpperCase()}_HOME`);
   return selected;
 }
 
@@ -150,7 +163,10 @@ function context(signal: AbortSignal, activities: AgentActivity[],
   return {
     signalCompletion() {}, createReviewInfo() {}, createSubTask() {}, respondToSubTask() {}, raiseToParent() {},
     waitForSubtasks() {}, saveSkill() {}, resolveDecision() {}, confirmDecision() {},
-    async requestSpend() { return { status: 'denied' }; }, emit() {}, emitActivity(activity) { activities.push(activity); },
+    async requestSpend() { return { status: 'denied' }; }, emit() {}, emitActivity(activity) {
+      activities.push(activity);
+      console.error(`[live-cloud] ${activity.phase} ${activity.kind}: ${activity.title}`);
+    },
     platformRequest, signal,
   };
 }

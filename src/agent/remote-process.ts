@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
@@ -10,7 +11,6 @@ import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
 const REMOTE_ROOT = '.karmax-injection/agent';
-const CLAUDE_PACKAGE = process.env.KARMAX_REMOTE_CLAUDE_PACKAGE ?? '@anthropic-ai/claude-code@2.1.212';
 const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? '@openai/codex@0.144.5';
 const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? '22.16.0';
 const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? '10.9.2';
@@ -114,6 +114,12 @@ export function remoteAgentEnv(provider: Provider, home: string, source: Record<
   };
   for (const key of [
     'KARMAX_TOKEN', 'KARMAX_GATEWAY_URL', 'CLAUDE_CODE_OAUTH_TOKEN',
+    // Agent SDK ↔ Claude Code protocol negotiation. Dropping ENTRYPOINT makes
+    // the CLI reject stream-json input unless --print; the remaining flags are
+    // SDK feature handshakes and must cross a custom-spawn boundary unchanged.
+    'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_AGENT_SDK_VERSION',
+    'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING', 'CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH',
+    'CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH', 'CLAUDE_CODE_QUESTION_PREVIEW_FORMAT',
     'ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
   ]) {
     const value = source[key];
@@ -126,10 +132,37 @@ export function remoteAgentEnv(provider: Provider, home: string, source: Record<
  * package. npx caches it in the sandbox after the first turn. */
 export function remoteAgentCommand(provider: Provider, command: string, args: string[]): { command: string; args: string[] } {
   if (provider === 'claude') {
-    const forwarded = path.basename(command).startsWith('node') && /(?:^|\/)cli\.js$/.test(args[0] ?? '') ? args.slice(1) : args;
-    return { command: 'npx', args: ['--yes', CLAUDE_PACKAGE, ...forwarded] };
+    const sdkArgs = path.basename(command).startsWith('node') && /(?:^|\/)cli\.js$/.test(args[0] ?? '') ? args.slice(1) : args;
+    // The SDK's embedded native binary infers print mode from its entrypoint.
+    // The separately published npm CLI still validates stream-json arguments at
+    // startup in some sandbox PTYs; make the SDK's intended mode explicit.
+    const forwarded = sdkArgs.includes('--print') || sdkArgs.includes('-p') ? sdkArgs : ['--print', ...sdkArgs];
+    // The Agent SDK and its embedded Claude Code binary are one tested protocol
+    // unit. Resolve the package's declared CLI version instead of maintaining a
+    // second hand-written pin that can silently drift on dependency upgrades.
+    const packageSpec = process.env.KARMAX_REMOTE_CLAUDE_PACKAGE
+      ?? `@anthropic-ai/claude-code@${installedClaudeCodeVersion()}`;
+    return { command: 'npx', args: ['--yes', packageSpec, ...forwarded] };
   }
   return { command: 'npx', args: ['--yes', CODEX_PACKAGE, ...args] };
+}
+
+/** Version of Claude Code explicitly paired with the installed Agent SDK. */
+export function installedClaudeCodeVersion(): string {
+  const require = createRequire(import.meta.url);
+  let directory = path.dirname(require.resolve('@anthropic-ai/claude-agent-sdk'));
+  for (;;) {
+    const packageFile = path.join(directory, 'package.json');
+    try {
+      const metadata = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+      if (metadata.name === '@anthropic-ai/claude-agent-sdk' && typeof metadata.claudeCodeVersion === 'string')
+        return metadata.claudeCodeVersion;
+    } catch { /* keep walking to the package root */ }
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  throw new Error('installed Claude Agent SDK does not declare claudeCodeVersion; set KARMAX_REMOTE_CLAUDE_PACKAGE explicitly');
 }
 
 /** ChildProcess-shaped bridge backed by the provider's bidirectional PTY. This is
@@ -150,7 +183,28 @@ export function spawnRemoteAgentProcess(opts: {
   const stderr = path.posix.join(home, 'agent-stderr.log');
   const bakedExecutable = `/opt/karmax/bin/${opts.provider}`;
   const forwardedArgs = executable.args.slice(2);
-  const selectedCommand = `if [ -x ${quote(bakedExecutable)} ]; then exec ${[bakedExecutable, ...forwardedArgs].map(quote).join(' ')}; else exec ${[executable.command, ...executable.args].map(quote).join(' ')}; fi`;
+  const expectedVersion = executable.args[1]?.slice(executable.args[1]!.lastIndexOf('@') + 1) ?? '';
+  // A user may keep an older E2B/Daytona template after upgrading Karmax. Only
+  // use its baked CLI when it is the version paired with this control-plane
+  // adapter; otherwise npx installs the matching package into the sandbox cache.
+  const bakedMatches = `[ -x ${quote(bakedExecutable)} ] && ${quote(bakedExecutable)} --version 2>/dev/null | grep -Fq -- ${quote(expectedVersion)}`;
+  const invocation = (command: string, args: string[]) => {
+    if (opts.provider !== 'claude') return [command, ...args].map(quote).join(' ');
+    // World transports are PTYs, but Claude's stream-json/print mode requires
+    // non-interactive stdin. This foreground relay gives the CLI a real pipe,
+    // forwards termination, and leaves its stdout/stderr on the provider PTY.
+    const relay = [
+      "const { spawn } = require('node:child_process')",
+      "const child = spawn(process.argv[1], process.argv.slice(2), { env: process.env, stdio: ['pipe', 'inherit', 'inherit'] })",
+      "process.stdin.on('data', (data) => { const end = data.indexOf(4); if (end < 0) child.stdin.write(data); else { if (end) child.stdin.write(data.subarray(0, end)); child.stdin.end(); } })",
+      "process.stdin.on('end', () => child.stdin.end())",
+      "for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal))",
+      "child.on('error', (error) => { console.error(error); process.exitCode = 1 })",
+      "child.on('exit', (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exit(code ?? 1) })",
+    ].join('; ');
+    return ['node', '-e', relay, command, ...args].map(quote).join(' ');
+  };
+  const selectedCommand = `if ${bakedMatches}; then exec ${invocation(bakedExecutable, forwardedArgs)}; else exec ${invocation(executable.command, executable.args)}; fi`;
   const commandLine = `sh -c ${quote(selectedCommand)}`;
   // Raw mode is required for the line-oriented JSON protocols: canonical PTYs
   // truncate single lines around MAX_CANON (~4 KiB). The sandbox-local pidfile
@@ -214,6 +268,12 @@ export class RemoteSpawnedProcess extends EventEmitter {
       },
       final: (done) => { Promise.all([this.ready, this.protocolGate]).then(([pty]) => pty.write('\x04')).then(() => done(), done); },
     });
+    // ChildProcess stdin streams own an error listener internally; our
+    // ChildProcess-shaped stream must do the same. Claude's SDK observes the
+    // authoritative process exit but does not subscribe to stdin errors, so an
+    // E2B write racing a fast CLI exit would otherwise crash Node as an
+    // unhandled Writable error before the adapter can report stderr.
+    this.stdin.on('error', () => {});
     const abort = () => { this.kill('SIGTERM'); };
     if (signal?.aborted) abort();
     else signal?.addEventListener('abort', abort, { once: true });
@@ -306,6 +366,36 @@ async function remoteHomeFiles(world: World, absolute: string): Promise<Set<stri
   const root = world.handle.root.replace(/\/+$/, '');
   return new Set(result.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
     file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file));
+}
+
+/** Attach Karmax's host-mediated tools to a Codex rollout minted by another
+ * client. Codex 0.144.x accepts dynamicTools only on thread/start; native
+ * resume/fork reloads them from the first session_meta record instead. Patch
+ * only the task-private sandbox copy so the original host transcript remains
+ * byte-for-byte untouched. */
+export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAgentHome,
+  session: string, dynamicTools: unknown[]): Promise<boolean> {
+  if (!world.writeFileBuffer) return false;
+  const prefix = `${home.relative}/sessions/`;
+  const candidates = [...await remoteHomeFiles(world, home.absolute)]
+    .filter((file) => file.startsWith(prefix) && file.endsWith('.jsonl') && path.posix.basename(file).includes(session));
+  const sessionFile = candidates[0];
+  if (!sessionFile) return false;
+  const original = (await world.readFileBuffer(sessionFile)).toString('utf8');
+  const newline = original.indexOf('\n');
+  const first = newline < 0 ? original : original.slice(0, newline);
+  let metadata: any;
+  try { metadata = JSON.parse(first); }
+  catch { throw new Error(`Codex session ${session} has invalid rollout metadata`); }
+  if (metadata?.type !== 'session_meta' || !metadata.payload || typeof metadata.payload !== 'object')
+    throw new Error(`Codex session ${session} is missing its leading session_meta record`);
+  metadata.payload.dynamic_tools = dynamicTools;
+  const updated = `${JSON.stringify(metadata)}${newline < 0 ? '' : original.slice(newline)}`;
+  await world.writeFileBuffer(sessionFile, Buffer.from(updated));
+  const protectedFile = path.posix.join(world.handle.root, sessionFile);
+  const chmod = await world.exec('chmod', ['600', protectedFile]);
+  if (chmod.code !== 0) throw new Error(`could not protect patched Codex session ${session}: ${chmod.stderr || chmod.stdout}`);
+  return true;
 }
 
 /** Copy one native provider session between persistent cloud worlds. The source

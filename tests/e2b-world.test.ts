@@ -14,6 +14,7 @@ describe('E2B cloud world provider', () => {
     let ptyData: ((data: unknown) => void) | undefined;
     let ptyOptions: any;
     let createdOptions: any;
+    let timeoutRefreshes = 0;
 
     const sandbox: E2BSandboxLike = {
       sandboxId: 'sbx_test',
@@ -54,6 +55,7 @@ describe('E2B cloud world provider', () => {
       },
       async pause() { paused++; },
       async kill() { killed++; },
+      async setTimeout(value) { expect(value).toBe(123_000); timeoutRefreshes++; },
     };
     const factory: E2BFactory = {
       async create(options) { createdOptions = options; return sandbox; },
@@ -95,6 +97,7 @@ describe('E2B cloud world provider', () => {
     await terminal.write('pwd\n');
     await terminal.resize(120, 40);
     await terminal.close();
+    expect(timeoutRefreshes).toBeGreaterThanOrEqual(2); // process + PTY leases
     expect(terminal.pid).toBeUndefined(); // remote pid must never enter the host process registry
     expect(ptyOptions.cmd).toBeUndefined();
     expect(terminalOutput).toBe('ready');

@@ -14,7 +14,8 @@ import { trackProcess } from '../util/processes.js';
 import { classifyLimitError, providerErrorFromMessage, providerFailure, type ProviderFailureMetadata } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity } from './activity.js';
-import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
+import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
+  spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -219,6 +220,14 @@ export class CodexAdapter implements AgentAdapter {
     const remoteHome = remote
       ? await seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session)
       : undefined;
+    const dynamicTools = PLATFORM_TOOL_SCHEMAS.map((tool) => ({
+      type: 'function', name: tool.name, description: tool.description, inputSchema: tool.parameters,
+    }));
+    // app-server exposes dynamicTools only on thread/start. A thread created by
+    // an ordinary Codex client has no persisted Karmax definitions, so enrich
+    // its sandbox-local rollout metadata before a true native resume/fork.
+    if (remoteHome && input.session)
+      await ensureRemoteCodexSessionTools(input.world, remoteHome, input.session, dynamicTools);
     let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome, ...(input.extraEnv ? { extra: input.extraEnv } : {}) });
     if (remoteHome) env = remoteAgentEnv('codex', remoteHome.absolute, {
       ...env,
@@ -515,9 +524,7 @@ export class CodexAdapter implements AgentAdapter {
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
           developerInstructions: input.systemPrompt,
-          ...(remote ? { dynamicTools: PLATFORM_TOOL_SCHEMAS.map((tool) => ({
-            type: 'function', name: tool.name, description: tool.description, inputSchema: tool.parameters,
-          })) } : {}),
+          ...(remote ? { dynamicTools } : {}),
           ...(model ? { model } : {}),
         });
         threadId = started?.thread?.id ?? threadId;

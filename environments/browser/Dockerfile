@@ -3,7 +3,10 @@ FROM node:22-bookworm
 ARG CHROME_DEVTOOLS_MCP_VERSION=1.6.0
 ARG PLAYWRIGHT_MCP_VERSION=0.0.78
 ARG PLAYWRIGHT_VERSION=1.61.1
-ARG CLAUDE_CODE_VERSION=2.1.212
+# Keep the pre-baked fast path paired with package.json's Agent SDK. Runtime
+# launch also verifies this version and falls back to the SDK-declared npx pin
+# when a user has not rebuilt an older template yet.
+ARG CLAUDE_CODE_VERSION=2.1.191
 ARG CODEX_VERSION=0.144.5
 
 ENV DEBIAN_FRONTEND=noninteractive \

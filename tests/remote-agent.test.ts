@@ -4,7 +4,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../src/agent/codex.js';
-import { materializeRemoteSession, remoteAgentCommand, remoteAgentEnv, remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome } from '../src/agent/remote-process.js';
+import { installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
+  remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome } from '../src/agent/remote-process.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
 describe('remote subscription agents', () => {
@@ -54,12 +55,15 @@ describe('remote subscription agents', () => {
     expect(remoteAgentEnv('claude', '/workspace/.karmax-injection/agent/claude', {
       PATH: '/host/bin', HOME: '/host/home', OPENAI_API_KEY: 'wrong-account',
       CLAUDE_CODE_OAUTH_TOKEN: 'subscription', KARMAX_TOKEN: 'turn-token',
+      CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDE_AGENT_SDK_VERSION: '0.3.191',
     })).toEqual({
       CLAUDE_CONFIG_DIR: '/workspace/.karmax-injection/agent/claude',
       CLAUDE_CODE_OAUTH_TOKEN: 'subscription', KARMAX_TOKEN: 'turn-token',
+      CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDE_AGENT_SDK_VERSION: '0.3.191',
     });
+    expect(installedClaudeCodeVersion()).toBe('2.1.191');
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
-      .toEqual(expect.arrayContaining(['@anthropic-ai/claude-code@2.1.212', '--resume', 's']));
+      .toEqual(expect.arrayContaining(['@anthropic-ai/claude-code@2.1.191', '--print', '--resume', 's']));
     expect(remoteAgentCommand('codex', 'codex', ['app-server']).args)
       .toEqual(expect.arrayContaining(['@openai/codex@0.144.5', 'app-server']));
   });
@@ -141,15 +145,49 @@ describe('remote subscription agents', () => {
     expect(platformCalls).toEqual(['GET /api/tasks/task/events?since=0']);
     expect(world.dynamicTools).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'list_events' })]));
   });
+
+  it.each([
+    { fork: false, method: 'thread/resume' },
+    { fork: true, method: 'thread/fork' },
+  ])('adds Karmax tools before native Codex $method of an external session', async ({ fork, method }) => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-external-codex-'));
+    fs.writeFileSync(path.join(localHome, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    const session = '019f-external-thread';
+    const directory = path.join(localHome, 'sessions', '2026', '07', '19');
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, `rollout-${session}.jsonl`),
+      `${JSON.stringify({ timestamp: 'now', type: 'session_meta', payload: { session_id: session, cwd: '/host' } })}\n` +
+      `${JSON.stringify({ timestamp: 'now', type: 'event_msg', payload: { type: 'task_started' } })}\n`);
+    const world = fakeWorld(true);
+
+    await new CodexAdapter().runTurn({
+      profile: { id: 'p', name: 'codex', provider: 'codex', role: 'do', capabilities: [] },
+      world, session, fork,
+      messages: [{ id: 'm', role: 'user', text: 'continue', ts: 0 }],
+      systemPrompt: 'Do the task.', role: 'do', resolvedAuth: { configHome: localHome },
+    } as any, { emit() {}, emitActivity() {},
+      platformRequest: async () => [{ type: 'ok' }] } as any);
+
+    expect(world.requests.some((request) => request.method === method)).toBe(true);
+    const remoteHome = remoteAgentHomeRelative('codex', localHome);
+    const rollout = world.files.get(`${remoteHome}/sessions/2026/07/19/rollout-${session}.jsonl`)!.toString();
+    const metadata = JSON.parse(rollout.split('\n')[0]!);
+    expect(metadata.payload.dynamic_tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'function', name: 'list_events' }),
+      expect.objectContaining({ type: 'function', name: 'publish_task_branch' }),
+      expect.objectContaining({ type: 'function', name: 'message_agent' }),
+    ]));
+  });
 });
 
 function fakeWorld(appServer = false, browserReady = false): World & {
-  files: Map<string, Buffer>; commands: string[]; openedPty?: WorldPtySpec; dynamicTools?: any[];
+  files: Map<string, Buffer>; commands: string[]; requests: any[]; openedPty?: WorldPtySpec; dynamicTools?: any[];
 } {
   const files = new Map<string, Buffer>();
   const commands: string[] = [];
-  const world: World & { files: Map<string, Buffer>; commands: string[]; openedPty?: WorldPtySpec; dynamicTools?: any[] } = {
-    files, commands,
+  const requests: any[] = [];
+  const world: World & { files: Map<string, Buffer>; commands: string[]; requests: any[]; openedPty?: WorldPtySpec; dynamicTools?: any[] } = {
+    files, commands, requests,
     handle: { version: 2, kind: 'e2b', provider: 'e2b', sealedProviderRef: 'sealed', id: 'task', root: '/workspace', branch: 'task', base: 'main' },
     async exec(command, args) {
       commands.push([command, ...args].join(' '));
@@ -193,12 +231,17 @@ function fakeWorld(appServer = false, browserReady = false): World & {
             const line = input.slice(0, newline); input = input.slice(newline + 1);
             if (!line.trim()) continue;
             const request = JSON.parse(line);
+            requests.push(request);
             if (request.method === 'initialize') send({ id: request.id, result: {} });
             else if (request.method === 'mcpServerStatus/list') send({ id: request.id, result: { data: [], nextCursor: null } });
             else if (request.method === 'thread/start') {
               world.dynamicTools = request.params.dynamicTools;
               send({ id: request.id, result: { thread: { id: 'remote-thread' } } });
             }
+            else if (request.method === 'thread/resume')
+              send({ id: request.id, result: { thread: { id: request.params.threadId } } });
+            else if (request.method === 'thread/fork')
+              send({ id: request.id, result: { thread: { id: 'forked-remote-thread' } } });
             else if (request.method === 'turn/start') {
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });
               send({ method: 'turn/started', params: { turn: { id: 'remote-turn' } } });

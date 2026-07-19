@@ -1936,19 +1936,23 @@ export class Gateway {
         if (!task || !project?.organizationId || !relPath) return this.json(res, 400, { error: 'task and artifact path are required' });
         const handle = worldHandleForView(task.lastView, taskId, store.effectiveProjectConfig(project));
         if (!handle) return this.json(res, 404, { error: 'no world for this task' });
-        const world = await this.deps.worlds.open(handle);
-        const data = await world.readFileBuffer(relPath);
-        if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
-        const id = newId('artifact');
-        const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
-        const mediaType = String(b.mediaType ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream');
-        const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
-        await this.deps.objects.put(objectKey, data, mediaType);
-        const ttlMs = b.ttlMs == null ? undefined : Math.max(60_000, Math.min(Number(b.ttlMs), 365 * 24 * 60 * 60 * 1000));
-        const artifact = store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
-          taskId, objectKey, sha256: crypto.createHash('sha256').update(data).digest('hex'), bytes: data.length,
-          mediaType, name, createdAt: Date.now(), ...(ttlMs ? { expiresAt: Date.now() + ttlMs } : {}) });
-        return this.json(res, 200, artifact);
+        let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
+        try {
+          access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+          const world = access?.world ?? await this.deps.worlds.open(handle);
+          const data = await world.readFileBuffer(relPath);
+          if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
+          const id = newId('artifact');
+          const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
+          const mediaType = String(b.mediaType ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream');
+          const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
+          await this.deps.objects.put(objectKey, data, mediaType);
+          const ttlMs = b.ttlMs == null ? undefined : Math.max(60_000, Math.min(Number(b.ttlMs), 365 * 24 * 60 * 60 * 1000));
+          const artifact = store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
+            taskId, objectKey, sha256: crypto.createHash('sha256').update(data).digest('hex'), bytes: data.length,
+            mediaType, name, createdAt: Date.now(), ...(ttlMs ? { expiresAt: Date.now() + ttlMs } : {}) });
+          return this.json(res, 200, artifact);
+        } finally { await access?.release(); }
       }
       const promotedArtifact = p.match(/^\/api\/artifacts\/([^/]+)$/);
       if (promotedArtifact) {
