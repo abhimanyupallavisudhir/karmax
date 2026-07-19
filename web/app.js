@@ -62,6 +62,7 @@ const S = {
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   agentQueue: { capacity: 3, queue: [], current: [] }, // workflow-owned host admission queue
   modelCatalog: null, // provider-native model metadata loaded from the gateway
+  worldProviderConnections: [], // org's connected remote sandbox providers → Agent-environment options
   inviteNotice: null,
 };
 
@@ -435,8 +436,22 @@ function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
   el.outerHTML = effortSelectHtml(effortCls, provider, model, el.value || '');
 }
 
+// The "Agent environment" (worldProvider) choices depend on the deployment and
+// which remote sandbox providers the organization has connected — so the manifest
+// ships an empty option list and the client fills it in. An empty first option ⇒
+// inherit the project / organization default.
+function agentEnvOptions() {
+  const local = S.meta?.hosted ? [] : ['worktree', 'container'];
+  const connected = (S.worldProviderConnections || [])
+    .filter((c) => c.enabled && c.credentialConfigured)
+    .map((c) => c.provider);
+  return ['', ...new Set([...local, ...connected])];
+}
+
 function schemaFor(workflow) {
-  return (S.schema.find((s) => s.name === workflow)?.params) || [];
+  const params = S.schema.find((s) => s.name === workflow)?.params || [];
+  // Fill the Agent-environment select's options from the live provider catalog.
+  return params.map((f) => (f.name === 'worldProvider' ? { ...f, options: agentEnvOptions() } : f));
 }
 
 // ── generic field renderer (SPEC §10.4 / §10.5) ──────────────────────────────
@@ -478,8 +493,13 @@ function renderField(f, own, inherited, withChips, alt) {
   }
   if (f.type === 'boolean')
     return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${f.required ? '' : resetBtns(f.name, alt)}</div></div>`;
-  if (f.type === 'select')
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+  if (f.type === 'select') {
+    // Keep the effective value selectable even if it isn't in the (possibly
+    // dynamic) option list — e.g. an inherited provider not connected locally.
+    const opts = [...(f.options || [])];
+    if (v !== '' && !opts.includes(v)) opts.push(v);
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${opts.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${o === '' ? 'Inherit default' : esc(o)}</option>`).join('')}</select></div>`;
+  }
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
@@ -517,18 +537,24 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   const group = renderAgentGroup(fields, own, inherited, altFor);
   const grouped = new Set(group ? agentGroupFields(fields).map((f) => f.name) : []);
   let groupDrawn = false;
+  // Base, target, and the Agent environment share one row (rendered at the first
+  // of them present, in this order); the rest are skipped where they'd fall.
+  const inlineRow = ['base', 'target', 'worldProvider'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
+  const inlineNames = new Set(inlineRow.map((f) => f.name));
+  let inlineDrawn = false;
   const html = [];
   for (const f of fields) {
     if (grouped.has(f.name)) {
       if (!groupDrawn) { html.push(group); groupDrawn = true; }
       continue;
     }
-    if (f.name === 'base' && fields.some((x) => x.name === 'target')) {
-      const target = fields.find((x) => x.name === 'target');
-      html.push(`<div class="branch-pair">${renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))}${renderField(target, own[target.name], inherited[target.name], false, altFor?.(target))}</div>`);
+    if (inlineNames.has(f.name) && inlineRow.length > 1) {
+      if (!inlineDrawn) {
+        inlineDrawn = true;
+        html.push(`<div class="branch-pair${inlineRow.length === 3 ? ' cols-3' : ''}">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`);
+      }
       continue;
     }
-    if (f.name === 'target' && fields.some((x) => x.name === 'base')) continue;
     html.push(renderField(f, own[f.name], inherited[f.name], withPromptChips && f.name === 'prompt', altFor?.(f)));
   }
   return html.join('');
@@ -1533,6 +1559,7 @@ async function boot() {
     S.contributions = await api(`/api/contributions${projectScope}`);
     S.schema = await api(`/api/schema${projectScope}`);
     S.modelCatalog = (await api(`/api/models${projectScope}`)).providers;
+    if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
   } catch {}
   connectWs();
   renderShell();
@@ -5705,7 +5732,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
 // edited in the Agents card beside the Do/Merge agents it gates — not here.
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
@@ -5850,6 +5877,7 @@ function settingsView(proj) {
 }
 function cloudEnvironmentCard(proj) {
   return `<div class="card"><div class="section-h">Where tasks run</div>
+    <p class="task-sub">Agent environments (worktree / container / E2B / Daytona), remote-provider connections, runner pools, and the organization budget are set up in <a class="organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-compute">Organization → Compute</a>. This section only tightens them for this project.</p>
     <div id="project-execution">Loading organization execution policy…</div>
   </div>`;
 }
@@ -6033,32 +6061,28 @@ async function hydrateExecutionProviders(proj) {
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
     ]);
-    const available = connections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider);
-    const local = S.meta?.hosted ? [] : ['worktree', 'container'];
-    const providers = [...new Set([...local, ...available])];
-    const selected = policy.override.worldProvider || '';
+    S.worldProviderConnections = connections;
+    // The Agent environment (worktree / container / E2B / Daytona) now lives in
+    // Task defaults — and can be overridden per task. Compute keeps the runner pool
+    // and budget, which only vary by environment, so the pool list is filtered by
+    // the effective environment (shown read-only here).
+    const environment = policy.effective.worldProvider || 'worktree';
     box.innerHTML = `<div class="settings-grid">
-      <label class="form-row">Execution provider<select id="project-execution-provider"><option value="">Organization default — ${esc(policy.organization.worldProvider || 'worktree')}</option>${providers.map((provider) => `<option value="${esc(provider)}" ${provider === selected ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
       <label class="form-row">Runner pool<select id="project-execution-pool"></select></label>
       <label class="form-row">Optional tighter project budget (USD/month)<input id="project-execution-budget" type="number" min="0" step="0.01" value="${policy.override.monthlyBudgetMicros == null ? '' : esc(policy.override.monthlyBudgetMicros / 1e6)}" placeholder="Use organization budget" /></label>
-    </div><div class="task-sub">Effective: ${esc(policy.effective.worldProvider)} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
-    <button class="btn sm primary" id="project-execution-save">Save project override</button>`;
-    const syncPools = (keep = '') => {
-      const provider = $('#project-execution-provider').value || policy.organization.worldProvider || 'worktree';
-      const matching = pools.filter((pool) => pool.provider === provider && pool.enabled);
-      $('#project-execution-pool').innerHTML = `<option value="">${provider === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === keep ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-    };
-    syncPools(policy.override.runnerPoolId || '');
-    $('#project-execution-provider')?.addEventListener('change', () => syncPools());
+    </div><div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
+    <button class="btn sm primary" id="project-execution-save">Save compute override</button>`;
+    const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
+    $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
     $('#project-execution-save')?.addEventListener('click', async () => {
-      const provider = $('#project-execution-provider').value; const pool = $('#project-execution-pool').value;
+      const pool = $('#project-execution-pool').value;
       const budget = $('#project-execution-budget').value.trim();
       try {
         await api(`/api/projects/${proj.id}/execution-policy`, { method: 'PUT', body: JSON.stringify({ override: {
-          worldProvider: provider || null, runnerPoolId: pool || null,
+          runnerPoolId: pool || null,
           monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
         } }) });
-        await loadProjects(); toast('Project execution policy saved'); await hydrateExecutionProviders(proj);
+        await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { toast(`Could not load compute providers: ${error.message}`, true); }
@@ -6915,10 +6939,13 @@ async function hydrateOrganizationView() {
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
-  const connectedProviders = providerConnections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider);
-  const executionProviders = [...new Set([executionPolicy.worldProvider, ...(S.meta?.hosted ? [] : ['worktree', 'container']), ...connectedProviders].filter(Boolean))];
+  S.worldProviderConnections = providerConnections;
+  // The default Agent environment moved to Task defaults (below) and can be
+  // overridden per project/task. Compute keeps the runner pool + budget; the pool
+  // list is scoped to the effective environment, shown read-only here.
+  const orgEnvironment = executionPolicy.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
   $('#org-execution').innerHTML = `<div class="settings-grid">
-    <label class="form-row">Default provider<select id="org-execution-provider">${executionProviders.map((provider) => `<option value="${esc(provider)}" ${provider === executionPolicy.worldProvider ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
+    <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
     <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
     <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
     <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
@@ -6929,11 +6956,17 @@ async function hydrateOrganizationView() {
   <p class="task-sub">Coding agents normally need arbitrary package registries, documentation, web search, and APIs. Restricted mode is for organizations with a maintained egress policy.</p>
   <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
   <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
+  const providerInfo = {
+    e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
+    daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io' },
+  };
   $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
     const connection = connectionFor(provider); const config = connection?.config || {};
     const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
+    const info = providerInfo[provider];
     return `<div class="team-block provider-connection" data-provider="${provider}">
-      <div class="member-row"><b>${provider === 'e2b' ? 'E2B' : 'Daytona'}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
+      <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
+      <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
       ${provider === 'e2b' ? `<label class="form-row">Template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-node22" /></label>`
@@ -6983,20 +7016,15 @@ async function hydrateOrganizationView() {
     row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   });
   $('#runner-create')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, capacity: { activeWorlds: Number($('#runner-worlds').value) } }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  const syncOrganizationPools = (keep = '') => {
-    const provider = $('#org-execution-provider').value;
-    const matching = runners.filter((pool) => pool.provider === provider && pool.enabled);
-    $('#org-execution-pool').innerHTML = `<option value="">Provider-managed default</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === keep ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-  };
-  syncOrganizationPools(executionPolicy.runnerPoolId || '');
-  $('#org-execution-provider')?.addEventListener('change', () => syncOrganizationPools());
+  const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
+  $('#org-execution-pool').innerHTML = `<option value="">Provider-managed default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
   $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
   $('#org-execution-save')?.addEventListener('click', async () => {
     const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
     const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
     try {
       await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
-        worldProvider: $('#org-execution-provider').value, runnerPoolId: $('#org-execution-pool').value || undefined,
+        runnerPoolId: $('#org-execution-pool').value || undefined,
         resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
         network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
         monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
