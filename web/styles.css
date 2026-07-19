@@ -145,6 +145,13 @@ a { color: var(--accent); text-decoration: none; }
   padding: 0 4px; border-radius: 9px; background: var(--accent); color: #fff;
   font-size: 10px; font-weight: 700; display: grid; place-items: center;
 }
+.topbar-user {
+  display: inline-flex; align-items: center;
+  height: 34px; padding: 0 12px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--surface-2); color: var(--ink-2); cursor: pointer; font-weight: 600;
+  max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.topbar-user:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface); }
 
 .body { display: grid; grid-template-columns: 232px 1fr; overflow: hidden; }
 
@@ -224,6 +231,24 @@ a { color: var(--accent); text-decoration: none; }
 .task-sub .branch { font-family: var(--font-mono); }
 .principal-chip { display:inline-flex; align-items:center; border-radius:999px; padding:2px 7px; background:var(--accent-weak); color:var(--accent); font-weight:600; }
 .task-right { display: flex; align-items: center; gap: 12px; }
+
+/* ── real-link rows ─────────────────────────────────────────────
+   Rows that open a task (task list, run history, merge/agent queues) are real
+   links: wireTaskNav() lays an absolutely-positioned <a> across the row so the
+   browser offers every native "open in new tab/window" gesture (Ctrl/⌘-click,
+   middle-click, Shift-click, right-click → Open in new tab). A plain left-click
+   is caught by installLinkRouter() and routed in place, so ordinary navigation
+   stays instant — no page reload. The overlay is a positive-z layer that sits
+   above the row's static text (so clicking anywhere navigates) but BELOW the
+   row's own controls, which are lifted above it here so buttons, drag handles
+   and drag-to-reorder keep working. */
+.has-row-link { position: relative; }
+.row-link { position: absolute; inset: 0; z-index: 1; border-radius: inherit; }
+.has-row-link button,
+.has-row-link .queue-actions,
+.has-row-link .drag-handle,
+.has-row-link [data-move],
+.has-row-link a:not(.row-link) { position: relative; z-index: 2; }
 .icon-btn svg { display: block; } /* archive/unarchive glyphs sit flush in the icon button */
 
 /* Undo action inside a toast — so an accidental archive is one click to reverse. */
@@ -485,8 +510,50 @@ a { color: var(--accent); text-decoration: none; }
 .msg.system { align-self: center; background: transparent; color: var(--ink-3); font-size: 12px; font-style: italic; }
 .msg-text { white-space: pre-wrap; }
 .msg-meta { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; }
+.msg-meta-gap { flex: 1; }
 .msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; font-family: var(--font-mono); }
 .msg time, .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
+
+/* A little copy control per message — faint until the bubble is hovered. */
+.msg-copy { display: inline-flex; align-items: center; justify-content: center; padding: 2px; border: 0; background: transparent; color: currentColor; opacity: 0; cursor: pointer; border-radius: 5px; transition: opacity .12s, background .12s; }
+.msg:hover .msg-copy, .msg-copy:focus-visible { opacity: .55; }
+.msg-copy:hover { opacity: 1; background: rgba(127, 127, 127, .18); }
+.msg-copy.copied { opacity: 1; color: var(--ok, #2f9e44); }
+.msg-copy.copied::after { content: "✓"; }
+.msg-copy.copied svg { display: none; }
+
+/* Rendered Markdown inside a message bubble: drop the raw pre-wrap and give the
+   common block elements sane, compact spacing. */
+.msg-text.md { white-space: normal; }
+.msg-text.md > :first-child { margin-top: 0; }
+.msg-text.md > :last-child { margin-bottom: 0; }
+.msg-text.md .md-p { margin: 0 0 8px; }
+.msg-text.md .md-h { margin: 10px 0 6px; line-height: 1.25; font-weight: 650; }
+.msg-text.md h1.md-h { font-size: 1.3em; }
+.msg-text.md h2.md-h { font-size: 1.18em; }
+.msg-text.md h3.md-h { font-size: 1.06em; }
+.msg-text.md h4.md-h, .msg-text.md h5.md-h, .msg-text.md h6.md-h { font-size: 1em; }
+.msg-text.md .md-list { margin: 0 0 8px; padding-left: 1.5em; }
+.msg-text.md ol.md-list { list-style: decimal; }
+.msg-text.md ul.md-list { list-style: disc; }
+.msg-text.md .md-list li { margin: 2px 0; }
+/* Nested lists hug their parent item; only the outermost list carries margin. */
+.msg-text.md .md-list .md-list { margin: 2px 0 0; }
+/* Loose lists (blank lines between items) breathe a little more. */
+.msg-text.md .md-loose > li { margin: 6px 0; }
+/* A paragraph that is the sole/last child of a list item shouldn't add a gap. */
+.msg-text.md .md-list li > .md-p:last-child { margin-bottom: 0; }
+.msg-text.md .md-quote { margin: 0 0 8px; padding: 2px 0 2px 10px; border-left: 3px solid var(--line); opacity: .9; }
+.msg-text.md .md-hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
+.msg-text.md a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.msg-text.md .md-inline { font-family: var(--font-mono); font-size: .9em; padding: 1px 4px; border-radius: 4px; background: rgba(127, 127, 127, .16); }
+.msg-text.md .md-code { margin: 0 0 8px; padding: 9px 11px; border-radius: 8px; overflow-x: auto; background: rgba(127, 127, 127, .14); }
+.msg-text.md .md-code code { font-family: var(--font-mono); font-size: 12px; line-height: 1.5; white-space: pre; }
+.msg-text.md .md-math { white-space: normal; }
+.msg-text.md .md-table { border-collapse: collapse; margin: 0 0 8px; display: block; overflow-x: auto; max-width: 100%; font-size: .95em; }
+.msg-text.md .md-table th, .msg-text.md .md-table td { border: 1px solid var(--line); padding: 5px 10px; text-align: left; vertical-align: top; }
+.msg-text.md .md-table th { background: rgba(127, 127, 127, .12); font-weight: 600; }
+.msg-text.md .md-table tr:nth-child(even) td { background: rgba(127, 127, 127, .05); }
 
 /* Provider-native work items. Commands, file edits, tools, reasoning and turn
    lifecycle live inline with the messages, but stay visually quieter than chat. */
@@ -572,6 +639,25 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .form-row input:focus { border-color: var(--accent); }
 .switch { display: flex; align-items: center; gap: 10px; }
 .switch input { width: 38px; height: 22px; }
+
+/* profile page */
+.profile-page { max-width: 620px; }
+.profile-identity { display: flex; align-items: center; gap: 16px; margin-bottom: 18px; }
+.profile-avatar {
+  width: 56px; height: 56px; border-radius: 50%; flex: none;
+  background: linear-gradient(135deg, var(--accent), #8a6cf0); color: #fff;
+  display: grid; place-items: center; font-size: 22px; font-weight: 700; overflow: hidden;
+}
+.profile-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.profile-name { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+.profile-email { color: var(--ink-3); font-size: 13px; margin-top: 2px; }
+.profile-rows { display: flex; flex-direction: column; }
+.profile-row {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 10px 0; border-top: 1px solid var(--line);
+}
+.profile-row-label { color: var(--ink-3); font-size: 13px; }
+.profile-row-value { font-weight: 600; text-align: right; word-break: break-word; }
 
 /* confirm layers (SPEC §5.2): one bordered row per Review gate, played in order */
 .cf-layer { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; background: var(--surface); }

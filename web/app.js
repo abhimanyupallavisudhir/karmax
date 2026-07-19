@@ -124,7 +124,7 @@ function currentOrg() {
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
 // Second-segment words that name an organization-level view rather than a project.
-const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox' };
+const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', profile: 'profile' };
 
 function parseRoute(pathname) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
@@ -295,31 +295,65 @@ function taskUrl(id) {
   return p ? `${projectRoute(p.id)}/tasks/${keyPart}` : location.pathname;
 }
 
-// Push a task permalink and remember where to return on close — but only when
-// coming FROM a list/queue, so j/k-walking between task pages keeps the original
-// list (not the previous task) as the place Esc returns to.
-function goToTask(id) {
-  if (!parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
-  return go(taskUrl(id));
+// True when a click means "open in a new tab/window" by browser convention: any
+// modifier key, or a non-primary mouse button. Real <a> elements honour this
+// natively — we only consult it so JS handlers never hijack such a click.
+function isNewTabClick(ev) {
+  return ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey;
 }
 
-// Make an element open a task like a link: plain click navigates in place;
-// Ctrl/⌘-click and middle-click open the task's permalink in a new browser tab.
-// `getId(ev)` returns the task id, or null to ignore the click (e.g. it landed
-// on an inner button); `open` overrides the in-place action (default goToTask).
-function wireTaskNav(el, getId, open = goToTask) {
-  el.addEventListener('click', (ev) => {
-    const id = getId(ev);
-    if (!id) return;
-    if (ev.ctrlKey || ev.metaKey) return void window.open(taskUrl(id), '_blank', 'noopener');
-    open(id);
-  });
-  el.addEventListener('auxclick', (ev) => {
-    const id = ev.button === 1 ? getId(ev) : null;
-    if (!id) return;
+// Navigate to an in-app path, remembering the list to return to when opening a
+// task from a non-task page (so Esc / j-k walking returns to the list, not the
+// previous task). Generalises the old goToTask logic to any SPA link.
+function spaNavigate(href) {
+  const to = parseRoute(href);
+  if (to && to.taskKey && !parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
+  return go(href);
+}
+
+// Every in-app link is a real `<a data-spa href="/…">` anchor, so the browser
+// hands us every native "open in a new tab/window" affordance for free:
+// Ctrl/⌘-click, middle-click, Shift-click, right-click → "Open link in new tab",
+// drag-to-bookmark and the hover URL preview. This single delegated handler is
+// the *only* thing that keeps a plain left-click fast — it cancels the full-page
+// navigation and routes in place. Every modified or non-primary click falls
+// through untouched, so the browser opens it exactly as it would any web link.
+function installLinkRouter() {
+  document.addEventListener('click', (ev) => {
+    if (isNewTabClick(ev) || ev.defaultPrevented) return;
+    const a = ev.target.closest('a[data-spa]');
+    if (!a) return;
+    const href = a.getAttribute('href');
+    if (!href || href[0] !== '/') return; // only same-origin app routes route in place
     ev.preventDefault();
-    window.open(taskUrl(id), '_blank', 'noopener');
+    spaNavigate(href);
   });
+}
+
+// Push a task permalink (in place), remembering where to return on close.
+function goToTask(id) { return spaNavigate(taskUrl(id)); }
+
+// Make a whole row open its task like a real link. Rather than fake it in JS
+// (which can't offer the right-click "Open in new tab" menu, Shift-click, or a
+// hover preview), we lay a real `<a>` across the row: an absolutely-positioned
+// overlay that the browser treats as an ordinary link for every "new tab"
+// gesture, while installLinkRouter() catches its plain left-click and routes in
+// place — so normal clicking stays exactly as fast as before, with no reload.
+// Inner buttons/handles sit above the overlay (see the .has-row-link CSS) and
+// keep working; the overlay is non-draggable so it never shadows a row's own
+// drag-to-reorder. `getId()` returns the task id (falsy → leave the row inert).
+function wireTaskNav(el, getId) {
+  const id = getId();
+  if (!id) return;
+  el.classList.add('has-row-link');
+  const a = document.createElement('a');
+  a.className = 'row-link';
+  a.href = taskUrl(id);
+  a.dataset.spa = '';
+  a.draggable = false;
+  a.tabIndex = -1;
+  a.setAttribute('aria-hidden', 'true');
+  el.appendChild(a);
 }
 
 // A short human label for a task id: `#num` when known, else a short id.
@@ -1154,6 +1188,318 @@ function renderMessageImages(images) {
     .join('')}</div>`;
 }
 
+// ── conversation rendering: markdown + math ──────────────────────────────────
+// Messages render as Markdown (with optional MathJax) by default; both can be
+// turned off in Organization settings → Advanced → Appearance. The flags live in
+// localStorage (a per-browser display choice, like the theme toggle), and every
+// reader is defensive about a missing localStorage so the same functions run
+// under the plain-node conversation tests.
+function renderFlag(key, dflt) {
+  try { const v = localStorage.getItem(key); return v == null ? dflt : v === '1'; } catch { return dflt; }
+}
+const markdownEnabled = () => renderFlag('karmax-md-render', true);
+const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
+
+// A message body: Markdown when enabled, otherwise the previous plain-escaped
+// text (the .msg-text pre-wrap handles its newlines). The caller adds the `md`
+// class so the two whitespace models don't collide.
+function renderMessageBody(text) {
+  return markdownEnabled() ? renderMarkdown(text, { math: mathjaxEnabled() }) : esc(text);
+}
+
+// A little copy control for a message bubble — copies the raw source text (the
+// attribute round-trips it: the browser decodes the entities back on read).
+function messageCopyButton(text) {
+  if (!text) return '';
+  return `<button class="msg-copy" data-copy-msg="${esc(text)}" title="Copy message" aria-label="Copy message">${ICON.copy}</button>`;
+}
+
+function wireMessageCopies(root = document) {
+  root.querySelectorAll('.msg-copy').forEach((btn) => {
+    if (btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      copyToClipboard(btn.dataset.copyMsg || '').then(() => {
+        btn.classList.add('copied');
+        setTimeout(() => btn.classList.remove('copied'), 1200);
+      });
+    });
+  });
+}
+
+// A compact, dependency-free Markdown renderer. It escapes first (untrusted
+// agent/user text), then applies a small, common subset: fenced + inline code,
+// headings, lists, blockquotes, rules, bold/italic/strike, links, and — when
+// math is on — $…$ / $$…$$ spans left intact for MathJax to typeset. Code and
+// math are stashed up front so inline formatting can't corrupt their contents;
+// the single stash is restored once at the end (nested blocks recurse through
+// mdBlocks, never renderMarkdown, so indices never clash).
+function renderMarkdown(src, opts = {}) {
+  const withMath = !!opts.math;
+  const stash = [];
+  const keep = (html) => `\u0000${stash.push(html) - 1}\u0000`;
+  let s = String(src ?? '').replace(/\r\n?/g, '\n');
+  // Fenced code blocks first (a blank line around the placeholder keeps it its
+  // own block).
+  s = s.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, body) =>
+    `\n${keep(`<pre class="md-code"><code>${esc(body.replace(/\n$/, ''))}</code></pre>`)}\n`);
+  if (withMath) s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, body) => keep(`<span class="md-math">$$${esc(body)}$$</span>`));
+  s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
+  if (withMath) s = s.replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
+  let html = mdBlocks(s, stash);
+  return html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+}
+
+function mdBlocks(s, stash) {
+  const lines = s.split('\n');
+  const out = [];
+  const bullet = /^\s*([-*+]|\d+[.)])\s+/;
+  const rule = /^\s*([-*_])(\s*\1){2,}\s*$/;
+  // A GFM pipe table: a header row followed by a |---|:--:| delimiter row.
+  const isTableStart = (idx) => idx + 1 < lines.length && lines[idx].includes('|')
+    && mdIsDelimiterRow(lines[idx + 1]) && mdSplitRow(lines[idx]).length > 1;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+    let m;
+    if ((m = /^(#{1,6})\s+(.*)$/.exec(line))) {
+      out.push(`<h${m[1].length} class="md-h">${mdInline(m[2].trim())}</h${m[1].length}>`);
+      i++; continue;
+    }
+    if (rule.test(line)) { out.push('<hr class="md-hr"/>'); i++; continue; }
+    if (/^\s*>\s?/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      out.push(`<blockquote class="md-quote">${mdBlocks(buf.join('\n'), stash)}</blockquote>`);
+      continue;
+    }
+    if (bullet.test(line)) {
+      const { html, next } = mdParseList(lines, i, stash);
+      out.push(html);
+      i = next;
+      continue;
+    }
+    if (isTableStart(i)) {
+      const headers = mdSplitRow(lines[i]);
+      const aligns = mdSplitRow(lines[i + 1]).map(mdCellAlign);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && !/^\s*$/.test(lines[i]) && lines[i].includes('|') && !mdIsDelimiterRow(lines[i])) {
+        rows.push(mdSplitRow(lines[i])); i++;
+      }
+      const al = (x) => (aligns[x] ? ` style="text-align:${aligns[x]}"` : '');
+      const head = `<thead><tr>${headers.map((h, x) => `<th${al(x)}>${mdInline(h)}</th>`).join('')}</tr></thead>`;
+      const body = rows.length
+        ? `<tbody>${rows.map((r) => `<tr>${headers.map((_, x) => `<td${al(x)}>${mdInline(r[x] || '')}</td>`).join('')}</tr>`).join('')}</tbody>`
+        : '';
+      out.push(`<table class="md-table">${head}${body}</table>`);
+      continue;
+    }
+    const buf = [line];
+    i++;
+    while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^(#{1,6})\s+/.test(lines[i])
+      && !bullet.test(lines[i]) && !/^\s*>\s?/.test(lines[i]) && !rule.test(lines[i]) && !isTableStart(i)) {
+      buf.push(lines[i]); i++;
+    }
+    const joined = buf.join('\n');
+    const sole = /^\u0000(\d+)\u0000$/.exec(joined.trim());
+    if (sole) { out.push(joined.trim()); continue; } // a lone code/display-math block: no wrapping <p>
+    out.push(`<p class="md-p">${mdInline(joined).replace(/\n/g, '<br>')}</p>`);
+  }
+  return out.join('\n');
+}
+
+// One list-item line: leading indent, the marker (bullet or `N.`/`N)`), the gap
+// after it, and the item's first-line content.
+const MD_ITEM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)(.*)$/;
+const mdListKind = (marker) => (/^\d/.test(marker) ? 'ol' : 'ul');
+// Leading-whitespace width of a line (a tab counts as 4 columns).
+function mdIndent(line) {
+  let w = 0;
+  for (const c of line) { if (c === ' ') w++; else if (c === '\t') w += 4; else break; }
+  return w;
+}
+
+// Parse a bullet/number list starting at lines[start]; returns { html, next }.
+// This is deliberately thorough because loose lists are where naive renderers
+// break: blank lines between items must NOT split one list into many one-item
+// lists (that is the classic bug where every ordered item shows "1."). It also
+// honours an arbitrary ordered start value (start=N), nested sublists by
+// indentation, and multi-line / multi-paragraph item bodies.
+function mdParseList(lines, start, stash) {
+  const first = MD_ITEM.exec(lines[start]);
+  const baseIndent = mdIndent(lines[start]);
+  const kind = mdListKind(first[2]);
+  const startNum = kind === 'ol' ? parseInt(first[2], 10) : 1;
+
+  // Extent of the whole list block: sibling markers at this indent, their more-
+  // indented continuation/nested lines, and interior blank lines (a blank counts
+  // as interior only when a later line resumes the list).
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (/^\s*$/.test(line)) {
+      let j = end;
+      while (j < lines.length && /^\s*$/.test(lines[j])) j++;
+      if (j >= lines.length) break;
+      const nm = MD_ITEM.exec(lines[j]);
+      const sameList = nm && mdIndent(lines[j]) === baseIndent && mdListKind(nm[2]) === kind;
+      const deeper = mdIndent(lines[j]) > baseIndent;
+      if (sameList || deeper) { end = j; continue; }
+      break;
+    }
+    const m = MD_ITEM.exec(line);
+    if (m && mdIndent(line) === baseIndent) {
+      if (mdListKind(m[2]) !== kind) break; // a switch of marker type starts a new list
+      end++; continue;
+    }
+    if (mdIndent(line) > baseIndent) { end++; continue; } // continuation / nested
+    break; // a dedented, non-item line ends the list
+  }
+
+  // A list is "loose" if any blank line falls inside its extent — CommonMark then
+  // wraps each item's text in a paragraph; we mirror that with extra spacing.
+  let loose = false;
+  for (let k = start; k < end - 1; k++) { if (/^\s*$/.test(lines[k])) { loose = true; break; } }
+
+  // Split the extent into items at each sibling marker; dedent each item's body
+  // by its own content indent so nested markup parses at the right level.
+  const items = [];
+  let k = start;
+  while (k < end) {
+    const m = MD_ITEM.exec(lines[k]);
+    if (!(m && mdIndent(lines[k]) === baseIndent && mdListKind(m[2]) === kind)) { k++; continue; }
+    const contentIndent = m[1].length + m[2].length + m[3].length;
+    const body = [m[4]];
+    k++;
+    while (k < end) {
+      const sib = MD_ITEM.exec(lines[k]);
+      if (sib && mdIndent(lines[k]) === baseIndent && mdListKind(sib[2]) === kind) break;
+      body.push(/^\s*$/.test(lines[k]) ? '' : lines[k].slice(contentIndent));
+      k++;
+    }
+    items.push(body.join('\n').replace(/\s+$/, ''));
+  }
+
+  // Render each item. A loose list wraps every item body in paragraphs (via
+  // mdBlocks). In a tight list, a plain item renders inline; one that carries a
+  // nested sublist keeps its lead text inline and parses only the sublist as a
+  // block, so tight lists don't sprout stray paragraph margins.
+  const li = items.map((text) => {
+    const rows = text.split('\n');
+    if (loose) return `<li>${mdBlocks(text, stash)}</li>`;
+    const cut = rows.findIndex((l, x) => x > 0 && MD_ITEM.test(l));
+    if (cut > 0) {
+      const lead = rows.slice(0, cut).join('\n').trim();
+      const rest = rows.slice(cut).join('\n');
+      const leadHtml = lead ? mdInline(lead).replace(/\n/g, '<br>') : '';
+      return `<li>${leadHtml}${leadHtml ? '\n' : ''}${mdBlocks(rest, stash)}</li>`;
+    }
+    return `<li>${mdInline(text).replace(/\n/g, '<br>')}</li>`;
+  }).join('');
+
+  const attr = kind === 'ol' && startNum !== 1 ? ` start="${startNum}"` : '';
+  return { html: `<${kind} class="md-list${loose ? ' md-loose' : ''}"${attr}>${li}</${kind}>`, next: end };
+}
+
+// Split one pipe-table row into trimmed cells, tolerating optional leading and
+// trailing pipes and backslash-escaped `\|` inside a cell.
+function mdSplitRow(line) {
+  const s = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\' && s[i + 1] === '|') { cur += '|'; i++; continue; }
+    if (s[i] === '|') { cells.push(cur.trim()); cur = ''; continue; }
+    cur += s[i];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+// The row under a table header: every cell is dashes with optional alignment
+// colons (`---`, `:--`, `--:`, `:-:`). The pipe requirement keeps a bare `---`
+// (a horizontal rule) from being mistaken for a one-column delimiter.
+function mdIsDelimiterRow(line) {
+  if (!line.includes('|') || !line.includes('-')) return false;
+  const cells = mdSplitRow(line);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+}
+
+function mdCellAlign(cell) {
+  const s = cell.trim();
+  const left = s.startsWith(':');
+  const right = s.endsWith(':');
+  return left && right ? 'center' : right ? 'right' : left ? 'left' : '';
+}
+
+// Inline formatting over already-block-split text. Escaping happens here so the
+// stash placeholders (bare digits) survive untouched.
+function mdInline(t) {
+  let x = esc(t);
+  // Backslash escapes: stash the escaped punctuation (as \u0001N\u0001) so the
+  // emphasis/link passes treat it as a literal, then restore it at the very end.
+  const lit = [];
+  x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
+  // Inline links [text](url "optional title") — safe schemes only; the title is
+  // dropped. Runs before autolinking so a bare URL inside a link is left alone.
+  x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
+    const safe = /^(https?:|mailto:|\/)/i.test(href) ? href : '#';
+    return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+  });
+  // Autolink bare http(s) URLs not already part of a link/attribute (only when
+  // preceded by start-of-string, whitespace or an opening paren). Trailing
+  // sentence punctuation is left outside the link.
+  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, url) => {
+    const tail = (url.match(/[.,;:!?]+$/) || [''])[0];
+    const bare = url.slice(0, url.length - tail.length);
+    return `${pre}<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>${tail}`;
+  });
+  x = x.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
+  x = x.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
+  x = x.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
+  x = x.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
+  x = x.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+  x = x.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
+  x = x.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  x = x.replace(/\u0001(\d+)\u0001/g, (_, n) => lit[Number(n)]);
+  return x;
+}
+
+// MathJax is loaded lazily from a CDN the first time a rendered message actually
+// contains math, and only while the flag is on. If it can't load (offline), the
+// raw $…$ simply stays visible — a graceful, non-fatal degradation.
+let mathjaxLoad = null;
+function ensureMathJax() {
+  if (mathjaxLoad) return mathjaxLoad;
+  mathjaxLoad = new Promise((resolve) => {
+    window.MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+      startup: { typeset: false, ready: () => { window.MathJax.startup.defaultReady(); resolve(true); } },
+    };
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js';
+    script.async = true;
+    script.onerror = () => resolve(false);
+    document.head.appendChild(script);
+  });
+  return mathjaxLoad;
+}
+function typesetMath(root) {
+  if (!mathjaxEnabled()) return;
+  const scope = root || document.getElementById('ck-thread');
+  if (!scope || !scope.querySelector('.md-math')) return;
+  ensureMathJax().then(() => {
+    if (!window.MathJax || !window.MathJax.typesetPromise) return;
+    try { window.MathJax.typesetClear?.([scope]); } catch {}
+    window.MathJax.typesetPromise([scope]).catch(() => {});
+  });
+}
+
 function toast(msg, err = false, action) {
   const t = document.createElement('div');
   t.className = 'toast' + (err ? ' err' : '');
@@ -1218,6 +1564,14 @@ async function boot() {
   connectWs();
   renderShell();
   bindKeys();
+  installLinkRouter();
+  // A background repaint deferred to protect an open menu / text-selection gets
+  // flushed once that interaction releases (setTimeout lets focus + selection
+  // settle first). selectionchange fires constantly, so it only pokes the flush
+  // when something is actually waiting.
+  document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
+  document.addEventListener('mouseup', () => setTimeout(flushBgRender, 0));
+  document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
   window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
   await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
@@ -1366,7 +1720,7 @@ function connectWs() {
     try { ev = JSON.parse(m.data); } catch { return; }
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
-    if (S.tab === 'activity') renderMain();
+    if (S.tab === 'activity') bgRenderMain();
     if (S.selected && ev.taskId === S.selected) {
       S.taskEvents.push(ev);
       if (ev.type === 'agent.output' && ev.payload?.text) {
@@ -1397,7 +1751,7 @@ async function refreshTasks() {
   try {
     await loadTasks();
     if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-    if (S.tab === 'tasks' || S.tab === 'queue') renderMain();
+    if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
     renderRail();
     if (S.tab === 'queue' && !S.selected) seedQueue();
   } catch {}
@@ -1417,8 +1771,10 @@ function renderShell() {
       <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
         <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
       </button>
-      <button class="icon-btn has-badge" id="bell" title="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></button>
-      <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
+      <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
+      <button class="icon-btn" id="topbar-help" title="Keyboard shortcuts (?)" aria-haspopup="dialog">?</button>
+      <a class="topbar-user" id="topbar-user" data-spa href="${globalRoute('profile')}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     <div class="body">
       <div class="rail" id="rail"></div>
@@ -1427,8 +1783,9 @@ function renderShell() {
   // Project-scoped query/filtering lives in the task list. The topbar finder is
   // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
   $('#topbar-search').addEventListener('click', openGlobalSearch);
-  $('#theme').addEventListener('click', toggleTheme);
-  $('#bell').addEventListener('click', () => go(globalRoute('inbox')));
+  $('#topbar-palette').addEventListener('click', openPalette);
+  $('#topbar-help').addEventListener('click', openHelp);
+  // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
   $('#org-switcher')?.addEventListener('change', async (e) => {
     if (e.target.value === '__new') return createOrganization();
     S.organizationId = e.target.value;
@@ -1448,29 +1805,20 @@ function renderRail() {
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
       .map(
-        (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" tabindex="0">
+        (p) => `<a class="proj ${p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
-        </div>`,
+        </a>`,
       )
       .join('')}
     <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
     <div class="label">Organization</div>
-    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
-    <div class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" id="rail-organization" tabindex="0">⚙ Settings</div>
-    <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
-    <div class="nav-item" id="rail-palette" tabindex="0" title="Run any available command">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
-  rail.querySelectorAll('.proj[data-id]').forEach((e) =>
-    e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
-  );
+    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
+    <a class="nav-item ${S.tab === 'profile' ? 'active' : ''}" data-spa href="${globalRoute('profile')}" id="rail-profile" tabindex="0" title="Your profile">◔ Profile${userDisplayName() ? ` · ${esc(userDisplayName())}` : ''}</a>`;
+  // Project + Dashboard/Settings/Profile entries are real <a> links — installLinkRouter()
+  // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
-  $('#rail-organization')?.addEventListener('click', () => go(globalRoute('organization')));
-  rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
-  $('#rail-logout')?.addEventListener('click', async () => {
-    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
-    location.reload();
-  });
-  $('#rail-palette')?.addEventListener('click', openPalette);
 }
 
 function switchTab(tab) {
@@ -1495,6 +1843,9 @@ function captureFocus(root) {
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
     st.selectionStart = el.selectionStart;
     st.selectionEnd = el.selectionEnd;
+    // A multi-line field scrolls its own content; a fresh element resets to the
+    // top, so snapshot the internal scroll and put it back with the caret.
+    st.scrollTop = el.scrollTop;
   }
   return st;
 }
@@ -1503,14 +1854,50 @@ function restoreFocus(root, st) {
   if (!st) return;
   const el = root.querySelector(`#${window.CSS && CSS.escape ? CSS.escape(st.id) : st.id}`);
   if (!el || el.tagName !== st.tag) return;
-  if (st.tag === 'PRE') { el.focus(); return; } // terminal screen: just re-focus (no value to restore)
+  if (st.tag === 'PRE') { el.focus({ preventScroll: true }); return; } // terminal screen: just re-focus (no value to restore)
   // Only carry over the in-progress value for free-text fields; a fresh empty
   // composer input would otherwise be reset by the re-render.
   if (st.tag !== 'SELECT') el.value = st.value;
-  el.focus();
+  // preventScroll: re-focusing must not yank the page's scroll container to the
+  // field — the surrounding restore logic owns scroll position.
+  el.focus({ preventScroll: true });
   if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
+  if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
+}
+
+// A background (WebSocket-driven) refresh repaints #main by swapping its
+// innerHTML, which tears down transient UI the user is mid-interaction with — an
+// open native <select> dropdown (e.g. the ＋ Filter… menu) or a live mouse
+// text-selection. A steady agent event stream would otherwise keep yanking the
+// menu shut / clearing the selection every few hundred ms. Detect an in-flight
+// interaction, defer the repaint, and flush it once the interaction releases
+// (blur / mouse-up / the next background event).
+let bgRenderQueued = false;
+function interactionInFlight(root) {
+  const el = document.activeElement;
+  if (el && el.tagName === 'SELECT' && root.contains(el)) return true; // dropdown may be open
+  const sel = window.getSelection && window.getSelection();
+  if (sel && !sel.isCollapsed && sel.rangeCount) {
+    const node = sel.anchorNode;
+    const host = node && (node.nodeType === 1 ? node : node.parentNode);
+    if (host && root.contains(host)) return true; // an active text selection
+  }
+  return false;
+}
+function bgRenderMain() {
+  const main = $('#main');
+  if (main && interactionInFlight(main)) { bgRenderQueued = true; return; }
+  bgRenderQueued = false;
+  renderMain();
+}
+function flushBgRender() {
+  if (!bgRenderQueued) return;
+  const main = $('#main');
+  if (main && interactionInFlight(main)) return; // still busy — wait for the next release
+  bgRenderQueued = false;
+  renderMain();
 }
 
 // ── main content ───────────────────────────────────────────────────────────
@@ -1532,7 +1919,7 @@ function renderMain() {
   const projectScoped = ['tasks', 'queue', 'activity', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
-        .map((t) => `<div class="tab ${S.tab === t ? 'active' : ''}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</div>`)
+        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
         .join('')}</div>`
     : '';
 
@@ -1543,6 +1930,7 @@ function renderMain() {
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
   else if (S.tab === 'inbox') content = inboxView();
   else if (S.tab === 'organization') content = organizationView();
+  else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
   else if (S.tab === 'global') content = globalSettingsView();
 
@@ -1552,13 +1940,14 @@ function renderMain() {
   const focusState = captureFocus(main);
 
   main.innerHTML = tabbar + content;
-  main.querySelectorAll('.tab[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
+  // Project tabs are real <a> links; installLinkRouter() handles the plain click.
   if (S.tab === 'tasks') wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
   if (S.tab === 'inbox') wireInboxView();
+  if (S.tab === 'profile') wireProfileView();
   if (S.tab === 'organization') { hydrateOrganizationView(); wireGlobalSettings(S.organizationId); }
 
   restoreFocus(main, focusState);
@@ -1568,11 +1957,11 @@ function renderMain() {
 // ── tasks ────────────────────────────────────────────────────────────────────
 // Client-side twin of the authoritative `matchText` in src/domain/search.ts — the
 // pre-server fallback while the first evaluation is in flight. Keep the two in
-// sync: token-AND over title / notes / #num, so "login fix" matches "fix login".
+// sync: token-AND over title / notes / prompt / #num, so "login fix" matches "fix login".
 function taskMatches(t, q) {
   const s = (q || '').toLowerCase().trim();
   if (!s) return true;
-  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
+  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${(t.params?.prompt || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
@@ -2028,14 +2417,18 @@ async function saveCurrentView() {
 function parseQueryClient(input) {
   const q = { filters: [], sort: [] };
   const text = [];
-  const re = /"([^"]*)"|(\S+)/g; let m;
+  // Mirrors the server tokenizer: a `key:` prefix binds to its value even when the
+  // value carries quotes, so `conversation:"merge conflict"` stays one clause.
+  const re = /([-!]{0,2}[A-Za-z_#][\w.#-]*):((?:"[^"]*"|[^\s"])*)|"([^"]*)"|(\S+)/g; let m;
   const OPS = [['>=', 'gte'], ['<=', 'lte'], ['>', 'gt'], ['<', 'lt'], ['=', 'is']];
+  const splitVals = (raw) => {
+    const vals = []; const vre = /"([^"]*)"|([^,]+)/g; let vm;
+    while ((vm = vre.exec(raw))) { const v = (vm[1] !== undefined ? vm[1] : vm[2]).trim(); if (v) vals.push(v); }
+    return vals;
+  };
   while ((m = re.exec(input))) {
-    const quoted = m[1] !== undefined;
-    const tok = quoted ? m[1] : m[2];
-    const colon = quoted ? -1 : tok.indexOf(':');
-    if (colon < 0) { if (tok) text.push(tok); continue; }
-    let key = tok.slice(0, colon); let rest = tok.slice(colon + 1); let negate = false;
+    if (m[1] === undefined) { const tok = m[3] !== undefined ? m[3] : m[4]; if (tok) text.push(tok); continue; }
+    let key = m[1]; let rest = m[2] || ''; let negate = false;
     if (key[0] === '-' || key[0] === '!') { negate = true; key = key.slice(1); }
     if (key === 'sort') { let dir = 'asc'; let k = rest; if (k[0] === '-') { dir = 'desc'; k = k.slice(1); } const dm = k.match(/^(.*)[-:](asc|desc)$/i); if (dm) { k = dm[1]; dir = dm[2].toLowerCase(); } q.sort.push({ field: k, dir }); continue; }
     if (key === 'group') { q.group = rest; continue; }
@@ -2043,10 +2436,10 @@ function parseQueryClient(input) {
     // `param.<key>` / `p.<key>` and `agent_<role>.<sub>` are synthetic (text) fields.
     const isParam = /^(param|p)\.[^.\s]+$/i.test(key) || /^agent_[a-z0-9]+\.(agent|model|effort)$/i.test(key);
     const fld = isParam ? { key, type: 'text' } : S.fields.find((f) => f.key === key || (f.aliases || []).includes(key));
-    if (!fld) { text.push(tok); continue; }
+    if (!fld) { text.push(m[0]); continue; }
     let op = fld.type === 'text' ? 'contains' : 'is';
-    for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
-    const values = rest.split(',').map((s) => s.trim()).filter(Boolean);
+    if (rest[0] !== '"') for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
+    const values = splitVals(rest);
     if (values.length) q.filters.push(negate ? { field: fld.key, op, values, negate: true } : { field: fld.key, op, values });
   }
   if (!q.filters.length) delete q.filters;
@@ -2341,9 +2734,7 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-delseries]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (!confirm('Delete this repeatable task? Its past runs are kept.')) return; try { await api(`/api/tasks/${b.dataset.delseries}`, { method: 'DELETE' }); toast('Repeatable task deleted'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
-  $('#main').querySelectorAll('[data-series]').forEach((e) =>
-    wireTaskNav(e, (ev) => (ev.target.closest('button') ? null : e.dataset.series)),
-  );
+  $('#main').querySelectorAll('[data-series]').forEach((e) => wireTaskNav(e, () => e.dataset.series));
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
     try {
@@ -3336,6 +3727,11 @@ function renderTaskPage() {
   const threadScroll = prevThread
     ? { top: prevThread.scrollTop, atBottom: prevThread.scrollHeight - prevThread.scrollTop - prevThread.clientHeight < 40 }
     : null;
+  // A background re-render (WS event while an agent streams) rebuilds the whole
+  // pane, which would drop any text the user has selected in the transcript.
+  // Snapshot the selection as character offsets and re-apply it after the swap —
+  // the same treatment scroll/focus already get.
+  const threadSel = prevThread ? captureThreadSelection(prevThread) : null;
   const focusState = captureFocus(main);
   // The per-agent follow-up textareas carry no id (captureFocus skips them), so
   // snapshot the active one by its agent role to re-focus the matching box after
@@ -3401,6 +3797,11 @@ function renderTaskPage() {
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
   const thread = document.getElementById('ck-thread');
   if (thread) thread.scrollTop = threadScroll && !threadScroll.atBottom ? threadScroll.top : thread.scrollHeight;
+  if (thread) {
+    restoreThreadSelection(thread, threadSel);
+    wireMessageCopies(thread);
+    typesetMath(thread);
+  }
   restoreFocus(main, focusState);
   restoreFollowupFocus(main, fuState);
   // The scrollable body is the page's own scroll container (the app shell is
@@ -3411,6 +3812,64 @@ function renderTaskPage() {
   const scroller = thread || newBody;
   const overlayOpen = $('#overlay-root')?.childElementCount > 0 || $('#modal-root')?.childElementCount > 0;
   if (scroller && shouldFocusTaskBody(main, document.activeElement, overlayOpen)) scroller.focus({ preventScroll: true });
+}
+
+// A text walker over the thread that ignores math (its raw `$…$` is replaced by
+// MathJax SVG + hidden MathML asynchronously, so counting it would make the
+// before/after offsets disagree). Skipping it keeps the character map stable
+// regardless of typeset state.
+function threadTextWalker(thread) {
+  return document.createTreeWalker(thread, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => (node.parentElement && node.parentElement.closest('.md-math, mjx-container'))
+      ? NodeFilter.FILTER_REJECT
+      : NodeFilter.FILTER_ACCEPT,
+  });
+}
+
+// The transcript's text selection, captured as absolute character offsets into
+// the thread's concatenated text so it can survive a full innerHTML rebuild
+// (the new nodes are different objects; offsets aren't). Returns null when there
+// is no live selection inside the thread.
+function captureThreadSelection(thread) {
+  const sel = window.getSelection && window.getSelection();
+  if (!thread || !sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!thread.contains(range.startContainer) || !thread.contains(range.endContainer)) return null;
+  const offsetOf = (node, off) => {
+    const walker = threadTextWalker(thread);
+    let total = 0, n;
+    while ((n = walker.nextNode())) {
+      if (n === node) return total + off;
+      total += n.nodeValue.length;
+    }
+    return total;
+  };
+  return { start: offsetOf(range.startContainer, range.startOffset), end: offsetOf(range.endContainer, range.endOffset) };
+}
+
+function restoreThreadSelection(thread, snap) {
+  if (!thread || !snap) return;
+  const locate = (target) => {
+    const walker = threadTextWalker(thread);
+    let total = 0, n;
+    while ((n = walker.nextNode())) {
+      const len = n.nodeValue.length;
+      if (total + len >= target) return { node: n, offset: target - total };
+      total += len;
+    }
+    return n ? { node: n, offset: n.nodeValue.length } : null;
+  };
+  const a = locate(snap.start);
+  const b = locate(snap.end);
+  if (!a || !b) return;
+  try {
+    const range = document.createRange();
+    range.setStart(a.node, a.offset);
+    range.setEnd(b.node, b.offset);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch {}
 }
 
 // Switch the open task page to another of its tabs, pinning the tab in the URL
@@ -3457,6 +3916,9 @@ function captureFollowupFocus(root) {
   if (!box) return null;
   const st = { role: box.dataset.role || '', value: el.value };
   if (typeof el.selectionStart === 'number') { st.selectionStart = el.selectionStart; st.selectionEnd = el.selectionEnd; }
+  // The compose box scrolls internally once the draft spills past its height; a
+  // fresh textarea starts at the top, so snapshot the scroll offset to restore.
+  st.scrollTop = el.scrollTop;
   return st;
 }
 
@@ -3468,10 +3930,15 @@ function restoreFollowupFocus(root, st) {
   // Only carry over the value if the box was cleared by the re-render (a sent
   // follow-up empties it); never clobber text the box already holds.
   if (st.value && !el.value) el.value = st.value;
-  el.focus();
+  // preventScroll: re-focusing the box must never scroll the conversation — that
+  // caused the box to jump to the top of the thread on every background refresh.
+  el.focus({ preventScroll: true });
   if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
+  // Put the caret's line back into view inside the textarea (focus + selection
+  // alone don't restore a multi-line box's own scroll in every browser).
+  if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
 }
 
 function stripAnsi(s) {
@@ -3786,7 +4253,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
     : '';
   const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
+    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><a class="branch sub-open" data-spa href="${taskUrl(id)}" style="cursor:pointer">↳ ${esc(numLabel(id))}</a></div>`).join('')}`
     : '';
   return `
     <div class="section-h">Pipeline</div>
@@ -3998,14 +4465,15 @@ function conversationTimeHtml(ts) {
 }
 
 function renderConversationEntry(entry) {
+  const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}</div><div class="msg-text">${esc(m.text)}</div>${renderMessageImages(m.images)}</div>`;
+    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${renderMessageBody(m.text)}</div>${renderMessageImages(m.images)}</div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}</div><div class="msg-text">${esc(a.title)}</div></div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderMessageBody(a.title)}</div></div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -4574,7 +5042,7 @@ function wireActions(v) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
+  // Sub-task references are real <a> permalinks; installLinkRouter() handles them.
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
@@ -4639,9 +5107,13 @@ function wireFollowups(v) {
 function updateLiveBubble() {
   const b = document.getElementById('live-bubble');
   if (!b) return;
+  // Follow the stream only when the reader is already parked at the bottom; if
+  // they've scrolled up to read history, hold their view fixed as text streams in.
+  const thread = document.getElementById('ck-thread');
+  const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight < 40;
   b.classList.remove('hidden');
   b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
-  b.scrollIntoView({ block: 'nearest' });
+  if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
 function renderTaskEvents() {
@@ -4778,7 +5250,7 @@ function localQueue(domain) {
 
 function wireQueueView() {
   $('#main').querySelectorAll('.queue-item').forEach((e) => {
-    if (taskRecord(e.dataset.id)) wireTaskNav(e, (ev) => (ev.target.closest('[data-move]') || ev.target.closest('.drag-handle') ? null : e.dataset.id));
+    if (taskRecord(e.dataset.id)) wireTaskNav(e, () => e.dataset.id);
   });
   $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
@@ -4981,7 +5453,7 @@ function procPanelHtml(sample) {
     .map((g) => {
       const kindChip = `<span class="chip">${esc(PROC_KIND_LABEL[g.kind] || g.kind)}</span>`;
       const taskChip = g.taskId
-        ? `<button class="chip proc-task" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</button>`
+        ? `<a class="chip proc-task" data-spa href="${esc(taskUrl(g.taskId))}" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</a>`
         : '';
       // A group is killable at the root when it's a registered entity (agents,
       // terminals, logins, probes) — its registered killer escalates properly.
@@ -5020,7 +5492,7 @@ function procPanelHtml(sample) {
 }
 
 function wireProcPanel(el) {
-  el.querySelectorAll('.proc-task').forEach((b) => b.addEventListener('click', () => goToTask(b.dataset.task)));
+  // .proc-task chips are real <a> permalinks handled by installLinkRouter().
   el.querySelectorAll('.proc-kill').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       const pid = Number(b.dataset.kill);
@@ -5698,6 +6170,9 @@ function globalSettingsView(embedded = false) {
     <div class="card" id="appearance-card">
       <div class="section-h">Appearance</div>
       <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
+      <div class="switch"><input type="checkbox" id="gs-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="gs-md-render">Render conversation messages as Markdown</label></div>
+      <div class="switch"><input type="checkbox" id="gs-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="gs-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
+      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
     <div class="card" id="resilience-card">
       <div class="section-h">Resilience</div>
@@ -6218,6 +6693,16 @@ function wireGlobalSettings(organizationId) {
     }),
   );
   $('#gs-theme')?.addEventListener('click', toggleTheme);
+  $('#gs-md-render')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
+    if (S.taskTab === 'checkin') renderTaskPage();
+    toast(`Markdown rendering ${e.target.checked ? 'on' : 'off'}`);
+  });
+  $('#gs-mathjax')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-mathjax', e.target.checked ? '1' : '0'); } catch {}
+    if (S.taskTab === 'checkin') renderTaskPage();
+    toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
+  });
   $('#safe-mode')?.addEventListener('change', async (e) => {
     try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
   });
@@ -6272,6 +6757,63 @@ async function openInboxItem(item) {
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
   return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
+}
+
+// The signed-in person's display name for the topbar/rail. The legacy single-user
+// session is the string 'me'; real identity sessions carry a Better Auth user.
+function userDisplayName() {
+  const u = S.user;
+  if (u && typeof u === 'object') return u.name || u.email || 'Account';
+  return 'Account';
+}
+
+// A clean profile page: identity, the browser display preference (theme), and the
+// one place to end the session. Sign out lives here rather than in the top bar.
+function profileView() {
+  const u = S.user && typeof S.user === 'object' ? S.user : null;
+  const name = userDisplayName();
+  const email = u?.email || '';
+  const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
+  const orgCount = (S.organizations || []).length;
+  const row = (label, value) => value
+    ? `<div class="profile-row"><span class="profile-row-label">${esc(label)}</span><span class="profile-row-value">${esc(value)}</span></div>`
+    : '';
+  return `<div class="profile-page">
+    <h1 class="page-title">Profile</h1>
+    <div class="card profile-card">
+      <div class="profile-identity">
+        <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
+        <div class="profile-meta">
+          <div class="profile-name">${esc(name)}</div>
+          ${email ? `<div class="profile-email">${esc(email)}</div>` : ''}
+        </div>
+      </div>
+      <div class="profile-rows">
+        ${row('Name', u?.name || '')}
+        ${row('Email', email)}
+        ${row('Account', u?.id || '')}
+        ${row('Organizations', orgCount ? String(orgCount) : '')}
+      </div>
+    </div>
+    <div class="card">
+      <div class="section-h">Appearance</div>
+      <p class="task-sub">The light / dark preference is remembered in this browser.</p>
+      <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
+    </div>
+    <div class="card">
+      <div class="section-h">Session</div>
+      <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
+      <button class="btn danger" id="profile-logout">Sign out</button>
+    </div>
+  </div>`;
+}
+
+function wireProfileView() {
+  $('#profile-theme')?.addEventListener('click', toggleTheme);
+  $('#profile-logout')?.addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
+    location.reload();
+  });
 }
 
 // The settings rail is real navigation, not a scroll-spy: exactly one section is
@@ -6903,7 +7445,13 @@ function bindKeys() {
     }
     // Enter on a focused button/link is native activation, not the list cursor.
     if (e.key === 'Enter' && t && t.closest && t.closest('button, a, summary, [role="button"]')) return;
-    dispatchKey(e);
+    if (dispatchKey(e)) return;
+    // Fallback: Enter activates whatever custom control has keyboard focus. A div
+    // made Tab-focusable with tabindex="0" (view chips, nav items, task rows, …)
+    // carries a click handler but has no native Enter activation — so synthesize the
+    // click. Native controls returned above; list/rail cursors have their own Enter
+    // commands, which dispatchKey matched first.
+    if (e.key === 'Enter' && t && t.matches && t.matches('[tabindex="0"]')) { e.preventDefault(); t.click(); }
   });
 }
 
@@ -6986,10 +7534,13 @@ function openGlobalSearch() {
     list.innerHTML = items.map((item, i) => {
       const head = item.group !== lastGroup ? `<div class="pal-group">${esc(item.group)}</div>` : '';
       lastGroup = item.group;
-      return `${head}<div class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}">
+      // Each result is a real permalink, so it opens in a new tab with any native
+      // gesture (Ctrl/⌘-click, middle-click, right-click → Open in new tab); a plain
+      // click below still opens it in place and dismisses the palette.
+      return `${head}<a class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}"${item.href ? ` data-spa href="${esc(item.href)}"` : ''}>
         <span class="global-search-kind" aria-hidden="true">${item.group === 'Projects' ? '◇' : '□'}</span>
         <span class="global-search-copy"><b>${esc(item.title)}</b><span>${esc(item.sub || '')}</span></span>
-      </div>`;
+      </a>`;
     }).join('');
     input.setAttribute('aria-activedescendant', `gs-result-${active}`);
     if (summary) list.insertAdjacentHTML('beforeend', `<div class="global-search-summary">${esc(summary)}</div>`);
@@ -7011,16 +7562,18 @@ function openGlobalSearch() {
     if (ownRequest !== request || !root.contains(input)) return;
     const found = assembleGlobalSearchResults(q, S.projects, responses);
     items = [
-      ...found.projectHits.map(({ project }) => ({
-        group: 'Projects', title: project.name, sub: 'Open project', run: () => go(projectRoute(project.id)),
-      })),
+      ...found.projectHits.map(({ project }) => {
+        const href = projectRoute(project.id);
+        return { group: 'Projects', title: project.name, sub: 'Open project', href, run: () => spaNavigate(href) };
+      }),
       ...found.taskHits.map(({ project, task }) => {
         const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
         const number = task.num != null ? `#${task.num} · ` : '';
+        const href = `${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
         return {
           group: 'Tasks', title: task.title,
           sub: `${number}${project.name} · ${stateLabel}`,
-          run: () => go(`${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`),
+          href, run: () => spaNavigate(href),
         };
       }),
     ];
@@ -7039,7 +7592,12 @@ function openGlobalSearch() {
     else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
     else if (e.key === 'Enter') { e.preventDefault(); run(active); }
   });
-  list.addEventListener('click', (e) => { const row = e.target.closest('.opt'); if (row) run(Number(row.dataset.i)); });
+  list.addEventListener('click', (e) => {
+    const row = e.target.closest('.opt'); if (!row) return;
+    if (isNewTabClick(e)) return; // real <a> result → let the browser open it in a new tab (palette stays open)
+    e.preventDefault();
+    run(Number(row.dataset.i));
+  });
   list.addEventListener('mousemove', (e) => { const row = e.target.closest('.opt'); if (row && Number(row.dataset.i) !== active) { active = Number(row.dataset.i); draw(); } });
   $('#gs-close').addEventListener('click', close);
   $('#gs-scrim').addEventListener('click', (e) => { if (e.target.id === 'gs-scrim') close(); });
