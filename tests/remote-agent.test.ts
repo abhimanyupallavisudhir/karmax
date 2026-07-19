@@ -22,6 +22,9 @@ describe('remote subscription agents', () => {
     fs.writeFileSync(path.join(localHome, 'skills', 'review', 'SKILL.md'), 'review skill');
     fs.mkdirSync(path.join(localHome, 'sessions'), { recursive: true });
     fs.writeFileSync(path.join(localHome, 'sessions', 'host-task.jsonl'), 'host-only conversation');
+    fs.mkdirSync(path.join(localHome, 'plugins', 'cache', 'large'), { recursive: true });
+    fs.writeFileSync(path.join(localHome, 'logs_2.sqlite'), Buffer.alloc(1024));
+    fs.writeFileSync(path.join(localHome, 'plugins', 'cache', 'large', 'asset.bin'), Buffer.alloc(1024));
     fs.writeFileSync(path.join(localHome, 'config.toml'), '[mcp_servers.karmax]\ncommand = "/host/node"\n\n[notice]\nkeep = true\n');
     process.env.KARMAX_REMOTE_GATEWAY_URL = 'https://karmax.example.test/';
     const world = fakeWorld();
@@ -33,11 +36,30 @@ describe('remote subscription agents', () => {
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('subscription');
     expect(world.files.get(`${remoteHome}/skills/review/SKILL.md`)?.toString()).toBe('review skill');
     expect(world.files.has(`${remoteHome}/sessions/host-task.jsonl`)).toBe(false);
+    expect(world.files.has(`${remoteHome}/logs_2.sqlite`)).toBe(false);
+    expect(world.files.has(`${remoteHome}/plugins/cache/large/asset.bin`)).toBe(false);
     const config = world.files.get(`${remoteHome}/config.toml`)?.toString() ?? '';
     expect(config).toContain('[notice]');
     expect(config).not.toContain('/host/node');
     expect(config).toContain('https://karmax.example.test');
-    expect(world.files.get(`${remoteHome}/karmax-mcp.mjs`)?.length).toBeGreaterThan(10_000);
+    const platformBundle = world.files.get('.karmax-injection/agent/tools/platform-mcp/karmax-mcp.cjs');
+    expect(platformBundle?.length).toBeGreaterThan(10_000);
+    // Execute the exact seeded artifact. Bundling Zod v4 into this bridge once
+    // produced a syntactically valid file that crashed before MCP initialize,
+    // leaving Codex with a named `karmax` server and zero tools.
+    const probeDir = path.join(localHome, 'bundle-probe');
+    fs.mkdirSync(probeDir);
+    fs.writeFileSync(path.join(probeDir, 'karmax-mcp.cjs'), platformBundle!);
+    fs.symlinkSync(path.resolve('node_modules'), path.join(probeDir, 'node_modules'), 'dir');
+    const handshake = [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'probe', version: '1' } } },
+      { jsonrpc: '2.0', method: 'notifications/initialized', params: {} },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+    ].map((message) => JSON.stringify(message)).join('\n') + '\n';
+    const probe = spawnSync(process.execPath, [path.join(probeDir, 'karmax-mcp.cjs')],
+      { input: handshake, encoding: 'utf8', timeout: 10_000 });
+    expect(probe.status, probe.stderr).toBe(0);
+    expect(probe.stdout).toContain('"name":"list_events"');
     world.files.set(`${remoteHome}/auth.json`, Buffer.from('{"tokens":{"access_token":"refreshed-remotely"}}'));
     await seedRemoteAgentHome(world, 'codex', localHome);
     expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('refreshed-remotely');
@@ -126,7 +148,9 @@ describe('remote subscription agents', () => {
     expect(world.openedPty?.command).toContain('/opt/karmax/bin/codex');
     expect(world.openedPty?.command).toContain('app-server');
     expect(world.openedPty?.command).toContain('stty raw -echo');
+    expect(world.openedPty?.command).toContain('exec sh -c');
     expect(world.openedPty?.command).toContain('karmax-agent.pid');
+    expect(world.openedPty?.command).not.toContain('\u001eKARMAX_AGENT_READY\u001e');
     expect(spawnSync('bash', ['-n', '-c', world.openedPty?.command ?? '']).status).toBe(0);
     const remoteHome = remoteAgentHomeRelative('codex', localHome);
     expect(world.openedPty?.env).toMatchObject({ CODEX_HOME: `/workspace/${remoteHome}` });
@@ -148,6 +172,8 @@ function fakeWorld(appServer = false, browserReady = false): World & {
       if (command === 'bash' && args[1]?.includes('-type f -print')) {
         return { stdout: [...files.keys()].map((file) => `/workspace/${file}`).join('\n'), stderr: '', code: 0 };
       }
+      if (command === 'node' && args[0] === '-e' && args[1]?.includes('process.versions.node'))
+        return { stdout: '', stderr: '', code: 0 };
       if (browserReady && command === 'node' && args[0] === '-e' && args[1]?.includes('executablePath'))
         return { stdout: '/opt/karmax/browsers/chromium', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
@@ -166,11 +192,17 @@ function fakeWorld(appServer = false, browserReady = false): World & {
       let ready = false;
       const send = (value: unknown) => { const line = JSON.stringify(value) + '\n'; for (const listener of data) listener(line); };
       const pty: WorldPty = {
-        onData(listener) { data.add(listener); return () => data.delete(listener); },
+        onData(listener) {
+          data.add(listener);
+          if (appServer && !ready) {
+            ready = true;
+            queueMicrotask(() => { if (data.has(listener)) listener('\u001eKARMAX_AGENT_READY\u001e'); });
+          }
+          return () => data.delete(listener);
+        },
         onExit(listener) { exits.add(listener); return () => exits.delete(listener); },
         async write(chunk) {
           if (!appServer || chunk === '\x04') return;
-          if (!ready) { ready = true; for (const listener of data) listener('\u001eKARMAX_AGENT_READY\u001e'); }
           input += chunk;
           let newline: number;
           while ((newline = input.indexOf('\n')) >= 0) {
@@ -178,6 +210,10 @@ function fakeWorld(appServer = false, browserReady = false): World & {
             if (!line.trim()) continue;
             const request = JSON.parse(line);
             if (request.method === 'initialize') send({ id: request.id, result: {} });
+            else if (request.method === 'mcpServerStatus/list') send({ id: request.id, result: { data: [
+              { name: 'karmax', authStatus: 'unsupported', resourceTemplates: [], resources: [],
+                tools: { list_events: { name: 'list_events', inputSchema: { type: 'object' } } } },
+            ], nextCursor: null } });
             else if (request.method === 'thread/start') send({ id: request.id, result: { thread: { id: 'remote-thread' } } });
             else if (request.method === 'turn/start') {
               send({ id: request.id, result: { turn: { id: 'remote-turn' } } });

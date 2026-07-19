@@ -224,6 +224,7 @@ export class CodexAdapter implements AgentAdapter {
       ...env,
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
     });
+    if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Detached ⇒ its own process group, so killAgent(-pid) reaps codex's descendants.
     const child: any = remote
@@ -270,6 +271,7 @@ export class CodexAdapter implements AgentAdapter {
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
     let shuttingDown = false;
+    const mcpStartup: any[] = [];
     // How many `input.messages` this turn has consumed — the initial delta up to the
     // schedule snapshot, then one more per in-flight follow-up steered/started below.
     let deliveredIndex = input.messages.length;
@@ -339,6 +341,14 @@ export class CodexAdapter implements AgentAdapter {
             phase: 'updated',
             title: 'Tool call',
             ...(activityDetail(params?.message) ? { detail: activityDetail(params.message) } : {}),
+          });
+          break;
+        case 'mcpServer/startupStatus/updated':
+          mcpStartup.push(params);
+          ctx.emitActivity({
+            id: `mcp-startup-${String(params?.name ?? params?.serverName ?? mcpStartup.length)}`,
+            kind: 'status', phase: 'updated', title: `MCP · ${String(params?.name ?? params?.serverName ?? 'startup')}`,
+            ...(activityDetail(params) ? { detail: activityDetail(params) } : {}),
           });
           break;
         case 'warning':
@@ -425,6 +435,36 @@ export class CodexAdapter implements AgentAdapter {
       // ── Handshake ──
       await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' }, capabilities: null });
       client.notify('initialized');
+      if (remote) {
+        // A cloud turn without the platform MCP can still produce plausible
+        // prose while silently losing collaboration, review, and completion
+        // tools. Ask app-server for its authoritative post-startup inventory and
+        // fail before the model turn when the generated remote config did not
+        // load. Do the same for any browser MCP we explicitly provisioned.
+        const required = ['karmax', ...Object.keys(remoteHome?.browserMcp ?? {})];
+        let servers: any[] = [];
+        let missing = required;
+        const deadline = Date.now() + 30_000;
+        do {
+          const inventory = await client.request<any>('mcpServerStatus/list', {
+            cursor: null, limit: 100, detail: 'toolsAndAuthOnly', threadId: null,
+          });
+          servers = Array.isArray(inventory?.data) ? inventory.data : [];
+          missing = required.filter((name) => {
+            const server = servers.find((candidate) => candidate?.name === name);
+            if (!server) return true;
+            const tools = server.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [];
+            return name === 'karmax' ? !tools.includes('list_events') : tools.length === 0;
+          });
+          if (!missing.length || Date.now() >= deadline) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        } while (true);
+        if (missing.length) {
+          const observed = servers.map((server) => ({ name: server?.name,
+            tools: server?.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [] }));
+          throw new Error(`remote Codex MCP startup incomplete (missing ${missing.join(', ')}; observed ${JSON.stringify(observed)}; startup ${JSON.stringify(mcpStartup)})`);
+        }
+      }
 
       // ── Thread: resume the prior one, or start fresh (systemPrompt → developer
       //    instructions; the thread carries them so resumes don't re-send them). ──

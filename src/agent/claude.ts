@@ -337,6 +337,7 @@ export class ClaudeAdapter implements AgentAdapter {
       ...env,
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
     });
+    if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
     // cancels. The Agent SDK spawns a child harness process (the Claude Code
@@ -444,13 +445,15 @@ export class ClaudeAdapter implements AgentAdapter {
         //    task attribution and an escalating kill.
         spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
           if (remote && remoteHome) {
+            const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env);
+            if (remoteHome.runtimeBin) remoteEnv.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
             return spawnRemoteAgentProcess({
               world: input.world,
               provider: 'claude',
               command: o.command,
               args: o.args,
               cwd: input.world.handle.root,
-              env: remoteAgentEnv('claude', remoteHome.absolute, o.env),
+              env: remoteEnv,
               signal: o.signal,
             }) as any;
           }

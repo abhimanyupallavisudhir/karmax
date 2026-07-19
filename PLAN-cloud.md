@@ -164,6 +164,16 @@ pattern inspects a devcontainer/Dockerfile and lockfiles and **proposes** an
 environment; it does not silently execute guessed setup forever. The project may
 import its devcontainer or select a custom image and setup commands.
 
+Generic provider templates remain a supported compatibility path. World startup
+probes for Node >= 22.12 and installs a pinned sandbox-local Node/npm runtime when
+the template is older, then installs pinned browser MCPs and Chromium and runs an
+actual headless launch probe. A single Playwright `install-deps` repair is allowed
+when the image lacks browser OS libraries. The restricted E2B policy includes the
+package, browser-download, OS-package, model, Git, and public-gateway hosts needed
+by that path. Curated Karmax templates bake the same artifacts and skip the cold
+start; users do not have to rebuild a selected stock template merely to obtain
+browser parity.
+
 An environment build runs once in an isolated builder and produces an immutable
 snapshot keyed by the spec, source image digest, setup commands, and relevant
 lockfiles. Task worlds clone/fork that snapshot, then run only cheap boot commands.
@@ -365,7 +375,10 @@ Most of this path already exists. `platformMcpSpec()` configures a stdio bridge
 to the gateway, and the activity injects a capability-scoped token. For cloud:
 
 1. The activity bundles and seeds the version-matched MCP bridge on the world's
-   non-checkpointed injection surface.
+   non-checkpointed injection surface. The bridge keeps Zod external in a pinned
+   shared runtime (bundling Zod v4 breaks its initialization graph), and Codex's
+   app-server inventory must report `karmax.list_events` plus every configured
+   browser server before the model turn begins.
 2. The bridge calls the Karmax public gateway over TLS. World tools execute
    directly in the sandbox through the native provider agent.
 3. A turn token carries organization, project, origin task, role, capabilities,
@@ -393,6 +406,12 @@ optimization may split these layers without changing the execution contract:
 - **Agent profile**: model, behavior, limits, and account-selection policy;
 - **Conversation session**: task × role state/artifact, world-portable where the
   provider permits and transcript-replayable otherwise.
+
+Generated provider databases/WALs, logs, history, shell snapshots, telemetry,
+and nested caches are excluded from first-use seeding; they can be hundreds of
+MiB and are neither authentication nor portable conversation state. Explicitly
+requested native sessions are materialized separately, while durable config,
+skills, rules, hooks, plugin manifests, and auth continue through the copy.
 
 A task-private home lives on the non-checkpointed injection surface for that
 world generation, preserving native sessions across turns. Its path includes a
@@ -859,6 +878,17 @@ world without reading its root path or spawning its processes directly.
 
 This phase is complete only when a task can wait for a human for several days
 with zero sandbox CPU/RAM, then resume and merge without manual repair.
+
+The explicit billable smoke test for an already-configured installation is:
+
+```bash
+KARMAX_REMOTE_GATEWAY_URL=https://reachable-karmax.example \
+KARMAX_LIVE_TASK_ID=task_... npx tsx scripts/live-cloud-subscription.ts
+```
+
+It resolves the E2B credential from Karmax's vault and requires completed scoped
+Karmax and Chrome DevTools screenshot tool events; a model merely claiming success
+does not pass the diagnostic.
 
 ### Phase 4 — hosted control plane (complete)
 

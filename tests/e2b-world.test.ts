@@ -67,7 +67,7 @@ describe('E2B cloud world provider', () => {
       timeoutMs: 123_000,
       lifecycle: { onTimeout: 'pause', autoResume: true },
       metadata: { karmaxTaskId: 'task-cloud' },
-      network: { allowOut: expect.arrayContaining(['github.com']), denyOut: [], allowPublicTraffic: false },
+      network: { allowOut: expect.arrayContaining(['github.com']), denyOut: ['0.0.0.0/0'], allowPublicTraffic: false },
     });
     expect(createdOptions.allowInternetAccess).toBeUndefined();
     expect(world.handle).toMatchObject({ version: 2, kind: 'e2b', provider: 'e2b', root: '/home/user/karmax' });

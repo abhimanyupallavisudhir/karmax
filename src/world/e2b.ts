@@ -525,13 +525,17 @@ function e2bNetwork(spec: WorldSpec): Pick<Parameters<E2BFactory['create']>[0], 
   if (spec.network?.unrestricted) return { allowInternetAccess: true };
   const allowOut = [...new Set(['github.com', 'api.github.com', 'ssh.github.com', 'registry.npmjs.org',
     'cdn.playwright.dev', 'playwright.download.prss.microsoft.com',
+    'storage.googleapis.com', 'chrome-for-testing-public.storage.googleapis.com',
+    'googlechromelabs.github.io', 'edgedl.me.gvt1.com', 'redirector.gvt1.com',
     'deb.debian.org', 'security.debian.org', 'archive.ubuntu.com', 'security.ubuntu.com', 'dl.google.com',
     'api.anthropic.com', 'claude.ai', 'api.openai.com', 'chatgpt.com', 'auth.openai.com',
     ...publicGatewayDomains(),
     ...(spec.network?.allowDomains ?? []), ...(spec.network?.allowCidrs ?? [])])];
-  // Supplying allowOut is itself deny-by-default. `allowInternetAccess: false`
-  // is equivalent to denyOut=all and would also block these explicit entries.
-  return { network: { allowOut, denyOut: [], allowPublicTraffic: false } };
+  // E2B requires the explicit all-traffic CIDR deny sentinel when an allowlist
+  // is supplied; without it the control plane rejects sandbox creation. The SDK
+  // exports this value as ALL_TRAFFIC (`0.0.0.0/0`). Explicit allowOut entries
+  // take precedence over the catch-all deny.
+  return { network: { allowOut, denyOut: ['0.0.0.0/0'], allowPublicTraffic: false } };
 }
 
 function publicGatewayDomains(): string[] {
