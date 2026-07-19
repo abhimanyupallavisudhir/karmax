@@ -7269,7 +7269,13 @@ function bindKeys() {
     }
     // Enter on a focused button/link is native activation, not the list cursor.
     if (e.key === 'Enter' && t && t.closest && t.closest('button, a, summary, [role="button"]')) return;
-    dispatchKey(e);
+    if (dispatchKey(e)) return;
+    // Fallback: Enter activates whatever custom control has keyboard focus. A div
+    // made Tab-focusable with tabindex="0" (view chips, nav items, task rows, …)
+    // carries a click handler but has no native Enter activation — so synthesize the
+    // click. Native controls returned above; list/rail cursors have their own Enter
+    // commands, which dispatchKey matched first.
+    if (e.key === 'Enter' && t && t.matches && t.matches('[tabindex="0"]')) { e.preventDefault(); t.click(); }
   });
 }
 
