@@ -55,6 +55,25 @@ describe('query-language parser', () => {
     expect(parseQuery('id:>=3').filters?.[0]).toEqual({ field: 'num', op: 'gte', values: ['3'] });
   });
 
+  it('keeps quoted multi-word clause values together (the form stringifyQuery emits)', () => {
+    expect(parseQuery('conversation:"merge conflict"').filters).toEqual([
+      { field: 'conversation', op: 'contains', values: ['merge conflict'] },
+    ]);
+    // commas outside quotes still split; quoted parts keep their spaces
+    expect(parseQuery('status:done,"in progress"').filters).toEqual([
+      { field: 'status', op: 'is', values: ['done', 'in progress'] },
+    ]);
+    // negation composes, and the quoted value is literal (no op sniffing inside)
+    expect(parseQuery('-says:">boom"').filters).toEqual([
+      { field: 'conversation', op: 'contains', values: ['>boom'], negate: true },
+    ]);
+  });
+
+  it('round-trips a spaced clause value through stringifyQuery', () => {
+    const q = parseQuery('conversation:"artifact cache" is:open');
+    expect(parseQuery(stringifyQuery(q))).toEqual(q);
+  });
+
   it('treats an unknown field key as free text (never drops it)', () => {
     const q = parseQuery('bogus:value plain');
     expect(q.filters).toBeUndefined();
@@ -161,6 +180,47 @@ describe('evaluateQuery — free text (token-AND over title/notes/prompt/#num)',
   it('supports an explicit prompt: filter distinct from title', () => {
     expect(evaluateQuery(tasks, parseQuery('prompt:wiki'), ctx).tasks.map((t) => t.num)).toEqual([4]);
     expect(evaluateQuery(tasks, parseQuery('-prompt:wiki login'), ctx).tasks.map((t) => t.num).sort()).toEqual([1, 2]);
+  });
+});
+
+describe('evaluateQuery — conversation: filter (opt-in transcript search)', () => {
+  const tasks: SearchTask[] = [
+    task({
+      title: 'Fix flaky deploy', num: 1,
+      lastView: view('waiting', 'review', {
+        messages: [{ id: 'm0', role: 'user', text: 'the deploy is flaky', ts: 0 }],
+        transcripts: [
+          { role: 'do', label: 'Do agent', messages: [
+            { id: 'm0', role: 'user', text: 'the deploy is flaky', ts: 0 },
+            { id: 'a1', role: 'agent', text: 'Root cause: a stale artifact cache; purged it.', ts: 1 },
+          ] },
+          { role: 'merge', label: 'Merge agent', messages: [
+            { id: 'a2', role: 'agent', text: 'Resolved a rebase conflict in ci.yml', ts: 2 },
+          ] },
+        ],
+      }),
+    }),
+    // No transcripts — the legacy top-level `messages` (the Do transcript) is the fallback.
+    task({ title: 'Old-style task', num: 2, lastView: view('done', 'done', { messages: [{ id: 'm0', role: 'user', text: 'tune the artifact retention', ts: 0 }] }) }),
+    // Never started — no lastView at all; must simply not match.
+    task({ title: 'Untouched draft', num: 3 }),
+  ];
+  const ctx = { now: NOW, tags: [] as Tag[] };
+
+  it('matches text from any role transcript, with the says: alias and negation', () => {
+    expect(evaluateQuery(tasks, parseQuery('conversation:"artifact cache"'), ctx).tasks.map((t) => t.num)).toEqual([1]);
+    expect(evaluateQuery(tasks, parseQuery('says:conflict'), ctx).tasks.map((t) => t.num)).toEqual([1]);
+    expect(evaluateQuery(tasks, parseQuery('-conversation:artifact'), ctx).tasks.map((t) => t.num)).toEqual([3]);
+  });
+
+  it('falls back to the legacy messages transcript and skips tasks with no view', () => {
+    expect(evaluateQuery(tasks, parseQuery('conversation:retention'), ctx).tasks.map((t) => t.num)).toEqual([2]);
+    expect(evaluateQuery(tasks, parseQuery('conversation:anything'), ctx).tasks.map((t) => t.num)).toEqual([]);
+  });
+
+  it('keeps bare free-text away from transcripts (precision guarantee)', () => {
+    // "conflict" lives only in the merge transcript — bare text must NOT find it.
+    expect(evaluateQuery(tasks, parseQuery('conflict'), ctx).tasks.map((t) => t.num)).toEqual([]);
   });
 });
 

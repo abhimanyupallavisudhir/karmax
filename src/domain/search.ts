@@ -188,6 +188,25 @@ const dependencyIds = (t: SearchTask): string[] =>
 const refBlob = (ids: string[], idToNum?: Map<string, number>): string =>
   ids.map((id) => `${id} #${idToNum?.get(id) ?? ''}`).join(' ');
 
+/**
+ * All conversation text across every role's transcript — powers the explicit
+ * `conversation:` filter. Reads the cached `lastView` (already hydrated on the record),
+ * so this is pure in-memory string scanning: what the task page shows, not the full
+ * durable history. Deliberately NOT part of bare free-text: transcripts quote error
+ * messages, file paths, and each other, so folding them into bare words would collapse
+ * search precision — conversation search is opt-in by field key.
+ */
+const conversationText = (t: SearchTask): string | undefined => {
+  const view = t.lastView;
+  if (!view) return undefined;
+  // `transcripts` carries all roles; the top-level `messages` is the Do transcript
+  // kept for back-compat, so only fall back to it when transcripts are absent.
+  const perRole = view.transcripts?.length ? view.transcripts.map((x) => x.messages) : [view.messages];
+  const chunks: string[] = [];
+  for (const msgs of perRole) for (const m of msgs ?? []) if (m?.text) chunks.push(m.text);
+  return chunks.length ? chunks.join('\n') : undefined;
+};
+
 /** Stable, searchable principal spelling shared by filters, URLs, and audit events. */
 const principalValue = (principal: TaskRecord['assignee']): string | undefined => {
   if (!principal) return undefined;
@@ -211,6 +230,7 @@ export const FIELDS: FieldDef[] = [
   { key: 'updated', label: 'Updated', type: 'date', get: (t) => t.lastView?.updatedAt, sortable: true, sortKey: (t) => t.lastView?.updatedAt ?? t.createdAt ?? 0 },
   { key: 'notes', label: 'Notes', type: 'text', get: (t) => t.notes },
   { key: 'prompt', label: 'Prompt', type: 'text', get: (t) => (t.params?.prompt == null ? undefined : String(t.params.prompt)) },
+  { key: 'conversation', label: 'Conversation', type: 'text', aliases: ['says'], get: conversationText },
   { key: 'branch', label: 'Branch', type: 'text', get: (t) => t.lastView?.branch },
   { key: 'target', label: 'Target', type: 'text', aliases: ['targetBranch'], get: (t) => t.lastView?.targetBranch },
   { key: 'parent', label: 'Parent', type: 'text', get: (t) => t.parentTaskId },
@@ -560,5 +580,5 @@ function groupTasks(tasks: SearchTask[], groupKey: string, ctx: FieldContext): T
 
 /** A compact descriptor of the field registry the UI consumes to build its menus. */
 export function fieldCatalogue() {
-  return FIELDS.map((f) => ({ key: f.key, label: f.label, type: f.type, options: f.options, groupable: !!f.groupable, sortable: !!f.sortable }));
+  return FIELDS.map((f) => ({ key: f.key, label: f.label, type: f.type, aliases: f.aliases, options: f.options, groupable: !!f.groupable, sortable: !!f.sortable }));
 }

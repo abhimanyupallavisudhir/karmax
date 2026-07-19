@@ -2344,14 +2344,18 @@ async function saveCurrentView() {
 function parseQueryClient(input) {
   const q = { filters: [], sort: [] };
   const text = [];
-  const re = /"([^"]*)"|(\S+)/g; let m;
+  // Mirrors the server tokenizer: a `key:` prefix binds to its value even when the
+  // value carries quotes, so `conversation:"merge conflict"` stays one clause.
+  const re = /([-!]{0,2}[A-Za-z_#][\w.#-]*):((?:"[^"]*"|[^\s"])*)|"([^"]*)"|(\S+)/g; let m;
   const OPS = [['>=', 'gte'], ['<=', 'lte'], ['>', 'gt'], ['<', 'lt'], ['=', 'is']];
+  const splitVals = (raw) => {
+    const vals = []; const vre = /"([^"]*)"|([^,]+)/g; let vm;
+    while ((vm = vre.exec(raw))) { const v = (vm[1] !== undefined ? vm[1] : vm[2]).trim(); if (v) vals.push(v); }
+    return vals;
+  };
   while ((m = re.exec(input))) {
-    const quoted = m[1] !== undefined;
-    const tok = quoted ? m[1] : m[2];
-    const colon = quoted ? -1 : tok.indexOf(':');
-    if (colon < 0) { if (tok) text.push(tok); continue; }
-    let key = tok.slice(0, colon); let rest = tok.slice(colon + 1); let negate = false;
+    if (m[1] === undefined) { const tok = m[3] !== undefined ? m[3] : m[4]; if (tok) text.push(tok); continue; }
+    let key = m[1]; let rest = m[2] || ''; let negate = false;
     if (key[0] === '-' || key[0] === '!') { negate = true; key = key.slice(1); }
     if (key === 'sort') { let dir = 'asc'; let k = rest; if (k[0] === '-') { dir = 'desc'; k = k.slice(1); } const dm = k.match(/^(.*)[-:](asc|desc)$/i); if (dm) { k = dm[1]; dir = dm[2].toLowerCase(); } q.sort.push({ field: k, dir }); continue; }
     if (key === 'group') { q.group = rest; continue; }
@@ -2359,10 +2363,10 @@ function parseQueryClient(input) {
     // `param.<key>` / `p.<key>` and `agent_<role>.<sub>` are synthetic (text) fields.
     const isParam = /^(param|p)\.[^.\s]+$/i.test(key) || /^agent_[a-z0-9]+\.(agent|model|effort)$/i.test(key);
     const fld = isParam ? { key, type: 'text' } : S.fields.find((f) => f.key === key || (f.aliases || []).includes(key));
-    if (!fld) { text.push(tok); continue; }
+    if (!fld) { text.push(m[0]); continue; }
     let op = fld.type === 'text' ? 'contains' : 'is';
-    for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
-    const values = rest.split(',').map((s) => s.trim()).filter(Boolean);
+    if (rest[0] !== '"') for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
+    const values = splitVals(rest);
     if (values.length) q.filters.push(negate ? { field: fld.key, op, values, negate: true } : { field: fld.key, op, values });
   }
   if (!q.filters.length) delete q.filters;
