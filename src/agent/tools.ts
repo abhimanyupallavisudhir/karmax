@@ -138,6 +138,33 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'read_wiki',
+    description:
+      'Navigate an organization or project wiki (skills, memories, prompts). No path → the full table of contents (this also expands any [more…] fold); a section path → that section listed in full; a skill/memory path → its complete markdown plus attached files. Your prompt names the scope ids that apply to your task.',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['organization', 'project'] },
+        id: { type: 'string', description: 'The organization or project id.' },
+        path: { type: 'string', description: 'Wiki-relative folder path of a section or skill; omit for the full TOC.' },
+      },
+      required: ['scope', 'id'],
+    },
+  },
+  {
+    name: 'search_wiki',
+    description: 'Grep every page of an organization or project wiki with a case-insensitive regular expression; returns file:line matches.',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['organization', 'project'] },
+        id: { type: 'string', description: 'The organization or project id.' },
+        query: { type: 'string' },
+      },
+      required: ['scope', 'id', 'query'],
+    },
+  },
+  {
     name: 'request_spend',
     description:
       'Request to pay for something with the project card. Amount in cents. Returns granted (charged), needs_approval, needs_funding, or denied. If not granted, stop and report — the human will fund/approve, then you can retry.',
@@ -342,6 +369,16 @@ export function platformToolHandlers(
     async save_skill(args) {
       ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
       return 'skill saved';
+    },
+    async read_wiki(args) {
+      const scope = args?.scope === 'organization' ? 'organizations' : 'projects';
+      const id = encodeURIComponent(String(args?.id ?? ''));
+      return JSON.stringify(await platformRequest('GET', `/api/${scope}/${id}/wiki?path=${encodeURIComponent(String(args?.path ?? ''))}`));
+    },
+    async search_wiki(args) {
+      const scope = args?.scope === 'organization' ? 'organizations' : 'projects';
+      const id = encodeURIComponent(String(args?.id ?? ''));
+      return JSON.stringify(await platformRequest('GET', `/api/${scope}/${id}/wiki/search?q=${encodeURIComponent(String(args?.query ?? ''))}`));
     },
     async request_spend(args) {
       const r = await ctx.requestSpend({

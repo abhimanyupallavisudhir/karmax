@@ -29,6 +29,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
+import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectUnconditional, searchWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -1585,6 +1586,75 @@ export class KarmaxApi {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, args.content);
     return { path: file };
+  }
+
+  // ── Wiki (org/project skills, memories, prompts — SPEC §4.4 content) ──────
+  // Reads need the scope's read capability; writes reuse skill:write (the wiki
+  // IS the skills store). All paths are traversal-checked inside src/wiki.
+
+  /** Resolve + authorize one wiki scope; returns its on-disk root. */
+  private wikiScope(token: string, scope: string, id: string, write: boolean): string {
+    if (scope !== 'organization' && scope !== 'project') throw new Error('wiki scope must be organization or project');
+    if (scope === 'project') {
+      const project = this.deps.store.getProject(id);
+      if (!project) throw new Error(`no project ${id}`);
+      this.require(token, write ? 'skill:write' : 'project:read', { projectId: id, organizationId: project.organizationId });
+    } else {
+      this.require(token, write ? 'skill:write' : 'organization:read', { organizationId: id });
+    }
+    return wikiRoot(this.deps.contentDir ?? paths().content, scope, id);
+  }
+
+  /** One navigation call: a skill path returns the page; anything else lists
+   *  the (sub)tree — the same call expands a TOC `[more…]` fold. The full tree
+   *  also carries the unconditional entries' bodies and `tocText`, the exact
+   *  rendered table of contents agents receive (importance order, [more…]
+   *  folds). The organization tree includes the built-ins, resolved through
+   *  their on-disk overrides when edited. */
+  readWiki(token: string, scope: WikiScope, id: string, rel = '') {
+    const root = this.wikiScope(token, scope, id, false);
+    const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
+    const builtins = scope === 'organization' ? resolveBuiltins(root) : [];
+    const builtin = builtins.find((b) => b.path === safeWikiPath(rel));
+    if (builtin) return { scope, id, path: builtin.path, page: builtin };
+    const page = rel ? readWikiPage(root, rel) : undefined;
+    if (page) return { scope, id, path: page.path, page };
+    const toc = listWiki(root, rel);
+    if (rel) return { scope, id, path: safeWikiPath(rel), toc };
+    const unconditional = [
+      ...builtins
+        .filter((b) => b.delivery === 'unconditional')
+        .map((b) => ({ ...entryOf(b), body: parseFrontmatter(b.content).body.trim() || b.content })),
+      ...collectUnconditional(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
+    ];
+    toc.children = [...builtins.map(entryOf), ...(toc.children ?? [])];
+    // renderWikiToc skips unconditional entries itself, so the full tree gives
+    // exactly the agent-visible TOC (indexed built-ins included).
+    const tocText = renderWikiToc(toc, { scope, id });
+    return { scope, id, path: '', toc, unconditional, tocText };
+  }
+
+  /** Create (`create` guards against overwriting), update, or — via `prevPath`
+   *  — rename an entry. `kind` picks SKILL.md vs MEMORY.md at creation only. */
+  saveWikiPage(
+    token: string,
+    scope: WikiScope,
+    id: string,
+    args: { path: string; content: string; kind?: 'skill' | 'memory'; create?: boolean; prevPath?: string },
+  ) {
+    const root = this.wikiScope(token, scope, id, true);
+    if (args.prevPath && safeWikiPath(args.prevPath) !== safeWikiPath(args.path)) moveWikiPage(root, args.prevPath, args.path);
+    return writeWikiPage(root, args.path, args.content, args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
+  }
+
+  deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string) {
+    const root = this.wikiScope(token, scope, id, true);
+    return { deleted: deleteWikiPage(root, rel) };
+  }
+
+  searchWiki(token: string, scope: WikiScope, id: string, query: string) {
+    const root = this.wikiScope(token, scope, id, false);
+    return { scope, id, query, hits: searchWiki(root, query) };
   }
 
   /** Propose a workflow-repo edit through the dogfooded merge-only PR gate (§4.4). */
