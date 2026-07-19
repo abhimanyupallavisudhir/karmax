@@ -823,8 +823,9 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 @media (max-width: 700px) { .parameter-fields .agent-controls { grid-template-columns: 1fr; } }
 @media (max-width: 700px) { .agent-profile-controls { grid-template-columns: 1fr; } }
 .branch-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.branch-pair.cols-3 { grid-template-columns: 1fr 1fr 1fr; }
 .branch-pair .form-row { min-width: 0; }
-@media (max-width: 700px) { .branch-pair { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .branch-pair, .branch-pair.cols-3 { grid-template-columns: 1fr; } }
 
 /* ── Schedule builder + 5-field cron grid (task form) ─────────────────────── */
 .sched-builder { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }

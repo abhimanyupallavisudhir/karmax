@@ -559,11 +559,19 @@ destroy()
 
 `createWorld` dispatches to the configured provider. The workflow talks only to this interface, so local-worktree → container → remote sandbox changes nothing upstream.
 
-Provider choice, pool, resources, network posture, organization cloud budget,
-and parked-world retention form one organization execution policy. Projects
-inherit it; their sparse override is limited to a provider/pool exception and a
-tighter project budget. Provider-specific template/snapshot/image settings stay
-on that provider connection. General coding defaults to unrestricted outbound
+Pool, resources, network posture, organization cloud budget, and parked-world
+retention form one organization **compute** policy (Settings → Compute). Projects
+inherit it; their sparse override is limited to a pool exception and a tighter
+project budget. The **provider choice itself is a different axis** — the *agent
+environment* (worktree / container / E2B / Daytona). It is a **task default**
+(§10.4), edited beside the base/target branches, so it inherits organization →
+project → task like any other field and a single task can pick a different
+environment without a project-wide change (it binds to `input.project.worldProvider`,
+which every world-creating workflow reads). Its canonical value still lives in the
+execution policy, so runner-pool compatibility and the effective-config merge stay
+coherent; the Compute section shows the effective environment read-only and scopes
+its pool list to it. Provider-specific template/snapshot/image settings stay on
+that provider connection. General coding defaults to unrestricted outbound
 internet; a domain/CIDR allowlist is an explicit enterprise hardening mode.
 
 When a self-hosted project stores a local repository path but selects a remote
