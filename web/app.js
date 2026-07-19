@@ -1217,17 +1217,9 @@ function mdBlocks(s, stash) {
       continue;
     }
     if (bullet.test(line)) {
-      const ordered = /^\s*\d+[.)]\s+/.test(line);
-      const items = [];
-      while (i < lines.length && bullet.test(lines[i])) {
-        let item = lines[i].replace(bullet, '');
-        i++;
-        while (i < lines.length && !/^\s*$/.test(lines[i]) && !bullet.test(lines[i]) && /^\s+/.test(lines[i])) {
-          item += '\n' + lines[i].replace(/^\s+/, ''); i++;
-        }
-        items.push(`<li>${mdInline(item)}</li>`);
-      }
-      out.push(`<${ordered ? 'ol' : 'ul'} class="md-list">${items.join('')}</${ordered ? 'ol' : 'ul'}>`);
+      const { html, next } = mdParseList(lines, i, stash);
+      out.push(html);
+      i = next;
       continue;
     }
     if (isTableStart(i)) {
@@ -1258,6 +1250,99 @@ function mdBlocks(s, stash) {
     out.push(`<p class="md-p">${mdInline(joined).replace(/\n/g, '<br>')}</p>`);
   }
   return out.join('\n');
+}
+
+// One list-item line: leading indent, the marker (bullet or `N.`/`N)`), the gap
+// after it, and the item's first-line content.
+const MD_ITEM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)(.*)$/;
+const mdListKind = (marker) => (/^\d/.test(marker) ? 'ol' : 'ul');
+// Leading-whitespace width of a line (a tab counts as 4 columns).
+function mdIndent(line) {
+  let w = 0;
+  for (const c of line) { if (c === ' ') w++; else if (c === '\t') w += 4; else break; }
+  return w;
+}
+
+// Parse a bullet/number list starting at lines[start]; returns { html, next }.
+// This is deliberately thorough because loose lists are where naive renderers
+// break: blank lines between items must NOT split one list into many one-item
+// lists (that is the classic bug where every ordered item shows "1."). It also
+// honours an arbitrary ordered start value (start=N), nested sublists by
+// indentation, and multi-line / multi-paragraph item bodies.
+function mdParseList(lines, start, stash) {
+  const first = MD_ITEM.exec(lines[start]);
+  const baseIndent = mdIndent(lines[start]);
+  const kind = mdListKind(first[2]);
+  const startNum = kind === 'ol' ? parseInt(first[2], 10) : 1;
+
+  // Extent of the whole list block: sibling markers at this indent, their more-
+  // indented continuation/nested lines, and interior blank lines (a blank counts
+  // as interior only when a later line resumes the list).
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (/^\s*$/.test(line)) {
+      let j = end;
+      while (j < lines.length && /^\s*$/.test(lines[j])) j++;
+      if (j >= lines.length) break;
+      const nm = MD_ITEM.exec(lines[j]);
+      const sameList = nm && mdIndent(lines[j]) === baseIndent && mdListKind(nm[2]) === kind;
+      const deeper = mdIndent(lines[j]) > baseIndent;
+      if (sameList || deeper) { end = j; continue; }
+      break;
+    }
+    const m = MD_ITEM.exec(line);
+    if (m && mdIndent(line) === baseIndent) {
+      if (mdListKind(m[2]) !== kind) break; // a switch of marker type starts a new list
+      end++; continue;
+    }
+    if (mdIndent(line) > baseIndent) { end++; continue; } // continuation / nested
+    break; // a dedented, non-item line ends the list
+  }
+
+  // A list is "loose" if any blank line falls inside its extent — CommonMark then
+  // wraps each item's text in a paragraph; we mirror that with extra spacing.
+  let loose = false;
+  for (let k = start; k < end - 1; k++) { if (/^\s*$/.test(lines[k])) { loose = true; break; } }
+
+  // Split the extent into items at each sibling marker; dedent each item's body
+  // by its own content indent so nested markup parses at the right level.
+  const items = [];
+  let k = start;
+  while (k < end) {
+    const m = MD_ITEM.exec(lines[k]);
+    if (!(m && mdIndent(lines[k]) === baseIndent && mdListKind(m[2]) === kind)) { k++; continue; }
+    const contentIndent = m[1].length + m[2].length + m[3].length;
+    const body = [m[4]];
+    k++;
+    while (k < end) {
+      const sib = MD_ITEM.exec(lines[k]);
+      if (sib && mdIndent(lines[k]) === baseIndent && mdListKind(sib[2]) === kind) break;
+      body.push(/^\s*$/.test(lines[k]) ? '' : lines[k].slice(contentIndent));
+      k++;
+    }
+    items.push(body.join('\n').replace(/\s+$/, ''));
+  }
+
+  // Render each item. A loose list wraps every item body in paragraphs (via
+  // mdBlocks). In a tight list, a plain item renders inline; one that carries a
+  // nested sublist keeps its lead text inline and parses only the sublist as a
+  // block, so tight lists don't sprout stray paragraph margins.
+  const li = items.map((text) => {
+    const rows = text.split('\n');
+    if (loose) return `<li>${mdBlocks(text, stash)}</li>`;
+    const cut = rows.findIndex((l, x) => x > 0 && MD_ITEM.test(l));
+    if (cut > 0) {
+      const lead = rows.slice(0, cut).join('\n').trim();
+      const rest = rows.slice(cut).join('\n');
+      const leadHtml = lead ? mdInline(lead).replace(/\n/g, '<br>') : '';
+      return `<li>${leadHtml}${leadHtml ? '\n' : ''}${mdBlocks(rest, stash)}</li>`;
+    }
+    return `<li>${mdInline(text).replace(/\n/g, '<br>')}</li>`;
+  }).join('');
+
+  const attr = kind === 'ol' && startNum !== 1 ? ` start="${startNum}"` : '';
+  return { html: `<${kind} class="md-list${loose ? ' md-loose' : ''}"${attr}>${li}</${kind}>`, next: end };
 }
 
 // Split one pipe-table row into trimmed cells, tolerating optional leading and
@@ -1295,15 +1380,32 @@ function mdCellAlign(cell) {
 // stash placeholders (bare digits) survive untouched.
 function mdInline(t) {
   let x = esc(t);
-  x = x.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, href) => {
+  // Backslash escapes: stash the escaped punctuation (as \u0001N\u0001) so the
+  // emphasis/link passes treat it as a literal, then restore it at the very end.
+  const lit = [];
+  x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
+  // Inline links [text](url "optional title") — safe schemes only; the title is
+  // dropped. Runs before autolinking so a bare URL inside a link is left alone.
+  x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
     const safe = /^(https?:|mailto:|\/)/i.test(href) ? href : '#';
     return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
   });
+  // Autolink bare http(s) URLs not already part of a link/attribute (only when
+  // preceded by start-of-string, whitespace or an opening paren). Trailing
+  // sentence punctuation is left outside the link.
+  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, url) => {
+    const tail = (url.match(/[.,;:!?]+$/) || [''])[0];
+    const bare = url.slice(0, url.length - tail.length);
+    return `${pre}<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>${tail}`;
+  });
+  x = x.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
+  x = x.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
   x = x.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
   x = x.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
   x = x.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
   x = x.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
   x = x.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  x = x.replace(/\u0001(\d+)\u0001/g, (_, n) => lit[Number(n)]);
   return x;
 }
 

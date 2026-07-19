@@ -509,7 +509,15 @@ a { color: var(--accent); text-decoration: none; }
 .msg-text.md h3.md-h { font-size: 1.06em; }
 .msg-text.md h4.md-h, .msg-text.md h5.md-h, .msg-text.md h6.md-h { font-size: 1em; }
 .msg-text.md .md-list { margin: 0 0 8px; padding-left: 1.5em; }
+.msg-text.md ol.md-list { list-style: decimal; }
+.msg-text.md ul.md-list { list-style: disc; }
 .msg-text.md .md-list li { margin: 2px 0; }
+/* Nested lists hug their parent item; only the outermost list carries margin. */
+.msg-text.md .md-list .md-list { margin: 2px 0 0; }
+/* Loose lists (blank lines between items) breathe a little more. */
+.msg-text.md .md-loose > li { margin: 6px 0; }
+/* A paragraph that is the sole/last child of a list item shouldn't add a gap. */
+.msg-text.md .md-list li > .md-p:last-child { margin-bottom: 0; }
 .msg-text.md .md-quote { margin: 0 0 8px; padding: 2px 0 2px 10px; border-left: 3px solid var(--line); opacity: .9; }
 .msg-text.md .md-hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
 .msg-text.md a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
