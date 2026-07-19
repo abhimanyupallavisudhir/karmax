@@ -41,6 +41,13 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/git-profiles', 'GET|PATCH|DELETE /api/git-profiles/:id',
     'GET /api/git-profiles/preflight?projectId=', 'POST /api/git-profiles/default',
   ],
+  wiki: [
+    'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',
+    'GET|PUT|DELETE /api/organizations/:organizationId/wiki/page?path= (PUT body {path, content, kind: skill|memory, create?, prevPath?})',
+    'GET /api/organizations/:organizationId/wiki/search?q=',
+    'GET /api/projects/:projectId/wiki?path=', 'GET|PUT|DELETE /api/projects/:projectId/wiki/page?path=',
+    'GET /api/projects/:projectId/wiki/search?q=',
+  ],
   payments: ['GET /api/payments/providers', 'POST /api/payments/connect', 'GET|POST /api/cards', 'POST /api/cards/:id/fund'],
   administration: [
     'GET|POST /api/users', 'DELETE /api/users/:id',

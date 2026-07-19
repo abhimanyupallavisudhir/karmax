@@ -684,12 +684,33 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const { paths } = await import('../config/paths.js');
         bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
       }
+      // Wiki context (SPEC §5.4 "global + project instructions"): the built-in
+      // working instructions (a virtual unconditional wiki entry), then per
+      // scope its unconditional entries in full and the indexed TOC. Read here
+      // (an activity) and snapshotted into the journaled turn input — content
+      // is free to edit between turns, never mid-turn. If the wiki is ever
+      // unreadable, the agent still gets the built-in instructions.
+      let projectInstructions: string | undefined;
+      let globalInstructions: string | undefined;
+      try {
+        const { buildWikiPromptContext } = await import('../wiki/wiki.js');
+        const { paths } = await import('../config/paths.js');
+        projectInstructions = buildWikiPromptContext({
+          contentDir: paths().content,
+          organizationId: store.getProject(args.task.projectId)?.organizationId,
+          projectId: args.task.projectId,
+          builtinInstructions: deps.globalInstructions,
+        }) || undefined;
+      } catch {
+        globalInstructions = deps.globalInstructions ?? GLOBAL_INSTRUCTIONS;
+      }
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: args.task,
         world: args.worldHandle,
-        globalInstructions: deps.globalInstructions ?? GLOBAL_INSTRUCTIONS,
+        globalInstructions,
+        projectInstructions,
         bindings,
       });
       // Snapshot the journaled turn input (SPEC §5.4).

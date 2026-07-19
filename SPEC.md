@@ -151,6 +151,8 @@ This PR gate is **the single most important safety boundary in the system**: age
 
 > **Rule of thumb: content the agent reads is free to edit; code that auto-runs is gated.**
 
+**The wiki is that content system's home.** Each organization and each project owns a wiki under `~/.karmax/content/wiki/<scope>/<id>/` — skills, memories, and prompts are all the same thing to the system. An entry is a **folder** holding a `SKILL.md` or `MEMORY.md` in the standard Agent Skills format (YAML frontmatter, then markdown); the folder name is its title, any other files (scripts, images, even further md files) ride along without becoming entries, and folders without a page file are sections that nest the tree. Frontmatter carries `name`/`description` plus two delivery controls: `delivery: unconditional | indexed` (default indexed) and `importance: <number>` (default 0). An *indexed* entry appears in the **table of contents** agents receive; an *unconditional* entry's full body is sent with every prompt — a scope's "general prompt" is simply an unconditional entry, and the built-in karmax working instructions ship as a bundled default at `@builtin/how-to-work` — an on-disk entry at that exact path is its editable override (the §9 overlay model: editing customizes, deleting the override restores the default; the rest of the `@` namespace stays reserved and built-in identities never rename). Every agent turn receives, in order: the built-in instructions, then per scope (organization, then project) its unconditional entries in full followed by the indexed TOC (names + descriptions only, expanded to every leaf, siblings ordered by importance). When a TOC's estimated tokens exceed 20k, each penultimate list of ≥10 entries keeps its 9 most important and folds the rest behind a `[more…]` link naming the exact expansion call. Agents navigate with `read_wiki` (TOC / section / full page) and grep with `search_wiki`; both are gateway-backed platform tools that run host-side, so they work identically from local worktrees and cloud sandboxes. Reads need the scope's read capability; writes reuse `skill:write` (the wiki *is* the skills store).
+
 ### 4.5 Versioning and in-flight changes
 
 Finite task workflows rarely need in-flight migration — let running tasks drain on their pinned version. Long-lived coordinators (§6) are the exception: their durable state outlives any code version, so coordinator edits require tested state migrations and Temporal patching for in-flight executions. See §9 for why safe mode does not rescue them.
@@ -465,6 +467,7 @@ Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
 not reproduce issue-tracker assignee/delegate/reviewer/follower state. Each
 workflow human wait declares the exact user/team/special audience for that step;
 the per-user inbox is a materialized projection of those workflow events.
+- **Wiki** — the organization and project wikis (§4.4): a tree of skills/memories with a rendered page view, a frontmatter-as-form editor (raw YAML behind a toggle, markdown preview), and an Index showing exactly what agents receive each turn: every unconditional entry in full, then the rendered table of contents (names + descriptions, importance order, [more…] folds). The project wiki is a project tab; the organization wiki is the bottom-left rail link.
 - **Dashboard** — agent runs, token/limit status across accounts, resources used.
 - **The final composed app UI** with the keyboard-navigation registry.
 
@@ -525,15 +528,17 @@ The console is a single-page app, but every page has its own **URL** so a specif
 /<org>/dashboard                     → organization dashboard
 /<org>/settings                      → organization settings
 /<org>/inbox                         → inbox
+/<org>/wiki                          → organization wiki (bottom-left rail link)
 /<org>/<project>                     → task list          (the primary surface)
 /<org>/<project>/queue               → merge queue
 /<org>/<project>/activity            → activity feed
+/<org>/<project>/wiki                → project wiki (a project tab)
 /<org>/<project>/settings            → project settings
 /<org>/<project>/tasks/:num          → a task permalink (opens the drawer over its list)
 /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
 ```
 
-Organizations carry a persisted `slug` (falling back to a slug of the name for records that predate it). A small set of reserved second-segment words (`dashboard`, `settings`, `inbox`) name organization-level views rather than projects, so those never round-trip through a project slug; every other second segment is a project. Project slugs need only be unique **within their org** — the slug resolves to a project by matching the slugified name (case-insensitive), scoped to the URL's org; names are expected distinct, and on the rare collision the first-created project wins. Because the console loads the full org + project list at boot, org↔project↔slug resolution is entirely client-side — no round-trip to open a deep link. Pre-organization URLs (`/dashboard`, `/organization`, `/settings`, `/projects/:name/…`) are still parsed and then **canonicalised** (History `replaceState`) to the org-prefixed form, so old bookmarks and server-issued redirects keep working.
+Organizations carry a persisted `slug` (falling back to a slug of the name for records that predate it). A small set of reserved second-segment words (`dashboard`, `settings`, `inbox`, `wiki`) name organization-level views rather than projects, so those never round-trip through a project slug; every other second segment is a project. Project slugs need only be unique **within their org** — the slug resolves to a project by matching the slugified name (case-insensitive), scoped to the URL's org; names are expected distinct, and on the rare collision the first-created project wins. Because the console loads the full org + project list at boot, org↔project↔slug resolution is entirely client-side — no round-trip to open a deep link. Pre-organization URLs (`/dashboard`, `/organization`, `/settings`, `/projects/:name/…`) are still parsed and then **canonicalised** (History `replaceState`) to the org-prefixed form, so old bookmarks and server-issued redirects keep working.
 
 **Workflows do not own URLs.** This is the answer to "does a workflow own its page?": no. Every page is a first-party **core UI module** (§10.3) whose *route* is host-owned; a workflow only ever *augments* a host page through the declared contribution system (§10.1) — a slot, a widget, an action, a param field — never by claiming a path. The merge queue is the illustrative case: it looks "produced by a workflow," but it is a host route that *projects* the merge-queue **coordinator's** query state (`{queue, current}`, §6.1) joined with each task's `mergeQueue` position. The coordinator is queried; it does not render or route. The same holds for the dashboard (projects the account coordinator's query). Keeping routes host-owned means the URL space is finite, stable, and knowable without loading any workflow package.
 

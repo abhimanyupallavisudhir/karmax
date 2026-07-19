@@ -83,7 +83,8 @@ function taskRecord(id) {
 //   /<org>/dashboard                     → organization dashboard
 //   /<org>/settings                      → organization settings
 //   /<org>/inbox                         → inbox
-//   /<org>/<project>                     → task list (also /queue, /activity, /settings)
+//   /<org>/wiki                          → organization wiki
+//   /<org>/<project>                     → task list (also /queue, /activity, /wiki, /settings)
 //   /<org>/<project>/tasks/:num          → the task's own page (permalink)
 //   /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
 // Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
@@ -123,7 +124,7 @@ function currentOrg() {
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
 // Second-segment words that name an organization-level view rather than a project.
-const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox' };
+const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
 function parseRoute(pathname) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
@@ -134,7 +135,7 @@ function parseRoute(pathname) {
   if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
   if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
-    const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
     return { name: 'project', slug: seg[1], tab, taskKey, taskTab, legacy: true };
@@ -143,7 +144,7 @@ function parseRoute(pathname) {
   const org = seg[0];
   if (!seg[1]) return { name: 'global', org, tab: null };            // /<org> → org home
   if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
-  const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+  const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab };
@@ -161,7 +162,7 @@ function projectRoute(pid, tab = 'tasks') {
 // An organization-level route (dashboard / settings / inbox) under the current
 // (or a given) org's slug. Internal tab key 'organization' → URL segment 'settings'.
 function globalRoute(tab, org = currentOrg()) {
-  const seg = tab === 'organization' ? 'settings' : tab;
+  const seg = tab === 'organization' ? 'settings' : tab === 'orgwiki' ? 'wiki' : tab;
   return `${orgBase(org)}/${seg}`;
 }
 
@@ -1742,6 +1743,7 @@ function renderRail() {
     <div class="grow"></div>
     <div class="label">Organization</div>
     <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
+    <div class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</div>
     <div class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" id="rail-organization" tabindex="0">⚙ Settings</div>
     <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
     <div class="nav-item" id="rail-palette" tabindex="0" title="Run any available command">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
@@ -1749,6 +1751,7 @@ function renderRail() {
     e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
   );
   $('#new-project')?.addEventListener('click', newProject);
+  $('#rail-wiki')?.addEventListener('click', () => go(globalRoute('orgwiki')));
   $('#rail-organization')?.addEventListener('click', () => go(globalRoute('organization')));
   rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
   $('#rail-logout')?.addEventListener('click', async () => {
@@ -1811,10 +1814,15 @@ function renderMain() {
     if (S.view) renderTaskPage();
     return;
   }
+  // An open wiki editor likewise manages its own renders: a background refresh
+  // must not clobber in-progress edits (only the focused field would survive
+  // the async rehydrate). Navigation still repaints — it changes S.tab or
+  // clears S.wikiEditing first.
+  if ((S.tab === 'wiki' || S.tab === 'orgwiki') && S.wikiEditing && $('#wiki-path')) return;
   const proj = S.projects.find((p) => p.id === S.projectId);
-  const tabs = ['tasks', 'queue', 'activity', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Queues', activity: 'Activity', settings: 'Project settings' };
-  const projectScoped = ['tasks', 'queue', 'activity', 'settings'].includes(S.tab);
+  const tabs = ['tasks', 'queue', 'activity', 'wiki', 'settings'];
+  const labels = { tasks: 'Tasks', queue: 'Queues', activity: 'Activity', wiki: 'Wiki', settings: 'Project settings' };
+  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<div class="tab ${S.tab === t ? 'active' : ''}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</div>`)
@@ -1828,6 +1836,8 @@ function renderMain() {
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
   else if (S.tab === 'inbox') content = inboxView();
   else if (S.tab === 'organization') content = organizationView();
+  else if (S.tab === 'wiki') content = wikiView(proj);
+  else if (S.tab === 'orgwiki') content = wikiView(null);
   else if (S.tab === 'settings') content = settingsView(proj);
   else if (S.tab === 'global') content = globalSettingsView();
 
@@ -1840,6 +1850,8 @@ function renderMain() {
   main.querySelectorAll('.tab[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
   if (S.tab === 'tasks') wireTasksView();
   if (S.tab === 'queue') wireQueueView();
+  if (S.tab === 'wiki') wireWikiView(proj);
+  if (S.tab === 'orgwiki') wireWikiView(null);
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
@@ -5729,6 +5741,342 @@ function wireQuickSettingsSave(scope, projectId, organizationId) {
 
 const quickDefaultsHeader = () => '';
 
+// ── wiki (org/project skills, memories, and prompts — one content system) ─────
+// One view serves both scopes: /<org>/wiki (proj = null) and /<org>/<project>/wiki.
+// The left rail lists the wiki tree; the pane shows the Index (every
+// `delivery: unconditional` entry rendered in full — exactly what agents get
+// with each prompt) or the selected entry. The open entry rides in the URL hash
+// so wiki pages deep-link like settings panes.
+function wikiScopeInfo(proj) {
+  if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki` };
+  const org = currentOrg();
+  if (!org) return null;
+  return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki` };
+}
+
+function wikiView(proj) {
+  const info = wikiScopeInfo(proj);
+  if (!info) return `<div class="empty">No organization yet.</div>`;
+  return `<div class="organization-settings wiki-page"><div class="settings-header"><div>
+      <h1 class="page-title">${esc(info.title)} — wiki</h1>
+    </div></div>
+    <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
+    <div class="settings-content" id="wiki-pane"></div></div></div>`;
+}
+
+const wikiGlyph = (e) => (e.delivery === 'unconditional' ? '✦' : e.kind === 'memory' ? '✎' : '⚡');
+
+function wikiTreeHtml(entries, sel, depth = 0) {
+  return (entries || []).map((e) => e.kind === 'section'
+    ? `<span class="wiki-sec" style="padding-left:${10 + depth * 12}px">${esc(e.name)}/</span>${wikiTreeHtml(e.children, sel, depth + 1)}`
+    : `<a href="#${encodeURIComponent(e.path)}" class="${sel === e.path ? 'active' : ''}" data-wiki-path="${esc(e.path)}"
+         style="padding-left:${10 + depth * 12}px" title="${esc(e.description || '')}">${wikiGlyph(e)} ${esc(e.name)}</a>`,
+  ).join('');
+}
+
+async function wireWikiView(proj) {
+  const info = wikiScopeInfo(proj);
+  const nav = $('#wiki-nav');
+  const pane = $('#wiki-pane');
+  if (!info || !nav || !pane) return;
+  const key = `${info.scope}:${info.id}`;
+  let data;
+  try { data = await api(info.base); }
+  catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
+  const sel = decodeURIComponent((location.hash || '').slice(1));
+
+  nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
+    <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
+    ${wikiTreeHtml(data.toc?.children, sel)}
+    <button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>`;
+  const open = (path) => {
+    S.wikiEditing = null;
+    history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
+    wireWikiView(proj);
+  };
+  nav.querySelector('[data-wiki-home]')?.addEventListener('click', (ev) => { ev.preventDefault(); open(''); });
+  nav.querySelectorAll('[data-wiki-path]').forEach((a) => a.addEventListener('click', (ev) => { ev.preventDefault(); open(a.dataset.wikiPath); }));
+  $('#wiki-new')?.addEventListener('click', () => renderWikiEditor(info, proj, pane, null));
+
+  // A page fetch goes through the base route so built-ins resolve (a virtual
+  // built-in has no on-disk page for /page to find).
+  const fetchPage = async (p) => (await api(`${info.base}?path=${encodeURIComponent(p)}`)).page;
+  // A background re-render (WS task event) must not blow away an in-progress
+  // editor: restore it for the same scope before painting the read view.
+  if (S.wikiEditing?.wikiKey === key) {
+    if (!S.wikiEditing.path) return renderWikiEditor(info, proj, pane, null);
+    try {
+      const editing = await fetchPage(S.wikiEditing.path);
+      if (editing) return renderWikiEditor(info, proj, pane, editing);
+    } catch { /* fall through */ }
+    S.wikiEditing = null;
+  }
+  if (!sel) return renderWikiHome(info, proj, pane, data);
+  let page;
+  try { page = await fetchPage(sel); } catch { page = null; }
+  if (!page) return renderWikiHome(info, proj, pane, data); // stale hash → fall back
+  renderWikiPage(info, proj, pane, page);
+}
+
+// Everything above the frontmatter fence is metadata; render only the body.
+function wikiBody(content) {
+  return String(content || '').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+}
+
+// ── frontmatter ⇄ form (the editor's two faces) ──────────────────────────────
+// Mirrors src/wiki/wiki.ts parseFrontmatter, plus strictness: toggling the raw
+// YAML view back to the form requires every line to be a valid known scalar.
+function parseWikiFm(text) {
+  const s = String(text ?? '');
+  if (!/^---\r?\n/.test(s)) return { ok: true, fields: {}, body: s };
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(s);
+  if (!m) return { ok: false, error: 'Unterminated frontmatter — missing the closing “---”.' };
+  const fields = {};
+  for (const line of m[1].split('\n')) {
+    if (!line.trim()) continue;
+    const kv = /^([A-Za-z][\w-]*):\s*(.*)$/.exec(line);
+    if (!kv) return { ok: false, error: `Invalid frontmatter line: “${line.trim()}”` };
+    fields[kv[1].toLowerCase()] = kv[2].trim().replace(/^["']|["']$/g, '');
+  }
+  if (fields.delivery && !['unconditional', 'indexed'].includes(fields.delivery))
+    return { ok: false, error: 'delivery must be “unconditional” or “indexed”.' };
+  if (fields.importance && !Number.isFinite(Number(fields.importance)))
+    return { ok: false, error: 'importance must be a number.' };
+  return { ok: true, fields, body: s.slice(m[0].length) };
+}
+
+function buildWikiContent(fields, body) {
+  const lines = [];
+  if (fields.name) lines.push(`name: ${fields.name}`);
+  if (fields.description) lines.push(`description: ${fields.description}`);
+  if (fields.delivery === 'unconditional') lines.push('delivery: unconditional');
+  if (fields.importance && Number(fields.importance) !== 0) lines.push(`importance: ${fields.importance}`);
+  const text = String(body ?? '').replace(/^\n+/, '');
+  return lines.length ? `---\n${lines.join('\n')}\n---\n\n${text}` : text;
+}
+
+// ── the path-as-title control ────────────────────────────────────────────────
+// A single-line contenteditable where the stem (after the last slash) is the
+// large title and any parent sections shrink into a prefix.
+function caretOffsetIn(el) {
+  const s = window.getSelection();
+  if (!s?.rangeCount || !el.contains(s.anchorNode)) return null;
+  const pre = s.getRangeAt(0).cloneRange();
+  const end = s.getRangeAt(0);
+  pre.selectNodeContents(el);
+  pre.setEnd(end.endContainer, end.endOffset);
+  return pre.toString().length;
+}
+function setCaretIn(el, offset) {
+  if (offset == null) return;
+  const sel = window.getSelection();
+  const range = document.createRange();
+  let left = offset;
+  let placed = false;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (left <= node.textContent.length) { range.setStart(node, left); range.collapse(true); placed = true; break; }
+    left -= node.textContent.length;
+  }
+  if (!placed) { range.selectNodeContents(el); range.collapse(false); }
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+function wikiPathValue(el) {
+  return el.textContent.replace(/\s+/g, '').replace(/\/+/g, '/').replace(/^\/|\/$/g, '');
+}
+function wireWikiPathEditor(el, warnEl, kindOf) {
+  const restyle = () => {
+    const text = el.textContent.replace(/[\r\n]/g, '');
+    const caret = caretOffsetIn(el);
+    const cut = text.lastIndexOf('/') + 1;
+    el.innerHTML = (cut ? `<span class="wiki-path-prefix">${esc(text.slice(0, cut))}</span>` : '') +
+      `<span class="wiki-path-stem">${esc(text.slice(cut))}</span>`;
+    setCaretIn(el, caret);
+    const ext = /\.[A-Za-z0-9]{1,6}$/.test(wikiPathValue(el));
+    warnEl.hidden = !ext;
+    if (ext) warnEl.textContent = `That looks like a file extension — this is the entry's folder path; the file itself will be ${kindOf() === 'memory' ? 'MEMORY.md' : 'SKILL.md'}.`;
+  };
+  el.addEventListener('input', restyle);
+  el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') ev.preventDefault(); });
+  el.addEventListener('paste', (ev) => {
+    ev.preventDefault();
+    document.execCommand('insertText', false, (ev.clipboardData?.getData('text/plain') || '').replace(/\s+/g, ''));
+  });
+  restyle();
+}
+
+// ── panes ────────────────────────────────────────────────────────────────────
+// Index: exactly what agents receive each turn — every unconditional entry in
+// full, then the rendered table of contents (importance order, [more…] folds).
+function renderWikiHome(info, proj, pane, data) {
+  pane.innerHTML = (data.unconditional || []).map((u) => `
+    <div class="card wiki-uncond">
+      <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
+        <button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button></div>
+      <div class="msg-text md wiki-md">${renderMessageBody(u.body || '')}</div>
+    </div>`).join('') + (data.tocText ? `
+    <div class="card wiki-uncond">
+      <div class="wiki-uncond-head"><b>Table of contents</b><span class="chip" title="Sent to agents as names and descriptions only; they open entries with read_wiki">titles only</span></div>
+      <div class="msg-text md wiki-md">${renderMessageBody(data.tocText)}</div>
+    </div>` : '');
+  typesetMath(pane);
+  pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
+    try {
+      const read = await api(`${info.base}?path=${encodeURIComponent(b.dataset.path)}`);
+      if (!read.page) return toast('Entry not found', true);
+      history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(read.page.path)}`);
+      renderWikiEditor(info, proj, pane, read.page);
+    } catch (e) { toast(e.message, true); }
+  }));
+}
+
+function renderWikiPage(info, proj, pane, page) {
+  // A built-in is always editable (the edit shadows the bundled default); its
+  // delete button appears only once customized, and restores that default.
+  const remove = page.builtin
+    ? (page.overridden ? '<button class="btn sm danger" id="wiki-page-delete">Restore default</button>' : '')
+    : '<button class="btn sm danger" id="wiki-page-delete">Delete</button>';
+  pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)}
+      <span class="chip">${page.kind}</span><span class="chip">${esc(page.path)}</span>
+      ${page.delivery === 'unconditional' ? '<span class="chip active">always in prompt</span>' : ''}
+      ${page.builtin ? '<span class="chip">built-in</span>' : ''}
+      ${page.overridden ? '<span class="chip">customized</span>' : ''}
+      ${page.description ? `<small>${esc(page.description)}</small>` : ''}</div></div>
+    <div class="card">
+      <div class="msg-text md wiki-md">${renderMessageBody(wikiBody(page.content))}</div>
+      ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
+      <div class="inline-form" style="margin-top:10px"><button class="btn sm" id="wiki-page-edit">Edit</button>${remove}</div>
+    </div>`;
+  typesetMath(pane);
+  $('#wiki-page-delete')?.addEventListener('click', async () => {
+    const q = page.builtin
+      ? `Restore the built-in default for “${page.name}”? Your customized text is discarded.`
+      : `Delete “${page.name}” (${page.path})? Its folder and attached files go with it.`;
+    if (!confirm(q)) return;
+    try {
+      await api(`${info.base}/page?path=${encodeURIComponent(page.path)}`, { method: 'DELETE' });
+      if (!page.builtin) history.replaceState({ kx: 1 }, '', location.pathname);
+      wireWikiView(proj);
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#wiki-page-edit')?.addEventListener('click', () => renderWikiEditor(info, proj, pane, page));
+}
+
+// Create (page = null) and edit share one editor: the path-as-title control, the
+// frontmatter as a form (raw YAML behind a toggle), and a Write/Preview body.
+function renderWikiEditor(info, proj, pane, page) {
+  const isNew = !page;
+  S.wikiEditing = { wikiKey: `${info.scope}:${info.id}`, path: page?.path ?? null };
+  const fm = parseWikiFm(page?.content ?? '');
+  // A pristine built-in has no frontmatter of its own — seed the form from its
+  // resolved metadata so the first save writes an override that keeps the
+  // unconditional delivery/importance instead of silently dropping them.
+  const fields = fm.ok
+    ? (page?.builtin
+      ? { name: page.name, description: page.description, delivery: page.delivery, importance: page.importance, ...Object.fromEntries(Object.entries(fm.fields).filter(([, v]) => v !== undefined && v !== '')) }
+      : fm.fields)
+    : {};
+  const body = fm.ok ? fm.body : (page?.content ?? '');
+  pane.innerHTML = `
+    <div class="wiki-title-row">
+      <div class="wiki-path-edit" id="wiki-path" contenteditable="${page?.builtin ? 'false' : 'true'}" spellcheck="false"></div>
+      ${isNew
+        ? `<select id="wiki-kind"><option value="skill">Skill</option><option value="memory">Memory</option></select>`
+        : `<span class="chip">${page.kind}</span>${page.builtin ? '<span class="chip">built-in</span>' : ''}`}
+    </div>
+    <div class="wiki-warn" id="wiki-path-warn" hidden></div>
+    <div class="card wiki-editor">
+      <div class="wiki-fields" id="wiki-form">
+        <label>Name<input id="wf-name" value="${esc(fields.name || '')}" placeholder="defaults to the folder name"></label>
+        <label>Description<input id="wf-desc" value="${esc(fields.description || '')}" placeholder="one line for the table of contents"></label>
+        <label>Delivery<select id="wf-delivery">
+          <option value="indexed">Indexed — listed in the table of contents</option>
+          <option value="unconditional" ${fields.delivery === 'unconditional' ? 'selected' : ''}>Unconditional — sent in full with every prompt</option>
+        </select></label>
+        <label>Importance<input id="wf-importance" type="number" step="any" value="${esc(fields.importance ?? '')}" placeholder="0"></label>
+      </div>
+      <div class="wiki-body-bar">
+        <button class="wiki-body-tab active" id="wiki-tab-write" type="button">Write</button>
+        <button class="wiki-body-tab" id="wiki-tab-preview" type="button">Preview</button>
+        <span class="grow"></span>
+        <label class="switch"><input type="checkbox" id="wiki-yaml"><span>YAML</span></label>
+      </div>
+      <textarea id="wiki-body" rows="16">${esc(body)}</textarea>
+      <div id="wiki-preview" class="msg-text md wiki-md wiki-preview" hidden></div>
+      <textarea id="wiki-raw" rows="20" hidden></textarea>
+      <div class="inline-form" style="margin-top:10px"><button class="btn sm primary" id="wiki-save">${isNew ? 'Create' : 'Save'}</button><button class="btn sm" id="wiki-cancel">Cancel</button></div>
+    </div>`;
+  const pathEl = $('#wiki-path');
+  pathEl.textContent = page?.path ?? '';
+  const kindOf = () => (isNew ? $('#wiki-kind').value : page.kind);
+  wireWikiPathEditor(pathEl, $('#wiki-path-warn'), kindOf);
+  $('#wiki-kind')?.addEventListener('change', () => pathEl.dispatchEvent(new Event('input')));
+  if (isNew) pathEl.focus();
+
+  const formFields = () => ({
+    name: $('#wf-name').value.trim(),
+    description: $('#wf-desc').value.trim(),
+    delivery: $('#wf-delivery').value,
+    importance: $('#wf-importance').value.trim(),
+  });
+  const yamlToggle = $('#wiki-yaml');
+  const inYaml = () => yamlToggle.checked;
+  yamlToggle.addEventListener('change', () => {
+    if (yamlToggle.checked) {
+      $('#wiki-raw').value = buildWikiContent(formFields(), $('#wiki-body').value);
+      $('#wiki-form').hidden = true;
+      $('.wiki-body-bar', pane).hidden = true;
+      $('#wiki-body').hidden = true;
+      $('#wiki-preview').hidden = true;
+      $('#wiki-raw').hidden = false;
+      $('#wiki-raw').focus();
+    } else {
+      const parsed = parseWikiFm($('#wiki-raw').value);
+      if (!parsed.ok) { toast(parsed.error, true); yamlToggle.checked = true; return; }
+      $('#wf-name').value = parsed.fields.name || '';
+      $('#wf-desc').value = parsed.fields.description || '';
+      $('#wf-delivery').value = parsed.fields.delivery === 'unconditional' ? 'unconditional' : 'indexed';
+      $('#wf-importance').value = parsed.fields.importance ?? '';
+      $('#wiki-body').value = parsed.body;
+      $('#wiki-form').hidden = false;
+      $('.wiki-body-bar', pane).hidden = false;
+      $('#wiki-raw').hidden = true;
+      showWrite();
+    }
+  });
+  const showWrite = () => {
+    $('#wiki-tab-write').classList.add('active');
+    $('#wiki-tab-preview').classList.remove('active');
+    $('#wiki-body').hidden = false;
+    $('#wiki-preview').hidden = true;
+  };
+  $('#wiki-tab-write').addEventListener('click', showWrite);
+  $('#wiki-tab-preview').addEventListener('click', () => {
+    $('#wiki-tab-preview').classList.add('active');
+    $('#wiki-tab-write').classList.remove('active');
+    const preview = $('#wiki-preview');
+    preview.innerHTML = renderMessageBody($('#wiki-body').value) || '<span class="task-sub">Nothing to preview.</span>';
+    $('#wiki-body').hidden = true;
+    preview.hidden = false;
+    typesetMath(preview);
+  });
+
+  $('#wiki-cancel').addEventListener('click', () => { S.wikiEditing = null; wireWikiView(proj); });
+  $('#wiki-save').addEventListener('click', async () => {
+    const path = wikiPathValue(pathEl);
+    if (!path) return toast('The entry needs a path', true);
+    const body = { path, kind: kindOf(), content: inYaml() ? $('#wiki-raw').value : buildWikiContent(formFields(), $('#wiki-body').value) };
+    if (isNew) body.create = true;
+    else if (path !== page.path) body.prevPath = page.path;
+    try {
+      await api(`${info.base}/page`, { method: 'PUT', body: JSON.stringify(body) });
+      S.wikiEditing = null;
+      history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(path)}`);
+      wireWikiView(proj);
+    } catch (e) { toast(e.message, true); }
+  });
+}
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
