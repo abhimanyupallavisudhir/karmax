@@ -370,11 +370,13 @@ to the gateway, and the activity injects a capability-scoped token. For cloud:
    directly in the sandbox through the native provider agent.
 3. A turn token carries organization, project, origin task, role, capabilities,
    audience, expiry, and unique ID. Any gateway replica can verify it.
-4. The selected Claude/Codex subscription home is copied into the task-private
-   injection directory on first use. Later turns preserve provider-refreshed auth,
-   enforce private file modes, and copy only a specifically requested native
-   session when resuming or forking across worlds. Only the scoped Karmax token is
-   added to the turn env.
+4. The selected Claude/Codex subscription home is copied into an account-keyed,
+   task-private injection directory on first use. Later turns preserve
+   provider-refreshed auth, enforce private file modes, and export only native
+   auth plus conversation files atomically back to that account's durable config
+   home. This makes OAuth rotation, portable hibernation, raw resume, and native
+   cross-task forks survive destruction of the provider world. Only the scoped
+   Karmax token is added to the turn env.
 5. Revoke the execution lease on cancellation/end. Keep an auditable token ID,
    never the raw bearer value, in events.
 
@@ -393,8 +395,11 @@ optimization may split these layers without changing the execution contract:
   provider permits and transcript-replayable otherwise.
 
 A task-private home lives on the non-checkpointed injection surface for that
-world generation, preserving native sessions across turns. The host login home
-is copied, never mounted or shared mutably across task sandboxes. Remote
+world generation, preserving native sessions across turns. Its path includes a
+stable digest of the leased config home, so account rotation cannot accidentally
+reuse another login's refreshed state. The host login home is never mounted;
+selected provider auth/session artifacts synchronize through atomic 0600 copies.
+Remote
 subscription turns use provider-world capacity and do not consume the host RAM/load
 agent-slot queue; their account concurrency and world-pool limits still apply.
 
@@ -681,6 +686,15 @@ world generation, repository ID, expected ancestry, object limits, destination
 ref, and exact branch capability, and then pushes `<verified-sha>:<allowed-ref>`
 over SSH. It never accepts a shell fragment or remote URL from the world. Target
 branch updates additionally require the merge-queue lease and reviewed commit.
+
+Agent collaboration uses the same boundary rather than opening another task's
+filesystem. `publish_task_branch` publishes the caller's clean committed ref;
+`import_task_branch` downloads a collaborator's published ref into
+`refs/karmax/tasks/<task>/<repo>` in the caller's world; and `refresh_upstream`
+updates the requested `refs/remotes/origin/*` ref. Agents coordinate publication
+with `message_agent`, then inspect, test, cherry-pick, merge, or rebase using
+ordinary local Git. Private-repository credentials remain in the broker, while
+the resulting Git experience matches a normal developer branch handoff.
 
 For GitHub Enterprise Cloud customers that already operate an SSH certificate
 authority, a customer runner may instead receive short-lived user certificates;

@@ -99,6 +99,84 @@ export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Pr
   return { updated };
 }
 
+export interface ImportedGitRef { repo: string; branch: string; ref: string; sha: string }
+
+/** Fetch another task branch through the trusted broker and expose it as a
+ * namespaced local ref. Nothing is merged automatically: the receiving agent
+ * can inspect, test, cherry-pick, or merge it using ordinary local Git. */
+export async function brokerImportTaskBranch(destination: World, source: import('./types.js').WorldHandle,
+  sourceTaskId: string, auth: GitBrokerAuth): Promise<ImportedGitRef[]> {
+  const sourceByRemote = new Map(worldRepos(source).map((repo) => [repo.repo, repo]));
+  const imported: ImportedGitRef[] = [];
+  for (const repo of worldRepos(destination.handle)) {
+    const sourceRepo = sourceByRemote.get(repo.repo);
+    if (!sourceRepo) continue;
+    const suffix = sourceTaskId.replace(/[^A-Za-z0-9._-]/g, '-');
+    const ref = `refs/karmax/tasks/${suffix}/${repo.name.replace(/[^A-Za-z0-9._-]/g, '-')}`;
+    const sha = await brokerFetchRef(destination, repo, sourceRepo.branch, ref, auth);
+    imported.push({ repo: repo.name, branch: sourceRepo.branch, ref, sha });
+  }
+  if (!imported.length) throw new Error('source and destination tasks do not share an enrolled repository');
+  return imported;
+}
+
+/** Refresh an upstream branch without putting a clone key in the sandbox. The
+ * resulting origin/* ref behaves exactly like a normal git fetch to the agent. */
+export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
+  requestedBranch?: string): Promise<ImportedGitRef[]> {
+  const refreshed: ImportedGitRef[] = [];
+  for (const repo of worldRepos(world.handle)) {
+    const branch = requestedBranch ?? repo.target ?? repo.base;
+    if (!safeBranch(branch)) throw new Error(`invalid upstream branch "${branch}"`);
+    const ref = `refs/remotes/origin/${branch}`;
+    const sha = await brokerFetchRef(world, repo, branch, ref, auth);
+    refreshed.push({ repo: repo.name, branch, ref, sha });
+  }
+  if (!refreshed.length) throw new Error('task world has no remote repository');
+  return refreshed;
+}
+
+async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: string, destinationRef: string,
+  auth: GitBrokerAuth): Promise<string> {
+  if (!/^(?:ssh:\/\/|git@)/.test(destinationRepo.repo)) throw new Error('Git broker requires an SSH remote');
+  if (!safeBranch(branch)) throw new Error(`Git broker rejected invalid branch "${branch}"`);
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-import-'));
+  const bundleName = `.karmax-import-${cryptoSafeName(destinationRepo.name)}.bundle`;
+  const bundleRelative = worldRepos(world.handle).length > 1 ? `${destinationRepo.name}/${bundleName}` : bundleName;
+  try {
+    const credential = await resolveCredential(auth, destinationRepo);
+    const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
+    if (credential.sshKey) {
+      const keyPath = path.join(temp, 'repository.key');
+      fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
+      env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+    }
+    const clone = path.join(temp, 'repo');
+    const cloned = await git(temp, ['clone', '-q', '--branch', branch, '--single-branch', destinationRepo.repo, clone],
+      { env, timeoutMs: 10 * 60_000 });
+    if (cloned.code !== 0) throw new Error(`could not fetch branch "${branch}": ${cloned.stderr || cloned.stdout}`);
+    const bundlePath = path.join(temp, 'incoming.bundle');
+    const bundled = await git(clone, ['bundle', 'create', bundlePath, `refs/heads/${branch}`]);
+    if (bundled.code !== 0) throw new Error(`could not package branch "${branch}": ${bundled.stderr || bundled.stdout}`);
+    const data = fs.readFileSync(bundlePath);
+    const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
+    if (data.length > maxBytes) throw new Error(`incoming branch bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
+    if (!world.writeFileBuffer) throw new Error('world provider cannot receive binary Git handoffs');
+    await world.writeFileBuffer(bundleRelative, data);
+    const fetched = await world.exec('git', ['fetch', bundleName, `refs/heads/${branch}:${destinationRef}`],
+      { cwd: destinationRepo.root, timeoutMs: 10 * 60_000 });
+    if (fetched.code !== 0) throw new Error(`world could not import branch "${branch}": ${fetched.stderr || fetched.stdout}`);
+    const head = await world.exec('git', ['rev-parse', destinationRef], { cwd: destinationRepo.root });
+    if (head.code !== 0) throw new Error(`could not resolve imported ref ${destinationRef}`);
+    return head.stdout.trim();
+  } finally {
+    await world.exec('rm', ['-f', bundleName], { cwd: destinationRepo.root }).catch(() => undefined);
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+function cryptoSafeName(value: string): string { return value.replace(/[^A-Za-z0-9._-]/g, '-'); }
+
 export async function brokerFinalizeMerge(
   world: World,
   target: string,

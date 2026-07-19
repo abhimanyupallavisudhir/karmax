@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../src/agent/codex.js';
-import { materializeRemoteSession, remoteAgentCommand, remoteAgentEnv, seedRemoteAgentHome } from '../src/agent/remote-process.js';
+import { materializeRemoteSession, remoteAgentCommand, remoteAgentEnv, remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome } from '../src/agent/remote-process.js';
 import type { World, WorldPty, WorldPtySpec } from '../src/world/types.js';
 
 describe('remote subscription agents', () => {
@@ -27,22 +27,23 @@ describe('remote subscription agents', () => {
     const world = fakeWorld();
 
     const seeded = await seedRemoteAgentHome(world, 'codex', localHome);
+    const remoteHome = remoteAgentHomeRelative('codex', localHome);
 
-    expect(seeded.absolute).toBe('/workspace/.karmax-injection/agent/codex');
-    expect(world.files.get('.karmax-injection/agent/codex/auth.json')?.toString()).toContain('subscription');
-    expect(world.files.get('.karmax-injection/agent/codex/skills/review/SKILL.md')?.toString()).toBe('review skill');
-    expect(world.files.has('.karmax-injection/agent/codex/sessions/host-task.jsonl')).toBe(false);
-    const config = world.files.get('.karmax-injection/agent/codex/config.toml')?.toString() ?? '';
+    expect(seeded.absolute).toBe(`/workspace/${remoteHome}`);
+    expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('subscription');
+    expect(world.files.get(`${remoteHome}/skills/review/SKILL.md`)?.toString()).toBe('review skill');
+    expect(world.files.has(`${remoteHome}/sessions/host-task.jsonl`)).toBe(false);
+    const config = world.files.get(`${remoteHome}/config.toml`)?.toString() ?? '';
     expect(config).toContain('[notice]');
     expect(config).not.toContain('/host/node');
     expect(config).toContain('https://karmax.example.test');
-    expect(world.files.get('.karmax-injection/agent/codex/karmax-mcp.mjs')?.length).toBeGreaterThan(10_000);
-    world.files.set('.karmax-injection/agent/codex/auth.json', Buffer.from('{"tokens":{"access_token":"refreshed-remotely"}}'));
+    expect(world.files.get(`${remoteHome}/karmax-mcp.mjs`)?.length).toBeGreaterThan(10_000);
+    world.files.set(`${remoteHome}/auth.json`, Buffer.from('{"tokens":{"access_token":"refreshed-remotely"}}'));
     await seedRemoteAgentHome(world, 'codex', localHome);
-    expect(world.files.get('.karmax-injection/agent/codex/auth.json')?.toString()).toContain('refreshed-remotely');
+    expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('refreshed-remotely');
     expect(world.commands.some((command) => command.includes('find') && command.includes('chmod 600'))).toBe(true);
     await seedRemoteAgentHome(world, 'codex', localHome, 'host-task');
-    expect(world.files.get('.karmax-injection/agent/codex/sessions/host-task.jsonl')?.toString()).toBe('host-only conversation');
+    expect(world.files.get(`${remoteHome}/sessions/host-task.jsonl`)?.toString()).toBe('host-only conversation');
   });
 
   it('passes only the remote home and explicit turn-scoped environment', () => {
@@ -59,6 +60,27 @@ describe('remote subscription agents', () => {
       .toEqual(expect.arrayContaining(['@openai/codex@0.144.5', 'app-server']));
   });
 
+  it('isolates rotated accounts and exports refreshed auth plus native sessions', async () => {
+    const first = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-account-a-'));
+    const second = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-account-b-'));
+    localHome = first;
+    fs.writeFileSync(path.join(first, 'auth.json'), '{"account":"a-old"}');
+    fs.writeFileSync(path.join(second, 'auth.json'), '{"account":"b"}');
+    process.env.KARMAX_REMOTE_GATEWAY_URL = 'https://karmax.example.test';
+    const world = fakeWorld();
+    const a = await seedRemoteAgentHome(world, 'codex', first);
+    const b = await seedRemoteAgentHome(world, 'codex', second);
+    expect(a.relative).not.toBe(b.relative);
+    expect(world.files.get(`${a.relative}/auth.json`)?.toString()).toContain('a-old');
+    expect(world.files.get(`${b.relative}/auth.json`)?.toString()).toContain('"b"');
+    world.files.set(`${a.relative}/auth.json`, Buffer.from('{"account":"a-refreshed"}'));
+    world.files.set(`${a.relative}/sessions/2026/session-a.jsonl`, Buffer.from('durable native session'));
+    await syncRemoteAgentHome(world, 'codex', a, first);
+    expect(fs.readFileSync(path.join(first, 'auth.json'), 'utf8')).toContain('a-refreshed');
+    expect(fs.readFileSync(path.join(first, 'sessions/2026/session-a.jsonl'), 'utf8')).toBe('durable native session');
+    fs.rmSync(second, { recursive: true, force: true });
+  });
+
   it('rewrites a selected browser MCP to the probed sandbox-local headless runtime', async () => {
     localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-browser-'));
     fs.writeFileSync(path.join(localHome, '.claude.json'), JSON.stringify({ mcpServers: {
@@ -73,13 +95,15 @@ describe('remote subscription agents', () => {
   });
 
   it('copies only the requested native session between remote worlds', async () => {
+    localHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-destination-'));
     const source = fakeWorld();
     const destination = fakeWorld();
     destination.handle.root = '/destination';
-    source.files.set('.karmax-injection/agent/claude/projects/-workspace/session-1.jsonl', Buffer.from('native history'));
-    source.files.set('.karmax-injection/agent/claude/projects/-workspace/other.jsonl', Buffer.from('do not copy'));
-    expect(await materializeRemoteSession(source, destination, 'claude', 'session-1')).toBe(true);
-    expect(destination.files.get('.karmax-injection/agent/claude/projects/-destination/session-1.jsonl')?.toString()).toBe('native history');
+    source.files.set('.karmax-injection/agent/claude/source-account/projects/-workspace/session-1.jsonl', Buffer.from('native history'));
+    source.files.set('.karmax-injection/agent/claude/source-account/projects/-workspace/other.jsonl', Buffer.from('do not copy'));
+    expect(await materializeRemoteSession(source, destination, 'claude', 'session-1', localHome)).toBe(true);
+    const destinationHome = remoteAgentHomeRelative('claude', localHome);
+    expect(destination.files.get(`${destinationHome}/projects/-destination/session-1.jsonl`)?.toString()).toBe('native history');
     expect([...destination.files.keys()].some((file) => file.endsWith('/other.jsonl'))).toBe(false);
   });
 
@@ -104,8 +128,9 @@ describe('remote subscription agents', () => {
     expect(world.openedPty?.command).toContain('stty raw -echo');
     expect(world.openedPty?.command).toContain('karmax-agent.pid');
     expect(spawnSync('bash', ['-n', '-c', world.openedPty?.command ?? '']).status).toBe(0);
-    expect(world.openedPty?.env).toMatchObject({ CODEX_HOME: '/workspace/.karmax-injection/agent/codex' });
-    expect(world.files.get('.karmax-injection/agent/codex/auth.json')?.toString()).toContain('chatgpt');
+    const remoteHome = remoteAgentHomeRelative('codex', localHome);
+    expect(world.openedPty?.env).toMatchObject({ CODEX_HOME: `/workspace/${remoteHome}` });
+    expect(world.files.get(`${remoteHome}/auth.json`)?.toString()).toContain('chatgpt');
     expect(sessions).toContain('remote-thread');
   });
 });

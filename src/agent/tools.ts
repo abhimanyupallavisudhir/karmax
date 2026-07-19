@@ -177,14 +177,19 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, message: { type: 'string' } }, required: ['task_id', 'message'] },
   },
   {
-    name: 'list_world_files',
-    description: "List files in another task's current world. Use this with read_world_file to inspect a collaborator's work without sharing provider credentials.",
-    parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+    name: 'publish_task_branch',
+    description: 'Publish this task’s clean, committed Git branch so another agent can import it. Commit first.',
+    parameters: { type: 'object', properties: {} },
   },
   {
-    name: 'read_world_file',
-    description: "Read a UTF-8 text file from another task's current world. Paths are relative to that world's workspace root.",
-    parameters: { type: 'object', properties: { task_id: { type: 'string' }, path: { type: 'string' } }, required: ['task_id', 'path'] },
+    name: 'import_task_branch',
+    description: 'Fetch another task’s published branch into a namespaced local ref for inspection, testing, cherry-picking, or merging.',
+    parameters: { type: 'object', properties: { source_task_id: { type: 'string' } }, required: ['source_task_id'] },
+  },
+  {
+    name: 'refresh_upstream',
+    description: 'Fetch the latest upstream base/target branch into refs/remotes/origin. Optionally name another branch.',
+    parameters: { type: 'object', properties: { branch: { type: 'string' } } },
   },
   {
     name: 'list_events',
@@ -383,15 +388,14 @@ export function platformToolHandlers(
       await platformRequest('POST', `/api/tasks/${taskId}/signal`, { signal: 'followUp', role: args?.role ?? 'do', text: args?.message });
       return 'message delivered';
     },
-    async list_world_files(args) {
-      const taskId = encodeURIComponent(String(args?.task_id ?? ''));
-      return truncate(JSON.stringify(await platformRequest('GET', `/api/tasks/${taskId}/world/files`)));
+    async publish_task_branch() {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/publish', {}));
     },
-    async read_world_file(args) {
-      const taskId = encodeURIComponent(String(args?.task_id ?? ''));
-      const filePath = encodeURIComponent(String(args?.path ?? ''));
-      const result = await platformRequest('GET', `/api/tasks/${taskId}/world/file?path=${filePath}`) as { content?: unknown };
-      return truncate(String(result?.content ?? ''));
+    async import_task_branch(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/import', { sourceTaskId: String(args?.source_task_id ?? '') }));
+    },
+    async refresh_upstream(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/refresh-upstream', { branch: args?.branch ? String(args.branch) : undefined }));
     },
     async list_events(args) {
       return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/events?since=${Number(args?.since ?? 0)}`));

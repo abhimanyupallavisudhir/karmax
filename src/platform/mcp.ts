@@ -30,8 +30,9 @@ export interface PlatformOps {
   getConversation(taskId: string, role?: string): Promise<unknown>;
   forkAgent(a: { taskId: string; role?: string; title?: string; message: string; authorizationProfile?: string }): Promise<{ id: string }>;
   listEvents(taskId: string, since?: number): Promise<unknown>;
-  listWorldFiles(taskId: string): Promise<unknown>;
-  readWorldFile(taskId: string, path: string): Promise<unknown>;
+  publishTaskBranch(): Promise<unknown>;
+  importTaskBranch(sourceTaskId: string): Promise<unknown>;
+  refreshUpstream(branch?: string): Promise<unknown>;
   listWorldProviders(organizationId: string): Promise<unknown>;
   connectWorldProvider(a: { organizationId: string; provider: 'e2b' | 'daytona'; apiKey?: string;
     name?: string; template?: string; snapshot?: string; image?: string; desktopTemplate?: string;
@@ -115,8 +116,9 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     getConversation: (id, role) => api.taskConversation(getToken(), id, role),
     forkAgent: (a) => api.forkTaskAgent(getToken(), a),
     listEvents: (id, since) => api.taskEvents(getToken(), id, since),
-    listWorldFiles: (id) => api.listWorldFiles(getToken(), id),
-    readWorldFile: (id, path) => api.readWorldFile(getToken(), id, path),
+    publishTaskBranch: () => api.publishTaskBranch(getToken()),
+    importTaskBranch: (sourceTaskId) => api.importTaskBranch(getToken(), sourceTaskId),
+    refreshUpstream: (branch) => api.refreshUpstream(getToken(), branch),
     listWorldProviders: (organizationId) => Promise.resolve(api.listWorldProviderConnections(getToken(), organizationId)),
     connectWorldProvider: (a) => Promise.resolve(api.saveWorldProviderConnection(getToken(), {
       organizationId: a.organizationId, provider: a.provider, apiKey: a.apiKey, name: a.name,
@@ -181,8 +183,9 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     getConversation: (id, role) => req(`/api/tasks/${id}/conversation${role ? `?role=${encodeURIComponent(role)}` : ''}`),
     forkAgent: (a) => req(`/api/tasks/${a.taskId}/fork-agent`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
     listEvents: (id, since = 0) => req(`/api/tasks/${id}/events?since=${since}`),
-    listWorldFiles: (id) => req(`/api/tasks/${id}/world/files`),
-    readWorldFile: (id, path) => req(`/api/tasks/${id}/world/file?path=${encodeURIComponent(path)}`),
+    publishTaskBranch: () => req('/api/agent/git/publish', { method: 'POST', body: '{}' }),
+    importTaskBranch: (sourceTaskId) => req('/api/agent/git/import', { method: 'POST', body: JSON.stringify({ sourceTaskId }) }),
+    refreshUpstream: (branch) => req('/api/agent/git/refresh-upstream', { method: 'POST', body: JSON.stringify({ branch }) }),
     listWorldProviders: (organizationId) => req(`/api/organizations/${organizationId}/world-providers`),
     connectWorldProvider: (a) => req(`/api/organizations/${a.organizationId}/world-providers/${a.provider}`, {
       method: 'PUT', body: JSON.stringify({ apiKey: a.apiKey, name: a.name,
@@ -306,8 +309,17 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, 'followUp', a.message, a.role); return 'message delivered'; }),
   );
   server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(() => ops.listEvents(a.taskId, a.since)));
-  server.registerTool('list_world_files', { description: "List files in another task's current world.", inputSchema: { taskId: z.string() } }, async (a) => wrap(() => ops.listWorldFiles(a.taskId)));
-  server.registerTool('read_world_file', { description: "Read a UTF-8 text file from another task's current world.", inputSchema: { taskId: z.string(), path: z.string() } }, async (a) => wrap(() => ops.readWorldFile(a.taskId, a.path)));
+  server.registerTool('publish_task_branch', {
+    description: 'Publish this task’s clean, committed branch through Karmax’s trusted Git broker so another agent can import it.', inputSchema: {},
+  }, async () => wrap(() => ops.publishTaskBranch()));
+  server.registerTool('import_task_branch', {
+    description: 'Fetch another task’s published branch into namespaced refs in this world. Inspect/test/cherry-pick or merge it locally afterward.',
+    inputSchema: { sourceTaskId: z.string() },
+  }, async (a) => wrap(() => ops.importTaskBranch(a.sourceTaskId)));
+  server.registerTool('refresh_upstream', {
+    description: 'Fetch the latest upstream base/target branch into refs/remotes/origin without placing Git credentials in this world.',
+    inputSchema: { branch: z.string().optional() },
+  }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
   server.registerTool(
     'describe_platform',
     { description: 'Describe the complete administrative API available through platform_request.', inputSchema: {} },

@@ -16,7 +16,7 @@ import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity } from './activity.js';
 import { platformMcpSpec } from '../autonomy/config-homes.js';
-import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess } from './remote-process.js';
+import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -640,6 +640,8 @@ export class ClaudeAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       injector.close(); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
+      if (remoteHome && input.resolvedAuth?.configHome)
+        await syncRemoteAgentHome(input.world, 'claude', remoteHome, input.resolvedAuth.configHome);
     }
     if (ctx.signal?.aborted) throw new Error('Claude Agent SDK turn cancelled');
     if (!successfulResult) {

@@ -47,7 +47,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'create_task', 'save_skill', 'signal_task', 'reorder_queue', 'propose_workflow_edit',
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent',
-        'list_events', 'list_world_files', 'read_world_file', 'describe_platform', 'platform_request', 'list_world_providers',
+        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'describe_platform', 'platform_request', 'list_world_providers',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
         'get_execution_policy', 'set_execution_policy',
       ]),
@@ -60,20 +60,10 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.cloud).toContain('GET|PUT /api/organizations/:organizationId/execution-policy');
   });
 
-  it("lists and reads another task's world with the dedicated capability", async () => {
-    const project = store.createProject('Collaboration');
-    const task = store.createTask({ projectId: project.id, title: 'Peer work', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
-    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
-    await world.writeFile('notes/result.md', 'peer result');
-    world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
-    currentToken = tokens.mint({ taskId: 'caller', projectId: project.id, profileId: 'do', principal: 'user:a',
-      ceiling: ['task:world:read'], grantorCaps: ['task:world:read'] }).token;
-
-    const listed: any = await client.callTool({ name: 'list_world_files', arguments: { taskId: task.id } });
-    expect(JSON.parse(listed.content[0].text).files).toContain('notes/result.md');
-    const read: any = await client.callTool({ name: 'read_world_file', arguments: { taskId: task.id, path: 'notes/result.md' } });
-    expect(JSON.parse(read.content[0].text)).toMatchObject({ path: 'notes/result.md', content: 'peer result' });
-    await world.destroy();
+  it('does not expose direct cross-world filesystem inspection', async () => {
+    const names = (await client.listTools()).tools.map((tool) => tool.name);
+    expect(names).not.toContain('list_world_files');
+    expect(names).not.toContain('read_world_file');
   });
 
   it('lets an authorized agent connect and disconnect a provider without reading its secret', async () => {

@@ -63,6 +63,7 @@ export interface GatewayDeps {
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
   handoffs?: import('../world/handoff.js').WorldHandoffService;
   runners?: import('../world/runners.js').RunnerPoolService;
+  worldAccess?: import('../world/access.js').WorldAccessService;
   objects?: ObjectStore;
   cellId?: string;
   hosted?: boolean;
@@ -133,7 +134,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
   if (/\/(sessions|agents|conversation)$/.test(p)) return 'task:conversation:read';
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
-  if (/\/world\/(?:files|file)$/.test(p)) return 'task:world:read';
+  if (p === '/api/agent/git/publish') return 'task:git:publish';
+  if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
@@ -310,7 +312,7 @@ export class Gateway {
   private fanout: DurableEventFanout;
 
   constructor(private deps: GatewayDeps) {
-    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners);
+    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess);
     this.fanout = new DurableEventFanout(deps.store, deps.bus);
   }
 
@@ -465,7 +467,8 @@ export class Gateway {
         this.deps.store.appendExecutionFrame(executionId, `${String((error as Error)?.message ?? error)}\n`, 'system');
         this.deps.store.finishExecution(executionId, null, 'failed');
       }
-      if (worldLeaseId) this.deps.runners?.release(worldLeaseId, handle.kind);
+      if (worldLeaseId && this.deps.worldAccess) await this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, worldLeaseId);
+      else if (worldLeaseId) this.deps.runners?.release(worldLeaseId, handle.kind);
       ws.send(JSON.stringify({ type: 'data', data: `Terminal unavailable: ${String((error as Error)?.message ?? error)}\r\n` }));
       ws.close();
       return;
@@ -493,7 +496,8 @@ export class Gateway {
       clearInterval(heartbeat);
       untrack();
       this.deps.store.finishExecution(executionId, code, cancelled ? 'cancelled' : undefined);
-      if (worldLeaseId) this.deps.runners?.release(worldLeaseId, handle.kind);
+      if (worldLeaseId && this.deps.worldAccess) void this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, worldLeaseId);
+      else if (worldLeaseId) this.deps.runners?.release(worldLeaseId, handle.kind);
     };
     term.onData((d: string) => {
       this.deps.store.appendExecutionFrame(executionId, d);
@@ -1791,14 +1795,18 @@ export class Gateway {
         try { return this.json(res, 200, this.deps.handoffs.checkout(checkoutMatch[1]!)); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
-      const worldFilesMatch = p.match(/^\/api\/tasks\/([^/]+)\/world\/files$/);
-      if (worldFilesMatch && method === 'GET') {
-        try { return this.json(res, 200, await api.listWorldFiles(token, worldFilesMatch[1]!)); }
+      if (p === '/api/agent/git/publish' && method === 'POST') {
+        try { return this.json(res, 200, await api.publishTaskBranch(token)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
-      const worldFileMatch = p.match(/^\/api\/tasks\/([^/]+)\/world\/file$/);
-      if (worldFileMatch && method === 'GET') {
-        try { return this.json(res, 200, await api.readWorldFile(token, worldFileMatch[1]!, url.searchParams.get('path') ?? '')); }
+      if (p === '/api/agent/git/import' && method === 'POST') {
+        const b = await this.body(req);
+        try { return this.json(res, 200, await api.importTaskBranch(token, String(b.sourceTaskId ?? ''))); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/git/refresh-upstream' && method === 'POST') {
+        const b = await this.body(req);
+        try { return this.json(res, 200, await api.refreshUpstream(token, b.branch ? String(b.branch) : undefined)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const desktopMatch = p.match(/^\/api\/tasks\/([^/]+)\/desktop$/);
@@ -1807,11 +1815,25 @@ export class Gateway {
         const task = store.getTask(taskId);
         const handle = worldHandleForView(task?.lastView, taskId, task ? store.effectiveProjectConfig(task.projectId) : undefined);
         if (!handle) return this.json(res, 404, { error: 'no world for this task' });
+        let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
         try {
-          const world = await this.deps.worlds.open(handle);
-          if (!world.desktopSession) return this.json(res, 409, { error: 'this world has no desktop experience' });
-          return this.json(res, 200, await world.desktopSession());
+          access = this.deps.worldAccess
+            ? await this.deps.worldAccess.open(taskId, handle, { dedicated: true })
+            : undefined;
+          const world = access?.world ?? await this.deps.worlds.open(handle);
+          if (!world.desktopSession) throw new Error('this world has no desktop experience');
+          const desktop = await world.desktopSession();
+          const expiresAt = Date.now() + 5 * 60_000;
+          if (access?.runnerLeaseId && task) {
+            const project = store.getProject(task.projectId)!;
+            store.createPreviewLease({ id: newId('desktop'), organizationId: project.organizationId!,
+              projectId: project.id, taskId, worldId: access.handle.id, generation: access.handle.generation ?? 1,
+              port: 6080, public: false, runnerLeaseId: access.runnerLeaseId, provider: access.handle.kind,
+              createdBy: authRecord?.principal ?? session.user, createdAt: Date.now(), expiresAt });
+          }
+          return this.json(res, 200, { ...desktop, expiresAt });
         } catch (error) {
+          await access?.release();
           return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
         }
       }
@@ -1993,7 +2015,9 @@ export class Gateway {
       if (previewLease && method === 'DELETE') {
         const lease = store.revokePreviewLease(previewLease[1]!);
         if (!lease) return this.json(res, 404, { error: 'preview lease not found' });
-        if (lease.runnerLeaseId) this.deps.runners?.release(lease.runnerLeaseId, lease.provider);
+        const handle = store.currentWorld(lease.worldId) as import('../world/types.js').WorldHandle | undefined;
+        if (handle && this.deps.worldAccess) await this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, lease.runnerLeaseId);
+        else if (lease.runnerLeaseId) this.deps.runners?.release(lease.runnerLeaseId, lease.provider);
         return this.json(res, 200, { ok: true });
       }
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
@@ -2753,8 +2777,10 @@ export class Gateway {
     const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
+    let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
     try {
-      const world = await this.deps.worlds.open(handle);
+      access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+      const world = access?.world ?? await this.deps.worlds.open(handle);
       const data = await world.readFileBuffer(relPath);
       res.writeHead(200, {
         'content-type': ARTIFACT_MIME[path.extname(relPath).toLowerCase()] ?? 'application/octet-stream',
@@ -2764,7 +2790,7 @@ export class Gateway {
     } catch (error) {
       const message = String((error as Error)?.message ?? error);
       this.json(res, /escape|relative/i.test(message) ? 400 : 404, { error: /escape|relative/i.test(message) ? message : 'artifact not found' });
-    }
+    } finally { await access?.release(); }
   }
 
   /** Reverse proxy for services inside a remote world. Provider traffic tokens
@@ -2781,10 +2807,12 @@ export class Gateway {
       res.writeHead(405, { allow: [...PREVIEW_METHODS].join(', ') });
       return void res.end();
     }
+    let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
     try {
       const body = method === 'GET' || method === 'HEAD' ? undefined : await this.rawBody(req, MAX_PREVIEW_REQUEST_BYTES);
-      const world = await this.deps.worlds.open(handle);
-      if (!world.fetchPort) return this.json(res, 400, { error: 'this world provider does not expose remote previews' });
+      access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+      const world = access?.world ?? await this.deps.worlds.open(handle);
+      if (!world.fetchPort) throw new Error('this world provider does not expose remote previews');
       const forwarded: Record<string, string> = {};
       for (const name of PREVIEW_REQUEST_HEADERS) {
         const value = req.headers[name];
@@ -2808,7 +2836,7 @@ export class Gateway {
       const tooLarge = error instanceof AttachmentError && /too large/i.test(error.message);
       this.json(res, tooLarge ? 413 : 502,
         { error: tooLarge ? error.message : `preview unavailable: ${String((error as Error)?.message ?? error)}` });
-    }
+    } finally { await access?.release(); }
   }
 
   private async serveLeasedPreview(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
@@ -2898,9 +2926,12 @@ export class Gateway {
     const task = this.deps.store.getTask(taskId);
     const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) { browser.close(4404, 'world unavailable'); return; }
-    const world = await this.deps.worlds.open(handle);
-    if (!world.previewSocketTarget) { browser.close(4400, 'provider has no WebSocket previews'); return; }
-    const target = await world.previewSocketTarget(port, requestPath);
+    const access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+    const world = access?.world ?? await this.deps.worlds.open(handle);
+    if (!world.previewSocketTarget) { await access?.release(); browser.close(4400, 'provider has no WebSocket previews'); return; }
+    let target: Awaited<ReturnType<NonNullable<typeof world.previewSocketTarget>>>;
+    try { target = await world.previewSocketTarget(port, requestPath); }
+    catch { await access?.release(); browser.close(1011, 'preview upstream unavailable'); return; }
     const protocols = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map((value) => value.trim()).filter(Boolean);
     const upstream = new WebSocketClient(target.url, protocols, { headers: target.headers });
     const pending: Array<{ data: import('ws').RawData; binary: boolean }> = [];
@@ -2908,17 +2939,24 @@ export class Gateway {
       if (upstream.readyState === WebSocketClient.OPEN) upstream.send(data, { binary });
       else if (upstream.readyState === WebSocketClient.CONNECTING && pending.length < 100) pending.push({ data, binary });
     });
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      void access?.release();
+    };
     browser.on('close', (code, reason) => {
+      release();
       if (upstream.readyState === WebSocketClient.CONNECTING) upstream.terminate();
       else if (upstream.readyState === WebSocketClient.OPEN) upstream.close(code || 1000, reason.toString());
     });
-    browser.on('error', () => upstream.terminate());
+    browser.on('error', () => { release(); upstream.terminate(); });
     upstream.on('open', () => {
       for (const message of pending.splice(0)) upstream.send(message.data, { binary: message.binary });
     });
     upstream.on('message', (data, binary) => { if (browser.readyState === browser.OPEN) browser.send(data, { binary }); });
-    upstream.on('close', (code, reason) => { if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
-    upstream.on('error', () => { if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
+    upstream.on('close', (code, reason) => { release(); if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
+    upstream.on('error', () => { release(); if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
   }
 
   /** SCIM 2.0 provisioning boundary. A tenant-scoped bearer token is stored only

@@ -15,7 +15,7 @@ export const PLATFORM_API_CATALOG = {
     'PUT /api/tasks/:taskId/tags|priority', 'POST /api/tasks/:taskId/tag|archive|signal|target',
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
     'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/refresh-from-github',
-    'GET /api/tasks/:taskId/world/files', 'GET /api/tasks/:taskId/world/file?path=',
+    'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',

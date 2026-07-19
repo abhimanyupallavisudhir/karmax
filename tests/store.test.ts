@@ -22,7 +22,8 @@ describe('Store', () => {
     // reopening runs migrateData
     const s2 = new Store(dbPath);
     expect(s2.getProfile('do-default')!.maxTurns).toBeUndefined(); // legacy cap stripped
-    expect(s2.getProfile('do-default')!.capabilities).toContain('task:world:read');
+    expect(s2.getProfile('do-default')!.capabilities).toEqual(expect.arrayContaining(['task:git:publish', 'task:git:import']));
+    expect(s2.getProfile('do-default')!.capabilities).not.toContain('task:world:read');
     expect(s2.getProfile('custom-big')!.maxTurns).toBe(99); // non-default profiles untouched
     fs.rmSync(dir, { recursive: true, force: true });
   });

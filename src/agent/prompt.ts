@@ -16,7 +16,10 @@ const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration pl
 - create_review_info(caption?, actions?): optional click-to-verify affordances for the Review stage. Use only when relevant: "run" actions for verification commands or starting an app/server (set server:true + openUrls to open it), and "open" actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output. The optional caption says WHAT to verify and is limited to 280 characters. Put summaries of changes/answers in your normal response, or in a file only when requested. The changed-files list is added automatically.
 - save_skill(name, content): persist a reusable skill for future tasks.
 - find_task(projectId, number), list_agents(taskId), get_conversation(taskId, role), fork_agent(...), and message_agent(...): discover work by its human #number and robustly inspect or continue another task agent without mutating its original session.
-- list_world_files(taskId) and read_world_file(taskId, path): inspect another task agent's world without copying credentials or mounting its sandbox.
+- message_agent(taskId, message): ask a collaborator to commit and publish its work.
+- publish_task_branch(): publish your clean committed branch for collaborators.
+- import_task_branch(sourceTaskId): fetch a collaborator's published branch into a namespaced local ref, then inspect/test/cherry-pick or merge it normally.
+- refresh_upstream(branch?): fetch the latest upstream branch into refs/remotes/origin before merging or rebasing.
 - list_events(taskId?, since?) and describe_platform(): inspect karmax event/diagnostic context and discover the automation surface.
 - platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by karmax for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, safe mode, settings, review actions, and future UI operations.
 - signal_completion(summary?): optional structured completion summary. Provider-reported successful turn completion is authoritative; this tool is not required.

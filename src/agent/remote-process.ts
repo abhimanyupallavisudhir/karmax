@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -33,7 +34,7 @@ export interface RemoteAgentHome {
 export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
   session?: string): Promise<RemoteAgentHome> {
   if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
-  const relative = `${REMOTE_ROOT}/${provider}`;
+  const relative = remoteAgentHomeRelative(provider, localHome);
   const absolute = path.posix.join(world.handle.root, relative);
   // A single-repo world's root is itself a checkout. Keep injected auth out of
   // `git add -A` without modifying the user's tracked .gitignore.
@@ -54,6 +55,51 @@ export async function seedRemoteAgentHome(world: World, provider: Provider, loca
     `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type d -exec chmod 700 {} + && find ${quote(absolute)} -type f -exec chmod 600 {} +; fi`]);
   if (permissions.code !== 0) throw new Error(`could not protect remote subscription files: ${permissions.stderr || permissions.stdout}`);
   return { ...home, ...(browserMcp ? { browserMcp } : {}) };
+}
+
+/** A world can rotate between several subscription accounts. Keep each native
+ * home isolated by the stable control-plane config-home identity so preserving
+ * refreshed auth for account A can never cause a later lease for B to run as A. */
+export function remoteAgentHomeRelative(provider: Provider, localHome: string): string {
+  const identity = crypto.createHash('sha256').update(path.resolve(localHome)).digest('hex').slice(0, 20);
+  return `${REMOTE_ROOT}/${provider}/${identity}`;
+}
+
+/** Export only provider-owned authentication and native conversation files.
+ * Remote MCP/browser rewrites, logs, caches, and process-control files remain
+ * sandbox-local. Atomic 0600 writes make OAuth token rotation durable without
+ * allowing a partial download to corrupt the account's control-plane home. */
+export async function syncRemoteAgentHome(world: World, provider: Provider, remoteHome: RemoteAgentHome,
+  localHome: string): Promise<void> {
+  if (!localHome) return;
+  const listed = await world.exec('bash', ['-lc',
+    `if [ -d ${quote(remoteHome.absolute)} ]; then find ${quote(remoteHome.absolute)} -type f -print; fi`]);
+  if (listed.code !== 0) throw new Error(`could not export remote ${provider} state: ${listed.stderr || listed.stdout}`);
+  const root = world.handle.root.replace(/\/+$/, '');
+  const homePrefix = `${remoteHome.relative}/`;
+  const files = listed.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
+    file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file).filter((file) => file.startsWith(homePrefix));
+  const auth = new Set(provider === 'codex'
+    ? ['auth.json', 'karmax-oauth.json']
+    : ['.credentials.json', '.claude/.credentials.json', 'karmax-oauth.json']);
+  for (const remoteFile of files) {
+    const relative = remoteFile.slice(homePrefix.length);
+    const session = provider === 'codex'
+      ? relative.startsWith('sessions/') && relative.endsWith('.jsonl')
+      : relative.startsWith('projects/') && relative.endsWith('.jsonl');
+    if (!auth.has(relative) && !session) continue;
+    const destination = path.join(localHome, ...relative.split('/'));
+    const data = await world.readFileBuffer(remoteFile);
+    fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+    const temp = `${destination}.${crypto.randomBytes(6).toString('hex')}.karmax-tmp`;
+    try {
+      fs.writeFileSync(temp, data, { mode: 0o600 });
+      fs.renameSync(temp, destination);
+      fs.chmodSync(destination, 0o600);
+    } finally {
+      fs.rmSync(temp, { force: true });
+    }
+  }
 }
 
 /** Minimal environment passed across the trust boundary. Authentication lives in
@@ -243,7 +289,7 @@ async function remoteHomeFiles(world: World, absolute: string): Promise<Set<stri
 /** Copy one native provider session between persistent cloud worlds. The source
  * remains untouched; only the requested session is exposed in the destination. */
 export async function materializeRemoteSession(source: World, destination: World,
-  provider: Provider, session: string): Promise<boolean> {
+  provider: Provider, session: string, destinationLocalHome: string): Promise<boolean> {
   if (!destination.writeFileBuffer) return false;
   const prefix = `${REMOTE_ROOT}/${provider}/`;
   let files: string[];
@@ -262,9 +308,10 @@ export async function materializeRemoteSession(source: World, destination: World
     : file.includes('/sessions/') && path.posix.basename(file).includes(session) && file.endsWith('.jsonl'));
   if (!sourceFile) return false;
   try {
+    const destinationPrefix = `${remoteAgentHomeRelative(provider, destinationLocalHome)}/`;
     const destinationFile = provider === 'claude'
-      ? `${prefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`
-      : `${prefix}sessions/forked/${path.posix.basename(sourceFile)}`;
+      ? `${destinationPrefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`
+      : `${destinationPrefix}sessions/forked/${path.posix.basename(sourceFile)}`;
     await destination.writeFileBuffer(destinationFile, await source.readFileBuffer(sourceFile));
     const protectedFile = path.posix.join(destination.handle.root, destinationFile);
     const chmod = await destination.exec('chmod', ['600', protectedFile]);

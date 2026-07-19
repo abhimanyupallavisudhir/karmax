@@ -18,6 +18,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 
 import { ClaudeAdapter } from '../src/agent/claude.js';
 import { ProviderFailure } from '../src/agent/limits.js';
+import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 
 const input: any = {
   profile: { id: 'p', name: 'claude', provider: 'claude', role: 'do', capabilities: [] },
@@ -90,8 +91,8 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       expect(sdkState.options.spawnClaudeCodeProcess).toBeTypeOf('function');
       expect(sdkState.options.mcpServers.karmax).toBeUndefined();
       expect(sdkState.options.mcpServers.karmax_control.tools.map((tool: any) => tool.name))
-        .toEqual(expect.arrayContaining(['message_agent', 'list_world_files', 'read_world_file']));
-      expect(files.get('.karmax-injection/agent/claude/.credentials.json')?.toString()).toContain('subscription');
+        .toEqual(expect.arrayContaining(['message_agent', 'publish_task_branch', 'import_task_branch', 'refresh_upstream']));
+      expect(files.get(`${remoteAgentHomeRelative('claude', home)}/.credentials.json`)?.toString()).toContain('subscription');
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 

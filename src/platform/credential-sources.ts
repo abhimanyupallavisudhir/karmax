@@ -3,6 +3,8 @@ import { CodexAdapter } from '../agent/codex.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { CredentialSources, CredPolicy } from './credentials.js';
+import os from 'node:os';
+import path from 'node:path';
 
 /**
  * Gather the live credential sources (config-home logins, ambient logins, env keys,
@@ -11,9 +13,12 @@ import type { CredentialSources, CredPolicy } from './credentials.js';
  * the core activity (resolution).
  */
 export function gatherCredentialSources(deps: { configHomes?: ConfigHomeManager; broker?: CredentialBroker }): CredentialSources {
+  const claudeHome = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+  const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
   return {
     logins: deps.configHomes?.list() ?? [],
     ambient: { claude: ClaudeAdapter.hasAmbientLogin(), codex: CodexAdapter.hasAmbientSubscription() },
+    ambientHomes: { claude: claudeHome, codex: codexHome },
     envKeys: { claude: !!process.env.ANTHROPIC_API_KEY, codex: !!process.env.OPENAI_API_KEY },
     handles: agentAccountHandles(deps.broker?.listHandles() ?? []),
   };

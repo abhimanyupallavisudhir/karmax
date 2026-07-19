@@ -14,7 +14,7 @@ import { trackProcess } from '../util/processes.js';
 import { classifyLimitError, providerErrorFromMessage, providerFailure, type ProviderFailureMetadata } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity } from './activity.js';
-import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess } from './remote-process.js';
+import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -429,7 +429,17 @@ export class CodexAdapter implements AgentAdapter {
       // ── Thread: resume the prior one, or start fresh (systemPrompt → developer
       //    instructions; the thread carries them so resumes don't re-send them). ──
       const resuming = !!input.session;
-      if (resuming) {
+      if (resuming && input.fork) {
+        const forked = await client.request<any>('thread/fork', {
+          threadId: input.session,
+          cwd,
+          sandbox: 'danger-full-access',
+          approvalPolicy: 'never',
+          developerInstructions: input.systemPrompt,
+          ...(model ? { model } : {}),
+        });
+        threadId = forked?.thread?.id ?? threadId;
+      } else if (resuming) {
         // Resume otherwise reloads the CLI/config defaults (`:workspace` +
         // on-request in current Codex), discarding karmax's headless posture.
         await client.request('thread/resume', {
@@ -514,6 +524,8 @@ export class CodexAdapter implements AgentAdapter {
       else child.kill('SIGTERM');
       unregisterAgent(child.pid);
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
+      if (remoteHome && input.resolvedAuth?.configHome)
+        await syncRemoteAgentHome(input.world, 'codex', remoteHome, input.resolvedAuth.configHome);
     }
 
     // A limit can also arrive as a rejected request (handshake/turn) or a subprocess

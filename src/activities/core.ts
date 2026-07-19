@@ -660,7 +660,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               if (sourceHandle && isRemote(sourceHandle.kind)) {
                 try {
                   const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
-                  forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession);
+                  forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
                 } catch { /* source world may have expired; try the durable local home below */ }
               }
             }
@@ -1323,7 +1323,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const delegation = attenuate(
         [
           'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
-          'task:read', 'task:event:read', 'task:world:read',
+          'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
           'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
         ],
         args.parentGrant ?? DEFAULT_GRANT,

@@ -87,13 +87,20 @@ export class Store {
       const p = JSON.parse(r.json);
       const legacyDoCapabilities = ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'];
       const modernDoCapabilities = [
-        ...legacyDoCapabilities, 'task:read', 'task:event:read', 'task:world:read',
+        ...legacyDoCapabilities, 'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
         'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
       ];
       if (p.role === 'do' && Array.isArray(p.capabilities)
         && p.capabilities.length === legacyDoCapabilities.length
         && legacyDoCapabilities.every((capability) => p.capabilities.includes(capability))) {
         p.capabilities = modernDoCapabilities;
+      }
+      // Direct cross-world file inspection was replaced by durable Git handoff.
+      // Migrate existing profiles so the removed capability does not strand their
+      // collaboration access or remain as an unrecognized settings value.
+      if (Array.isArray(p.capabilities) && p.capabilities.includes('task:world:read')) {
+        p.capabilities = [...new Set(p.capabilities.filter((capability: string) => capability !== 'task:world:read')
+          .concat(['task:git:publish', 'task:git:import']))];
       }
       if (p.maxTurns !== undefined) {
         delete p.maxTurns;
@@ -2615,6 +2622,11 @@ export class Store {
 
   worldLease(id: string): any {
     return this.db.prepare('SELECT * FROM world_leases WHERE id=?').get(id) as any;
+  }
+
+  activeWorldLeaseCount(worldId: string): number {
+    return Number((this.db.prepare("SELECT COUNT(*) n FROM world_leases WHERE worldId=? AND state='active'")
+      .get(worldId) as any)?.n ?? 0);
   }
 
   listWorldLeases(runnerPoolId: string): any[] {
