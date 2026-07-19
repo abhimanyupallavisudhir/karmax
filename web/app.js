@@ -1538,6 +1538,13 @@ async function boot() {
   renderShell();
   bindKeys();
   installLinkRouter();
+  // A background repaint deferred to protect an open menu / text-selection gets
+  // flushed once that interaction releases (setTimeout lets focus + selection
+  // settle first). selectionchange fires constantly, so it only pokes the flush
+  // when something is actually waiting.
+  document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
+  document.addEventListener('mouseup', () => setTimeout(flushBgRender, 0));
+  document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
   window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
   await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
@@ -1686,7 +1693,7 @@ function connectWs() {
     try { ev = JSON.parse(m.data); } catch { return; }
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
-    if (S.tab === 'activity') renderMain();
+    if (S.tab === 'activity') bgRenderMain();
     if (S.selected && ev.taskId === S.selected) {
       S.taskEvents.push(ev);
       if (ev.type === 'agent.output' && ev.payload?.text) {
@@ -1717,7 +1724,7 @@ async function refreshTasks() {
   try {
     await loadTasks();
     if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-    if (S.tab === 'tasks' || S.tab === 'queue') renderMain();
+    if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
     renderRail();
     if (S.tab === 'queue' && !S.selected) seedQueue();
   } catch {}
@@ -1809,6 +1816,9 @@ function captureFocus(root) {
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
     st.selectionStart = el.selectionStart;
     st.selectionEnd = el.selectionEnd;
+    // A multi-line field scrolls its own content; a fresh element resets to the
+    // top, so snapshot the internal scroll and put it back with the caret.
+    st.scrollTop = el.scrollTop;
   }
   return st;
 }
@@ -1817,14 +1827,50 @@ function restoreFocus(root, st) {
   if (!st) return;
   const el = root.querySelector(`#${window.CSS && CSS.escape ? CSS.escape(st.id) : st.id}`);
   if (!el || el.tagName !== st.tag) return;
-  if (st.tag === 'PRE') { el.focus(); return; } // terminal screen: just re-focus (no value to restore)
+  if (st.tag === 'PRE') { el.focus({ preventScroll: true }); return; } // terminal screen: just re-focus (no value to restore)
   // Only carry over the in-progress value for free-text fields; a fresh empty
   // composer input would otherwise be reset by the re-render.
   if (st.tag !== 'SELECT') el.value = st.value;
-  el.focus();
+  // preventScroll: re-focusing must not yank the page's scroll container to the
+  // field — the surrounding restore logic owns scroll position.
+  el.focus({ preventScroll: true });
   if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
+  if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
+}
+
+// A background (WebSocket-driven) refresh repaints #main by swapping its
+// innerHTML, which tears down transient UI the user is mid-interaction with — an
+// open native <select> dropdown (e.g. the ＋ Filter… menu) or a live mouse
+// text-selection. A steady agent event stream would otherwise keep yanking the
+// menu shut / clearing the selection every few hundred ms. Detect an in-flight
+// interaction, defer the repaint, and flush it once the interaction releases
+// (blur / mouse-up / the next background event).
+let bgRenderQueued = false;
+function interactionInFlight(root) {
+  const el = document.activeElement;
+  if (el && el.tagName === 'SELECT' && root.contains(el)) return true; // dropdown may be open
+  const sel = window.getSelection && window.getSelection();
+  if (sel && !sel.isCollapsed && sel.rangeCount) {
+    const node = sel.anchorNode;
+    const host = node && (node.nodeType === 1 ? node : node.parentNode);
+    if (host && root.contains(host)) return true; // an active text selection
+  }
+  return false;
+}
+function bgRenderMain() {
+  const main = $('#main');
+  if (main && interactionInFlight(main)) { bgRenderQueued = true; return; }
+  bgRenderQueued = false;
+  renderMain();
+}
+function flushBgRender() {
+  if (!bgRenderQueued) return;
+  const main = $('#main');
+  if (main && interactionInFlight(main)) return; // still busy — wait for the next release
+  bgRenderQueued = false;
+  renderMain();
 }
 
 // ── main content ───────────────────────────────────────────────────────────
@@ -3839,6 +3885,9 @@ function captureFollowupFocus(root) {
   if (!box) return null;
   const st = { role: box.dataset.role || '', value: el.value };
   if (typeof el.selectionStart === 'number') { st.selectionStart = el.selectionStart; st.selectionEnd = el.selectionEnd; }
+  // The compose box scrolls internally once the draft spills past its height; a
+  // fresh textarea starts at the top, so snapshot the scroll offset to restore.
+  st.scrollTop = el.scrollTop;
   return st;
 }
 
@@ -3850,10 +3899,15 @@ function restoreFollowupFocus(root, st) {
   // Only carry over the value if the box was cleared by the re-render (a sent
   // follow-up empties it); never clobber text the box already holds.
   if (st.value && !el.value) el.value = st.value;
-  el.focus();
+  // preventScroll: re-focusing the box must never scroll the conversation — that
+  // caused the box to jump to the top of the thread on every background refresh.
+  el.focus({ preventScroll: true });
   if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
+  // Put the caret's line back into view inside the textarea (focus + selection
+  // alone don't restore a multi-line box's own scroll in every browser).
+  if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
 }
 
 function stripAnsi(s) {
@@ -5022,9 +5076,13 @@ function wireFollowups(v) {
 function updateLiveBubble() {
   const b = document.getElementById('live-bubble');
   if (!b) return;
+  // Follow the stream only when the reader is already parked at the bottom; if
+  // they've scrolled up to read history, hold their view fixed as text streams in.
+  const thread = document.getElementById('ck-thread');
+  const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight < 40;
   b.classList.remove('hidden');
   b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
-  b.scrollIntoView({ block: 'nearest' });
+  if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
 function renderTaskEvents() {
