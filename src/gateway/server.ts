@@ -2438,8 +2438,16 @@ export class Gateway {
         const gs = (s: string, w: string) => store.getSettings(s, w);
         const project = store.getProject(projectId);
         const organizationId = url.searchParams.get('organizationId') ?? project?.organizationId;
-        const globalVals = globalSettingsFor(gs, wf, organizationId ?? undefined);
-        const projectVals = project ? projectSettingsFor(gs, project, wf) : {};
+        const globalVals = { ...globalSettingsFor(gs, wf, organizationId ?? undefined) };
+        const projectVals = project ? { ...projectSettingsFor(gs, project, wf) } : {};
+        // "Agent environment" (worldProvider) is stored in the execution policy, not
+        // the settings rows — surface the real organization default + project override
+        // so the Task Defaults form shows and inherits the true selection (§11).
+        if (organizationId && globalVals.worldProvider === undefined) {
+          const orgProvider = store.getOrganizationExecutionPolicy(organizationId).worldProvider;
+          if (orgProvider !== undefined) globalVals.worldProvider = orgProvider;
+        }
+        if (project?.config.worldProvider !== undefined) projectVals.worldProvider = project.config.worldProvider;
         // Detect the repo's real default branch so placeholders show it (not "main").
         const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
         const db = repo0 ? await defaultBranch(repo0).catch(() => undefined) : undefined;
@@ -2475,7 +2483,14 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
-          store.setSettings(`organization:${organizationId}`, wf!, b.values ?? {});
+          const values = b.values ?? {};
+          store.setSettings(`organization:${organizationId}`, wf!, values);
+          // The organization "Agent environment" default lives in the execution
+          // policy (so runner-pool compatibility and effectiveProjectConfig agree);
+          // mirror a non-empty selection there. Blank at organization scope means
+          // "unchanged" — the top-level default is always a concrete provider.
+          if (values.worldProvider)
+            store.setOrganizationExecutionPolicy(organizationId!, { worldProvider: values.worldProvider as string });
           return this.json(res, 200, { ok: true });
         }
       }
@@ -2519,6 +2534,11 @@ export class Gateway {
           // Mirror bound-project fields into ProjectConfig for back-compat.
           const m = manifest(wf);
           if (m) store.updateProjectConfig(projectId, settingsToProjectConfig(m, values));
+          // "Agent environment" is canonically an execution-policy value; mirror it so
+          // effectiveProjectConfig, runner-pool compatibility, and the Compute section
+          // stay coherent (empty ⇒ clear the override and inherit the organization).
+          if (Object.prototype.hasOwnProperty.call(values, 'worldProvider'))
+            store.setProjectExecutionPolicy(projectId, { worldProvider: (values.worldProvider as string) || null });
           return this.json(res, 200, { ok: true });
         }
       }

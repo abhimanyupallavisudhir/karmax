@@ -62,6 +62,7 @@ const S = {
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   agentQueue: { capacity: 3, queue: [], current: [] }, // workflow-owned host admission queue
   modelCatalog: null, // provider-native model metadata loaded from the gateway
+  worldProviderConnections: [], // org's connected remote sandbox providers → Agent-environment options
   inviteNotice: null,
 };
 
@@ -124,7 +125,7 @@ function currentOrg() {
 function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 
 // Second-segment words that name an organization-level view rather than a project.
-const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
+const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki', profile: 'profile' };
 
 function parseRoute(pathname) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
@@ -295,31 +296,65 @@ function taskUrl(id) {
   return p ? `${projectRoute(p.id)}/tasks/${keyPart}` : location.pathname;
 }
 
-// Push a task permalink and remember where to return on close — but only when
-// coming FROM a list/queue, so j/k-walking between task pages keeps the original
-// list (not the previous task) as the place Esc returns to.
-function goToTask(id) {
-  if (!parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
-  return go(taskUrl(id));
+// True when a click means "open in a new tab/window" by browser convention: any
+// modifier key, or a non-primary mouse button. Real <a> elements honour this
+// natively — we only consult it so JS handlers never hijack such a click.
+function isNewTabClick(ev) {
+  return ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey;
 }
 
-// Make an element open a task like a link: plain click navigates in place;
-// Ctrl/⌘-click and middle-click open the task's permalink in a new browser tab.
-// `getId(ev)` returns the task id, or null to ignore the click (e.g. it landed
-// on an inner button); `open` overrides the in-place action (default goToTask).
-function wireTaskNav(el, getId, open = goToTask) {
-  el.addEventListener('click', (ev) => {
-    const id = getId(ev);
-    if (!id) return;
-    if (ev.ctrlKey || ev.metaKey) return void window.open(taskUrl(id), '_blank', 'noopener');
-    open(id);
-  });
-  el.addEventListener('auxclick', (ev) => {
-    const id = ev.button === 1 ? getId(ev) : null;
-    if (!id) return;
+// Navigate to an in-app path, remembering the list to return to when opening a
+// task from a non-task page (so Esc / j-k walking returns to the list, not the
+// previous task). Generalises the old goToTask logic to any SPA link.
+function spaNavigate(href) {
+  const to = parseRoute(href);
+  if (to && to.taskKey && !parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
+  return go(href);
+}
+
+// Every in-app link is a real `<a data-spa href="/…">` anchor, so the browser
+// hands us every native "open in a new tab/window" affordance for free:
+// Ctrl/⌘-click, middle-click, Shift-click, right-click → "Open link in new tab",
+// drag-to-bookmark and the hover URL preview. This single delegated handler is
+// the *only* thing that keeps a plain left-click fast — it cancels the full-page
+// navigation and routes in place. Every modified or non-primary click falls
+// through untouched, so the browser opens it exactly as it would any web link.
+function installLinkRouter() {
+  document.addEventListener('click', (ev) => {
+    if (isNewTabClick(ev) || ev.defaultPrevented) return;
+    const a = ev.target.closest('a[data-spa]');
+    if (!a) return;
+    const href = a.getAttribute('href');
+    if (!href || href[0] !== '/') return; // only same-origin app routes route in place
     ev.preventDefault();
-    window.open(taskUrl(id), '_blank', 'noopener');
+    spaNavigate(href);
   });
+}
+
+// Push a task permalink (in place), remembering where to return on close.
+function goToTask(id) { return spaNavigate(taskUrl(id)); }
+
+// Make a whole row open its task like a real link. Rather than fake it in JS
+// (which can't offer the right-click "Open in new tab" menu, Shift-click, or a
+// hover preview), we lay a real `<a>` across the row: an absolutely-positioned
+// overlay that the browser treats as an ordinary link for every "new tab"
+// gesture, while installLinkRouter() catches its plain left-click and routes in
+// place — so normal clicking stays exactly as fast as before, with no reload.
+// Inner buttons/handles sit above the overlay (see the .has-row-link CSS) and
+// keep working; the overlay is non-draggable so it never shadows a row's own
+// drag-to-reorder. `getId()` returns the task id (falsy → leave the row inert).
+function wireTaskNav(el, getId) {
+  const id = getId();
+  if (!id) return;
+  el.classList.add('has-row-link');
+  const a = document.createElement('a');
+  a.className = 'row-link';
+  a.href = taskUrl(id);
+  a.dataset.spa = '';
+  a.draggable = false;
+  a.tabIndex = -1;
+  a.setAttribute('aria-hidden', 'true');
+  el.appendChild(a);
 }
 
 // A short human label for a task id: `#num` when known, else a short id.
@@ -402,8 +437,22 @@ function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
   el.outerHTML = effortSelectHtml(effortCls, provider, model, el.value || '');
 }
 
+// The "Agent environment" (worldProvider) choices depend on the deployment and
+// which remote sandbox providers the organization has connected — so the manifest
+// ships an empty option list and the client fills it in. An empty first option ⇒
+// inherit the project / organization default.
+function agentEnvOptions() {
+  const local = S.meta?.hosted ? [] : ['worktree', 'container'];
+  const connected = (S.worldProviderConnections || [])
+    .filter((c) => c.enabled && c.credentialConfigured)
+    .map((c) => c.provider);
+  return ['', ...new Set([...local, ...connected])];
+}
+
 function schemaFor(workflow) {
-  return (S.schema.find((s) => s.name === workflow)?.params) || [];
+  const params = S.schema.find((s) => s.name === workflow)?.params || [];
+  // Fill the Agent-environment select's options from the live provider catalog.
+  return params.map((f) => (f.name === 'worldProvider' ? { ...f, options: agentEnvOptions() } : f));
 }
 
 // ── generic field renderer (SPEC §10.4 / §10.5) ──────────────────────────────
@@ -445,8 +494,13 @@ function renderField(f, own, inherited, withChips, alt) {
   }
   if (f.type === 'boolean')
     return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${f.required ? '' : resetBtns(f.name, alt)}</div></div>`;
-  if (f.type === 'select')
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+  if (f.type === 'select') {
+    // Keep the effective value selectable even if it isn't in the (possibly
+    // dynamic) option list — e.g. an inherited provider not connected locally.
+    const opts = [...(f.options || [])];
+    if (v !== '' && !opts.includes(v)) opts.push(v);
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${opts.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${o === '' ? 'Inherit default' : esc(o)}</option>`).join('')}</select></div>`;
+  }
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
@@ -484,18 +538,24 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   const group = renderAgentGroup(fields, own, inherited, altFor);
   const grouped = new Set(group ? agentGroupFields(fields).map((f) => f.name) : []);
   let groupDrawn = false;
+  // Base, target, and the Agent environment share one row (rendered at the first
+  // of them present, in this order); the rest are skipped where they'd fall.
+  const inlineRow = ['base', 'target', 'worldProvider'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
+  const inlineNames = new Set(inlineRow.map((f) => f.name));
+  let inlineDrawn = false;
   const html = [];
   for (const f of fields) {
     if (grouped.has(f.name)) {
       if (!groupDrawn) { html.push(group); groupDrawn = true; }
       continue;
     }
-    if (f.name === 'base' && fields.some((x) => x.name === 'target')) {
-      const target = fields.find((x) => x.name === 'target');
-      html.push(`<div class="branch-pair">${renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))}${renderField(target, own[target.name], inherited[target.name], false, altFor?.(target))}</div>`);
+    if (inlineNames.has(f.name) && inlineRow.length > 1) {
+      if (!inlineDrawn) {
+        inlineDrawn = true;
+        html.push(`<div class="branch-pair${inlineRow.length === 3 ? ' cols-3' : ''}">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`);
+      }
       continue;
     }
-    if (f.name === 'target' && fields.some((x) => x.name === 'base')) continue;
     html.push(renderField(f, own[f.name], inherited[f.name], withPromptChips && f.name === 'prompt', altFor?.(f)));
   }
   return html.join('');
@@ -1500,10 +1560,19 @@ async function boot() {
     S.contributions = await api(`/api/contributions${projectScope}`);
     S.schema = await api(`/api/schema${projectScope}`);
     S.modelCatalog = (await api(`/api/models${projectScope}`)).providers;
+    if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
   } catch {}
   connectWs();
   renderShell();
   bindKeys();
+  installLinkRouter();
+  // A background repaint deferred to protect an open menu / text-selection gets
+  // flushed once that interaction releases (setTimeout lets focus + selection
+  // settle first). selectionchange fires constantly, so it only pokes the flush
+  // when something is actually waiting.
+  document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
+  document.addEventListener('mouseup', () => setTimeout(flushBgRender, 0));
+  document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
   window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
   await applyRoute(); // honor the initial URL (deep link / bookmark)
 }
@@ -1652,7 +1721,7 @@ function connectWs() {
     try { ev = JSON.parse(m.data); } catch { return; }
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
-    if (S.tab === 'activity') renderMain();
+    if (S.tab === 'activity') bgRenderMain();
     if (S.selected && ev.taskId === S.selected) {
       S.taskEvents.push(ev);
       if (ev.type === 'agent.output' && ev.payload?.text) {
@@ -1683,7 +1752,7 @@ async function refreshTasks() {
   try {
     await loadTasks();
     if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-    if (S.tab === 'tasks' || S.tab === 'queue') renderMain();
+    if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
     renderRail();
     if (S.tab === 'queue' && !S.selected) seedQueue();
   } catch {}
@@ -1703,8 +1772,10 @@ function renderShell() {
       <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
         <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
       </button>
-      <button class="icon-btn has-badge" id="bell" title="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></button>
-      <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
+      <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
+      <button class="icon-btn" id="topbar-help" title="Keyboard shortcuts (?)" aria-haspopup="dialog">?</button>
+      <a class="topbar-user" id="topbar-user" data-spa href="${globalRoute('profile')}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     <div class="body">
       <div class="rail" id="rail"></div>
@@ -1713,8 +1784,9 @@ function renderShell() {
   // Project-scoped query/filtering lives in the task list. The topbar finder is
   // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
   $('#topbar-search').addEventListener('click', openGlobalSearch);
-  $('#theme').addEventListener('click', toggleTheme);
-  $('#bell').addEventListener('click', () => go(globalRoute('inbox')));
+  $('#topbar-palette').addEventListener('click', openPalette);
+  $('#topbar-help').addEventListener('click', openHelp);
+  // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
   $('#org-switcher')?.addEventListener('change', async (e) => {
     if (e.target.value === '__new') return createOrganization();
     S.organizationId = e.target.value;
@@ -1734,31 +1806,21 @@ function renderRail() {
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
       .map(
-        (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" tabindex="0">
+        (p) => `<a class="proj ${p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
-        </div>`,
+        </a>`,
       )
       .join('')}
     <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
     <div class="label">Organization</div>
-    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
-    <div class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</div>
-    <div class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" id="rail-organization" tabindex="0">⚙ Settings</div>
-    <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
-    <div class="nav-item" id="rail-palette" tabindex="0" title="Run any available command">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
-  rail.querySelectorAll('.proj[data-id]').forEach((e) =>
-    e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
-  );
+    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
+    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</a>
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
+    <a class="nav-item ${S.tab === 'profile' ? 'active' : ''}" data-spa href="${globalRoute('profile')}" id="rail-profile" tabindex="0" title="Your profile">◔ Profile${userDisplayName() ? ` · ${esc(userDisplayName())}` : ''}</a>`;
+  // Project + Dashboard/Wiki/Settings/Profile entries are real <a> links — installLinkRouter()
+  // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
-  $('#rail-wiki')?.addEventListener('click', () => go(globalRoute('orgwiki')));
-  $('#rail-organization')?.addEventListener('click', () => go(globalRoute('organization')));
-  rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
-  $('#rail-logout')?.addEventListener('click', async () => {
-    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
-    location.reload();
-  });
-  $('#rail-palette')?.addEventListener('click', openPalette);
 }
 
 function switchTab(tab) {
@@ -1783,6 +1845,9 @@ function captureFocus(root) {
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
     st.selectionStart = el.selectionStart;
     st.selectionEnd = el.selectionEnd;
+    // A multi-line field scrolls its own content; a fresh element resets to the
+    // top, so snapshot the internal scroll and put it back with the caret.
+    st.scrollTop = el.scrollTop;
   }
   return st;
 }
@@ -1791,14 +1856,50 @@ function restoreFocus(root, st) {
   if (!st) return;
   const el = root.querySelector(`#${window.CSS && CSS.escape ? CSS.escape(st.id) : st.id}`);
   if (!el || el.tagName !== st.tag) return;
-  if (st.tag === 'PRE') { el.focus(); return; } // terminal screen: just re-focus (no value to restore)
+  if (st.tag === 'PRE') { el.focus({ preventScroll: true }); return; } // terminal screen: just re-focus (no value to restore)
   // Only carry over the in-progress value for free-text fields; a fresh empty
   // composer input would otherwise be reset by the re-render.
   if (st.tag !== 'SELECT') el.value = st.value;
-  el.focus();
+  // preventScroll: re-focusing must not yank the page's scroll container to the
+  // field — the surrounding restore logic owns scroll position.
+  el.focus({ preventScroll: true });
   if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
+  if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
+}
+
+// A background (WebSocket-driven) refresh repaints #main by swapping its
+// innerHTML, which tears down transient UI the user is mid-interaction with — an
+// open native <select> dropdown (e.g. the ＋ Filter… menu) or a live mouse
+// text-selection. A steady agent event stream would otherwise keep yanking the
+// menu shut / clearing the selection every few hundred ms. Detect an in-flight
+// interaction, defer the repaint, and flush it once the interaction releases
+// (blur / mouse-up / the next background event).
+let bgRenderQueued = false;
+function interactionInFlight(root) {
+  const el = document.activeElement;
+  if (el && el.tagName === 'SELECT' && root.contains(el)) return true; // dropdown may be open
+  const sel = window.getSelection && window.getSelection();
+  if (sel && !sel.isCollapsed && sel.rangeCount) {
+    const node = sel.anchorNode;
+    const host = node && (node.nodeType === 1 ? node : node.parentNode);
+    if (host && root.contains(host)) return true; // an active text selection
+  }
+  return false;
+}
+function bgRenderMain() {
+  const main = $('#main');
+  if (main && interactionInFlight(main)) { bgRenderQueued = true; return; }
+  bgRenderQueued = false;
+  renderMain();
+}
+function flushBgRender() {
+  if (!bgRenderQueued) return;
+  const main = $('#main');
+  if (main && interactionInFlight(main)) return; // still busy — wait for the next release
+  bgRenderQueued = false;
+  renderMain();
 }
 
 // ── main content ───────────────────────────────────────────────────────────
@@ -1825,7 +1926,7 @@ function renderMain() {
   const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
-        .map((t) => `<div class="tab ${S.tab === t ? 'active' : ''}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</div>`)
+        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
         .join('')}</div>`
     : '';
 
@@ -1838,6 +1939,7 @@ function renderMain() {
   else if (S.tab === 'organization') content = organizationView();
   else if (S.tab === 'wiki') content = wikiView(proj);
   else if (S.tab === 'orgwiki') content = wikiView(null);
+  else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
   else if (S.tab === 'global') content = globalSettingsView();
 
@@ -1847,7 +1949,7 @@ function renderMain() {
   const focusState = captureFocus(main);
 
   main.innerHTML = tabbar + content;
-  main.querySelectorAll('.tab[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
+  // Project tabs are real <a> links; installLinkRouter() handles the plain click.
   if (S.tab === 'tasks') wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'wiki') wireWikiView(proj);
@@ -1856,6 +1958,7 @@ function renderMain() {
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
   if (S.tab === 'inbox') wireInboxView();
+  if (S.tab === 'profile') wireProfileView();
   if (S.tab === 'organization') { hydrateOrganizationView(); wireGlobalSettings(S.organizationId); }
 
   restoreFocus(main, focusState);
@@ -1865,11 +1968,11 @@ function renderMain() {
 // ── tasks ────────────────────────────────────────────────────────────────────
 // Client-side twin of the authoritative `matchText` in src/domain/search.ts — the
 // pre-server fallback while the first evaluation is in flight. Keep the two in
-// sync: token-AND over title / notes / #num, so "login fix" matches "fix login".
+// sync: token-AND over title / notes / prompt / #num, so "login fix" matches "fix login".
 function taskMatches(t, q) {
   const s = (q || '').toLowerCase().trim();
   if (!s) return true;
-  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
+  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${(t.params?.prompt || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
@@ -2325,14 +2428,18 @@ async function saveCurrentView() {
 function parseQueryClient(input) {
   const q = { filters: [], sort: [] };
   const text = [];
-  const re = /"([^"]*)"|(\S+)/g; let m;
+  // Mirrors the server tokenizer: a `key:` prefix binds to its value even when the
+  // value carries quotes, so `conversation:"merge conflict"` stays one clause.
+  const re = /([-!]{0,2}[A-Za-z_#][\w.#-]*):((?:"[^"]*"|[^\s"])*)|"([^"]*)"|(\S+)/g; let m;
   const OPS = [['>=', 'gte'], ['<=', 'lte'], ['>', 'gt'], ['<', 'lt'], ['=', 'is']];
+  const splitVals = (raw) => {
+    const vals = []; const vre = /"([^"]*)"|([^,]+)/g; let vm;
+    while ((vm = vre.exec(raw))) { const v = (vm[1] !== undefined ? vm[1] : vm[2]).trim(); if (v) vals.push(v); }
+    return vals;
+  };
   while ((m = re.exec(input))) {
-    const quoted = m[1] !== undefined;
-    const tok = quoted ? m[1] : m[2];
-    const colon = quoted ? -1 : tok.indexOf(':');
-    if (colon < 0) { if (tok) text.push(tok); continue; }
-    let key = tok.slice(0, colon); let rest = tok.slice(colon + 1); let negate = false;
+    if (m[1] === undefined) { const tok = m[3] !== undefined ? m[3] : m[4]; if (tok) text.push(tok); continue; }
+    let key = m[1]; let rest = m[2] || ''; let negate = false;
     if (key[0] === '-' || key[0] === '!') { negate = true; key = key.slice(1); }
     if (key === 'sort') { let dir = 'asc'; let k = rest; if (k[0] === '-') { dir = 'desc'; k = k.slice(1); } const dm = k.match(/^(.*)[-:](asc|desc)$/i); if (dm) { k = dm[1]; dir = dm[2].toLowerCase(); } q.sort.push({ field: k, dir }); continue; }
     if (key === 'group') { q.group = rest; continue; }
@@ -2340,10 +2447,10 @@ function parseQueryClient(input) {
     // `param.<key>` / `p.<key>` and `agent_<role>.<sub>` are synthetic (text) fields.
     const isParam = /^(param|p)\.[^.\s]+$/i.test(key) || /^agent_[a-z0-9]+\.(agent|model|effort)$/i.test(key);
     const fld = isParam ? { key, type: 'text' } : S.fields.find((f) => f.key === key || (f.aliases || []).includes(key));
-    if (!fld) { text.push(tok); continue; }
+    if (!fld) { text.push(m[0]); continue; }
     let op = fld.type === 'text' ? 'contains' : 'is';
-    for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
-    const values = rest.split(',').map((s) => s.trim()).filter(Boolean);
+    if (rest[0] !== '"') for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
+    const values = splitVals(rest);
     if (values.length) q.filters.push(negate ? { field: fld.key, op, values, negate: true } : { field: fld.key, op, values });
   }
   if (!q.filters.length) delete q.filters;
@@ -2638,9 +2745,7 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-delseries]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (!confirm('Delete this repeatable task? Its past runs are kept.')) return; try { await api(`/api/tasks/${b.dataset.delseries}`, { method: 'DELETE' }); toast('Repeatable task deleted'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
-  $('#main').querySelectorAll('[data-series]').forEach((e) =>
-    wireTaskNav(e, (ev) => (ev.target.closest('button') ? null : e.dataset.series)),
-  );
+  $('#main').querySelectorAll('[data-series]').forEach((e) => wireTaskNav(e, () => e.dataset.series));
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
     try {
@@ -3822,6 +3927,9 @@ function captureFollowupFocus(root) {
   if (!box) return null;
   const st = { role: box.dataset.role || '', value: el.value };
   if (typeof el.selectionStart === 'number') { st.selectionStart = el.selectionStart; st.selectionEnd = el.selectionEnd; }
+  // The compose box scrolls internally once the draft spills past its height; a
+  // fresh textarea starts at the top, so snapshot the scroll offset to restore.
+  st.scrollTop = el.scrollTop;
   return st;
 }
 
@@ -3833,10 +3941,15 @@ function restoreFollowupFocus(root, st) {
   // Only carry over the value if the box was cleared by the re-render (a sent
   // follow-up empties it); never clobber text the box already holds.
   if (st.value && !el.value) el.value = st.value;
-  el.focus();
+  // preventScroll: re-focusing the box must never scroll the conversation — that
+  // caused the box to jump to the top of the thread on every background refresh.
+  el.focus({ preventScroll: true });
   if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
+  // Put the caret's line back into view inside the textarea (focus + selection
+  // alone don't restore a multi-line box's own scroll in every browser).
+  if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
 }
 
 function stripAnsi(s) {
@@ -4151,7 +4264,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
     : '';
   const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
+    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><a class="branch sub-open" data-spa href="${taskUrl(id)}" style="cursor:pointer">↳ ${esc(numLabel(id))}</a></div>`).join('')}`
     : '';
   return `
     <div class="section-h">Pipeline</div>
@@ -4940,7 +5053,7 @@ function wireActions(v) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
+  // Sub-task references are real <a> permalinks; installLinkRouter() handles them.
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
@@ -5005,9 +5118,13 @@ function wireFollowups(v) {
 function updateLiveBubble() {
   const b = document.getElementById('live-bubble');
   if (!b) return;
+  // Follow the stream only when the reader is already parked at the bottom; if
+  // they've scrolled up to read history, hold their view fixed as text streams in.
+  const thread = document.getElementById('ck-thread');
+  const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight < 40;
   b.classList.remove('hidden');
   b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
-  b.scrollIntoView({ block: 'nearest' });
+  if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
 function renderTaskEvents() {
@@ -5144,7 +5261,7 @@ function localQueue(domain) {
 
 function wireQueueView() {
   $('#main').querySelectorAll('.queue-item').forEach((e) => {
-    if (taskRecord(e.dataset.id)) wireTaskNav(e, (ev) => (ev.target.closest('[data-move]') || ev.target.closest('.drag-handle') ? null : e.dataset.id));
+    if (taskRecord(e.dataset.id)) wireTaskNav(e, () => e.dataset.id);
   });
   $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
@@ -5347,7 +5464,7 @@ function procPanelHtml(sample) {
     .map((g) => {
       const kindChip = `<span class="chip">${esc(PROC_KIND_LABEL[g.kind] || g.kind)}</span>`;
       const taskChip = g.taskId
-        ? `<button class="chip proc-task" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</button>`
+        ? `<a class="chip proc-task" data-spa href="${esc(taskUrl(g.taskId))}" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</a>`
         : '';
       // A group is killable at the root when it's a registered entity (agents,
       // terminals, logins, probes) — its registered killer escalates properly.
@@ -5386,7 +5503,7 @@ function procPanelHtml(sample) {
 }
 
 function wireProcPanel(el) {
-  el.querySelectorAll('.proc-task').forEach((b) => b.addEventListener('click', () => goToTask(b.dataset.task)));
+  // .proc-task chips are real <a> permalinks handled by installLinkRouter().
   el.querySelectorAll('.proc-kill').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       const pid = Number(b.dataset.kill);
@@ -5626,7 +5743,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
 // `confirm` (the Review route) stays a shared/common value on the wire, but it is
 // edited in the Agents card beside the Do/Merge agents it gates — not here.
 const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
@@ -6107,6 +6224,7 @@ function settingsView(proj) {
 }
 function cloudEnvironmentCard(proj) {
   return `<div class="card"><div class="section-h">Where tasks run</div>
+    <p class="task-sub">Agent environments (worktree / container / E2B / Daytona), remote-provider connections, runner pools, and the organization budget are set up in <a class="organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-compute">Organization → Compute</a>. This section only tightens them for this project.</p>
     <div id="project-execution">Loading organization execution policy…</div>
   </div>`;
 }
@@ -6290,32 +6408,28 @@ async function hydrateExecutionProviders(proj) {
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
     ]);
-    const available = connections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider);
-    const local = S.meta?.hosted ? [] : ['worktree', 'container'];
-    const providers = [...new Set([...local, ...available])];
-    const selected = policy.override.worldProvider || '';
+    S.worldProviderConnections = connections;
+    // The Agent environment (worktree / container / E2B / Daytona) now lives in
+    // Task defaults — and can be overridden per task. Compute keeps the runner pool
+    // and budget, which only vary by environment, so the pool list is filtered by
+    // the effective environment (shown read-only here).
+    const environment = policy.effective.worldProvider || 'worktree';
     box.innerHTML = `<div class="settings-grid">
-      <label class="form-row">Execution provider<select id="project-execution-provider"><option value="">Organization default — ${esc(policy.organization.worldProvider || 'worktree')}</option>${providers.map((provider) => `<option value="${esc(provider)}" ${provider === selected ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
       <label class="form-row">Runner pool<select id="project-execution-pool"></select></label>
       <label class="form-row">Optional tighter project budget (USD/month)<input id="project-execution-budget" type="number" min="0" step="0.01" value="${policy.override.monthlyBudgetMicros == null ? '' : esc(policy.override.monthlyBudgetMicros / 1e6)}" placeholder="Use organization budget" /></label>
-    </div><div class="task-sub">Effective: ${esc(policy.effective.worldProvider)} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
-    <button class="btn sm primary" id="project-execution-save">Save project override</button>`;
-    const syncPools = (keep = '') => {
-      const provider = $('#project-execution-provider').value || policy.organization.worldProvider || 'worktree';
-      const matching = pools.filter((pool) => pool.provider === provider && pool.enabled);
-      $('#project-execution-pool').innerHTML = `<option value="">${provider === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === keep ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-    };
-    syncPools(policy.override.runnerPoolId || '');
-    $('#project-execution-provider')?.addEventListener('change', () => syncPools());
+    </div><div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
+    <button class="btn sm primary" id="project-execution-save">Save compute override</button>`;
+    const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
+    $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
     $('#project-execution-save')?.addEventListener('click', async () => {
-      const provider = $('#project-execution-provider').value; const pool = $('#project-execution-pool').value;
+      const pool = $('#project-execution-pool').value;
       const budget = $('#project-execution-budget').value.trim();
       try {
         await api(`/api/projects/${proj.id}/execution-policy`, { method: 'PUT', body: JSON.stringify({ override: {
-          worldProvider: provider || null, runnerPoolId: pool || null,
+          runnerPoolId: pool || null,
           monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
         } }) });
-        await loadProjects(); toast('Project execution policy saved'); await hydrateExecutionProviders(proj);
+        await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { toast(`Could not load compute providers: ${error.message}`, true); }
@@ -6992,6 +7106,63 @@ async function openInboxItem(item) {
   return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
 }
 
+// The signed-in person's display name for the topbar/rail. The legacy single-user
+// session is the string 'me'; real identity sessions carry a Better Auth user.
+function userDisplayName() {
+  const u = S.user;
+  if (u && typeof u === 'object') return u.name || u.email || 'Account';
+  return 'Account';
+}
+
+// A clean profile page: identity, the browser display preference (theme), and the
+// one place to end the session. Sign out lives here rather than in the top bar.
+function profileView() {
+  const u = S.user && typeof S.user === 'object' ? S.user : null;
+  const name = userDisplayName();
+  const email = u?.email || '';
+  const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
+  const orgCount = (S.organizations || []).length;
+  const row = (label, value) => value
+    ? `<div class="profile-row"><span class="profile-row-label">${esc(label)}</span><span class="profile-row-value">${esc(value)}</span></div>`
+    : '';
+  return `<div class="profile-page">
+    <h1 class="page-title">Profile</h1>
+    <div class="card profile-card">
+      <div class="profile-identity">
+        <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
+        <div class="profile-meta">
+          <div class="profile-name">${esc(name)}</div>
+          ${email ? `<div class="profile-email">${esc(email)}</div>` : ''}
+        </div>
+      </div>
+      <div class="profile-rows">
+        ${row('Name', u?.name || '')}
+        ${row('Email', email)}
+        ${row('Account', u?.id || '')}
+        ${row('Organizations', orgCount ? String(orgCount) : '')}
+      </div>
+    </div>
+    <div class="card">
+      <div class="section-h">Appearance</div>
+      <p class="task-sub">The light / dark preference is remembered in this browser.</p>
+      <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
+    </div>
+    <div class="card">
+      <div class="section-h">Session</div>
+      <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
+      <button class="btn danger" id="profile-logout">Sign out</button>
+    </div>
+  </div>`;
+}
+
+function wireProfileView() {
+  $('#profile-theme')?.addEventListener('click', toggleTheme);
+  $('#profile-logout')?.addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
+    location.reload();
+  });
+}
+
 // The settings rail is real navigation, not a scroll-spy: exactly one section is
 // visible at a time, so each pane reads as a page with a single purpose instead
 // of a position in one endless scroll. The URL hash names the open pane (via
@@ -7115,10 +7286,13 @@ async function hydrateOrganizationView() {
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
   const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
-  const connectedProviders = providerConnections.filter((connection) => connection.enabled && connection.credentialConfigured).map((connection) => connection.provider);
-  const executionProviders = [...new Set([executionPolicy.worldProvider, ...(S.meta?.hosted ? [] : ['worktree', 'container']), ...connectedProviders].filter(Boolean))];
+  S.worldProviderConnections = providerConnections;
+  // The default Agent environment moved to Task defaults (below) and can be
+  // overridden per project/task. Compute keeps the runner pool + budget; the pool
+  // list is scoped to the effective environment, shown read-only here.
+  const orgEnvironment = executionPolicy.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
   $('#org-execution').innerHTML = `<div class="settings-grid">
-    <label class="form-row">Default provider<select id="org-execution-provider">${executionProviders.map((provider) => `<option value="${esc(provider)}" ${provider === executionPolicy.worldProvider ? 'selected' : ''}>${esc(provider)}</option>`).join('')}</select></label>
+    <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
     <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
     <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
     <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
@@ -7129,11 +7303,17 @@ async function hydrateOrganizationView() {
   <p class="task-sub">Coding agents normally need arbitrary package registries, documentation, web search, and APIs. Restricted mode is for organizations with a maintained egress policy.</p>
   <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
   <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
+  const providerInfo = {
+    e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
+    daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io' },
+  };
   $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
     const connection = connectionFor(provider); const config = connection?.config || {};
     const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
+    const info = providerInfo[provider];
     return `<div class="team-block provider-connection" data-provider="${provider}">
-      <div class="member-row"><b>${provider === 'e2b' ? 'E2B' : 'Daytona'}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
+      <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
+      <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
       ${provider === 'e2b' ? `<label class="form-row">Template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-node22" /></label>`
@@ -7183,20 +7363,15 @@ async function hydrateOrganizationView() {
     row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   });
   $('#runner-create')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, capacity: { activeWorlds: Number($('#runner-worlds').value) } }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
-  const syncOrganizationPools = (keep = '') => {
-    const provider = $('#org-execution-provider').value;
-    const matching = runners.filter((pool) => pool.provider === provider && pool.enabled);
-    $('#org-execution-pool').innerHTML = `<option value="">Provider-managed default</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === keep ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
-  };
-  syncOrganizationPools(executionPolicy.runnerPoolId || '');
-  $('#org-execution-provider')?.addEventListener('change', () => syncOrganizationPools());
+  const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
+  $('#org-execution-pool').innerHTML = `<option value="">Provider-managed default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
   $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
   $('#org-execution-save')?.addEventListener('click', async () => {
     const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
     const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
     try {
       await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
-        worldProvider: $('#org-execution-provider').value, runnerPoolId: $('#org-execution-pool').value || undefined,
+        runnerPoolId: $('#org-execution-pool').value || undefined,
         resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
         network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
         monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
@@ -7706,10 +7881,13 @@ function openGlobalSearch() {
     list.innerHTML = items.map((item, i) => {
       const head = item.group !== lastGroup ? `<div class="pal-group">${esc(item.group)}</div>` : '';
       lastGroup = item.group;
-      return `${head}<div class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}">
+      // Each result is a real permalink, so it opens in a new tab with any native
+      // gesture (Ctrl/⌘-click, middle-click, right-click → Open in new tab); a plain
+      // click below still opens it in place and dismisses the palette.
+      return `${head}<a class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}"${item.href ? ` data-spa href="${esc(item.href)}"` : ''}>
         <span class="global-search-kind" aria-hidden="true">${item.group === 'Projects' ? '◇' : '□'}</span>
         <span class="global-search-copy"><b>${esc(item.title)}</b><span>${esc(item.sub || '')}</span></span>
-      </div>`;
+      </a>`;
     }).join('');
     input.setAttribute('aria-activedescendant', `gs-result-${active}`);
     if (summary) list.insertAdjacentHTML('beforeend', `<div class="global-search-summary">${esc(summary)}</div>`);
@@ -7731,16 +7909,18 @@ function openGlobalSearch() {
     if (ownRequest !== request || !root.contains(input)) return;
     const found = assembleGlobalSearchResults(q, S.projects, responses);
     items = [
-      ...found.projectHits.map(({ project }) => ({
-        group: 'Projects', title: project.name, sub: 'Open project', run: () => go(projectRoute(project.id)),
-      })),
+      ...found.projectHits.map(({ project }) => {
+        const href = projectRoute(project.id);
+        return { group: 'Projects', title: project.name, sub: 'Open project', href, run: () => spaNavigate(href) };
+      }),
       ...found.taskHits.map(({ project, task }) => {
         const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
         const number = task.num != null ? `#${task.num} · ` : '';
+        const href = `${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
         return {
           group: 'Tasks', title: task.title,
           sub: `${number}${project.name} · ${stateLabel}`,
-          run: () => go(`${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`),
+          href, run: () => spaNavigate(href),
         };
       }),
     ];
@@ -7759,7 +7939,12 @@ function openGlobalSearch() {
     else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
     else if (e.key === 'Enter') { e.preventDefault(); run(active); }
   });
-  list.addEventListener('click', (e) => { const row = e.target.closest('.opt'); if (row) run(Number(row.dataset.i)); });
+  list.addEventListener('click', (e) => {
+    const row = e.target.closest('.opt'); if (!row) return;
+    if (isNewTabClick(e)) return; // real <a> result → let the browser open it in a new tab (palette stays open)
+    e.preventDefault();
+    run(Number(row.dataset.i));
+  });
   list.addEventListener('mousemove', (e) => { const row = e.target.closest('.opt'); if (row && Number(row.dataset.i) !== active) { active = Number(row.dataset.i); draw(); } });
   $('#gs-close').addEventListener('click', close);
   $('#gs-scrim').addEventListener('click', (e) => { if (e.target.id === 'gs-scrim') close(); });

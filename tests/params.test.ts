@@ -252,6 +252,8 @@ describe('settingsToProjectConfig (mirror back to ProjectConfig)', () => {
     expect(cfg.defaultBase).toBe('main');
     expect(cfg.defaultTarget).toBe('prod');
     expect(cfg.repos).toEqual([path.join(os.homedir(), 'r')]);
-    expect(cfg.worldProvider).toBeUndefined(); // infrastructure is organization/project policy, not a workflow field
+    // "Agent environment" is now a task default (bind:'project'), so it mirrors back
+    // to ProjectConfig.worldProvider like the other project-bound fields.
+    expect(cfg.worldProvider).toBe('container');
   });
 });

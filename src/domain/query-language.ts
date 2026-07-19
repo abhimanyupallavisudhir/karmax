@@ -9,6 +9,7 @@
  *   priority:>=2  priority:high  number clause, comparison ops or level names
  *   created:<7d   updated:>2026-01-01   date clause (relative age or absolute)
  *   is:draft  is:open  has:pr    facets (boolean-ish predicates)
+ *   conversation:"merge conflict"   quotes keep a multi-word clause value together
  *   label:frontend               'label' is an alias for 'tag' (parent matches children)
  *   sort:priority-desc  sort:-created   sort directive
  *   group:status                 grouping directive
@@ -19,16 +20,35 @@
 import { TaskQuery, FilterClause, SortClause, FilterOp } from './types.js';
 import { fieldByKey } from './search.js';
 
-/** Split on whitespace but keep quoted spans together (and remember they were quoted). */
-function tokenize(input: string): { text: string; quoted: boolean }[] {
-  const toks: { text: string; quoted: boolean }[] = [];
-  const re = /"([^"]*)"|(\S+)/g;
+/**
+ * Split on whitespace but keep quoted spans together (and remember they were quoted).
+ * A `key:` prefix binds to its value even when the value carries quotes — so
+ * `conversation:"merge conflict"` and `status:done,"in progress"` stay one token
+ * (`value` keeps the quotes; `splitValues` strips them per comma-separated part).
+ * This is the form `stringifyQuery`/`addClause` already emit for spaced values.
+ */
+function tokenize(input: string): { text: string; quoted: boolean; key?: string; value?: string }[] {
+  const toks: { text: string; quoted: boolean; key?: string; value?: string }[] = [];
+  const re = /([-!]{0,2}[A-Za-z_#][\w.#-]*):((?:"[^"]*"|[^\s"])*)|"([^"]*)"|(\S+)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(input))) {
-    if (m[1] !== undefined) toks.push({ text: m[1], quoted: true });
-    else toks.push({ text: m[2]!, quoted: false });
+    if (m[1] !== undefined) toks.push({ text: m[0], quoted: false, key: m[1], value: m[2] ?? '' });
+    else if (m[3] !== undefined) toks.push({ text: m[3], quoted: true });
+    else toks.push({ text: m[4]!, quoted: false });
   }
   return toks;
+}
+
+/** Split a clause value on commas outside quotes, stripping the quotes per part. */
+function splitValues(raw: string): string[] {
+  const vals: string[] = [];
+  const re = /"([^"]*)"|([^,]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw))) {
+    const v = (m[1] !== undefined ? m[1] : m[2]!).trim();
+    if (v) vals.push(v);
+  }
+  return vals;
 }
 
 const OP_PREFIX: { p: string; op: FilterOp }[] = [
@@ -47,14 +67,13 @@ export function parseQuery(input: string): TaskQuery {
   const textParts: string[] = [];
 
   for (const tok of tokenize(input)) {
-    // A quoted bare token, or one with no colon, is free text.
-    const colon = tok.quoted ? -1 : tok.text.indexOf(':');
-    if (colon < 0) {
+    // A quoted bare token, or one with no `key:` prefix, is free text.
+    if (tok.key === undefined) {
       if (tok.text) textParts.push(tok.text);
       continue;
     }
-    let key = tok.text.slice(0, colon);
-    let rest = tok.text.slice(colon + 1);
+    let key = tok.key;
+    let rest = tok.value!;
     let negate = false;
     if (key.startsWith('-')) { negate = true; key = key.slice(1); }
     if (key.startsWith('!')) { negate = true; key = key.slice(1); }
@@ -71,11 +90,14 @@ export function parseQuery(input: string): TaskQuery {
     }
 
     // comparison op prefix on the value (number/date), else default per field type.
+    // A quote-led value is literal — no op sniffing inside it.
     let op: FilterOp = field.type === 'text' ? 'contains' : 'is';
-    for (const { p, op: o } of OP_PREFIX) {
-      if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
+    if (!rest.startsWith('"')) {
+      for (const { p, op: o } of OP_PREFIX) {
+        if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
+      }
     }
-    const values = rest.split(',').map((s) => s.trim()).filter(Boolean);
+    const values = splitValues(rest);
     if (values.length) filters.push({ field: field.key, op, values, ...(negate ? { negate: true } : {}) });
   }
 
