@@ -1884,11 +1884,11 @@ function renderMain() {
 // ── tasks ────────────────────────────────────────────────────────────────────
 // Client-side twin of the authoritative `matchText` in src/domain/search.ts — the
 // pre-server fallback while the first evaluation is in flight. Keep the two in
-// sync: token-AND over title / notes / #num, so "login fix" matches "fix login".
+// sync: token-AND over title / notes / prompt / #num, so "login fix" matches "fix login".
 function taskMatches(t, q) {
   const s = (q || '').toLowerCase().trim();
   if (!s) return true;
-  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
+  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${(t.params?.prompt || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 

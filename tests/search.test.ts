@@ -126,11 +126,13 @@ describe('evaluateQuery — filtering', () => {
   });
 });
 
-describe('evaluateQuery — free text (token-AND over title/notes/#num)', () => {
+describe('evaluateQuery — free text (token-AND over title/notes/prompt/#num)', () => {
   const tasks: SearchTask[] = [
     task({ title: 'Fix login bug', num: 1, notes: 'affects the web client' }),
     task({ title: 'Add login rate limit', num: 2 }),
     task({ title: 'Refactor auth', num: 3 }),
+    // A boilerplate preamble becomes the title; the real subject lives only in the prompt.
+    task({ title: '[STANDING INSTRUCTION. My requests are APPROXIMATE…', num: 4, params: { prompt: '[STANDING INSTRUCTION…]\n\nkarmax needs a wiki system for agent skills' } }),
   ];
   const ctx = { now: NOW, tags: [] as Tag[] };
 
@@ -148,6 +150,17 @@ describe('evaluateQuery — free text (token-AND over title/notes/#num)', () => 
 
   it('matches the task number as a term', () => {
     expect(evaluateQuery(tasks, parseQuery('#3'), ctx).tasks.map((t) => t.num)).toEqual([3]);
+  });
+
+  it('matches words that appear only in the prompt (titles are just its first line)', () => {
+    expect(evaluateQuery(tasks, parseQuery('wiki'), ctx).tasks.map((t) => t.num)).toEqual([4]);
+    // terms may straddle title and prompt
+    expect(evaluateQuery(tasks, parseQuery('standing wiki'), ctx).tasks.map((t) => t.num)).toEqual([4]);
+  });
+
+  it('supports an explicit prompt: filter distinct from title', () => {
+    expect(evaluateQuery(tasks, parseQuery('prompt:wiki'), ctx).tasks.map((t) => t.num)).toEqual([4]);
+    expect(evaluateQuery(tasks, parseQuery('-prompt:wiki login'), ctx).tasks.map((t) => t.num).sort()).toEqual([1, 2]);
   });
 });
 

@@ -210,6 +210,7 @@ export const FIELDS: FieldDef[] = [
   { key: 'created', label: 'Created', type: 'date', get: (t) => t.createdAt, sortable: true, sortKey: (t) => t.createdAt ?? 0 },
   { key: 'updated', label: 'Updated', type: 'date', get: (t) => t.lastView?.updatedAt, sortable: true, sortKey: (t) => t.lastView?.updatedAt ?? t.createdAt ?? 0 },
   { key: 'notes', label: 'Notes', type: 'text', get: (t) => t.notes },
+  { key: 'prompt', label: 'Prompt', type: 'text', get: (t) => (t.params?.prompt == null ? undefined : String(t.params.prompt)) },
   { key: 'branch', label: 'Branch', type: 'text', get: (t) => t.lastView?.branch },
   { key: 'target', label: 'Target', type: 'text', aliases: ['targetBranch'], get: (t) => t.lastView?.targetBranch },
   { key: 'parent', label: 'Parent', type: 'text', get: (t) => t.parentTaskId },
@@ -442,11 +443,13 @@ function matchDate(ts: number, op: FilterClause['op'], val: DateVal, now: number
 // console has a client-side twin, `taskMatches` in web/app.js, used as the pre-server
 // fallback AND by the fork-from picker — keep the two behaviours in sync when editing.
 // Semantics: token-AND — every whitespace-separated term must appear somewhere in the
-// task's title, notes, or `#num` (order-independent), so "login fix" matches "fix login".
+// task's title, notes, prompt, or `#num` (order-independent), so "login fix" matches
+// "fix login". The prompt is included because titles are just the prompt's first line —
+// a task whose prompt opens with a boilerplate preamble is otherwise unfindable.
 function matchText(t: SearchTask, q: string): boolean {
   const needle = q.toLowerCase().trim();
   if (!needle) return true;
-  const hay = `${lc(t.title)} ${lc(t.notes)} ${t.num != null ? '#' + t.num : ''}`;
+  const hay = `${lc(t.title)} ${lc(t.notes)} ${lc(t.params?.prompt)} ${t.num != null ? '#' + t.num : ''}`;
   return needle.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
