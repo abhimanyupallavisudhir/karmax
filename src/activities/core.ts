@@ -18,7 +18,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
-import { worldRepos } from '../world/types.js';
+import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
@@ -316,8 +316,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const linked = projectId ? store.listProjectRepositories(projectId) : [];
     if (project?.organizationId && linked.length && deps.githubApp) {
       return async (worldRepo) => {
-        const repository = linked.find((candidate) => candidate.repository.sshUrl === worldRepo.repo)?.repository;
-        if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${worldRepo.repo}`);
+        const source = worldRepoSource(worldRepo);
+        const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository;
+        if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${source}`);
         return deps.githubApp!.brokerCredentials(repository);
       };
     }
@@ -364,9 +365,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` });
       }
       try {
-        gitCredentials = profile && remote ? gitProfiles.worldCredentials(profile, { taskId: args.taskId }) : undefined;
+        gitCredentials = profile ? gitProfiles.worldCredentials(profile, { taskId: args.taskId }) : undefined;
       } catch (e) {
-        record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" cloud credentials: ${e instanceof Error ? e.message : e}` });
+        record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` });
       }
       const requestedSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
       const cloudSources = remote ? await Promise.all(requestedSources.map((source) => cloudGitSource(source))) : [];
@@ -377,24 +378,31 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             localPath: cloudSources[i]!.localPath, remote: cloudSources[i]!.source,
           });
       }
-      const linkedRepositories = args.projectId ? store.listProjectRepositories(args.projectId) : [];
+      // Older/local workflow histories do not pass projectId into createWorld;
+      // the durable task record is the compatibility source for repository
+      // enrollment, credentials, and world ownership.
+      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
+      const linkedRepositories = projectId ? store.listProjectRepositories(projectId) : [];
       const repositoryBranches = Object.fromEntries(linkedRepositories.map((candidate) => {
         const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
         return [candidate.repository.sshUrl, { base, target: candidate.targetBranch ?? base }];
       }));
-      if (remote && linkedRepositories.length) {
-        if (!deps.githubApp) throw new Error('hosted repositories require the configured GitHub App');
+      if (linkedRepositories.length) {
+        if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const credentials: Record<string, string> = {};
         for (const source of worldSources) {
           const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
-          if (!linked) throw new Error(`repository ${source} is not enrolled in this project`);
-          credentials[source] = deps.githubApp.repositorySshKey(linked.repository.id, 'clone');
+          if (!linked) {
+            if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
+            continue;
+          }
+          if (deps.githubApp) credentials[source] = deps.githubApp.repositorySshKey(linked.repository.id, 'clone');
         }
-        // Repository-scoped read-only keys completely replace personal/profile
-        // SSH material for a hosted project.
-        gitCredentials = { repositories: credentials };
+        // Repository-scoped read-only keys take precedence for enrolled
+        // sources. Local managed clones use the same ephemeral provisioning
+        // credential without persisting it.
+        if (Object.keys(credentials).length) gitCredentials = { ...gitCredentials, repositories: credentials };
       }
-      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
       const project = projectId ? store.getProject(projectId) : undefined;
       const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
@@ -428,7 +436,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       try {
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
-        if (args.projectId) world.handle.meta = { ...world.handle.meta, projectId: args.projectId,
+        if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
           repositoryIds: linkedRepositories.map((candidate) => candidate.repository.id) };
         if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
         if (projectId) {

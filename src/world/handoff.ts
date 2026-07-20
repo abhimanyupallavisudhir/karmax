@@ -1,7 +1,7 @@
 import type { Store } from '../store/db.js';
 import type { TaskView } from '../domain/types.js';
 import type { WorldHandle } from './types.js';
-import { worldRepos } from './types.js';
+import { worldRepos, worldRepoSource } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import type { RunnerPoolService } from './runners.js';
 import type { GitHubAppService } from '../integrations/github-app.js';
@@ -41,7 +41,7 @@ export class WorldHandoffService {
     const linked = this.store.listProjectRepositories(project.id);
     if (!linked.length) throw new Error('project has no GitHub repositories');
     const handleRepos = new Map(worldRepos(handle ?? ({ id: taskId, kind: 'unknown', root: '.', branch,
-      base: task.lastView?.base ?? 'main' } as WorldHandle)).map((repo) => [repo.repo, repo]));
+      base: task.lastView?.base ?? 'main' } as WorldHandle)).map((repo) => [worldRepoSource(repo), repo]));
     const repositories = linked.map((entry) => {
       const inWorld = handleRepos.get(entry.repository.sshUrl);
       const base = inWorld?.base ?? entry.baseBranch ?? entry.repository.defaultBranch;

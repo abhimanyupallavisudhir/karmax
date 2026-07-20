@@ -27,6 +27,9 @@ export interface WorldRepo {
   name: string;
   /** Absolute source repo path (the origin the worktree branches off). */
   repo: string;
+  /** Configured network source when `repo` is a managed local checkout. Remote
+   *  providers keep the URL directly in `repo`, so this is normally absent. */
+  source?: string;
   /** Absolute worktree path (where this repo is checked out in the world). */
   root: string;
   /** The branch work happens on in this repo. */
@@ -123,6 +126,13 @@ export function worldRepos(handle: WorldHandle): WorldRepo[] {
       branch: handle.branch, base: handle.base, target: handle.target }];
   }
   return [];
+}
+
+/** Stable configured identity for enrollment/checkpoint lookups. Local
+ * worktrees created from URLs branch from a managed checkout, but must retain
+ * the URL selected in project Settings. */
+export function worldRepoSource(repo: WorldRepo): string {
+  return repo.source ?? repo.repo;
 }
 
 export interface ExecResult {
