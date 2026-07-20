@@ -46,6 +46,7 @@ export interface E2BSandboxLike {
   };
   pause(): Promise<unknown>;
   kill(): Promise<unknown>;
+  updateNetwork(network: { allowInternetAccess?: boolean; allowOut?: string[]; denyOut?: string[] }): Promise<unknown>;
   setTimeout?(timeoutMs: number): Promise<unknown>;
   getInfo?(): Promise<{ state?: string }>;
   stream?: {
@@ -58,7 +59,7 @@ export interface E2BSandboxLike {
 export interface E2BFactory {
   create(options: { template?: string; desktop?: boolean; apiKey?: string; timeoutMs: number; lifecycle: { onTimeout: 'pause'; autoResume: true };
     metadata: Record<string, string>; allowInternetAccess?: boolean;
-    network?: { allowOut: string[]; denyOut: string[]; allowPublicTraffic: false } }): Promise<E2BSandboxLike>;
+    network?: { allowOut?: string[]; denyOut?: string[]; allowPublicTraffic: false } }): Promise<E2BSandboxLike>;
   connect(id: string, options: { timeoutMs: number; apiKey?: string; desktop?: boolean }): Promise<E2BSandboxLike>;
   /** Control-plane state lookup that must not resume a paused sandbox; absent
    * (or undefined result) means the provider cannot answer cheaply. */
@@ -96,6 +97,7 @@ export class E2BWorldProvider implements WorldProvider {
     const selectedTemplate = flavor === 'desktop'
       ? spec.environment?.template ?? spec.environment?.snapshot ?? connection?.config.desktopTemplate ?? this.desktopTemplate
       : spec.environment?.template ?? spec.environment?.snapshot ?? spec.environment?.image ?? connection?.config.template ?? this.template;
+    const taskNetwork = e2bNetwork(spec);
     const sandbox = await this.factory.create({
       ...(selectedTemplate ? { template: selectedTemplate } : {}),
       ...(flavor === 'desktop' ? { desktop: true } : {}),
@@ -103,7 +105,11 @@ export class E2BWorldProvider implements WorldProvider {
       timeoutMs: this.idleMs,
       lifecycle: { onTimeout: 'pause', autoResume: true },
       metadata: { karmaxTaskId: spec.taskId },
-      ...e2bNetwork(spec),
+      // Git provisioning is trusted host work and may require protocols (most
+      // notably GitHub SSH) that E2B's domain allowlist proxy resets even when
+      // the host is explicitly allowed. No task code runs in this phase. The
+      // final task policy is installed atomically below before the World escapes.
+      allowInternetAccess: true,
     });
     this.sandboxes.set(sandbox.sandboxId, sandbox);
     this.states.set(sandbox.sandboxId, 'ready');
@@ -119,6 +125,12 @@ export class E2BWorldProvider implements WorldProvider {
       // execution environment gets a read/write checkout but no reusable secret;
       // pushes and merges go through the host-side Git broker.
       await provisionRun(provisioner, 'rm -f /home/user/.ssh/karmax-auth*');
+      if (taskNetwork.network) {
+        await sandbox.updateNetwork({
+          allowOut: taskNetwork.network.allowOut,
+          denyOut: taskNetwork.network.denyOut,
+        });
+      }
       const handle: WorldHandle = {
         version: 2,
         kind: 'e2b',
@@ -471,9 +483,24 @@ class E2BWorld implements World {
 function provisionTarget(sandbox: E2BSandboxLike): ProvisionTarget {
   return {
     async run(command, timeoutMs) {
-      const result = await sandbox.commands.run(command, { timeoutMs });
-      return { stdout: String(result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
-        code: Number(result?.exitCode ?? result?.code ?? 0) };
+      try {
+        const result = await sandbox.commands.run(command, { timeoutMs });
+        return { stdout: String(result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
+          code: Number(result?.exitCode ?? result?.code ?? 0) };
+      } catch (error) {
+        // E2B throws CommandExitError for ordinary non-zero exits. Its generic
+        // Error.message is only "exit status N", while the useful Git/compiler
+        // diagnosis remains on stdout/stderr. Normalize that expected shape so
+        // runOrThrow can surface the captured output just like every other world.
+        const failed = error as { exitCode?: unknown; code?: unknown; stdout?: unknown; stderr?: unknown };
+        const code = Number(failed.exitCode ?? failed.code);
+        if (Number.isFinite(code)) return {
+          stdout: String(failed.stdout ?? ''),
+          stderr: String(failed.stderr ?? ''),
+          code,
+        };
+        throw error;
+      }
     },
     async writeFile(remotePath, content) { await sandbox.files.write(remotePath, content); },
   };
