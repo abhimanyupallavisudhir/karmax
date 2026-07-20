@@ -130,7 +130,7 @@ Each workflow lives in its own git repo under `~/.karmax/workflows/<name>/`:
 - `requires: [...]` — other workflows this one depends on (e.g. software-dev `requires: ['merge-queue']`). Activating a workflow activates the transitive closure.
 - `events: {...}` — the typed event types this workflow emits, each with a schema (§5).
 - `capabilities: [...]` — capabilities this workflow's agents may need (the ceiling; §8).
-- `onActivate` — an optional hook run when the workflow is added to a project (§4.6).
+- `onActivate` — an optional preparation task the workflow contributes; the default workflow's runs automatically when a project is created (§4.6).
 - `ui: [...]` — slot contributions (§10).
 - `commands: [...]` — command/keybinding registrations (§10).
 
@@ -162,7 +162,7 @@ Finite task workflows rarely need in-flight migration — let running tasks drai
 Two manifest mechanisms, kept deliberately minimal:
 
 - `requires` — declared workflow dependencies, resolved transitively on activation.
-- `onActivate` — when a workflow is added to a project, it may spawn a **task** (run by an agent) to prepare the project. For software-dev this spawns a "make this project karmax-ready" task: ensure git is initialized in each repo; for brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees, and fix them.
+- `onActivate` — a workflow may declare a **task** (run by an agent) to prepare a project for it. A new project's tasks default to the software-dev workflow, so on project creation karmax automatically seeds software-dev's prep task — "make this project karmax-ready": ensure git is initialized in each repo; for brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees, and fix them. It's seeded as a **draft** (a project is usually named before its repo is set, and a repo-oriented task can't run without one), so it waits on the list for the user to queue once the repository is configured. (There is no separate "activate a workflow on a project" step — a task selects its workflow directly.)
 
 **Design note.** The bootstrap is *itself a karmax task*, which is the philosophy applied to the system's own setup. Do not generalize this into a large lifecycle-event framework; `requires` plus `onActivate` (and optionally `onDeactivate` later) is sufficient.
 

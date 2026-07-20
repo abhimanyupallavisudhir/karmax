@@ -131,7 +131,6 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/(tags|views)\//.test(p)) return read ? 'task:read' : 'task:edit';
-  if (/^\/api\/projects\/[^/]+\/activate-workflow$/.test(p)) return 'workflow:install';
   if (/^\/api\/projects\/[^/]+\/workflow-pins$/.test(p)) return read ? 'workflow:read' : 'workflow:edit';
   if (/^\/api\/projects\/[^/]+\/propose-workflow-edit$/.test(p)) return 'workflow:edit';
   if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
@@ -1107,6 +1106,7 @@ export class Gateway {
           const b = await this.body(req);
           const project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
           if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
+          await this.spawnProjectPrepTask(token, project.id);
           return this.json(res, 200, project);
         }
       }
@@ -1337,7 +1337,9 @@ export class Gateway {
         if (this.deps.hosted)
           return this.json(res, 400, { error: 'hosted projects must be created inside an organization' });
         const b = await this.body(req);
-        return this.json(res, 200, store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true)));
+        const project = store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true));
+        await this.spawnProjectPrepTask(token, project.id);
+        return this.json(res, 200, project);
       }
       const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
       if (projMatch) {
@@ -1498,12 +1500,6 @@ export class Gateway {
           const task = await api.createTask(token, { projectId, ...b });
           return this.json(res, 200, task);
         }
-      }
-      const activateMatch = p.match(/^\/api\/projects\/([^/]+)\/activate-workflow$/);
-      if (activateMatch && method === 'POST') {
-        const projectId = activateMatch[1]!;
-        const b = await this.body(req);
-        return this.json(res, 200, await this.activateWorkflow(token, projectId, b.workflow));
       }
 
       // ── search / organization (a view is a saved query — PLAN-search-views) ──
@@ -2609,20 +2605,30 @@ export class Gateway {
     }
   }
 
-  private async activateWorkflow(token: string, projectId: string, workflow: string) {
-    const m = manifest(workflow);
-    const spawned: string[] = [];
-    if (m?.onActivate?.spawnTask) {
-      const t = m.onActivate.spawnTask;
-      const task = await this.deps.api.createTask(token, {
+  /**
+   * Seed a brand-new project with its preparation task (SPEC §4.6). A new project's
+   * tasks default to the `software-dev` workflow, so we seed that workflow's
+   * `onActivate` prep task — "make this project karmax-ready" — as the first task on
+   * the list. It's created as a **draft**: a project is usually created (name only)
+   * before its repository is configured, and a repo-oriented task can't run without
+   * one — so the prep task waits on the list for the user to queue once the repo is
+   * set, rather than failing creation or running against an empty sandbox.
+   * Best-effort: a failure here must never fail project creation.
+   */
+  private async spawnProjectPrepTask(token: string, projectId: string): Promise<void> {
+    const prep = manifest('software-dev')?.onActivate?.spawnTask;
+    if (!prep) return;
+    try {
+      await this.deps.api.createTask(token, {
         projectId,
-        title: t.title,
-        prompt: t.prompt,
-        workflow: t.workflow,
+        title: prep.title,
+        prompt: prep.prompt,
+        workflow: prep.workflow,
+        draft: true,
       });
-      spawned.push(task.id);
+    } catch (error) {
+      console.warn(`[karmax] could not spawn prep task for ${projectId}:`, error instanceof Error ? error.message : error);
     }
-    return { activated: workflow, requires: m?.requires ?? [], spawnedTasks: spawned };
   }
 
   private async availableModels(refresh = false): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
