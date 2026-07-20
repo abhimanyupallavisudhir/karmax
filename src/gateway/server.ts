@@ -97,6 +97,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
+  // The wiki is the skills store: reads need the scope's read capability, edits
+  // reuse skill:write (agents and developers can both grow it).
+  if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
+  if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
@@ -2146,6 +2150,39 @@ export class Gateway {
         await api.moveAgentQueueItem(token, String(b.turnId), b.beforeTurnId ? String(b.beforeTurnId) : undefined);
         return this.json(res, 200, { ok: true });
       }
+      // Wiki — org/project skills, memories, and general prompts. One route
+      // family per scope; KarmaxApi enforces read/write capabilities and path
+      // safety, so the wiki works identically for humans (UI) and agents
+      // (read_wiki/search_wiki/platform_request, including from cloud worlds).
+      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search))?$/);
+      if (wikiMatch) {
+        const scope = wikiMatch[1] === 'projects' ? ('project' as const) : ('organization' as const);
+        const id = wikiMatch[2]!;
+        const sub = wikiMatch[3];
+        try {
+          if (!sub && method === 'GET') return this.json(res, 200, api.readWiki(token, scope, id, url.searchParams.get('path') ?? ''));
+          if (sub === 'page') {
+            if (method === 'GET') {
+              const read = api.readWiki(token, scope, id, String(url.searchParams.get('path') ?? ''));
+              return 'page' in read ? this.json(res, 200, read.page) : this.json(res, 404, { error: 'wiki page not found' });
+            }
+            if (method === 'PUT') {
+              const b = await this.body(req);
+              return this.json(res, 200, api.saveWikiPage(token, scope, id, {
+                path: String(b.path ?? ''), content: String(b.content ?? ''), kind: b.kind === 'memory' ? 'memory' : 'skill',
+                create: b.create === true, prevPath: b.prevPath ? String(b.prevPath) : undefined,
+              }));
+            }
+            if (method === 'DELETE') return this.json(res, 200, api.deleteWikiPage(token, scope, id, String(url.searchParams.get('path') ?? '')));
+          }
+          if (sub === 'search' && method === 'GET') return this.json(res, 200, api.searchWiki(token, scope, id, String(url.searchParams.get('q') ?? '')));
+        } catch (error) {
+          if (error instanceof CapabilityError) throw error;
+          const conflict = /already exists/.test(String((error as Error)?.message));
+          return this.json(res, conflict ? 409 : 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
       // platform API surface used by the MCP server (save skill / propose edit)
       if (p === '/api/skills' && method === 'POST') {
         const b = await this.body(req);
@@ -2488,8 +2525,16 @@ export class Gateway {
         const gs = (s: string, w: string) => store.getSettings(s, w);
         const project = store.getProject(projectId);
         const organizationId = url.searchParams.get('organizationId') ?? project?.organizationId;
-        const globalVals = globalSettingsFor(gs, wf, organizationId ?? undefined);
-        const projectVals = project ? projectSettingsFor(gs, project, wf) : {};
+        const globalVals = { ...globalSettingsFor(gs, wf, organizationId ?? undefined) };
+        const projectVals = project ? { ...projectSettingsFor(gs, project, wf) } : {};
+        // "Agent environment" (worldProvider) is stored in the execution policy, not
+        // the settings rows — surface the real organization default + project override
+        // so the Task Defaults form shows and inherits the true selection (§11).
+        if (organizationId && globalVals.worldProvider === undefined) {
+          const orgProvider = store.getOrganizationExecutionPolicy(organizationId).worldProvider;
+          if (orgProvider !== undefined) globalVals.worldProvider = orgProvider;
+        }
+        if (project?.config.worldProvider !== undefined) projectVals.worldProvider = project.config.worldProvider;
         // Detect the repo's real default branch so placeholders show it (not "main").
         const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
         const db = repo0 ? await defaultBranch(repo0).catch(() => undefined) : undefined;
@@ -2525,7 +2570,14 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
         if (method === 'PUT') {
           const b = await this.body(req);
-          store.setSettings(`organization:${organizationId}`, wf!, b.values ?? {});
+          const values = b.values ?? {};
+          store.setSettings(`organization:${organizationId}`, wf!, values);
+          // The organization "Agent environment" default lives in the execution
+          // policy (so runner-pool compatibility and effectiveProjectConfig agree);
+          // mirror a non-empty selection there. Blank at organization scope means
+          // "unchanged" — the top-level default is always a concrete provider.
+          if (values.worldProvider)
+            store.setOrganizationExecutionPolicy(organizationId!, { worldProvider: values.worldProvider as string });
           return this.json(res, 200, { ok: true });
         }
       }
@@ -2569,6 +2621,11 @@ export class Gateway {
           // Mirror bound-project fields into ProjectConfig for back-compat.
           const m = manifest(wf);
           if (m) store.updateProjectConfig(projectId, settingsToProjectConfig(m, values));
+          // "Agent environment" is canonically an execution-policy value; mirror it so
+          // effectiveProjectConfig, runner-pool compatibility, and the Compute section
+          // stay coherent (empty ⇒ clear the override and inherit the organization).
+          if (Object.prototype.hasOwnProperty.call(values, 'worldProvider'))
+            store.setProjectExecutionPolicy(projectId, { worldProvider: (values.worldProvider as string) || null });
           return this.json(res, 200, { ok: true });
         }
       }

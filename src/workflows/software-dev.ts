@@ -549,6 +549,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
 
   // ── Resolve wrapper (SPEC §5.2) ──
   async function withResolve<T>(stageName: string, fn: () => Promise<T>): Promise<T> {
+    // Usually identical to stageName, except the Confirm agent runs inside the
+    // public Review stage. Preserve the actual UI stage for a later human retry.
+    const resumeStage = stage;
     let lastError = '';
     for (;;) {
       let attempt = 0;
@@ -696,6 +699,12 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       await condition(() => retryRequested || cancelled);
       waitingFor = undefined;
       if (cancelled) throw new Cancelled();
+      // A human/parent retry resumes the stage that failed. Leaving this as
+      // `escalated` made the live view claim the task was still escalated while
+      // its replacement agent turn was already running (task #240). This is a
+      // pure state correction before the existing next publish/activity, so it
+      // does not insert a new Temporal command into historical workflow replay.
+      stage = resumeStage;
       status = 'active';
       error = undefined;
     }
@@ -1523,6 +1532,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     await condition(() => retryRequested || cancelled);
     waitingFor = undefined;
     if (cancelled) return await abort();
+    stage = 'merge';
+    status = 'active';
     error = undefined;
     mergeAttempts = 0; // a human/parent retry grants a fresh loop-back budget
   }

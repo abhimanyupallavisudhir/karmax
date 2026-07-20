@@ -60,6 +60,25 @@ const gitProfileField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
+// "Agent environment" (SPEC §11) — the world backend a task's agent runs in: a
+// local git worktree/container or a remote sandbox (E2B/Daytona). Canonical
+// storage remains the execution policy (ProjectConfig.worldProvider / the
+// organization policy); this field exposes it as an ordinary task default AND a
+// per-task override, so a single task can pick a different environment without a
+// project-wide change. `bind:'project'` lands the resolved value on
+// `input.project.worldProvider`, which every world-creating workflow already
+// reads. Options are filled in by the client from the organization's connected
+// providers; an empty value ⇒ inherit the project / organization default. It is
+// frozen once the task starts (default `queue`): the world is provisioned at
+// setup and can't be swapped mid-flight.
+const agentEnvironmentField = (): FieldSpec => ({
+  name: 'worldProvider',
+  type: 'select',
+  label: 'Agent environment',
+  options: [''],
+  scopes: ALL,
+  bind: 'project',
+});
 
 export interface EventSchemaDecl {
   type: string;
@@ -330,6 +349,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       agentField('do', 'Do agent', 'always'),
       baseField(),
       targetField(),
+      agentEnvironmentField(),
       reposField(),
       copyGlobsField(),
       remoteField(),
@@ -364,7 +384,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), agentEnvironmentField(), reposField(), confirmerField()],
   },
   {
     name: 'script-exec',
@@ -384,6 +404,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     params: [
       { name: 'command', type: 'text', label: 'Command', required: true, scopes: ['task'], bind: 'top', placeholder: 'npm test' },
+      agentEnvironmentField(),
       reposField(),
     ],
   },
@@ -399,7 +420,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Merge/Review machinery.
     roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), remoteField(), gitProfileField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), gitProfileField(), confirmerField()],
   },
   {
     name: 'merge-only',
@@ -421,6 +442,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     params: [
       { name: 'branch', type: 'branch', label: 'Branch to merge', required: true, scopes: ['task'], bind: 'top' },
       targetField(),
+      agentEnvironmentField(),
       reposField(),
       agentField('merge', 'Merge agent'),
       confirmerField(),

@@ -10,7 +10,13 @@ import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
-import { ProviderFailure, providerErrorFromMessage } from './limits.js';
+import {
+  ProviderFailure,
+  classifyLimitError,
+  isTransportError,
+  providerErrorFromMessage,
+  providerFailure,
+} from './limits.js';
 import { spawn } from 'node:child_process';
 import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
@@ -504,6 +510,55 @@ export class ClaudeAdapter implements AgentAdapter {
             .filter((b: any) => b.type === 'text')
             .map((b: any) => b.text)
             .join('\n');
+          // Claude Code exposes provider failures on the assistant frame itself.
+          // In task #183 a session limit arrived as `error: rate_limit`, followed by
+          // a misleading SDK result (`subtype: success`, `is_error: true`,
+          // `errors: ['completed']`). Waiting for that result erased the only useful
+          // signal and routed the task to human escalation. Preserve the structured
+          // error here, before the generic terminal-result handling can flatten it.
+          const assistantError = (message as any).error ?? (message as any).message?.error;
+          if (assistantError === 'rate_limit') {
+            const cls = classifyLimitError(text, { providerOrigin: true });
+            throw providerFailure(text || 'Claude usage limit reached', {
+              kind: 'quota',
+              permanence: 'transient',
+              provider: 'claude',
+              source: 'structured',
+              window: cls.window ?? '5h',
+              ...(cls.resetHint ? { resetHint: cls.resetHint } : {}),
+              ...(cls.note ? { note: cls.note } : {}),
+            });
+          }
+          if (assistantError === 'authentication_failed' || assistantError === 'oauth_org_not_allowed') {
+            throw providerFailure(text || `Claude credential rejected (${assistantError})`, {
+              kind: 'credential', permanence: 'hard', provider: 'claude', source: 'structured',
+            });
+          }
+          if (assistantError === 'billing_error') {
+            throw providerFailure(text || 'Claude billing account is unavailable', {
+              kind: 'quota', permanence: 'hard', provider: 'claude', source: 'structured',
+            });
+          }
+          if (assistantError === 'overloaded' || assistantError === 'server_error') {
+            throw new Error(`Claude provider ${assistantError}: ${text || 'temporarily unavailable'}`);
+          }
+          if (assistantError === 'max_output_tokens') {
+            // The response was cut at a mechanical output boundary. Retrying the
+            // activity resumes the same provider session, so the agent continues
+            // rather than asking a human to diagnose a token counter.
+            throw new Error(`turn interrupted before completion: Claude reached max_output_tokens${text ? ` · ${text}` : ''}`);
+          }
+          // Claude Code sometimes carries the only real failure in a text block,
+          // then emits the same misleading `success` / `completed` result envelope
+          // seen with structured limits. Task #240 was exactly this shape:
+          // "API Error: Connection closed mid-response" followed by a nominally
+          // successful result. Preserve recognized transport failures before that
+          // terminal frame can erase them. Requiring both the provider's API-error
+          // prefix and our conservative transport classifier avoids treating an
+          // agent merely discussing a connection error as a failed turn.
+          if (/^\s*API Error:/i.test(text) && isTransportError(text)) {
+            throw new Error(`Claude provider transport interruption: ${text}`);
+          }
           if (text) {
             finalText = text;
             ctx.emit(text);
@@ -551,6 +606,22 @@ export class ClaudeAdapter implements AgentAdapter {
               phase: block.is_error ? 'failed' : 'completed',
               title: prior?.title ?? (block.is_error ? 'Tool failed' : 'Tool completed'),
               ...(detail ? { detail } : {}),
+            });
+          }
+        } else if (message.type === 'rate_limit_event') {
+          const info = (message as any).rate_limit_info;
+          if (info?.status === 'rejected' || info?.overageStatus === 'rejected') {
+            const kind = String(info.rateLimitType ?? 'five_hour');
+            const window = kind === 'five_hour' || kind === 'overage'
+              ? '5h'
+              : /^seven_day_(?:opus|sonnet)$/.test(kind) ? 'model' : 'weekly';
+            const reset = Number(info.resetsAt);
+            const resetMs = Number.isFinite(reset) ? (reset < 1_000_000_000_000 ? reset * 1000 : reset) : 0;
+            const seconds = resetMs > Date.now() ? Math.ceil((resetMs - Date.now()) / 1000) : 0;
+            throw providerFailure('Claude usage limit reached', {
+              kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window,
+              ...(seconds ? { resetHint: `in ${seconds}s` } : {}),
+              ...(window === 'model' ? { note: kind.replace(/^seven_day_/, '') } : {}),
             });
           }
         } else if (message.type === 'tool_progress') {

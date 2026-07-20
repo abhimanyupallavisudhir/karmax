@@ -24,6 +24,8 @@ export interface PlatformOps {
   signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
+  readWiki(scope: 'organization' | 'project', id: string, path?: string): Promise<unknown>;
+  searchWiki(scope: 'organization' | 'project', id: string, query: string): Promise<unknown>;
   proposeWorkflowEdit(a: { projectId: string; title: string; repo: string; branch: string; target: string }): Promise<{ id: string }>;
   findTask(projectId: string, num: number): Promise<unknown>;
   listAgents(taskId: string): Promise<unknown>;
@@ -110,6 +112,8 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     signalTask: async (id, sig, text, role) => void (await api.signalTask(getToken(), id, sig as any, text, role)),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
+    readWiki: async (scope, id, path) => api.readWiki(getToken(), scope, id, path ?? ''),
+    searchWiki: async (scope, id, query) => api.searchWiki(getToken(), scope, id, query),
     proposeWorkflowEdit: (a) => api.proposeWorkflowEdit(getToken(), a),
     findTask: (pid, num) => api.findTask(getToken(), pid, num),
     listAgents: (id) => api.listTaskAgents(getToken(), id),
@@ -177,6 +181,8 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     signalTask: async (id, signal, text, role) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role }) })),
     reorderQueue: async (domain, taskId) => void (await req(`/api/queue/prioritize`, { method: 'POST', body: JSON.stringify({ domain, taskId }) })),
     saveSkill: (a) => req(`/api/skills`, { method: 'POST', body: JSON.stringify(a) }),
+    readWiki: (scope, id, path) => req(`/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/wiki?path=${encodeURIComponent(path ?? '')}`),
+    searchWiki: (scope, id, query) => req(`/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/wiki/search?q=${encodeURIComponent(query)}`),
     proposeWorkflowEdit: (a) => req(`/api/projects/${a.projectId}/propose-workflow-edit`, { method: 'POST', body: JSON.stringify(a) }) as Promise<{ id: string }>,
     findTask: (pid, num) => req(`/api/projects/${pid}/tasks/by-num/${num}`),
     listAgents: (id) => req(`/api/tasks/${id}/agents`),
@@ -384,6 +390,23 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', { description: 'Save a reusable skill (markdown) for future tasks.', inputSchema: { name: z.string(), content: z.string() } }, async (a) => wrap(() => ops.saveSkill(a)));
+  server.registerTool(
+    'read_wiki',
+    {
+      description:
+        'Navigate an organization or project wiki (skills, memories, prompts). No path → the full table of contents (this also expands any [more…] fold); a section path → that section listed in full; a skill/memory path → its complete markdown plus attached files. Your prompt names the scope ids that apply to your task.',
+      inputSchema: { scope: z.enum(['organization', 'project']), id: z.string(), path: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.readWiki(a.scope, a.id, a.path)),
+  );
+  server.registerTool(
+    'search_wiki',
+    {
+      description: 'Grep every page of an organization or project wiki with a case-insensitive regular expression; returns file:line matches. Works from any world, including cloud sandboxes.',
+      inputSchema: { scope: z.enum(['organization', 'project']), id: z.string(), query: z.string() },
+    },
+    async (a) => wrap(() => ops.searchWiki(a.scope, a.id, a.query)),
+  );
   server.registerTool(
     'propose_workflow_edit',
     { description: 'Propose an edit to a workflow repo through the reviewed merge-only PR gate.', inputSchema: { projectId: z.string(), title: z.string(), repo: z.string(), branch: z.string(), target: z.string() } },

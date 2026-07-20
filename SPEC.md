@@ -151,6 +151,8 @@ This PR gate is **the single most important safety boundary in the system**: age
 
 > **Rule of thumb: content the agent reads is free to edit; code that auto-runs is gated.**
 
+**The wiki is that content system's home.** Each organization and each project owns a wiki under `~/.karmax/content/wiki/<scope>/<id>/` — skills, memories, and prompts are all the same thing to the system. An entry is a **folder** holding a `SKILL.md` or `MEMORY.md` in the standard Agent Skills format (YAML frontmatter, then markdown); the folder name is its title, any other files (scripts, images, even further md files) ride along without becoming entries, and folders without a page file are sections that nest the tree. Frontmatter carries `name`/`description` plus two delivery controls: `delivery: unconditional | indexed` (default indexed) and `importance: <number>` (default 0). An *indexed* entry appears in the **table of contents** agents receive; an *unconditional* entry's full body is sent with every prompt — a scope's "general prompt" is simply an unconditional entry, and the built-in karmax working instructions ship as a bundled default at `@builtin/how-to-work` — an on-disk entry at that exact path is its editable override (the §9 overlay model: editing customizes, deleting the override restores the default; the rest of the `@` namespace stays reserved and built-in identities never rename). Every agent turn receives, in order: the built-in instructions, then per scope (organization, then project) its unconditional entries in full followed by the indexed TOC (names + descriptions only, expanded to every leaf, siblings ordered by importance). When a TOC's estimated tokens exceed 20k, each penultimate list of ≥10 entries keeps its 9 most important and folds the rest behind a `[more…]` link naming the exact expansion call. Agents navigate with `read_wiki` (TOC / section / full page) and grep with `search_wiki`; both are gateway-backed platform tools that run host-side, so they work identically from local worktrees and cloud sandboxes. Reads need the scope's read capability; writes reuse `skill:write` (the wiki *is* the skills store).
+
 ### 4.5 Versioning and in-flight changes
 
 Finite task workflows rarely need in-flight migration — let running tasks drain on their pinned version. Long-lived coordinators (§6) are the exception: their durable state outlives any code version, so coordinator edits require tested state migrations and Temporal patching for in-flight executions. See §9 for why safe mode does not rescue them.
@@ -204,7 +206,7 @@ Merge is the point of no return.
 
 **Merge.** Enqueue in the merge-queue coordinator for the target branch; on grant, run the **merge agent** in the world; release the lease; → End. The merge commit is the **point of no return**: before it, the task may be cancelled; after it, not.
 
-**Resolve (cross-cutting).** On an unhandled error at any stage, route first to **auto-resolve** (scripted handlers keyed on error signature — retries, known fix scripts). On miss/novelty, spawn the **Resolve agent** with a context bundle. On fix → resume the originating stage; on failure → escalate to the human via the task UI. Fixes the Resolve agent discovers are saved as skills.
+**Resolve (cross-cutting).** On an unhandled error at any stage, route first to **auto-resolve** (scripted handlers keyed on error signature — retries, known fix scripts). Provider-originated failures keep their structured classification through this path: transient usage/session limits mark the current credential exhausted and rotate to another compatible login or park until its reset; transport/provider outages and recoverable process interruptions retry the checkpointed session without spending a Resolve turn. Persistent faults such as invalid configuration, permissions, disk exhaustion, or credentials that require funding/re-auth remain human decision points rather than being retried blindly. On an auto-resolve miss/novelty, spawn the **Resolve agent** with a context bundle. On fix → resume the originating stage; on failure → escalate to the human via the task UI. A human/parent Retry leaves Escalated immediately and restores the originating public stage while the replacement work is waiting or running. Fixes the Resolve agent discovers are saved as skills.
 
 ### 5.3 Transition rules
 
@@ -341,7 +343,7 @@ A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capa
 The task view reports the turn's resource boundaries separately: `waitingFor: account` while credential capacity is being leased, `waitingFor: agentSlot` / `agentTurn: waiting-slot` after the account grant while host admission is pending, and `agentTurn: running` only after the activity has acquired the host slot. The workflow publishes the post-grant transition immediately; it must not leave the last account-wait snapshot visible for the duration of a running turn.
 
 1. Spins up / resumes the agent session (via session/thread ID stored in workflow state).
-2. Lets the agent work until the provider emits a verified successful terminal event. Failed, interrupted, cancelled, truncated, or transport-ended terminal states throw even if partial text exists; infrastructure interruptions retry and resume the checkpointed provider session.
+2. Lets the agent work until the provider emits a verified successful terminal event. Failed, interrupted, cancelled, truncated, or transport-ended terminal states throw even if partial text exists. Structured assistant errors (quota, authentication, billing, overload/server failure, output truncation) and provider-marked text-only API errors are classified before a later generic terminal result can erase their cause; recoverable infrastructure interruptions retry and resume the checkpointed provider session.
 3. Captures output, events, and the new session ID; exits — the process dies, RAM is reclaimed.
 
 Between turns — where all waits live — the agent is only a stored session ID. **RAM is consumed strictly during turns, never during waits**, regardless of whether a wait is five seconds or five hours. This is the fix for the naive "long-lived agent process" design that exhausts system resources.
@@ -465,6 +467,7 @@ Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
 not reproduce issue-tracker assignee/delegate/reviewer/follower state. Each
 workflow human wait declares the exact user/team/special audience for that step;
 the per-user inbox is a materialized projection of those workflow events.
+- **Wiki** — the organization and project wikis (§4.4): a tree of skills/memories with a rendered page view, a frontmatter-as-form editor (raw YAML behind a toggle, markdown preview), and an Index showing exactly what agents receive each turn: every unconditional entry in full, then the rendered table of contents (names + descriptions, importance order, [more…] folds). The project wiki is a project tab; the organization wiki is the bottom-left rail link.
 - **Dashboard** — agent runs, token/limit status across accounts, resources used.
 - **The final composed app UI** with the keyboard-navigation registry.
 
@@ -525,15 +528,17 @@ The console is a single-page app, but every page has its own **URL** so a specif
 /<org>/dashboard                     → organization dashboard
 /<org>/settings                      → organization settings
 /<org>/inbox                         → inbox
+/<org>/wiki                          → organization wiki (bottom-left rail link)
 /<org>/<project>                     → task list          (the primary surface)
 /<org>/<project>/queue               → merge queue
 /<org>/<project>/activity            → activity feed
+/<org>/<project>/wiki                → project wiki (a project tab)
 /<org>/<project>/settings            → project settings
 /<org>/<project>/tasks/:num          → a task permalink (opens the drawer over its list)
 /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
 ```
 
-Organizations carry a persisted `slug` (falling back to a slug of the name for records that predate it). A small set of reserved second-segment words (`dashboard`, `settings`, `inbox`) name organization-level views rather than projects, so those never round-trip through a project slug; every other second segment is a project. Project slugs need only be unique **within their org** — the slug resolves to a project by matching the slugified name (case-insensitive), scoped to the URL's org; names are expected distinct, and on the rare collision the first-created project wins. Because the console loads the full org + project list at boot, org↔project↔slug resolution is entirely client-side — no round-trip to open a deep link. Pre-organization URLs (`/dashboard`, `/organization`, `/settings`, `/projects/:name/…`) are still parsed and then **canonicalised** (History `replaceState`) to the org-prefixed form, so old bookmarks and server-issued redirects keep working.
+Organizations carry a persisted `slug` (falling back to a slug of the name for records that predate it). A small set of reserved second-segment words (`dashboard`, `settings`, `inbox`, `wiki`) name organization-level views rather than projects, so those never round-trip through a project slug; every other second segment is a project. Project slugs need only be unique **within their org** — the slug resolves to a project by matching the slugified name (case-insensitive), scoped to the URL's org; names are expected distinct, and on the rare collision the first-created project wins. Because the console loads the full org + project list at boot, org↔project↔slug resolution is entirely client-side — no round-trip to open a deep link. Pre-organization URLs (`/dashboard`, `/organization`, `/settings`, `/projects/:name/…`) are still parsed and then **canonicalised** (History `replaceState`) to the org-prefixed form, so old bookmarks and server-issued redirects keep working.
 
 **Workflows do not own URLs.** This is the answer to "does a workflow own its page?": no. Every page is a first-party **core UI module** (§10.3) whose *route* is host-owned; a workflow only ever *augments* a host page through the declared contribution system (§10.1) — a slot, a widget, an action, a param field — never by claiming a path. The merge queue is the illustrative case: it looks "produced by a workflow," but it is a host route that *projects* the merge-queue **coordinator's** query state (`{queue, current}`, §6.1) joined with each task's `mergeQueue` position. The coordinator is queried; it does not render or route. The same holds for the dashboard (projects the account coordinator's query). Keeping routes host-owned means the URL space is finite, stable, and knowable without loading any workflow package.
 
@@ -559,11 +564,19 @@ destroy()
 
 `createWorld` dispatches to the configured provider. The workflow talks only to this interface, so local-worktree → container → remote sandbox changes nothing upstream.
 
-Provider choice, pool, resources, network posture, organization cloud budget,
-and parked-world retention form one organization execution policy. Projects
-inherit it; their sparse override is limited to a provider/pool exception and a
-tighter project budget. Provider-specific template/snapshot/image settings stay
-on that provider connection. General coding defaults to unrestricted outbound
+Pool, resources, network posture, organization cloud budget, and parked-world
+retention form one organization **compute** policy (Settings → Compute). Projects
+inherit it; their sparse override is limited to a pool exception and a tighter
+project budget. The **provider choice itself is a different axis** — the *agent
+environment* (worktree / container / E2B / Daytona). It is a **task default**
+(§10.4), edited beside the base/target branches, so it inherits organization →
+project → task like any other field and a single task can pick a different
+environment without a project-wide change (it binds to `input.project.worldProvider`,
+which every world-creating workflow reads). Its canonical value still lives in the
+execution policy, so runner-pool compatibility and the effective-config merge stay
+coherent; the Compute section shows the effective environment read-only and scopes
+its pool list to it. Provider-specific template/snapshot/image settings stay on
+that provider connection. General coding defaults to unrestricted outbound
 internet; a domain/CIDR allowlist is an explicit enterprise hardening mode.
 
 When a self-hosted project stores a local repository path but selects a remote
