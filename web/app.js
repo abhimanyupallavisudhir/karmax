@@ -485,11 +485,18 @@ function renderField(f, own, inherited, withChips, alt) {
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
   if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
-    const ta = `<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea>`;
+    // The prompt field (withChips) also carries the @-mention affordance, so its
+    // placeholder advertises both image paste and wiki tagging.
+    const placeholder = withChips ? 'Describe the task (paste an image to attach, type @ to add context from the wiki)' : (f.placeholder || '');
+    const ta = `<textarea ${attrs} rows="4" placeholder="${esc(placeholder)}">${esc(v)}</textarea>`;
     // For the prompt field, pasted images render inside the box (below the text),
     // growing it as needed — rather than in a separate "Images" section.
     if (withChips)
-      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div></div></div>`;
+      // The prompt box's clean bottom row: a borderless "wiki context" field,
+      // seeded elsewhere with the default @proj:tag:default / @org:tag:default so
+      // the user sees (and can backspace away) what's inlined by default.
+      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div>
+        <div class="prompt-context-row"><span class="pc-prefix" title="Wiki pages, labels (@…:tag:…), or folders (@…/*) inlined into this task's context. Type @ to add; backspace to remove.">context</span><textarea id="tf-context" class="prompt-context" rows="1" spellcheck="false" placeholder="type @ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
   if (f.type === 'boolean')
@@ -3123,6 +3130,20 @@ async function openTaskForm(workflow, draft, seedText) {
   $('#tf-body')
     .querySelectorAll('textarea, input[type="text"], input:not([type])')
     .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
+  // Typing "@" in the prompt tags wiki pages/labels/folders into the task's context.
+  const promptTa = $('#tf-body')?.querySelector('textarea[data-field="prompt"]');
+  if (promptTa) wireWikiMention(promptTa, projectId);
+  // The prompt's "wiki context" bottom row: seed with the task's tokens, or the
+  // defaults so the user can see (and backspace away) what's inlined by default.
+  const contextTa = $('#tf-context');
+  if (contextTa) {
+    const wc = draft?.params?.wikiContext;
+    contextTa.value = Array.isArray(wc) ? wc.join(' ') : '@proj:tag:default @org:tag:default';
+    const growContext = () => { contextTa.style.height = 'auto'; contextTa.style.height = `${contextTa.scrollHeight}px`; };
+    growContext();
+    contextTa.addEventListener('input', growContext);
+    wireWikiMention(contextTa, projectId);
+  }
   paintFormChips();
   // Focus the consuming field (prompt/command) with the caret at the end, so
   // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
@@ -3165,16 +3186,25 @@ async function openTaskForm(workflow, draft, seedText) {
     const triggers = collectTriggers(values.triggers);
     if (triggers.length) body.triggers = triggers;
     if ($('#trig-repeatable')?.checked) body.repeatable = true;
+    // The "wiki context" row (@proj:…/@org:… tokens). Always sent — even empty,
+    // which is a deliberate opt-out of the default `default`-labelled pages — so
+    // the replace:true auto-save preserves the user's choice.
+    const ctx = $('#tf-context');
+    if (ctx) body.wikiContext = String(ctx.value).split(/\s+/).map((t) => t.trim()).filter((t) => /^@(proj|org):\S/i.test(t));
     return { body, notes: $('#tf-notes')?.value ?? '', authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
   // guards against spawning empty drafts just from opening the form.
-  const hasContent = ({ body, notes }) =>
-    notes.trim() !== '' ||
-    hasPolicy() ||
-    formImages.length > 0 ||
-    Object.values(body).some((v) =>
-      Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
+  const hasContent = ({ body, notes }) => {
+    // Wiki context alone (default or edited) isn't "content" worth a draft — it
+    // rides along once there's a real prompt/command. Exclude it from the scan.
+    const { wikiContext: _wc, ...rest } = body;
+    return notes.trim() !== '' ||
+      hasPolicy() ||
+      formImages.length > 0 ||
+      Object.values(rest).some((v) =>
+        Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
+  };
 
   // Persist the current form as a draft without leaving the form. Silent by
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
@@ -4387,7 +4417,7 @@ function conversationPane(v, t) {
   const fu = followUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (paste an image to attach, type @ to add context from the wiki)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           <div class="img-chips followup-chips" style="display:none"></div>
         </div>
         <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
@@ -5074,6 +5104,9 @@ function wireFollowups(v) {
     const chips = box.querySelector('.followup-chips');
     const paint = () => renderImageChips(chips, store);
     wireImagePaste(ta, () => store, paint);
+    // Typing "@" tags wiki pages/labels/folders into the follow-up, same as the
+    // task prompt — the backend scans follow-up messages for `@proj:…`/`@org:…`.
+    wireWikiMention(ta, taskRecord(v.taskId)?.projectId || S.projectId);
     paint();
     const send = async () => {
       const text = ta.value.trim();
@@ -5860,10 +5893,10 @@ const quickDefaultsHeader = () => '';
 
 // ── wiki (org/project skills, memories, and prompts — one content system) ─────
 // One view serves both scopes: /<org>/wiki (proj = null) and /<org>/<project>/wiki.
-// The left rail lists the wiki tree; the pane shows the Index (every
-// `delivery: unconditional` entry rendered in full — exactly what agents get
-// with each prompt) or the selected entry. The open entry rides in the URL hash
-// so wiki pages deep-link like settings panes.
+// The left rail lists the wiki tree; the pane shows the Index (every `default`-
+// labelled entry rendered in full, plus the table of contents — exactly what
+// agents get with each prompt) or the selected entry. The open entry rides in
+// the URL hash so wiki pages deep-link like settings panes.
 function wikiScopeInfo(proj) {
   if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki` };
   const org = currentOrg();
@@ -5881,7 +5914,8 @@ function wikiView(proj) {
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
 }
 
-const wikiGlyph = (e) => (e.delivery === 'unconditional' ? '✦' : e.kind === 'memory' ? '✎' : '⚡');
+const wikiIsDefault = (e) => (e.labels || []).includes('default');
+const wikiGlyph = (e) => (wikiIsDefault(e) ? '✦' : e.kind === 'memory' ? '✎' : '⚡');
 
 function wikiTreeHtml(entries, sel, depth = 0) {
   return (entries || []).map((e) => e.kind === 'section'
@@ -5955,21 +5989,166 @@ function parseWikiFm(text) {
     if (!kv) return { ok: false, error: `Invalid frontmatter line: “${line.trim()}”` };
     fields[kv[1].toLowerCase()] = kv[2].trim().replace(/^["']|["']$/g, '');
   }
-  if (fields.delivery && !['unconditional', 'indexed'].includes(fields.delivery))
-    return { ok: false, error: 'delivery must be “unconditional” or “indexed”.' };
+  // Back-compat: an older `delivery: unconditional` folds into the `default` label.
+  if (fields.delivery === 'unconditional')
+    fields.labels = [...new Set([...parseWikiLabels(fields.labels), 'default'])].join(', ');
+  delete fields.delivery;
   if (fields.importance && !Number.isFinite(Number(fields.importance)))
     return { ok: false, error: 'importance must be a number.' };
   return { ok: true, fields, body: s.slice(m[0].length) };
+}
+
+// Split a comma-separated (optionally `[a, b]`) labels string into clean tokens.
+function parseWikiLabels(raw) {
+  return String(raw ?? '')
+    .replace(/^\[|\]$/g, '')
+    .split(',')
+    .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
 }
 
 function buildWikiContent(fields, body) {
   const lines = [];
   if (fields.name) lines.push(`name: ${fields.name}`);
   if (fields.description) lines.push(`description: ${fields.description}`);
-  if (fields.delivery === 'unconditional') lines.push('delivery: unconditional');
+  const labels = parseWikiLabels(fields.labels);
+  if (labels.length) lines.push(`labels: ${labels.join(', ')}`);
   if (fields.importance && Number(fields.importance) !== 0) lines.push(`importance: ${fields.importance}`);
   const text = String(body ?? '').replace(/^\n+/, '');
   return lines.length ? `---\n${lines.join('\n')}\n---\n\n${text}` : text;
+}
+
+// ── @-mention: tag wiki context into a task prompt ───────────────────────────
+// Typing "@" in a prompt opens a dropdown that searches BOTH the project and
+// the organization wiki. Picking a result inserts a `@proj:…` / `@org:…` token
+// that inlines that page — or a whole label (`@proj:tag:…`) or folder
+// (`@proj:…/*`) — into the task's context at run time. Enter picks the top
+// (or highlighted) result; ↑/↓ navigate; Esc dismisses; a click picks directly.
+
+// Viewport-relative pixel position of a caret offset inside a textarea, via a
+// mirror div that copies the textarea's text metrics (the standard technique).
+function textareaCaretXY(ta, pos) {
+  const rect = ta.getBoundingClientRect();
+  const style = getComputedStyle(ta);
+  const mirror = document.createElement('div');
+  for (const p of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'textTransform',
+    'wordSpacing', 'lineHeight', 'textIndent', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+    'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth', 'boxSizing'])
+    mirror.style[p] = style[p];
+  Object.assign(mirror.style, {
+    position: 'absolute', visibility: 'hidden', whiteSpace: 'pre-wrap', wordWrap: 'break-word',
+    overflow: 'hidden', width: `${ta.clientWidth}px`, top: '0', left: '0',
+  });
+  mirror.textContent = ta.value.slice(0, pos);
+  const marker = document.createElement('span');
+  marker.textContent = ta.value.slice(pos) || '.';
+  mirror.appendChild(marker);
+  document.body.appendChild(mirror);
+  const lineH = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.4;
+  const xy = {
+    top: rect.top + marker.offsetTop - ta.scrollTop + lineH,
+    left: rect.left + marker.offsetLeft - ta.scrollLeft,
+  };
+  mirror.remove();
+  return xy;
+}
+
+function wireWikiMention(ta, projectId) {
+  if (!ta || !projectId || ta.dataset.wmWired) return;
+  ta.dataset.wmWired = '1';
+  const orgId = projectById(projectId)?.organizationId;
+  let menu = null, items = [], active = 0, token = null, seq = 0;
+
+  const close = () => { menu?.remove(); menu = null; items = []; token = null; };
+  // The @-token immediately before the caret — only at the start or right after
+  // whitespace (so `b@`, `\@`, `(@` don't trigger), and never inside an inline
+  // code span (odd count of backticks before the @). Mirrors parseWikiRefs.
+  const tokenAt = () => {
+    const pos = ta.selectionStart;
+    if (pos == null || pos !== ta.selectionEnd) return null;
+    const m = /(?:^|\s)@([^\s@]*)$/.exec(ta.value.slice(0, pos));
+    if (!m) return null;
+    const at = pos - m[1].length - 1;
+    if ((ta.value.slice(0, at).match(/`/g) || []).length % 2 === 1) return null;
+    return { start: at, end: pos, query: m[1] };
+  };
+  const parseQuery = (q) => /^proj:/i.test(q) ? { scopes: ['project'], q: q.slice(5) }
+    : /^org:/i.test(q) ? { scopes: ['organization'], q: q.slice(4) }
+    : { scopes: ['project', 'organization'], q };
+  const tokenFor = (s) => `@${s.scope === 'project' ? 'proj' : 'org'}:${s.ref}`;
+  const glyph = (s) => s.kind === 'label' ? '🏷' : s.kind === 'folder' ? '🗀' : s.scope === 'project' ? '⚡' : '✦';
+
+  const fetchSuggestions = async (q) => {
+    const { scopes, q: search } = parseQuery(q);
+    const per = await Promise.all(scopes.map((scope) => {
+      const id = scope === 'project' ? projectId : orgId;
+      if (!id) return Promise.resolve([]);
+      const base = scope === 'project' ? `/api/projects/${encodeURIComponent(id)}/wiki` : `/api/organizations/${encodeURIComponent(id)}/wiki`;
+      return api(`${base}/suggest?q=${encodeURIComponent(search)}`).then((r) => (r.suggestions || []).map((s) => ({ ...s, scope }))).catch(() => []);
+    }));
+    // Interleave the scopes so both surface near the top, then cap the list.
+    const merged = [], max = Math.max(0, ...per.map((r) => r.length));
+    for (let i = 0; i < max; i++) for (const r of per) if (r[i]) merged.push(r[i]);
+    return merged.slice(0, 8);
+  };
+
+  const highlight = () => menu?.querySelectorAll('.wm-opt').forEach((el, i) => el.classList.toggle('active', i === active));
+  const choose = (s) => {
+    if (!s || !token) return close();
+    const insert = `${tokenFor(s)} `;
+    ta.value = ta.value.slice(0, token.start) + insert + ta.value.slice(token.end);
+    const caret = token.start + insert.length;
+    close();
+    ta.setSelectionRange(caret, caret);
+    ta.focus();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  const render = () => {
+    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu'; document.body.appendChild(menu); }
+    menu.innerHTML = items.length ? items.map((s, i) => `
+      <div class="wm-opt ${i === active ? 'active' : ''}" data-i="${i}">
+        <span class="wm-glyph">${glyph(s)}</span>
+        <span class="wm-main"><span class="wm-ref">${esc(tokenFor(s))}</span>${
+          s.description ? `<span class="wm-desc">${esc(s.description)}</span>`
+          : s.count != null ? `<span class="wm-desc">${s.count} page${s.count === 1 ? '' : 's'}</span>` : ''
+        }</span>
+        <span class="wm-scope">${s.scope === 'project' ? 'project' : 'org'}</span>
+      </div>`).join('') : `<div class="wm-empty">No matching wiki pages</div>`;
+    menu.querySelectorAll('.wm-opt').forEach((el) => {
+      el.addEventListener('mousedown', (ev) => { ev.preventDefault(); choose(items[+el.dataset.i]); });
+      el.addEventListener('mouseenter', () => { active = +el.dataset.i; highlight(); });
+    });
+    const xy = textareaCaretXY(ta, token.start);
+    menu.style.left = `${Math.min(xy.left, window.innerWidth - 380)}px`;
+    menu.style.top = `${xy.top}px`;
+  };
+  const update = async () => {
+    token = tokenAt();
+    if (!token) return close();
+    const my = ++seq;
+    const found = await fetchSuggestions(token.query);
+    if (my !== seq) return;               // superseded by a newer keystroke
+    token = tokenAt();
+    if (!token) return close();           // caret moved off the token meanwhile
+    items = found; active = 0;
+    render();
+  };
+
+  ta.addEventListener('input', update);
+  ta.addEventListener('click', () => { if (!tokenAt()) close(); });
+  // Registered before the box's own send/submit keydown, so while the menu is
+  // open these keys drive it and stopImmediatePropagation keeps them from ALSO
+  // reaching the ⌘/Ctrl-Enter send/submit or Esc-close-form handlers.
+  ta.addEventListener('keydown', (ev) => {
+    if (!menu) return;
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopImmediatePropagation(); close(); }
+    else if (!items.length) return;
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active + 1) % items.length; highlight(); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active - 1 + items.length) % items.length; highlight(); }
+    else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
+  });
+  ta.addEventListener('blur', () => setTimeout(close, 150));
+  window.addEventListener('resize', close);
 }
 
 // ── the path-as-title control ────────────────────────────────────────────────
@@ -6056,7 +6235,8 @@ function renderWikiPage(info, proj, pane, page) {
     : '<button class="btn sm danger" id="wiki-page-delete">Delete</button>';
   pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)}
       <span class="chip">${page.kind}</span><span class="chip">${esc(page.path)}</span>
-      ${page.delivery === 'unconditional' ? '<span class="chip active">always in prompt</span>' : ''}
+      ${wikiIsDefault(page) ? '<span class="chip active" title="Labelled “default” — inlined into every task’s prompt">always in prompt</span>' : ''}
+      ${(page.labels || []).filter((l) => l !== 'default').map((l) => `<span class="chip">${esc(l)}</span>`).join('')}
       ${page.builtin ? '<span class="chip">built-in</span>' : ''}
       ${page.overridden ? '<span class="chip">customized</span>' : ''}
       ${page.description ? `<small>${esc(page.description)}</small>` : ''}</div></div>
@@ -6087,11 +6267,11 @@ function renderWikiEditor(info, proj, pane, page) {
   S.wikiEditing = { wikiKey: `${info.scope}:${info.id}`, path: page?.path ?? null };
   const fm = parseWikiFm(page?.content ?? '');
   // A pristine built-in has no frontmatter of its own — seed the form from its
-  // resolved metadata so the first save writes an override that keeps the
-  // unconditional delivery/importance instead of silently dropping them.
+  // resolved metadata so the first save writes an override that keeps its
+  // labels/importance instead of silently dropping them.
   const fields = fm.ok
     ? (page?.builtin
-      ? { name: page.name, description: page.description, delivery: page.delivery, importance: page.importance, ...Object.fromEntries(Object.entries(fm.fields).filter(([, v]) => v !== undefined && v !== '')) }
+      ? { name: page.name, description: page.description, labels: (page.labels || []).join(', '), importance: page.importance, ...Object.fromEntries(Object.entries(fm.fields).filter(([, v]) => v !== undefined && v !== '')) }
       : fm.fields)
     : {};
   const body = fm.ok ? fm.body : (page?.content ?? '');
@@ -6107,10 +6287,7 @@ function renderWikiEditor(info, proj, pane, page) {
       <div class="wiki-fields" id="wiki-form">
         <label>Name<input id="wf-name" value="${esc(fields.name || '')}" placeholder="defaults to the folder name"></label>
         <label>Description<input id="wf-desc" value="${esc(fields.description || '')}" placeholder="one line for the table of contents"></label>
-        <label>Delivery<select id="wf-delivery">
-          <option value="indexed">Indexed — listed in the table of contents</option>
-          <option value="unconditional" ${fields.delivery === 'unconditional' ? 'selected' : ''}>Unconditional — sent in full with every prompt</option>
-        </select></label>
+        <label title="Comma-separated. Every entry is always in the table of contents; a task inlines an entry in full by tagging its label with @proj:tag:… (or @org:tag:…). Add “default” to inline it into every task.">Labels<input id="wf-labels" value="${esc(fields.labels || '')}" placeholder="e.g. default, security"></label>
         <label>Importance<input id="wf-importance" type="number" step="any" value="${esc(fields.importance ?? '')}" placeholder="0"></label>
       </div>
       <div class="wiki-body-bar">
@@ -6134,7 +6311,7 @@ function renderWikiEditor(info, proj, pane, page) {
   const formFields = () => ({
     name: $('#wf-name').value.trim(),
     description: $('#wf-desc').value.trim(),
-    delivery: $('#wf-delivery').value,
+    labels: $('#wf-labels').value.trim(),
     importance: $('#wf-importance').value.trim(),
   });
   const yamlToggle = $('#wiki-yaml');
@@ -6153,7 +6330,7 @@ function renderWikiEditor(info, proj, pane, page) {
       if (!parsed.ok) { toast(parsed.error, true); yamlToggle.checked = true; return; }
       $('#wf-name').value = parsed.fields.name || '';
       $('#wf-desc').value = parsed.fields.description || '';
-      $('#wf-delivery').value = parsed.fields.delivery === 'unconditional' ? 'unconditional' : 'indexed';
+      $('#wf-labels').value = parseWikiLabels(parsed.fields.labels).join(', ');
       $('#wf-importance').value = parsed.fields.importance ?? '';
       $('#wiki-body').value = parsed.body;
       $('#wiki-form').hidden = false;

@@ -14,7 +14,7 @@ import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
  * gateway over HTTP (a CLI agent reading its config home's mcpServers).
  */
 export interface PlatformOps {
-  createTask(a: { projectId: string; title: string; prompt: string; workflow?: string }): Promise<{ id: string }>;
+  createTask(a: { projectId: string; title: string; prompt: string; workflow?: string; wikiContext?: string[] }): Promise<{ id: string }>;
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
@@ -214,7 +214,11 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
 
   server.registerTool(
     'create_task',
-    { description: 'Create a new task on a project task list.', inputSchema: { projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional() } },
+    {
+      description:
+        'Create a new task on a project task list. To inline wiki context into the new task, pass wikiContext: an array of `@proj:…`/`@org:…` tokens — a page (@proj:guides/deploy), a whole label (@proj:tag:security), or a folder (@proj:runbooks/*). Omit it to inherit the default `default`-labelled pages; pass [] to inline none.',
+      inputSchema: { projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional(), wikiContext: z.array(z.string()).optional() },
+    },
     async (a) => wrap(async () => (await ops.createTask(a)).id),
   );
   server.registerTool(

@@ -695,11 +695,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       try {
         const { buildWikiPromptContext } = await import('../wiki/wiki.js');
         const { paths } = await import('../config/paths.js');
+        // Wiki pages the task tags in its prompt/follow-ups (`@proj:…`/`@org:…`)
+        // are inlined in full, as are the tokens in the task's wiki-context field
+        // (`params.wikiContext`, read fresh here like the wiki content itself;
+        // absent ⇒ the default `tag:default` tokens apply).
+        const taggedText = [args.task.prompt, ...args.messages.filter((m) => m.role === 'user').map((m) => m.text)]
+          .filter(Boolean)
+          .join('\n');
+        const wikiContext = store.getTask(args.taskId)?.params?.wikiContext;
         projectInstructions = buildWikiPromptContext({
           contentDir: paths().content,
           organizationId: store.getProject(args.task.projectId)?.organizationId,
           projectId: args.task.projectId,
           builtinInstructions: deps.globalInstructions,
+          taggedText,
+          contextTokens: Array.isArray(wikiContext) ? wikiContext.map(String) : undefined,
         }) || undefined;
       } catch {
         globalInstructions = deps.globalInstructions ?? GLOBAL_INSTRUCTIONS;

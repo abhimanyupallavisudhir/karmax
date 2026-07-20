@@ -8,11 +8,14 @@ import {
   writeWikiPage,
   moveWikiPage,
   deleteWikiPage,
-  collectUnconditional,
+  collectDefaultPages,
   searchWiki,
+  suggestWiki,
   renderWikiToc,
   buildWikiPromptContext,
   parseFrontmatter,
+  parseWikiRefs,
+  resolveWikiRefs,
   safeWikiPath,
   wikiRoot,
   BUILTIN_WIKI_ENTRIES,
@@ -91,37 +94,104 @@ describe('listWiki / readWikiPage', () => {
   });
 });
 
-describe('delivery / importance frontmatter', () => {
-  it('parses delivery and importance; importance orders siblings (desc, then name)', () => {
+describe('labels / importance frontmatter', () => {
+  it('parses labels and importance; importance orders siblings (desc, then name)', () => {
     const root = tmp();
     try {
       writeWikiPage(root, 'low', '---\ndescription: l\n---\nx'); // importance defaults to 0
       writeWikiPage(root, 'high', '---\ndescription: h\nimportance: 5\n---\nx');
       writeWikiPage(root, 'mid', '---\ndescription: m\nimportance: 2\n---\nx');
-      writeWikiPage(root, 'always', '---\ndescription: a\ndelivery: unconditional\nimportance: 9\n---\nSent every turn.');
+      writeWikiPage(root, 'always', '---\ndescription: a\nlabels: default, style\nimportance: 9\n---\nSent every turn.');
       const tree = listWiki(root);
       expect(tree.children!.map((e) => e.path)).toEqual(['always', 'high', 'mid', 'low']);
-      expect(tree.children![0]!.delivery).toBe('unconditional');
+      expect(tree.children![0]!.labels).toEqual(['default', 'style']);
       expect(tree.children![1]!.importance).toBe(5);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('delivers unconditional entries in full (importance order) and keeps them out of the TOC', () => {
+  it('inlines `default`-labelled entries in full (importance order) but STILL lists every entry in the TOC', () => {
     const root = tmp();
     try {
-      writeWikiPage(root, 'style', '---\ndelivery: unconditional\nimportance: 1\n---\nPrefer small diffs.');
-      writeWikiPage(root, 'tone', '---\ndelivery: unconditional\nimportance: 9\n---\nBe direct.');
+      writeWikiPage(root, 'style', '---\nlabels: default\nimportance: 1\n---\nPrefer small diffs.');
+      writeWikiPage(root, 'tone', '---\nlabels: default\nimportance: 9\n---\nBe direct.');
       writeWikiPage(root, 'indexed-skill', '---\ndescription: findable\n---\nBody.');
       const tree = listWiki(root);
-      const unconditional = collectUnconditional(root, tree);
-      expect(unconditional.map((u) => u.body)).toEqual(['Be direct.', 'Prefer small diffs.']);
+      const defaults = collectDefaultPages(root, tree);
+      expect(defaults.map((u) => u.body)).toEqual(['Be direct.', 'Prefer small diffs.']);
+      // Every entry is always indexed — the `default` ones included, tagged {default}.
       const toc = renderWikiToc(tree, { scope: 'project', id: 'p1' });
       expect(toc).toContain('indexed-skill');
-      expect(toc).not.toContain('tone');
-      expect(toc).not.toContain('style');
-      // A section whose entries are ALL unconditional leaves no empty "- sec/" line.
-      writeWikiPage(root, 'always/only-uncond', '---\ndelivery: unconditional\n---\nx');
-      expect(renderWikiToc(listWiki(root), { scope: 'project', id: 'p1' })).not.toContain('always/');
+      expect(toc).toContain('tone] {default}');
+      expect(toc).toContain('style] {default}');
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('reads a legacy `delivery: unconditional` forward as the `default` label', () => {
+    const root = tmp();
+    try {
+      writeWikiPage(root, 'legacy', '---\ndelivery: unconditional\n---\nOld style.');
+      expect(listWiki(root).children![0]!.labels).toEqual(['default']);
+      expect(collectDefaultPages(root, listWiki(root)).map((u) => u.body)).toEqual(['Old style.']);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('wiki refs (@proj:… / @org:… tags) and suggestions', () => {
+  it('parses page / label / folder tags, ignoring surrounding punctuation', () => {
+    const refs = parseWikiRefs('See @proj:guides/e2e-runbook and @org:tag:security, plus @proj:guides/* — done. a@b.com untouched');
+    expect(refs).toEqual([
+      { scope: 'project', kind: 'page', value: 'guides/e2e-runbook' },
+      { scope: 'organization', kind: 'label', value: 'security' },
+      { scope: 'project', kind: 'folder', value: 'guides' },
+    ]);
+  });
+
+  it('ignores @ that is mid-word, escaped, or inside code spans', () => {
+    // Only a tag at the start or right after whitespace counts.
+    expect(parseWikiRefs('email a@proj:x, path b/@proj:y, escaped \\@proj:z, paren (@proj:w')).toEqual([]);
+    // Inline `code` and fenced ```blocks``` are stripped before scanning.
+    expect(parseWikiRefs('use `@proj:in-code` here')).toEqual([]);
+    expect(parseWikiRefs('```\n@proj:in-fence\n```\nbut @proj:live counts')).toEqual([
+      { scope: 'project', kind: 'page', value: 'live' },
+    ]);
+    // Start-of-string and newline-led tags still count.
+    expect(parseWikiRefs('@proj:first\n@org:tag:second')).toEqual([
+      { scope: 'project', kind: 'page', value: 'first' },
+      { scope: 'organization', kind: 'label', value: 'second' },
+    ]);
+  });
+
+  it('resolves a page, a folder subtree, and a label into the pages they name', () => {
+    const root = tmp();
+    try {
+      writeWikiPage(root, 'guides/a', '---\nlabels: security\n---\nx');
+      writeWikiPage(root, 'guides/sub/b', '---\ndescription: d\n---\nx');
+      writeWikiPage(root, 'loose', '---\nlabels: security\n---\nx');
+      const tree = listWiki(root);
+      const page = resolveWikiRefs(parseWikiRefs('@proj:guides/a'), 'project', root, tree);
+      expect(page).toEqual(['guides/a']);
+      const folder = resolveWikiRefs(parseWikiRefs('@proj:guides/*'), 'project', root, tree).sort();
+      expect(folder).toEqual(['guides/a', 'guides/sub/b']);
+      const label = resolveWikiRefs(parseWikiRefs('@proj:tag:security'), 'project', root, tree).sort();
+      expect(label).toEqual(['guides/a', 'loose']);
+      // Scope-mismatched refs and non-existent pages resolve to nothing.
+      expect(resolveWikiRefs(parseWikiRefs('@org:guides/a @proj:nope'), 'project', root, tree)).toEqual([]);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('suggests pages, folders, and labels ranked by relevance (tag: → labels, * → folders)', () => {
+    const root = tmp();
+    try {
+      writeWikiPage(root, 'guides/e2e-runbook', '---\ndescription: how to run e2e\nlabels: testing\n---\nx');
+      writeWikiPage(root, 'deploy-checklist', '---\nlabels: ops\n---\nx');
+      const kinds = (q: string) => suggestWiki(root, q).map((s) => `${s.kind}:${s.ref}`);
+      // A page-ish query surfaces the page and its containing folder.
+      const runbook = kinds('runbook');
+      expect(runbook).toContain('page:guides/e2e-runbook');
+      // `tag:` restricts to labels; the query filters them.
+      expect(kinds('tag:test')).toEqual(['label:tag:testing']);
+      // A trailing `*` biases folders to the top.
+      expect(suggestWiki(root, 'guides/*')[0]).toMatchObject({ kind: 'folder', ref: 'guides/*', count: 1 });
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });
@@ -184,14 +254,17 @@ describe('write / move / delete round-trip', () => {
 
 describe('parseFrontmatter', () => {
   it('reads the known scalar fields and returns the body; tolerates missing frontmatter', () => {
-    const fm = parseFrontmatter('---\nname: X\ndescription: "quoted"\ndelivery: unconditional\nimportance: 3.5\nextra: [ignored]\n---\nbody line\n');
+    const fm = parseFrontmatter('---\nname: X\ndescription: "quoted"\nlabels: default, security\nimportance: 3.5\nextra: [ignored]\n---\nbody line\n');
     expect(fm.name).toBe('X');
     expect(fm.description).toBe('quoted');
-    expect(fm.delivery).toBe('unconditional');
+    expect(fm.labels).toEqual(['default', 'security']);
     expect(fm.importance).toBe(3.5);
     expect(fm.body).toBe('body line\n');
     expect(parseFrontmatter('no fences').body).toBe('no fences');
-    expect(parseFrontmatter('---\ndelivery: nonsense\n---\nx').delivery).toBeUndefined();
+    expect(parseFrontmatter('no fences').labels).toEqual([]);
+    // `[a, b]` flow form parses too; a legacy delivery folds into `default`.
+    expect(parseFrontmatter('---\nlabels: [a, b]\n---\nx').labels).toEqual(['a', 'b']);
+    expect(parseFrontmatter('---\ndelivery: unconditional\nlabels: x\n---\nx').labels).toEqual(['default', 'x']);
   });
 });
 
@@ -250,14 +323,14 @@ describe('searchWiki (host-side grep — the cloud-world-safe path)', () => {
 });
 
 describe('buildWikiPromptContext', () => {
-  it('delivers built-ins first, then per scope its unconditional entries and indexed TOC', () => {
+  it('inlines built-ins first, then per scope its `default` bodies and the full TOC', () => {
     const contentDir = tmp();
     try {
       const orgRoot = wikiRoot(contentDir, 'organization', 'org1');
       const projRoot = wikiRoot(contentDir, 'project', 'p1');
-      writeWikiPage(orgRoot, 'org-rules', '---\ndelivery: unconditional\n---\nOrg-wide rule.');
+      writeWikiPage(orgRoot, 'org-rules', '---\nlabels: default\n---\nOrg-wide rule.');
       writeWikiPage(orgRoot, 'org-skill', '---\ndescription: org one\n---\nx');
-      writeWikiPage(projRoot, 'proj-rules', '---\ndelivery: unconditional\n---\nProject rule.');
+      writeWikiPage(projRoot, 'proj-rules', '---\nlabels: default\n---\nProject rule.');
       writeWikiPage(projRoot, 'proj-skill', '---\ndescription: proj one\n---\nx');
       const ctx = buildWikiPromptContext({ contentDir, organizationId: 'org1', projectId: 'p1' });
       const builtinAt = ctx.indexOf('# How to work'); // GLOBAL_INSTRUCTIONS, unified into the wiki
@@ -268,9 +341,54 @@ describe('buildWikiPromptContext', () => {
       expect(projAt).toBeGreaterThan(orgAt);
       expect(ctx).toContain('org-skill] — org one');
       expect(ctx).toContain('proj-skill] — proj one');
-      expect(ctx).not.toContain('org-rules]'); // unconditional entries are not TOC lines
+      // A `default` entry is inlined in full, so it is NOT also listed in the TOC.
+      expect(ctx).not.toContain('org-rules]');
       expect(ctx).toContain('read_wiki(scope, id, path?)');
       expect(ctx).toContain('project id "p1"');
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+
+  it('inlines the pages a task tags in its prompt (`@proj:…`/`@org:…`) in full', () => {
+    const contentDir = tmp();
+    try {
+      const orgRoot = wikiRoot(contentDir, 'organization', 'org1');
+      const projRoot = wikiRoot(contentDir, 'project', 'p1');
+      writeWikiPage(orgRoot, 'security/threat-model', '---\ndescription: org sec\nlabels: security\n---\nThreat model body.');
+      writeWikiPage(projRoot, 'runbooks/deploy', '---\ndescription: how to deploy\n---\nDeploy body.');
+      writeWikiPage(projRoot, 'runbooks/rollback', '---\ndescription: how to roll back\n---\nRollback body.');
+      const base = { contentDir, organizationId: 'org1', projectId: 'p1' };
+      // Untagged: bodies stay out of the prompt (only the TOC lists them).
+      const plain = buildWikiPromptContext(base);
+      expect(plain).not.toContain('Deploy body.');
+      expect(plain).not.toContain('Threat model body.');
+      // Tagged: a project folder + an org label are both inlined in full.
+      const tagged = buildWikiPromptContext({ ...base, taggedText: 'Do the deploy @proj:runbooks/* using @org:tag:security' });
+      expect(tagged).toContain('Deploy body.');
+      expect(tagged).toContain('Rollback body.');
+      expect(tagged).toContain('Threat model body.');
+      // The wiki-context field inlines the same way, independent of the prompt.
+      const viaField = buildWikiPromptContext({ ...base, contextTokens: ['@proj:runbooks/deploy'] });
+      expect(viaField).toContain('Deploy body.');
+      expect(viaField).not.toContain('Rollback body.');
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+
+  it('inlines `default` pages via the default context tokens, and lets a task opt out', () => {
+    const contentDir = tmp();
+    try {
+      const projRoot = wikiRoot(contentDir, 'project', 'p1');
+      writeWikiPage(projRoot, 'house-rules', '---\ndescription: the rules\nlabels: default\n---\nAlways rule.');
+      const base = { contentDir, organizationId: 'org1', projectId: 'p1' };
+      // No context field ⇒ default tokens ⇒ the `default` page is inlined (not in the TOC).
+      const dflt = buildWikiPromptContext(base);
+      expect(dflt).toContain('Always rule.');
+      expect(dflt).not.toContain('house-rules]');
+      // Cleared context field ([]) ⇒ opt out: the body leaves the prompt, back into the TOC.
+      const optOut = buildWikiPromptContext({ ...base, contextTokens: [] });
+      expect(optOut).not.toContain('Always rule.');
+      expect(optOut).toContain('house-rules] {default}');
+      // The built-in working instructions are delivered regardless of the field.
+      expect(optOut).toContain('# How to work');
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
   });
 
@@ -286,12 +404,12 @@ describe('buildWikiPromptContext', () => {
     const contentDir = tmp();
     try {
       const orgRoot = wikiRoot(contentDir, 'organization', 'org1');
-      writeWikiPage(orgRoot, BUILTIN_WIKI_ENTRIES[0]!.path, '---\ndelivery: unconditional\n---\nHouse variant of the instructions.');
+      writeWikiPage(orgRoot, BUILTIN_WIKI_ENTRIES[0]!.path, '---\nlabels: default\n---\nHouse variant of the instructions.');
       const ctx = buildWikiPromptContext({ contentDir, organizationId: 'org1', projectId: 'p1' });
       expect(ctx).toContain('House variant of the instructions.');
       expect(ctx).not.toContain('Do the task completely and correctly.');
-      // Re-delivered as indexed → it leaves the standing prompt for the org TOC.
-      writeWikiPage(orgRoot, BUILTIN_WIKI_ENTRIES[0]!.path, '---\nname: How to work\ndescription: house rules\ndelivery: indexed\n---\nHouse variant.');
+      // Drop the `default` label → its body leaves the standing prompt (still in the org TOC).
+      writeWikiPage(orgRoot, BUILTIN_WIKI_ENTRIES[0]!.path, '---\nname: How to work\ndescription: house rules\n---\nHouse variant.');
       const indexed = buildWikiPromptContext({ contentDir, organizationId: 'org1', projectId: 'p1' });
       expect(indexed).not.toContain('House variant.');
       expect(indexed).toContain('How to work [@builtin/how-to-work] — house rules');
@@ -328,7 +446,7 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       // The organization tree carries the built-in (delivered unconditionally),
       // and the Index response carries the agent-exact TOC text.
       const org = k.readWiki(rw, 'organization', organization.id) as any;
-      expect(org.toc.children[0]).toMatchObject({ path: BUILTIN_WIKI_ENTRIES[0]!.path, builtin: true, delivery: 'unconditional' });
+      expect(org.toc.children[0]).toMatchObject({ path: BUILTIN_WIKI_ENTRIES[0]!.path, builtin: true, labels: ['default'] });
       expect(org.unconditional[0].body).toBe(GLOBAL_INSTRUCTIONS);
       expect(org.tocText).toBeDefined();
       const proj = k.readWiki(rw, 'project', project.id) as any;
@@ -336,7 +454,7 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       const builtinPage = k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any;
       expect(builtinPage.page.builtin).toBe(true);
       // Editing a built-in writes its override; deleting the override restores the default.
-      k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\ndelivery: unconditional\n---\nOur own rules.' });
+      k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' });
       const edited = k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any;
       expect(edited.page).toMatchObject({ builtin: true, overridden: true });
       expect(edited.page.content).toContain('Our own rules.');

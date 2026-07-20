@@ -478,6 +478,16 @@ export interface TaskParams {
   prompt: string;
   /** Images attached to the initial prompt (references, never inline bytes). */
   images?: ImageRef[];
+  /**
+   * Wiki pages inlined into this task's agent context, as `@proj:…`/`@org:…`
+   * tokens (a page, a whole `@proj:tag:<label>`, or a folder `@proj:<section>/*`).
+   * The task-form "wiki context" field seeds this with `@proj:tag:default` and
+   * `@org:tag:default` so `default`-labelled pages are inlined by default; a task
+   * opts out by clearing them. Absent (API/quick-add) ⇒ the default tokens apply.
+   * Resolved fresh each turn by `buildWikiPromptContext` (SPEC §5.4), UNION any
+   * `@…` tags written inline in the prompt/follow-ups.
+   */
+  wikiContext?: string[];
   base?: string;
   target?: string;
   /** role -> profile id overrides. */

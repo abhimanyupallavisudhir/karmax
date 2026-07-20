@@ -2067,7 +2067,7 @@ export class Gateway {
       // family per scope; KarmaxApi enforces read/write capabilities and path
       // safety, so the wiki works identically for humans (UI) and agents
       // (read_wiki/search_wiki/platform_request, including from cloud worlds).
-      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search))?$/);
+      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search|suggest))?$/);
       if (wikiMatch) {
         const scope = wikiMatch[1] === 'projects' ? ('project' as const) : ('organization' as const);
         const id = wikiMatch[2]!;
@@ -2089,6 +2089,7 @@ export class Gateway {
             if (method === 'DELETE') return this.json(res, 200, api.deleteWikiPage(token, scope, id, String(url.searchParams.get('path') ?? '')));
           }
           if (sub === 'search' && method === 'GET') return this.json(res, 200, api.searchWiki(token, scope, id, String(url.searchParams.get('q') ?? '')));
+          if (sub === 'suggest' && method === 'GET') return this.json(res, 200, api.suggestWiki(token, scope, id, String(url.searchParams.get('q') ?? '')));
         } catch (error) {
           if (error instanceof CapabilityError) throw error;
           const conflict = /already exists/.test(String((error as Error)?.message));
