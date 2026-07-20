@@ -10,6 +10,7 @@ const sources = {
     { provider: 'claude', account: 'loggedout', path: '/h/lo', loggedIn: false }, // excluded
   ],
   ambient: { claude: true, codex: true },
+  ambientHomes: { claude: '/home/test/.claude', codex: '/home/test/.codex' },
   envKeys: { claude: false, codex: true }, // OPENAI_API_KEY present
   handles: ['claude:broker1'],
 };
@@ -31,6 +32,8 @@ describe('credential enumeration', () => {
     expect(k).not.toContain('login:claude:loggedout'); // not logged in
     expect(k).not.toContain('key:claude'); // ANTHROPIC_API_KEY absent
     expect(all.find((c) => c.key === 'login:claude:manyu')?.configHome).toBe('/h/cm');
+    expect(all.find((c) => c.key === 'ambient:claude')?.configHome).toBe('/home/test/.claude');
+    expect(all.find((c) => c.key === 'ambient:codex')?.configHome).toBe('/home/test/.codex');
   });
 });
 

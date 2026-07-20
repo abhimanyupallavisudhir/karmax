@@ -40,6 +40,7 @@ export interface RunningAction {
   leaseReleased?: boolean;
   provider: string;
   previewLeaseIds: string[];
+  world: WorldHandle;
 }
 
 export interface ActionStatus {
@@ -59,7 +60,8 @@ export class ReviewActionRunner {
   private procs = new Map<string, RunningAction>();
   private commandPoll: NodeJS.Timeout;
 
-  constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService) {
+  constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService,
+    private access?: import('../world/access.js').WorldAccessService) {
     this.commandPoll = setInterval(() => {
       for (const rec of this.procs.values()) {
         this.store.heartbeatExecution(rec.procId);
@@ -98,7 +100,8 @@ export class ReviewActionRunner {
         kind: 'review-action', label: opts.label, command: opts.command, server: !!opts.server,
         openUrls: durableOpenUrls, runnerLeaseId });
     } catch (error) {
-      if (runnerLeaseId) this.runners?.release(runnerLeaseId, opts.world.kind);
+      if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(opts.world, runnerLeaseId);
+      else if (runnerLeaseId) this.runners?.release(runnerLeaseId, opts.world.kind);
       for (const id of previewLeaseIds) this.store.revokePreviewLease(id);
       throw error;
     }
@@ -109,7 +112,8 @@ export class ReviewActionRunner {
     } catch (error) {
       this.store.appendExecutionFrame(procId, `${error instanceof Error ? error.message : String(error)}\n`, 'system');
       this.store.finishExecution(procId, null, 'failed');
-      if (runnerLeaseId) this.runners?.release(runnerLeaseId, opts.world.kind);
+      if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(opts.world, runnerLeaseId);
+      else if (runnerLeaseId) this.runners?.release(runnerLeaseId, opts.world.kind);
       for (const id of previewLeaseIds) this.store.revokePreviewLease(id);
       throw error;
     }
@@ -130,6 +134,7 @@ export class ReviewActionRunner {
       runnerLeaseId,
       provider: opts.world.kind,
       previewLeaseIds,
+      world: opts.world,
     };
     const append = (buf: unknown) => {
       const s = String(buf);
@@ -225,7 +230,8 @@ export class ReviewActionRunner {
   private releaseLease(rec: RunningAction, provider: string): void {
     if (!rec.runnerLeaseId || rec.leaseReleased) return;
     rec.leaseReleased = true;
-    this.runners?.release(rec.runnerLeaseId, provider);
+    if (this.access) void this.access.releaseLeaseAndParkIfIdle(rec.world, rec.runnerLeaseId);
+    else this.runners?.release(rec.runnerLeaseId, provider);
   }
 
   private revokePreviews(rec: RunningAction): void {
@@ -272,7 +278,7 @@ function reviewPreviewTtlMs(): number {
 }
 
 function toStatus(r: RunningAction): ActionStatus {
-  const { process: _p, listeners: _l, runnerLeaseId: _r, leaseReleased: _x, provider: _provider,
+  const { process: _p, listeners: _l, runnerLeaseId: _r, leaseReleased: _x, provider: _provider, world: _world,
     previewLeaseIds: _previewLeaseIds, ...rest } = r;
   return rest;
 }

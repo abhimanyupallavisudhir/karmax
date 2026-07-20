@@ -147,11 +147,15 @@ export interface McpBaseline {
   platform?: McpServerSpec;
 }
 
+export const CHROME_DEVTOOLS_MCP_VERSION = '1.6.0';
+export const PLAYWRIGHT_MCP_VERSION = '0.0.78';
+export const PLAYWRIGHT_VERSION = '1.61.1';
+
 /** Resolve a baseline spec to concrete stdio MCP server commands. */
 export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
   const out: Record<string, McpServerSpec> = {};
-  if (spec.browser === 'chrome-devtools') out['chrome-devtools'] = { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] };
-  else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', '@playwright/mcp@latest'] };
+  if (spec.browser === 'chrome-devtools') out['chrome-devtools'] = { command: 'npx', args: ['-y', `chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`] };
+  else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`] };
   if (spec.platform) out['karmax'] = spec.platform;
   return out;
 }

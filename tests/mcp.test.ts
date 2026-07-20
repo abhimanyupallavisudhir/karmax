@@ -11,6 +11,7 @@ import { TokenAuthority } from '../src/platform/tokens.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
+import { WorldRegistry } from '../src/world/registry.js';
 
 describe('platform MCP server (capability-checked tool calls)', () => {
   let store: Store;
@@ -19,13 +20,15 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   let contentDir: string;
   let currentToken: string;
   let client: Client;
+  let worlds: WorldRegistry;
 
   beforeEach(async () => {
     store = new Store(':memory:');
     tokens = new TokenAuthority();
     contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
     const providerConnections = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(path.join(contentDir, 'vault'))));
-    api = new KarmaxApi({ store, client: {} as any, taskQueue: 'karmax', tokens, contentDir, providerConnections });
+    worlds = new WorldRegistry();
+    api = new KarmaxApi({ store, client: {} as any, taskQueue: 'karmax', tokens, contentDir, providerConnections, worlds });
     const server = createPlatformMcpServer(apiOps(api, () => currentToken));
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
     await server.connect(serverT);
@@ -44,7 +47,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'create_task', 'save_skill', 'signal_task', 'reorder_queue', 'propose_workflow_edit',
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent',
-        'list_events', 'describe_platform', 'platform_request', 'list_world_providers',
+        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'describe_platform', 'platform_request', 'list_world_providers',
         'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
         'get_execution_policy', 'set_execution_policy',
       ]),
@@ -55,6 +58,12 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.payments).toContain('GET|POST /api/cards');
     expect(catalog.cloud).toContain('GET /api/organizations/:organizationId/world-providers');
     expect(catalog.cloud).toContain('GET|PUT /api/organizations/:organizationId/execution-policy');
+  });
+
+  it('does not expose direct cross-world filesystem inspection', async () => {
+    const names = (await client.listTools()).tools.map((tool) => tool.name);
+    expect(names).not.toContain('list_world_files');
+    expect(names).not.toContain('read_world_file');
   });
 
   it('lets an authorized agent connect and disconnect a provider without reading its secret', async () => {

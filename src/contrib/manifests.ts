@@ -141,7 +141,11 @@ export interface WorkflowRole {
 const DO_ROLE: WorkflowRole = {
   name: 'do',
   label: 'Do agent',
-  capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
+  capabilities: [
+    'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
+    'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
+    'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
+  ],
   promptTemplate: `{{toolsPreamble}}
 
 # Task
