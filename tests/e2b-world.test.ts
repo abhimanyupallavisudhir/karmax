@@ -14,6 +14,7 @@ describe('E2B cloud world provider', () => {
     let ptyData: ((data: unknown) => void) | undefined;
     let ptyOptions: any;
     let createdOptions: any;
+    const networkUpdates: any[] = [];
     let timeoutRefreshes = 0;
 
     const sandbox: E2BSandboxLike = {
@@ -55,6 +56,7 @@ describe('E2B cloud world provider', () => {
       },
       async pause() { paused++; },
       async kill() { killed++; },
+      async updateNetwork(network) { networkUpdates.push(network); },
       async setTimeout(value) { expect(value).toBe(123_000); timeoutRefreshes++; },
     };
     const factory: E2BFactory = {
@@ -69,9 +71,13 @@ describe('E2B cloud world provider', () => {
       timeoutMs: 123_000,
       lifecycle: { onTimeout: 'pause', autoResume: true },
       metadata: { karmaxTaskId: 'task-cloud' },
-      network: { allowOut: expect.arrayContaining(['github.com']), denyOut: ['0.0.0.0/0'], allowPublicTraffic: false },
+      allowInternetAccess: true,
     });
-    expect(createdOptions.allowInternetAccess).toBeUndefined();
+    expect(createdOptions.network).toBeUndefined();
+    expect(networkUpdates).toEqual([{
+      allowOut: expect.arrayContaining(['github.com']),
+      denyOut: ['0.0.0.0/0'],
+    }]);
     expect(world.handle).toMatchObject({ version: 2, kind: 'e2b', provider: 'e2b', root: '/home/user/karmax' });
     expect(world.handle.sealedProviderRef).toBeTruthy();
     expect(JSON.stringify(world.handle)).not.toContain('sbx_test');
@@ -163,6 +169,27 @@ describe('E2B cloud world provider', () => {
     expect(JSON.stringify(world.handle)).not.toContain('PRIVATE CLONE KEY');
   });
 
+  it('surfaces E2B command stderr instead of an opaque exit status', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.commands.run = async (command) => {
+      if (!command.includes('git clone')) return { stdout: '', stderr: '', exitCode: 0 };
+      throw Object.assign(new Error('exit status 128'), {
+        name: 'CommandExitError', exitCode: 128, stdout: '',
+        stderr: 'fatal: Could not read from remote repository',
+      });
+    };
+    const previous = process.env.KARMAX_WORLD_CLONE_RETRIES;
+    process.env.KARMAX_WORLD_CLONE_RETRIES = '0';
+    try {
+      const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+      await expect(provider.create({ taskId: 'clone-error', base: 'main',
+        repo: 'git@github.com:acme/private.git' })).rejects.toThrow('Could not read from remote repository');
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_WORLD_CLONE_RETRIES;
+      else process.env.KARMAX_WORLD_CLONE_RETRIES = previous;
+    }
+  });
+
   it('fails rather than silently reviewing the wrong branch', async () => {
     const sandbox = fakeSandbox(() => undefined);
     sandbox.commands.run = async (command) => ({
@@ -246,5 +273,6 @@ function fakeSandbox(onKill: () => void): E2BSandboxLike {
     },
     pause: async () => undefined,
     kill: async () => { onKill(); },
+    updateNetwork: async () => undefined,
   };
 }
