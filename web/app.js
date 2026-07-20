@@ -6636,25 +6636,37 @@ async function hydrateExecutionProviders(proj) {
     ]);
     S.worldProviderConnections = connections;
     // The Agent environment (worktree / container / E2B / Daytona) now lives in
-    // Task defaults — and can be overridden per task. Compute keeps the runner pool
-    // and budget, which only vary by environment, so the pool list is filtered by
-    // the effective environment (shown read-only here).
+    // Task defaults — and can be overridden per task. Compute keeps the runner
+    // pool, network policy, world flavor, and budget, so the pool list is filtered
+    // by the effective environment (shown read-only here).
     const environment = policy.effective.worldProvider || 'worktree';
+    const networkOverride = policy.override.network;
+    const networkMode = networkOverride ? (networkOverride.unrestricted ? 'unrestricted' : 'restricted') : '';
     box.innerHTML = `<div class="settings-grid">
       <label class="form-row">Runner pool<select id="project-execution-pool"></select></label>
       <label class="form-row">World experience<select id="project-execution-flavor"><option value="">Organization default — ${esc(policy.organization.environment?.flavor || 'headless')}</option><option value="headless" ${policy.override.environment?.flavor === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${policy.override.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
+      <label class="form-row">Outbound network<select id="project-execution-network"><option value="" ${networkMode === '' ? 'selected' : ''}>Organization default — ${policy.organization.network?.unrestricted !== false ? 'normal internet' : 'restricted'}</option><option value="unrestricted" ${networkMode === 'unrestricted' ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${networkMode === 'restricted' ? 'selected' : ''}>Restricted allowlist</option></select></label>
       <label class="form-row">Optional tighter project budget (USD/month)<input id="project-execution-budget" type="number" min="0" step="0.01" value="${policy.override.monthlyBudgetMicros == null ? '' : esc(policy.override.monthlyBudgetMicros / 1e6)}" placeholder="Use organization budget" /></label>
-    </div><div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
+    </div>
+    <details id="project-network-restrictions" ${networkMode === 'restricted' ? 'open' : ''}><summary class="task-sub">Project restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="project-execution-domains" value="${esc((networkOverride?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="project-execution-cidrs" value="${esc((networkOverride?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
+    <div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
     <button class="btn sm primary" id="project-execution-save">Save compute override</button>`;
     const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
     $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+    $('#project-execution-network')?.addEventListener('change', (event) => {
+      $('#project-network-restrictions').open = event.target.value === 'restricted';
+    });
     $('#project-execution-save')?.addEventListener('click', async () => {
       const pool = $('#project-execution-pool').value;
       const budget = $('#project-execution-budget').value.trim();
+      const selectedNetwork = $('#project-execution-network').value;
+      const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
       try {
         await api(`/api/projects/${proj.id}/execution-policy`, { method: 'PUT', body: JSON.stringify({ override: {
           runnerPoolId: pool || null,
           environment: $('#project-execution-flavor').value ? { flavor: $('#project-execution-flavor').value } : null,
+          network: selectedNetwork === '' ? null : selectedNetwork === 'unrestricted' ? { unrestricted: true }
+            : { unrestricted: false, allowDomains: split('#project-execution-domains'), allowCidrs: split('#project-execution-cidrs') },
           monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
         } }) });
         await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);

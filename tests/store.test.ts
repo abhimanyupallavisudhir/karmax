@@ -28,6 +28,34 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('migrates expanded legacy project infrastructure defaults back to organization inheritance', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-policy-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = {
+      defaultBase: 'main', repos: ['/repo'], worldProvider: 'worktree', runnerPoolId: null,
+      resources: { cpu: 2, memoryMb: 2048 },
+      network: { allowDomains: [], allowCidrs: [], unrestricted: false },
+      environment: {}, monthlyBudgetMicros: null, hibernateAfterMs: 7 * 24 * 60 * 60 * 1000,
+    };
+    const s1 = new Store(dbPath);
+    const migrated = s1.createProject('Legacy', legacy as any);
+    const intentional = s1.createProject('Intentional restriction', {
+      ...legacy, network: { unrestricted: false, allowDomains: ['internal.example'], allowCidrs: [] },
+    } as any);
+    s1.close();
+
+    const s2 = new Store(dbPath);
+    expect(s2.getProject(migrated.id)!.config).toEqual({
+      defaultBase: 'main', repos: ['/repo'], worldProvider: 'worktree',
+    });
+    expect(s2.effectiveProjectConfig(migrated.id).network).toEqual({ unrestricted: true });
+    expect(s2.getProject(intentional.id)!.config.network).toEqual({
+      unrestricted: false, allowDomains: ['internal.example'], allowCidrs: [],
+    });
+    s2.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('creates a project with a default task list', () => {
     const p = store.createProject('Acme', { defaultBase: 'main' });
     expect(p.id).toMatch(/^proj_/);

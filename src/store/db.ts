@@ -79,6 +79,36 @@ export class Store {
 
   /** One-time data migrations (idempotent; run every boot). */
   private migrateData() {
+    // Early organization-policy builds expanded their infrastructure defaults
+    // into every project. Those records accidentally became permanent project
+    // overrides when execution policy later switched to sparse inheritance. In
+    // particular, the old restricted-by-default network object made existing
+    // projects silently lose general internet access even though the current
+    // organization default is unrestricted. Match the complete legacy tuple so
+    // a deliberately customized project policy is never mistaken for a default.
+    const projects = this.db.prepare('SELECT id, config FROM projects').all() as Array<{ id: string; config: string }>;
+    for (const row of projects) {
+      const config = JSON.parse(row.config) as Record<string, any>;
+      const resources = config.resources;
+      const network = config.network;
+      const environment = config.environment;
+      const legacyResources = resources && resources.cpu === 2 && resources.memoryMb === 2048
+        && (resources.gpu === undefined || resources.gpu === 0)
+        && Object.keys(resources).every((key) => ['cpu', 'memoryMb', 'gpu'].includes(key));
+      const legacyNetwork = network?.unrestricted === false
+        && Array.isArray(network.allowDomains) && network.allowDomains.length === 0
+        && Array.isArray(network.allowCidrs) && network.allowCidrs.length === 0
+        && Object.keys(network).every((key) => ['unrestricted', 'allowDomains', 'allowCidrs'].includes(key));
+      const legacyEnvironment = environment && Object.keys(environment).length === 0;
+      if (config.runnerPoolId === null && config.monthlyBudgetMicros === null
+        && config.hibernateAfterMs === 7 * 24 * 60 * 60 * 1000
+        && legacyResources && legacyNetwork && legacyEnvironment) {
+        for (const key of ['runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'])
+          delete config[key];
+        this.db.prepare('UPDATE projects SET config=? WHERE id=?').run(JSON.stringify(config), row.id);
+      }
+    }
+
     // Turn caps are now optional (unlimited by default). Strip the legacy caps
     // that older builds seeded onto the role-default profiles so existing installs
     // match the new "no limit unless you set one" behavior.
