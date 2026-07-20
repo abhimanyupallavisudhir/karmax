@@ -204,6 +204,21 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, message: { type: 'string' } }, required: ['task_id', 'message'] },
   },
   {
+    name: 'publish_task_branch',
+    description: 'Publish this task’s clean, committed Git branch so another agent can import it. Commit first.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'import_task_branch',
+    description: 'Fetch another task’s published branch into a namespaced local ref for inspection, testing, cherry-picking, or merging.',
+    parameters: { type: 'object', properties: { source_task_id: { type: 'string' } }, required: ['source_task_id'] },
+  },
+  {
+    name: 'refresh_upstream',
+    description: 'Fetch the latest upstream base/target branch into refs/remotes/origin. Optionally name another branch.',
+    parameters: { type: 'object', properties: { branch: { type: 'string' } } },
+  },
+  {
     name: 'list_events',
     description: 'Read durable karmax events for a task after an optional sequence number.',
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, since: { type: 'number' } }, required: ['task_id'] },
@@ -409,6 +424,15 @@ export function platformToolHandlers(
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       await platformRequest('POST', `/api/tasks/${taskId}/signal`, { signal: 'followUp', role: args?.role ?? 'do', text: args?.message });
       return 'message delivered';
+    },
+    async publish_task_branch() {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/publish', {}));
+    },
+    async import_task_branch(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/import', { sourceTaskId: String(args?.source_task_id ?? '') }));
+    },
+    async refresh_upstream(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/refresh-upstream', { branch: args?.branch ? String(args.branch) : undefined }));
     },
     async list_events(args) {
       return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/events?since=${Number(args?.since ?? 0)}`));

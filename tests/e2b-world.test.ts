@@ -12,7 +12,9 @@ describe('E2B cloud world provider', () => {
     let ptyInput = '';
     let ptySize = { cols: 0, rows: 0 };
     let ptyData: ((data: unknown) => void) | undefined;
+    let ptyOptions: any;
     let createdOptions: any;
+    let timeoutRefreshes = 0;
 
     const sandbox: E2BSandboxLike = {
       sandboxId: 'sbx_test',
@@ -43,6 +45,7 @@ describe('E2B cloud world provider', () => {
       },
       pty: {
         async create(options: any) {
+          ptyOptions = options;
           ptyData = options.onData;
           return { pid: 41, wait: () => new Promise(() => {}), async kill() { ptyKilled++; } };
         },
@@ -52,6 +55,7 @@ describe('E2B cloud world provider', () => {
       },
       async pause() { paused++; },
       async kill() { killed++; },
+      async setTimeout(value) { expect(value).toBe(123_000); timeoutRefreshes++; },
     };
     const factory: E2BFactory = {
       async create(options) { createdOptions = options; return sandbox; },
@@ -65,7 +69,7 @@ describe('E2B cloud world provider', () => {
       timeoutMs: 123_000,
       lifecycle: { onTimeout: 'pause', autoResume: true },
       metadata: { karmaxTaskId: 'task-cloud' },
-      network: { allowOut: expect.arrayContaining(['github.com']), denyOut: [], allowPublicTraffic: false },
+      network: { allowOut: expect.arrayContaining(['github.com']), denyOut: ['0.0.0.0/0'], allowPublicTraffic: false },
     });
     expect(createdOptions.allowInternetAccess).toBeUndefined();
     expect(world.handle).toMatchObject({ version: 2, kind: 'e2b', provider: 'e2b', root: '/home/user/karmax' });
@@ -86,16 +90,18 @@ describe('E2B cloud world provider', () => {
     await proc.kill();
     expect(processKilled).toBe(1);
 
-    const terminal = await world.openPty();
+    const terminal = await world.openPty({ command: 'exec agent' });
     let terminalOutput = '';
     terminal.onData((chunk) => { terminalOutput += chunk; });
     ptyData?.(new TextEncoder().encode('ready'));
     await terminal.write('pwd\n');
     await terminal.resize(120, 40);
     await terminal.close();
+    expect(timeoutRefreshes).toBeGreaterThanOrEqual(2); // process + PTY leases
     expect(terminal.pid).toBeUndefined(); // remote pid must never enter the host process registry
+    expect(ptyOptions.cmd).toBeUndefined();
     expect(terminalOutput).toBe('ready');
-    expect(ptyInput).toBe('pwd\n');
+    expect(ptyInput).toBe('exec agent\npwd\n');
     expect(await world.previewSocketTarget!(3000, '/hmr?x=1')).toMatchObject({
       url: 'wss://3000-sbx_test.e2b.app/hmr?x=1', headers: { 'x-access-token': 'provider-secret' },
     });
@@ -190,6 +196,40 @@ describe('E2B cloud world provider', () => {
     ]);
     expect(commands.some((command) => command.includes('origin/trunk'))).toBe(true);
     expect(commands.some((command) => command.includes('origin/develop'))).toBe(true);
+  });
+
+  it('uses the desktop SDK flavor for creation, reconnect, and authenticated viewing', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    let created: any;
+    let connected: any;
+    let streamStarts = 0;
+    sandbox.stream = {
+      async start(options) { expect(options).toEqual({ requireAuth: true }); streamStarts++; },
+      getAuthKey: () => 'viewer-secret',
+      getUrl: (options) => `https://desktop.invalid/?auth=${options?.authKey}`,
+    };
+    const provider = new E2BWorldProvider({
+      async create(options) { created = options; return sandbox; },
+      async connect(_id, options) { connected = options; return sandbox; },
+    }, 120_000, undefined, undefined, 'karmax-desktop');
+    const world = await provider.create({ taskId: 'desktop', base: 'main', environment: { flavor: 'desktop' } });
+    expect(created).toMatchObject({ template: 'karmax-desktop', desktop: true });
+    expect(await world.desktopSession!()).toEqual({ provider: 'e2b', url: 'https://desktop.invalid/?auth=viewer-secret' });
+    await provider.park(world.handle);
+    await provider.open(world.handle);
+    expect(connected).toMatchObject({ desktop: true });
+    expect(streamStarts).toBe(1);
+  });
+
+  it('replays a PTY exit that happens before the caller attaches', async () => {
+    const sandbox = fakeSandbox(() => undefined);
+    sandbox.pty.create = async () => ({ pid: 9, async wait() { return { exitCode: 23 }; } });
+    const provider = new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox });
+    const world = await provider.create({ taskId: 'fast-exit', base: 'main' });
+    const pty = await world.openPty();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const code = await new Promise<number | null>((resolve) => pty.onExit(resolve));
+    expect(code).toBe(23);
   });
 });
 

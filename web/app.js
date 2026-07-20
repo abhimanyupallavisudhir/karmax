@@ -4317,7 +4317,7 @@ function selectCheckinPane(v, key, openShell = false) {
   if (changed) renderTaskPage();
   // Selecting the sidebar's "Open terminal" action is deliberately enough to
   // start the PTY; no second click inside the terminal pane is required.
-  if (openShell && key === 'terminal' && v.worldPath && !termIsOpenFor(v.taskId)) {
+  if (openShell && key === 'terminal' && (v.worldAvailable || v.worldPath) && !termIsOpenFor(v.taskId)) {
     document.getElementById('ck-term-hint')?.remove();
     openTerminal(v.taskId);
   }
@@ -4342,14 +4342,15 @@ function checkinTab(v) {
         <span class="ck-count">${conversationEntries(t).length}</span>
       </div>`)
     .join('');
+  const hasWorld = !!(v.worldAvailable || v.worldPath);
   return `<div class="ck-layout">
     <div class="ck-side">
       <div class="ck-side-h">Agents</div>
       ${items}
       <div class="ck-side-h">Shell</div>
       <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
-        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${v.worldPath ? '' : 'disabled'} title="${v.worldPath ? 'Open a terminal in this task world' : 'No world yet'}">
-          <span class="ck-name">${v.worldPath ? 'Open terminal' : 'No world yet'}</span>
+        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? 'Open a terminal in this task world' : 'No world yet'}">
+          <span class="ck-name">${hasWorld ? 'Open terminal' : 'No world yet'}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
         ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
@@ -4374,9 +4375,12 @@ function conversationPane(v, t) {
   // id is published mid-turn (#3), so this appears WHILE the agent runs.
   const sess = S.sessions && S.sessions[t.role];
   const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
+  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && !S.meta?.hosted;
   const copy = forkCmd
     ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
-    : '';
+    : remoteFork
+      ? `<button class="btn sm fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">⑂ fork locally</button>`
+      : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
   // appears only when the workflow currently allows follow-ups.
@@ -4522,7 +4526,9 @@ function terminalPane(v) {
       <span class="pal-sub">a shell in the task's world — killed when you leave the task</span>
       <span style="flex:1"></span>
       ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      ${S.meta?.hosted && v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
+      ${v.worldAvailable && !v.worldPath ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
+      ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
+      ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
       <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No world yet'}</button>
     </div>
     <div class="ck-term">
@@ -4538,9 +4544,16 @@ function wireCheckinSidebar(v) {
     }),
   );
   $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
+  $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
+  $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
+  $('#desktop-open')?.addEventListener('click', async () => {
+    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`); window.open(session.url, '_blank', 'noopener'); }
+    catch (error) { toast(error.message, true); }
+  });
 }
 
 async function openLocalCheckout(v) {
+  if (!S.meta?.hosted) return materializeLocalCheckout(v);
   let plan;
   try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
   catch (error) { return toast(error.message, true); }
@@ -4569,6 +4582,50 @@ async function openLocalCheckout(v) {
       await refreshTask();
     } catch (error) { result.textContent = error.message; button.disabled = false; }
   });
+}
+
+async function materializeLocalCheckout(v, session) {
+  let checkout;
+  try {
+    checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+  } catch (error) { toast(error.message, true); return null; }
+  const fork = session ? forkCommandFor(session, checkout.cwd) : '';
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <p class="task-sub">Karmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world was parked again.</p>
+    <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
+    <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
+    ${fork ? `<div class="section-h" style="margin-top:14px">Fork this agent locally</div><pre class="raw">${esc(fork)}</pre><button class="btn sm local-copy" data-value="${esc(fork)}">Copy fork command</button>` : ''}
+    <div class="section-h" style="margin-top:14px">Repositories</div>
+    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
+  </div></div>`;
+  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
+  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
+  return checkout;
+}
+
+async function forkCloudSessionLocally(v, button) {
+  button.disabled = true;
+  button.textContent = 'Materializing…';
+  const session = { provider: button.dataset.provider, id: button.dataset.session, home: button.dataset.home };
+  const checkout = await materializeLocalCheckout(v, session);
+  if (checkout) await copyToClipboard(forkCommandFor(session, checkout.cwd)).then(() => toast('Fork command copied'));
+  button.disabled = false;
+  button.textContent = '⑂ fork locally';
+}
+
+async function copyNativeAttachCommand(v) {
+  try {
+    const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/terminal-ticket`, { method: 'POST', body: '{}' });
+    const command = [...(result.attachArgv || ['karmax']), 'attach', v.taskId, '--url', result.gatewayUrl, '--ticket', result.ticket]
+      .map((part) => JSON.stringify(String(part))).join(' ');
+    await copyToClipboard(command);
+    toast('One-time attach command copied');
+  } catch (error) { toast(error.message, true); }
 }
 
 // Parameters: everything the human configured on this task, in one place —
@@ -6416,8 +6473,9 @@ async function hydrateExecutionProviders(proj) {
     const environment = policy.effective.worldProvider || 'worktree';
     box.innerHTML = `<div class="settings-grid">
       <label class="form-row">Runner pool<select id="project-execution-pool"></select></label>
+      <label class="form-row">World experience<select id="project-execution-flavor"><option value="">Organization default — ${esc(policy.organization.environment?.flavor || 'headless')}</option><option value="headless" ${policy.override.environment?.flavor === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${policy.override.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
       <label class="form-row">Optional tighter project budget (USD/month)<input id="project-execution-budget" type="number" min="0" step="0.01" value="${policy.override.monthlyBudgetMicros == null ? '' : esc(policy.override.monthlyBudgetMicros / 1e6)}" placeholder="Use organization budget" /></label>
-    </div><div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
+    </div><div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
     <button class="btn sm primary" id="project-execution-save">Save compute override</button>`;
     const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
     $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
@@ -6427,6 +6485,7 @@ async function hydrateExecutionProviders(proj) {
       try {
         await api(`/api/projects/${proj.id}/execution-policy`, { method: 'PUT', body: JSON.stringify({ override: {
           runnerPoolId: pool || null,
+          environment: $('#project-execution-flavor').value ? { flavor: $('#project-execution-flavor').value } : null,
           monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
         } }) });
         await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);
@@ -7288,6 +7347,7 @@ async function hydrateOrganizationView() {
   $('#org-execution').innerHTML = `<div class="settings-grid">
     <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
     <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
+    <label class="form-row">World experience<select id="org-execution-flavor"><option value="headless" ${(executionPolicy.environment?.flavor || 'headless') === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${executionPolicy.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
     <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
     <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
     <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
@@ -7310,8 +7370,8 @@ async function hydrateOrganizationView() {
       <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
       ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
       <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
-      ${provider === 'e2b' ? `<label class="form-row">Template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-node22" /></label>`
-        : `<label class="form-row">Snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="provider default" /></label><label class="form-row">Image<input class="provider-image" value="${esc(config.image || '')}" placeholder="provider default" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
+      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-browser-v1" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
+        : `<label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="recommended" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
       </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
   }).join('');
   $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${r.capacity.activeWorlds} worlds</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
@@ -7347,8 +7407,9 @@ async function hydrateOrganizationView() {
     const provider = row.dataset.provider;
     row.querySelector('.provider-save')?.addEventListener('click', async () => {
       const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
-        ? { template: row.querySelector('.provider-template').value }
+        ? { template: row.querySelector('.provider-template').value, desktopTemplate: row.querySelector('.provider-desktop-template').value }
         : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
+            desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
             apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
       try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await hydrateOrganizationView(); }
       catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
@@ -7366,6 +7427,7 @@ async function hydrateOrganizationView() {
     try {
       await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
         runnerPoolId: $('#org-execution-pool').value || undefined,
+        environment: { flavor: $('#org-execution-flavor').value },
         resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
         network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
         monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),

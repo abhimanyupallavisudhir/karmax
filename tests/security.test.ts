@@ -33,10 +33,12 @@ describe('capability model + attenuation (SPEC §8.2)', () => {
     // Mirrors prepareChildTask: delegation caps attenuated by the parent's grant,
     // merge scoped to the parent's own branch.
     const parentBranch = 'karmax/task_parent';
-    const delegation = attenuate(['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'], ['*']);
+    const collaboration = ['task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
+      'task:conversation:read', 'task:conversation:fork', 'task:conversation:message'];
+    const delegation = attenuate(['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', ...collaboration], ['*']);
     const childGrant = [...delegation, `merge-into:${parentBranch}`];
     // The do-agent profile ceiling still carries the broad merge-into:* …
-    const ceiling = ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'];
+    const ceiling = ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', ...collaboration, 'merge-into:*'];
     const eff = attenuate(ceiling, childGrant);
     // … but the child may merge into ONLY its parent's branch.
     expect(allows(eff, `merge-into:${parentBranch}`)).toBe(true);
@@ -46,6 +48,8 @@ describe('capability model + attenuation (SPEC §8.2)', () => {
     // Delegation caps survive so it can run its own Do/Review/sub-tasks.
     expect(allows(eff, 'create-sub-task')).toBe(true);
     expect(allows(eff, 'signal-completion')).toBe(true);
+    expect(allows(eff, 'task:git:publish')).toBe(true);
+    expect(allows(eff, 'task:git:import')).toBe(true);
   });
 });
 

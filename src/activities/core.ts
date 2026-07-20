@@ -24,6 +24,7 @@ import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
+import { materializeRemoteSession } from '../agent/remote-process.js';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -423,6 +424,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           target: args.target,
           branch: args.branch,
           copyGlobs: args.copyGlobs,
+          ...(remote ? { copySources: cloudSources.map((source) => source.localPath) } : {}),
           gitIdentity,
           gitCredentials,
           ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
@@ -443,7 +445,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           world.handle = store.registerWorld(world.handle, projectId, {
             runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${args.kind}` : 'local'),
             environmentDigest: remote
-              ? (process.env[`KARMAX_${args.kind.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_TEMPLATE`] ?? `karmax-${args.kind}`)
+              ? String(world.handle.meta?.environmentArtifact ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`)
               : 'karmax-local',
           }) as WorldHandle;
         }
@@ -604,11 +606,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
       }
+      // API sessions are stateless. Cloud subscription sessions live in their
+      // sandbox; a requested cross-world session is materialized explicitly below.
       const apiRail = !!resolvedAuth?.apiKey || (!resolvedAuth && (
         (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY) ||
         (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
       ));
-
+      const remoteSubscriptionRail = isRemote(args.worldHandle.kind) && !apiRail;
       // ── Fork a prior agent (SPEC §10.5) ──────────────────────────────────────
       // Branch a NEW session from the source's REAL conversation — NOT by stuffing its
       // transcript into the prompt. Make the source session visible to THIS turn's
@@ -659,7 +663,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (metaRaw) { try { const m = JSON.parse(metaRaw); srcHome = m.home || undefined; srcProvider = m.provider || undefined; } catch { /* ignore */ } }
           let forked = false;
           if (srcSession && (!srcProvider || srcProvider === profile.provider)) {
-            forked = materializeFork({ provider: profile.provider, session: srcSession, forkHome, worldPath: world.handle.root, srcHome });
+            if (remoteSubscriptionRail) {
+              const sourceHandle = store.currentWorld(spec.resumeFrom.taskId) as WorldHandle | undefined;
+              if (sourceHandle && isRemote(sourceHandle.kind)) {
+                try {
+                  const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
+                  forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
+                } catch { /* source world may have expired; try the durable local home below */ }
+              }
+            }
+            if (!forked) forked = materializeFork({ provider: profile.provider, session: srcSession,
+              forkHome, worldPath: world.handle.root, srcHome });
             if (forked) {
               session = srcSession;
               fork = true; // adapter branches a NEW session id from it (native fork)
@@ -816,32 +830,37 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastEmit: string | undefined;
       let result;
       try {
-        publishLegacyAgentState('waiting-slot');
-        // Current workflows carry a stable turn id, so the activity enrolls that
-        // turn in the durable/reorderable coordinator before starting the model.
-        // Historical executions lack the id and retain the replay-safe file gate.
-        if (args.agentTurnId && deps.client && deps.taskQueue) {
-          releaseSlot = await acquireWorkflowAgentSlot({
-            client: deps.client,
-            taskQueue: deps.taskQueue,
-            store,
-            taskId: args.taskId,
-            turnId: args.agentTurnId,
-            role: args.role,
-            provider: profile.provider,
-            title: args.task.title,
-            projectId: args.task.projectId,
-            heartbeat,
-            signal,
-          });
-          try {
-            await awaitAgentResources(heartbeat, signal);
-          } catch (e) {
-            await releaseSlot();
-            releaseSlot = () => {};
-            throw e;
-          }
-        } else releaseSlot = await acquireAgentSlot(heartbeat, signal);
+        // Remote subscription CLIs consume provider-world CPU/RAM, not host
+        // capacity. API rails and local subprocesses retain the host admission
+        // queue; account-level concurrency is enforced separately for every rail.
+        if (!remoteSubscriptionRail) {
+          publishLegacyAgentState('waiting-slot');
+          // Current workflows carry a stable turn id, so the activity enrolls that
+          // turn in the durable/reorderable coordinator before starting the model.
+          // Historical executions lack the id and retain the replay-safe file gate.
+          if (args.agentTurnId && deps.client && deps.taskQueue) {
+            releaseSlot = await acquireWorkflowAgentSlot({
+              client: deps.client,
+              taskQueue: deps.taskQueue,
+              store,
+              taskId: args.taskId,
+              turnId: args.agentTurnId,
+              role: args.role,
+              provider: profile.provider,
+              title: args.task.title,
+              projectId: args.task.projectId,
+              heartbeat,
+              signal,
+            });
+            try {
+              await awaitAgentResources(heartbeat, signal);
+            } catch (e) {
+              await releaseSlot();
+              releaseSlot = () => {};
+              throw e;
+            }
+          } else releaseSlot = await acquireAgentSlot(heartbeat, signal);
+        }
         // The workflow publishes `waiting-slot` immediately after the account grant;
         // only admission itself can truthfully report that the model is now running.
         if (deps.client && args.agentTurnId) {
@@ -851,12 +870,6 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             .catch(() => undefined);
         }
         publishLegacyAgentState('running');
-        if (isRemote(args.worldHandle.kind) && profile.provider !== 'mock' && !apiRail) {
-          throw ApplicationFailure.nonRetryable(
-            'Cloud worlds currently require an API-key agent credential. Subscription CLI sessions execute on the karmax host and cannot safely see a remote filesystem; select an API-key profile for this project.',
-            'cloud-agent-credential',
-          );
-        }
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -1337,7 +1350,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // branch (which the parent owns and merges into). If no branch is known,
       // the child gets no merge capability — never a broad fallback.
       const delegation = attenuate(
-        ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
+        [
+          'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
+          'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
+          'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
+        ],
         args.parentGrant ?? DEFAULT_GRANT,
       );
       const mergeBack = args.parentBranch && allows(args.parentGrant ?? DEFAULT_GRANT, `merge-into:${args.parentBranch}`)
