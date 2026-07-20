@@ -1823,9 +1823,9 @@ function renderRail() {
     <div class="label">Organization</div>
     <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
     <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</a>
-    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>
-    <a class="nav-item ${S.tab === 'profile' ? 'active' : ''}" data-spa href="${globalRoute('profile')}" id="rail-profile" tabindex="0" title="Your profile">◔ Profile${userDisplayName() ? ` · ${esc(userDisplayName())}` : ''}</a>`;
-  // Project + Dashboard/Wiki/Settings/Profile entries are real <a> links — installLinkRouter()
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>`;
+  // Your profile lives in the top bar (#topbar-user), not the rail. Project +
+  // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
 }
@@ -7450,6 +7450,19 @@ function wireSettingsNavigation() {
   activate(location.hash.slice(1));
 }
 
+// { / } walk the settings rail's panes, mirroring the Check-in page's pane
+// navigation. Clicking the nav link reuses wireSettingsNavigation's handler,
+// so the URL hash and active pane stay in sync.
+function cycleSettingsPane(delta) {
+  const layout = document.querySelector('.settings-layout');
+  if (!layout) return;
+  const links = [...layout.querySelectorAll('.settings-nav a[href^="#"]')];
+  if (!links.length) return;
+  const i = links.findIndex((l) => l.classList.contains('active'));
+  const at = i < 0 ? (delta > 0 ? -1 : 0) : i;
+  links[(at + delta + links.length) % links.length]?.click();
+}
+
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">Settings</h1>
@@ -7787,11 +7800,14 @@ const HOST_COMMANDS = [
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
   { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
-  { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g d', run: () => switchTab('dashboard') },
+  { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g D', run: () => switchTab('dashboard') },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
-  { id: 'nav.global', title: 'Go to organization settings', key: 'g g', run: () => switchTab('global') },
-  { id: 'nav.projects', title: 'Go to projects', key: 'g p', run: () => focusRail() },
-  { id: 'nav.notifications', title: 'Go to inbox', key: 'g n', run: () => go(globalRoute('inbox')) },
+  { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', run: () => switchTab('wiki') },
+  { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', run: () => go(globalRoute('orgwiki')) },
+  { id: 'nav.global', title: 'Go to organization settings', key: 'g S', run: () => switchTab('global') },
+  { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
+  { id: 'nav.profile', title: 'Go to your profile', key: 'g A', run: () => go(globalRoute('profile')) },
+  { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', run: () => go(globalRoute('inbox')) },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -7832,6 +7848,10 @@ function allCommands() {
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
   add({ id: 'task.checkin.prev', title: 'Previous Check-in pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
   add({ id: 'task.checkin.next', title: 'Next Check-in pane', keybinding: '}', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(1) });
+  // { / } also walk the settings rail's panes (project or organization settings).
+  const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
+  add({ id: 'settings.pane.prev', title: 'Previous settings section', keybinding: '{', group: 'Navigation', help: false, available: onSettings, run: () => cycleSettingsPane(-1) });
+  add({ id: 'settings.pane.next', title: 'Next settings section', keybinding: '}', group: 'Navigation', help: false, available: onSettings, run: () => cycleSettingsPane(1) });
   // Workflow-contributed task commands: `task.<action>` binds to the selected
   // task's DECLARED action of that name — available only when the selected
   // task runs the contributing workflow and the action is currently enabled.
