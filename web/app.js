@@ -6448,8 +6448,7 @@ function settingsView(proj) {
     <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
-      <div id="wf-pins-list">Loading…</div>
-      <button class="btn" id="activate-sd">Activate software-dev</button></div>
+      <div id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced"><div>Advanced<small>Rarely needed — and hard to undo</small></div></div>
     <div class="card" style="border-color:var(--danger-weak)">
       <div class="section-h" style="color:var(--danger)">Danger zone</div>
@@ -6603,13 +6602,6 @@ function wireSettingsView(proj) {
       out.textContent = e.message;
       out.style.color = 'var(--bad, crimson)';
     } finally { btn.disabled = false; }
-  });
-  $('#activate-sd')?.addEventListener('click', async () => {
-    try {
-      const r = await api(`/api/projects/${proj.id}/activate-workflow`, { method: 'POST', body: JSON.stringify({ workflow: 'software-dev' }) });
-      toast(`Activated (deps: ${r.requires.join(', ') || 'none'}${r.spawnedTasks.length ? '; prep task spawned' : ''})`);
-      refreshTasks();
-    } catch (e) { toast(e.message, true); }
   });
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;

@@ -3,7 +3,7 @@ export const PLATFORM_API_CATALOG = {
   note: 'Every route is authenticated and capability checked. Colon-prefixed names are path parameters.',
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
-    'POST /api/projects/:projectId/activate-workflow', 'GET|POST /api/projects/:projectId/workflow-pins',
+    'GET|POST /api/projects/:projectId/workflow-pins',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
