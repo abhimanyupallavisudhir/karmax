@@ -86,6 +86,84 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     });
   });
 
+  it('uses the structured assistant rate-limit signal even when the SDK result lies about success', async () => {
+    sdkState.messages = [
+      {
+        type: 'assistant', session_id: 's1', error: 'rate_limit',
+        message: { content: [{ type: 'text', text: "You've hit your session limit · resets 2:20am (America/Los_Angeles)" }] },
+      },
+      // This is the exact misleading terminal shape observed in task #183.
+      { type: 'result', subtype: 'success', is_error: true, session_id: 's1', errors: ['completed'] },
+    ];
+    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderFailure);
+    expect(failure.metadata).toMatchObject({
+      kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: '5h',
+    });
+    expect(failure.metadata.resetHint).toBe('2:20am (America/Los_Angeles)');
+  });
+
+  it('uses a rejected SDK rate-limit event even without an assistant error frame', async () => {
+    sdkState.messages = [
+      {
+        type: 'rate_limit_event', session_id: 's1',
+        rate_limit_info: { status: 'rejected', rateLimitType: 'seven_day_opus', resetsAt: Math.floor(Date.now() / 1000) + 120 },
+      },
+      { type: 'result', subtype: 'success', is_error: false, session_id: 's1' },
+    ];
+    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderFailure);
+    expect(failure.metadata).toMatchObject({
+      kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window: 'model', note: 'opus',
+    });
+    expect(failure.metadata.resetHint).toMatch(/^in \d+s$/);
+  });
+
+  it('preserves a text-only API transport failure before a misleading success result', async () => {
+    sdkState.messages = [
+      {
+        type: 'assistant', session_id: 's1',
+        message: {
+          stop_reason: 'stop_sequence',
+          content: [{ type: 'text', text: 'API Error: Connection closed mid-response. The response above may be incomplete.' }],
+        },
+      },
+      // Exact terminal envelope observed in task #240.
+      { type: 'result', subtype: 'success', is_error: true, session_id: 's1', errors: ['completed'] },
+    ];
+    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(ProviderFailure);
+    expect(failure.message).toMatch(/transport interruption.*connection closed mid-response/i);
+  });
+
+  it.each([
+    ['authentication_failed', 'credential'],
+    ['billing_error', 'quota'],
+  ])('types the structured %s assistant failure as hard %s unavailability', async (code, kind) => {
+    sdkState.messages = [{
+      type: 'assistant', session_id: 's1', error: code,
+      message: { content: [{ type: 'text', text: 'account unavailable' }] },
+    }];
+    const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderFailure);
+    expect(failure.metadata).toMatchObject({ kind, permanence: 'hard', provider: 'claude', source: 'structured' });
+  });
+
+  it.each(['overloaded', 'server_error', 'max_output_tokens'])(
+    'surfaces the structured %s assistant failure as a retryable interruption',
+    async (code) => {
+      sdkState.messages = [{
+        type: 'assistant', session_id: 's1', error: code,
+        message: { content: [{ type: 'text', text: 'provider could not finish' }] },
+      }];
+      const failure = await new ClaudeAdapter().runTurn(input, ctx).catch((e) => e);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ProviderFailure);
+      expect(failure.message).toMatch(/overloaded|server_error|interrupted before completion/);
+    },
+  );
+
   it('rejects a stream that ends without any result event', async () => {
     sdkState.messages = [
       { type: 'assistant', session_id: 's1', message: { content: [{ type: 'text', text: 'partial work' }] } },

@@ -136,6 +136,10 @@ describe('workflow-declared resolve rules (SPEC §5.2)', () => {
     expect(autoResolve('do', "You've hit your session limit · resets 3:45pm").resolved).toBe(true);
     expect(autoResolve('do', "You've hit your weekly limit · resets Mon 12:00am").resolved).toBe(true);
     expect(autoResolve('do', 'OpenAI insufficient_quota: check billing').resolved).toBe(true);
+    expect(autoResolve('do', 'codex app-server turn failed: Reconnecting... 1/5 · timeout waiting for child process to exit')).toEqual({
+      resolved: true, action: 'retry', note: 'transient infrastructure error — retrying',
+    });
+    expect(autoResolve('do', 'Claude Code process terminated by signal SIGKILL').resolved).toBe(true);
     expect(
       autoResolve(
         'do',

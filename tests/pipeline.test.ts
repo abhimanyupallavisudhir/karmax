@@ -467,6 +467,36 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('cancelled');
   });
 
+  it('restores the failed stage as soon as an escalated task is retried', async () => {
+    const repo = await h.makeRepo('app-escalation-retry-stage');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId,
+        repo,
+        title: 'Retry stage',
+        // First invocation escalates. On the human retry, failonce has cleared and
+        // the sleep keeps the replacement agent turn observable in the live view.
+        prompt: '@failonce novel agent failure\n@sleep 3000\n@write retry.txt :: resumed\n@review retry worked',
+        resolveAgentEnabled: false,
+      })],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('escalated');
+    await handle.signal('retry');
+    await expect.poll(async () => (await view(handle)).agentTurn?.state, { timeout: 15_000 }).toBe('running');
+    const running = await view(handle);
+    expect(running.stage).toBe('do');
+    expect(running.status).toBe('active');
+    expect(running.error).toBeUndefined();
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+  });
+
   it('escalates when the Resolve agent itself fails instead of failing the workflow', async () => {
     const repo = await h.makeRepo('app-resolver-fail');
     const taskId = newId('task');
@@ -553,6 +583,47 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect((await handle.result()).stage).toBe('cancelled');
   });
 
+  it('rotates on a transient session limit instead of escalating', async () => {
+    const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
+    const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coord.registerAccounts([
+      { id: 'mock:limited', configHome: '/tmp/mock-limited', provider: 'mock', maxConcurrent: 1 },
+      { id: 'mock:fallback', configHome: '/tmp/mock-fallback', provider: 'mock', maxConcurrent: 1 },
+    ]);
+    const accounts = h.client.workflow.getHandle(accountCoordinatorId());
+    await expect.poll(async () => ((await accounts.query('accounts')) as any).accounts.length, { timeout: 10_000 }).toBe(2);
+
+    const repo = await h.makeRepo('app-session-limit');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId,
+        repo,
+        title: 'Session limit',
+        prompt: "@write ok.txt :: hi\n@failonce You've hit your session limit · resets 3:45pm",
+      })],
+    });
+
+    // The limited login is marked unavailable, the same stage is retried on the
+    // fallback login, and no Resolve/human escalation is involved.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const v = await view(handle);
+    expect((v.transcripts ?? []).find((t: any) => t.role === 'resolve')?.messages?.length ?? 0).toBe(0);
+    expect(h.store.eventsSince(taskId, 0).filter((e) => e.type === 'resolve.auto')).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ resolved: true, source: 'provider-metadata' }) }),
+    ]);
+    await expect.poll(async () => {
+      const state = (await accounts.query('accounts')) as any;
+      return state.accounts.find((a: any) => a.id === 'mock:limited')?.status;
+    }, { timeout: 10_000 }).toBe('exhausted');
+
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    await accounts.terminate('test complete').catch(() => {});
+  });
+
   it('semantically classifies novel provider quota wording and marks the credential needs-attention', async () => {
     const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
     const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
@@ -599,8 +670,9 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const handle = await h.client.workflow.start('softwareDev', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
-      // the exact failure shape a suspend/resume produces (2026-07-07 outage)
-      args: [input({ taskId, repo, title: 'Flaky', prompt: '@write ok.txt :: hi\n@failonce API Error: Connection closed mid-response' })],
+      // Exact terminal shape from task #225: Codex had already tried reconnecting,
+      // then its model-refresh child timed out while the internet was down.
+      args: [input({ taskId, repo, title: 'Flaky', prompt: '@write ok.txt :: hi\n@failonce codex app-server turn failed: Reconnecting... 1/5 · failed to refresh available models: timeout waiting for child process to exit' })],
     });
     // the turn dies once (tagged 'agent-infra' → retryable), Temporal re-runs it
     // (~10s backoff) and the task reaches Review normally
@@ -616,7 +688,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     await handle.signal('confirm');
     const result = await handle.result();
     expect(result.stage).toBe('done');
-  });
+  }, 75_000);
 
   // Wait until the parent has surfaced a child's raise AND parked afterward (its last
   // message is the agent's turn on that raise). This guarantees the child is in

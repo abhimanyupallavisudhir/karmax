@@ -3,7 +3,7 @@
  * signature. A hit returns a vetted action (e.g. retry); a miss falls through to
  * the Resolve agent. Agents extend this list through the reviewed PR path.
  */
-import { classifyLimitError } from '../agent/limits.js';
+import { classifyLimitError, isResourceKill, isTransportError } from '../agent/limits.js';
 
 export interface ResolveOutcome {
   resolved: boolean;
@@ -30,21 +30,14 @@ interface ResolveCase {
   outcome: ResolveOutcome;
 }
 
-// NOTE (karmax#4): a signal-9/SIGKILL agent kill is already classified upstream as a
-// retryable `agent-infra` failure in src/activities/core.ts (via the shared
-// `isResourceKill` predicate in src/agent/limits.ts), so it parks-and-retries and
-// does not reach Resolve. The software-dev auto-resolve case for it is tracked as a
-// separate task — when added here, reuse `isResourceKill` rather than a new regex so
-// both paths agree on "is this a signal-9/OOM kill?". IMPORTANT: do NOT hard-code an
-// "out of memory" note. The confirmed sender in the 2026-07 incident was karmax's own
-// reapOrphans() reload sweep, not the kernel OOM killer (journalctl/oomd logged zero
-// kills) — branch on live memory like signalKillMessage() does, or keep the note
-// cause-neutral, so the resolve messaging doesn't encode a misdiagnosis.
 const CASES: ResolveCase[] = [
   {
-    name: 'transient-network',
-    match: (_s, e) => /ETIMEDOUT|ECONNRESET|ENOTFOUND|socket hang up|fetch failed|network/i.test(e),
-    outcome: { resolved: true, action: 'retry', note: 'transient network error — retrying' },
+    name: 'transient-infrastructure',
+    // Most agent-turn failures are tagged `agent-infra` before they get here. This
+    // shared fallback covers legacy histories plus setup/merge activities without
+    // maintaining a second, inevitably divergent list of network/process strings.
+    match: (_s, e) => isTransportError(e) || isResourceKill(e),
+    outcome: { resolved: true, action: 'retry', note: 'transient infrastructure error — retrying' },
   },
   {
     name: 'rate-limit',
