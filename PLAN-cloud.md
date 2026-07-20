@@ -12,8 +12,9 @@ The repository now implements the hosted product baseline end to end:
 - provider-owned exec/process/PTY/files/preview/park operations, with local,
   Docker, memory, E2B, and Daytona adapters;
 - auto-pause plus explicit park-on-wait and transparent resume;
-- remote SSH clone provisioning, API-key agent tool loops operating on the remote
-  world, authenticated terminals/artifacts/previews, and a trusted host Git
+- remote SSH clone provisioning, API-key tool loops plus full Claude/Codex
+  subscription agents executing inside the remote world, authenticated
+  terminals/artifacts/previews, and a trusted host Git
   bundle broker for branch/merge/PR handoff;
 - hosted bind/public-origin settings and a public view projection that never
   exposes world handles, sandbox IDs, repository locations, or provider tokens;
@@ -157,11 +158,22 @@ interface EnvironmentSpec {
 ```
 
 Karmax ships curated, digest-pinned base images containing Git, SSH, common
-language toolchains, the agent harnesses, browser support, and the version-matched
-Karmax runtime/MCP bridge. During project onboarding, the existing bootstrap-task
-pattern inspects a devcontainer/Dockerfile and lockfiles and **proposes** an
-environment; it does not silently execute guessed setup forever. The project may
-import its devcontainer or select a custom image and setup commands.
+language toolchains, the agent harnesses, and browser support. Karmax platform
+tools do not require a sandbox-resident runtime or inbound network route. During
+project onboarding, the existing bootstrap-task pattern inspects a
+devcontainer/Dockerfile and lockfiles and **proposes** an environment; it does
+not silently execute guessed setup forever. The project may import its
+devcontainer or select a custom image and setup commands.
+
+Generic provider templates remain a supported compatibility path. World startup
+probes for Node >= 22.12 and installs a pinned sandbox-local Node/npm runtime when
+the template is older, then installs pinned browser MCPs and Chromium and runs an
+actual headless launch probe. A single Playwright `install-deps` repair is allowed
+when the image lacks browser OS libraries. The restricted E2B policy includes the
+package, browser-download, OS-package, model, Git, and public-gateway hosts needed
+by that path. Curated Karmax templates bake the same artifacts and skip the cold
+start; users do not have to rebuild a selected stock template merely to obtain
+browser parity.
 
 An environment build runs once in an isolated builder and produces an immutable
 snapshot keyed by the spec, source image digest, setup commands, and relevant
@@ -339,11 +351,24 @@ is expected to reach directly.
 
 ### The Karmax runtime boundary
 
-The versioned runtime protocol remains in the trusted activity worker. It runs
-the Claude/Codex model loop and MCP bridge there while every filesystem, command,
-process, PTY, artifact, and port operation is dispatched through the task's
-provider-owned world. This is intentionally safer than copying provider login
-homes or reusable model API keys into untrusted repository compute.
+The versioned runtime protocol remains coordinated by the trusted activity
+worker. Metered API loops run there. Subscription-backed Claude/Codex SDK agents
+run as native subprocesses inside the task's provider-owned world, after the
+leased config home is seeded into a task-private directory. The provider CLI,
+its tools, session files, and repository cwd therefore share the same sandbox,
+matching local execution instead of emulating filesystem calls from the host.
+The stock adapters launch pinned `@anthropic-ai/claude-code` and `@openai/codex`
+packages through `npx` (cached in the sandbox). Claude's CLI pin is derived from
+the installed Agent SDK's declared `claudeCodeVersion`, and a baked executable is
+used only when its reported version matches. Custom images can override package
+specs with `KARMAX_REMOTE_CLAUDE_PACKAGE` and
+`KARMAX_REMOTE_CODEX_PACKAGE`. Their PTY transport runs raw so large JSON protocol
+frames are not subject to canonical-line limits. A small Claude relay presents
+pipe-backed stdin to its streaming CLI while retaining the provider PTY as the
+transport. Active E2B PTYs/background processes renew the sandbox deadline, so
+the nominal idle timeout cannot pause a long-running agent or review server. A
+sandbox-local process-group lease reaps a surviving CLI before a Temporal retry
+starts another writer.
 
 The determinism boundary is unchanged: the workflow awaits one `runAgentTurn`
 activity, the activity emits the typed stream and heartbeats, and cancellation
@@ -351,37 +376,61 @@ kills provider-owned processes. Sandboxes need no inbound SSH and receive only
 the repository read key needed during provisioning; platform actions use a
 short-lived, audience-bound token at the trusted MCP boundary.
 
-## Karmax MCP from a cloud world
+## Karmax platform tools from a cloud world
 
-Most of this path already exists. `platformMcpSpec()` configures a stdio bridge
-to the gateway, and the activity injects a capability-scoped token. For cloud:
+Cloud platform calls travel back over the provider's existing control channel;
+they do not call a public Karmax gateway from the sandbox:
 
-1. The trusted runtime starts the version-matched MCP bridge; it is never an
-   absolute path stored in a world checkpoint.
-2. The bridge calls the Karmax gateway over loopback/TLS while world tools use
-   the provider API. The sandbox itself does not need broad control-plane access.
-3. A turn token carries organization, project, origin task, role, capabilities,
-   audience, expiry, and unique ID. Any gateway replica can verify it.
-4. Do not put a refresh credential in the agent environment. The activity may
-   reissue the same attenuated grant while the execution lease remains valid.
+1. Remote Claude receives the platform handlers as the Agent SDK's in-process MCP
+   server. Remote Codex receives the same schemas as app-server `dynamicTools`;
+   `item/tool/call` requests cross its already-open PTY and execute in the trusted
+   activity process. The capability-scoped turn context authorizes each handler.
+2. A Codex thread created outside this path has no saved dynamic-tool definitions.
+   Before native resume/fork, Karmax enriches only the task-private sandbox copy
+   of its rollout `session_meta`; Codex then reloads the tools through its native
+   continuation path. The durable source transcript is not modified.
+3. Browser MCPs are different: they launch beside the browser inside the world.
+   Codex's app-server inventory and Claude's SDK configuration must expose every
+   explicitly configured browser server before the model turn begins.
+4. The selected Claude/Codex subscription home is copied into an account-keyed,
+   task-private injection directory on first use. Later turns preserve
+   provider-refreshed auth, enforce private file modes, and export only native
+   auth plus conversation files atomically back to that account's durable config
+   home. This makes OAuth rotation, portable hibernation, raw resume, and native
+   cross-task forks survive destruction of the provider world.
 5. Revoke the execution lease on cancellation/end. Keep an auditable token ID,
-   never the raw bearer value, in events.
+   never the raw bearer value, in events. `KARMAX_PUBLIC_URL` remains for genuinely
+   inbound surfaces such as remote human access, OAuth callbacks, and webhooks;
+   it is not a cloud-agent platform-tool prerequisite.
 
-Provider keys, vault roots, Git write keys, Temporal credentials, and runner-pool
-credentials never enter a world. LLM/API credentials should use opaque outbound
-substitution where the provider supports it; otherwise materialize only the
-turn-scoped value in the execution environment and remove it at process end.
+Provider-controller keys, vault roots, Git write keys, Temporal credentials, and
+runner-pool credentials never enter a world. The leased model subscription is
+the intentional exception: its native config files are seeded so the full SDK
+agent can authenticate from inside the sandbox.
 
-The current config home conflates account authentication with conversation state.
-Cloud execution should split them:
+Cloud execution seeds the selected config home into the task sandbox and lets the
+native provider manage its session state there. A later credential-broker
+optimization may split these layers without changing the execution contract:
 
 - **Agent account**: encrypted broker record, organization/user scoped;
 - **Agent profile**: model, behavior, limits, and account-selection policy;
 - **Conversation session**: task × role state/artifact, world-portable where the
   provider permits and transcript-replayable otherwise.
 
-An ephemeral home is assembled for a turn from those three layers and destroyed
-with the execution. No mutable cross-task home is mounted into untrusted worlds.
+Generated provider databases/WALs, logs, history, shell snapshots, telemetry,
+and nested caches are excluded from first-use seeding; they can be hundreds of
+MiB and are neither authentication nor portable conversation state. Explicitly
+requested native sessions are materialized separately, while durable config,
+skills, rules, hooks, plugin manifests, and auth continue through the copy.
+
+A task-private home lives on the non-checkpointed injection surface for that
+world generation, preserving native sessions across turns. Its path includes a
+stable digest of the leased config home, so account rotation cannot accidentally
+reuse another login's refreshed state. The host login home is never mounted;
+selected provider auth/session artifacts synchronize through atomic 0600 copies.
+Remote
+subscription turns use provider-world capacity and do not consume the host RAM/load
+agent-slot queue; their account concurrency and world-pool limits still apply.
 
 ## Network and preview security
 
@@ -667,6 +716,15 @@ ref, and exact branch capability, and then pushes `<verified-sha>:<allowed-ref>`
 over SSH. It never accepts a shell fragment or remote URL from the world. Target
 branch updates additionally require the merge-queue lease and reviewed commit.
 
+Agent collaboration uses the same boundary rather than opening another task's
+filesystem. `publish_task_branch` publishes the caller's clean committed ref;
+`import_task_branch` downloads a collaborator's published ref into
+`refs/karmax/tasks/<task>/<repo>` in the caller's world; and `refresh_upstream`
+updates the requested `refs/remotes/origin/*` ref. Agents coordinate publication
+with `message_agent`, then inspect, test, cherry-pick, merge, or rebase using
+ordinary local Git. Private-repository credentials remain in the broker, while
+the resulting Git experience matches a normal developer branch handoff.
+
 For GitHub Enterprise Cloud customers that already operate an SSH certificate
 authority, a customer runner may instead receive short-lived user certificates;
 GitHub supports expiring OpenSSH certificates for Git operations
@@ -823,13 +881,25 @@ world without reading its root path or spawning its processes directly.
 
 - Versioned Karmax environment Dockerfile/template and provider snapshot cache.
 - Provision from a GitHub repository over SSH; run agent and test commands.
-- Cloud MCP connectivity with scoped token renewal and audit.
+- Cloud platform-tool connectivity over the agent protocol channel, with scoped authorization and audit.
 - Browser PTY, review action stream, signed preview, artifact open.
 - Explicit park at Review, resume on follow-up, portable checkpoint fallback.
 - Merge/push/PR, cancellation, cleanup, quotas, and measured cost events.
 
 This phase is complete only when a task can wait for a human for several days
 with zero sandbox CPU/RAM, then resume and merge without manual repair.
+
+The explicit billable smoke test for an already-configured installation is:
+
+```bash
+KARMAX_LIVE_TASK_ID=task_... npx tsx scripts/live-cloud-subscription.ts
+```
+
+It resolves the E2B credential from Karmax's vault and requires completed scoped
+Karmax dynamic-tool and Chrome DevTools screenshot events; a model merely claiming
+success does not pass the diagnostic. The Karmax tool crosses app-server's existing
+PTY transport and executes on the host, so a locally hosted control plane needs no
+public URL or inbound tunnel for cloud-agent platform tools.
 
 ### Phase 4 — hosted control plane (complete)
 

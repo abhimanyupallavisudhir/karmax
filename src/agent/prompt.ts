@@ -17,6 +17,10 @@ const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration pl
 - save_skill(name, content): persist a reusable skill for future tasks.
 - read_wiki(scope, id, path?) and search_wiki(scope, id, query): navigate and grep the organization/project wikis (skills, memories, prompts). Your instructions include each wiki's table of contents and scope ids; read_wiki with a section path expands any [more…] fold. These run host-side, so they work from every world, including cloud sandboxes.
 - find_task(projectId, number), list_agents(taskId), get_conversation(taskId, role), fork_agent(...), and message_agent(...): discover work by its human #number and robustly inspect or continue another task agent without mutating its original session.
+- message_agent(taskId, message): ask a collaborator to commit and publish its work.
+- publish_task_branch(): publish your clean committed branch for collaborators.
+- import_task_branch(sourceTaskId): fetch a collaborator's published branch into a namespaced local ref, then inspect/test/cherry-pick or merge it normally.
+- refresh_upstream(branch?): fetch the latest upstream branch into refs/remotes/origin before merging or rebasing.
 - list_events(taskId?, since?) and describe_platform(): inspect karmax event/diagnostic context and discover the automation surface.
 - platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by karmax for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, safe mode, settings, review actions, and future UI operations.
 - signal_completion(summary?): optional structured completion summary. Provider-reported successful turn completion is authoritative; this tool is not required.

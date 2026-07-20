@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { RunnerPoolService, WorldLifecycleManager } from '../src/world/runners.js';
 import { WorldRegistry } from '../src/world/registry.js';
+import { WorldAccessService } from '../src/world/access.js';
 
 describe('runner capacity and world lifecycle', () => {
   it('inherits one organization execution policy and keeps project overrides sparse', () => {
@@ -67,6 +68,36 @@ describe('runner capacity and world lifecycle', () => {
     const oversized = store.createProject('Large', { worldProvider: 'daytona', runnerPoolId: 'daytona-only',
       resources: { cpu: 4, memoryMb: 2048 } }, organization.id);
     await expect(runners.acquire({ project: oversized, taskId: 'two', worldId: 'two', provider: 'daytona' })).rejects.toThrow(/exceeds/);
+  });
+
+  it('accounts non-workflow access and reparks a remote world when the last accessor leaves', async () => {
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Access', ownerUserId: 'owner' });
+    const project = store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Inspect', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+    const handle = store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
+      root: '/workspace', workspaceRoot: '/workspace', branch: `karmax/${task.id}`, base: 'main',
+      meta: { projectId: project.id } }, project.id) as any;
+    let parked = 0;
+    const world = { handle, listFiles: async () => [], readFile: async () => '', readFileBuffer: async () => Buffer.alloc(0),
+      writeFile: async () => {}, exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      startProcess: async () => { throw new Error('unused'); }, openPty: async () => { throw new Error('unused'); },
+      destroy: async () => {} } as any;
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', capabilities: { remote: true }, parkable: true, open: async () => world,
+      park: async () => { parked++; return handle; }, status: async () => parked ? 'parked' : 'ready' } as any);
+    const accessService = new WorldAccessService(store, worlds, new RunnerPoolService(store));
+    const access = await accessService.open(task.id, handle);
+    expect(store.activeWorldLeaseCount(task.id)).toBe(1);
+    const borrowed = await accessService.open(task.id, handle);
+    expect(borrowed.runnerLeaseId).toBeUndefined();
+    await access.release();
+    expect(store.activeWorldLeaseCount(task.id)).toBe(0);
+    expect(parked).toBe(0);
+    await borrowed.release();
+    expect(parked).toBe(1);
+    expect(store.worldState(task.id)).toBe('parked');
   });
 
   it('hibernates parked worlds only after a portable checkpoint exists', async () => {

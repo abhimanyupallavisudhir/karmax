@@ -27,6 +27,9 @@ export interface WorldRepo {
   name: string;
   /** Absolute source repo path (the origin the worktree branches off). */
   repo: string;
+  /** Configured network source when `repo` is a managed local checkout. Remote
+   *  providers keep the URL directly in `repo`, so this is normally absent. */
+  source?: string;
   /** Absolute worktree path (where this repo is checked out in the world). */
   root: string;
   /** The branch work happens on in this repo. */
@@ -90,6 +93,9 @@ export interface WorldSpec {
   branch?: string;
   /** Gitignored files (globs) to copy into the world (SPEC §5.2). */
   copyGlobs?: string[];
+  /** Host checkouts corresponding to `repos`, used only by the trusted
+   * provisioner to upload requested gitignored files into a remote clone. */
+  copySources?: Array<string | undefined>;
   /** Worktree-scoped identity/signing for every commit made in this world
    *  (PLAN-git-config.md §4A). Absent ⇒ host identity, else karmax@localhost. */
   gitIdentity?: WorldGitIdentity;
@@ -106,7 +112,7 @@ export interface WorldSpec {
    * attachments. Keys are the exact SSH URLs in `repos`. */
   repositoryBranches?: Record<string, { base: string; target: string }>;
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
-  environment?: { image?: string; snapshot?: string };
+  environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
   resources?: { cpu?: number; memoryMb?: number; gpu?: number };
 }
 
@@ -123,6 +129,13 @@ export function worldRepos(handle: WorldHandle): WorldRepo[] {
       branch: handle.branch, base: handle.base, target: handle.target }];
   }
   return [];
+}
+
+/** Stable configured identity for enrollment/checkpoint lookups. Local
+ * worktrees created from URLs branch from a managed checkout, but must retain
+ * the URL selected in project Settings. */
+export function worldRepoSource(repo: WorldRepo): string {
+  return repo.source ?? repo.repo;
 }
 
 export interface ExecResult {
@@ -167,6 +180,9 @@ export interface WorldPty {
 }
 
 export interface WorldPtySpec {
+  /** Optional command to execute directly on the PTY. Remote agent runtimes use
+   * this bidirectional channel for the Claude/Codex SDK protocol. */
+  command?: string;
   cwd?: string;
   cols?: number;
   rows?: number;
@@ -192,6 +208,12 @@ export interface WorldPreviewSocketTarget {
   headers?: Record<string, string>;
 }
 
+export interface WorldDesktopSession {
+  /** Provider-authenticated browser URL for a human visual check-in. */
+  url: string;
+  provider: string;
+}
+
 export interface World {
   handle: WorldHandle;
   exec(cmd: string, args: string[], opts?: ExecOptions): Promise<ExecResult>;
@@ -208,6 +230,9 @@ export interface World {
   /** Short-lived, server-side upstream for an authenticated preview WebSocket.
    * Provider traffic credentials are returned only to the gateway. */
   previewSocketTarget?(port: number, requestPath: string): Promise<WorldPreviewSocketTarget>;
+  /** Start (or reconnect to) the provider's desktop stack and return its
+   * authenticated noVNC viewer. Present only for desktop-flavor worlds. */
+  desktopSession?(): Promise<WorldDesktopSession>;
   destroy(): Promise<void>;
 }
 

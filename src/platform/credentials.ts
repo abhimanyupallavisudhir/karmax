@@ -39,6 +39,8 @@ export interface CredentialSources {
   logins: { provider: string; account: string; path: string; loggedIn: boolean }[];
   /** Ambient (~/.claude / ~/.codex) login present? */
   ambient: { claude: boolean; codex: boolean };
+  /** Resolved ambient homes. Optional keeps pure callers/tests backwards compatible. */
+  ambientHomes?: { claude?: string; codex?: string };
   /** ANTHROPIC_API_KEY / OPENAI_API_KEY present in the environment? */
   envKeys: { claude: boolean; codex: boolean };
   /** Broker-registered API-key handles (e.g. "claude:work"). */
@@ -54,8 +56,8 @@ export function enumerateCredentials(s: CredentialSources): Credential[] {
     if (!l.loggedIn || !isProvider(l.provider)) continue;
     out.push({ key: `login:${l.provider}:${l.account}`, provider: l.provider, kind: 'login', label: `${l.provider}:${l.account}`, configHome: l.path, account: l.account });
   }
-  if (s.ambient.claude) out.push({ key: 'ambient:claude', provider: 'claude', kind: 'ambient', label: 'claude (ambient ~/.claude)' });
-  if (s.ambient.codex) out.push({ key: 'ambient:codex', provider: 'codex', kind: 'ambient', label: 'codex (ambient ~/.codex)' });
+  if (s.ambient.claude) out.push({ key: 'ambient:claude', provider: 'claude', kind: 'ambient', label: 'claude (ambient ~/.claude)', configHome: s.ambientHomes?.claude });
+  if (s.ambient.codex) out.push({ key: 'ambient:codex', provider: 'codex', kind: 'ambient', label: 'codex (ambient ~/.codex)', configHome: s.ambientHomes?.codex });
   if (s.envKeys.claude) out.push({ key: 'key:claude', provider: 'claude', kind: 'key', label: 'ANTHROPIC_API_KEY' });
   if (s.envKeys.codex) out.push({ key: 'key:codex', provider: 'codex', kind: 'key', label: 'OPENAI_API_KEY' });
   for (const h of s.handles) {

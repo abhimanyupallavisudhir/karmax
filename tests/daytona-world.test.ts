@@ -71,7 +71,7 @@ describe('Daytona cloud world provider', () => {
     await process.kill();
     expect(sessionDeleted).toBe(1);
 
-    const terminal = await world.openPty();
+    const terminal = await world.openPty({ command: 'exec agent' });
     let terminalOutput = '';
     terminal.onData((chunk) => { terminalOutput += chunk; });
     ptyData?.(new TextEncoder().encode('ready'));
@@ -79,7 +79,7 @@ describe('Daytona cloud world provider', () => {
     await terminal.resize(100, 30);
     await terminal.close();
     expect(terminalOutput).toBe('ready');
-    expect(ptyInput).toBe('pwd\n');
+    expect(ptyInput).toBe('exec agent\npwd\n');
     expect(size).toEqual({ cols: 100, rows: 30 });
     expect((await world.previewSocketTarget!(3000, '/hmr')).url).toBe('wss://preview.invalid/hmr?signed=keep');
     const originalFetch = globalThis.fetch;
@@ -120,6 +120,38 @@ describe('Daytona cloud world provider', () => {
     expect(commands.some((command) => command.includes('GIT_SSH_COMMAND=') && command.includes('git clone'))).toBe(true);
     expect(commands.at(-1)).toContain('rm -f');
     expect(JSON.stringify(world.handle)).not.toContain('PRIVATE KEY');
+  });
+
+  it('starts Daytona Computer Use and returns its signed noVNC viewer', async () => {
+    const sandbox = fakeSandbox();
+    let options: any;
+    let computerStarts = 0;
+    let previewPort = 0;
+    sandbox.computerUse = { async start() { computerStarts++; } };
+    sandbox.getSignedPreviewUrl = async (port) => { previewPort = port; return { url: 'https://desktop.invalid/signed' }; };
+    const provider = new DaytonaWorldProvider({
+      async create(value) { options = value; return sandbox; },
+      async get() { return sandbox; },
+    }, 120_000, undefined, undefined, undefined, 'desktop-snapshot');
+    const world = await provider.create({ taskId: 'desktop', base: 'main', environment: { flavor: 'desktop' } });
+    expect(options).toMatchObject({ snapshot: 'desktop-snapshot' });
+    expect(computerStarts).toBe(1);
+    expect(await world.desktopSession!()).toEqual({ provider: 'daytona', url: 'https://desktop.invalid/signed' });
+    expect(previewPort).toBe(6080);
+  });
+
+  it('replays a PTY exit that happens before the caller attaches', async () => {
+    const sandbox = fakeSandbox();
+    sandbox.process.createPty = async () => ({
+      async waitForConnection() {}, async wait() { return { exitCode: 29 }; },
+      async sendInput() {}, async resize() {}, async kill() {},
+    });
+    const provider = new DaytonaWorldProvider({ create: async () => sandbox, get: async () => sandbox });
+    const world = await provider.create({ taskId: 'fast-exit', base: 'main' });
+    const pty = await world.openPty();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const code = await new Promise<number | null>((resolve) => pty.onExit(resolve));
+    expect(code).toBe(29);
   });
 });
 

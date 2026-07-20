@@ -30,6 +30,7 @@ export interface DaytonaSandboxLike {
   };
   getUserHomeDir(): Promise<string>;
   getSignedPreviewUrl(port: number, expiresInSeconds?: number): Promise<{ url: string; token?: string }>;
+  computerUse?: { start(): Promise<unknown>; getStatus?(): Promise<unknown> };
   refreshData?(): Promise<void>;
   start(timeoutSeconds?: number): Promise<void>;
   stop(timeoutSeconds?: number, force?: boolean): Promise<void>;
@@ -59,7 +60,9 @@ export class DaytonaWorldProvider implements WorldProvider {
     private idleMs = positiveInt(process.env.KARMAX_DAYTONA_IDLE_MS, DEFAULT_IDLE_MS),
     private snapshot = process.env.KARMAX_DAYTONA_SNAPSHOT,
     private image = process.env.KARMAX_DAYTONA_IMAGE,
-    private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection) {
+    private resolveConnection?: (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection,
+    private desktopSnapshot = process.env.KARMAX_DAYTONA_DESKTOP_SNAPSHOT,
+    private desktopImage = process.env.KARMAX_DAYTONA_DESKTOP_IMAGE) {
     this.refKey = crypto.createHash('sha256').update(
       process.env.KARMAX_WORLD_REF_KEY ?? process.env.DAYTONA_API_KEY ?? 'karmax-development-world-ref',
     ).digest();
@@ -69,12 +72,19 @@ export class DaytonaWorldProvider implements WorldProvider {
     const connection = this.connection(spec.organizationId);
     const factory = this.factoryFor(connection);
     const environment = spec.environment ?? {};
+    const flavor = environment.flavor ?? 'headless';
+    const selectedSnapshot = environment.snapshot ?? (flavor === 'desktop'
+      ? connection?.config.desktopSnapshot ?? this.desktopSnapshot
+      : connection?.config.snapshot ?? this.snapshot);
+    // Daytona's create API is a discriminated choice. A pre-built snapshot wins;
+    // never forward both snapshot and image as the old settings path did.
+    const selectedImage = selectedSnapshot ? undefined : environment.image ?? (flavor === 'desktop'
+      ? connection?.config.desktopImage ?? this.desktopImage
+      : connection?.config.image ?? this.image);
     const network = daytonaNetwork(spec);
     const sandbox = await factory.create({
-      ...(environment.snapshot ?? connection?.config.snapshot ?? this.snapshot
-        ? { snapshot: environment.snapshot ?? connection?.config.snapshot ?? this.snapshot } : {}),
-      ...(environment.image ?? connection?.config.image ?? this.image
-        ? { image: environment.image ?? connection?.config.image ?? this.image } : {}),
+      ...(selectedSnapshot ? { snapshot: selectedSnapshot } : {}),
+      ...(selectedImage ? { image: selectedImage } : {}),
       labels: { karmaxTaskId: spec.taskId }, public: false,
       autoStopInterval: Math.max(1, Math.ceil(this.idleMs / 60_000)), autoArchiveInterval: 24 * 60,
       autoDeleteInterval: -1, ...network,
@@ -84,6 +94,10 @@ export class DaytonaWorldProvider implements WorldProvider {
     this.sandboxes.set(sandbox.id, sandbox);
     this.states.set(sandbox.id, 'ready');
     try {
+      if (flavor === 'desktop') {
+        if (!sandbox.computerUse) throw new Error('the selected Daytona environment does not support Computer Use');
+        await sandbox.computerUse.start();
+      }
       const home = await sandbox.getUserHomeDir();
       const root = path.posix.join(home, 'karmax');
       const provisioner = provisionTarget(sandbox);
@@ -100,7 +114,8 @@ export class DaytonaWorldProvider implements WorldProvider {
         target: provisioned.repos[0]?.target ?? spec.target,
         repo: provisioned.repos[0]?.repo, repos: provisioned.repos,
         sealedProviderRef: this.seal({ sandboxId: sandbox.id, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) }),
-        meta: { releaseOnCompletion: true },
+        meta: { releaseOnCompletion: true, environmentFlavor: flavor,
+          ...((selectedSnapshot ?? selectedImage) ? { environmentArtifact: selectedSnapshot ?? selectedImage } : {}) },
         ...(provisioned.warnings.length ? { warnings: provisioned.warnings } : {}),
       };
       return new DaytonaWorld(handle, sandbox);
@@ -118,6 +133,10 @@ export class DaytonaWorldProvider implements WorldProvider {
     const sandbox = this.sandboxes.get(id) ?? await this.factoryFor(this.connection(reference.organizationId)).get(id);
     await sandbox.refreshData?.();
     if (!['started', 'starting'].includes(String(sandbox.state ?? '').toLowerCase())) await sandbox.start(90);
+    if (handle.meta?.environmentFlavor === 'desktop') {
+      if (!sandbox.computerUse) throw new Error('the Daytona world no longer exposes Computer Use');
+      await sandbox.computerUse.start();
+    }
     this.sandboxes.set(id, sandbox);
     this.states.set(id, 'ready');
     return new DaytonaWorld(handle, sandbox);
@@ -176,7 +195,8 @@ export class DaytonaWorldProvider implements WorldProvider {
   private connection(organizationId: string | undefined): ResolvedWorldProviderConnection | undefined {
     if (this.resolveConnection) return this.resolveConnection(organizationId, this.kind);
     return process.env.DAYTONA_API_KEY ? { organizationId, provider: this.kind, apiKey: process.env.DAYTONA_API_KEY,
-      config: { snapshot: this.snapshot, image: this.image, apiUrl: process.env.DAYTONA_API_URL,
+      config: { snapshot: this.snapshot, image: this.image, desktopSnapshot: this.desktopSnapshot,
+        desktopImage: this.desktopImage, apiUrl: process.env.DAYTONA_API_URL,
         target: process.env.DAYTONA_TARGET } } : undefined;
   }
 
@@ -265,16 +285,39 @@ class DaytonaWorld implements World {
   async openPty(spec: WorldPtySpec = {}): Promise<WorldPty> {
     const output = new Set<(value: string) => void>();
     const exits = new Set<(code: number | null) => void>();
+    const pending: string[] = [];
+    let attached = false;
+    let exited = false;
+    let exitCode: number | null = null;
     const terminal = await this.sandbox.process.createPty({ id: `karmax-${crypto.randomBytes(8).toString('hex')}`,
       cwd: this.cwd(spec.cwd), envs: remoteEnv(spec.env), cols: spec.cols ?? 80, rows: spec.rows ?? 24,
-      onData: (data: Uint8Array) => { const chunk = new TextDecoder().decode(data); for (const listener of output) listener(chunk); } });
+      onData: (data: Uint8Array) => {
+        const chunk = new TextDecoder().decode(data);
+        if (!attached) pending.push(chunk);
+        for (const listener of output) listener(chunk);
+      } });
     await terminal.waitForConnection?.();
+    if (spec.command) await terminal.sendInput(`${spec.command}\n`);
     void Promise.resolve(terminal.wait?.()).then((result) => {
-      for (const listener of exits) listener(Number(result?.exitCode ?? 0));
-    }).catch(() => { for (const listener of exits) listener(-1); });
+      exited = true;
+      exitCode = Number(result?.exitCode ?? 0);
+      for (const listener of exits) listener(exitCode);
+    }).catch(() => {
+      exited = true;
+      exitCode = -1;
+      for (const listener of exits) listener(exitCode);
+    });
     return {
-      onData(listener) { output.add(listener); return () => output.delete(listener); },
-      onExit(listener) { exits.add(listener); return () => exits.delete(listener); },
+      onData(listener) {
+        output.add(listener);
+        if (!attached) { attached = true; for (const chunk of pending.splice(0)) listener(chunk); }
+        return () => output.delete(listener);
+      },
+      onExit(listener) {
+        if (exited) queueMicrotask(() => listener(exitCode));
+        else exits.add(listener);
+        return () => exits.delete(listener);
+      },
       async write(data) { await terminal.sendInput(data); },
       async resize(cols, rows) { await terminal.resize(cols, rows); },
       async close() { if (terminal.kill) await terminal.kill(); else await terminal.disconnect?.(); },
@@ -301,6 +344,15 @@ class DaytonaWorld implements World {
     target.protocol = target.protocol === 'http:' ? 'ws:' : 'wss:';
     applyPreviewPath(target, requestPath);
     return { url: target.toString() };
+  }
+
+  async desktopSession() {
+    if (this.handle.meta?.environmentFlavor !== 'desktop') throw new Error('this is a headless world');
+    if (!this.sandbox.computerUse) throw new Error('the selected Daytona environment does not support Computer Use');
+    await this.sandbox.computerUse.start();
+    const port = positiveInt(process.env.KARMAX_DAYTONA_NOVNC_PORT, 6080);
+    const signed = await this.sandbox.getSignedPreviewUrl(port, 300);
+    return { provider: 'daytona', url: signed.url };
   }
 
   async destroy(): Promise<void> { await this.sandbox.delete(60); }
@@ -343,7 +395,16 @@ function provisionTarget(sandbox: DaytonaSandboxLike): ProvisionTarget {
 
 function daytonaNetwork(spec: WorldSpec): Record<string, unknown> {
   if (spec.network?.unrestricted) return { networkBlockAll: false };
-  const domains = [...new Set(['github.com', 'api.github.com', 'ssh.github.com', ...(spec.network?.allowDomains ?? [])])];
+  let gateway: string[] = [];
+  try {
+    const value = process.env.KARMAX_REMOTE_GATEWAY_URL ?? process.env.KARMAX_PUBLIC_URL;
+    if (value) gateway = [new URL(value).hostname];
+  } catch { /* invalid hosted config is rejected at boot */ }
+  const domains = [...new Set(['github.com', 'api.github.com', 'ssh.github.com', 'registry.npmjs.org',
+    'cdn.playwright.dev', 'playwright.download.prss.microsoft.com',
+    'deb.debian.org', 'security.debian.org', 'archive.ubuntu.com', 'security.ubuntu.com', 'dl.google.com',
+    'api.anthropic.com', 'claude.ai', 'api.openai.com', 'chatgpt.com', 'auth.openai.com',
+    ...gateway, ...(spec.network?.allowDomains ?? [])])];
   return { networkBlockAll: true, domainAllowList: domains.join(','),
     ...(spec.network?.allowCidrs?.length ? { networkAllowList: spec.network.allowCidrs.join(',') } : {}) };
 }

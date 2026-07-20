@@ -35,6 +35,11 @@ import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import type { KarmaxBus } from '../contrib/bus.js';
+import type { WorldRegistry } from '../world/registry.js';
+import type { WorldHandle } from '../world/types.js';
+import { worldRepos } from '../world/types.js';
+import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, type GitBrokerAuth } from '../world/git-broker.js';
+import type { WorldAccessService } from '../world/access.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -125,6 +130,10 @@ export interface KarmaxApiDeps {
   /** Organization-scoped cloud provider credentials. Kept optional for the
    * small unit-test API harnesses; production always supplies it. */
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  /** World access for permission-checked collaboration tools. */
+  worlds?: WorldRegistry;
+  worldAccess?: WorldAccessService;
+  githubApp?: import('../integrations/github-app.js').GitHubAppService;
   /** Wake live gateway subscribers when platform-side actions append events. The
    * durable event table remains the source of truth when this is absent. */
   bus?: KarmaxBus;
@@ -143,6 +152,79 @@ export class KarmaxApi {
   /** Attach the trigger dispatcher after construction (resolves the ctor cycle). */
   setTriggerArmer(armer: TriggerArmer) {
     this.armer = armer;
+  }
+
+  private collaborationTask(token: string, tool: 'publish_task_branch' | 'import_task_branch' | 'refresh_upstream') {
+    const caller = this.require(token, tool);
+    if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
+    const task = this.deps.store.getTask(caller.taskId);
+    if (!task) throw new Error('calling task not found');
+    const project = this.deps.store.getProject(task.projectId);
+    if (!project?.organizationId) throw new Error('calling task project is unavailable');
+    const handle = (this.deps.store.currentWorld(task.id) ?? task.lastView?.world) as WorldHandle | undefined;
+    if (!handle) throw new Error('calling task has no recoverable world');
+    return { task, project, handle };
+  }
+
+  private gitBrokerAuth(projectId: string): GitBrokerAuth {
+    if (!this.deps.githubApp) throw new Error('Git collaboration requires a connected GitHub App');
+    const linked = this.deps.store.listProjectRepositories(projectId);
+    return async (repo) => {
+      const repository = linked.find((candidate) => candidate.repository.sshUrl === repo.repo)?.repository;
+      if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
+      return this.deps.githubApp!.brokerCredentials(repository);
+    };
+  }
+
+  private async openCollaborationWorld(taskId: string, handle: WorldHandle) {
+    if (this.deps.worldAccess) return this.deps.worldAccess.open(taskId, handle);
+    if (!this.deps.worlds) throw new Error('world access is unavailable');
+    return { world: await this.deps.worlds.open(handle), handle, release: async () => {} };
+  }
+
+  async publishTaskBranch(token: string): Promise<{ branch: string; pushed: string[] }> {
+    const { task, handle } = this.collaborationTask(token, 'publish_task_branch');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      for (const repo of worldRepos(access.world.handle)) {
+        const dirty = await access.world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+        if (dirty.code !== 0) throw new Error(`could not inspect ${repo.name}: ${dirty.stderr || dirty.stdout}`);
+        if (dirty.stdout.trim()) throw new Error(`repo "${repo.name}" has uncommitted changes; commit them before publishing`);
+      }
+      const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId));
+      if (!result.pushed.length || result.skipped.length)
+        throw new Error(`could not publish ${result.skipped.length ? result.skipped.join(', ') : 'task branch'}`);
+      const event = { taskId: task.id, type: 'push.branch', ts: Date.now(), payload: {
+        branch: access.handle.branch, repos: result.pushed, reason: 'agent-collaboration' } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+      return { branch: access.handle.branch, pushed: result.pushed };
+    } finally { await access.release(); }
+  }
+
+  async importTaskBranch(token: string, sourceTaskId: string) {
+    const { task, handle } = this.collaborationTask(token, 'import_task_branch');
+    const source = this.deps.store.getTask(sourceTaskId);
+    if (!source || source.projectId !== task.projectId) throw new Error('source task must belong to the same project');
+    const sourceHandle = (this.deps.store.currentWorld(sourceTaskId) ?? source.lastView?.world) as WorldHandle | undefined;
+    if (!sourceHandle) throw new Error('source task has no published world branch');
+    const published = this.deps.store.eventsSince(sourceTaskId, 0).some((event) => event.type === 'push.branch'
+      && (event.payload as { branch?: string } | undefined)?.branch === sourceHandle.branch);
+    if (!published) throw new Error('source branch is not published yet; message its agent and ask it to commit and call publish_task_branch');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      const refs = await brokerImportTaskBranch(access.world, sourceHandle, sourceTaskId,
+        this.gitBrokerAuth(task.projectId));
+      return { sourceTaskId, refs };
+    } finally { await access.release(); }
+  }
+
+  async refreshUpstream(token: string, branch?: string) {
+    const { task, handle } = this.collaborationTask(token, 'refresh_upstream');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      return { refs: await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch) };
+    } finally { await access.release(); }
   }
 
   listWorldProviderConnections(token: string, organizationId: string) {

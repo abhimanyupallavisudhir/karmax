@@ -6,7 +6,7 @@ import type { WorldCheckpoint, WorldHandleRef } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
 import type { Store } from '../store/db.js';
 import type { World, WorldHandle, WorldKind, WorldRepo } from './types.js';
-import { worldRepos } from './types.js';
+import { worldRepos, worldRepoSource } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
 
@@ -49,8 +49,9 @@ export class WorldCheckpointService {
         }
       }
       const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
-      const repository = linked.find((candidate) => candidate.repository.sshUrl === repo.repo)?.repository;
-      repos.push({ repositoryId: repository?.id ?? `local:${sha256(Buffer.from(repo.repo)).slice(0, 24)}`,
+      const source = worldRepoSource(repo);
+      const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository;
+      repos.push({ repositoryId: repository?.id ?? `local:${sha256(Buffer.from(source)).slice(0, 24)}`,
         checkoutPath: worldRepos(world.handle).length > 1 ? repo.name : '.', baseSha: repo.baseSha ?? handle.base,
         branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined });
     }

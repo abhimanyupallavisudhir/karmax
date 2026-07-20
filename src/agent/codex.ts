@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { PLATFORM_TOOL_SCHEMAS, TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
@@ -14,6 +14,8 @@ import { trackProcess } from '../util/processes.js';
 import { classifyLimitError, providerErrorFromMessage, providerFailure, type ProviderFailureMetadata } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity } from './activity.js';
+import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
+  spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -62,7 +64,7 @@ export class CodexAdapter implements AgentAdapter {
   /** The ChatGPT-subscription rail: the app-server (live, steerable) by default, or
    *  the legacy one-shot `codex exec` when forced via `KARMAX_CODEX_USE_EXEC`. */
   private runSubscription(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    if (process.env.KARMAX_CODEX_USE_EXEC === '1') return this.runCodexExec(input, ctx);
+    if (process.env.KARMAX_CODEX_USE_EXEC === '1' && !isRemoteAgentWorld(input.world)) return this.runCodexExec(input, ctx);
     return this.runCodexAppServer(input, ctx);
   }
 
@@ -214,22 +216,53 @@ export class CodexAdapter implements AgentAdapter {
     const cwd = input.world.handle.root;
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
-    const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome, ...(input.extraEnv ? { extra: input.extraEnv } : {}) });
+    const remote = isRemoteAgentWorld(input.world);
+    const remoteHome = remote
+      ? await seedRemoteAgentHome(input.world, 'codex', input.resolvedAuth?.configHome ?? '', input.session)
+      : undefined;
+    const dynamicTools = PLATFORM_TOOL_SCHEMAS.map((tool) => ({
+      type: 'function', name: tool.name, description: tool.description, inputSchema: tool.parameters,
+    }));
+    // app-server exposes dynamicTools only on thread/start. A thread created by
+    // an ordinary Codex client has no persisted Karmax definitions, so enrich
+    // its sandbox-local rollout metadata before a true native resume/fork.
+    if (remoteHome && input.session)
+      await ensureRemoteCodexSessionTools(input.world, remoteHome, input.session, dynamicTools);
+    let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome, ...(input.extraEnv ? { extra: input.extraEnv } : {}) });
+    if (remoteHome) env = remoteAgentEnv('codex', remoteHome.absolute, {
+      ...env,
+      KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
+    });
+    if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Detached ⇒ its own process group, so killAgent(-pid) reaps codex's descendants.
-    const child = spawn(cmd, ['app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    const child: any = remote
+      ? spawnRemoteAgentProcess({ world: input.world, provider: 'codex', command: cmd, args: ['app-server'], cwd, env, signal: ctx.signal })
+      : spawn(cmd, ['app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
+    const platformHandlers = platformToolHandlers(input.world, ctx);
     let stderr = '';
-    child.stderr?.on('data', (d) => { stderr += d.toString(); });
+    child.stderr?.on('data', (d: Buffer | string) => { stderr += d.toString(); });
 
     const cleanups: Array<() => void> = [];
     const hb = ctx.heartbeat ? setInterval(() => { try { ctx.heartbeat!(); } catch { /* ignore */ } }, 10_000) : undefined;
     // Materialize a set of messages' image attachments to real files → `localImage`
     // input items (the app-server takes paths, like `codex exec -i`). Cleaned in finally.
-    const imageItems = (msgs: any[]): any[] => {
+    const imageItems = async (msgs: any[]): Promise<any[]> => {
       const { files, cleanup } = materializeImageFiles(msgs);
       cleanups.push(cleanup);
+      if (remote) {
+        const uploaded: string[] = [];
+        for (const file of files) {
+          const relative = `.karmax-injection/agent/codex/images/${path.basename(file)}`;
+          const content = fs.readFileSync(file);
+          if (!input.world.writeFileBuffer) throw new Error('remote world cannot receive image attachments');
+          await input.world.writeFileBuffer(relative, content);
+          uploaded.push(path.posix.join(input.world.handle.root, relative));
+        }
+        return uploaded.map((p) => ({ type: 'localImage', path: p }));
+      }
       return files.map((p) => ({ type: 'localImage', path: p }));
     };
 
@@ -237,7 +270,26 @@ export class CodexAdapter implements AgentAdapter {
     // boundary, so run with approvals off and full access — the app-server analogue
     // of `codex exec --dangerously-bypass-approvals-and-sandbox`. Any approval the
     // server still requests is auto-granted below.
-    client.onServerRequest((method) => (/approval/i.test(method) ? { decision: 'approved_for_session' } : {}));
+    client.onServerRequest(async (method, params) => {
+      if (/approval/i.test(method)) return { decision: 'approved_for_session' };
+      if (method !== 'item/tool/call' || !remote) return {};
+      const tool = String(params?.tool ?? '');
+      const handler = platformHandlers[tool];
+      if (!handler) return { contentItems: [{ type: 'inputText', text: `unknown Karmax tool ${tool}` }], success: false };
+      const id = String(params?.callId ?? tool);
+      ctx.emitActivity({ id, kind: 'tool', phase: 'started', title: tool,
+        ...(activityDetail(params?.arguments) ? { detail: activityDetail(params.arguments) } : {}) });
+      try {
+        const result = await handler(params?.arguments ?? {});
+        ctx.emitActivity({ id, kind: 'tool', phase: 'completed', title: tool,
+          ...(activityDetail(result) ? { detail: activityDetail(result) } : {}) });
+        return { contentItems: [{ type: 'inputText', text: result }], success: true };
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        ctx.emitActivity({ id, kind: 'tool', phase: 'failed', title: tool, detail });
+        return { contentItems: [{ type: 'inputText', text: detail }], success: false };
+      }
+    });
 
     let threadId: string | undefined = input.session;
     let currentTurnId: string | undefined;
@@ -248,6 +300,7 @@ export class CodexAdapter implements AgentAdapter {
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
     let shuttingDown = false;
+    const mcpStartup: any[] = [];
     // How many `input.messages` this turn has consumed — the initial delta up to the
     // schedule snapshot, then one more per in-flight follow-up steered/started below.
     let deliveredIndex = input.messages.length;
@@ -260,8 +313,8 @@ export class CodexAdapter implements AgentAdapter {
     // If the subprocess dies (bad spawn, an app-server-less older CLI, a crash), don't
     // hang waiting on a response that will never come: record it and settle the turn so
     // the awaited handshake/turn rejects promptly and the workflow can resolve/retry.
-    child.once('error', (e) => { turnError = turnError ?? `codex app-server spawn error: ${String(e)}`; turnActive = false; client.close(); settleTurn?.(); });
-    child.once('close', (code, signal) => {
+    child.once('error', (e: Error) => { turnError = turnError ?? `codex app-server spawn error: ${String(e)}`; turnActive = false; client.close(); settleTurn?.(); });
+    child.once('close', (code: number | null, signal: NodeJS.Signals | null) => {
       if (!shuttingDown && !turnError) {
         turnError = `codex app-server connection closed unexpectedly (code ${code ?? -1}${signal ? `, signal ${signal}` : ''})${stderr ? `: ${stderr.slice(0, 200)}` : ''}`;
       }
@@ -319,6 +372,14 @@ export class CodexAdapter implements AgentAdapter {
             ...(activityDetail(params?.message) ? { detail: activityDetail(params.message) } : {}),
           });
           break;
+        case 'mcpServer/startupStatus/updated':
+          mcpStartup.push(params);
+          ctx.emitActivity({
+            id: `mcp-startup-${String(params?.name ?? params?.serverName ?? mcpStartup.length)}`,
+            kind: 'status', phase: 'updated', title: `MCP · ${String(params?.name ?? params?.serverName ?? 'startup')}`,
+            ...(activityDetail(params) ? { detail: activityDetail(params) } : {}),
+          });
+          break;
         case 'warning':
         case 'configWarning':
           ctx.emitActivity({
@@ -365,7 +426,8 @@ export class CodexAdapter implements AgentAdapter {
     // Mid-turn cancel (SPEC §5.6): interrupt the active turn, then reap the group.
     const onAbort = () => {
       if (threadId && currentTurnId) client.request('turn/interrupt', { threadId, turnId: currentTurnId }).catch(() => undefined);
-      void killAgent(child.pid);
+      if (child.pid) void killAgent(child.pid);
+      else child.kill('SIGTERM');
       settleTurn?.();
     };
     if (ctx.signal?.aborted) onAbort();
@@ -385,7 +447,7 @@ export class CodexAdapter implements AgentAdapter {
           if (!turnActive) break; // turn ended mid-drain → leave the rest for next turn
           if (m.role !== 'system' && m.role !== 'agent') {
             try {
-              await client.request('turn/steer', { threadId, expectedTurnId: currentTurnId, input: [{ type: 'text', text: m.text, text_elements: [] }, ...imageItems([m])] });
+              await client.request('turn/steer', { threadId, expectedTurnId: currentTurnId, input: [{ type: 'text', text: m.text, text_elements: [] }, ...await imageItems([m])] });
             } catch {
               break; // steer rejected (turn no longer active) → don't advance past it
             }
@@ -400,13 +462,53 @@ export class CodexAdapter implements AgentAdapter {
 
     try {
       // ── Handshake ──
-      await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' }, capabilities: null });
+      await client.request('initialize', { clientInfo: { name: 'karmax', title: 'karmax', version: '1.0.0' },
+        capabilities: { experimentalApi: true, requestAttestation: false } });
       client.notify('initialized');
+      if (remote && Object.keys(remoteHome?.browserMcp ?? {}).length) {
+        // Dynamic Karmax tools use this control channel and therefore need no
+        // sandbox startup probe. Browser MCPs really do launch remotely: ask
+        // app-server for its authoritative inventory and fail before the model
+        // turn when an explicitly provisioned browser did not load.
+        const required = Object.keys(remoteHome?.browserMcp ?? {});
+        let servers: any[] = [];
+        let missing = required;
+        const deadline = Date.now() + 30_000;
+        do {
+          const inventory = await client.request<any>('mcpServerStatus/list', {
+            cursor: null, limit: 100, detail: 'toolsAndAuthOnly', threadId: null,
+          });
+          servers = Array.isArray(inventory?.data) ? inventory.data : [];
+          missing = required.filter((name) => {
+            const server = servers.find((candidate) => candidate?.name === name);
+            if (!server) return true;
+            const tools = server.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [];
+            return tools.length === 0;
+          });
+          if (!missing.length || Date.now() >= deadline) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        } while (true);
+        if (missing.length) {
+          const observed = servers.map((server) => ({ name: server?.name,
+            tools: server?.tools && typeof server.tools === 'object' ? Object.keys(server.tools) : [] }));
+          throw new Error(`remote Codex MCP startup incomplete (missing ${missing.join(', ')}; observed ${JSON.stringify(observed)}; startup ${JSON.stringify(mcpStartup)})`);
+        }
+      }
 
       // ── Thread: resume the prior one, or start fresh (systemPrompt → developer
       //    instructions; the thread carries them so resumes don't re-send them). ──
       const resuming = !!input.session;
-      if (resuming) {
+      if (resuming && input.fork) {
+        const forked = await client.request<any>('thread/fork', {
+          threadId: input.session,
+          cwd,
+          sandbox: 'danger-full-access',
+          approvalPolicy: 'never',
+          developerInstructions: input.systemPrompt,
+          ...(model ? { model } : {}),
+        });
+        threadId = forked?.thread?.id ?? threadId;
+      } else if (resuming) {
         // Resume otherwise reloads the CLI/config defaults (`:workspace` +
         // on-request in current Codex), discarding karmax's headless posture.
         await client.request('thread/resume', {
@@ -422,6 +524,7 @@ export class CodexAdapter implements AgentAdapter {
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
           developerInstructions: input.systemPrompt,
+          ...(remote ? { dynamicTools } : {}),
           ...(model ? { model } : {}),
         });
         threadId = started?.thread?.id ?? threadId;
@@ -433,7 +536,7 @@ export class CodexAdapter implements AgentAdapter {
       //    never folds the agent's own prior replies back in as user input). ──
       const convo = messagesToDeliver(input).filter((m) => m.role !== 'system');
       const initialText = conversationToPromptText(convo) || (resuming ? 'Continue.' : 'Begin the task described in the developer instructions.');
-      let nextInput: any[] = [{ type: 'text', text: initialText, text_elements: [] }, ...imageItems(convo)];
+      let nextInput: any[] = [{ type: 'text', text: initialText, text_elements: [] }, ...await imageItems(convo)];
 
       // ── Turn loop (Model-B): run a turn; follow-ups arriving DURING it are steered
       //    in-flight; any that land after it start a follow-on turn in this same
@@ -469,7 +572,7 @@ export class CodexAdapter implements AgentAdapter {
         nextInput = [];
         if (ctx.pullFollowUps) {
           for (const m of await ctx.pullFollowUps(deliveredIndex)) {
-            if (m.role !== 'system' && m.role !== 'agent') nextInput.push({ type: 'text', text: m.text, text_elements: [] }, ...imageItems([m]));
+            if (m.role !== 'system' && m.role !== 'agent') nextInput.push({ type: 'text', text: m.text, text_elements: [] }, ...await imageItems([m]));
             deliveredIndex++;
           }
         }
@@ -487,9 +590,12 @@ export class CodexAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       client.close();
-      void killAgent(child.pid);
+      if (child.pid) void killAgent(child.pid);
+      else child.kill('SIGTERM');
       unregisterAgent(child.pid);
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
+      if (remoteHome && input.resolvedAuth?.configHome)
+        await syncRemoteAgentHome(input.world, 'codex', remoteHome, input.resolvedAuth.configHome);
     }
 
     // A limit can also arrive as a rejected request (handshake/turn) or a subprocess

@@ -28,7 +28,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
 
   it('resolves a browser + platform MCP baseline (SPEC §7.5)', () => {
     const servers = mcpServerMap({ browser: 'chrome-devtools', platform: { command: 'node', args: ['mcp.js'] } });
-    expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] });
+    expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@1.6.0'] });
     expect(servers['karmax']).toEqual({ command: 'node', args: ['mcp.js'] });
     expect(mcpServerMap({ browser: 'none' })).toEqual({});
   });
@@ -307,7 +307,12 @@ describe('PTY terminal check-in (SPEC §5.5)', () => {
       if (v?.worldPath) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    const wsUrl = base.replace('http', 'ws') + `/ws/terminal?taskId=${task.id}&token=${encodeURIComponent(token)}`;
+    const ticket: any = await (await fetch(`${base}/api/tasks/${task.id}/terminal-ticket`, {
+      method: 'POST', headers: auth, body: '{}',
+    })).json();
+    expect(ticket.gatewayUrl).toBe(base);
+    expect(ticket.expiresAt).toBeGreaterThan(Date.now());
+    const wsUrl = base.replace('http', 'ws') + `/ws/terminal?taskId=${task.id}&ticket=${encodeURIComponent(ticket.ticket)}`;
     const got = await new Promise<string>((resolve) => {
       const ws = new WebSocket(wsUrl);
       let buf = '';
