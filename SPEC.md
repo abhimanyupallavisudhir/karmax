@@ -591,6 +591,14 @@ listed as manifest subscriptions.
 
 **Multi-repo worlds.** A project may configure several `repos`; a task's world then checks out **one worktree per repo**, each on the same `karmax/<taskId>` branch off its own base. A single repo keeps the flat layout (the world root *is* the worktree); with several, the world root is a parent directory holding one subdirectory per repo (named after it, deduped on collision), so the agent sees `frontend/`, `backend/`, … side by side and works across them. The finalize-merge lands the branch in **every** repo, stopping at the first conflict for the merge agent to resolve — a re-run re-merges already-landed repos as no-ops (partial-merge recoverable, not atomic). The world handle carries the full `repos[]`; older single-repo handles are read through a compatibility shim (`worldRepos`).
 
+For the local worktree provider, a configured network Git URL is materialized
+once as a Karmax-managed local checkout under the worlds data directory; task
+worktrees branch from that checkout exactly as they do from a user-supplied
+local path. The handle retains the configured URL separately for repository
+enrollment and checkpoint identity. Clone credentials are ephemeral (a selected
+GitHub repository's read-only deploy key, then a Git profile, then host Git/SSH)
+and are never written into the checkout or durable handle.
+
 A multi-repo task must serialize against *every* repo it touches, not just one — so it takes a slot in the merge queue (§6.1) of **each** repo. To keep concurrent multi-repo merges deadlock-free, slots are acquired by **ordered acquisition** (lock ordering): the task's repos are sorted into one global order and their slots claimed one at a time in that order, holding each while it waits for the next. Because all tasks request shared repos in the same order, a task only ever waits on a repo ordered *after* everything it already holds, so the wait-for graph is acyclic and the classic three-task cycle (A&B, A&C, B&C) cannot deadlock. Slots are released after the finalize-merge (and on cancel/abort); an orphaned lease is reclaimed by the coordinator's liveness check.
 
 ### 11.2 Backends
