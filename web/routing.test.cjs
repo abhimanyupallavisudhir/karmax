@@ -104,6 +104,14 @@ eq(parseRoute('/acme/website-redesign/tasks/42/checkin'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin' },
   'parse a task permalink pinned to a tab');
 
+// ── Wiki routes (org-level bottom-left link + project tab) ────────────────────
+eq(globalRoute('orgwiki'), '/acme/wiki', 'internal tab "orgwiki" → URL segment "wiki"');
+eq(parseRoute('/acme/wiki'), { name: 'global', org: 'acme', tab: 'orgwiki' }, 'parse /<org>/wiki as the organization wiki');
+eq(projectRoute('P1', 'wiki'), '/acme/website-redesign/wiki', 'project wiki route');
+eq(parseRoute('/acme/website-redesign/wiki'),
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'wiki', taskKey: null, taskTab: null },
+  'parse a project wiki tab');
+
 // ── Round-trip: build → parse → resolve ───────────────────────────────────────
 const r = parseRoute(projectRoute('P2'));
 eq(organizationBySlug(r.org)?.id, 'org_globex', 'built project route resolves back to its org');

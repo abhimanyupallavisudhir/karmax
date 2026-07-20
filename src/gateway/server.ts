@@ -95,6 +95,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
+  // The wiki is the skills store: reads need the scope's read capability, edits
+  // reuse skill:write (agents and developers can both grow it).
+  if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
+  if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
@@ -2059,6 +2063,39 @@ export class Gateway {
         await api.moveAgentQueueItem(token, String(b.turnId), b.beforeTurnId ? String(b.beforeTurnId) : undefined);
         return this.json(res, 200, { ok: true });
       }
+      // Wiki — org/project skills, memories, and general prompts. One route
+      // family per scope; KarmaxApi enforces read/write capabilities and path
+      // safety, so the wiki works identically for humans (UI) and agents
+      // (read_wiki/search_wiki/platform_request, including from cloud worlds).
+      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search))?$/);
+      if (wikiMatch) {
+        const scope = wikiMatch[1] === 'projects' ? ('project' as const) : ('organization' as const);
+        const id = wikiMatch[2]!;
+        const sub = wikiMatch[3];
+        try {
+          if (!sub && method === 'GET') return this.json(res, 200, api.readWiki(token, scope, id, url.searchParams.get('path') ?? ''));
+          if (sub === 'page') {
+            if (method === 'GET') {
+              const read = api.readWiki(token, scope, id, String(url.searchParams.get('path') ?? ''));
+              return 'page' in read ? this.json(res, 200, read.page) : this.json(res, 404, { error: 'wiki page not found' });
+            }
+            if (method === 'PUT') {
+              const b = await this.body(req);
+              return this.json(res, 200, api.saveWikiPage(token, scope, id, {
+                path: String(b.path ?? ''), content: String(b.content ?? ''), kind: b.kind === 'memory' ? 'memory' : 'skill',
+                create: b.create === true, prevPath: b.prevPath ? String(b.prevPath) : undefined,
+              }));
+            }
+            if (method === 'DELETE') return this.json(res, 200, api.deleteWikiPage(token, scope, id, String(url.searchParams.get('path') ?? '')));
+          }
+          if (sub === 'search' && method === 'GET') return this.json(res, 200, api.searchWiki(token, scope, id, String(url.searchParams.get('q') ?? '')));
+        } catch (error) {
+          if (error instanceof CapabilityError) throw error;
+          const conflict = /already exists/.test(String((error as Error)?.message));
+          return this.json(res, conflict ? 409 : 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
       // platform API surface used by the MCP server (save skill / propose edit)
       if (p === '/api/skills' && method === 'POST') {
         const b = await this.body(req);
