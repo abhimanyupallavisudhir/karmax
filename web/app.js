@@ -1191,7 +1191,7 @@ function renderMessageImages(images) {
 
 // ── conversation rendering: markdown + math ──────────────────────────────────
 // Messages render as Markdown (with optional MathJax) by default; both can be
-// turned off in Organization settings → Advanced → Appearance. The flags live in
+// turned off on the Profile page → Appearance. The flags live in
 // localStorage (a per-browser display choice, like the theme toggle), and every
 // reader is defensive about a missing localStorage so the same functions run
 // under the plain-node conversation tests.
@@ -6514,13 +6514,6 @@ function globalSettingsView(embedded = false) {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
       </div>
     </div>
-    <div class="card" id="appearance-card">
-      <div class="section-h">Appearance</div>
-      <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
-      <div class="switch"><input type="checkbox" id="gs-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="gs-md-render">Render conversation messages as Markdown</label></div>
-      <div class="switch"><input type="checkbox" id="gs-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="gs-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
-      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
-    </div>
     <div class="card" id="resilience-card">
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
@@ -7039,17 +7032,6 @@ function wireGlobalSettings(organizationId) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#gs-theme')?.addEventListener('click', toggleTheme);
-  $('#gs-md-render')?.addEventListener('change', (e) => {
-    try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
-    if (S.taskTab === 'checkin') renderTaskPage();
-    toast(`Markdown rendering ${e.target.checked ? 'on' : 'off'}`);
-  });
-  $('#gs-mathjax')?.addEventListener('change', (e) => {
-    try { localStorage.setItem('karmax-mathjax', e.target.checked ? '1' : '0'); } catch {}
-    if (S.taskTab === 'checkin') renderTaskPage();
-    toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
-  });
   $('#safe-mode')?.addEventListener('change', async (e) => {
     try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
   });
@@ -7144,8 +7126,10 @@ function profileView() {
     </div>
     <div class="card">
       <div class="section-h">Appearance</div>
-      <p class="task-sub">The light / dark preference is remembered in this browser.</p>
       <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
+      <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
+      <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
+      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
     <div class="card">
       <div class="section-h">Session</div>
@@ -7157,6 +7141,16 @@ function profileView() {
 
 function wireProfileView() {
   $('#profile-theme')?.addEventListener('click', toggleTheme);
+  $('#profile-md-render')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
+    if (S.taskTab === 'checkin') renderTaskPage();
+    toast(`Markdown rendering ${e.target.checked ? 'on' : 'off'}`);
+  });
+  $('#profile-mathjax')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-mathjax', e.target.checked ? '1' : '0'); } catch {}
+    if (S.taskTab === 'checkin') renderTaskPage();
+    toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
+  });
   $('#profile-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();
@@ -7250,7 +7244,7 @@ async function hydrateOrganizationView() {
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   const authorization = $('#authorization-card-global');
   if (authorization && $('#org-authorization-slot')) $('#org-authorization-slot').append(authorization);
-  for (const card of [$('#main [data-wf="agent-queue"]'), $('#appearance-card'), $('#resilience-card')])
+  for (const card of [$('#main [data-wf="agent-queue"]'), $('#resilience-card')])
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
   await loadCollaboration().catch(() => {});
