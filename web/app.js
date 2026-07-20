@@ -45,12 +45,22 @@ const S = {
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   agentQueue: { capacity: 3, queue: [], current: [] }, // workflow-owned host admission queue
   modelCatalog: null, // provider-native model metadata loaded from the gateway
+  // The notification surface is an action inbox, not an event log. It is loaded
+  // across every visible project and contains only tasks currently waiting for a
+  // human decision (review) or direction (escalated).
+  attention: [],
+  attentionLoaded: false,
+  attentionLoading: false,
+  attentionError: null,
+  attentionFilter: 'all',
 };
 
 // Non-principal attempts are intentionally absent from S.tasks because the list
 // has one row per logical task. Page lookups must also consult the loaded group.
 function taskRecord(id) {
-  return (S.attemptGroup?.attempts || []).find((t) => t.id === id) || (S.tasks || []).find((t) => t.id === id);
+  return (S.attemptGroup?.attempts || []).find((t) => t.id === id)
+    || (S.tasks || []).find((t) => t.id === id)
+    || (S.attention || []).find((t) => t.id === id);
 }
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
@@ -61,6 +71,7 @@ function taskRecord(id) {
 // Scheme:
 //   /                                    → home (redirects to a project's tasks)
 //   /dashboard                           → global dashboard
+//   /notifications                       → global human-attention inbox
 //   /settings                            → global settings
 //   /projects/:name/tasks                → task list (also /queue, /activity, /settings)
 //   /projects/:name/tasks/:num           → the task's own page (permalink)
@@ -83,6 +94,7 @@ function parseRoute(pathname) {
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard' };
   if (seg[0] === 'settings') return { name: 'global', tab: 'global' };
+  if (seg[0] === 'notifications') return { name: 'global', tab: 'notifications' };
   if (seg[0] === 'projects' && seg[1]) {
     const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
@@ -131,6 +143,10 @@ async function applyRoute() {
     renderRail();
     renderMain();
     if (r.tab === 'dashboard') renderDashboard();
+    // Re-evaluate on every inbox visit. Notifications are projections of current
+    // task state, so returning after acting on the task page must never revive the
+    // old review/blocker card even if its WebSocket transition was missed.
+    if (r.tab === 'notifications') loadAttention();
     return;
   }
   // project / task routes → resolve the project (by name-slug) + optional open task
@@ -962,7 +978,15 @@ async function boot() {
   renderShell();
   bindKeys();
   window.addEventListener('popstate', () => applyRoute());
+  document.addEventListener('visibilitychange', () => {
+    // A background tab can miss a socket transition during reconnect. Refetching
+    // on focus makes stale attention self-heal without polling while idle.
+    if (document.visibilityState === 'visible' && S.attentionLoaded) scheduleAttentionRefresh();
+  });
   await applyRoute(); // honor the initial URL (deep link / bookmark)
+  // Prime the global badge without delaying first paint. The notifications page
+  // itself shows an honest loading state if it is the initial route.
+  if (!S.attentionLoaded && !S.attentionLoading) loadAttention();
 }
 
 async function loadProjects() {
@@ -981,6 +1005,55 @@ async function loadTasks() {
   // set can't grow without bound (task ids are never reused).
   for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
   S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
+}
+
+let attentionPromise = null;
+let attentionReloadQueued = false;
+async function loadAttention() {
+  // Coalesce bursts, but remember that state changed during the in-flight read.
+  // The follow-up pass closes the race where an older response could otherwise
+  // repaint a notification after its task had already advanced.
+  if (attentionPromise) {
+    attentionReloadQueued = true;
+    return attentionPromise;
+  }
+  S.attentionLoading = true;
+  S.attentionError = null;
+  if (S.tab === 'notifications') renderMain();
+  attentionPromise = (async () => {
+    const query = 'stage:review,escalated -status:done,failed,cancelled -is:archived -is:subtask sort:updated-desc';
+    const results = await Promise.allSettled(S.projects.map(async (project) => {
+      const result = await api(`/api/projects/${project.id}/search?q=${encodeURIComponent(query)}`);
+      return (result.tasks || []).map((task) => ({ ...task, projectName: project.name }));
+    }));
+    const loaded = results.filter((r) => r.status === 'fulfilled');
+    S.attention = loaded
+      .flatMap((r) => r.value)
+      .filter(isAttentionTask)
+      .sort((a, b) => {
+        const blocked = Number(b.lastView?.stage === 'escalated') - Number(a.lastView?.stage === 'escalated');
+        if (blocked) return blocked;
+        const priority = Number(b.params?.priority || 0) - Number(a.params?.priority || 0);
+        return priority || (b.lastView?.updatedAt || b.createdAt || 0) - (a.lastView?.updatedAt || a.createdAt || 0);
+      });
+    S.attentionLoaded = true;
+    if (loaded.length !== results.length) {
+      S.attentionError = loaded.length
+        ? `Could not check ${results.length - loaded.length} project${results.length - loaded.length === 1 ? '' : 's'}.`
+        : 'Could not load notifications.';
+    }
+  })().finally(() => {
+    S.attentionLoading = false;
+    attentionPromise = null;
+    updateBell();
+    renderRail();
+    if (S.tab === 'notifications' && !S.selected) renderMain();
+    if (attentionReloadQueued) {
+      attentionReloadQueued = false;
+      setTimeout(loadAttention, 0);
+    }
+  });
+  return attentionPromise;
 }
 
 // ── task organization: tags, saved views, query search ──────────────────────
@@ -1104,10 +1177,14 @@ function connectWs() {
         refreshTask(); // the session id was just published mid-turn → show the live fork command
       } else renderTaskEvents();
     }
+    if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
+      scheduleAttentionRefresh();
+    }
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => { if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks(); }, 350);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
+  ws.onopen = () => { if (S.attentionLoaded) scheduleAttentionRefresh(); };
 }
 
 async function refreshTasks() {
@@ -1128,7 +1205,7 @@ function renderShell() {
       <div class="brand"><span class="mark">◇</span> karmax</div>
       <div class="spacer"></div>
       <button class="icon-btn" id="topbar-palette" title="Search everything ( ${esc(fmtKeys('meta+k'))} )">⌕</button>
-      <button class="icon-btn has-badge" id="bell" title="Needs attention">🔔<span class="badge hidden" id="bell-badge">0</span></button>
+      <button class="icon-btn has-badge" id="bell" title="Notifications" aria-label="Notifications"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg><span class="badge hidden" id="bell-badge">0</span></button>
       <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
     </div>
     <div class="body">
@@ -1139,7 +1216,7 @@ function renderShell() {
   // glass icon opens the global command palette (commands, tasks, projects).
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#theme').addEventListener('click', toggleTheme);
-  $('#bell').addEventListener('click', toggleNotifications);
+  $('#bell').addEventListener('click', openNotifications);
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
 }
@@ -1159,6 +1236,7 @@ function renderRail() {
     <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
     <div class="label">Global</div>
+    <div class="nav-item ${S.tab === 'notifications' ? 'active' : ''}" data-tab="notifications" tabindex="0">♢ Notifications${needsAttention().length ? `<span class="count">${needsAttention().length}</span>` : ''}</div>
     <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
     <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
     <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
@@ -1176,6 +1254,7 @@ function renderRail() {
 }
 
 function switchTab(tab) {
+  if (tab === 'notifications') return go('/notifications');
   if (tab === 'dashboard') return go('/dashboard');
   if (tab === 'global') return go('/settings');
   const pid = S.projectId || S.projects[0]?.id;
@@ -1242,6 +1321,7 @@ function renderMain() {
   else if (S.tab === 'queue') content = queuesView();
   else if (S.tab === 'activity') content = activityView();
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
+  else if (S.tab === 'notifications') content = notificationsView();
   else if (S.tab === 'settings') content = settingsView(proj);
   else if (S.tab === 'global') content = globalSettingsView();
 
@@ -1257,6 +1337,7 @@ function renderMain() {
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
+  if (S.tab === 'notifications') wireNotificationsView();
 
   restoreFocus(main, focusState);
   updateBell();
@@ -5572,29 +5653,110 @@ function wireGlobalSettings() {
 }
 
 // ── notifications ────────────────────────────────────────────────────────────
+function isAttentionTask(t) {
+  return ['review', 'escalated'].includes(t.lastView?.stage)
+    && !['done', 'failed', 'cancelled'].includes(t.lastView?.status)
+    && !t.parentTaskId
+    && !t.params?.archived;
+}
 function needsAttention() {
-  return S.tasks.filter((t) => ['review', 'escalated'].includes(t.lastView?.stage) && t.lastView?.status !== 'done' && !t.parentTaskId && !t.params?.archived);
+  return (S.attentionLoaded || S.attentionLoading ? S.attention : S.tasks).filter(isAttentionTask);
 }
 function updateBell() {
   const badge = $('#bell-badge');
   if (!badge) return;
   const n = needsAttention().length;
-  badge.textContent = n;
+  badge.textContent = n > 99 ? '99+' : n;
   badge.classList.toggle('hidden', n === 0);
+  $('#bell')?.classList.toggle('active', S.tab === 'notifications');
 }
-function toggleNotifications() {
-  const existing = $('#notif-pop');
-  if (existing) return existing.remove();
+function openNotifications() { return go('/notifications'); }
+
+let attentionRefreshTimer = null;
+function scheduleAttentionRefresh() {
+  clearTimeout(attentionRefreshTimer);
+  attentionRefreshTimer = setTimeout(loadAttention, 400);
+}
+
+function attentionCopy(t) {
+  const v = t.lastView || {};
+  if (v.stage === 'escalated') {
+    return v.error || v.waitingFor?.detail || 'The agent is blocked and needs your direction to continue.';
+  }
+  return v.reviewInfo?.caption || v.reviewInfo?.summary || 'The work is ready for your review and decision.';
+}
+
+function attentionItem(t) {
+  const v = t.lastView || {};
+  const blocked = v.stage === 'escalated';
+  // "review" is already the task-page review panel's global CSS class; use a
+  // notification-specific name so the compact status label cannot inherit that
+  // panel's border/padding rules.
+  const kind = blocked ? 'blocked' : 'ready';
+  const label = blocked ? 'Needs direction' : 'Ready for review';
+  const project = t.projectName || projectById(t.projectId)?.name || 'Project';
+  const when = v.updatedAt || t.createdAt;
+  return `<article class="attention-item ${kind}" data-id="${esc(t.id)}" tabindex="0">
+    <div class="attention-mark" aria-hidden="true">${blocked ? '!' : '✓'}</div>
+    <div class="attention-body">
+      <div class="attention-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
+      <div class="attention-copy">${esc(attentionCopy(t))}</div>
+      <div class="attention-meta"><span>${esc(project)}</span><span>${esc(t.workflow)}</span><time datetime="${new Date(when).toISOString()}" title="${new Date(when).toLocaleString()}">${esc(fmtAgo(when))}</time></div>
+    </div>
+    <div class="attention-end"><span class="attention-kind ${kind}">${label}</span><button class="btn sm ${blocked ? '' : 'primary'}" data-open-attention="${esc(t.id)}">${blocked ? 'Open task' : 'Review'}</button></div>
+  </article>`;
+}
+
+function notificationsView() {
   const items = needsAttention();
-  const pop = document.createElement('div');
-  pop.className = 'popover';
-  pop.id = 'notif-pop';
-  pop.innerHTML = `<div class="ph">Needs attention (${items.length})</div>${
-    items.length ? items.map((t) => `<div class="pi" data-id="${t.id}"><b>${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</b><div class="task-sub"><span class="chip ${t.lastView.status}">${esc(t.lastView.stage)}</span></div></div>`).join('') : '<div class="pi" style="color:var(--ink-3)">All clear ✓</div>'
-  }`;
-  $('#overlay-root').appendChild(pop);
-  pop.querySelectorAll('.pi[data-id]').forEach((e) => e.addEventListener('click', () => { pop.remove(); goToTask(e.dataset.id); }));
-  setTimeout(() => document.addEventListener('click', function h(ev) { if (!pop.contains(ev.target) && ev.target.id !== 'bell') { pop.remove(); document.removeEventListener('click', h); } }), 10);
+  const blocked = items.filter((t) => t.lastView?.stage === 'escalated');
+  const reviews = items.filter((t) => t.lastView?.stage === 'review');
+  const filter = S.attentionFilter || 'all';
+  const visible = filter === 'blocked' ? blocked : filter === 'review' ? reviews : items;
+  const filters = [
+    ['all', 'All', items.length],
+    ['blocked', 'Needs direction', blocked.length],
+    ['review', 'Ready for review', reviews.length],
+  ];
+  const loading = S.attentionLoading && !S.attentionLoaded;
+  const unavailable = S.attentionError === 'Could not load notifications.';
+  return `<div class="attention-page">
+    <div class="attention-head">
+      <div><h1>Notifications</h1><p>Tasks that need a decision from you, across all projects.</p></div>
+      <button class="btn sm" id="attention-refresh" ${S.attentionLoading ? 'disabled' : ''}><span class="refresh-glyph">↻</span> ${S.attentionLoading ? 'Refreshing…' : 'Refresh'}</button>
+    </div>
+    <div class="attention-filters" role="tablist" aria-label="Notification type">
+      ${filters.map(([key, label, count]) => `<button role="tab" class="attention-filter ${filter === key ? 'active' : ''}" data-attention-filter="${key}" aria-selected="${filter === key}"><span>${label}</span><b>${count}</b></button>`).join('')}
+    </div>
+    ${S.attentionError ? `<div class="attention-warning">${esc(S.attentionError)} <button id="attention-retry">Try again</button></div>` : ''}
+    ${loading
+      ? `<div class="attention-loading"><span></span><span></span><span></span></div>`
+      : unavailable
+        ? `<div class="attention-empty"><div class="attention-empty-mark unavailable">!</div><h2>Notifications are unavailable</h2><p>We couldn’t check your projects. Try refreshing in a moment.</p></div>`
+      : visible.length
+        ? `<div class="attention-list">${visible.map(attentionItem).join('')}</div>`
+        : `<div class="attention-empty"><div class="attention-empty-mark">✓</div><h2>${items.length ? 'Nothing in this view' : 'You’re all caught up'}</h2><p>${items.length ? 'Choose another filter to see the rest of your notifications.' : 'There are no reviews or blockers waiting on you.'}</p></div>`}
+    <div class="attention-footnote">Items leave this inbox automatically when the task advances.</div>
+  </div>`;
+}
+
+function wireNotificationsView() {
+  $('#attention-refresh')?.addEventListener('click', loadAttention);
+  $('#attention-retry')?.addEventListener('click', loadAttention);
+  document.querySelectorAll('[data-attention-filter]').forEach((button) => button.addEventListener('click', () => {
+    S.attentionFilter = button.dataset.attentionFilter;
+    renderMain();
+  }));
+  document.querySelectorAll('.attention-item[data-id]').forEach((item) => {
+    wireTaskNav(item, (event) => event.target.closest('button') ? null : item.dataset.id);
+    item.addEventListener('keydown', (event) => {
+      if ((event.key === 'Enter' || event.key === ' ') && event.target === item) {
+        event.preventDefault();
+        goToTask(item.dataset.id);
+      }
+    });
+  });
+  document.querySelectorAll('[data-open-attention]').forEach((button) => button.addEventListener('click', () => goToTask(button.dataset.openAttention)));
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────
@@ -5721,7 +5883,7 @@ const HOST_COMMANDS = [
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
   { id: 'nav.global', title: 'Go to global settings', key: 'g g', run: () => switchTab('global') },
   { id: 'nav.projects', title: 'Go to projects', key: 'g p', run: () => focusRail() },
-  { id: 'nav.notifications', title: 'Go to notifications', key: 'g n', run: () => toggleNotifications() },
+  { id: 'nav.notifications', title: 'Go to notifications', key: 'g N', run: () => openNotifications() },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -5904,8 +6066,6 @@ function moveRail(delta) {
 
 // -- Escape layering: pop the topmost surface ---------------------------------
 function closeTopOverlay() {
-  const pop = $('#notif-pop');
-  if (pop) return pop.remove();
   // Secondary modals (task picker, filter picker, tags manager, tag picker) stack
   // above the form/page in #modal-root — pop the topmost one first (a filter
   // picker can itself sit on the task-picker overlay).

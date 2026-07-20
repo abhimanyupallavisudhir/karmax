@@ -30,6 +30,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   it('exposes contributions (slots, commands, event schemas)', async () => {
     const c: any = await (await fetch(`${base}/api/contributions`, { headers: auth() })).json();
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
+    expect(c.commands.find((x: any) => x.id === 'nav.notifications')?.keybinding).toBe('g N');
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);
     expect(c.slots.some((s: any) => s.workflow === 'agent-queue' && s.contribution.slot === 'queue-panel')).toBe(true);
