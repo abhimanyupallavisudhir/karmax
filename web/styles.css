@@ -973,6 +973,12 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .prompt-field:focus-within { border-color: var(--accent); }
 .prompt-field > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
 .prompt-field > .img-chips { margin: 0; padding: 0 10px 9px; }
+/* The prompt's clean bottom row: the "wiki context" field — no border, just a
+   faint hairline separating it from the prompt text above. */
+.prompt-context-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 12px 8px; border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+.prompt-context-row .pc-prefix { flex: none; font-size: 10.5px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-3); cursor: default; user-select: none; padding-top: 2px; }
+.prompt-context { flex: 1; border: none; background: transparent; outline: none; box-shadow: none; resize: none; overflow: hidden; width: 100%; padding: 1px 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: var(--accent); }
+.prompt-context::placeholder { color: var(--ink-3); font-family: var(--font-sans, inherit); }
 .form-row .prompt-field { background: var(--surface-2); }
 .img-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
 .img-chip { position: relative; display: inline-flex; }
@@ -1136,3 +1142,20 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .wiki-editor textarea { width: 100%; resize: vertical; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; padding: 9px 11px; border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; color: var(--ink); }
 .wiki-editor .wiki-preview { min-height: 120px; padding: 4px 2px; }
 @media (max-width: 850px) { .wiki-editor .wiki-fields { grid-template-columns: 1fr; } }
+
+/* @-mention dropdown: tag wiki pages/labels/folders into a task prompt. */
+.wiki-mention-menu {
+  position: fixed; z-index: 90; width: min(360px, 90vw); max-height: 264px; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 12px 30px rgba(20, 24, 34, .18); padding: 5px; font-size: 13px;
+}
+.wiki-mention-menu .wm-opt {
+  display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 7px; cursor: pointer;
+}
+.wiki-mention-menu .wm-opt.active { background: var(--accent-weak); }
+.wiki-mention-menu .wm-glyph { flex: none; width: 16px; text-align: center; opacity: .85; }
+.wiki-mention-menu .wm-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.wiki-mention-menu .wm-ref { font-family: var(--font-mono); font-size: 12px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wiki-mention-menu .wm-desc { color: var(--ink-3); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wiki-mention-menu .wm-scope { flex: none; color: var(--ink-3); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
+.wiki-mention-menu .wm-empty { padding: 9px 10px; color: var(--ink-3); }

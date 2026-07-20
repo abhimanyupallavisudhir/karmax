@@ -17,21 +17,28 @@ import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
  * directories) ride along inside the folder and do NOT count as more entries.
  * A folder WITHOUT a SKILL/MEMORY.md is a section and is recursed into.
  *
- * Frontmatter fields: `name`, `description`, and two delivery controls —
- *   delivery: unconditional | indexed   (default indexed)
- *   importance: <number>                (default 0)
- * An *indexed* entry appears in the table of contents agents receive each turn;
- * an *unconditional* entry's full body is sent with every prompt instead (this
- * is how a scope's "general prompt" is expressed — it is just an entry).
+ * Frontmatter fields: `name`, `description`, `importance` (a number, default 0)
+ * and `labels` (a free-form list). Delivery is no longer a fixed per-page
+ * choice — **every** entry is always listed in the table of contents agents
+ * receive each turn. What varies is which entries' *full bodies* are inlined
+ * into a given task's prompt:
+ *   - an entry labelled `default` is inlined for every task (this is how a
+ *     scope's "general prompt" is expressed — it is just a `default` entry);
+ *   - a task additionally inlines the entries it tags in its prompt with
+ *     `@proj:…`/`@org:…` — a single page, a whole `label` (`@proj:tag:…`), or a
+ *     folder (`@proj:some/section/*`). See `parseWikiRefs`/`resolveWikiRefs`.
  * `importance` orders siblings (higher first) and decides which entries survive
  * a TOC `[more…]` fold. The built-in karmax working instructions are a virtual
- * read-only unconditional entry under `@builtin/` — the `@` first segment is
+ * read-only `default` entry under `@builtin/` — the `@` first segment is
  * reserved and unwritable. Content is snapshotted at the point of use (SPEC
  * §4.4): freely editable, never versioned per execution.
  */
 
 export type WikiScope = 'organization' | 'project';
-export type WikiDelivery = 'unconditional' | 'indexed';
+
+/** The label that inlines an entry's full body into every task's prompt (what
+ *  the old `delivery: unconditional` used to mean — now just a label). */
+export const DEFAULT_LABEL = 'default';
 
 export interface WikiEntry {
   /** Folder name (the title unless frontmatter overrides `name`). */
@@ -41,7 +48,8 @@ export interface WikiEntry {
   kind: 'skill' | 'memory' | 'section';
   /** Frontmatter `description` (skills/memories only). */
   description?: string;
-  delivery?: WikiDelivery;
+  /** Frontmatter `labels` (skills/memories only). */
+  labels?: string[];
   importance?: number;
   /** Virtual, read-only entry shipped by karmax (not on disk). */
   builtin?: boolean;
@@ -54,7 +62,7 @@ export interface WikiPage {
   path: string;
   kind: 'skill' | 'memory';
   description?: string;
-  delivery?: WikiDelivery;
+  labels?: string[];
   importance?: number;
   builtin?: boolean;
   /** A built-in whose bundled default is shadowed by an on-disk edit (§9 overlay). */
@@ -76,17 +84,22 @@ const PAGE_FILES = ['SKILL.md', 'MEMORY.md'] as const;
 /** Reserved first path segment for virtual built-in entries. */
 export const BUILTIN_WIKI_PREFIX = '@builtin';
 
-/** The karmax working instructions, unified into the wiki as an unconditional
- *  entry (shown in every organization wiki, delivered first). These are the
- *  bundled DEFAULTS (§9): an on-disk entry at the same `@builtin/…` path is the
- *  editable override that shadows one; deleting it restores the default. */
+/** Does an entry carry the `default` label (inlined into every task's prompt)? */
+export function isDefaultDelivered(e: { labels?: string[] }): boolean {
+  return !!e.labels?.includes(DEFAULT_LABEL);
+}
+
+/** The karmax working instructions, unified into the wiki as a `default` entry
+ *  (shown in every organization wiki, delivered first). These are the bundled
+ *  DEFAULTS (§9): an on-disk entry at the same `@builtin/…` path is the editable
+ *  override that shadows one; deleting it restores the default. */
 export const BUILTIN_WIKI_ENTRIES: WikiPage[] = [
   {
     name: 'How to work',
     path: `${BUILTIN_WIKI_PREFIX}/how-to-work`,
     kind: 'skill',
     description: 'Built-in karmax working instructions, sent to every agent.',
-    delivery: 'unconditional',
+    labels: [DEFAULT_LABEL],
     importance: 1000,
     builtin: true,
     content: GLOBAL_INSTRUCTIONS,
@@ -156,18 +169,31 @@ function writableWikiPath(rel: string): string {
   return safe;
 }
 
+/** Split a frontmatter `labels` value — a comma-separated list, optionally in
+ *  `[a, b]` flow form — into trimmed, de-duplicated, non-empty labels. */
+export function parseLabels(raw?: string): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const part of raw.replace(/^\[|\]$/g, '').split(',')) {
+    const label = part.trim().replace(/^["']|["']$/g, '');
+    if (label && !out.includes(label)) out.push(label);
+  }
+  return out;
+}
+
 /** Minimal YAML-frontmatter reader — the flat `key: value` scalars the Agent
- *  Skills format uses (`name`, `description`, `delivery`, `importance`);
- *  anything richer is ignored rather than mis-parsed. */
+ *  Skills format uses (`name`, `description`, `labels`, `importance`); anything
+ *  richer is ignored rather than mis-parsed. A legacy `delivery: unconditional`
+ *  is read forward as the `default` label. */
 export function parseFrontmatter(content: string): {
   name?: string;
   description?: string;
-  delivery?: WikiDelivery;
+  labels: string[];
   importance?: number;
   body: string;
 } {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(content);
-  if (!m) return { body: content };
+  if (!m) return { body: content, labels: [] };
   const fields: Record<string, string> = {};
   for (const line of m[1]!.split('\n')) {
     const kv = /^([A-Za-z][\w-]*):\s*(.*)$/.exec(line);
@@ -175,10 +201,13 @@ export function parseFrontmatter(content: string): {
     fields[kv[1]!.toLowerCase()] = kv[2]!.trim().replace(/^["']|["']$/g, '');
   }
   const importance = Number(fields.importance);
+  const labels = parseLabels(fields.labels);
+  // Back-compat: an older `delivery: unconditional` is the `default` label now.
+  if (fields.delivery === 'unconditional' && !labels.includes(DEFAULT_LABEL)) labels.unshift(DEFAULT_LABEL);
   return {
     name: fields.name || undefined,
     description: fields.description || undefined,
-    delivery: fields.delivery === 'unconditional' ? 'unconditional' : fields.delivery === 'indexed' ? 'indexed' : undefined,
+    labels,
     importance: Number.isFinite(importance) ? importance : undefined,
     body: content.slice(m[0].length),
   };
@@ -210,7 +239,7 @@ function readEntry(root: string, rel: string): WikiEntry | undefined {
       const fm = parseFrontmatter(fs.readFileSync(path.join(dir, page.file), 'utf8'));
       if (fm.name) entry.name = fm.name;
       entry.description = fm.description;
-      if (fm.delivery) entry.delivery = fm.delivery;
+      if (fm.labels.length) entry.labels = fm.labels;
       if (fm.importance !== undefined) entry.importance = fm.importance;
     } catch { /* unreadable — index by folder name alone */ }
     return entry;
@@ -247,6 +276,15 @@ export function listWiki(root: string, rel = ''): WikiEntry {
   return readEntry(root, safe) ?? { name: safe ? path.basename(safe) : '', path: safe, kind: 'section', children: [] };
 }
 
+/** Visit every leaf (skill/memory) entry of a tree in order. */
+function walkLeaves(tree: WikiEntry, fn: (e: WikiEntry) => void): void {
+  const rec = (e: WikiEntry) => {
+    if (e.kind === 'section') (e.children ?? []).forEach(rec);
+    else fn(e);
+  };
+  rec(tree);
+}
+
 /** Read one skill/memory page (its markdown plus the folder's other files). */
 export function readWikiPage(root: string, rel: string): WikiPage | undefined {
   const safe = safeWikiPath(rel);
@@ -272,7 +310,7 @@ export function readWikiPage(root: string, rel: string): WikiPage | undefined {
     path: safe,
     kind: page.kind,
     description: fm.description,
-    delivery: fm.delivery,
+    labels: fm.labels.length ? fm.labels : undefined,
     importance: fm.importance,
     content,
     files: files.sort(),
@@ -372,49 +410,217 @@ export function searchWiki(root: string, query: string, limit = 50): WikiSearchH
   return hits;
 }
 
-/** Every unconditional entry of a tree (importance desc, then path), with its
- *  body read back for delivery. */
-export function collectUnconditional(root: string, tree: WikiEntry): (WikiPage & { body: string })[] {
-  const found: WikiEntry[] = [];
-  const walk = (e: WikiEntry) => {
-    if (e.kind === 'section') (e.children ?? []).forEach(walk);
-    else if (e.delivery === 'unconditional') found.push(e);
-  };
-  walk(tree);
-  found.sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0) || a.path.localeCompare(b.path));
-  const out: (WikiPage & { body: string })[] = [];
-  for (const e of found) {
-    try {
-      const page = readWikiPage(root, e.path);
-      if (page) out.push({ ...page, body: parseFrontmatter(page.content).body.trim() });
-    } catch { /* unreadable entry — skip from delivery */ }
+// ─── Tagging wiki context onto a task (`@proj:…` / `@org:…` in the prompt) ─────
+
+/** A reference a task's prompt makes to wiki content it wants inlined in full:
+ *  a single `page`, an entire `label`, or a `folder` and everything under it. */
+export interface WikiRef {
+  scope: WikiScope;
+  kind: 'page' | 'label' | 'folder';
+  /** Page path, label name, or folder path (already `@…`-token stripped). */
+  value: string;
+}
+
+/** The wiki-context tokens a task gets when it never touches the context field:
+ *  the two scopes' `default` labels (so `default` pages are inlined by default,
+ *  and a task can opt out by clearing them from the field). */
+export const DEFAULT_CONTEXT_TOKENS = ['@proj:tag:default', '@org:tag:default'];
+
+/** Blank out inline `` `code` `` and fenced ```code``` regions so an `@…` inside
+ *  them is never read as a tag (positions are irrelevant to ref extraction). */
+function stripCodeSpans(text: string): string {
+  return String(text ?? '').replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ');
+}
+
+/**
+ * Extract every `@proj:…` / `@org:…` tag from free text (a task prompt, a
+ * follow-up). A tag counts only at the start or right after whitespace — never
+ * mid-word (`b@…`, `\@…`) or inside code spans — so ordinary prose is left
+ * alone. Grammar of the part after the scope colon:
+ *   `tag:<label>`   → a whole label            (kind `label`)
+ *   `<path>/*`      → a folder and its subtree  (kind `folder`)
+ *   `<path>`        → one page                  (kind `page`)
+ * A token runs to the next whitespace; trailing sentence punctuation is trimmed.
+ */
+export function parseWikiRefs(text: string): WikiRef[] {
+  const out: WikiRef[] = [];
+  const re = /(?<=^|\s)@(proj|org):(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stripCodeSpans(text)))) {
+    const scope: WikiScope = m[1] === 'proj' ? 'project' : 'organization';
+    let rest = m[2]!.replace(/[.,;:!?)"'\]]+$/, ''); // trim trailing sentence punctuation
+    if (!rest) continue;
+    if (rest.startsWith('tag:')) {
+      const value = rest.slice(4).replace(/\/+$/, '');
+      if (value) out.push({ scope, kind: 'label', value });
+    } else if (rest.endsWith('/*')) {
+      const value = rest.slice(0, -2);
+      if (value) out.push({ scope, kind: 'folder', value });
+    } else {
+      out.push({ scope, kind: 'page', value: rest });
+    }
   }
   return out;
 }
 
-/**
- * Render the TOC the agent sees: the indexed entries (unconditional ones are
- * delivered in full instead), expanded to every leaf, names + descriptions
- * only, siblings in importance order. When the whole TOC would exceed `budget`
- * tokens, every penultimate list (a section's direct skills) with ≥ FOLD_AT
- * entries keeps its FOLD_KEEP most important and folds the rest behind a
- * `[more…]` line naming the exact `read_wiki` call that expands it.
- */
-export function renderWikiToc(tree: WikiEntry, opts: { scope: WikiScope; id: string; budget?: number }): string {
-  const full = renderEntries(tree.children ?? [], 0, { fold: false, scope: opts.scope, id: opts.id });
-  if (estimateTokens(full) <= (opts.budget ?? WIKI_TOC_TOKEN_BUDGET)) return full;
-  return renderEntries(tree.children ?? [], 0, { fold: true, scope: opts.scope, id: opts.id });
+/** Resolve the refs that target `scope` into the set of page paths they name
+ *  (a page that exists, every page under a folder, every page with a label). */
+export function resolveWikiRefs(refs: WikiRef[], scope: WikiScope, root: string, tree: WikiEntry): string[] {
+  const out = new Set<string>();
+  for (const ref of refs) {
+    if (ref.scope !== scope) continue;
+    let value: string;
+    try {
+      value = safeWikiPath(ref.value);
+    } catch {
+      if (ref.kind !== 'label') continue;
+      value = ref.value;
+    }
+    if (ref.kind === 'page') {
+      if (pageFileIn(path.join(root, value))) out.add(value);
+    } else if (ref.kind === 'folder') {
+      walkLeaves(tree, (e) => { if (e.path === value || e.path.startsWith(`${value}/`)) out.add(e.path); });
+    } else {
+      walkLeaves(tree, (e) => { if (e.labels?.includes(ref.value)) out.add(e.path); });
+    }
+  }
+  return [...out];
 }
 
-function renderEntries(entries: WikiEntry[], depth: number, opts: { fold: boolean; scope: WikiScope; id: string }): string {
+// ─── The `@`-mention search (what the task-form dropdown queries) ─────────────
+
+export interface WikiSuggestion {
+  kind: 'page' | 'label' | 'folder';
+  /** The value to append after `@proj:`/`@org:` to insert this suggestion. */
+  ref: string;
+  /** Display label. */
+  name: string;
+  description?: string;
+  /** For labels/folders: how many pages it covers. */
+  count?: number;
+}
+
+/** Case-insensitive relevance of `needle` against `hay`: prefix > word-start >
+ *  substring > subsequence; -1 for no match. Empty needle matches everything. */
+function matchScore(hay: string, needle: string): number {
+  if (!needle) return 1;
+  const h = hay.toLowerCase();
+  const n = needle.toLowerCase();
+  const idx = h.indexOf(n);
+  if (idx === 0) return 100 - h.length * 0.01;
+  if (idx > 0) return 60 + (/[\s/_-]/.test(h[idx - 1]!) ? 20 : 0) - idx * 0.1;
+  let hi = 0;
+  for (const c of n) {
+    hi = h.indexOf(c, hi);
+    if (hi < 0) return -1;
+    hi++;
+  }
+  return 20;
+}
+
+/** The best of a page/folder's path or last segment against the query. */
+function pathScore(p: string, needle: string): number {
+  return Math.max(matchScore(p, needle), matchScore(p.split('/').pop() ?? p, needle));
+}
+
+/**
+ * Rank wiki pages, folders, and labels of one scope against a typed query for
+ * the `@`-mention dropdown. A `tag:` prefix restricts to labels; a trailing
+ * `*` (or `/*`) biases folders; otherwise pages, folders, and labels are mixed
+ * by relevance (importance breaks near-ties so the useful entries surface).
+ */
+export function suggestWiki(root: string, query: string, limit = 8): WikiSuggestion[] {
+  const tree = listWiki(root);
+  const leaves: WikiEntry[] = [];
+  const folders: WikiEntry[] = [];
+  const labelCounts = new Map<string, number>();
+  walkLeaves(tree, (e) => {
+    leaves.push(e);
+    for (const l of e.labels ?? []) labelCounts.set(l, (labelCounts.get(l) ?? 0) + 1);
+  });
+  const collectFolders = (e: WikiEntry) => {
+    if (e.kind !== 'section') return;
+    if (e.path) folders.push(e);
+    (e.children ?? []).forEach(collectFolders);
+  };
+  (tree.children ?? []).forEach(collectFolders);
+  const folderCount = (p: string) => leaves.filter((e) => e.path === p || e.path.startsWith(`${p}/`)).length;
+
+  const raw = String(query ?? '').trim();
+  const labelsOnly = raw.toLowerCase().startsWith('tag:');
+  const foldersBias = /\/?\*+$/.test(raw);
+  const q = (labelsOnly ? raw.slice(4) : raw).replace(/\/?\*+$/, '').trim();
+
+  const scored: (WikiSuggestion & { score: number })[] = [];
+  if (!labelsOnly) {
+    for (const e of leaves) {
+      const s = pathScore(e.path, q);
+      if (s > 0) scored.push({ kind: 'page', ref: e.path, name: e.name, description: e.description, score: s + (e.importance ?? 0) * 0.001 });
+    }
+    for (const e of folders) {
+      const s = pathScore(e.path, q);
+      if (s > 0) scored.push({ kind: 'folder', ref: `${e.path}/*`, name: `${e.path}/*`, count: folderCount(e.path), score: s + (foldersBias ? 15 : 0) });
+    }
+  }
+  if (!foldersBias) {
+    for (const [label, count] of labelCounts) {
+      const s = matchScore(label, q);
+      if (s > 0) scored.push({ kind: 'label', ref: `tag:${label}`, name: `tag:${label}`, count, score: s + (labelsOnly ? 15 : 0) });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score || a.ref.localeCompare(b.ref));
+  return scored.slice(0, limit).map(({ score: _score, ...s }) => s);
+}
+
+/** Read a set of page paths into ordered (importance desc, then path) pages with
+ *  their bodies for prompt delivery. Unreadable entries are skipped. */
+function readOrderedPages(root: string, paths: Iterable<string>): (WikiPage & { body: string })[] {
+  const out: (WikiPage & { body: string })[] = [];
+  for (const rel of paths) {
+    try {
+      const page = readWikiPage(root, rel);
+      if (page) out.push({ ...page, body: parseFrontmatter(page.content).body.trim() });
+    } catch { /* unreadable entry — skip from delivery */ }
+  }
+  out.sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0) || a.path.localeCompare(b.path));
+  return out;
+}
+
+/** Every `default`-labelled entry of a tree (importance desc, then path), with
+ *  its body read back — the pages inlined into every task's prompt. */
+export function collectDefaultPages(root: string, tree: WikiEntry): (WikiPage & { body: string })[] {
+  const paths: string[] = [];
+  walkLeaves(tree, (e) => { if (isDefaultDelivered(e)) paths.push(e.path); });
+  return readOrderedPages(root, paths);
+}
+
+/**
+ * Render the TOC the agent sees: every entry of a scope's catalogue, expanded
+ * to every leaf, names + descriptions only, siblings in importance order.
+ * Entries whose full body is already inlined into this task's prompt (the
+ * `exclude` set — `default`-labelled and `@`-tagged pages) are left out so they
+ * are not sent twice. When the whole TOC would exceed `budget` tokens, every
+ * penultimate list (a section's direct skills) with ≥ FOLD_AT entries keeps its
+ * FOLD_KEEP most important and folds the rest behind a `[more…]` line naming
+ * the exact `read_wiki` call that expands it.
+ */
+export function renderWikiToc(tree: WikiEntry, opts: { scope: WikiScope; id: string; budget?: number; exclude?: Set<string> }): string {
+  const base = { fold: false, scope: opts.scope, id: opts.id, exclude: opts.exclude ?? new Set<string>() };
+  const full = renderEntries(tree.children ?? [], 0, base);
+  if (estimateTokens(full) <= (opts.budget ?? WIKI_TOC_TOKEN_BUDGET)) return full;
+  return renderEntries(tree.children ?? [], 0, { ...base, fold: true });
+}
+
+function renderEntries(entries: WikiEntry[], depth: number, opts: { fold: boolean; scope: WikiScope; id: string; exclude: Set<string> }): string {
   const pad = '  '.repeat(depth);
   const lines: string[] = [];
-  const leaves = entries.filter((e) => e.kind !== 'section' && e.delivery !== 'unconditional');
+  const leaves = entries.filter((e) => e.kind !== 'section' && !opts.exclude.has(e.path));
   const sections = entries.filter((e) => e.kind === 'section');
   const shown = opts.fold && leaves.length >= FOLD_AT ? leaves.slice(0, FOLD_KEEP) : leaves;
   for (const e of shown) {
     const tag = e.kind === 'memory' ? ' (memory)' : '';
-    lines.push(`${pad}- ${e.name}${tag} [${e.path}]${e.description ? ` — ${e.description}` : ''}`);
+    const labels = e.labels?.length ? ` {${e.labels.join(', ')}}` : '';
+    lines.push(`${pad}- ${e.name}${tag} [${e.path}]${labels}${e.description ? ` — ${e.description}` : ''}`);
   }
   if (shown.length < leaves.length) {
     const parent = leaves[0]!.path.split('/').slice(0, -1).join('/');
@@ -424,7 +630,7 @@ function renderEntries(entries: WikiEntry[], depth: number, opts: { fold: boolea
   }
   for (const s of sections) {
     const subtree = renderEntries(s.children ?? [], depth + 1, opts);
-    if (!subtree) continue; // e.g. a section whose entries are all unconditional
+    if (!subtree) continue;
     lines.push(`${pad}- ${s.name}/`);
     lines.push(subtree);
   }
@@ -439,10 +645,17 @@ function pageBody(page: WikiPage): string {
 /**
  * The per-turn prompt block (SPEC §5.4 "global + project instructions"): the
  * built-in working instructions (an on-disk `@builtin/…` edit in the org wiki
- * shadows the bundled default), then per scope (organization, then project)
- * its unconditional entries in full followed by the indexed TOC, with one usage
- * line so the agent knows how to open, expand, and search entries from ANY
- * world (the tools run host-side).
+ * shadows the bundled default), then per scope (organization, then project) the
+ * full bodies of the entries inlined for this task, followed by the TOC of the
+ * rest, with one usage line so the agent knows how to open, expand, and search
+ * entries from ANY world (the tools run host-side).
+ *
+ * Which entries are inlined = the task's **wiki-context tokens** (`contextTokens`,
+ * defaulting to `@proj:tag:default @org:tag:default` when the task never set the
+ * field — so `default` pages inline by default, and a task can opt out by
+ * clearing them) UNION the `@proj:…`/`@org:…` tags written inline in the
+ * prompt/follow-ups (`taggedText`). The built-in working instructions are always
+ * delivered regardless (they are not subject to the context field).
  */
 export function buildWikiPromptContext(args: {
   contentDir: string;
@@ -450,13 +663,20 @@ export function buildWikiPromptContext(args: {
   projectId?: string;
   /** External override for the built-in instructions (tests/deployments). */
   builtinInstructions?: string;
+  /** Task text (prompt + follow-ups) scanned for `@proj:…`/`@org:…` tags. */
+  taggedText?: string;
+  /** The task's wiki-context field tokens; `undefined` ⇒ the default tokens. */
+  contextTokens?: string[];
 }): string {
   const orgRoot = args.organizationId ? wikiRoot(args.contentDir, 'organization', args.organizationId) : undefined;
   const builtins = args.builtinInstructions === undefined ? resolveBuiltins(orgRoot) : [];
+  const tokens = (args.contextTokens ?? DEFAULT_CONTEXT_TOKENS).map((t) => (t.startsWith('@') ? t : `@${t}`));
+  const refs = [...parseWikiRefs(tokens.join(' ')), ...(args.taggedText ? parseWikiRefs(args.taggedText) : [])];
+  const entryOf = ({ content: _c, files: _f, ...entry }: WikiPage): WikiEntry => entry;
   const sections: string[] =
     args.builtinInstructions !== undefined
       ? [args.builtinInstructions]
-      : builtins.filter((b) => b.delivery === 'unconditional').map(pageBody);
+      : builtins.filter(isDefaultDelivered).map(pageBody);
   const scopes: { scope: WikiScope; id: string; heading: string }[] = [];
   if (args.organizationId) scopes.push({ scope: 'organization', id: args.organizationId, heading: 'Organization' });
   if (args.projectId) scopes.push({ scope: 'project', id: args.projectId, heading: 'Project' });
@@ -464,18 +684,25 @@ export function buildWikiPromptContext(args: {
   for (const { scope, id, heading } of scopes) {
     const root = wikiRoot(args.contentDir, scope, id);
     const tree = listWiki(root);
-    const unconditional = collectUnconditional(root, tree);
-    // A built-in overridden to `delivery: indexed` moves from the standing
-    // prompt into the organization TOC like any other indexed entry.
-    const indexedBuiltins = scope === 'organization' ? builtins.filter((b) => b.delivery !== 'unconditional') : [];
-    const tocTree = indexedBuiltins.length
-      ? { ...tree, children: [...indexedBuiltins.map(({ content: _c, files: _f, ...entry }) => entry), ...(tree.children ?? [])] }
-      : tree;
-    const toc = renderWikiToc(tocTree, { scope, id });
-    if (!unconditional.length && !toc) continue;
+    // Inlined in full: every ref this task resolves to (context field defaults +
+    // inline prompt tags). The built-in `default` entries are inlined above
+    // (before the scope headings), so only on-disk pages are gathered here.
+    const inlined = new Set<string>();
+    for (const p of resolveWikiRefs(refs, scope, root, tree)) inlined.add(p);
+    const pages = readOrderedPages(root, inlined);
+    // The TOC lists every entry NOT already inlined above (built-ins included in
+    // the org catalogue; the `default` ones are inlined, so they drop out too).
+    const tocTree =
+      scope === 'organization' && builtins.length
+        ? { ...tree, children: [...builtins.map(entryOf), ...(tree.children ?? [])] }
+        : tree;
+    const exclude = new Set(inlined);
+    if (scope === 'organization') for (const b of builtins) if (isDefaultDelivered(b)) exclude.add(b.path);
+    const toc = renderWikiToc(tocTree, { scope, id, exclude });
+    if (!pages.length && !toc) continue;
     hasWiki = true;
     const parts = [`# ${heading} instructions`];
-    for (const entry of unconditional) if (entry.body) parts.push(entry.body);
+    for (const page of pages) if (page.body) parts.push(page.body);
     if (toc) parts.push(`## ${heading} wiki — skills & memories (titles only; open before relying on one)\n${toc}`);
     sections.push(parts.join('\n\n'));
   }
@@ -485,7 +712,8 @@ export function buildWikiPromptContext(args: {
     sections.push(
       `Wiki access (works from any world, including cloud sandboxes): read_wiki(scope, id, path?) — no path lists a full table of contents (expanding any [more…]), a section path lists that section, a skill path returns its full markdown; search_wiki(scope, id, query) greps every wiki page. ` +
         `Scopes here: ${scopes.map((s) => `${s.scope} id "${s.id}"`).join(', ')}. ` +
-        `To add or update an entry, platform_request PUT ${scopes.map(apiBase).join('/page or ')}/page with {path, content, kind} (SKILL.md format: YAML frontmatter name/description/delivery/importance, then markdown).`,
+        `To add or update an entry, platform_request PUT ${scopes.map(apiBase).join('/page or ')}/page with {path, content, kind} (SKILL.md format: YAML frontmatter name/description/labels/importance, then markdown; label an entry \`default\` to inline it into every task). ` +
+        `To inline a page/label/folder into a task's context, tag it in the prompt as \`@proj:<path>\` / \`@org:<path>\` (a whole label is \`@proj:tag:<label>\`, a folder is \`@proj:<section>/*\`); create_task also accepts a \`wikiContext\` array of these tokens.`,
     );
   }
   return sections.join('\n\n');

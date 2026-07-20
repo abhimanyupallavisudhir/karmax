@@ -29,7 +29,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
-import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectUnconditional, searchWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
+import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -358,6 +358,8 @@ export class KarmaxApi {
       prompt?: string;
       /** Images attached to the initial prompt (references, never inline bytes). */
       images?: ImageRef[];
+      /** Wiki context to inline, as `@proj:…`/`@org:…` tokens (see TaskParams.wikiContext). */
+      wikiContext?: string[];
       workflow?: string;
       base?: string;
       target?: string;
@@ -403,6 +405,9 @@ export class KarmaxApi {
     // Image attachments ride alongside the prompt but aren't a manifest param, so
     // carry them explicitly (references only — bytes live in the attachment store).
     if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
+    // Wiki context (which pages to inline) isn't a manifest param either; a
+    // top-level arg (MCP/API) is folded in like the form sends it via `params`.
+    if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
     // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
     // (drafts may still be saved without one, then checked again at queueTask).
@@ -1689,10 +1694,10 @@ export class KarmaxApi {
 
   /** One navigation call: a skill path returns the page; anything else lists
    *  the (sub)tree — the same call expands a TOC `[more…]` fold. The full tree
-   *  also carries the unconditional entries' bodies and `tocText`, the exact
-   *  rendered table of contents agents receive (importance order, [more…]
-   *  folds). The organization tree includes the built-ins, resolved through
-   *  their on-disk overrides when edited. */
+   *  also carries the `default`-labelled entries' bodies (inlined into every
+   *  task) and `tocText`, the exact rendered table of contents agents receive
+   *  (importance order, [more…] folds). The organization tree includes the
+   *  built-ins, resolved through their on-disk overrides when edited. */
   readWiki(token: string, scope: WikiScope, id: string, rel = '') {
     const root = this.wikiScope(token, scope, id, false);
     const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
@@ -1703,17 +1708,26 @@ export class KarmaxApi {
     if (page) return { scope, id, path: page.path, page };
     const toc = listWiki(root, rel);
     if (rel) return { scope, id, path: safeWikiPath(rel), toc };
+    // `default` entries are inlined into every task's prompt (built-ins first).
     const unconditional = [
       ...builtins
-        .filter((b) => b.delivery === 'unconditional')
+        .filter(isDefaultDelivered)
         .map((b) => ({ ...entryOf(b), body: parseFrontmatter(b.content).body.trim() || b.content })),
-      ...collectUnconditional(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
+      ...collectDefaultPages(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
     ];
     toc.children = [...builtins.map(entryOf), ...(toc.children ?? [])];
-    // renderWikiToc skips unconditional entries itself, so the full tree gives
-    // exactly the agent-visible TOC (indexed built-ins included).
-    const tocText = renderWikiToc(toc, { scope, id });
+    // The TOC lists every entry except the `default` ones inlined above (shown
+    // in full as their own cards) — the same rendering agents get.
+    const exclude = new Set(unconditional.map((u) => u.path));
+    const tocText = renderWikiToc(toc, { scope, id, exclude });
     return { scope, id, path: '', toc, unconditional, tocText };
+  }
+
+  /** Rank pages, labels, and folders of one scope against a typed query — what
+   *  the task-form `@proj:…`/`@org:…` mention dropdown searches. */
+  suggestWiki(token: string, scope: WikiScope, id: string, query: string) {
+    const root = this.wikiScope(token, scope, id, false);
+    return { scope, id, query, suggestions: suggestWiki(root, query) };
   }
 
   /** Create (`create` guards against overwriting), update, or — via `prevPath`
