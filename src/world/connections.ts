@@ -135,6 +135,9 @@ function cleanConfig(value: WorldProviderConnection['config']): WorldProviderCon
     ...(one(value.template) ? { template: one(value.template) } : {}),
     ...(one(value.snapshot) ? { snapshot: one(value.snapshot) } : {}),
     ...(one(value.image) ? { image: one(value.image) } : {}),
+    ...(one(value.desktopTemplate) ? { desktopTemplate: one(value.desktopTemplate) } : {}),
+    ...(one(value.desktopSnapshot) ? { desktopSnapshot: one(value.desktopSnapshot) } : {}),
+    ...(one(value.desktopImage) ? { desktopImage: one(value.desktopImage) } : {}),
     ...(apiUrl ? { apiUrl } : {}),
     ...(one(value.target, 100) ? { target: one(value.target, 100) } : {}),
   };
@@ -142,8 +145,11 @@ function cleanConfig(value: WorldProviderConnection['config']): WorldProviderCon
 
 function environmentConfig(provider: string): WorldProviderConnection['config'] {
   return provider === 'e2b'
-    ? { template: process.env.KARMAX_E2B_TEMPLATE }
+    ? { template: process.env.KARMAX_E2B_TEMPLATE,
+        desktopTemplate: process.env.KARMAX_E2B_DESKTOP_TEMPLATE }
     : { snapshot: process.env.KARMAX_DAYTONA_SNAPSHOT, image: process.env.KARMAX_DAYTONA_IMAGE,
+        desktopSnapshot: process.env.KARMAX_DAYTONA_DESKTOP_SNAPSHOT,
+        desktopImage: process.env.KARMAX_DAYTONA_DESKTOP_IMAGE,
         apiUrl: process.env.DAYTONA_API_URL, target: process.env.DAYTONA_TARGET };
 }
 

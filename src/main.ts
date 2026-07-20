@@ -37,6 +37,7 @@ import { WorldProviderConnectionService } from './world/connections.js';
 import { E2BWorldProvider } from './world/e2b.js';
 import { DaytonaWorldProvider } from './world/daytona.js';
 import { WorldHandoffService } from './world/handoff.js';
+import { WorldAccessService } from './world/access.js';
 
 const VERSION = '1.0.0';
 
@@ -139,8 +140,9 @@ async function main() {
     : new LocalObjectStore(p.objects);
   const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp);
   const runners = new RunnerPoolService(store);
-  const handoffs = new WorldHandoffService(store, worlds, githubApp, runners);
-  const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners);
+  const worldAccess = new WorldAccessService(store, worlds, runners);
+  const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess);
+  const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners, worldAccess);
   const delivery = new DeliveryDispatcher(store, {
     browser: new BrowserDeliveryAdapter(),
     ...(process.env.KARMAX_EMAIL_DELIVERY_URL ? { email: new WebhookDeliveryAdapter(process.env.KARMAX_EMAIL_DELIVERY_URL, 'email') } : {}),
@@ -236,7 +238,8 @@ async function main() {
   const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
   if (restored) console.log(`  • Restored ${restored} installed workflow(s)`);
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
-    authorization, defaultAgentProvider: provider, hosted: deployment.hosted, providerConnections, bus });
+    authorization, defaultAgentProvider: provider, hosted: deployment.hosted, providerConnections, worlds,
+    worldAccess, githubApp, bus });
 
   // Trigger dispatcher (SPEC §3.3): starts armed triggered tasks when a
   // dependency completes, a schedule fires, or a matching event occurs. Runs
@@ -314,6 +317,7 @@ async function main() {
     providerConnections,
     handoffs,
     runners,
+    worldAccess,
     objects: objectStore,
     cellId: deployment.cellId,
     hosted: deployment.hosted,

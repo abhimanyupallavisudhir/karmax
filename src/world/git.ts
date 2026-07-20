@@ -27,7 +27,7 @@ export async function git(cwd: string, args: string[], opts: { timeoutMs?: numbe
 }
 
 /** git that throws on failure (for steps that must succeed). */
-export async function gitOrThrow(cwd: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<string> {
+export async function gitOrThrow(cwd: string, args: string[], opts: { timeoutMs?: number; env?: Record<string, string> } = {}): Promise<string> {
   const r = await git(cwd, args, opts);
   if (r.code !== 0) throw new Error(`git ${args.join(' ')} failed (${r.code}): ${r.stderr || r.stdout}`);
   return r.stdout.trim();

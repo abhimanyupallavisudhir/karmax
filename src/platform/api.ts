@@ -29,12 +29,17 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
-import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectUnconditional, searchWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
+import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import type { KarmaxBus } from '../contrib/bus.js';
+import type { WorldRegistry } from '../world/registry.js';
+import type { WorldHandle } from '../world/types.js';
+import { worldRepos } from '../world/types.js';
+import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, type GitBrokerAuth } from '../world/git-broker.js';
+import type { WorldAccessService } from '../world/access.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -125,6 +130,10 @@ export interface KarmaxApiDeps {
   /** Organization-scoped cloud provider credentials. Kept optional for the
    * small unit-test API harnesses; production always supplies it. */
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  /** World access for permission-checked collaboration tools. */
+  worlds?: WorldRegistry;
+  worldAccess?: WorldAccessService;
+  githubApp?: import('../integrations/github-app.js').GitHubAppService;
   /** Wake live gateway subscribers when platform-side actions append events. The
    * durable event table remains the source of truth when this is absent. */
   bus?: KarmaxBus;
@@ -143,6 +152,79 @@ export class KarmaxApi {
   /** Attach the trigger dispatcher after construction (resolves the ctor cycle). */
   setTriggerArmer(armer: TriggerArmer) {
     this.armer = armer;
+  }
+
+  private collaborationTask(token: string, tool: 'publish_task_branch' | 'import_task_branch' | 'refresh_upstream') {
+    const caller = this.require(token, tool);
+    if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
+    const task = this.deps.store.getTask(caller.taskId);
+    if (!task) throw new Error('calling task not found');
+    const project = this.deps.store.getProject(task.projectId);
+    if (!project?.organizationId) throw new Error('calling task project is unavailable');
+    const handle = (this.deps.store.currentWorld(task.id) ?? task.lastView?.world) as WorldHandle | undefined;
+    if (!handle) throw new Error('calling task has no recoverable world');
+    return { task, project, handle };
+  }
+
+  private gitBrokerAuth(projectId: string): GitBrokerAuth {
+    if (!this.deps.githubApp) throw new Error('Git collaboration requires a connected GitHub App');
+    const linked = this.deps.store.listProjectRepositories(projectId);
+    return async (repo) => {
+      const repository = linked.find((candidate) => candidate.repository.sshUrl === repo.repo)?.repository;
+      if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
+      return this.deps.githubApp!.brokerCredentials(repository);
+    };
+  }
+
+  private async openCollaborationWorld(taskId: string, handle: WorldHandle) {
+    if (this.deps.worldAccess) return this.deps.worldAccess.open(taskId, handle);
+    if (!this.deps.worlds) throw new Error('world access is unavailable');
+    return { world: await this.deps.worlds.open(handle), handle, release: async () => {} };
+  }
+
+  async publishTaskBranch(token: string): Promise<{ branch: string; pushed: string[] }> {
+    const { task, handle } = this.collaborationTask(token, 'publish_task_branch');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      for (const repo of worldRepos(access.world.handle)) {
+        const dirty = await access.world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+        if (dirty.code !== 0) throw new Error(`could not inspect ${repo.name}: ${dirty.stderr || dirty.stdout}`);
+        if (dirty.stdout.trim()) throw new Error(`repo "${repo.name}" has uncommitted changes; commit them before publishing`);
+      }
+      const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId));
+      if (!result.pushed.length || result.skipped.length)
+        throw new Error(`could not publish ${result.skipped.length ? result.skipped.join(', ') : 'task branch'}`);
+      const event = { taskId: task.id, type: 'push.branch', ts: Date.now(), payload: {
+        branch: access.handle.branch, repos: result.pushed, reason: 'agent-collaboration' } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+      return { branch: access.handle.branch, pushed: result.pushed };
+    } finally { await access.release(); }
+  }
+
+  async importTaskBranch(token: string, sourceTaskId: string) {
+    const { task, handle } = this.collaborationTask(token, 'import_task_branch');
+    const source = this.deps.store.getTask(sourceTaskId);
+    if (!source || source.projectId !== task.projectId) throw new Error('source task must belong to the same project');
+    const sourceHandle = (this.deps.store.currentWorld(sourceTaskId) ?? source.lastView?.world) as WorldHandle | undefined;
+    if (!sourceHandle) throw new Error('source task has no published world branch');
+    const published = this.deps.store.eventsSince(sourceTaskId, 0).some((event) => event.type === 'push.branch'
+      && (event.payload as { branch?: string } | undefined)?.branch === sourceHandle.branch);
+    if (!published) throw new Error('source branch is not published yet; message its agent and ask it to commit and call publish_task_branch');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      const refs = await brokerImportTaskBranch(access.world, sourceHandle, sourceTaskId,
+        this.gitBrokerAuth(task.projectId));
+      return { sourceTaskId, refs };
+    } finally { await access.release(); }
+  }
+
+  async refreshUpstream(token: string, branch?: string) {
+    const { task, handle } = this.collaborationTask(token, 'refresh_upstream');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      return { refs: await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch) };
+    } finally { await access.release(); }
   }
 
   listWorldProviderConnections(token: string, organizationId: string) {
@@ -276,6 +358,8 @@ export class KarmaxApi {
       prompt?: string;
       /** Images attached to the initial prompt (references, never inline bytes). */
       images?: ImageRef[];
+      /** Wiki context to inline, as `@proj:…`/`@org:…` tokens (see TaskParams.wikiContext). */
+      wikiContext?: string[];
       workflow?: string;
       base?: string;
       target?: string;
@@ -321,6 +405,9 @@ export class KarmaxApi {
     // Image attachments ride alongside the prompt but aren't a manifest param, so
     // carry them explicitly (references only — bytes live in the attachment store).
     if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
+    // Wiki context (which pages to inline) isn't a manifest param either; a
+    // top-level arg (MCP/API) is folded in like the form sends it via `params`.
+    if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
     // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
     // (drafts may still be saved without one, then checked again at queueTask).
@@ -1607,10 +1694,10 @@ export class KarmaxApi {
 
   /** One navigation call: a skill path returns the page; anything else lists
    *  the (sub)tree — the same call expands a TOC `[more…]` fold. The full tree
-   *  also carries the unconditional entries' bodies and `tocText`, the exact
-   *  rendered table of contents agents receive (importance order, [more…]
-   *  folds). The organization tree includes the built-ins, resolved through
-   *  their on-disk overrides when edited. */
+   *  also carries the `default`-labelled entries' bodies (inlined into every
+   *  task) and `tocText`, the exact rendered table of contents agents receive
+   *  (importance order, [more…] folds). The organization tree includes the
+   *  built-ins, resolved through their on-disk overrides when edited. */
   readWiki(token: string, scope: WikiScope, id: string, rel = '') {
     const root = this.wikiScope(token, scope, id, false);
     const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
@@ -1621,17 +1708,26 @@ export class KarmaxApi {
     if (page) return { scope, id, path: page.path, page };
     const toc = listWiki(root, rel);
     if (rel) return { scope, id, path: safeWikiPath(rel), toc };
+    // `default` entries are inlined into every task's prompt (built-ins first).
     const unconditional = [
       ...builtins
-        .filter((b) => b.delivery === 'unconditional')
+        .filter(isDefaultDelivered)
         .map((b) => ({ ...entryOf(b), body: parseFrontmatter(b.content).body.trim() || b.content })),
-      ...collectUnconditional(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
+      ...collectDefaultPages(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
     ];
     toc.children = [...builtins.map(entryOf), ...(toc.children ?? [])];
-    // renderWikiToc skips unconditional entries itself, so the full tree gives
-    // exactly the agent-visible TOC (indexed built-ins included).
-    const tocText = renderWikiToc(toc, { scope, id });
+    // The TOC lists every entry except the `default` ones inlined above (shown
+    // in full as their own cards) — the same rendering agents get.
+    const exclude = new Set(unconditional.map((u) => u.path));
+    const tocText = renderWikiToc(toc, { scope, id, exclude });
     return { scope, id, path: '', toc, unconditional, tocText };
+  }
+
+  /** Rank pages, labels, and folders of one scope against a typed query — what
+   *  the task-form `@proj:…`/`@org:…` mention dropdown searches. */
+  suggestWiki(token: string, scope: WikiScope, id: string, query: string) {
+    const root = this.wikiScope(token, scope, id, false);
+    return { scope, id, query, suggestions: suggestWiki(root, query) };
   }
 
   /** Create (`create` guards against overwriting), update, or — via `prevPath`

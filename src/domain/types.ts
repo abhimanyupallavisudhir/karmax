@@ -190,9 +190,15 @@ export interface WorldProviderConnection {
   name: string;
   credentialHandle: string;
   config: {
+    /** Provider-native launch artifact for ordinary headless worlds. */
     template?: string;
     snapshot?: string;
     image?: string;
+    /** Optional provider-native desktop variant. E2B defaults to its public
+     * `desktop` template; Daytona defaults to its VNC-capable stock image. */
+    desktopTemplate?: string;
+    desktopSnapshot?: string;
+    desktopImage?: string;
     apiUrl?: string;
     target?: string;
   };
@@ -363,7 +369,7 @@ export interface ProjectConfig {
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
   /** Immutable remote environment selector. Provider adapters resolve this to
    * their image/snapshot primitive and stamp the result on the world handle. */
-  environment?: { image?: string; snapshot?: string };
+  environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
   /** Hard monthly provider-cost ceiling; provisioning queues once exhausted. */
   monthlyBudgetMicros?: number;
   /** Parked-world retention before portable hibernation (default seven days). */
@@ -378,6 +384,9 @@ export interface OrganizationExecutionPolicy {
   runnerPoolId?: string;
   resources?: ProjectConfig['resources'];
   network?: ProjectConfig['network'];
+  /** Headless includes screenshot-capable browser MCPs. Desktop additionally
+   * enables provider-native Xvfb/XFCE/noVNC computer use. */
+  environment?: ProjectConfig['environment'];
   monthlyBudgetMicros?: number;
   hibernateAfterMs?: number;
 }
@@ -478,6 +487,16 @@ export interface TaskParams {
   prompt: string;
   /** Images attached to the initial prompt (references, never inline bytes). */
   images?: ImageRef[];
+  /**
+   * Wiki pages inlined into this task's agent context, as `@proj:…`/`@org:…`
+   * tokens (a page, a whole `@proj:tag:<label>`, or a folder `@proj:<section>/*`).
+   * The task-form "wiki context" field seeds this with `@proj:tag:default` and
+   * `@org:tag:default` so `default`-labelled pages are inlined by default; a task
+   * opts out by clearing them. Absent (API/quick-add) ⇒ the default tokens apply.
+   * Resolved fresh each turn by `buildWikiPromptContext` (SPEC §5.4), UNION any
+   * `@…` tags written inline in the prompt/follow-ups.
+   */
+  wikiContext?: string[];
   base?: string;
   target?: string;
   /** role -> profile id overrides. */
@@ -888,6 +907,8 @@ export interface TaskView {
   /** Safe client projection of the selected backend. Provider-owned ids and
    * metadata are intentionally never included. */
   worldProvider?: WorldHandleRef['kind'];
+  /** Safe projection indicating that provider-native noVNC check-in exists. */
+  worldDesktop?: boolean;
   worldPath?: string;
   pr?: { url: string; number: number };
   mergeQueue?: { position: number; total: number };

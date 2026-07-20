@@ -1,0 +1,595 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
+import { PassThrough, Writable } from 'node:stream';
+import type { Provider } from '../domain/types.js';
+import type { World, WorldPty } from '../world/types.js';
+import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION } from '../autonomy/config-homes.js';
+
+// CheckpointService already excludes this injection surface. Keep it under the
+// world root only because every remote provider exposes that portable write API.
+const REMOTE_ROOT = '.karmax-injection/agent';
+const CODEX_PACKAGE = process.env.KARMAX_REMOTE_CODEX_PACKAGE ?? '@openai/codex@0.144.5';
+const REMOTE_NODE_VERSION = process.env.KARMAX_REMOTE_NODE_VERSION ?? '22.16.0';
+const REMOTE_NPM_VERSION = process.env.KARMAX_REMOTE_NPM_VERSION ?? '10.9.2';
+const READY = '\u001eKARMAX_AGENT_READY\u001e';
+
+/** A V2 provider world is the execution boundary: native agent subprocesses must
+ * run there, not on the control-plane host against a virtual cwd. */
+export function isRemoteAgentWorld(world: World): boolean {
+  return world.handle.version === 2 && Boolean(world.handle.sealedProviderRef);
+}
+
+export interface RemoteAgentHome {
+  absolute: string;
+  relative: string;
+  /** Optional sandbox-local modern Node bin directory for old provider images. */
+  runtimeBin?: string;
+  /** Browser entries rewritten to sandbox-local, pinned executables. */
+  browserMcp?: Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
+}
+
+/** Seed the leased subscription credentials/config into this task's persistent
+ * sandbox. Provider session/cache directories are deliberately left sandbox-
+ * local; files are copied non-destructively, so remote sessions survive turns. */
+export async function seedRemoteAgentHome(world: World, provider: Provider, localHome: string,
+  session?: string): Promise<RemoteAgentHome> {
+  if (!localHome) throw new Error(`${provider} subscription has no config home to seed`);
+  const relative = remoteAgentHomeRelative(provider, localHome);
+  const absolute = path.posix.join(world.handle.root, relative);
+  // A single-repo world's root is itself a checkout. Keep injected auth out of
+  // `git add -A` without modifying the user's tracked .gitignore.
+  await world.exec('bash', ['-lc', "exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p \"$(dirname \"$exclude\")\" && { grep -qxF '.karmax-injection/' \"$exclude\" 2>/dev/null || printf '%s\\n' '.karmax-injection/' >> \"$exclude\"; } || true"]);
+  const existing = await remoteHomeFiles(world, absolute);
+  for (const file of configFiles(localHome, provider, session)) {
+    const target = `${relative}/${file.relative.split(path.sep).join('/')}`;
+    if (!world.writeFileBuffer) throw new Error('remote world cannot receive subscription config files');
+    // Provider CLIs refresh OAuth state in-place. Never replace a sandbox copy
+    // with the older control-plane copy on a later turn.
+    if (!existing.has(target)) await world.writeFileBuffer(target, file.content);
+  }
+  const runtimeBin = await ensureRemoteNode(world);
+  const home = { absolute, relative, ...(runtimeBin ? { runtimeBin } : {}) };
+  const browser = configuredBrowser(localHome, provider);
+  const browserMcp = browser ? await ensureRemoteBrowser(world, browser, runtimeBin) : undefined;
+  if (provider === 'codex') await seedRemoteCodexConfig(world, localHome, home, browserMcp);
+  const permissions = await world.exec('bash', ['-lc',
+    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type d -exec chmod 700 {} + && find ${quote(absolute)} -type f -exec chmod 600 {} +; fi`]);
+  if (permissions.code !== 0) throw new Error(`could not protect remote subscription files: ${permissions.stderr || permissions.stdout}`);
+  return { ...home, ...(browserMcp ? { browserMcp } : {}) };
+}
+
+/** A world can rotate between several subscription accounts. Keep each native
+ * home isolated by the stable control-plane config-home identity so preserving
+ * refreshed auth for account A can never cause a later lease for B to run as A. */
+export function remoteAgentHomeRelative(provider: Provider, localHome: string): string {
+  const identity = crypto.createHash('sha256').update(path.resolve(localHome)).digest('hex').slice(0, 20);
+  return `${REMOTE_ROOT}/${provider}/${identity}`;
+}
+
+/** Export only provider-owned authentication and native conversation files.
+ * Remote MCP/browser rewrites, logs, caches, and process-control files remain
+ * sandbox-local. Atomic 0600 writes make OAuth token rotation durable without
+ * allowing a partial download to corrupt the account's control-plane home. */
+export async function syncRemoteAgentHome(world: World, provider: Provider, remoteHome: RemoteAgentHome,
+  localHome: string): Promise<void> {
+  if (!localHome) return;
+  const listed = await world.exec('bash', ['-lc',
+    `if [ -d ${quote(remoteHome.absolute)} ]; then find ${quote(remoteHome.absolute)} -type f -print; fi`]);
+  if (listed.code !== 0) throw new Error(`could not export remote ${provider} state: ${listed.stderr || listed.stdout}`);
+  const root = world.handle.root.replace(/\/+$/, '');
+  const homePrefix = `${remoteHome.relative}/`;
+  const files = listed.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
+    file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file).filter((file) => file.startsWith(homePrefix));
+  const auth = new Set(provider === 'codex'
+    ? ['auth.json', 'karmax-oauth.json']
+    : ['.credentials.json', '.claude/.credentials.json', 'karmax-oauth.json']);
+  for (const remoteFile of files) {
+    const relative = remoteFile.slice(homePrefix.length);
+    const session = provider === 'codex'
+      ? relative.startsWith('sessions/') && relative.endsWith('.jsonl')
+      : relative.startsWith('projects/') && relative.endsWith('.jsonl');
+    if (!auth.has(relative) && !session) continue;
+    const destination = path.join(localHome, ...relative.split('/'));
+    const data = await world.readFileBuffer(remoteFile);
+    fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+    const temp = `${destination}.${crypto.randomBytes(6).toString('hex')}.karmax-tmp`;
+    try {
+      fs.writeFileSync(temp, data, { mode: 0o600 });
+      fs.renameSync(temp, destination);
+      fs.chmodSync(destination, 0o600);
+    } finally {
+      fs.rmSync(temp, { force: true });
+    }
+  }
+}
+
+/** Minimal environment passed across the trust boundary. Authentication lives in
+ * the seeded home; only explicit turn-scoped values and provider tuning cross. */
+export function remoteAgentEnv(provider: Provider, home: string, source: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {
+    ...(provider === 'claude' ? { CLAUDE_CONFIG_DIR: home } : { CODEX_HOME: home }),
+  };
+  for (const key of [
+    'KARMAX_TOKEN', 'KARMAX_GATEWAY_URL', 'CLAUDE_CODE_OAUTH_TOKEN',
+    // Agent SDK ↔ Claude Code protocol negotiation. Dropping ENTRYPOINT makes
+    // the CLI reject stream-json input unless --print; the remaining flags are
+    // SDK feature handshakes and must cross a custom-spawn boundary unchanged.
+    'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_AGENT_SDK_VERSION',
+    'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING', 'CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH',
+    'CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH', 'CLAUDE_CODE_QUESTION_PREVIEW_FORMAT',
+    'ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+  ]) {
+    const value = source[key];
+    if (value) out[key] = value;
+  }
+  return out;
+}
+
+/** Translate the host SDK's bundled executable into the matching published CLI
+ * package. npx caches it in the sandbox after the first turn. */
+export function remoteAgentCommand(provider: Provider, command: string, args: string[]): { command: string; args: string[] } {
+  if (provider === 'claude') {
+    const sdkArgs = path.basename(command).startsWith('node') && /(?:^|\/)cli\.js$/.test(args[0] ?? '') ? args.slice(1) : args;
+    // The SDK's embedded native binary infers print mode from its entrypoint.
+    // The separately published npm CLI still validates stream-json arguments at
+    // startup in some sandbox PTYs; make the SDK's intended mode explicit.
+    const forwarded = sdkArgs.includes('--print') || sdkArgs.includes('-p') ? sdkArgs : ['--print', ...sdkArgs];
+    // The Agent SDK and its embedded Claude Code binary are one tested protocol
+    // unit. Resolve the package's declared CLI version instead of maintaining a
+    // second hand-written pin that can silently drift on dependency upgrades.
+    const packageSpec = process.env.KARMAX_REMOTE_CLAUDE_PACKAGE
+      ?? `@anthropic-ai/claude-code@${installedClaudeCodeVersion()}`;
+    return { command: 'npx', args: ['--yes', packageSpec, ...forwarded] };
+  }
+  return { command: 'npx', args: ['--yes', CODEX_PACKAGE, ...args] };
+}
+
+/** Version of Claude Code explicitly paired with the installed Agent SDK. */
+export function installedClaudeCodeVersion(): string {
+  const require = createRequire(import.meta.url);
+  let directory = path.dirname(require.resolve('@anthropic-ai/claude-agent-sdk'));
+  for (;;) {
+    const packageFile = path.join(directory, 'package.json');
+    try {
+      const metadata = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+      if (metadata.name === '@anthropic-ai/claude-agent-sdk' && typeof metadata.claudeCodeVersion === 'string')
+        return metadata.claudeCodeVersion;
+    } catch { /* keep walking to the package root */ }
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  throw new Error('installed Claude Agent SDK does not declare claudeCodeVersion; set KARMAX_REMOTE_CLAUDE_PACKAGE explicitly');
+}
+
+/** ChildProcess-shaped bridge backed by the provider's bidirectional PTY. This is
+ * the process abstraction both the Claude Agent SDK custom-spawn hook and Codex
+ * app-server need. stderr is redirected away from the JSON protocol stream. */
+export function spawnRemoteAgentProcess(opts: {
+  world: World;
+  provider: Provider;
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  signal?: AbortSignal;
+}): RemoteSpawnedProcess {
+  const executable = remoteAgentCommand(opts.provider, opts.command, opts.args);
+  const home = opts.env[opts.provider === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR']!;
+  const pidFile = path.posix.join(home, 'karmax-agent.pid');
+  const stderr = path.posix.join(home, 'agent-stderr.log');
+  const bakedExecutable = `/opt/karmax/bin/${opts.provider}`;
+  const forwardedArgs = executable.args.slice(2);
+  const expectedVersion = executable.args[1]?.slice(executable.args[1]!.lastIndexOf('@') + 1) ?? '';
+  // A user may keep an older E2B/Daytona template after upgrading Karmax. Only
+  // use its baked CLI when it is the version paired with this control-plane
+  // adapter; otherwise npx installs the matching package into the sandbox cache.
+  const bakedMatches = `[ -x ${quote(bakedExecutable)} ] && ${quote(bakedExecutable)} --version 2>/dev/null | grep -Fq -- ${quote(expectedVersion)}`;
+  const invocation = (command: string, args: string[]) => {
+    if (opts.provider !== 'claude') return [command, ...args].map(quote).join(' ');
+    // World transports are PTYs, but Claude's stream-json/print mode requires
+    // non-interactive stdin. This foreground relay gives the CLI a real pipe,
+    // forwards termination, and leaves its stdout/stderr on the provider PTY.
+    const relay = [
+      "const { spawn } = require('node:child_process')",
+      "const child = spawn(process.argv[1], process.argv.slice(2), { env: process.env, stdio: ['pipe', 'inherit', 'inherit'] })",
+      "process.stdin.on('data', (data) => { const end = data.indexOf(4); if (end < 0) child.stdin.write(data); else { if (end) child.stdin.write(data.subarray(0, end)); child.stdin.end(); } })",
+      "process.stdin.on('end', () => child.stdin.end())",
+      "for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal))",
+      "child.on('error', (error) => { console.error(error); process.exitCode = 1 })",
+      "child.on('exit', (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exit(code ?? 1) })",
+    ].join('; ');
+    return ['node', '-e', relay, command, ...args].map(quote).join(' ');
+  };
+  const selectedCommand = `if ${bakedMatches}; then exec ${invocation(bakedExecutable, forwardedArgs)}; else exec ${invocation(executable.command, executable.args)}; fi`;
+  const commandLine = `sh -c ${quote(selectedCommand)}`;
+  // Raw mode is required for the line-oriented JSON protocols: canonical PTYs
+  // truncate single lines around MAX_CANON (~4 KiB). The sandbox-local pidfile
+  // also lets a Temporal retry reap an agent left behind by a worker crash
+  // before starting a second writer in the same world. Keep the app-server in
+  // the PTY foreground: `setsid` detaches its controlling terminal, after which
+  // the real E2B process stays alive but never receives JSON-RPC input.
+  const shell = [
+    'stty raw -echo',
+    `pidfile=${quote(pidFile)}`,
+    `if [ -s "$pidfile" ]; then old=$(cat "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
+    'printf \'%s\\n\' "$$" > "$pidfile"',
+    // Assemble the sentinel at runtime. The PTY echoes this whole shell command
+    // before `stty -echo` executes; embedding READY literally would make that
+    // command echo open the protocol gate before `exec agent`, allowing Bash to
+    // consume the JSON initialize line. The newline also forces prompt delivery
+    // through provider PTY streams that coalesce partial output.
+    "printf '\\036KARMAX_AGENT_%s\\036\\n' READY",
+    `exec ${commandLine} 2>${quote(stderr)}`,
+  ].join('; ');
+  return new RemoteSpawnedProcess(opts.world, shell, opts.cwd, opts.env, opts.signal);
+}
+
+export class RemoteSpawnedProcess extends EventEmitter {
+  readonly stdin: Writable;
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly pid = undefined;
+  killed = false;
+  exitCode: number | null = null;
+  private pty?: WorldPty;
+  private ready: Promise<WorldPty>;
+  private protocolGate: Promise<void>;
+  private openProtocolGate!: () => void;
+  private preamble = '';
+  private protocolReady = false;
+
+  constructor(world: World, command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal) {
+    super();
+    this.protocolGate = new Promise<void>((resolve) => { this.openProtocolGate = resolve; });
+    this.ready = world.openPty({ command, cwd, env, cols: 200, rows: 40 }).then((pty) => {
+      this.pty = pty;
+      pty.onData((chunk) => this.onData(chunk));
+      pty.onExit((code) => this.finish(code));
+      return pty;
+    }).catch((error) => {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      queueMicrotask(() => this.emit('error', failure));
+      this.finish(-1);
+      return {
+        onData: () => () => {}, onExit: () => () => {},
+        write: async () => { throw failure; }, resize: async () => {}, close: async () => {},
+      } satisfies WorldPty;
+    });
+    // The SDK may write initialize before the provider opens the PTY or before
+    // its login shell reaches `exec agent`. Gate every byte on READY; otherwise
+    // the shell can consume JSON as its next command.
+    this.stdin = new Writable({
+      write: (chunk, _encoding, done) => {
+        Promise.all([this.ready, this.protocolGate]).then(([pty]) => pty.write(Buffer.from(chunk).toString())).then(() => done(), done);
+      },
+      final: (done) => { Promise.all([this.ready, this.protocolGate]).then(([pty]) => pty.write('\x04')).then(() => done(), done); },
+    });
+    // ChildProcess stdin streams own an error listener internally; our
+    // ChildProcess-shaped stream must do the same. Claude's SDK observes the
+    // authoritative process exit but does not subscribe to stdin errors, so an
+    // E2B write racing a fast CLI exit would otherwise crash Node as an
+    // unhandled Writable error before the adapter can report stderr.
+    this.stdin.on('error', () => {});
+    const abort = () => { this.kill('SIGTERM'); };
+    if (signal?.aborted) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
+  }
+
+  kill(_signal: NodeJS.Signals = 'SIGTERM'): boolean {
+    if (this.killed) return false;
+    this.killed = true;
+    void this.ready.then((pty) => pty.close()).catch(() => undefined);
+    return true;
+  }
+
+  private finish(code: number | null): void {
+    if (this.exitCode !== null) return;
+    this.exitCode = code;
+    this.openProtocolGate();
+    this.stdout.end();
+    this.stderr.end();
+    this.emit('exit', code, null);
+    this.emit('close', code, null);
+  }
+
+  private onData(chunk: string): void {
+    if (this.protocolReady) { this.stdout.write(chunk); return; }
+    this.preamble += chunk;
+    const marker = this.preamble.indexOf(READY);
+    if (marker < 0) {
+      // Bound shell banners/prompts while waiting for the marker.
+      if (this.preamble.length > 16_384) this.preamble = this.preamble.slice(-READY.length);
+      return;
+    }
+    this.protocolReady = true;
+    this.openProtocolGate();
+    const rest = this.preamble.slice(marker + READY.length);
+    this.preamble = '';
+    if (rest) this.stdout.write(rest);
+  }
+}
+
+function configFiles(root: string, provider: Provider, session?: string): Array<{ relative: string; content: Buffer }> {
+  const files: Array<{ relative: string; content: Buffer }> = [];
+  const walk = (dir: string, relative = '') => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const rel = path.join(relative, entry.name);
+      const full = path.join(dir, entry.name);
+      const segments = rel.split(path.sep).map((segment) => segment.toLowerCase());
+      const top = segments[0]!;
+      // Native homes contain large, live provider state that is neither required
+      // to authenticate nor safe to snapshot file-by-file (SQLite + WAL pairs).
+      // Codex currently names these logs_2.sqlite/state_5.sqlite and stores tens
+      // of MiB in shell_snapshots and nested plugin caches. Uploading them made a
+      // real E2B filesystem request time out. Durable config, skills, rules,
+      // commands, hooks, and plugin manifests continue through this walk; the one
+      // requested session is materialized separately below.
+      if (['projects', 'sessions', 'logs', 'log', 'debug', 'tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
+        || segments.some((segment) => ['cache', '.remote-plugin-install-staging'].includes(segment))
+        || /^(?:logs?|state|goals|memories)(?:[_-].*)?\.sqlite(?:-(?:wal|shm))?$/.test(entry.name.toLowerCase())
+        || ['history.jsonl', 'models_cache.json'].includes(entry.name.toLowerCase())) continue;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) walk(full, rel);
+      else if (entry.isFile()) files.push({ relative: rel, content: fs.readFileSync(full) });
+    }
+  };
+  walk(root);
+  if (session) {
+    const sessionRoot = path.join(root, provider === 'codex' ? 'sessions' : 'projects');
+    const stack = [sessionRoot];
+    while (stack.length) {
+      const dir = stack.pop()!;
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) stack.push(full);
+        else if (entry.isFile() && entry.name.endsWith('.jsonl')
+          && (provider === 'claude' ? entry.name === `${session}.jsonl` : entry.name.includes(session))) {
+          const relative = path.relative(root, full);
+          if (!files.some((file) => file.relative === relative)) files.push({ relative, content: fs.readFileSync(full) });
+        }
+      }
+    }
+  }
+  return files;
+}
+
+async function remoteHomeFiles(world: World, absolute: string): Promise<Set<string>> {
+  const result = await world.exec('bash', ['-lc',
+    `if [ -d ${quote(absolute)} ]; then find ${quote(absolute)} -type f -print; fi`]);
+  if (result.code !== 0) throw new Error(`could not inspect remote subscription home: ${result.stderr || result.stdout}`);
+  const root = world.handle.root.replace(/\/+$/, '');
+  return new Set(result.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
+    file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file));
+}
+
+/** Attach Karmax's host-mediated tools to a Codex rollout minted by another
+ * client. Codex 0.144.x accepts dynamicTools only on thread/start; native
+ * resume/fork reloads them from the first session_meta record instead. Patch
+ * only the task-private sandbox copy so the original host transcript remains
+ * byte-for-byte untouched. */
+export async function ensureRemoteCodexSessionTools(world: World, home: RemoteAgentHome,
+  session: string, dynamicTools: unknown[]): Promise<boolean> {
+  if (!world.writeFileBuffer) return false;
+  const prefix = `${home.relative}/sessions/`;
+  const candidates = [...await remoteHomeFiles(world, home.absolute)]
+    .filter((file) => file.startsWith(prefix) && file.endsWith('.jsonl') && path.posix.basename(file).includes(session));
+  const sessionFile = candidates[0];
+  if (!sessionFile) return false;
+  const original = (await world.readFileBuffer(sessionFile)).toString('utf8');
+  const newline = original.indexOf('\n');
+  const first = newline < 0 ? original : original.slice(0, newline);
+  let metadata: any;
+  try { metadata = JSON.parse(first); }
+  catch { throw new Error(`Codex session ${session} has invalid rollout metadata`); }
+  if (metadata?.type !== 'session_meta' || !metadata.payload || typeof metadata.payload !== 'object')
+    throw new Error(`Codex session ${session} is missing its leading session_meta record`);
+  metadata.payload.dynamic_tools = dynamicTools;
+  const updated = `${JSON.stringify(metadata)}${newline < 0 ? '' : original.slice(newline)}`;
+  await world.writeFileBuffer(sessionFile, Buffer.from(updated));
+  const protectedFile = path.posix.join(world.handle.root, sessionFile);
+  const chmod = await world.exec('chmod', ['600', protectedFile]);
+  if (chmod.code !== 0) throw new Error(`could not protect patched Codex session ${session}: ${chmod.stderr || chmod.stdout}`);
+  return true;
+}
+
+/** Copy one native provider session between persistent cloud worlds. The source
+ * remains untouched; only the requested session is exposed in the destination. */
+export async function materializeRemoteSession(source: World, destination: World,
+  provider: Provider, session: string, destinationLocalHome: string): Promise<boolean> {
+  if (!destination.writeFileBuffer) return false;
+  const prefix = `${REMOTE_ROOT}/${provider}/`;
+  let files: string[];
+  try {
+    const sourceDirectory = path.posix.join(source.handle.root, prefix);
+    const listed = await source.exec('bash', ['-lc',
+      `if [ -d ${quote(sourceDirectory)} ]; then find ${quote(sourceDirectory)} -type f -print; fi`]);
+    if (listed.code !== 0) return false;
+    const root = source.handle.root.replace(/\/+$/, '');
+    files = listed.stdout.split('\n').map((file) => file.trim()).filter(Boolean).map((file) =>
+      file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file).filter((file) => file.startsWith(prefix));
+  }
+  catch { return false; }
+  const sourceFile = files.find((file) => provider === 'claude'
+    ? file.includes('/projects/') && path.posix.basename(file) === `${session}.jsonl`
+    : file.includes('/sessions/') && path.posix.basename(file).includes(session) && file.endsWith('.jsonl'));
+  if (!sourceFile) return false;
+  try {
+    const destinationPrefix = `${remoteAgentHomeRelative(provider, destinationLocalHome)}/`;
+    const destinationFile = provider === 'claude'
+      ? `${destinationPrefix}projects/${claudeCwdSlug(destination.handle.root)}/${session}.jsonl`
+      : `${destinationPrefix}sessions/forked/${path.posix.basename(sourceFile)}`;
+    await destination.writeFileBuffer(destinationFile, await source.readFileBuffer(sourceFile));
+    const protectedFile = path.posix.join(destination.handle.root, destinationFile);
+    const chmod = await destination.exec('chmod', ['600', protectedFile]);
+    return chmod.code === 0;
+  } catch { return false; }
+}
+
+function claudeCwdSlug(worldPath: string): string { return worldPath.replace(/[^a-zA-Z0-9]/g, '-'); }
+
+/** Browser MCPs execute in the sandbox, while Karmax platform tools cross the
+ * existing app-server stdio channel and execute on the trusted host. Remove the
+ * old host-specific Karmax MCP table and preserve every other user entry. */
+async function seedRemoteCodexConfig(world: World, localHome: string, home: RemoteAgentHome,
+  browserMcp?: RemoteAgentHome['browserMcp']): Promise<void> {
+  let config = '';
+  // Preserve settings the remote Codex process changed itself; use the host
+  // config only for the first seed into a new sandbox.
+  try { config = await world.readFile(`${home.relative}/config.toml`); }
+  catch { try { config = fs.readFileSync(path.join(localHome, 'config.toml'), 'utf8'); } catch { /* new home */ } }
+  config = removeTomlTable(removeTomlTable(removeTomlTable(config,
+    'mcp_servers.karmax'), 'mcp_servers.chrome-devtools'), 'mcp_servers.playwright').trimEnd();
+  for (const [name, server] of Object.entries(browserMcp ?? {})) {
+    config += `\n\n[mcp_servers.${name}]\ncommand = ${JSON.stringify(server.command)}\nargs = ${JSON.stringify(server.args)}\n`;
+    if (server.env && Object.keys(server.env).length) {
+      config += `\n[mcp_servers.${name}.env]\n${Object.entries(server.env).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join('\n')}\n`;
+    }
+  }
+  await world.writeFile(`${home.relative}/config.toml`, config);
+}
+
+type BrowserKind = 'chrome-devtools' | 'playwright';
+
+function configuredBrowser(home: string, provider: Provider): BrowserKind | undefined {
+  try {
+    if (provider === 'claude') {
+      const value = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'))?.mcpServers;
+      if (value?.['chrome-devtools']) return 'chrome-devtools';
+      if (value?.playwright) return 'playwright';
+      return undefined;
+    }
+    const value = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
+    if (/^\s*\[mcp_servers\.chrome-devtools]\s*$/m.test(value)) return 'chrome-devtools';
+    if (/^\s*\[mcp_servers\.playwright]\s*$/m.test(value)) return 'playwright';
+  } catch { /* a home without MCP configuration needs no browser bootstrap */ }
+  return undefined;
+}
+
+/** Provider templates are the fast path; this sandbox-local installation is the
+ * compatibility path for stock/custom environments. The launch smoke test is
+ * the actual guarantee: a world is never handed to an agent with a configured
+ * browser MCP that cannot start its browser. */
+async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBin?: string): Promise<NonNullable<RemoteAgentHome['browserMcp']>> {
+  const relative = `${REMOTE_ROOT}/tools/browser-${PLAYWRIGHT_VERSION}`;
+  const absolute = path.posix.join(world.handle.root, relative);
+  const bin = path.posix.join(absolute, 'node_modules/.bin');
+  const browserCache = path.posix.join(absolute, 'browsers');
+  const marker = `${relative}/ready.json`;
+  let chromium = '';
+  let resolvedBin = bin;
+  let resolvedCache = browserCache;
+  const nodeCommand = runtimeBin ? path.posix.join(runtimeBin, 'node') : 'node';
+  const pathEnv = runtimeBin ? `${runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` : undefined;
+  const bakedRoot = '/opt/karmax/browser';
+  const bakedCache = '/opt/karmax/browsers';
+  const baked = await world.exec('bash', ['-lc', 'test -x /opt/karmax/bin/playwright-mcp && test -x /opt/karmax/bin/chrome-devtools-mcp && test -f /opt/karmax/smoke.mjs']);
+  if (baked.code === 0) {
+    const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
+      cwd: bakedRoot, env: { NODE_PATH: path.posix.join(bakedRoot, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: bakedCache,
+        ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 30_000,
+    });
+    const smoke = await world.exec(nodeCommand, ['/opt/karmax/smoke.mjs'], {
+      env: { PLAYWRIGHT_BROWSERS_PATH: bakedCache, ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 60_000 });
+    if (executable.code === 0 && executable.stdout.trim() && smoke.code === 0) {
+      chromium = executable.stdout.trim();
+      resolvedBin = '/opt/karmax/bin';
+      resolvedCache = bakedCache;
+    }
+  }
+  if (!chromium) try { chromium = JSON.parse(await world.readFile(marker)).chromium; } catch { /* install below */ }
+  if (!chromium) {
+    const packages = [
+      `playwright@${PLAYWRIGHT_VERSION}`,
+      `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`,
+      `chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`,
+    ];
+    const install = await world.exec('bash', ['-lc', [
+      ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
+      `mkdir -p ${quote(absolute)} ${quote(browserCache)}`,
+      `npm install --prefix ${quote(absolute)} --no-audit --no-fund --omit=dev ${packages.map(quote).join(' ')}`,
+      `PLAYWRIGHT_BROWSERS_PATH=${quote(browserCache)} ${quote(path.posix.join(bin, 'playwright'))} install chromium`,
+    ].join(' && ')], { timeoutMs: 10 * 60_000 });
+    if (install.code !== 0) throw new Error(`remote browser installation failed: ${install.stderr || install.stdout}`);
+    const executable = await world.exec(nodeCommand, ['-e', "process.stdout.write(require('playwright').chromium.executablePath())"], {
+      cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
+        ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 30_000,
+    });
+    if (executable.code !== 0 || !executable.stdout.trim()) throw new Error(`could not locate remote Chromium: ${executable.stderr}`);
+    chromium = executable.stdout.trim();
+    const smoke = await world.exec(nodeCommand, ['-e', "require('playwright').chromium.launch({headless:true,args:['--no-sandbox']}).then(async b=>{await b.close()}).catch(e=>{console.error(e);process.exit(1)})"], {
+      cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
+        ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 60_000,
+    });
+    if (smoke.code !== 0) {
+      // Stock provider environments frequently have a package manager and
+      // passwordless sudo even when browser libraries are absent. Repair that
+      // case once; custom locked-down images still fail with an actionable
+      // template/image error instead of handing the agent a broken MCP.
+      const dependencyInstall = await world.exec('bash', ['-lc', [
+        ...(runtimeBin ? [`export PATH=${quote(pathEnv!)}\${PATH:+:$PATH}`] : []),
+        `installer=${quote(path.posix.join(bin, 'playwright'))}`,
+        'if [ "$(id -u)" = 0 ]; then "$installer" install-deps chromium',
+        'elif command -v sudo >/dev/null 2>&1; then sudo -n "$installer" install-deps chromium',
+        'else exit 126',
+        'fi',
+      ].join('; ')], { env: { PLAYWRIGHT_BROWSERS_PATH: browserCache,
+        ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 10 * 60_000 });
+      const repaired = dependencyInstall.code === 0
+        ? await world.exec(nodeCommand, ['-e', "require('playwright').chromium.launch({headless:true,args:['--no-sandbox']}).then(async b=>{await b.close()}).catch(e=>{console.error(e);process.exit(1)})"], {
+            cwd: absolute, env: { NODE_PATH: path.posix.join(absolute, 'node_modules'), PLAYWRIGHT_BROWSERS_PATH: browserCache,
+              ...(pathEnv ? { PATH: pathEnv } : {}) }, timeoutMs: 60_000,
+          })
+        : dependencyInstall;
+      if (repaired.code !== 0) throw new Error(`remote Chromium readiness probe failed; select a Karmax browser template/image or permit Playwright OS-dependency installation: ${repaired.stderr || repaired.stdout || smoke.stderr || smoke.stdout}`);
+    }
+    await world.writeFile(marker, JSON.stringify({ chromium, playwright: PLAYWRIGHT_VERSION }));
+  }
+  const env = { PLAYWRIGHT_BROWSERS_PATH: resolvedCache, ...(pathEnv ? { PATH: pathEnv } : {}) };
+  return browser === 'playwright'
+    ? { playwright: { command: path.posix.join(resolvedBin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } }
+    : { 'chrome-devtools': { command: path.posix.join(resolvedBin, 'chrome-devtools-mcp'),
+        args: ['--headless', '--isolated', '--executablePath', chromium, '--chromeArg=--no-sandbox'], env } };
+}
+
+/** Bring stock provider images up to the minimum runtime required by the pinned
+ * Codex/Claude and browser MCP packages. The runtime is installed from npm into
+ * the world injection surface, so users do not need to rebuild their selected
+ * E2B template merely because its system Node is stale. Baked Karmax images skip
+ * this entirely. */
+async function ensureRemoteNode(world: World): Promise<string | undefined> {
+  const acceptable = "const [a,b]=process.versions.node.split('.').map(Number);process.exit(a>22||(a===22&&b>=12)?0:1)";
+  if ((await world.exec('node', ['-e', acceptable], { timeoutMs: 30_000 })).code === 0) return undefined;
+  const root = path.posix.join(world.handle.root, `${REMOTE_ROOT}/tools/node-${REMOTE_NODE_VERSION}`);
+  const bin = path.posix.join(root, 'bin');
+  const node = path.posix.join(bin, 'node');
+  const install = await world.exec('bash', ['-lc', [
+    `mkdir -p ${quote(bin)}`,
+    `test -x ${quote(node)} || npm install --prefix ${quote(root)} --no-audit --no-fund --omit=dev node@${quote(REMOTE_NODE_VERSION)} npm@${quote(REMOTE_NPM_VERSION)}`,
+    `ln -sfn ../node_modules/node/bin/node ${quote(node)}`,
+    `ln -sfn ../node_modules/npm/bin/npm-cli.js ${quote(path.posix.join(bin, 'npm'))}`,
+    `ln -sfn ../node_modules/npm/bin/npx-cli.js ${quote(path.posix.join(bin, 'npx'))}`,
+    `${quote(node)} -e ${quote(acceptable)}`,
+  ].join(' && ')], { timeoutMs: 5 * 60_000 });
+  if (install.code !== 0) throw new Error(`remote world needs Node 22.12+ and automatic runtime installation failed: ${install.stderr || install.stdout}`);
+  return bin;
+}
+
+function removeTomlTable(source: string, owned: string): string {
+  let remove = false;
+  return source.split(/(?<=\n)/).filter((line) => {
+    const header = line.match(/^\s*\[([^\]]+)]\s*(?:#.*)?(?:\r?\n)?$/);
+    if (header) {
+      const table = header[1]!.trim();
+      remove = table === owned || table.startsWith(`${owned}.`);
+    }
+    return !remove;
+  }).join('');
+}
+
+function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }

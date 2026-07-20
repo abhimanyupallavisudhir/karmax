@@ -14,7 +14,9 @@ export const PLATFORM_API_CATALOG = {
     'PATCH /api/tasks/:taskId/params|notes|authorization',
     'PUT /api/tasks/:taskId/tags|priority', 'POST /api/tasks/:taskId/tag|archive|signal|target',
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
-    'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/refresh-from-github',
+    'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/materialize-local',
+    'POST /api/tasks/:taskId/terminal-ticket', 'POST /api/tasks/:taskId/refresh-from-github',
+    'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
@@ -24,7 +26,7 @@ export const PLATFORM_API_CATALOG = {
   review: [
     'POST /api/tasks/:taskId/review-action', 'GET /api/tasks/:taskId/review-action/:procId',
     'POST /api/tasks/:taskId/review-action/:procId/stop', 'GET /api/tasks/:taskId/artifact?path=',
-    'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
+    'GET /api/tasks/:taskId/desktop', 'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
   ],
   automation: [
     'GET /api/workflows', 'POST /api/workflows/install', 'POST /api/projects/:projectId/propose-workflow-edit',

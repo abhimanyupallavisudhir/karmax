@@ -76,7 +76,8 @@ export class WorldLifecycleManager {
    * the provider control plane on every sweep tick. */
   private probedAt = new Map<string, number>();
   constructor(private store: Store, private worlds: WorldRegistry, private checkpoints: WorldCheckpointService,
-    private intervalMs = 60_000, private objects?: ObjectStore, private runners?: RunnerPoolService) {}
+    private intervalMs = 60_000, private objects?: ObjectStore, private runners?: RunnerPoolService,
+    private access?: import('./access.js').WorldAccessService) {}
 
   start(): void {
     if (this.timer) return;
@@ -92,13 +93,16 @@ export class WorldLifecycleManager {
     }
     for (const preview of this.store.expiredPreviewLeases(now)) {
       this.store.revokePreviewLease(preview.id);
-      if (preview.runnerLeaseId) this.runners?.release(preview.runnerLeaseId, preview.provider);
+      const handle = this.store.currentWorld(preview.worldId) as any;
+      if (handle && this.access) await this.access.releaseLeaseAndParkIfIdle(handle, preview.runnerLeaseId);
+      else if (preview.runnerLeaseId) this.runners?.release(preview.runnerLeaseId, preview.provider);
     }
     for (const id of this.store.markLostExecutions(now - 2 * 60_000)) {
       const execution = this.store.execution(id);
       if (!execution?.runnerLeaseId) continue;
       const world = this.store.currentWorld(execution.worldId);
-      this.runners?.release(execution.runnerLeaseId, world?.provider ?? world?.kind ?? 'unknown');
+      if (world && this.access) await this.access.releaseLeaseAndParkIfIdle(world as any, execution.runnerLeaseId);
+      else this.runners?.release(execution.runnerLeaseId, world?.provider ?? world?.kind ?? 'unknown');
     }
     // Reconciliation: an active remote world whose sandbox disappeared
     // out-of-band (manual deletion, provider eviction) should surface as

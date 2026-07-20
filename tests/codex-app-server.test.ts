@@ -15,6 +15,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   if (msg.method === 'initialize') send({ id: msg.id, result: { codexHome: process.env.CODEX_HOME } });
   else if (msg.method === 'thread/start') send({ id: msg.id, result: { thread: { id: 'thread-new' } } });
   else if (msg.method === 'thread/resume') send({ id: msg.id, result: { thread: { id: msg.params.threadId } } });
+  else if (msg.method === 'thread/fork') send({ id: msg.id, result: { thread: { id: 'thread-forked' } } });
   else if (msg.method === 'turn/start') {
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
     send({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'done' } } });
@@ -39,7 +40,7 @@ describe('CodexAdapter app-server security policy', () => {
     dir = undefined;
   });
 
-  async function run(session?: string, mode?: string): Promise<any[]> {
+  async function run(session?: string, mode?: string, fork = false): Promise<any[]> {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-app-server-'));
     const stub = path.join(dir, 'codex-stub.cjs');
     const requests = path.join(dir, 'requests.jsonl');
@@ -57,7 +58,7 @@ describe('CodexAdapter app-server security policy', () => {
         systemPrompt: 'Prepare the branch for merge.',
         role: 'merge',
         resolvedAuth: { configHome: dir },
-        ...(session ? { session } : {}),
+        ...(session ? { session } : {}), ...(fork ? { fork: true } : {}),
       } as any,
       { emit() {} } as any,
     );
@@ -87,6 +88,15 @@ describe('CodexAdapter app-server security policy', () => {
       sandboxPolicy: { type: 'dangerFullAccess' },
       approvalPolicy: 'never',
     });
+  });
+
+  it('forks into a new Codex thread instead of appending to the source', async () => {
+    const requests = await run('thread-existing', undefined, true);
+    expect(requests.find((r) => r.method === 'thread/fork')?.params).toMatchObject({
+      threadId: 'thread-existing', sandbox: 'danger-full-access', approvalPolicy: 'never',
+    });
+    expect(requests.some((r) => r.method === 'thread/resume')).toBe(false);
+    expect(requests.find((r) => r.method === 'turn/start')?.params.threadId).toBe('thread-forked');
   });
 
   it('rejects an interrupted terminal status even when partial assistant text exists', async () => {
