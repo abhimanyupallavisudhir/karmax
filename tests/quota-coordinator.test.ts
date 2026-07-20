@@ -3,6 +3,7 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { accountCoordinatorId } from '../src/coordinators/names.js';
 import { newId } from '../src/util/id.js';
+import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 
 /**
  * Hermetic verification of the quota engine's core (RESOLVE-PLAN §2) — provider-
@@ -139,6 +140,21 @@ describe('account coordinator — quota engine', () => {
     await expect.poll(async () => (await accounts()).waiting, { timeout: 5000 }).toBe(0);
     expect((await acct('A')).inUse).toBe(0);
     await g.h.signal('finish');
+    await coord.terminate('done');
+  });
+
+  it('acknowledges availability changes only after they are applied', async () => {
+    const coord = await startCoord([A({ id: 'A' })]);
+    const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+
+    // This activity used to return as soon as its signal was accepted by Temporal,
+    // allowing an immediate retry to lease A again before the signal handler ran.
+    await activities.setAccountAvailability({ accountId: 'A', status: 'needs-attention' });
+    expect((await acct('A')).status).toBe('needs-attention');
+
+    await activities.reportAccountExhausted({ accountId: 'A', window: '5h', resetHint: 'in 1 hour' });
+    expect((await acct('A')).status).toBe('exhausted');
+    expect((await acct('A')).resetAt).toBeGreaterThan(Date.now());
     await coord.terminate('done');
   });
 

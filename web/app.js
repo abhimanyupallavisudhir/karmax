@@ -4696,7 +4696,7 @@ function waitingLabel(w) {
     // wait also covers plain lease contention (another task holds the login) and
     // grant latency, where asserting a quota cause sends the user to check a
     // dashboard that rightly shows nothing wrong.
-    case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to free up'}`;
+    case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to become available'}`;
     case 'agentSlot': return w.detail || 'a host agent slot';
     case 'mergeSlot': return 'a merge slot';
     case 'human': return w.detail ? `human input (${w.detail})` : 'human input';

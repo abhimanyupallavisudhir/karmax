@@ -35,6 +35,10 @@ export const SIG_REGISTER_ACCOUNTS = 'registerAccounts';
 export const SIG_REPORT_EXHAUSTED = 'reportExhausted';
 /** Manual override (UI/MCP): set a login available/unavailable + its reset time. */
 export const SIG_SET_ACCOUNT_AVAILABILITY = 'setAccountAvailability';
+/** Synchronous update variants used by activities that must not re-lease a stale
+ * account before the coordinator has applied its new availability state. */
+export const UPD_REPORT_EXHAUSTED = 'reportExhaustedSync';
+export const UPD_SET_ACCOUNT_AVAILABILITY = 'setAccountAvailabilitySync';
 export const QRY_ACCOUNTS = 'accounts';
 
 export const SIG_REQUEST_SPEND = 'requestSpend';
