@@ -89,9 +89,19 @@ function termsNear(tokens: string[], left: Set<string>, right: Set<string>, dist
 export function isTransportError(message: string): boolean {
   const lc = String(message ?? '').toLowerCase();
   return (
-    /connection (closed|error|refused|reset|terminated)|socket hang ?up|network error|fetch failed|premature close|server disconnected|stream (closed|disconnected|ended unexpectedly|error)|turn interrupted before completion|econnreset|econnrefused|etimedout|epipe|enetunreach|eai_again|enotfound|\boverloaded\b/.test(
+    /connection (closed|error|refused|reset|terminated|timed? out)|socket hang ?up|network error|network is unreachable|no route to host|fetch failed|premature close|server disconnected|stream (closed|disconnected|ended unexpectedly|error)|turn interrupted before completion|request timed? out|operation timed? out|tls handshake timeout|temporary failure in name resolution|unexpected eof|broken pipe|econnreset|econnrefused|etimedout|epipe|enetunreach|ehostunreach|eai_again|enotfound|\boverloaded\b|service unavailable|gateway timeout|upstream (?:connect )?error|internal server error|\bserver_error\b/.test(
       lc,
-    ) || /\b(?:50[234]|529)\b/.test(lc)
+    ) ||
+    // Codex app-server reports a dropped connection as a reconnect banner. In
+    // task #225 the only terminal text after five internal reconnect attempts was
+    // a model-refresh child-process timeout, so neither the old socket matcher nor
+    // the HTTP-status matcher recognized the outage.
+    /\breconnecting(?:\.{3}|\s)*\s*\d+\s*\/\s*\d+\b/.test(lc) ||
+    /timeout waiting for (?:a |the )?child process to exit/.test(lc) ||
+    // Short-lived host process-table / descriptor pressure. Disk-full and
+    // permission errors are intentionally absent: those need intervention.
+    /\b(?:eagain|emfile|enfile)\b/.test(lc) ||
+    /\b(?:408|50[0234]|529)\b/.test(lc)
   );
 }
 
