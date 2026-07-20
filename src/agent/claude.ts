@@ -610,7 +610,15 @@ export class ClaudeAdapter implements AgentAdapter {
           }
         } else if (message.type === 'rate_limit_event') {
           const info = (message as any).rate_limit_info;
-          if (info?.status === 'rejected' || info?.overageStatus === 'rejected') {
+          // `overageStatus: rejected` only says that paid overage is unavailable;
+          // it is commonly paired with `status: allowed` while subscription quota
+          // remains. Treating that informational field as a turn rejection parked
+          // a login whose live /usage panel showed just 10% used (task #245).
+          // Conversely, a rejected base window is still usable when the SDK says
+          // overage is allowed/in use.
+          const overageUsable = info?.overageStatus === 'allowed' || info?.overageStatus === 'allowed_warning'
+            || info?.isUsingOverage === true || info?.overageInUse === true;
+          if (info?.status === 'rejected' && !overageUsable) {
             const kind = String(info.rateLimitType ?? 'five_hour');
             const window = kind === 'five_hour' || kind === 'overage'
               ? '5h'

@@ -151,6 +151,34 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(failure.metadata.resetHint).toMatch(/^in \d+s$/);
   });
 
+  it('does not mistake unavailable paid overage for exhausted subscription quota', async () => {
+    sdkState.messages = [
+      {
+        type: 'rate_limit_event', session_id: 's1',
+        rate_limit_info: {
+          status: 'allowed', utilization: 0.1, rateLimitType: 'five_hour',
+          overageStatus: 'rejected', overageDisabledReason: 'overage_not_provisioned',
+        },
+      },
+      { type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' },
+    ];
+    const turn = await new ClaudeAdapter().runTurn(input, ctx);
+    expect(turn.termination).toEqual({ kind: 'success', status: 'success', reason: 'end_turn' });
+  });
+
+  it('continues through an exhausted base window when overage is usable', async () => {
+    sdkState.messages = [
+      {
+        type: 'rate_limit_event', session_id: 's1',
+        rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour', overageStatus: 'allowed', isUsingOverage: true },
+      },
+      { type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' },
+    ];
+    await expect(new ClaudeAdapter().runTurn(input, ctx)).resolves.toMatchObject({
+      termination: { kind: 'success', status: 'success' },
+    });
+  });
+
   it('preserves a text-only API transport failure before a misleading success result', async () => {
     sdkState.messages = [
       {
