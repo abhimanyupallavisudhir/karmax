@@ -563,7 +563,11 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId)!;
     const errs = validateTriggers(normalizeTriggers(task.params));
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
-    this.deps.store.updateTaskParams(taskId, { ...task.params, draft: false, triggerState: 'armed' });
+    // Arming is the queue transition for triggered work, so this also assigns
+    // the logical task's human-facing number if it has never been queued before.
+    this.deps.store.clearDraft(taskId);
+    const queued = this.deps.store.getTask(taskId)!;
+    this.deps.store.updateTaskParams(taskId, { ...queued.params, triggerState: 'armed' });
     const armed = this.deps.store.getTask(taskId)!;
     this.armer?.arm(armed);
     return armed;
@@ -593,17 +597,18 @@ export class KarmaxApi {
     // Pin to the version stamped when the draft was created, not whatever is
     // current now — queueing a draft after an upgrade must not silently swap code.
     const { startType, input } = await this.buildStart(task);
+    const hadNumber = task.num != null;
     this.deps.store.clearDraft(taskId);
-    // Bounded + compensated: on a wedged engine, restore the draft flag so a
-    // failed queue attempt leaves the task saved (not stranded, non-draft, with
-    // no workflow) and report a real error rather than hanging.
+    // Bounded + compensated: on a wedged engine, restore the draft and release a
+    // number minted by this failed transition. Previously established permalinks
+    // remain stable when already-numbered work is queued again.
     try {
       await withTimeout(
         this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      this.deps.store.updateTaskParams(taskId, { ...task.params, draft: true });
+      this.deps.store.restoreDraft(taskId, !hadNumber);
       throw new Error(
         `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
           `It's still saved as a draft — check that Temporal is healthy and try again.`,
