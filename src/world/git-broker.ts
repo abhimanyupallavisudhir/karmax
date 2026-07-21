@@ -282,7 +282,13 @@ async function withTransferredRepo<T>(
   if (!safeBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
   const transferName = `.karmax-transfer-${repo.name.replace(/[^a-zA-Z0-9_.-]/g, '-')}.bundle`;
   const transferRel = worldRepos(world.handle).length > 1 ? `${repo.name}/${transferName}` : transferName;
-  const bundle = await world.exec('git', ['bundle', 'create', transferName, 'HEAD'], { cwd: repo.root, timeoutMs: 10 * 60_000 });
+  // Package the named task ref, not the worktree's current HEAD. Human review
+  // terminals and verification servers may legitimately stay open while a
+  // committed snapshot is published for local testing; an unrelated `git
+  // switch` in one of those sessions must not change which branch crosses the
+  // broker boundary.
+  const sourceRef = `refs/heads/${repo.branch}`;
+  const bundle = await world.exec('git', ['bundle', 'create', transferName, sourceRef], { cwd: repo.root, timeoutMs: 10 * 60_000 });
   if (bundle.code !== 0) throw new Error(`could not package cloud branch: ${bundle.stderr || bundle.stdout}`);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
   try {
@@ -301,7 +307,7 @@ async function withTransferredRepo<T>(
     const clone = path.join(temp, 'repo');
     const cloned = await git(temp, ['clone', '-q', '--no-checkout', repo.repo, clone], { env, timeoutMs: 10 * 60_000 });
     if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
-    const fetched = await git(clone, ['fetch', bundlePath, `HEAD:refs/heads/${repo.branch}`]);
+    const fetched = await git(clone, ['fetch', bundlePath, `${sourceRef}:refs/heads/${repo.branch}`]);
     if (fetched.code !== 0) throw new Error(`bundle import failed: ${fetched.stderr || fetched.stdout}`);
     if (repo.baseSha) {
       const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
