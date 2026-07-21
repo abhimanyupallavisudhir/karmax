@@ -3796,6 +3796,7 @@ function renderTaskPage() {
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
+          ${rec ? orgEditorHtml(rec) : ''}
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
@@ -3817,6 +3818,7 @@ function renderTaskPage() {
   );
   wireAttempts(v);
   wireActions(v); // the footer action bar lives on every tab
+  wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
@@ -3825,7 +3827,6 @@ function renderTaskPage() {
     wireFollowups(v);
     wireTerminal(v.taskId);
   } else if (tab === 'parameters') {
-    wireTaskOrg(v);
     wireParams(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
   } else if (tab === 'advanced') {
@@ -4662,10 +4663,9 @@ async function copyNativeAttachCommand(v) {
 // priority + tags (organization), the workflow's declared params (editable or
 // frozen per its lifecycle), and the per-task credential policy.
 function parametersTab(v) {
-  const rec = taskRecord(v.taskId);
+  // Priority + tags (organization metadata) now live in the page header, above the
+  // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
   return `
-    <div class="section-h">Organization</div>
-    ${rec ? orgEditorHtml(rec) : '<div class="task-sub" style="color:var(--ink-3)">Priority + tags load with the task list.</div>'}
     ${paramsSection(v)}
     <div class="section-h">Credentials</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
@@ -5011,7 +5011,7 @@ function paramsSection(v) {
   const footer = editable.size
     ? `<button class="btn sm primary" id="params-save">Save changes</button>`
     : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
-  return `<div class="section-h">Parameters</div><div id="tp-params">${rows}${footer}</div>`;
+  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
 }
 
 // Best-known current value of a param for a running task (the view carries a few;

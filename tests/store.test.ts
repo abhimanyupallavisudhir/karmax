@@ -115,6 +115,18 @@ describe('Store', () => {
     expect(group.principalAttemptId).toBe(second.id);
   });
 
+  it('hydrates tags onto attempt-group records (task page reads these)', () => {
+    const p = store.createProject('Acme');
+    const t = store.createTask({ projectId: p.id, title: 'Tagged', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const tag = store.createTag({ projectId: p.id, name: 'dontmerge' });
+    store.setTaskTags(t.id, [tag.id]);
+    // The task page resolves its record via attemptGroup — its attempts must carry tags,
+    // just like listPrincipalTasks does, or the tag renders on the list but not the page.
+    const group = store.attemptGroup(t.id)!;
+    expect(group.attempts.find((a) => a.id === t.id)?.tags).toEqual([tag.id]);
+    expect(store.attemptsOf(t.id).find((a) => a.id === t.id)?.tags).toEqual([tag.id]);
+  });
+
   it('numbers tasks per project, each starting at #1 (task 10.6)', () => {
     const a = store.createProject('Acme');
     const b = store.createProject('Beta');

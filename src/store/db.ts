@@ -1518,8 +1518,10 @@ export class Store {
   attemptsOf(taskOrIntentId: string): TaskRecord[] {
     const t = this.getTask(taskOrIntentId);
     const intentId = t?.intentId ?? taskOrIntentId;
-    return (this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
+    const tasks = (this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.intentId = ? ORDER BY t.attemptNumber`).all(intentId) as any[]).map(rowToTask);
+    const projectId = t?.projectId ?? tasks[0]?.projectId;
+    return projectId ? this.attachTags(projectId, tasks) : tasks;
   }
 
   attemptGroup(taskOrIntentId: string): { intentId: string; principalAttemptId: string; committedAttemptId?: string; confirmer?: unknown; attempts: TaskRecord[] } | undefined {
