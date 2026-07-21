@@ -3075,6 +3075,7 @@ function renderTaskPage() {
   main.innerHTML = `
     <div class="task-page">
       <div class="tp-head">
+        ${parentTaskContext(v)}
         <div class="row1">
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
@@ -3479,6 +3480,79 @@ function setStopBtn(running, procId, taskId) {
   };
 }
 
+// A child should always feel like part of its parent task, never like an orphaned
+// page. Keep the relationship in the task-page masthead where it reads as
+// navigation; `taskRecord` normally supplies the human title/number from the
+// project task pool, with a compact id fallback for old or partially loaded data.
+function parentTaskContext(v) {
+  const child = taskRecord(v.taskId);
+  const parentId = v.parentTaskId || child?.parentTaskId;
+  if (!parentId) return '';
+  const parent = taskRecord(parentId);
+  const label = parent
+    ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
+    : numLabel(parentId);
+  return `<button type="button" class="tp-parent" data-open="${esc(parentId)}" aria-label="Open parent task ${esc(label)}">
+    <span class="tp-parent-kicker">Sub-task of</span>
+    <span class="tp-parent-title">${esc(label)}</span>
+    <span class="tp-parent-arrow" aria-hidden="true">›</span>
+  </button>`;
+}
+
+// Turn workflow vocabulary into the one short state phrase a person needs while
+// scanning delegated work. The pipeline still carries exact stage progression;
+// this copy carries meaning.
+function subTaskState(rec) {
+  const v = rec?.lastView || {};
+  const status = v.status || 'active';
+  const stage = v.stage || 'setup';
+  if (status === 'done' || stage === 'done') return { label: 'Complete', tone: 'done', complete: true };
+  if (status === 'failed') return { label: 'Failed', tone: 'failed', complete: false };
+  if (status === 'cancelled') return { label: 'Cancelled', tone: 'cancelled', complete: false };
+  if (stage === 'escalated' || status === 'blocked') return { label: 'Needs direction', tone: 'blocked', complete: false };
+  if (stage === 'review') return { label: 'Ready to return', tone: 'waiting', complete: false };
+  if (v.waitingFor?.kind === 'parent') return { label: 'Waiting on parent', tone: 'waiting', complete: false };
+  if (status === 'waiting') return { label: 'Waiting', tone: 'waiting', complete: false };
+  return { label: 'In progress', tone: 'active', complete: false };
+}
+
+function subTasksSection(v) {
+  if (!v.subTasks?.length) return '';
+  const children = v.subTasks.map((id) => {
+    const rec = taskRecord(id);
+    const state = subTaskState(rec);
+    return { id, rec, state };
+  });
+  const complete = children.filter((child) => child.state.complete).length;
+  const progress = Math.round((complete / children.length) * 100);
+  const rows = children.map(({ id, rec, state }) => {
+    const title = rec?.title || `Sub-task ${numLabel(id)}`;
+    const childView = { workflow: rec?.workflow || v.workflow, ...(rec?.lastView || {}) };
+    return `<button type="button" class="subtask-row" data-open="${esc(id)}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
+      <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
+      <span class="subtask-identity">
+        <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
+        <span class="subtask-copy">${esc(state.label)} <span aria-hidden="true">·</span> ${esc(stageLabel(childView))}</span>
+      </span>
+      <span class="subtask-pipeline" aria-hidden="true">${pipeline(childView)}</span>
+      <span class="subtask-arrow" aria-hidden="true">›</span>
+    </button>`;
+  }).join('');
+  return `<section class="subtasks" aria-labelledby="subtasks-title">
+    <div class="subtasks-head">
+      <div>
+        <div class="subtasks-kicker">Delegated work</div>
+        <h3 id="subtasks-title">Sub-tasks</h3>
+      </div>
+      <div class="subtasks-count"><strong>${complete}</strong> of ${children.length} complete</div>
+    </div>
+    <div class="subtasks-progress" role="progressbar" aria-label="Sub-task completion" aria-valuemin="0" aria-valuemax="${children.length}" aria-valuenow="${complete}">
+      <span style="--subtask-progress:${progress}%"></span>
+    </div>
+    <div class="subtask-list">${rows}</div>
+  </section>`;
+}
+
 // ── the four task-page tabs ───────────────────────────────────────────────────
 // Overview: what the task IS and where it stands — pipeline, review, widgets,
 // sub-tasks, notes. Everything shown comes off the workflow's declared view.
@@ -3513,18 +3587,16 @@ function overviewTab(v) {
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
     : '';
-  const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><span class="branch" data-open="${id}" style="cursor:pointer">↳ ${esc(numLabel(id))}</span></div>`).join('')}`
-    : '';
+  const subtasks = subTasksSection(v);
   return `
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
     ${error}
     ${waiting}
     ${agentTurn}
+    ${subtasks}
     ${review}
     ${renderWidgetGroups(S.widgets)}
-    ${subtasks}
     ${notesSection(v)}`;
 }
 
