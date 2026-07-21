@@ -3115,6 +3115,7 @@ function renderTaskPage() {
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
+    wireWorldFileLinks(v);
   } else if (tab === 'parameters') {
     wireTaskOrg(v);
     wireParams(v);
@@ -3579,7 +3580,7 @@ function checkinTab(v) {
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
-  const msgs = entries.map(renderConversationEntry).join('') || '<div class="msg system">No messages yet</div>';
+  const msgs = entries.map((entry) => renderConversationEntry(entry, v)).join('') || '<div class="msg system">No messages yet</div>';
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -3679,15 +3680,76 @@ function conversationTimeHtml(ts) {
   return `<time datetime="${new Date(Number(ts)).toISOString()}" title="${esc(new Date(Number(ts)).toLocaleString())}">${esc(label)}</time>`;
 }
 
-function renderConversationEntry(entry) {
+// Render the small Markdown-link subset agents use for file citations without
+// changing the stored transcript. The anchor keeps the agent's exact href (so
+// Copy Link Address and every transcript/copy surface retain the original); a
+// click handler below may resolve it through the task's world instead.
+function renderConversationText(text, role, v = S.view) {
+  const source = String(text ?? '');
+  if (role !== 'agent') return esc(source);
+  const link = /\[([^\]\n]+)\]\(\s*(<[^>\n]+>|[^\s)]+)(?:\s+["'][^\n)]*["'])?\s*\)/g;
+  let html = '';
+  let at = 0;
+  for (const match of source.matchAll(link)) {
+    html += esc(source.slice(at, match.index));
+    const href = match[2].startsWith('<') ? match[2].slice(1, -1) : match[2];
+    const worldFile = worldFileTarget(href, v?.worldPath);
+    html += `<a href="${esc(href)}" target="_blank" rel="noopener"${worldFile ? ` class="world-file-link" data-world-file="${esc(href)}"` : ''}>${esc(match[1])}</a>`;
+    at = match.index + match[0].length;
+  }
+  return html + esc(source.slice(at));
+}
+
+// Agent links commonly carry editor-style locations (`file.ts:12:4` or
+// `file.ts#L12`). Separate that location from the path sent to the gateway.
+function worldFileTarget(raw, worldPath) {
+  if (!raw || !worldPath) return null;
+  let value = String(raw).trim();
+  if (/^file:\/\//i.test(value)) {
+    try { value = decodeURIComponent(new URL(value).pathname); } catch { return null; }
+  }
+  let line;
+  const fragment = value.match(/#L(\d+)(?:-L?\d+)?$/i);
+  if (fragment) {
+    line = Number(fragment[1]);
+    value = value.slice(0, fragment.index);
+  } else {
+    const suffix = value.match(/:(\d+)(?::\d+)?$/);
+    if (suffix) {
+      line = Number(suffix[1]);
+      value = value.slice(0, suffix.index);
+    }
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value) && !/^[a-z]:[\\/]/i.test(value)) return null;
+  if (!value || value.startsWith('#') || value.startsWith('?')) return null;
+  // Absolute paths must name this task's world. Relative paths are resolved by
+  // the server against the world root and confined there authoritatively.
+  if (value.startsWith('/')) {
+    const root = String(worldPath).replace(/\/+$/, '');
+    if (value !== root && !value.startsWith(`${root}/`)) return null;
+  }
+  return { path: value, line };
+}
+
+function fileLinksEnabled() {
+  const user = typeof S.user === 'object' ? S.user?.id : S.user;
+  return localStorage.getItem(`karmax-appearance:${user || 'local'}:world-file-links`) !== 'off';
+}
+
+function setFileLinksEnabled(enabled) {
+  const user = typeof S.user === 'object' ? S.user?.id : S.user;
+  localStorage.setItem(`karmax-appearance:${user || 'local'}:world-file-links`, enabled ? 'on' : 'off');
+}
+
+function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}</div><div class="msg-text">${esc(m.text)}</div>${renderMessageImages(m.images)}</div>`;
+    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}</div><div class="msg-text">${renderConversationText(m.text, m.role, v)}</div>${renderMessageImages(m.images)}</div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}</div><div class="msg-text">${esc(a.title)}</div></div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}</div><div class="msg-text">${renderConversationText(a.title, 'agent', v)}</div></div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -3697,6 +3759,62 @@ function renderConversationEntry(entry) {
     <span class="activity-icon" aria-hidden="true">${icons[a.kind] || '·'}</span>
     <div class="activity-body"><div class="activity-head"><span class="activity-title">${esc(a.title)}</span><span class="activity-state">${esc(a.phase)}</span>${conversationTimeHtml(entry.ts)}</div>${detail}</div>
   </div>`;
+}
+
+function fileViewerHtml(text, title, line) {
+  const rows = String(text).split('\n');
+  const code = rows.map((row, i) => `<div class="line${line === i + 1 ? ' selected' : ''}" id="L${i + 1}"><a href="#L${i + 1}">${i + 1}</a><span>${esc(row) || ' '}</span></div>`).join('');
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><style>
+    :root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#e6edf3;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+    header{position:sticky;top:0;z-index:1;padding:10px 16px;background:#161b22;border-bottom:1px solid #30363d;color:#b1bac4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    main{padding:8px 0 28px;min-width:max-content}.line{display:flex;min-height:20px}.line:target,.line.selected{background:#3b2e00}.line>a{width:64px;padding:0 14px;color:#6e7681;text-align:right;text-decoration:none;user-select:none}.line>span{white-space:pre;padding-right:24px}
+  </style></head><body><header>${esc(title)}</header><main>${code}</main></body></html>`;
+}
+
+async function openWorldFile(anchor, v) {
+  const target = worldFileTarget(anchor.dataset.worldFile, v?.worldPath);
+  if (!target) return;
+  const popup = window.open('', '_blank');
+  if (popup) {
+    popup.opener = null;
+    popup.document.title = 'Opening file…';
+    popup.document.body.textContent = 'Opening file…';
+  }
+  try {
+    const url = `/api/tasks/${encodeURIComponent(v.taskId)}/file?path=${encodeURIComponent(target.path)}`;
+    const res = await fetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
+    if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || 'could not open file');
+    const type = res.headers.get('content-type') || '';
+    if (!/^text\//i.test(type) && !/json|javascript|xml/i.test(type)) {
+      const objectUrl = URL.createObjectURL(await res.blob());
+      if (popup) popup.location.replace(objectUrl);
+      else window.open(objectUrl, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+      return;
+    }
+    const html = fileViewerHtml(await res.text(), anchor.dataset.worldFile, target.line);
+    if (popup) {
+      popup.document.open();
+      popup.document.write(html);
+      popup.document.close();
+      if (target.line) popup.location.hash = `L${target.line}`;
+    } else {
+      const objectUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+      window.open(objectUrl, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    }
+  } catch (e) {
+    if (popup) popup.close();
+    toast(e.message, true);
+  }
+}
+
+function wireWorldFileLinks(v) {
+  document.querySelectorAll('.world-file-link').forEach((anchor) => anchor.addEventListener('click', (event) => {
+    if (!fileLinksEnabled()) return;
+    event.preventDefault();
+    openWorldFile(anchor, v);
+  }));
 }
 
 function conversationPresence(v, t) {
@@ -5174,6 +5292,8 @@ function globalSettingsView() {
     <div class="card">
       <div class="section-h">Appearance</div>
       <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
+      <div class="switch" style="margin-top:10px"><input type="checkbox" id="gs-world-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="gs-world-file-links">Open agent file links in their task world</label></div>
+      <div style="font-size:11px;color:var(--ink-3);margin:5px 0 0 24px">Keeps the agent’s original URL when copied; only clicks are resolved through karmax.</div>
     </div>
     <div class="card">
       <div class="section-h">Resilience</div>
@@ -5647,6 +5767,7 @@ function wireGlobalSettings() {
     }),
   );
   $('#gs-theme')?.addEventListener('click', toggleTheme);
+  $('#gs-world-file-links')?.addEventListener('change', (e) => setFileLinksEnabled(e.target.checked));
   $('#safe-mode')?.addEventListener('change', async (e) => {
     try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
   });

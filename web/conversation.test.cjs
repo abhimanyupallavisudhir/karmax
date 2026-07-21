@@ -18,7 +18,14 @@ function extractFn(name) {
 
 global.esc = (s) => String(s ?? '').replace(/</g, '&lt;');
 global.renderMessageImages = () => '';
+const preferences = new Map();
+global.localStorage = {
+  getItem: (key) => preferences.has(key) ? preferences.get(key) : null,
+  setItem: (key, value) => preferences.set(key, value),
+};
 global.S = {
+  user: { id: 'user-1' },
+  view: { taskId: 'task-1', worldPath: '/work/task-1' },
   taskEvents: [
     { seq: 1, ts: 1710000001000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' } },
     { seq: 2, ts: 1710000002000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'cmd', kind: 'command', phase: 'started', title: 'npm test' } },
@@ -27,7 +34,7 @@ global.S = {
   ],
 };
 
-for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileLinksEnabled', 'setFileLinksEnabled', 'renderConversationText', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -49,6 +56,19 @@ ok(html.includes('You') && html.includes('Please run the tests'), 'user message 
 ok(html.includes('npm test') && html.includes('completed'), 'agent action and its state are visible');
 ok(html.includes('<time'), 'timestamps are rendered');
 ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown exactly once');
+
+const linked = renderConversationText('See [app.js](/work/task-1/web/app.js:42) and [docs](https://example.com).', 'agent', S.view);
+ok(linked.includes('href="/work/task-1/web/app.js:42"'), 'the agent-provided file href is preserved for copy behavior');
+ok(linked.includes('data-world-file="/work/task-1/web/app.js:42"'), 'an in-world file link is marked for click interception');
+ok(!linked.match(/data-world-file="https:/), 'external links are never treated as world files');
+ok(worldFileTarget('/work/task-1/web/app.js#L9', S.view.worldPath).line === 9, 'GitHub-style line fragments are parsed');
+ok(worldFileTarget('/other/task/app.js:3', S.view.worldPath) === null, 'absolute paths outside the task world are not intercepted');
+ok(renderConversationText('[app](/work/task-1/app.js)', 'user', S.view).includes('[app]('), 'user-authored Markdown remains literal');
+ok(fileLinksEnabled() === true, 'world file links default on');
+setFileLinksEnabled(false);
+ok(fileLinksEnabled() === false, 'the appearance preference disables world file opening');
+S.user = { id: 'user-2' };
+ok(fileLinksEnabled() === true, 'the appearance preference is scoped to the signed-in user');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

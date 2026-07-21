@@ -97,6 +97,7 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
   if (/\/(sessions|agents|conversation)$/.test(p)) return 'task:conversation:read';
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
+  if (/\/file$/.test(p)) return 'task:conversation:read';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p)) return 'task:review:execute';
   if (/\/signal$/.test(p)) return 'task:signal';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
@@ -123,6 +124,20 @@ const MIME: Record<string, string> = {
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.cjs': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.ts': 'text/plain; charset=utf-8',
+  '.tsx': 'text/plain; charset=utf-8',
+  '.jsx': 'text/javascript; charset=utf-8',
+  '.py': 'text/plain; charset=utf-8',
+  '.rs': 'text/plain; charset=utf-8',
+  '.go': 'text/plain; charset=utf-8',
+  '.java': 'text/plain; charset=utf-8',
+  '.rb': 'text/plain; charset=utf-8',
+  '.sh': 'text/plain; charset=utf-8',
+  '.yml': 'text/plain; charset=utf-8',
+  '.yaml': 'text/plain; charset=utf-8',
+  '.toml': 'text/plain; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
@@ -953,6 +968,13 @@ export class Gateway {
       if (artifactMatch && method === 'GET') {
         return this.serveArtifact(res, artifactMatch[1]!, url.searchParams.get('path') ?? '');
       }
+      // Conversation file links are readable wherever the conversation itself
+      // is readable. They use the same world confinement as review artifacts,
+      // but unknown extensions default to inline text for a useful source view.
+      const fileMatch = p.match(/^\/api\/tasks\/([^/]+)\/file$/);
+      if (fileMatch && method === 'GET') {
+        return this.serveArtifact(res, fileMatch[1]!, url.searchParams.get('path') ?? '', true);
+      }
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
@@ -1669,20 +1691,29 @@ export class Gateway {
   /** Serve a produced artifact (an `open` action's file target) from the task's
    *  world, so the UI can open a PDF/image/video/notebook it generated. Path is
    *  confined to the world root — no traversal outside it. */
-  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string) {
+  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
     const worldPath = this.deps.store.getTask(taskId)?.lastView?.worldPath;
     if (!worldPath) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
-    const root = path.resolve(worldPath);
-    const file = path.resolve(root, relPath);
-    if (file !== root && !file.startsWith(root + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
     try {
+      const root = await fs.promises.realpath(path.resolve(worldPath));
+      const requested = path.resolve(root, relPath);
+      if (requested !== root && !requested.startsWith(root + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
+      // A lexical prefix check does not catch a symlink in the world pointing
+      // outside it. Confine the resolved target too before reading any bytes.
+      const file = await fs.promises.realpath(requested);
+      if (file !== root && !file.startsWith(root + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
       const stat = await fs.promises.stat(file);
       if (stat.isDirectory()) return this.json(res, 400, { error: 'path is a directory' });
       const data = await fs.promises.readFile(file);
+      const inferredType = ARTIFACT_MIME[path.extname(file).toLowerCase()];
+      const looksTextual = !data.subarray(0, 8192).includes(0);
       res.writeHead(200, {
-        'content-type': ARTIFACT_MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
+        'content-type': inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
         'content-length': String(data.length),
+        'content-disposition': `inline; filename="${path.basename(file).replace(/["\\\r\n]/g, '_')}"`,
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
       });
       res.end(data);
     } catch {
