@@ -86,6 +86,19 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
     const out = assemblePrompt({ profile: profile({ role: 'reviewer' }), role: 'reviewer', task, world });
     expect(out).toContain('# Task'); // do template floor
   });
+
+  it('includes global and project wiki context in the Confirm-agent prompt', () => {
+    const out = assemblePrompt({
+      profile: profile({ role: 'confirm' }),
+      role: 'confirm',
+      task,
+      world,
+      globalInstructions: 'Organization wiki context',
+      projectInstructions: 'Project wiki context',
+    });
+    expect(out).toContain('Organization wiki context');
+    expect(out).toContain('Project wiki context');
+  });
 });
 
 describe('workflow-owned lifecycle stages (SPEC §5 — the pipeline the UI renders)', () => {

@@ -468,7 +468,7 @@ function cfLayerHtml(f, layer, agentDefault) {
       <button type="button" class="btn sm cf-del" title="Remove this layer">✕</button>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type @ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
   </div>`;
@@ -680,6 +680,16 @@ function cfSync(box) {
   if (empty) empty.style.display = rows.length ? 'none' : '';
 }
 
+// Review-request prompts accept the same project/org wiki mentions as the task
+// prompt and follow-up composer. The resolver scans the rendered request when the
+// Confirm turn starts; wireWikiMention supplies the shared search/picker UI.
+function wireConfirmerWikiPrompts(root) {
+  // Kept guarded for hosts upgrading from a build before wiki mentions existed;
+  // current builds always provide the shared picker.
+  if (typeof wireWikiMention !== 'function') return;
+  root.querySelectorAll('.cf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
+}
+
 // Confirmer fields: an editable layer list. Row controls are delegated to the box
 // so a reset (which re-renders the rows) needs no re-wiring; only dynamically
 // added agent sub-forms are wired as they appear.
@@ -715,6 +725,7 @@ function wireConfirmerField(box) {
       if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
       else list.appendChild(row);
       row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      wireConfirmerWikiPrompts(row);
       cfSync(box); changed();
     }
   });
@@ -726,6 +737,7 @@ function wireConfirmerField(box) {
     const ab = row.querySelector('.cf-agent');
     if (ab) ab.style.display = e.target.value === 'agent' ? '' : 'none';
   });
+  wireConfirmerWikiPrompts(box);
   cfSync(box);
 }
 
@@ -825,6 +837,7 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   // the box, so only the fresh agent sub-forms need wiring.
   list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
   list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  wireConfirmerWikiPrompts(list);
   cfSync(box);
 }
 
