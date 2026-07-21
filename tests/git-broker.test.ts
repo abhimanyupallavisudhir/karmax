@@ -42,6 +42,9 @@ describe('cloud Git broker', () => {
       GIT_CONFIG_VALUE_0: 'git@example:',
     };
 
+    // An open review terminal can inspect another revision without changing the
+    // task branch. Publishing must still transfer the named task ref, not HEAD.
+    await gitOrThrow(world.handle.root, ['switch', '--detach', '-q', 'main']);
     expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['source'], skipped: [] });
     const collaborator = await provider.create({ taskId: 'collaborator', repo: source, base: 'main' });
     collaborator.handle.repo = sshRemote;

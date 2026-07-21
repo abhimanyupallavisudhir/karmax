@@ -141,6 +141,13 @@ describe('hosted/local Git handoff', () => {
     handle.id = task.id;
     const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting', actions: [], state: {}, messages: [], branch, base: 'main', waitingFor: { kind: 'human' }, updatedAt: 1 } as any;
     store.saveView(task.id, view); store.registerWorld(handle, project.id);
+    // Review is precisely when humans run verification commands or open a
+    // terminal. Those processes keep the cloud world alive, but must not block
+    // publishing the committed task ref into a separate local checkout.
+    store.createExecution({ id: 'review-server', organizationId: organization.id, projectId: project.id,
+      taskId: task.id, worldId: task.id, generation: 1, kind: 'review-action', label: 'Preview',
+      command: 'npm start', server: true, openUrls: [] });
+    store.setExecutionRunning('review-server');
     const worlds = new WorldRegistry();
     worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world, open: async () => world, destroy: async () => {} } as any);
     const github = { brokerCredentials: async () => ({ env: { GIT_SSH_COMMAND: ssh } }) } as any;

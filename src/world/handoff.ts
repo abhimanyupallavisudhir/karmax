@@ -50,8 +50,6 @@ export class WorldHandoffService {
     if (!task || !project?.organizationId) throw new Error('task project is unavailable');
     if (view.agentTurn || view.status === 'active')
       throw new Error('wait for the agent to reach a checkpoint before materializing its branch locally');
-    if (this.store.listExecutions(taskId).some((execution) => ['starting', 'running', 'stop-requested'].includes(execution.state)))
-      throw new Error('close task terminals and review processes before materializing locally');
     const handle = this.store.currentWorld(taskId) as WorldHandle | undefined;
     if (!handle) throw new Error('task has no recoverable world');
     if (!this.worlds.get(handle.kind).capabilities?.remote)
