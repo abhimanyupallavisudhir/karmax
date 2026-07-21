@@ -100,7 +100,8 @@ export interface TaskRecord {
   attemptNumber?: number;
   /**
    * Simple, human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
-   * project's tasks run #1, #2, …, assigned at creation. The UI displays `#num` and
+   * project's queued tasks run #1, #2, …, assigned when first queued. Drafts that
+   * have never been queued have no number. The UI displays `#num` and
    * the URL scheme uses it (`/projects/<name>/tasks/<num>`); the opaque `id` above
    * stays the canonical key (it is the Temporal workflowId, event key, and session
    * key, so it must never change).

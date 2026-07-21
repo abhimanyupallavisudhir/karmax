@@ -84,13 +84,17 @@ describe('Store', () => {
     expect(group.principalAttemptId).toBe(second.id);
   });
 
-  it('numbers tasks per project, each starting at #1 (task 10.6)', () => {
+  it('numbers queued tasks per project, each starting at #1 (task 10.6)', () => {
     const a = store.createProject('Acme');
     const b = store.createProject('Beta');
+    const draft = store.createTask({ projectId: a.id, title: 'A-draft', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'later', draft: true } });
     const a1 = store.createTask({ projectId: a.id, title: 'A-one', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } });
     const b1 = store.createTask({ projectId: b.id, title: 'B-one', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'y' } });
     const a2 = store.createTask({ projectId: a.id, title: 'A-two', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'z' } });
-    // each project runs its own #1, #2, … independently
+    // Never-queued drafts have no number and do not consume one. Each project's
+    // queued work therefore runs its own #1, #2, … independently.
+    expect(draft.num).toBeUndefined();
+    expect(store.getTask(draft.id)!.num).toBeUndefined();
     expect([a1.num, a2.num]).toEqual([1, 2]);
     expect(b1.num).toBe(1);
     // resolvable by (project, number) — drives the /projects/:name/tasks/:num permalink + search
@@ -99,6 +103,26 @@ describe('Store', () => {
     expect(store.getTaskByNum(a.id, 2)!.id).toBe(a2.id);
     expect(store.getTaskByNum(a.id, 99)).toBeUndefined();
     expect(store.getTask(a2.id)!.num).toBe(2);
+
+    // The number is allocated at the queue transition and remains stable if the
+    // transition is invoked again.
+    store.clearDraft(draft.id);
+    expect(store.getTask(draft.id)!.num).toBe(3);
+    store.clearDraft(draft.id);
+    expect(store.getTask(draft.id)!.num).toBe(3);
+  });
+
+  it('assigns one logical number when an alternate draft is queued first', () => {
+    const p = store.createProject('Acme');
+    const first = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'first', draft: true } });
+    const second = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'second', draft: true }, intentId: first.intentId });
+    expect(first.num).toBeUndefined();
+    expect(second.num).toBeUndefined();
+
+    store.clearDraft(second.id);
+    expect(store.getTask(first.id)!.num).toBe(1);
+    expect(store.getTask(second.id)!.num).toBe(1);
+    expect(store.getTaskByNum(p.id, 1)!.id).toBe(first.id);
   });
 
   it('backfills per-project task numbers for rows created before the column existed', () => {
@@ -110,6 +134,7 @@ describe('Store', () => {
     const a1 = s1.createTask({ projectId: a.id, title: 'A older', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '1' } });
     const b1 = s1.createTask({ projectId: b.id, title: 'B older', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '2' } });
     const a2 = s1.createTask({ projectId: a.id, title: 'A newer', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '3' } });
+    const draft = s1.createTask({ projectId: a.id, title: 'A draft', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'later', draft: true } });
     // simulate a pre-feature install: no num column, no per-project index
     (s1 as any).db.exec('DROP INDEX IF EXISTS idx_tasks_num_project');
     (s1 as any).db.exec('ALTER TABLE tasks DROP COLUMN num');
@@ -118,6 +143,7 @@ describe('Store', () => {
     expect(s2.getTask(a1.id)!.num).toBe(1);
     expect(s2.getTask(a2.id)!.num).toBe(2);
     expect(s2.getTask(b1.id)!.num).toBe(1); // project B starts fresh at #1
+    expect(s2.getTask(draft.id)!.num).toBeUndefined(); // never-queued legacy drafts stay unnumbered
     // brand-new tasks continue each project's sequence
     expect(s2.createTask({ projectId: a.id, title: 'A next', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '4' } }).num).toBe(3);
     expect(s2.createTask({ projectId: b.id, title: 'B next', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '5' } }).num).toBe(2);

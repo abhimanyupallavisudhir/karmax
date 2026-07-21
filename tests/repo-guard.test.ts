@@ -20,14 +20,17 @@ describe('repo-required guard (empty-repo footgun)', () => {
   let api: KarmaxApi;
   let token: string;
   let started: unknown[][];
+  let startError: Error | undefined;
 
   beforeEach(() => {
     store = new Store(':memory:');
     const tokens = new TokenAuthority();
     started = [];
+    startError = undefined;
     const client = {
       workflow: {
         start: async (...a: unknown[]) => {
+          if (startError) throw startError;
           started.push(a);
           return {};
         },
@@ -110,6 +113,26 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(started).toHaveLength(0); // a draft starts nothing
     await expect(api.queueTask(token, draft.id)).rejects.toThrow(/repository/i);
     expect(started).toHaveLength(0); // still not started after the refused queue
+  });
+
+  it('does not retain a number when the durable engine refuses the queue', async () => {
+    const p = store.createProject('QueueFailure', { repos: ['/some/repo'] });
+    const draft = await api.createTask(token, {
+      projectId: p.id,
+      workflow: 'software-dev',
+      prompt: 'x',
+      draft: true,
+    });
+    expect(draft.num).toBeUndefined();
+
+    startError = new Error('engine unavailable');
+    await expect(api.queueTask(token, draft.id)).rejects.toThrow(/still saved as a draft/i);
+    expect(store.getTask(draft.id)).toMatchObject({ num: undefined, params: { draft: true } });
+
+    startError = undefined;
+    const queued = await api.queueTask(token, draft.id);
+    expect(queued.num).toBe(1);
+    expect(queued.params.draft).toBe(false);
   });
 
   // The scratch-sandbox incident: the guard and the world builder read different

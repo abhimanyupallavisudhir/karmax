@@ -341,8 +341,10 @@ describe('TriggerScheduler (dispatcher)', () => {
     // Save as a draft that carries a trigger, then queue it.
     const draft = await api.createTask(token, { projectId, workflow: 'just-do', draft: true, params: { prompt: 'p', triggers: [{ kind: 'event', type: 'x.y' }] } });
     expect(draft.params.draft).toBe(true);
+    expect(draft.num).toBeUndefined();
     expect(armed.has(draft.id)).toBe(false); // a draft isn't armed yet
     const queued = await api.queueTask(token, draft.id);
+    expect(queued.num).toBe(1); // arming is this task's queue transition
     expect(queued.params.triggerState).toBe('armed');
     expect(queued.params.draft).toBe(false);
     expect(armed.has(draft.id)).toBe(true);
