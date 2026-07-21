@@ -4065,7 +4065,56 @@ function makeTermScreen(maxLines = 2000) {
       row = Math.max(0, row - drop);
     }
   }
-  return { write, render: () => lines.join('\n') };
+  // render() joins the authoritative buffer; an optional `pending` string is the
+  // predicted (locally-echoed, not-yet-confirmed) tail — overlaid at the cursor
+  // without mutating the buffer, so the next server byte reconciles cleanly.
+  return {
+    write,
+    cursor: () => ({ row, col }),
+    render: (pending = '') => {
+      if (!pending) return lines.join('\n');
+      const out = lines.slice();
+      let line = out[row] ?? '';
+      if (line.length < col) line += ' '.repeat(col - line.length);
+      out[row] = line.slice(0, col) + pending + line.slice(col + pending.length);
+      return out.join('\n');
+    },
+  };
+}
+
+// Predictive local echo (mosh-style, conservative). Typing into a cloud world's
+// PTY costs a full network round-trip before the remote shell echoes the char
+// back, so without prediction every keystroke feels laggy. We optimistically
+// render printable characters the instant they're typed (`term.pending`), then
+// reconcile against the authoritative server stream: each echoed printable byte
+// confirms and drops one predicted char; anything unexpected (an escape sequence,
+// a mismatch — completion, prompt redraw, program output) discards the whole
+// prediction and lets the server drive. Non-printable keys (Enter, arrows, Tab,
+// Ctrl-*) can't be predicted safely, so they clear pending and defer to the shell.
+function predictInput(bytes, ctrl) {
+  if (!term) return;
+  if (!ctrl && bytes.length === 1 && bytes >= ' ' && bytes !== '\x7f') {
+    term.pending += bytes;                       // printable → echo locally now
+  } else if (bytes === '\x7f' && term.pending) {
+    term.pending = term.pending.slice(0, -1);    // backspace an unconfirmed char
+  } else {
+    term.pending = '';                           // Enter/arrows/Tab/Ctrl-* → server drives
+  }
+}
+
+// Consume the server's echo of characters we already predicted, so they don't
+// render twice. Stops (and discards remaining predictions) on the first byte that
+// doesn't match — the server is authoritative from that point on.
+function reconcilePrediction(data) {
+  if (!term || !term.pending) return;
+  for (let i = 0; i < data.length && term.pending; i++) {
+    const ch = data[i];
+    const code = data.charCodeAt(i);
+    if (ch === '\x1b') { term.pending = ''; return; }   // escape/redraw → drop predictions
+    if (code < 32 || code === 127) continue;            // ignore CR/LF/other controls
+    if (ch === term.pending[0]) term.pending = term.pending.slice(1); // confirmed
+    else { term.pending = ''; return; }                 // mismatch → server wins
+  }
 }
 
 // Translate a browser keydown into the bytes a PTY expects. Returns null to let
@@ -4100,13 +4149,13 @@ function keyToPtyBytes(e) {
 function bindTermScreen(out) {
   if (!term || !out) return;
   out.classList.remove('hidden');
-  out.textContent = term.screen.render();
-  out.scrollTop = out.scrollHeight;
+  const repaint = () => { out.textContent = term.screen.render(term.pending); out.scrollTop = out.scrollHeight; };
+  repaint();
   const ws = term.ws;
   ws.onmessage = (m) => {
     try {
       const msg = JSON.parse(m.data);
-      if (msg.type === 'data') { term.screen.write(msg.data); out.textContent = term.screen.render(); out.scrollTop = out.scrollHeight; }
+      if (msg.type === 'data') { reconcilePrediction(msg.data); term.screen.write(msg.data); repaint(); }
     } catch {}
   };
   const send = (data) => { if (term && term.ws && term.ws.readyState === 1) term.ws.send(JSON.stringify({ type: 'input', data })); };
@@ -4119,12 +4168,16 @@ function bindTermScreen(out) {
     e.preventDefault();
     e.stopPropagation();                                                // consumed by the shell — never let it trigger an app shortcut
     send(bytes);
+    predictInput(bytes, e.ctrlKey);                                     // optimistic local echo — hides the round-trip on cloud worlds
+    repaint();
   };
   out.onpaste = (e) => {
     const text = (e.clipboardData || window.clipboardData)?.getData('text');
     if (!text) return;
     e.preventDefault();
     send(text);
+    term.pending = '';                                                  // multi-line paste: let the shell echo authoritatively
+    repaint();
   };
 }
 
@@ -4132,9 +4185,10 @@ function openTerminal(taskId) {
   if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
-  term = { taskId, ws, screen: makeTermScreen() };
+  term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
+    term.pending = '';
     term.screen.write('\r\n[terminal closed]\r\n');
     const out = document.getElementById('term-out');
     if (out) out.textContent = term.screen.render();
