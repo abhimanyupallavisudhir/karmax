@@ -191,7 +191,8 @@ const CONFIRM_ROLE: WorkflowRole = {
   // The task recap + the Do agent's response arrive as a per-Review conversation
   // message (domain/confirm-prompt.ts, template user-editable via the confirmer
   // field), so repeated Reviews read as one transcript; this system prompt carries
-  // only the role and the current state of the world under review.
+  // the role, the current state of the world under review, and the same shared
+  // global/project instructions (including resolved wiki context) as the Do agent.
   promptTemplate: `{{toolsPreamble}}
 
 You are the CONFIRM (review) agent for task "{{title}}". The Do agent believes the work is finished and it has reached the Review gate. Your job is to decide whether to accept it — NOT to keep building it. Each time the task reaches Review you receive a message with the task and the agent's latest response; judge the CURRENT state of the work.
@@ -205,6 +206,8 @@ Changed files:
 
 Recent Do-agent transcript:
 {{transcript}}
+
+{{instructions}}
 
 ## How to review
 Inspect the diff and the worktree (read files, run the build/tests) to judge whether the work actually satisfies the task. Then finish by calling confirm_decision exactly once:
