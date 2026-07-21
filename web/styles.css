@@ -1073,6 +1073,9 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .org-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 8px; }
 .org-editor .org-prio { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); }
 .org-editor .org-tags { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+/* On the task page the editor rides the meta line (workflow → target): no extra row,
+   pushed to the right to fill the otherwise-empty horizontal space. */
+.tp-head .meta .org-editor { margin: 0 0 0 auto; }
 
 .attempts { margin-top: 10px; display: grid; gap: 5px; }
 .attempts-head { display: flex; align-items: center; justify-content: space-between; color: var(--ink-3); font-size: 12px; }
