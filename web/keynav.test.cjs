@@ -34,6 +34,7 @@ eval(extractConst('KEY_NAMES').replace('const KEY_NAMES =', 'global.KEY_NAMES ='
 eval(extractFn('parseKeybinding'));
 eval(extractFn('stepMatches'));
 eval(extractFn('chordCandidates'));
+eval(extractFn('isBareModifier'));
 eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
 eval(extractFn('adjacentCheckinPane'));
@@ -89,6 +90,17 @@ ok(chordCandidates(cmds, [ev('g')], ev('g')).map((c) => c.id).join() === 'nav.gl
 ok(chordCandidates(cmds, [ev('g')], ev('z')).length === 0, 'g then unknown → no candidates');
 ok(chordCandidates(cmds, [], ev('k', { ctrlKey: true })).map((c) => c.id).join() === 'pal', 'Ctrl+K finds meta+k');
 ok(chordCandidates(cmds, [], ev('t')).length === 0, "bare 't' is not a command (only after 'g')");
+
+// ── shifted chords survive the Shift keydown (g P / g W / g D / g S) ──
+// The dispatcher skips bare-modifier keydowns so pressing Shift for the second
+// step of a shifted chord doesn't reset the pending prefix. Model `g` → `Shift`
+// → `P`: the Shift event is ignored, so the buffer still holds `g` when `P`/`S`
+// lands. (Uses a fresh command whose second step needs Shift.)
+ok(isBareModifier('Shift') && isBareModifier('Control') && isBareModifier('Alt') && isBareModifier('Meta'), 'the four bare modifiers are recognized');
+ok(!isBareModifier('g') && !isBareModifier('S'), 'ordinary keys are not bare modifiers');
+const shiftedCmds = [{ id: 'nav.global', keys: parseKeybinding('g S') }];
+ok(isBareModifier('Shift'), 'Shift keydown between g and S is skipped, so the g prefix survives');
+ok(chordCandidates(shiftedCmds, [ev('g')], ev('S', { shiftKey: true })).map((c) => c.id).join() === 'nav.global', 'g then Shift+S resolves once the Shift event is ignored');
 
 // ── fmtKeys ──
 ok(fmtKeys('meta+k') === 'Ctrl+k', 'meta renders as Ctrl+ on non-mac');

@@ -8065,7 +8065,14 @@ function closeTopOverlay() {
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
 function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
+// A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
+// it modifies. It must be transparent to the chord buffer — otherwise pressing
+// Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
+// would land here between the two steps, match nothing, and reset the pending
+// `g` before `P` ever arrives.
+function isBareModifier(key) { return key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta'; }
 function dispatchKey(e) {
+  if (isBareModifier(e.key)) return false;
   const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
   const cmds = allCommands().filter((c) => c.keys && c.available);
   const candidates = chordCandidates(cmds, CHORD.pending, snap);
