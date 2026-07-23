@@ -3,21 +3,16 @@ import { promisify } from 'node:util';
 
 const pexec = promisify(execFile);
 
-/**
- * Remote access (SPEC §12). karmax serves on localhost; a mesh or tunnel makes
- * it reachable. This is purely an access layer, orthogonal to the core. We
- * detect the available tool and print guidance — never auto-expose, and always
- * behind karmax's own auth (defense in depth; §12 non-negotiable).
- */
-export type RemoteMethod = 'tailscale' | 'cloudflare' | 'ngrok' | 'none';
+export type RemoteMethod = 'tailscale' | 'hosted' | 'none';
+export type RemoteState = 'ready' | 'available' | 'needs-login' | 'unavailable' | 'conflict' | 'error';
 
-async function has(bin: string): Promise<boolean> {
-  try {
-    await pexec('bash', ['-lc', `command -v ${bin}`]);
-    return true;
-  } catch {
-    return false;
-  }
+export interface RemoteAccessStatus {
+  method: RemoteMethod;
+  state: RemoteState;
+  url?: string;
+  detail: string;
+  canEnable: boolean;
+  canDisable: boolean;
 }
 
 export interface RemoteAccessPlan {
@@ -26,39 +21,219 @@ export interface RemoteAccessPlan {
   guidance: string;
 }
 
-export async function remoteAccessPlan(port: number, opts: { hasPassword: boolean; detect?: (bin: string) => Promise<boolean> } = { hasPassword: false }): Promise<RemoteAccessPlan> {
-  const detect = opts.detect ?? has;
-  const authNote = opts.hasPassword
-    ? ''
-    : '\n  ⚠ Set KARMAX_PASSWORD before exposing karmax — it can move money and drive agents (§12).';
+interface CommandResult {
+  stdout: string;
+  stderr: string;
+}
 
+type Run = (args: string[]) => Promise<CommandResult>;
+
+function commandError(error: unknown): CommandResult {
+  const value = error as { stdout?: string | Buffer; stderr?: string | Buffer; message?: string; code?: string };
+  return {
+    stdout: String(value.stdout ?? ''),
+    stderr: String(value.stderr || value.message || value.code || ''),
+  };
+}
+
+function cleanDnsName(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  return value.trim().replace(/\.$/, '');
+}
+
+function urlFromText(value: string): string | undefined {
+  return value.match(/https:\/\/[a-z0-9.-]+\.ts\.net(?::\d+)?/i)?.[0];
+}
+
+function noServeConfig(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed || /(?:no serve config|not configured|no configuration)/i.test(trimmed)) return true;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed == null
+      || (Array.isArray(parsed) && parsed.length === 0)
+      || (typeof parsed === 'object' && Object.keys(parsed).length === 0);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Owns the one safe local remote-access path: Tailscale Serve proxies the
+ * loopback-only gateway over private HTTPS. It never opens Karmax on the LAN
+ * and deliberately has no Funnel/quick-tunnel path.
+ */
+export class RemoteAccessController {
+  private readonly run: Run;
+
+  constructor(private readonly options: {
+    port: () => number;
+    hosted?: boolean;
+    publicUrl?: string;
+    run?: Run;
+  }) {
+    this.run = options.run ?? (async (args) => {
+      const result = await pexec('tailscale', args, { timeout: 20_000 });
+      return { stdout: result.stdout, stderr: result.stderr };
+    });
+  }
+
+  async status(): Promise<RemoteAccessStatus> {
+    if (this.options.hosted) {
+      return {
+        method: 'hosted',
+        state: 'ready',
+        ...(this.options.publicUrl ? { url: this.options.publicUrl } : {}),
+        detail: 'This hosted installation already uses authenticated HTTPS.',
+        canEnable: false,
+        canDisable: false,
+      };
+    }
+
+    let node: Record<string, any>;
+    try {
+      const result = await this.run(['status', '--json']);
+      node = JSON.parse(result.stdout);
+    } catch (error) {
+      const result = commandError(error);
+      const missing = /(?:ENOENT|not found|not recognized)/i.test(`${result.stderr}\n${result.stdout}`);
+      return {
+        method: missing ? 'none' : 'tailscale',
+        state: missing ? 'unavailable' : 'needs-login',
+        detail: missing
+          ? 'Install Tailscale on this computer to turn on private phone access.'
+          : 'Tailscale is installed but this computer is not connected. Run “tailscale up”, then try again.',
+        canEnable: false,
+        canDisable: false,
+      };
+    }
+
+    if (node.BackendState !== 'Running') {
+      return {
+        method: 'tailscale',
+        state: 'needs-login',
+        detail: 'Tailscale is installed but this computer is not connected. Run “tailscale up”, then try again.',
+        canEnable: false,
+        canDisable: false,
+      };
+    }
+
+    const dnsName = cleanDnsName(node.Self?.DNSName);
+    let serve: CommandResult;
+    try {
+      serve = await this.run(['serve', 'status', '--json']);
+    } catch (error) {
+      serve = commandError(error);
+      // Older clients may support Serve but not JSON status.
+      try {
+        serve = await this.run(['serve', 'status']);
+      } catch (fallbackError) {
+        serve = commandError(fallbackError);
+      }
+    }
+    const text = `${serve.stdout}\n${serve.stderr}`.trim();
+    const target = `127.0.0.1:${this.options.port()}`;
+    const active = text.includes(target);
+    const url = urlFromText(text) ?? (dnsName ? `https://${dnsName}` : undefined);
+
+    if (active) {
+      return {
+        method: 'tailscale',
+        state: 'ready',
+        ...(url ? { url } : {}),
+        detail: 'Private HTTPS access is on. Only devices allowed by your tailnet can connect.',
+        canEnable: false,
+        canDisable: true,
+      };
+    }
+    if (!noServeConfig(text)) {
+      return {
+        method: 'tailscale',
+        state: 'conflict',
+        detail: 'Tailscale Serve is already routing this device to another app. Karmax left that configuration untouched.',
+        canEnable: false,
+        canDisable: false,
+      };
+    }
+    return {
+      method: 'tailscale',
+      state: 'available',
+      detail: 'Tailscale is connected and ready to provide private HTTPS access.',
+      canEnable: true,
+      canDisable: false,
+    };
+  }
+
+  async enable(): Promise<RemoteAccessStatus> {
+    const before = await this.status();
+    if (before.state === 'ready') return before;
+    if (!before.canEnable) return before;
+    const target = `http://127.0.0.1:${this.options.port()}`;
+    try {
+      await this.run(['serve', '--bg', target]);
+    } catch (error) {
+      const result = commandError(error);
+      return {
+        method: 'tailscale',
+        state: 'error',
+        detail: (result.stderr || result.stdout || 'Tailscale could not enable Serve.').trim(),
+        canEnable: true,
+        canDisable: false,
+      };
+    }
+    return this.status();
+  }
+
+  async disable(): Promise<RemoteAccessStatus> {
+    const before = await this.status();
+    if (!before.canDisable) return before;
+    try {
+      await this.run(['serve', 'off']);
+    } catch (error) {
+      const result = commandError(error);
+      return {
+        method: 'tailscale',
+        state: 'error',
+        detail: (result.stderr || result.stdout || 'Tailscale could not disable Serve.').trim(),
+        canEnable: false,
+        canDisable: true,
+      };
+    }
+    return this.status();
+  }
+}
+
+/**
+ * Compact startup guidance. Setup itself is available in Settings → Advanced;
+ * this remains useful before the first browser session.
+ */
+export async function remoteAccessPlan(port: number, opts: {
+  hasPassword: boolean;
+  detect?: (bin: string) => Promise<boolean>;
+} = { hasPassword: false }): Promise<RemoteAccessPlan> {
+  const detect = opts.detect ?? (async () => {
+    try {
+      await pexec('tailscale', ['version'], { timeout: 3_000 });
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  const authNote = opts.hasPassword ? '' : '\n  Set KARMAX_PASSWORD before sharing an older password-only installation.';
   if (await detect('tailscale')) {
     return {
       method: 'tailscale',
-      command: `tailscale serve --bg ${port}`,
+      command: `tailscale serve --bg http://127.0.0.1:${port}`,
       guidance:
-        `Private access (just you): your phone joins the tailnet and reaches this laptop directly.\n` +
-        `  Run:  tailscale serve --bg ${port}\n` +
-        `  Then open the printed https://*.ts.net URL. Nothing is exposed publicly.${authNote}`,
+        `Phone access: open Settings → Access, or run:\n` +
+        `  tailscale serve --bg http://127.0.0.1:${port}\n` +
+        `  Karmax stays on localhost and is shared privately over HTTPS.${authNote}`,
     };
-  }
-  if (await detect('cloudflared')) {
-    return {
-      method: 'cloudflare',
-      command: `cloudflared tunnel --url http://127.0.0.1:${port}`,
-      guidance:
-        `Public URL with auth (business / multiple people): outbound-only tunnel, no open ports.\n` +
-        `  Run:  cloudflared tunnel --url http://127.0.0.1:${port}\n` +
-        `  Put Cloudflare Access (SSO/OTP) + WAF in front. Never a naked public tunnel.${authNote}`,
-    };
-  }
-  if (await detect('ngrok')) {
-    return { method: 'ngrok', command: `ngrok http ${port}`, guidance: `Quick one-off demo only:  ngrok http ${port}${authNote}` };
   }
   return {
     method: 'none',
     guidance:
-      `No tunnel tool found. Install Tailscale (recommended, private) or Cloudflare Tunnel + Access (public, behind SSO).\n` +
-      `  https://tailscale.com  •  https://developers.cloudflare.com/cloudflare-one/${authNote}`,
+      `Phone access: install Tailscale, connect this computer and your phone to the same tailnet,\n` +
+      `  then open Settings → Access. https://tailscale.com/download${authNote}`,
   };
 }

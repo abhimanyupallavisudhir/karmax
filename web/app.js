@@ -16,6 +16,13 @@ const ICON = {
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
 };
 
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  installPrompt = event;
+});
+window.addEventListener('appinstalled', () => { installPrompt = null; });
+
 const S = {
   token: null,
   meta: null,
@@ -1770,6 +1777,7 @@ function renderShell() {
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
+      <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
       <div class="brand"><span class="mark">◇</span> karmax</div>
       <select class="org-switcher" id="org-switcher" title="Organization">
         ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
@@ -1786,6 +1794,7 @@ function renderShell() {
     </div>
     <div class="body">
       <div class="rail" id="rail"></div>
+      <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>`;
   // Project-scoped query/filtering lives in the task list. The topbar finder is
@@ -1793,6 +1802,21 @@ function renderShell() {
   $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#topbar-help').addEventListener('click', openHelp);
+  const closeMobileNav = () => {
+    $('#rail')?.classList.remove('mobile-open');
+    $('#rail-scrim')?.classList.remove('visible');
+    $('#mobile-menu')?.setAttribute('aria-expanded', 'false');
+  };
+  $('#mobile-menu')?.addEventListener('click', () => {
+    const open = !$('#rail')?.classList.contains('mobile-open');
+    $('#rail')?.classList.toggle('mobile-open', open);
+    $('#rail-scrim')?.classList.toggle('visible', open);
+    $('#mobile-menu')?.setAttribute('aria-expanded', String(open));
+  });
+  $('#rail-scrim')?.addEventListener('click', closeMobileNav);
+  $('#rail')?.addEventListener('click', (event) => {
+    if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
+  });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
   $('#org-switcher')?.addEventListener('change', async (e) => {
     if (e.target.value === '__new') return createOrganization();
@@ -6811,7 +6835,85 @@ function globalSettingsView(embedded = false) {
     <div class="card" id="resilience-card">
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
+    </div>
+    <div class="settings-section-title" id="settings-access"><div>Access<small>How you open Karmax from another device</small></div></div>
+    <div class="card phone-access-card" id="phone-access-card">
+      <div class="section-h">Phone access <span class="chip">private by default</span></div>
+      <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
     </div>`;
+}
+
+function phoneInstallHelp() {
+  if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) {
+    return '<span class="phone-installed">Installed on this device ✓</span>';
+  }
+  return `<button class="btn sm" id="install-karmax">Add Karmax to this phone</button>
+    <span class="task-sub" id="phone-install-note">No native Karmax app is needed.</span>`;
+}
+
+function renderPhoneAccess(status) {
+  const box = $('#phone-access-status');
+  if (!box) return;
+  const ready = status.state === 'ready';
+  const hosted = status.method === 'hosted';
+  const label = ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
+    : status.state === 'needs-login' ? 'Sign-in needed'
+      : status.state === 'conflict' ? 'Already in use' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
+  const link = status.url
+    ? `<a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a>`
+    : '';
+  const setup = hosted
+    ? '<li>Open this same HTTPS address on your phone.</li>'
+    : `<li>Install <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Tailscale</a> on your phone and sign in to the same tailnet.</li>
+       <li>Open the private Karmax address shown here. Keep Tailscale connected.</li>`;
+  box.innerHTML = `<div class="phone-access-head"><span class="remote-state ${ready ? 'ready' : ''}">${esc(label)}</span>${link}</div>
+    <p>${esc(status.detail)}</p>
+    ${ready ? `<ol class="phone-steps">${setup}<li>Use Karmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
+      <div class="phone-access-actions">${phoneInstallHelp()}${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}</div>`
+      : `<div class="phone-access-actions">
+          ${status.canEnable ? '<button class="btn sm primary" id="remote-enable">Turn on private access</button>' : ''}
+          ${status.method === 'none' ? '<a class="btn sm" href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Install Tailscale</a>' : ''}
+          <button class="btn sm" id="remote-refresh">Check again</button>
+        </div>`}
+    <p class="phone-security">${hosted ? 'Karmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. Karmax stays bound to localhost and is never made public.'}</p>`;
+
+  const act = async (action, button) => {
+    button.disabled = true;
+    button.textContent = action === 'enable' ? 'Turning on…' : 'Turning off…';
+    try {
+      renderPhoneAccess(await api('/api/remote-access', { method: 'POST', body: JSON.stringify({ action }) }));
+    } catch (error) {
+      toast(error.message, true);
+      hydratePhoneAccess();
+    }
+  };
+  $('#remote-enable')?.addEventListener('click', (event) => act('enable', event.currentTarget));
+  $('#remote-disable')?.addEventListener('click', (event) => act('disable', event.currentTarget));
+  $('#remote-refresh')?.addEventListener('click', hydratePhoneAccess);
+  $('#install-karmax')?.addEventListener('click', async () => {
+    const note = $('#phone-install-note');
+    if (installPrompt) {
+      await installPrompt.prompt();
+      await installPrompt.userChoice;
+      installPrompt = null;
+      if (note) note.textContent = 'Karmax can now open from your Home Screen.';
+      return;
+    }
+    const ios = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    if (note) note.textContent = ios
+      ? 'Tap Share, then “Add to Home Screen”.'
+      : 'Open your browser menu, then choose “Install app” or “Add to Home screen”.';
+  });
+}
+
+async function hydratePhoneAccess() {
+  const box = $('#phone-access-status');
+  if (!box) return;
+  try {
+    renderPhoneAccess(await api('/api/remote-access'));
+  } catch (error) {
+    box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`;
+  }
 }
 
 async function hydrateGitProfiles() {
@@ -7220,6 +7322,7 @@ async function hydrateAuthorization(scope, projectId) {
 }
 
 function wireGlobalSettings(organizationId) {
+  hydratePhoneAccess();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
@@ -7523,7 +7626,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>

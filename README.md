@@ -18,6 +18,22 @@ npm start          # boots Temporal (SQLite) + worker + gateway, prints a URL
 Then open the printed `http://127.0.0.1:<port>` (ports are chosen dynamically —
 nothing is hardcoded).
 
+### Use Karmax from your phone
+
+For a local installation, install [Tailscale](https://tailscale.com/download) on
+the Karmax computer and your phone, then sign in to the same tailnet. In Karmax,
+open **Organization settings → Access** and choose **Turn on
+private access**. Karmax shows the private `https://….ts.net` address to open on
+your phone. It stays bound to localhost; Tailscale Serve supplies private HTTPS
+and never exposes it to the public internet.
+
+For hosted Karmax, open its normal `https://karmax.example.com` address on the
+phone and sign in. In either case, choose **Add Karmax to this phone** in the
+same Access card (or use the browser's **Add to Home Screen**) for a standalone
+app-like window. A Karmax-specific iOS or Android app is not required; the
+responsive installable web app provides the full task, review, and check-in UI.
+The Tailscale mobile app is only needed for a private local installation.
+
 To host the complete HTTPS control plane on a VPS, install Docker and run:
 
 ```bash
@@ -108,6 +124,6 @@ OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
   the dev server wedges after you edit workflow code (running singletons replay
   old history against new code). Worlds/worktrees are preserved.
 - First boot asks you to create the administrator account; every later browser
-  session uses Better Auth login. **Never** expose karmax on a naked public
-  tunnel — keep it behind Tailscale or Cloudflare Access as defense in depth.
+  session uses Better Auth login. **Never** expose local Karmax through Funnel
+  or a naked public tunnel; use the built-in private Tailscale Serve setup.
 - `KARMAX_HOME` overrides the data home (default `~/.karmax`).
