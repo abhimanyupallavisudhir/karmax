@@ -279,22 +279,54 @@ selection.
 
 ## 12. Phases
 
-1. **VaultItem + grants** — metadata layer over the vault; `use-credential:`
-   item/tag/domain grammar; task-form credential picker; Settings Vault card.
-   (No new crypto, no new coordinator.)
-2. **Use paths** — materialization for `env`/`api-key`/`ssh-key` items
-   (generalize git-profiles' injection); `fill_credential` host-side fill +
-   TOTP; `get_credential` reveal with policy gate; audit surfacing.
-3. **Escalation** — `request_credential`/`store_credential` tools; pending
-   approvals in a credential coordinator (budget-coordinator shape); Review
-   gate + Access-requests cards; grant-extension bookkeeping (grantor
-   recorded).
-4. **Connectors** — Bitwarden, 1Password service accounts, pass; selective
-   mirror + write-back; Connectors card.
-5. **Account creation autonomy** — agent email connector + `check_agent_mail`;
-   registration prompt guidance (generate password → register → enroll
-   agent passkey → `store_credential`); passkey virtual-authenticator
-   enrollment/login.
+Phases 1–3 are implemented (tests: `tests/vault-items.test.ts` unit coverage
+incl. RFC 6238 vectors and a mock-CDP fill; `tests/gateway.test.ts` runs the
+item lifecycle and the full pull model over HTTP).
+
+1. **VaultItem + grants** ✅ — `VaultItems` (`src/autonomy/vault-items.ts`):
+   metadata in the store kv (`vault:items`), secrets in the existing vault
+   under `item:<id>:<field>` handles (broker-resolved, GitProfiles-style);
+   `use-credential:item|tag|domain` grammar via the existing wildcard matcher;
+   `vault:store` capability (developer profile + do-role ceiling, which also
+   gained `credential:read` + `use-credential:*`); `credentialGrants` on
+   createTask / PATCH authorization (creator-capped: own coverage or
+   `credential:write`); task-form **Vault credentials** picker; Settings →
+   **Passwords & payments** with the Vault card (write-only secrets, per-item
+   use/reveal policy).
+2. **Use paths** ✅ — spawn-time `envFor` injection wired into
+   `runAgentTurn`'s `extraEnv` (env bags, api-key `envVar`, ssh-key 0600 file
+   paths; `auto`-policy granted items only; local worlds, like gitEnv);
+   `POST /api/vault/fill` → `fillViaCdp` (`src/autonomy/fill.ts`: loopback
+   CDP, live `location.origin` re-verified against item domains before
+   typing, TOTP computed broker-side); `POST /api/vault/resolve` reveal with
+   policy gate; durable audit via `store.appendAudit`
+   (`vault.used/revealed/requested/…`).
+3. **Escalation** ✅ — `request_credential` / `fill_credential` /
+   `get_credential` / `store_credential` on both agent rails (Messages-API
+   `tools.ts` + platform MCP `mcp.ts`); pending requests are **store-backed**
+   (kv), not a Temporal coordinator — like `request_spend`, the decision
+   itself is synchronous service logic, and approval works by editing durable
+   state the next token mint reads: `once`/`task`/`always`/`deny`, with
+   one-shot passes, per-task grant extensions (`vault:grant:<taskId>`,
+   grantor recorded, merged into the grant at every mint — extending a
+   running task without touching frozen workflow input), and `always`
+   flipping item policy; Access-requests card in Settings.
+4. **Connectors** (not built) — Bitwarden, 1Password service accounts, pass;
+   selective mirror + write-back; Connectors card.
+5. **Account creation autonomy** (not built) — agent email connector +
+   `check_agent_mail`; registration prompt guidance (generate password →
+   register → enroll agent passkey → `store_credential`); passkey
+   virtual-authenticator enrollment/login.
+
+Implementation notes:
+- Existing installs keep their seeded role profiles (`seedProfiles` does not
+  overwrite), so the do-role's new `credential:read`/`vault:store`/
+  `use-credential:*` ceiling applies to fresh stores; an existing install
+  edits the do profile once (or deletes it to reseed).
+- `fill_credential` discovers the CDP endpoint from inside the world, so the
+  §5B trust boundary holds against prompt injection (live origin check over
+  CDP), not against a malicious agent standing up a fake CDP server — stated
+  in `fill.ts` and accepted for v1.
 
 ---
 

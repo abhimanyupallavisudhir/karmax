@@ -43,6 +43,14 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/git-profiles', 'GET|PATCH|DELETE /api/git-profiles/:id',
     'GET /api/git-profiles/preflight?projectId=', 'POST /api/git-profiles/default',
   ],
+  vault: [
+    'GET|POST /api/vault/items (typed credential items; secret fields are write-only)', 'DELETE /api/vault/items/:id',
+    'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?})',
+    'POST /api/vault/resolve (plaintext reveal, per-item grant + policy gated; body {itemId?|domain?, field?})',
+    'POST /api/vault/fill (zero-exposure browser fill via CDP; body {itemId?|domain?, field?, selector, cdpUrl?})',
+    'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access; body {itemId?|domain?, field?, mode?, why})',
+    'POST /api/vault/requests/:id/resolve (human: body {action: once|task|always|deny, itemId?})',
+  ],
   wiki: [
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',
     'GET|PUT|DELETE /api/organizations/:organizationId/wiki/page?path= (PUT body {path, content, kind: skill|memory, create?, prevPath?})',

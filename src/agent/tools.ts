@@ -179,6 +179,71 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'request_credential',
+    description:
+      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that this task was not granted. Identify it by item_id or by the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human — stop and report, they will grant/add it and you can retry), or denied (do not re-ask).',
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string', description: 'A vault item id (list them via platform_request GET /api/vault/items).' },
+        domain: { type: 'string', description: 'The site this credential is for, e.g. "github.com" — used when you do not know the item id.' },
+        mode: { type: 'string', enum: ['use', 'reveal'], description: 'use = fill/inject without seeing the secret (default); reveal = you need the plaintext.' },
+        why: { type: 'string', description: 'Why you need it (shown to the human).' },
+      },
+      required: ['why'],
+    },
+  },
+  {
+    name: 'fill_credential',
+    description:
+      'Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: karmax resolves it and types it over CDP, verifying the page origin matches the credential\'s domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). Requires the browser to expose a DevTools endpoint (launch Chrome with --remote-debugging-port=9222).',
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
+        field: { type: 'string', enum: ['username', 'password', 'totp'], description: 'Default password. totp types the current one-time code.' },
+        selector: { type: 'string', description: 'CSS selector of the input element to fill.' },
+        cdp_url: { type: 'string', description: 'DevTools endpoint (default http://127.0.0.1:9222).' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'get_credential',
+    description:
+      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, needs_approval/denied per the item\'s reveal policy, or not_in_vault.',
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        domain: { type: 'string' },
+        field: { type: 'string', description: 'password | totp | secret | privateKey | env | note (defaults to the item type\'s main field).' },
+      },
+    },
+  },
+  {
+    name: 'store_credential',
+    description:
+      'Save a credential you just created (a registered account, generated password, captured TOTP seed, minted API key or SSH key) into the user\'s vault so it outlives this task. Secret values go in `secrets` and are write-only. You may update only items this task created.',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Omit to create; set to update an item this task created.' },
+        type: { type: 'string', enum: ['login', 'api-key', 'ssh-key', 'env', 'note'] },
+        label: { type: 'string' },
+        domains: { type: 'array', items: { type: 'string' } },
+        username: { type: 'string' },
+        env_var: { type: 'string', description: 'api-key/ssh-key: env var to inject it under in future task worlds.' },
+        secrets: {
+          type: 'object',
+          description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI); api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
+        },
+      },
+      required: ['type', 'label'],
+    },
+  },
+  {
     name: 'find_task',
     description: 'Find a task by project id and human-facing project-local number (#100).',
     parameters: { type: 'object', properties: { project_id: { type: 'string' }, number: { type: 'number' } }, required: ['project_id', 'number'] },
@@ -402,6 +467,33 @@ export function platformToolHandlers(
         why: args?.why ? String(args.why) : undefined,
       });
       return JSON.stringify(r);
+    },
+    async request_credential(args) {
+      const r: any = await platformRequest('POST', '/api/vault/requests', {
+        itemId: args?.item_id, domain: args?.domain, mode: args?.mode, why: args?.why ? String(args.why) : undefined,
+      });
+      // Mirror request_spend: a parked request surfaces at the Review gate.
+      if (r?.status === 'needs_approval' || r?.status === 'not_in_vault') {
+        ctx.createReviewInfo({ summary: `Credential access requested: ${args?.item_id ?? args?.domain ?? ''} (${r.status === 'not_in_vault' ? 'not in the vault — add it or ask me to create the account' : 'approval needed'}). ${args?.why ?? ''}`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+      }
+      return JSON.stringify(r);
+    },
+    async fill_credential(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/fill', {
+        itemId: args?.item_id, domain: args?.domain, field: args?.field,
+        selector: String(args?.selector ?? ''), cdpUrl: args?.cdp_url,
+      }));
+    },
+    async get_credential(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/resolve', {
+        itemId: args?.item_id, domain: args?.domain, field: args?.field,
+      }));
+    },
+    async store_credential(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/store', {
+        id: args?.id, type: args?.type, label: args?.label, domains: args?.domains,
+        username: args?.username, envVar: args?.env_var, secrets: args?.secrets,
+      }));
     },
     async find_task(args) {
       return JSON.stringify(await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tasks/by-num/${Number(args?.number)}`));

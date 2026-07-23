@@ -330,6 +330,50 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     description: 'Fetch the latest upstream base/target branch into refs/remotes/origin without placing Git credentials in this world.',
     inputSchema: { branch: z.string().optional() },
   }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
+  // Vault credentials (PLAN-passwords.md) — thin wrappers over the gateway's
+  // /api/vault surface so the pull model is first-class, not buried behind
+  // platform_request. Available on the gateway-backed bridge; the in-process
+  // apiOps embedding reports the same platform_request limitation.
+  server.registerTool(
+    'request_credential',
+    {
+      description:
+        'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) this task was not granted, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human: stop and report, retry after they grant/add it; denied → do not re-ask.',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), why: z.string() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/requests', a)),
+  );
+  server.registerTool(
+    'fill_credential',
+    {
+      description:
+        'Type a vault credential into the page open in your browser WITHOUT the secret entering your context — karmax resolves and types it over CDP after verifying the page origin matches the credential\'s domains. Call once per field (username, password, then totp for a one-time code). The browser must expose DevTools (launch Chrome with --remote-debugging-port=9222).',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string(), cdpUrl: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/fill', a)),
+  );
+  server.registerTool(
+    'get_credential',
+    {
+      description:
+        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents) — the audited last resort; prefer fill_credential for logins. Returns granted with the value, needs_approval/denied per the item\'s reveal policy, or not_in_vault.',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/resolve', a)),
+  );
+  server.registerTool(
+    'store_credential',
+    {
+      description:
+        'Save a credential you just created (registered account, generated password, captured TOTP seed, minted API/SSH key) into the user\'s vault so it outlives this task. Secrets are write-only: login → {password, totp}, api-key → {secret}, ssh-key → {privateKey}, env → {env}, note → {note}. You may update only items this task created.',
+      inputSchema: {
+        id: z.string().optional(), type: z.enum(['login', 'api-key', 'ssh-key', 'env', 'note']), label: z.string(),
+        domains: z.array(z.string()).optional(), username: z.string().optional(), envVar: z.string().optional(),
+        secrets: z.record(z.string(), z.string()).optional(),
+      },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/store', a)),
+  );
   server.registerTool(
     'describe_platform',
     { description: 'Describe the complete administrative API available through platform_request.', inputSchema: {} },

@@ -605,4 +605,63 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(views.map((v: any) => v.name)).toContain('Urgent frontend');
     expect(views.find((v: any) => v.id === view.id).query.filters[0].field).toBe('tag');
   });
+
+  // ── vault items + the credential pull model over HTTP (PLAN-passwords.md) ──
+  it('vault item lifecycle: add, list without secrets, policy-gated reveal, delete', async () => {
+    const created: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'login', label: 'GitHub (test)', domains: 'github.com', username: 'octo',
+      policy: { use: 'auto', reveal: 'ask' }, secrets: { password: 'hunter2' },
+    }) })).json();
+    expect(created.id).toBeTruthy();
+    expect(created.fields).toEqual(['password']);
+    expect(JSON.stringify(created)).not.toContain('hunter2');
+    const items: any = await (await fetch(`${base}/api/vault/items`, { headers: auth() })).json();
+    expect(JSON.stringify(items)).not.toContain('hunter2');
+    expect(items.map((i: any) => i.id)).toContain(created.id);
+
+    // reveal policy 'ask' gates even an all-capability caller
+    const asked: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com' }) })).json();
+    expect(asked.status).toBe('needs_approval');
+    await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({ id: created.id, type: 'login', label: created.label, domains: created.domains, policy: { reveal: 'auto' } }) });
+    const revealed: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com' }) })).json();
+    expect(revealed.status).toBe('granted');
+    expect(revealed.value).toBe('hunter2');
+    expect(revealed.username).toBe('octo');
+
+    // escalation requests are for task agents, not human sessions
+    const noTask: any = await (await fetch(`${base}/api/vault/requests`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com', why: 'x' }) })).json();
+    expect(noTask.error).toMatch(/task-agent/);
+
+    await fetch(`${base}/api/vault/items/${created.id}`, { method: 'DELETE', headers: auth() });
+    const after: any = await (await fetch(`${base}/api/vault/items`, { headers: auth() })).json();
+    expect(after.map((i: any) => i.id)).not.toContain(created.id);
+  });
+
+  it('agent pull model: needs_approval → human grants for the task → retry succeeds', async () => {
+    const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'api-key', label: 'Service key', policy: { use: 'auto', reveal: 'auto' }, secrets: { secret: 'sk-999' },
+    }) })).json();
+    // A task-agent bearer whose grant does NOT cover the item (the do-role
+    // ceiling admits use-credential:*, but the task grant carries no item cap).
+    const minted = h.tokens.mint({ taskId: 'task_vaulttest', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read'] });
+    const agentAuth = { authorization: `Bearer ${minted.token}`, 'content-type': 'application/json' };
+
+    const first: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }) })).json();
+    expect(first.status).toBe('needs_approval');
+    const req: any = await (await fetch(`${base}/api/vault/requests`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id, mode: 'reveal', why: 'need the key' }) })).json();
+    expect(req.status).toBe('needs_approval');
+    expect(req.requestId).toBeTruthy();
+    // the human resolves it for the whole task (durable grant extension)
+    const resolved: any = await (await fetch(`${base}/api/vault/requests/${req.requestId}/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ action: 'task' }) })).json();
+    expect(resolved.status).toBe('granted');
+    const second: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }) })).json();
+    expect(second.status).toBe('granted');
+    expect(second.value).toBe('sk-999');
+    // and only for that task — a sibling task with the same shape stays parked
+    const other = h.tokens.mint({ taskId: 'task_other', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read'] });
+    const third: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: { authorization: `Bearer ${other.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ itemId: item.id }) })).json();
+    expect(third.status).toBe('needs_approval');
+  });
 });

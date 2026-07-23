@@ -3072,6 +3072,10 @@ async function openTaskForm(workflow, draft, seedText) {
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
             </div>` : ''}
+            <div class="form-row" data-row="__vault">
+              <div class="label-row"><label title="Which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Agents can request more mid-task; you approve each request.">Vault credentials</label></div>
+              <div id="tf-vault-grants" style="font-size:12px">Loading…</div>
+            </div>
             <div class="form-row" data-row="__creds">
               <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Credentials</label></div>
               <div id="cred-editor-newtask">Loading…</div>
@@ -3163,6 +3167,24 @@ async function openTaskForm(workflow, draft, seedText) {
   const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+  // The vault credential picker (PLAN-passwords.md §6): item grants layered onto
+  // the authorization package. Checkbox changes ride the #tf-body change
+  // listener into auto-save; grants persist via createTask/PATCH authorization.
+  (async () => {
+    const box = $('#tf-vault-grants');
+    if (!box) return;
+    let items = [];
+    try { items = await api('/api/vault/items'); } catch { box.closest('[data-row="__vault"]')?.remove(); return; }
+    if (!items.length) {
+      box.closest('[data-row="__vault"]')?.remove();
+      return;
+    }
+    const granted = new Set((draft?.params?._authorization?.capabilities || [])
+      .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
+    box.innerHTML = items.map((i) => `<label style="display:flex;gap:6px;align-items:center;margin:2px 0;cursor:pointer">
+      <input type="checkbox" class="tf-vault-grant" value="use-credential:item:${esc(i.id)}" ${granted.has(i.id) ? 'checked' : ''} />
+      <span>${esc(i.label)}</span> <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(', ')) : ''}</span></label>`).join('');
+  })();
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
 
@@ -3191,7 +3213,12 @@ async function openTaskForm(workflow, draft, seedText) {
     // the replace:true auto-save preserves the user's choice.
     const ctx = $('#tf-context');
     if (ctx) body.wikiContext = String(ctx.value).split(/\s+/).map((t) => t.trim()).filter((t) => /^@(proj|org):\S/i.test(t));
-    return { body, notes: $('#tf-notes')?.value ?? '', authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization };
+    return {
+      body, notes: $('#tf-notes')?.value ?? '',
+      authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization,
+      // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
+      credentialGrants: [...document.querySelectorAll('.tf-vault-grant:checked')].map((b) => b.value),
+    };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
   // guards against spawning empty drafts just from opening the form.
@@ -3234,12 +3261,12 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
+          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
         }
         if (localCred && hasPolicy()) await api(`/api/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
@@ -3275,7 +3302,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, credentialGrants: state.credentialGrants, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -3311,12 +3338,12 @@ async function openTaskForm(workflow, draft, seedText) {
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
         await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
+        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
+        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
         if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
@@ -3326,13 +3353,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -6738,7 +6765,9 @@ function globalSettingsView(embedded = false) {
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
     ${authorizationCard('global')}
-    <div class="settings-section-title" id="settings-payments"><div>Payments<small>What tasks may spend, and the cards they spend from</small></div></div>
+    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
+    ${vaultCard()}
+    ${vaultRequestsCard()}
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
     <div class="card" id="accounts-card">
@@ -6942,6 +6971,138 @@ async function wirePaymentsCard(scope, projectId) {
       renderCards();
     } catch (e) { toast(e.message, true); }
   });
+}
+
+// ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
+const VAULT_SECRET_LABELS = {
+  login: [['password', 'password'], ['totp', 'TOTP seed (base32 or otpauth:// URI)']],
+  'api-key': [['secret', 'API key']],
+  'ssh-key': [['privateKey', 'private key (PEM)']],
+  env: [['env', '.env contents (KEY=VALUE per line)']],
+  note: [['note', 'note']],
+};
+function vaultCard() {
+  return `<div class="card" id="vault-card">
+    <div class="section-h">Credential vault <span class="chip">installation resource</span></div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Site logins, API keys, SSH keys, and .env bags agents may use on your behalf. Secrets are encrypted at rest and <b>write-only</b> here; agents use them through grants you attach per task (or approve when an agent asks). Policy <b>use</b> covers browser fill and env injection (the agent never sees the secret); <b>reveal</b> is plaintext to the agent.</p>
+    <div class="vault-items-list" style="margin-bottom:12px">Loading…</div>
+    <div style="font-weight:600;margin-bottom:4px">Add an item</div>
+    <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap">
+      <select class="vi-type">${Object.keys(VAULT_SECRET_LABELS).map((t) => `<option>${t}</option>`).join('')}</select>
+      <input class="vi-label" placeholder="label (e.g. GitHub — alice)" style="flex:1;min-width:140px" />
+      <input class="vi-domains" placeholder="domains (e.g. github.com)" style="flex:1;min-width:140px" />
+      <input class="vi-username" placeholder="username" style="min-width:120px" />
+      <input class="vi-envvar" placeholder="env var (api/ssh keys)" style="min-width:140px;display:none" />
+    </div></div>
+    <div class="vault-secret-rows"></div>
+    <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <label style="font-size:12px">use <select class="vi-use"><option>auto</option><option>ask</option></select></label>
+      <label style="font-size:12px">reveal <select class="vi-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+      <button class="btn primary vi-add">Add to vault</button>
+    </div></div>
+  </div>`;
+}
+function vaultRequestsCard() {
+  return `<div class="card" id="vault-requests-card">
+    <div class="section-h">Credential access requests</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted (or one that isn't in the vault yet — add it above, then approve, or tell the agent to create the account itself). <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto.</p>
+    <div class="vault-requests-list">Loading…</div>
+  </div>`;
+}
+async function wireVaultCards() {
+  const box = $('#vault-card');
+  if (!box) return;
+  const secretRows = () => {
+    const type = box.querySelector('.vi-type').value;
+    box.querySelector('.vi-envvar').style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
+    box.querySelector('.vault-secret-rows').innerHTML = VAULT_SECRET_LABELS[type].map(([field, label]) =>
+      `<div class="form-row"><label>${esc(label)}</label>${field === 'env' || field === 'privateKey' || field === 'note'
+        ? `<textarea class="vi-secret" data-field="${field}" rows="3" style="width:100%"></textarea>`
+        : `<input class="vi-secret" data-field="${field}" type="password" autocomplete="off" />`}</div>`).join('');
+  };
+  secretRows();
+  box.querySelector('.vi-type').addEventListener('change', secretRows);
+  const renderItems = async () => {
+    let items = [];
+    try { items = await api('/api/vault/items'); } catch {}
+    const list = box.querySelector('.vault-items-list');
+    list.innerHTML = items.length
+      ? items.map((i) => `<div class="queue-item" data-vi="${esc(i.id)}">
+          <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span>
+            ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
+            <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}${i.provenance?.source?.startsWith('task:') ? ' · created by an agent' : ''} · secrets: ${esc((i.fields || []).join(', ') || 'none')}</div></div>
+          <label style="font-size:11px">use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <label style="font-size:11px">reveal <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button></div>`).join('')
+      : '<span style="color:var(--ink-3)">No vault items yet.</span>';
+    list.querySelectorAll('[data-vi]').forEach((row) => {
+      const item = items.find((x) => x.id === row.dataset.vi);
+      const savePolicy = async () => {
+        try {
+          await api('/api/vault/items', { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
+          toast('Policy saved');
+        } catch (e) { toast(e.message, true); }
+      };
+      row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
+      row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+    });
+    list.querySelectorAll('[data-vi-del]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Delete this vault item (and its secrets)?')) return;
+      try { await api(`/api/vault/items/${b.dataset.viDel}`, { method: 'DELETE' }); renderItems(); } catch (e) { toast(e.message, true); }
+    }));
+    return items;
+  };
+  box.querySelector('.vi-add').addEventListener('click', async () => {
+    const secrets = {};
+    box.querySelectorAll('.vi-secret').forEach((el) => { if (el.value) secrets[el.dataset.field] = el.value; });
+    try {
+      await api('/api/vault/items', { method: 'POST', body: JSON.stringify({
+        type: box.querySelector('.vi-type').value,
+        label: box.querySelector('.vi-label').value,
+        domains: box.querySelector('.vi-domains').value,
+        username: box.querySelector('.vi-username').value || undefined,
+        envVar: box.querySelector('.vi-envvar').value || undefined,
+        policy: { use: box.querySelector('.vi-use').value, reveal: box.querySelector('.vi-reveal').value },
+        secrets,
+      }) });
+      box.querySelectorAll('.vi-label,.vi-domains,.vi-username,.vi-envvar,.vi-secret').forEach((el) => (el.value = ''));
+      toast('Added to the vault');
+      await renderItems();
+      renderRequests();
+    } catch (e) { toast(e.message, true); }
+  });
+  const renderRequests = async () => {
+    const rbox = $('#vault-requests-card .vault-requests-list');
+    if (!rbox) return;
+    let requests = [];
+    let items = [];
+    try { [requests, items] = await Promise.all([api('/api/vault/requests'), api('/api/vault/items')]); } catch {}
+    const pending = requests.filter((r) => r.status === 'pending');
+    const recent = requests.filter((r) => r.status !== 'pending').slice(-5).reverse();
+    const itemLabel = (id) => items.find((i) => i.id === id)?.label || id;
+    rbox.innerHTML = (pending.length
+      ? pending.map((r) => `<div class="queue-item" data-vreq="${esc(r.id)}">
+          <div style="flex:1"><b>${r.itemId ? esc(itemLabel(r.itemId)) : `${esc(r.domain || '?')} <span class="chip" style="color:var(--warn,#e0b15a)">not in vault</span>`}</b>
+            <span class="chip">${esc(r.mode)}</span>
+            <div class="task-sub" style="color:var(--ink-3)">task <a data-spa href="#" onclick="return false">${esc(r.taskId)}</a>${r.why ? ` — ${esc(r.why)}` : ''}</div></div>
+          ${r.itemId ? '' : `<select class="vreq-bind"><option value="">bind to item…</option>${items.map((i) => `<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`}
+          <button class="btn sm" data-vreq-act="once">Once</button>
+          <button class="btn sm" data-vreq-act="task">This task</button>
+          <button class="btn sm" data-vreq-act="always">Always</button>
+          <button class="btn sm" data-vreq-act="deny">Deny</button></div>`).join('')
+      : '<span style="color:var(--ink-3)">No pending requests.</span>')
+      + (recent.length ? `<div class="task-sub" style="color:var(--ink-3);margin-top:8px">${recent.map((r) => `${r.status} · ${r.itemId ? esc(itemLabel(r.itemId)) : esc(r.domain || '?')} (${esc(r.resolution?.action || '')})`).join('<br>')}</div>` : '');
+    rbox.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((b) => b.addEventListener('click', async () => {
+      const itemId = row.querySelector('.vreq-bind')?.value || undefined;
+      try {
+        await api(`/api/vault/requests/${row.dataset.vreq}/resolve`, { method: 'POST', body: JSON.stringify({ action: b.dataset.vreqAct, itemId }) });
+        toast(b.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted — tell the task to retry (or it will pick it up next turn)');
+        renderRequests();
+      } catch (e) { toast(e.message, true); }
+    })));
+  };
+  await renderItems();
+  await renderRequests();
 }
 
 // Which accounts an agent may use (SPEC §7.3/§6.2) — a checkbox pool, all checked
@@ -7229,6 +7390,7 @@ function wireGlobalSettings(organizationId) {
   hydrateAuthorization('global');
   hydrateWorkflows();
   hydrateGitProfiles();
+  wireVaultCards();
   wirePaymentsCard('global');
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
@@ -7523,7 +7685,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>

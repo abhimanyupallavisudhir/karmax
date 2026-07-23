@@ -17,6 +17,7 @@ import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
+import { VaultItems } from '../autonomy/vault-items.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
@@ -288,6 +289,7 @@ export interface PrepareChildArgs {
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const gitProfiles = new GitProfiles(store, deps.broker);
+  const vaultItems = new VaultItems(store, deps.broker);
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
@@ -555,7 +557,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
       // capabilities = intersection(profile ceiling, granting principal).
-      const grant = args.task.grant ?? DEFAULT_GRANT;
+      // Human-approved credential escalations recorded after creation
+      // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
+      // so the next minted token carries them without touching workflow input.
+      const grant = [...(args.task.grant ?? DEFAULT_GRANT), ...vaultItems.extensionCaps(args.taskId)];
       const effective = attenuate(profile.capabilities, grant);
       let token: string | undefined;
       if (deps.tokens) {
@@ -895,10 +900,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(() => {
             const gitEnv = isRemote(args.worldHandle.kind) ? {} : gitEnvFor(args.worldHandle, args.taskId);
+            // Granted `auto` vault items materialize into the subprocess env
+            // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
+            // SSH keys as 0600 file paths. Local worlds only, like gitEnv.
+            const vaultEnv = isRemote(args.worldHandle.kind) ? {} : vaultItems.envFor(args.taskId, effective);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
-            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            const extraEnv = { ...vaultEnv, ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
             return Object.keys(extraEnv).length ? { extraEnv } : {};
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).

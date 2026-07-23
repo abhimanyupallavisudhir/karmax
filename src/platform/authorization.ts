@@ -24,7 +24,7 @@ export interface PrincipalGrant {
 }
 
 const developer = [
-  'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read', 'credential:read', 'skill:write',
+  'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read', 'credential:read', 'vault:store', 'skill:write',
   'organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*',
   // Workflow-internal decisions and merges are still narrowed by the role
   // profile and the workflow's exact branch target at execution time.
@@ -46,7 +46,8 @@ const operator = [
 const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
-  'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+  'credential:read', 'vault:store', 'use-credential:*', 'skill:write',
+  'resolve-decision', 'confirm-decision', 'merge-into:*',
   'organization:read', 'organization:member:read', 'team:*', 'repository:*', 'inbox:*',
 ];
 
@@ -54,7 +55,7 @@ const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:settings:*',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
-  'credential:read', 'skill:write', 'payment:read',
+  'credential:read', 'vault:store', 'use-credential:*', 'skill:write', 'payment:read',
 ];
 
 /**
@@ -119,7 +120,10 @@ export class AuthorizationService {
     if (!profile.id.trim() || !profile.name.trim()) throw new Error('authorization profile needs an id and name');
     if (!profile.capabilities.length) throw new Error('authorization profile needs at least one capability');
     for (const cap of profile.capabilities) {
-      if (cap !== '*' && !cap.endsWith(':*') && !CAPABILITIES.includes(cap as any) && !cap.startsWith('merge-into:'))
+      // `use-credential:` grants are target-scoped (item/tag/domain names), so
+      // their concrete values cannot be enumerated in the catalogue (§ the
+      // "separate advanced control" of PLAN-authorization).
+      if (cap !== '*' && !cap.endsWith(':*') && !CAPABILITIES.includes(cap as any) && !cap.startsWith('merge-into:') && !cap.startsWith('use-credential:'))
         throw new Error(`unknown capability ${cap}`);
     }
     const { scopeKey: _claimedScope, ...clean } = profile;

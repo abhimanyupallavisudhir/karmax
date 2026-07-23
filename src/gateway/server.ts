@@ -112,6 +112,14 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return 'credential:write';
   }
   if (p.startsWith('/api/credentials')) return read ? 'credential:read' : 'credential:write';
+  // Vault items (PLAN-passwords.md): admin CRUD is credential:write; agent
+  // write-back is the narrower vault:store; use/reveal/fill/request attempts
+  // need only credential:read — the per-item grant + policy check happens in
+  // the handler against the caller's own capability set.
+  if (p === '/api/vault/store') return 'vault:store';
+  if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:write';
+  if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : 'credential:write';
+  if (p.startsWith('/api/vault')) return 'credential:read';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return 'safe-mode:write';
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -1740,7 +1748,8 @@ export class Gateway {
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
-        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? '')));
+        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
+          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined));
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {
@@ -2266,6 +2275,143 @@ export class Gateway {
         const prov = this.deps.paymentRegistry?.get(b.provider) ?? this.deps.payments;
         if (!prov) return this.json(res, 400, { error: 'no payment provider configured' });
         return this.json(res, 200, await prov.connect());
+      }
+
+      // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
+      if (p.startsWith('/api/vault')) {
+        const { VaultItems, ITEM_FIELDS } = await import('../autonomy/vault-items.js');
+        const vault = new VaultItems(store, this.deps.broker);
+        const caps = authRecord?.caps ?? [];
+        // A human session's token is task-unscoped; per-task passes/extensions
+        // only ever apply to real task-agent bearers.
+        const callerTaskId = authRecord?.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
+        const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+        const defaultField = (type: string): any =>
+          ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', note: 'note' })[type];
+        const findItem = (b: any) => (b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined);
+
+        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, vault.list());
+        if (p === '/api/vault/items' && method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, vault.save({
+            id: b.id ? String(b.id) : undefined,
+            type: b.type,
+            label: String(b.label ?? ''),
+            domains: Array.isArray(b.domains) ? b.domains.map(String) : typeof b.domains === 'string' ? b.domains.split(/[,\s]+/).filter(Boolean) : undefined,
+            username: b.username ? String(b.username) : undefined,
+            tags: Array.isArray(b.tags) ? b.tags.map(String) : typeof b.tags === 'string' ? b.tags.split(/[,\s]+/).filter(Boolean) : undefined,
+            envVar: b.envVar ? String(b.envVar) : undefined,
+            policy: b.policy,
+            secrets: b.secrets,
+            provenance: { source: 'manual' },
+          }));
+        }
+        const viDel = p.match(/^\/api\/vault\/items\/([^/]+)$/);
+        if (viDel && method === 'DELETE') {
+          vault.delete(viDel[1]!);
+          return this.json(res, 200, { deleted: true });
+        }
+        // Agent write-back (§7 store_credential): create freely; update only
+        // items this same task created — an agent must not overwrite the
+        // user's existing credentials through the narrow vault:store power.
+        if (p === '/api/vault/store' && method === 'POST') {
+          const b = await this.body(req);
+          if (!callerTaskId && !allows(caps, 'credential:write')) return this.json(res, 400, { error: 'a task-agent token is required' });
+          if (b.id) {
+            const prior = vault.get(String(b.id));
+            if (!prior) return this.json(res, 404, { error: `no vault item ${b.id}` });
+            if (callerTaskId && prior.provenance.taskId !== callerTaskId && !allows(caps, 'credential:write'))
+              return this.json(res, 403, { error: 'vault:store may only update items this task created' });
+          }
+          const saved = vault.save({
+            id: b.id ? String(b.id) : undefined,
+            type: b.type,
+            label: String(b.label ?? ''),
+            domains: Array.isArray(b.domains) ? b.domains.map(String) : undefined,
+            username: b.username ? String(b.username) : undefined,
+            tags: Array.isArray(b.tags) ? b.tags.map(String) : undefined,
+            envVar: b.envVar ? String(b.envVar) : undefined,
+            policy: b.policy,
+            secrets: b.secrets,
+            provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
+          });
+          return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields });
+        }
+        // Plaintext reveal (§5C) — per-item grant + reveal policy, audited.
+        if (p === '/api/vault/resolve' && method === 'POST') {
+          const b = await this.body(req);
+          const item = findItem(b);
+          if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const decision = vault.access(caps, callerTaskId, item, 'reveal', { consume: true });
+          if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+          const field = (b.field as any) ?? defaultField(item.type);
+          if (!ITEM_FIELDS[item.type].includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
+          const value = field === 'totp'
+            ? vault.totp(item, { taskId: callerTaskId, principal })
+            : vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' });
+          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value });
+        }
+        // Zero-exposure browser fill (§5B) — the secret goes gateway → CDP,
+        // never through the agent. `username` fills metadata; `totp` fills the
+        // current code computed broker-side from the stored seed.
+        if (p === '/api/vault/fill' && method === 'POST') {
+          const b = await this.body(req);
+          const item = findItem(b);
+          if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const decision = vault.access(caps, callerTaskId, item, 'use', { consume: true });
+          if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+          const field = String(b.field ?? 'password');
+          const text = field === 'username'
+            ? item.username
+            : field === 'totp'
+              ? vault.totp(item, { taskId: callerTaskId, principal })
+              : vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' });
+          if (!text) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
+          try {
+            const { fillViaCdp } = await import('../autonomy/fill.js');
+            const filled = await fillViaCdp({
+              cdpUrl: String(b.cdpUrl ?? 'http://127.0.0.1:9222'),
+              selector: String(b.selector ?? ''),
+              text,
+              expectDomains: item.domains,
+            });
+            return this.json(res, 200, { status: 'granted', itemId: item.id, filled: true, origin: filled.origin });
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        if (p === '/api/vault/requests' && method === 'GET') {
+          return this.json(res, 200, vault.requests({
+            taskId: url.searchParams.get('taskId') ?? undefined,
+            status: (url.searchParams.get('status') as any) ?? undefined,
+          }));
+        }
+        // The pull model (§7): an agent escalates for an item it lacks.
+        if (p === '/api/vault/requests' && method === 'POST') {
+          const b = await this.body(req);
+          if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
+          return this.json(res, 200, vault.request({
+            taskId: callerTaskId,
+            projectId: authRecord?.projectId,
+            caps,
+            itemId: b.itemId ? String(b.itemId) : undefined,
+            domain: b.domain ? String(b.domain) : undefined,
+            field: b.field,
+            mode: b.mode,
+            why: b.why ? String(b.why) : undefined,
+          }));
+        }
+        const vres = p.match(/^\/api\/vault\/requests\/([^/]+)\/resolve$/);
+        if (vres && method === 'POST') {
+          const b = await this.body(req);
+          const action = String(b.action ?? '');
+          if (!['once', 'task', 'always', 'deny'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny' });
+          try {
+            return this.json(res, 200, vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined }));
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
       }
 
       // cards (payment resources; SPEC §7.6). Provision/list/fund.
