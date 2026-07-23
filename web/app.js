@@ -8016,7 +8016,10 @@ function moveCursor(delta) {
   rows[i].focus?.(); // rows carry tabindex=0, so the cursor and Tab order agree
 }
 function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId); }
-function openCursorRow() { cursorRow()?.click(); }
+// A data-id row navigates through its .row-link `<a>` overlay (the delegated
+// link router only fires for anchors), so click that; draft rows carry their
+// own click handler on the div, so fall back to the row itself.
+function openCursorRow() { const r = cursorRow(); if (r) (r.querySelector('a.row-link') || r).click(); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows.
 function taskOrder() {
