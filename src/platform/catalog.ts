@@ -4,6 +4,9 @@ export const PLATFORM_API_CATALOG = {
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
     'GET|POST /api/projects/:projectId/workflow-pins',
+    'GET|POST /api/projects/:projectId/objects (data objects: POST {path, mode: seed|readonly|writeback, text|dataBase64} upserts a mount; DELETE ?path=)',
+    'GET /api/projects/:projectId/objects/data?path= (download the current version)',
+    'POST /api/tasks/:taskId/objects/promote (body {path}: promote the task world\'s modified copy to the new current version)',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',

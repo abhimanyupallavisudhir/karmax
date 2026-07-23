@@ -19,7 +19,9 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { ProjectSecrets } from '../autonomy/project-secrets.js';
+import { ProjectObjects } from '../store/project-objects.js';
 import { materializeFileSecrets } from '../world/secrets.js';
+import { materializeObjectMounts } from '../world/mounts.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
@@ -172,6 +174,7 @@ export interface CoreActivityDeps {
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
+  objects?: import('../store/objects.js').ObjectStore;
   runners?: import('../world/runners.js').RunnerPoolService;
   payments?: PaymentProvider;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
@@ -475,6 +478,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           } catch (e) {
             record(args.taskId, 'world.warning', { warning: `project secrets: ${e instanceof Error ? e.message : e}` });
+          }
+        }
+        // Materialize declared data-object mounts (PLAN-state §3.2). The handle
+        // records path/version/mode so the checkpoint can capture task-local
+        // drift even for gitignored paths. Same failure posture as secrets.
+        if (projectId && deps.objects) {
+          try {
+            const mounts = await new ProjectObjects(store, deps.objects).resolved(projectId);
+            if (mounts.length) {
+              const manifest = await materializeObjectMounts(world, mounts);
+              world.handle.meta = { ...world.handle.meta, objectMounts: manifest };
+            }
+          } catch (e) {
+            record(args.taskId, 'world.warning', { warning: `project objects: ${e instanceof Error ? e.message : e}` });
           }
         }
         if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };

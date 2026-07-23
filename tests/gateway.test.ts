@@ -129,6 +129,30 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(after.secrets.map((s: any) => s.name)).toEqual(['STRIPE_KEY']);
   });
 
+  it('manages project data objects and promotes a task copy to a new version', async () => {
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Datary' }) })).json();
+    const created: any = await (await fetch(`${base}/api/projects/${project.id}/objects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ path: 'fixtures/dev.sql', mode: 'writeback', text: 'seed-v1' }) })).json();
+    expect(created.object.object).toMatch(/^[a-f0-9]{64}$/);
+    const listed: any = await (await fetch(`${base}/api/projects/${project.id}/objects`, { headers: auth() })).json();
+    expect(listed.objects).toEqual([expect.objectContaining({ path: 'fixtures/dev.sql', mode: 'writeback', bytes: 7 })]);
+    const downloaded = await fetch(`${base}/api/projects/${project.id}/objects/data?path=${encodeURIComponent('fixtures/dev.sql')}`, { headers: auth() });
+    expect(await downloaded.text()).toBe('seed-v1');
+
+    // A task world modifies its copy; promotion makes that the current version.
+    const task = h.store.createTask({ projectId: project.id, title: 'Data task', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'x', draft: true } });
+    const world = await h.worlds.create('memory', { taskId: task.id, base: 'main' });
+    await world.writeFile('fixtures/dev.sql', 'task-improved');
+    h.store.registerWorld(world.handle, project.id);
+    const promoted: any = await (await fetch(`${base}/api/tasks/${task.id}/objects/promote`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ path: 'fixtures/dev.sql' }) })).json();
+    expect(promoted.object.history.length).toBe(1);
+    const afterText = await (await fetch(`${base}/api/projects/${project.id}/objects/data?path=${encodeURIComponent('fixtures/dev.sql')}`, { headers: auth() })).text();
+    expect(afterText).toBe('task-improved');
+  });
+
   it('suggests secret names from the repo’s .env.example', async () => {
     const os = await import('node:os');
     const dir = fs.mkdtempSync(`${os.tmpdir()}/karmax-envex-`);

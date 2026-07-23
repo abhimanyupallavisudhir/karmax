@@ -9,6 +9,8 @@ import type { World, WorldHandle, WorldKind, WorldRepo } from './types.js';
 import { worldRepos, worldRepoSource } from './types.js';
 import { materializeFileSecrets, secretFileManifest } from './secrets.js';
 import { ProjectSecrets } from '../autonomy/project-secrets.js';
+import { ProjectObjects } from '../store/project-objects.js';
+import { enclosingRepo, materializeObjectMounts, objectMountManifest } from './mounts.js';
 import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
 
@@ -43,13 +45,16 @@ export class WorldCheckpointService {
     // exclude write failed. The literal `.env`/`.karmax-injection/` names cover
     // pre-manifest worlds (copyGlobs-era .env copies).
     const secretFiles = secretFileManifest(handle.meta);
+    // Readonly mounts are immutable by contract — capturing them would only
+    // bloat the delta and collide with their 444 copies at restore.
+    const readonlyMounts = new Set(objectMountManifest(handle.meta).filter((m) => m.mode === 'readonly').map((m) => m.path));
     for (const repo of worldRepos(world.handle)) {
       const status = await world.exec('git', ['status', '--porcelain=v1', '-z'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
         if (change.path === '.env' || change.path.startsWith('.karmax-injection/')) continue;
         const relative = worldRepos(world.handle).length > 1 ? `${repo.name}/${change.path}` : change.path;
-        if (secretFiles.has(relative)) continue;
+        if (secretFiles.has(relative) || readonlyMounts.has(relative)) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
         else {
           const data = await world.readFileBuffer(relative);
@@ -62,6 +67,23 @@ export class WorldCheckpointService {
       repos.push({ repositoryId: repository?.id ?? `local:${sha256(Buffer.from(source)).slice(0, 24)}`,
         checkoutPath: worldRepos(world.handle).length > 1 ? repo.name : '.', baseSha: repo.baseSha ?? handle.base,
         branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined });
+    }
+    // Data-object mounts (PLAN-state §3.2): task-local drift rides the delta
+    // even when the path is gitignored (git status cannot see it). `readonly`
+    // mounts never drift by contract; a sha match costs one hash.
+    for (const mount of objectMountManifest(handle.meta)) {
+      if (mount.mode === 'readonly') continue;
+      const enclosing = enclosingRepo(world.handle, mount.path);
+      if (!enclosing) continue;
+      const already = files.some((f) => f.repo === enclosing.repo.name && f.path === enclosing.inRepo);
+      if (already) continue;
+      try {
+        const data = await world.readFileBuffer(mount.path);
+        if (sha256(data) === mount.object) continue;
+        files.push({ repo: enclosing.repo.name, path: enclosing.inRepo, data: data.toString('base64') });
+      } catch {
+        files.push({ repo: enclosing.repo.name, path: enclosing.inRepo, deleted: true });
+      }
     }
     const delta: PortableDelta = { version: 1, files };
     const compressed = await gzip(Buffer.from(JSON.stringify(delta)));
@@ -110,13 +132,27 @@ export class WorldCheckpointService {
       branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
       ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
       network: executionConfig.network, environment: executionConfig.environment, resources: executionConfig.resources });
+    // Object mounts materialize first (current project versions), then the
+    // delta applies on top — the task's own modified copies win.
+    let mountManifest: Array<{ path: string; object: string; mode: 'seed' | 'readonly' | 'writeback' }> = [];
+    try {
+      mountManifest = await materializeObjectMounts(world,
+        await new ProjectObjects(this.store, this.objects).resolved(checkpoint.projectId));
+    } catch { /* world remains usable without them */ }
     for (const file of delta.files) {
       const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
       if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
       else {
         const content = Buffer.from(file.data ?? '', 'base64');
-        if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
-        else await world.writeFile(relative, content.toString('utf8'));
+        const write = () => world.writeFileBuffer ? world.writeFileBuffer(relative, content) : world.writeFile(relative, content.toString('utf8'));
+        try {
+          await write();
+        } catch {
+          // A read-only target (e.g. a mount materialized moments ago): make it
+          // writable and retry — the delta is the task's authoritative state.
+          await world.exec('chmod', ['u+w', relative]).catch(() => undefined);
+          await write();
+        }
       }
     }
     // Re-materialize file-shaped project secrets: they are excluded from the
@@ -129,6 +165,7 @@ export class WorldCheckpointService {
         new ProjectSecrets(this.store, this.broker).files(checkpoint.projectId, { taskId: checkpoint.worldId }));
       if (manifest.length) world.handle.meta = { ...world.handle.meta, secretFiles: manifest };
     } catch { /* world remains usable without them */ }
+    if (mountManifest.length) world.handle.meta = { ...world.handle.meta, objectMounts: mountManifest };
     let registered: WorldHandle;
     try {
       registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,

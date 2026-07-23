@@ -229,5 +229,15 @@ the declaration.
 3. **Project objects.** Local content-addressed store, `seed`/`readonly`
    mounts, checkpoint-delta capture, Review-gated `writeback` promotion; hosted
    backend is an S3 bucket behind the same interface.
+   *Shipped:* `src/store/project-objects.ts` (mount registry in kv, blobs at
+   `objects/<projectId>/<sha256>` in the existing ObjectStore — S3 hosted comes
+   free), `src/world/mounts.ts` materialization (readonly ⇒ chmod 444) +
+   `meta.objectMounts` manifest, createWorld wiring, checkpoint captures
+   sha-drift of gitignored mounts (and skips readonly mounts, whose 444 copies
+   would otherwise collide at restore — restore also chmod-retries read-only
+   delta targets), restore re-materializes mounts before applying the delta,
+   `/api/projects/:id/objects` (+`/data` download) and
+   `/api/tasks/:id/objects/promote` (task:review:execute, emits
+   `object.promoted`), Settings → Data card with file upload and mode select.
 4. **Services.** Compose/devcontainer import into the Environment
    (depends on PLAN-cloud.md environment builds), seed objects wired in.

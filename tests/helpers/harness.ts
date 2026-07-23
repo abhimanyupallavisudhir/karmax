@@ -19,6 +19,7 @@ import { ContributionRegistry } from '../../src/contrib/registry.js';
 import { Overlays } from '../../src/store/overlays.js';
 import { Gateway } from '../../src/gateway/server.js';
 import { CredentialBroker } from '../../src/autonomy/broker.js';
+import { LocalObjectStore } from '../../src/store/objects.js';
 import { Vault } from '../../src/autonomy/vault.js';
 import { MockPaymentProvider, StripeIssuingProvider, PaymentRegistry } from '../../src/autonomy/payments.js';
 import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
@@ -122,6 +123,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
         staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-static-')),
         agentInfo: { provider: 'mock', reason: 'test' },
         broker: new CredentialBroker(new Vault(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-')))),
+        objects: new LocalObjectStore(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-objects-'))),
         payments,
         paymentRegistry,
         configHomes,

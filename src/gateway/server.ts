@@ -127,6 +127,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/secrets(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/objects(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/tasks\/[^/]+\/objects\/promote$/.test(p)) return 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
@@ -1955,6 +1957,38 @@ export class Gateway {
           return this.json(res, 200, artifact);
         } finally { await access?.release(); }
       }
+      // Promote a task world's modified copy of a declared object mount to the
+      // project's new current version (PLAN-state §3.2) — the data analogue of
+      // merging a branch, gated at Review like code.
+      const objectPromote = p.match(/^\/api\/tasks\/([^/]+)\/objects\/promote$/);
+      if (objectPromote && method === 'POST') {
+        if (!this.deps.objects) return this.json(res, 503, { error: 'object storage is not configured' });
+        const taskId = objectPromote[1]!;
+        const task = store.getTask(taskId);
+        const project = task ? store.getProject(task.projectId) : undefined;
+        const b = await this.body(req);
+        const relPath = String(b.path ?? '');
+        if (!task || !project || !relPath) return this.json(res, 400, { error: 'task and object path are required' });
+        const handle = (store.currentWorld(taskId)
+          ?? worldHandleForView(task.lastView, taskId, store.effectiveProjectConfig(project))) as import('../world/types.js').WorldHandle | undefined;
+        if (!handle) return this.json(res, 404, { error: 'no world for this task' });
+        let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
+        try {
+          access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+          const world = access?.world ?? await this.deps.worlds.open(handle);
+          const data = await world.readFileBuffer(relPath);
+          if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'object exceeds 100 MiB' });
+          const { ProjectObjects } = await import('../store/project-objects.js');
+          const mount = await new ProjectObjects(store, this.deps.objects).promote(project.id, relPath, data);
+          const ev = { type: 'object.promoted', taskId, ts: Date.now(),
+            payload: { path: mount.path, object: mount.object, bytes: mount.bytes } };
+          const seq = store.appendEvent(ev);
+          this.deps.bus?.emit({ ...ev, seq });
+          return this.json(res, 200, { object: mount });
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        } finally { await access?.release(); }
+      }
       const promotedArtifact = p.match(/^\/api\/artifacts\/([^/]+)$/);
       if (promotedArtifact) {
         const artifact = store.getPromotedArtifact(promotedArtifact[1]!);
@@ -2429,6 +2463,51 @@ export class Gateway {
           }
           if (method === 'DELETE' && name) {
             secrets.delete(project.id, name);
+            return this.json(res, 200, { ok: true });
+          }
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
+      // Project data objects (PLAN-state.md §3.2): content-addressed values —
+      // fixtures, dev-db seeds, weights — with declared mounts materialized
+      // into every world. Values are versioned (history chain), not merged.
+      const projectObjectsMatch = p.match(/^\/api\/projects\/([^/]+)\/objects(?:\/(data))?$/);
+      if (projectObjectsMatch && ['GET', 'POST', 'DELETE'].includes(method)) {
+        const project = store.getProject(projectObjectsMatch[1]!);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        if (!this.deps.objects) return this.json(res, 503, { error: 'object storage is not configured' });
+        const { ProjectObjects } = await import('../store/project-objects.js');
+        const objects = new ProjectObjects(store, this.deps.objects);
+        try {
+          if (method === 'GET' && projectObjectsMatch[2] === 'data') {
+            const mountPath = url.searchParams.get('path') ?? '';
+            const mount = objects.get(project.id, mountPath);
+            if (!mount) return this.json(res, 404, { error: 'no object mount at that path' });
+            const data = await objects.data(project.id, mount.object);
+            res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(data.length),
+              'content-disposition': `attachment; filename="${path.basename(mount.path).replace(/["\\\r\n]/g, '_')}"`,
+              'cache-control': 'private, no-store' });
+            return void res.end(data);
+          }
+          if (method === 'GET' && !projectObjectsMatch[2]) return this.json(res, 200, { objects: objects.list(project.id) });
+          if (method === 'POST' && !projectObjectsMatch[2]) {
+            const b = await this.body(req);
+            if (!b.path) return this.json(res, 400, { error: 'path required' });
+            const data = b.dataBase64 != null ? Buffer.from(String(b.dataBase64), 'base64')
+              : b.text != null ? Buffer.from(String(b.text), 'utf8') : undefined;
+            if (!data) return this.json(res, 400, { error: 'dataBase64 or text required' });
+            if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'object exceeds 100 MiB' });
+            const mode = b.mode != null ? String(b.mode) : undefined;
+            if (mode && !['seed', 'readonly', 'writeback'].includes(mode)) return this.json(res, 400, { error: 'mode must be seed, readonly, or writeback' });
+            return this.json(res, 200, { object: await objects.put(project.id, { path: String(b.path),
+              ...(mode ? { mode: mode as 'seed' | 'readonly' | 'writeback' } : {}), data }) });
+          }
+          if (method === 'DELETE' && !projectObjectsMatch[2]) {
+            const mountPath = url.searchParams.get('path') ?? '';
+            if (!mountPath) return this.json(res, 400, { error: 'path required' });
+            objects.remove(project.id, mountPath);
             return this.json(res, 200, { ok: true });
           }
         } catch (e) {

@@ -439,6 +439,24 @@ export interface ProjectSecret {
   mode?: number;
 }
 
+/**
+ * One declared data-object placement (PLAN-state.md §3.2): a content-addressed
+ * value from the project object store, materialized into each world at a path.
+ * `object` is the sha256 of the current version; replacing/promoting pushes the
+ * prior version onto `history`, so promotion is auditable and reversible.
+ * Modes: `seed` — fresh per world, task-local changes ride the checkpoint delta
+ * and die unless promoted; `readonly` — shared immutable data (weights, media);
+ * `writeback` — like seed, and eligible for promotion to a new version.
+ */
+export interface ProjectObjectMount {
+  path: string;
+  object: string;
+  mode: 'seed' | 'readonly' | 'writeback';
+  bytes: number;
+  updatedAt: number;
+  history?: Array<{ object: string; bytes: number; replacedAt: number }>;
+}
+
 export interface TaskList {
   id: string;
   projectId: string;

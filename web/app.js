@@ -6485,11 +6485,13 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-data">Data</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
     <div class="settings-section-title" id="project-secrets"><div>Secrets<small>Values this project's own code reads (DATABASE_URL, API keys) — vault-stored, injected into task worlds, never committed</small></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
+    <div class="settings-section-title" id="project-data"><div>Data<small>Versioned data objects — fixtures, dev-db seeds, model weights — materialized into every task world</small></div></div>
+    <div class="card"><div id="project-objects-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
@@ -6569,6 +6571,33 @@ async function hydrateProjectSecrets(proj) {
         const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ env: $('#project-secret-env').value }) });
         toast(`Imported ${result.imported.length} ${result.imported.length === 1 ? 'secret' : 'secrets'}`);
         await hydrateProjectSecrets(proj);
+      } catch (error) { toast(error.message, true); }
+    });
+  } catch (error) { box.textContent = error.message; }
+}
+async function hydrateProjectObjects(proj) {
+  const box = $('#project-objects-box'); if (!box) return;
+  const fmtBytes = (n) => n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MiB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KiB` : `${n} B`;
+  try {
+    const { objects } = await api(`/api/projects/${encodeURIComponent(proj.id)}/objects`);
+    box.innerHTML = `
+      ${objects.map((o) => `<div class="queue-item"><div style="flex:1"><b>${esc(o.path)}</b> <span class="chip">${esc(o.mode)}</span> <span class="chip">${fmtBytes(o.bytes)}</span> <span class="chip" title="${esc(o.object)}">${esc(o.object.slice(0, 8))}${o.history?.length ? ` · v${o.history.length + 1}` : ''}</span></div><a class="btn sm" href="/api/projects/${encodeURIComponent(proj.id)}/objects/data?path=${encodeURIComponent(o.path)}" download>Download</a><button class="btn sm project-object-delete" data-path="${esc(o.path)}">Remove</button></div>`).join('')
+        || '<p class="task-sub">No data objects yet. Declare files too big or too binary for git — fixtures, dev-db seeds, model weights. Each task world gets a fresh copy; changed copies can be promoted to a new version at Review.</p>'}
+      <div class="inline-form" style="margin-top:8px"><input type="file" id="project-object-file" style="flex:1;min-width:160px"><input id="project-object-path" placeholder="path in world (defaults to file name)" style="max-width:230px"><select id="project-object-mode"><option value="seed">seed — fresh per world</option><option value="readonly">readonly — shared immutable</option><option value="writeback">writeback — promotable</option></select><button class="btn sm primary" id="project-object-save">Add object</button></div>`;
+    box.querySelectorAll('.project-object-delete').forEach((button) => button.addEventListener('click', async () => {
+      if (!confirm(`Remove the object mount at ${button.dataset.path}? Stored versions are kept for history.`)) return;
+      try { await api(`/api/projects/${proj.id}/objects?path=${encodeURIComponent(button.dataset.path)}`, { method: 'DELETE' }); await hydrateProjectObjects(proj); }
+      catch (error) { toast(error.message, true); }
+    }));
+    $('#project-object-save')?.addEventListener('click', async () => {
+      const file = $('#project-object-file').files[0];
+      if (!file) return toast('Choose a file first', true);
+      const mountPath = $('#project-object-path').value.trim() || file.name;
+      try {
+        const dataUrl = await new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = () => reject(new Error('could not read file')); r.readAsDataURL(file); });
+        await api(`/api/projects/${proj.id}/objects`, { method: 'POST', body: JSON.stringify({ path: mountPath, mode: $('#project-object-mode').value, dataBase64: String(dataUrl).split(',')[1] || '' }) });
+        toast(`Added ${mountPath}`);
+        await hydrateProjectObjects(proj);
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { box.textContent = error.message; }
@@ -6662,6 +6691,7 @@ function wireSettingsView(proj) {
   hydrateExecutionProviders(proj);
   hydrateProjectGitProfile(proj);
   hydrateProjectSecrets(proj);
+  hydrateProjectObjects(proj);
   hydrateSettingsForms('project', proj.id);
   hydrateQuickSettingsForms('project', proj.id);
   wireQuickSettingsSave('project', proj.id);
