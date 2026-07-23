@@ -357,7 +357,7 @@ export class Store {
   }
 
   /** One row per logical task: only the current principal appears in list/search. */
-  listPrincipalTasks(projectId: string): TaskRecord[] {
+  listTasks(projectId: string): TaskRecord[] {
     const rows = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       JOIN task_intents i ON i.principalAttemptId=t.id JOIN tasks root ON root.id=i.id
       WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId) as any[];
@@ -424,7 +424,8 @@ export class Store {
     return r ? this.getTask(r.id) : undefined;
   }
 
-  listTasks(projectId: string): TaskRecord[] {
+  /** Every attempt execution. Internal lifecycle work must opt into this explicitly. */
+  listTaskAttempts(projectId: string): TaskRecord[] {
     const tasks = (
       this.db
         .prepare('SELECT * FROM tasks WHERE projectId = ? ORDER BY ord, createdAt')
