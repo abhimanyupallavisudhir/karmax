@@ -153,6 +153,31 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(afterText).toBe('task-improved');
   });
 
+  it('manages project services and imports proposals from docker-compose', async () => {
+    const os = await import('node:os');
+    const dir = fs.mkdtempSync(`${os.tmpdir()}/karmax-compose-`);
+    fs.writeFileSync(`${dir}/docker-compose.yml`, 'services:\n  db:\n    image: postgres:16\n    ports: ["5432:5432"]\n');
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Serviceful' }) })).json();
+    h.store.updateProjectConfig(project.id, { repos: [dir] } as any);
+    const imported: any = await (await fetch(`${base}/api/projects/${project.id}/services/compose-import`, { headers: auth() })).json();
+    expect(imported.proposals).toEqual([expect.objectContaining({ name: 'db', kind: 'per-world', image: 'postgres:16',
+      containerPort: 5432, urlEnv: 'DATABASE_URL' })]);
+    const saved = await fetch(`${base}/api/projects/${project.id}/services`, { method: 'POST', headers: auth(),
+      body: JSON.stringify(imported.proposals[0]) });
+    expect(saved.status).toBe(200);
+    // Once accepted, the proposal disappears (already declared).
+    const again: any = await (await fetch(`${base}/api/projects/${project.id}/services/compose-import`, { headers: auth() })).json();
+    expect(again.proposals).toEqual([]);
+    const rejected = await fetch(`${base}/api/projects/${project.id}/services`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'shared', kind: 'external' }) });
+    expect(rejected.status).toBe(400); // external needs a connection Secret
+    const removed = await fetch(`${base}/api/projects/${project.id}/services?name=db`, { method: 'DELETE', headers: auth() });
+    expect(removed.status).toBe(200);
+    const after: any = await (await fetch(`${base}/api/projects/${project.id}/services`, { headers: auth() })).json();
+    expect(after.services).toEqual([]);
+  });
+
   it('suggests secret names from the repo’s .env.example', async () => {
     const os = await import('node:os');
     const dir = fs.mkdtempSync(`${os.tmpdir()}/karmax-envex-`);

@@ -6485,13 +6485,15 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-data">Data</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-data">Data</a><a href="#project-services">Services</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
     <div class="settings-section-title" id="project-secrets"><div>Secrets<small>Values this project's own code reads (DATABASE_URL, API keys) — vault-stored, injected into task worlds, never committed</small></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
     <div class="settings-section-title" id="project-data"><div>Data<small>Versioned data objects — fixtures, dev-db seeds, model weights — materialized into every task world</small></div></div>
     <div class="card"><div id="project-objects-box">Loading…</div></div>
+    <div class="settings-section-title" id="project-services"><div>Services<small>What this project's code connects to — a shared instance via a Secret, or a private per-world container</small></div></div>
+    <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
@@ -6602,6 +6604,49 @@ async function hydrateProjectObjects(proj) {
     });
   } catch (error) { box.textContent = error.message; }
 }
+async function hydrateProjectServices(proj) {
+  const box = $('#project-services-box'); if (!box) return;
+  try {
+    const { services } = await api(`/api/projects/${encodeURIComponent(proj.id)}/services`);
+    box.innerHTML = `
+      ${services.map((s) => `<div class="queue-item"><div style="flex:1"><b>${esc(s.name)}</b> <span class="chip">${esc(s.kind)}</span> ${s.kind === 'external' ? `<span class="chip">secret · ${esc(s.connectionSecret || '')}</span>` : `<span class="chip">${esc(s.image || '')}</span>${s.urlEnv ? ` <span class="chip">${esc(s.urlEnv)}</span>` : ''}${s.seedObject ? ` <span class="chip">seed · ${esc(s.seedObject)}</span>` : ''}`}</div><button class="btn sm project-service-delete" data-name="${esc(s.name)}">Remove</button></div>`).join('')
+        || '<p class="task-sub">No services yet. A shared database is just a connection-string Secret; a per-world service gives every task world its own fresh container, seeded from a Data object.</p>'}
+      <div class="inline-form" style="margin-top:8px"><button class="btn sm" id="project-service-import">Import from docker-compose</button></div>
+      <div id="project-service-proposals"></div>
+      <details class="settings-disclosure compact"><summary><b>Add a service by hand</b></summary>
+        <div class="inline-form"><input id="project-service-name" placeholder="name (e.g. postgres)" style="max-width:150px"><select id="project-service-kind"><option value="per-world">per-world container</option><option value="external">external (via Secret)</option></select><input id="project-service-image" placeholder="image (per-world)" style="max-width:160px"><input id="project-service-port" placeholder="port" style="max-width:70px"><input id="project-service-urlenv" placeholder="urlEnv (e.g. DATABASE_URL)" style="max-width:180px"><input id="project-service-template" placeholder="url template with {host}:{port}" style="flex:1;min-width:170px"><input id="project-service-secret" placeholder="connection Secret name (external)" style="max-width:210px"><button class="btn sm primary" id="project-service-save">Save service</button></div>
+      </details>`;
+    box.querySelectorAll('.project-service-delete').forEach((button) => button.addEventListener('click', async () => {
+      if (!confirm(`Remove service ${button.dataset.name}?`)) return;
+      try { await api(`/api/projects/${proj.id}/services?name=${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' }); await hydrateProjectServices(proj); }
+      catch (error) { toast(error.message, true); }
+    }));
+    $('#project-service-import')?.addEventListener('click', async () => {
+      try {
+        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`);
+        const target = $('#project-service-proposals');
+        if (!proposals.length) { target.innerHTML = '<p class="task-sub">No importable services found in this repo’s docker-compose file.</p>'; return; }
+        target.innerHTML = proposals.map((s, i) => `<div class="queue-item"><div style="flex:1"><b>${esc(s.name)}</b> <span class="chip">${esc(s.image)}</span>${s.urlEnv ? ` <span class="chip">${esc(s.urlEnv)}</span>` : ''}</div><button class="btn sm primary project-service-accept" data-index="${i}">Add</button></div>`).join('');
+        target.querySelectorAll('.project-service-accept').forEach((button) => button.addEventListener('click', async () => {
+          try { await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify(proposals[Number(button.dataset.index)]) }); toast('Service added'); await hydrateProjectServices(proj); }
+          catch (error) { toast(error.message, true); }
+        }));
+      } catch (error) { toast(error.message, true); }
+    });
+    $('#project-service-save')?.addEventListener('click', async () => {
+      const kind = $('#project-service-kind').value;
+      const body = { name: $('#project-service-name').value.trim(), kind,
+        ...(kind === 'external' ? { connectionSecret: $('#project-service-secret').value.trim() } : {
+          image: $('#project-service-image').value.trim(),
+          containerPort: Number($('#project-service-port').value) || undefined,
+          urlEnv: $('#project-service-urlenv').value.trim() || undefined,
+          urlTemplate: $('#project-service-template').value.trim() || undefined,
+        }) };
+      try { await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify(body) }); toast(`Saved ${body.name}`); await hydrateProjectServices(proj); }
+      catch (error) { toast(error.message, true); }
+    });
+  } catch (error) { box.textContent = error.message; }
+}
 async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
@@ -6692,6 +6737,7 @@ function wireSettingsView(proj) {
   hydrateProjectGitProfile(proj);
   hydrateProjectSecrets(proj);
   hydrateProjectObjects(proj);
+  hydrateProjectServices(proj);
   hydrateSettingsForms('project', proj.id);
   hydrateQuickSettingsForms('project', proj.id);
   wireQuickSettingsSave('project', proj.id);

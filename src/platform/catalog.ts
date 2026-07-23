@@ -6,6 +6,8 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/projects/:projectId/workflow-pins',
     'GET|POST /api/projects/:projectId/objects (data objects: POST {path, mode: seed|readonly|writeback, text|dataBase64} upserts a mount; DELETE ?path=)',
     'GET /api/projects/:projectId/objects/data?path= (download the current version)',
+    'GET|POST|DELETE /api/projects/:projectId/services (external → {name, kind: external, connectionSecret}; per-world → {name, kind: per-world, image, containerPort, urlEnv, urlTemplate, seedObject?}; DELETE ?name=)',
+    'GET /api/projects/:projectId/services/compose-import (proposals parsed from the repo\'s docker-compose file)',
     'POST /api/tasks/:taskId/objects/promote (body {path}: promote the task world\'s modified copy to the new current version)',
   ],
   tasks: [

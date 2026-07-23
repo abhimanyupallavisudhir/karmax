@@ -20,8 +20,10 @@ import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { ProjectSecrets } from '../autonomy/project-secrets.js';
 import { ProjectObjects } from '../store/project-objects.js';
+import { ProjectServices } from '../store/project-services.js';
 import { materializeFileSecrets } from '../world/secrets.js';
 import { materializeObjectMounts } from '../world/mounts.js';
+import { destroyWorldServices, launchWorldServices, serviceEnvManifest } from '../world/services.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
@@ -325,9 +327,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : undefined;
     if (!projectId) return {};
     try {
-      return projectSecrets.env(projectId, { taskId });
+      // Per-world service connection env first (throwaway values recorded on
+      // the handle), then vault-resolved secrets — secrets win on a name clash.
+      return { ...serviceEnvManifest(handle.meta), ...projectSecrets.env(projectId, { taskId }) };
     } catch {
-      return {};
+      return serviceEnvManifest(handle.meta);
     }
   }
 
@@ -492,6 +496,39 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           } catch (e) {
             record(args.taskId, 'world.warning', { warning: `project objects: ${e instanceof Error ? e.message : e}` });
+          }
+        }
+        // Launch per-world service instances (PLAN-state §3.3): a private
+        // container per declared service, seeded from the object store, its
+        // connection env recorded on the handle (per-world throwaway values,
+        // not secrets). Host-Docker services are reachable on 127.0.0.1 only
+        // from host-side worlds — other backends surface a warning instead.
+        if (projectId) {
+          try {
+            const services = new ProjectServices(store).list(projectId);
+            const perWorld = services.filter((s) => s.kind === 'per-world');
+            if (perWorld.length && args.kind !== 'worktree') {
+              record(args.taskId, 'world.warning', { warning: `per-world services (${perWorld.map((s) => s.name).join(', ')}) are launched for worktree worlds only — declare them external (a connection Secret) for ${args.kind} worlds` });
+            } else if (perWorld.length) {
+              const seeds = new Map<string, Buffer>();
+              if (deps.objects) {
+                const projectObjects = new ProjectObjects(store, deps.objects);
+                for (const service of perWorld) {
+                  if (!service.seedObject) continue;
+                  const mount = projectObjects.get(projectId, service.seedObject);
+                  if (mount) seeds.set(service.seedObject, await projectObjects.data(projectId, mount.object));
+                }
+              }
+              const launched = await launchWorldServices(args.taskId, perWorld, seeds);
+              for (const warning of launched.warnings) record(args.taskId, 'world.warning', { warning });
+              if (launched.containers.length) {
+                world.handle.meta = { ...world.handle.meta,
+                  serviceContainers: launched.containers,
+                  ...(Object.keys(launched.env).length ? { serviceEnv: launched.env } : {}) };
+              }
+            }
+          } catch (e) {
+            record(args.taskId, 'world.warning', { warning: `project services: ${e instanceof Error ? e.message : e}` });
           }
         }
         if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
@@ -1242,6 +1279,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         store.setWorldState((store.currentWorld(handle.id) ?? current) as WorldHandle, 'degraded');
         record(handle.id, 'world.destroy_failed', { error: error instanceof Error ? error.message : String(error) });
       } finally {
+        // Per-world service containers die with the world (PLAN-state §3.3).
+        await destroyWorldServices(handle.id).catch(() => undefined);
         if (leaseId) deps.runners?.release(leaseId, current.kind);
       }
     },

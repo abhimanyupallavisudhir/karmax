@@ -128,6 +128,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/secrets(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/objects(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/services(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/objects\/promote$/.test(p)) return 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
@@ -2508,6 +2509,52 @@ export class Gateway {
             const mountPath = url.searchParams.get('path') ?? '';
             if (!mountPath) return this.json(res, 400, { error: 'path required' });
             objects.remove(project.id, mountPath);
+            return this.json(res, 200, { ok: true });
+          }
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
+      // Project services (PLAN-state.md §3.3): external → a connection Secret;
+      // per-world → a private container per task world. compose-import turns
+      // the compose file the repo already has into proposals.
+      const projectServicesMatch = p.match(/^\/api\/projects\/([^/]+)\/services(?:\/(compose-import))?$/);
+      if (projectServicesMatch && ['GET', 'POST', 'DELETE'].includes(method)) {
+        const project = store.getProject(projectServicesMatch[1]!);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        const { ProjectServices, composeServiceProposals } = await import('../store/project-services.js');
+        const services = new ProjectServices(store);
+        try {
+          if (method === 'GET' && projectServicesMatch[2] === 'compose-import') {
+            const { managedRepoPath } = await import('../world/worktree.js');
+            const { expandPath } = await import('../util/expand.js');
+            const fs = await import('node:fs');
+            const nodePath = await import('node:path');
+            const proposals: import('../domain/types.js').ProjectService[] = [];
+            for (const source of project.config.repos ?? []) {
+              const local = expandPath(source);
+              const dir = fs.existsSync(local) ? local : fs.existsSync(managedRepoPath(source)) ? managedRepoPath(source) : undefined;
+              if (!dir) continue;
+              for (const file of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+                const composePath = nodePath.join(dir, file);
+                if (!fs.existsSync(composePath)) continue;
+                proposals.push(...composeServiceProposals(fs.readFileSync(composePath, 'utf8')));
+                break;
+              }
+            }
+            const existing = new Set(services.list(project.id).map((s) => s.name));
+            return this.json(res, 200, { proposals: proposals.filter((s) => !existing.has(s.name)) });
+          }
+          if (method === 'GET') return this.json(res, 200, { services: services.list(project.id) });
+          if (method === 'POST' && !projectServicesMatch[2]) {
+            const b = await this.body(req);
+            return this.json(res, 200, { service: services.save(project.id, b as import('../domain/types.js').ProjectService) });
+          }
+          if (method === 'DELETE' && !projectServicesMatch[2]) {
+            const name = url.searchParams.get('name') ?? '';
+            if (!name) return this.json(res, 400, { error: 'name required' });
+            services.delete(project.id, name);
             return this.json(res, 200, { ok: true });
           }
         } catch (e) {

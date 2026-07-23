@@ -241,3 +241,19 @@ the declaration.
    `object.promoted`), Settings → Data card with file upload and mode select.
 4. **Services.** Compose/devcontainer import into the Environment
    (depends on PLAN-cloud.md environment builds), seed objects wired in.
+   *Shipped:* `ProjectService` records (`src/store/project-services.ts`) —
+   external services are just a named connection Secret; per-world services
+   launch a private Docker container per task world
+   (`src/world/services.ts`: `karmax.task=<taskId>` label, 127.0.0.1 ephemeral
+   port, seed object bind-mounted read-only, connection env rendered from
+   `urlTemplate` and recorded as `meta.serviceEnv`, injected into every turn
+   via the same secretEnv channel, containers destroyed with the world by
+   label). Compose import (`composeServiceProposals`, `yaml` dep) turns the
+   repo's own docker-compose file into one-click proposals with ready
+   connection templates for postgres/mysql/redis/mongo;
+   `/api/projects/:id/services` + `/compose-import` routes and a Settings →
+   Services card. Per-world launch is worktree-backend-only for now (host
+   Docker on 127.0.0.1); container/remote worlds get a warning pointing at
+   external-via-Secret, and in-environment services for cloud worlds remain
+   the PLAN-cloud environment-build follow-up. devcontainer.json import also
+   remains follow-up work.

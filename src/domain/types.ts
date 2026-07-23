@@ -457,6 +457,40 @@ export interface ProjectObjectMount {
   history?: Array<{ object: string; bytes: number; replacedAt: number }>;
 }
 
+/**
+ * A service the project's code depends on (PLAN-state.md §3.3). A database is a
+ * dependency to REACH or RECREATE, never state to copy:
+ * - `external` — a shared instance; its connection string is just a project
+ *   Secret (named by `connectionSecret`), nothing to build.
+ * - `per-world` — a private container per task world, launched at world
+ *   creation from `image` and destroyed with the world, with initial state
+ *   pulled from a seed data object. `urlEnv`/`urlTemplate` describe the
+ *   connection env var every world process receives ({host}/{port} resolve to
+ *   the world's own instance) — per-world throwaway credentials, not secrets.
+ */
+export interface ProjectService {
+  name: string;
+  kind: 'external' | 'per-world';
+  /** external: the project Secret whose value is the connection string. */
+  connectionSecret?: string;
+  /** per-world: container image (required). */
+  image?: string;
+  /** per-world: container command override (custom images). */
+  command?: string[];
+  /** per-world: container environment (dev-instance config, not secrets). */
+  env?: Record<string, string>;
+  /** per-world: the port the service listens on inside the container. */
+  containerPort?: number;
+  /** Env var injected into world processes, e.g. DATABASE_URL. */
+  urlEnv?: string;
+  /** Connection string with {host}/{port} placeholders. */
+  urlTemplate?: string;
+  /** Path of a project object mount whose current version seeds the instance. */
+  seedObject?: string;
+  /** Where the seed is mounted in the container (e.g. /docker-entrypoint-initdb.d/init.sql). */
+  seedContainerPath?: string;
+}
+
 export interface TaskList {
   id: string;
   projectId: string;
