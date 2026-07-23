@@ -646,7 +646,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .form-row input, .form-row select, .form-row textarea {
   padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); outline: none;
 }
-.form-row input:focus { border-color: var(--accent); }
+.form-row input:focus, .form-row select:focus { border-color: var(--accent); }
 .switch { display: flex; align-items: center; gap: 10px; }
 .switch input { width: 38px; height: 22px; }
 
