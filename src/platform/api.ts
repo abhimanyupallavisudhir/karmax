@@ -1,4 +1,4 @@
-import { WorkflowNotFoundError, type Client } from '@temporalio/client';
+import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
@@ -604,15 +604,28 @@ export class KarmaxApi {
     // remain stable when already-numbered work is queued again.
     try {
       await withTimeout(
-        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
+        this.deps.client.workflow.start(startType, {
+          taskQueue: this.deps.taskQueue,
+          workflowId: task.id,
+          // Queueing is idempotent. In particular, never create a second run if
+          // the first one finished before a lost start acknowledgement is retried.
+          workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,
+          args: [input],
+        }),
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      this.deps.store.restoreDraft(taskId, !hadNumber);
-      throw new Error(
-        `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
-          `It's still saved as a draft — check that Temporal is healthy and try again.`,
-      );
+      // A start acknowledgement can be lost after Temporal durably accepted the
+      // workflow. The retry then reports "already started"; that is proof of
+      // acceptance for this task's unique workflow ID, not a queue failure.
+      // Keep the task queued and repair the stale draft metadata.
+      if (!(e instanceof WorkflowExecutionAlreadyStartedError)) {
+        this.deps.store.restoreDraft(taskId, !hadNumber);
+        throw new Error(
+          `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
+            `It's still saved as a draft — check that Temporal is healthy and try again.`,
+        );
+      }
     }
     const started = this.resolveStart(task.workflow, task.workflowVersion);
     if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
