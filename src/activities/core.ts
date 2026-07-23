@@ -18,6 +18,8 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
+import { ProjectSecrets } from '../autonomy/project-secrets.js';
+import { materializeFileSecrets } from '../world/secrets.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
@@ -288,6 +290,7 @@ export interface PrepareChildArgs {
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const gitProfiles = new GitProfiles(store, deps.broker);
+  const projectSecrets = new ProjectSecrets(store, deps.broker);
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
@@ -306,6 +309,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     try {
       const profile = gitProfiles.get(name);
       return profile ? gitProfiles.env(profile, { taskId }) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** JIT env-shaped project secrets for a subprocess in this world (PLAN-state
+   *  §3.1): resolved from the vault per spawn, never persisted in the handle or
+   *  journaled. Empty when the project has none or resolution fails — the turn
+   *  then runs without them rather than not at all. */
+  function secretEnvFor(handle: WorldHandle, taskId?: string): Record<string, string> {
+    const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : undefined;
+    if (!projectId) return {};
+    try {
+      return projectSecrets.env(projectId, { taskId });
     } catch {
       return {};
     }
@@ -440,6 +457,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
           repositoryIds: linkedRepositories.map((candidate) => candidate.repository.id) };
+        // Inject project secrets (PLAN-state §3.1): file-shaped ones are written
+        // 0600 + git-excluded now; env-shaped ones resolve JIT per subprocess.
+        // The handle records only the materialization manifest — paths and
+        // names, never values. Failure degrades to a warning: the world is
+        // still usable, and the missing secret surfaces where it is first used.
+        if (projectId) {
+          try {
+            const secrets = projectSecrets.list(projectId);
+            if (secrets.length && remote) {
+              record(args.taskId, 'world.warning', { warning: 'project secrets are not yet injected into remote worlds' });
+            } else if (secrets.length) {
+              const manifest = await materializeFileSecrets(world, projectSecrets.files(projectId, { taskId: args.taskId }));
+              const envNames = projectSecrets.envNames(projectId);
+              world.handle.meta = { ...world.handle.meta,
+                ...(manifest.length ? { secretFiles: manifest } : {}),
+                ...(envNames.length ? { secretEnv: envNames } : {}) };
+            }
+          } catch (e) {
+            record(args.taskId, 'world.warning', { warning: `project secrets: ${e instanceof Error ? e.message : e}` });
+          }
+        }
         if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
         if (projectId) {
           world.handle = store.registerWorld(world.handle, projectId, {
@@ -894,11 +932,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Git-profile credentials for the agent subprocess (PLAN-git-config.md
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(() => {
-            const gitEnv = isRemote(args.worldHandle.kind) ? {} : gitEnvFor(args.worldHandle, args.taskId);
+            const local = !isRemote(args.worldHandle.kind);
+            const gitEnv = local ? gitEnvFor(args.worldHandle, args.taskId) : {};
+            // Project secrets first so they can never shadow karmax's own vars.
+            const secretEnv = local ? secretEnvFor(args.worldHandle, args.taskId) : {};
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
-            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            const extraEnv = { ...secretEnv, ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
             return Object.keys(extraEnv).length ? { extraEnv } : {};
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).

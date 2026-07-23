@@ -126,6 +126,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/secrets(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
@@ -2387,6 +2388,38 @@ export class Gateway {
         new GitProfiles(store, this.deps.broker).delete(decodeURIComponent(gitProfileMatch[1]!));
         return this.json(res, 200, { ok: true });
       }
+      // Project runtime secrets (PLAN-state.md §3.1): the DATABASE_URL-shaped
+      // values the project's own code reads. Values are write-only — the list
+      // returns names/shape only; injection happens at world boot / per spawn.
+      const projectSecretsMatch = p.match(/^\/api\/projects\/([^/]+)\/secrets(?:\/([^/]+))?$/);
+      if (projectSecretsMatch && ['GET', 'POST', 'DELETE'].includes(method)) {
+        const project = store.getProject(projectSecretsMatch[1]!);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+        const { ProjectSecrets } = await import('../autonomy/project-secrets.js');
+        const secrets = new ProjectSecrets(store, this.deps.broker);
+        const name = projectSecretsMatch[2] ? decodeURIComponent(projectSecretsMatch[2]) : undefined;
+        try {
+          if (method === 'GET' && !name) return this.json(res, 200, { secrets: secrets.list(project.id) });
+          if (method === 'POST' && !name) {
+            const b = await this.body(req);
+            if (typeof b.env === 'string') return this.json(res, 200, { imported: secrets.importEnv(project.id, b.env) });
+            if (!b.name) return this.json(res, 400, { error: 'name required (or env: "<pasted .env>" to bulk-import)' });
+            const rec = secrets.save(project.id, { name: String(b.name),
+              value: b.value != null && b.value !== '' ? String(b.value) : undefined,
+              file: b.file ? String(b.file) : undefined,
+              mode: b.mode != null && b.mode !== '' ? Number(b.mode) : undefined });
+            return this.json(res, 200, { secret: rec }); // never echoes the value
+          }
+          if (method === 'DELETE' && name) {
+            secrets.delete(project.id, name);
+            return this.json(res, 200, { ok: true });
+          }
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
       // The doctor check (PLAN-git-config.md §7): which tier a project's remote
       // ops resolve to (profile / host fallback) and whether it can reach the
       // repos' remotes non-interactively. Read-only.

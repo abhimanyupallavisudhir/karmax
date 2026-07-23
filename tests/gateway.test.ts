@@ -107,6 +107,28 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(res.status).toBe(401);
   });
 
+  it('manages project secrets write-only through the API', async () => {
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Secretive' }) })).json();
+    const saved = await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'DATABASE_URL', value: 'postgres://dev' }) });
+    expect(saved.status).toBe(200);
+    expect(JSON.stringify(await saved.json())).not.toContain('postgres://dev'); // never echoed
+    const imported: any = await (await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ env: 'STRIPE_KEY="sk_1"\n# note\nEMPTY=' }) })).json();
+    expect(imported.imported).toEqual(['STRIPE_KEY']);
+    const listed: any = await (await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })).json();
+    expect(listed.secrets.map((s: any) => s.name).sort()).toEqual(['DATABASE_URL', 'STRIPE_KEY']);
+    expect(JSON.stringify(listed)).not.toContain('sk_1'); // names/shape only
+    const rejected = await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'lower-case', value: 'x' }) });
+    expect(rejected.status).toBe(400);
+    const removed = await fetch(`${base}/api/projects/${project.id}/secrets/DATABASE_URL`, { method: 'DELETE', headers: auth() });
+    expect(removed.status).toBe(200);
+    const after: any = await (await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })).json();
+    expect(after.secrets.map((s: any) => s.name)).toEqual(['STRIPE_KEY']);
+  });
+
   it('deletes provider worlds before committing project deletion', async () => {
     const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
       body: JSON.stringify({ name: 'Disposable' }) })).json();

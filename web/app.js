@@ -6485,9 +6485,11 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
+    <div class="settings-section-title" id="project-secrets"><div>Secrets<small>Values this project's own code reads (DATABASE_URL, API keys) — vault-stored, injected into task worlds, never committed</small></div></div>
+    <div class="card"><div id="project-secrets-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
@@ -6529,6 +6531,40 @@ async function hydrateProjectGitProfile(proj) {
       if (selected) current.gitProfile = selected; else delete current.gitProfile;
       await api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`, { method: 'PUT', body: JSON.stringify({ values: current }) });
       toast('Git profile saved');
+    });
+  } catch (error) { box.textContent = error.message; }
+}
+async function hydrateProjectSecrets(proj) {
+  const box = $('#project-secrets-box'); if (!box) return;
+  try {
+    const { secrets } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    box.innerHTML = `
+      ${secrets.map((s) => `<div class="queue-item"><div style="flex:1"><b>${esc(s.name)}</b> <span class="chip">${s.file ? `file · ${esc(s.file)}` : 'env var'}</span></div><button class="btn sm project-secret-delete" data-name="${esc(s.name)}">Remove</button></div>`).join('')
+        || '<p class="task-sub">No secrets yet. Add the values your code reads at runtime — each task world gets them as env vars (or a file), and they never enter git, checkpoints, or events.</p>'}
+      <div class="inline-form" style="margin-top:8px"><input id="project-secret-name" placeholder="DATABASE_URL" style="max-width:190px"><input id="project-secret-value" type="password" placeholder="value (write-only)" style="flex:1;min-width:140px"><input id="project-secret-file" placeholder="as file at path (optional)" style="max-width:190px"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
+      <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Values go to the vault and are never shown again. Re-saving a name with a blank value keeps the stored one.</div>
+      <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# comments, blank lines, and empty values are skipped" style="width:100%"></textarea><div class="inline-form"><button class="btn sm primary" id="project-secret-import">Import</button></div></details>`;
+    box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
+      if (!confirm(`Remove secret ${button.dataset.name}? Its stored value is deleted from the vault.`)) return;
+      try { await api(`/api/projects/${proj.id}/secrets/${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' }); await hydrateProjectSecrets(proj); }
+      catch (error) { toast(error.message, true); }
+    }));
+    $('#project-secret-save')?.addEventListener('click', async () => {
+      const name = $('#project-secret-name').value.trim();
+      if (!name) return toast('Secret name is required', true);
+      try {
+        await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ name,
+          value: $('#project-secret-value').value || undefined, file: $('#project-secret-file').value.trim() || undefined }) });
+        toast(`🟢 Saved ${name}. The value went to the vault and is never shown again.`);
+        await hydrateProjectSecrets(proj);
+      } catch (error) { toast(error.message, true); }
+    });
+    $('#project-secret-import')?.addEventListener('click', async () => {
+      try {
+        const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ env: $('#project-secret-env').value }) });
+        toast(`Imported ${result.imported.length} ${result.imported.length === 1 ? 'secret' : 'secrets'}`);
+        await hydrateProjectSecrets(proj);
+      } catch (error) { toast(error.message, true); }
     });
   } catch (error) { box.textContent = error.message; }
 }
@@ -6620,6 +6656,7 @@ function wireSettingsView(proj) {
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
   hydrateProjectGitProfile(proj);
+  hydrateProjectSecrets(proj);
   hydrateSettingsForms('project', proj.id);
   hydrateQuickSettingsForms('project', proj.id);
   wireQuickSettingsSave('project', proj.id);

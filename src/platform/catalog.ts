@@ -42,6 +42,8 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/credentials?projectId=&taskId=', 'POST /api/credentials/policy?projectId=|taskId=',
     'GET|POST /api/git-profiles', 'GET|PATCH|DELETE /api/git-profiles/:id',
     'GET /api/git-profiles/preflight?projectId=', 'POST /api/git-profiles/default',
+    'GET|POST /api/projects/:projectId/secrets (POST {name, value?, file?, mode?} upserts; {env: "<pasted .env>"} bulk-imports; values are write-only)',
+    'DELETE /api/projects/:projectId/secrets/:name',
   ],
   wiki: [
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',

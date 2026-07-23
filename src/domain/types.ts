@@ -422,6 +422,23 @@ export interface GitProfile {
   githubToken?: boolean;
 }
 
+/**
+ * A project runtime secret (PLAN-state.md §3.1) — a named value the project's
+ * OWN code reads (DATABASE_URL, STRIPE_KEY, …), as opposed to the credentials
+ * karmax itself uses. The record carries NO value: the value lives in the vault
+ * under `secret:<projectId>:<name>` and is resolved JIT at the injection
+ * boundary — env var on agent subprocesses by default, or a 0600 git-excluded
+ * file when a tool demands one. Never in git, checkpoints, merges, or events.
+ */
+export interface ProjectSecret {
+  /** Env-var-shaped name; also the injected variable name for env secrets. */
+  name: string;
+  /** Present as a file at this world-relative path instead of an env var. */
+  file?: string;
+  /** File mode for file-shaped secrets (default 0600). */
+  mode?: number;
+}
+
 export interface TaskList {
   id: string;
   projectId: string;

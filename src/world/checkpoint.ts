@@ -7,6 +7,8 @@ import type { ObjectStore } from '../store/objects.js';
 import type { Store } from '../store/db.js';
 import type { World, WorldHandle, WorldKind, WorldRepo } from './types.js';
 import { worldRepos, worldRepoSource } from './types.js';
+import { materializeFileSecrets, secretFileManifest } from './secrets.js';
+import { ProjectSecrets } from '../autonomy/project-secrets.js';
 import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
 
@@ -36,12 +38,18 @@ export class WorldCheckpointService {
     const linked = this.store.listProjectRepositories(projectId);
     const files: DeltaFile[] = [];
     const repos: WorldCheckpoint['repos'] = [];
+    // Secret-materialized files are git-excluded at injection so status rarely
+    // sees them; the handle's manifest is the backstop for backends where the
+    // exclude write failed. The literal `.env`/`.karmax-injection/` names cover
+    // pre-manifest worlds (copyGlobs-era .env copies).
+    const secretFiles = secretFileManifest(handle.meta);
     for (const repo of worldRepos(world.handle)) {
       const status = await world.exec('git', ['status', '--porcelain=v1', '-z'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
         if (change.path === '.env' || change.path.startsWith('.karmax-injection/')) continue;
         const relative = worldRepos(world.handle).length > 1 ? `${repo.name}/${change.path}` : change.path;
+        if (secretFiles.has(relative)) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
         else {
           const data = await world.readFileBuffer(relative);
@@ -111,6 +119,16 @@ export class WorldCheckpointService {
         else await world.writeFile(relative, content.toString('utf8'));
       }
     }
+    // Re-materialize file-shaped project secrets: they are excluded from the
+    // portable delta by design, so a restored world injects them fresh (the
+    // same duty createWorld performs). Env-shaped secrets resolve JIT per
+    // subprocess and need nothing here. Best-effort — a missing value surfaces
+    // where it is first used, not as a failed restore.
+    try {
+      const manifest = await materializeFileSecrets(world,
+        new ProjectSecrets(this.store, this.broker).files(checkpoint.projectId, { taskId: checkpoint.worldId }));
+      if (manifest.length) world.handle.meta = { ...world.handle.meta, secretFiles: manifest };
+    } catch { /* world remains usable without them */ }
     let registered: WorldHandle;
     try {
       registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,

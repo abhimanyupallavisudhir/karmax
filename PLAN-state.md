@@ -203,6 +203,15 @@ the declaration.
    injection in worktree/container worlds + materialization manifest driving
    checkpoint/merge/handoff exclusions + paste-`.env` import UI. This alone
    replaces the main real-world use of `copyGlobs`.
+   *Shipped:* `src/autonomy/project-secrets.ts` (registry in kv, values in the
+   vault under `secret:<projectId>:<name>`, git-profiles pattern),
+   `src/world/secrets.ts` (0600 materialization + worktree-scoped
+   `core.excludesFile` exclusion — deliberately NOT the shared `info/exclude`,
+   which would leak patterns into the user's checkout), createWorld injection +
+   `meta.secretFiles`/`meta.secretEnv` manifest, JIT env merge into local agent
+   turns, checkpoint manifest backstop + restore re-materialization,
+   `/api/projects/:id/secrets` (write-only; `{env}` bulk import), Settings →
+   Secrets UI. Remote worlds record a `world.warning` until phase 2.
 2. **Secrets in cloud worlds.** E2B provisioning-time env + file
    materialization; Daytona opaque substitution. Deprecate `copyGlobs` behind
    the import flow. Hosted onboarding asks for values named by `.env.example`.
