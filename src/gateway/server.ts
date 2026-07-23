@@ -37,6 +37,7 @@ import { newId } from '../util/id.js';
 import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
+import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
 
 export interface GatewayDeps {
@@ -68,6 +69,7 @@ export interface GatewayDeps {
   objects?: ObjectStore;
   cellId?: string;
   hosted?: boolean;
+  remoteAccess?: RemoteAccessController;
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
@@ -81,6 +83,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/platform') return 'workflow:read';
   if (p === '/api/logout') return 'none';
   if (p === '/api/dashboard') return 'diagnostic:read';
+  if (p === '/api/remote-access') return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
@@ -274,7 +277,9 @@ const MIME: Record<string, string> = {
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
   '.ico': 'image/x-icon',
 };
 
@@ -849,6 +854,17 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
+      if (p === '/api/remote-access' && method === 'GET') {
+        if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
+        return this.json(res, 200, await this.deps.remoteAccess.status());
+      }
+      if (p === '/api/remote-access' && method === 'POST') {
+        if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
+        const b = await this.body(req);
+        if (b.action === 'enable') return this.json(res, 200, await this.deps.remoteAccess.enable());
+        if (b.action === 'disable') return this.json(res, 200, await this.deps.remoteAccess.disable());
+        return this.json(res, 400, { error: 'action must be enable or disable' });
+      }
 
       // Organization is the hosted tenant boundary. Collection discovery is
       // filtered by membership; every nested request was minted an

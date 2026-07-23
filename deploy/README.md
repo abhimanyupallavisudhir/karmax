@@ -49,6 +49,12 @@ to:
 5. Add an Anthropic/OpenAI API key under agent credentials if the deployment
    does not use another connected login.
 
+That same HTTPS URL works from a phone—no VPN and no Karmax-specific native app
+are required. **Organization settings → Access** offers an
+**Add Karmax to this phone** action; the browser installs the responsive web app
+to the Home Screen. Tailscale is for reaching a Karmax process that lives on a
+private laptop or workstation, not for this hosted stack.
+
 All of those operations have authenticated HTTP APIs. Provider discovery,
 connection, testing, rotation, and removal also have permission-checked platform
 MCP tools, so an authorized agent can connect E2B or Daytona without shell

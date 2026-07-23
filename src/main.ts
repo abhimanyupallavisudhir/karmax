@@ -21,7 +21,7 @@ import { KarmaxApi } from './platform/api.js';
 import { ContributionRegistry } from './contrib/registry.js';
 import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
-import { remoteAccessPlan } from './remote/access.js';
+import { RemoteAccessController, remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
 import { registerAppInstance } from './util/instance.js';
 import { AuthorizationService } from './platform/authorization.js';
@@ -292,6 +292,12 @@ async function main() {
   }
 
   const staticDir = fileURLToPath(new URL('../web', import.meta.url));
+  let gatewayPort = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : 4505;
+  const remoteAccess = new RemoteAccessController({
+    port: () => gatewayPort,
+    hosted: deployment.hosted,
+    publicUrl,
+  });
   const gateway = new Gateway({
     api,
     store,
@@ -321,9 +327,11 @@ async function main() {
     objects: objectStore,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
+    remoteAccess,
   });
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
   const { url, internalUrl, port, close: closeGateway } = await gateway.listen(preferred);
+  gatewayPort = port;
   // Activities read this lazily when an agent invokes the complete platform API.
   // Keep service-to-service agent/MCP traffic on the control plane's loopback,
   // even when browsers use a public TLS URL through a reverse proxy.
@@ -337,8 +345,10 @@ async function main() {
   console.log(`\n  ✓ karmax is running:  ${url}\n`);
   if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
   try {
-    const remote = await remoteAccessPlan(port, { hasPassword: true });
-    console.log(`\n  Remote access (${remote.method}):\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
+    if (!deployment.hosted) {
+      const remote = await remoteAccessPlan(port, { hasPassword: true });
+      console.log(`\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
+    }
   } catch {
     /* ignore */
   }

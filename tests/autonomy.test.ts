@@ -8,7 +8,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
 import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, isFullyAuthed, capturedToken, tokenToInject } from '../src/autonomy/config-homes.js';
 import { LoginManager } from '../src/autonomy/login.js';
-import { remoteAccessPlan } from '../src/remote/access.js';
+import { RemoteAccessController, remoteAccessPlan } from '../src/remote/access.js';
 
 describe('config homes + scrubbed env (SPEC §7.3)', () => {
   it('mints one home per (account × provider) and scrubs inherited keys', () => {
@@ -237,6 +237,68 @@ describe('remote access plan (SPEC §12)', () => {
   it('falls back to guidance when no tunnel tool is installed', async () => {
     const plan = await remoteAccessPlan(4173, { hasPassword: true, detect: async () => false });
     expect(plan.method).toBe('none');
+    expect(plan.guidance).not.toMatch(/cloudflared|ngrok|funnel/i);
+  });
+  it('reports a missing Tailscale executable as installable, not logged out', async () => {
+    const missing = Object.assign(new Error('spawn tailscale ENOENT'), { code: 'ENOENT', stdout: '', stderr: '' });
+    const controller = new RemoteAccessController({ port: () => 4173, run: async () => { throw missing; } });
+    expect(await controller.status()).toMatchObject({
+      method: 'none',
+      state: 'unavailable',
+      canEnable: false,
+    });
+  });
+  it('detects and enables the private Tailscale route without touching an existing Serve app', async () => {
+    let serve = 'No serve config';
+    const calls: string[][] = [];
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        calls.push(args);
+        if (args[0] === 'status') return { stdout: JSON.stringify({
+          BackendState: 'Running',
+          Self: { DNSName: 'laptop.example.ts.net.' },
+        }), stderr: '' };
+        if (args.join(' ') === 'serve status --json') return { stdout: serve, stderr: '' };
+        if (args[0] === 'serve' && args[1] === '--bg') {
+          serve = 'https://laptop.example.ts.net\n|-- / proxy http://127.0.0.1:4173';
+          return { stdout: 'Serve started', stderr: '' };
+        }
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+    });
+    expect(await controller.status()).toMatchObject({ state: 'available', canEnable: true });
+    expect(await controller.enable()).toMatchObject({
+      state: 'ready',
+      url: 'https://laptop.example.ts.net',
+      canDisable: true,
+    });
+    expect(calls).toContainEqual(['serve', '--bg', 'http://127.0.0.1:4173']);
+  });
+  it('refuses to overwrite another Tailscale Serve route', async () => {
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => args[0] === 'status'
+        ? { stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }), stderr: '' }
+        : { stdout: 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:9000', stderr: '' },
+    });
+    expect(await controller.enable()).toMatchObject({ state: 'conflict', canEnable: false, canDisable: false });
+  });
+  it('reports a hosted HTTPS installation as ready without invoking Tailscale', async () => {
+    const controller = new RemoteAccessController({
+      port: () => 4505,
+      hosted: true,
+      publicUrl: 'https://karmax.example.com',
+      run: async () => { throw new Error('must not run'); },
+    });
+    expect(await controller.status()).toEqual({
+      method: 'hosted',
+      state: 'ready',
+      url: 'https://karmax.example.com',
+      detail: 'This hosted installation already uses authenticated HTTPS.',
+      canEnable: false,
+      canDisable: false,
+    });
   });
 });
 
