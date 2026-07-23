@@ -875,7 +875,7 @@ export class KarmaxApi {
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks', { projectId });
-    return this.deps.store.listPrincipalTasks(projectId);
+    return this.deps.store.listTasks(projectId);
   }
 
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
@@ -984,7 +984,7 @@ export class KarmaxApi {
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
     this.require(token, 'search_tasks', { projectId });
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
-    const tasks = this.deps.store.listPrincipalTasks(projectId);
+    const tasks = this.deps.store.listTasks(projectId);
     const tags = this.deps.store.listTags(projectId);
     return evaluateQuery(tasks, q, { now, tags });
   }
