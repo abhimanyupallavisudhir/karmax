@@ -116,10 +116,17 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // write-back is the narrower vault:store; use/reveal/fill/request attempts
   // need only credential:read — the per-item grant + policy check happens in
   // the handler against the caller's own capability set.
-  if (p === '/api/vault/store') return 'vault:store';
+  if (p === '/api/vault/store' || p === '/api/vault/passkey/save') return 'vault:store';
   if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:write';
   if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : 'credential:write';
+  // Connectors: describe is read; connect/sync/config/write-back are admin.
+  if (p.startsWith('/api/vault/connectors')) return read ? 'credential:read' : 'credential:write';
   if (p.startsWith('/api/vault')) return 'credential:read';
+  // Agent mailbox (PLAN-passwords.md §8): the inbound webhook authenticates with
+  // its own shared secret (like the GitHub webhook), so it needs no capability;
+  // reading/config is credential:read/write.
+  if (p === '/api/agent-mail/ingest') return 'none';
+  if (p.startsWith('/api/agent-mail')) return read ? 'credential:read' : 'credential:write';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return 'safe-mode:write';
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -323,6 +330,8 @@ export class Gateway {
   private modelCatalog?: { at: number; value: ModelCatalog };
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
   private fanout: DurableEventFanout;
+  /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
+  private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
 
   constructor(private deps: GatewayDeps) {
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess);
@@ -656,6 +665,18 @@ export class Gateway {
       } catch (error) {
         return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
       }
+    }
+    // Agent mailbox inbound webhook (PLAN-passwords.md §8): authenticated by a
+    // configured shared secret, not a karmax session — so it sits with the other
+    // unauthenticated endpoints, before the session gate.
+    if (p === '/api/agent-mail/ingest' && method === 'POST') {
+      const secret = process.env.KARMAX_AGENT_MAIL_SECRET;
+      const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
+      if (!secret || bearer !== secret) return this.json(res, 401, { error: 'agent-mail ingest requires the configured shared secret' });
+      const { AgentMail } = await import('../autonomy/agent-mail.js');
+      const b = await this.body(req);
+      if (!b.to || !b.from) return this.json(res, 400, { error: 'to and from are required' });
+      return this.json(res, 200, new AgentMail(this.deps.store).ingest({ to: String(b.to), from: String(b.from), subject: b.subject ? String(b.subject) : undefined, text: String(b.text ?? '') }));
     }
     const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
     if (githubManifestCallback && method === 'GET' && this.deps.githubApp && this.deps.identity) {
@@ -2412,6 +2433,87 @@ export class Gateway {
             return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
           }
         }
+
+        // ── external store connectors (§9) ──
+        if (p.startsWith('/api/vault/connectors')) {
+          if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+          const { Connectors, BitwardenConnector, OnePasswordConnector, PassConnector } = await import('../autonomy/connectors.js');
+          const connectors = new Connectors(store, vault, this.deps.broker);
+          connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden')));
+          connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password')));
+          connectors.register(new PassConnector());
+          if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
+          const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
+          if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });
+          if (connName && method === 'POST') {
+            const b = await this.body(req);
+            const action = connName[2];
+            try {
+              if (action === 'connect') { connectors.connect(connName[1]!, String(b.secret ?? '')); return this.json(res, 200, { connected: true }); }
+              if (action === 'config') return this.json(res, 200, connectors.setConfig(connName[1]!, { writeBack: !!b.writeBack }));
+              if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
+              if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : []));
+              if (action === 'write-back') return this.json(res, 200, (await connectors.writeBack(connName[1]!, String(b.itemId ?? ''))) ?? { skipped: 'write-back disabled for this connector' });
+            } catch (e) {
+              return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+            }
+            return this.json(res, 404, { error: 'unknown connector action' });
+          }
+        }
+
+        // ── agent-enrolled passkeys (§8) ──
+        if (p.startsWith('/api/vault/passkey')) {
+          if (!this.passkeys) {
+            const { PasskeyManager } = await import('../autonomy/passkey.js');
+            this.passkeys = new PasskeyManager();
+          }
+          const b = method === 'POST' ? await this.body(req) : {};
+          const item = b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined;
+          try {
+            if (p === '/api/vault/passkey/enroll' && method === 'POST') {
+              const domains = Array.isArray(b.domains) ? b.domains.map(String) : b.domain ? [String(b.domain)] : undefined;
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? 'http://127.0.0.1:9222'), { expectDomains: domains, mode: 'enroll' });
+              return this.json(res, 200, { ...started, next: 'trigger the site\'s "create a passkey" button in the browser, then POST /api/vault/passkey/save with this authenticatorId' });
+            }
+            if (p === '/api/vault/passkey/save' && method === 'POST') {
+              const creds = await this.passkeys.harvest(String(b.authenticatorId ?? ''));
+              if (!creds.length) return this.json(res, 400, { error: 'no passkey was created on the page — trigger the site\'s enroll button first' });
+              const saved = vault.save({
+                type: 'passkey',
+                label: String(b.label ?? (item?.label ? `${item.label} (passkey)` : 'passkey')),
+                domains: Array.isArray(b.domains) ? b.domains.map(String) : creds[0]!.rpId ? [creds[0]!.rpId] : undefined,
+                username: b.username ? String(b.username) : undefined,
+                secrets: { passkey: JSON.stringify(creds) },
+                provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
+              });
+              return this.json(res, 200, { itemId: saved.id, label: saved.label, count: creds.length });
+            }
+            if (p === '/api/vault/passkey/login' && method === 'POST') {
+              if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no passkey item — enroll one first' });
+              const decision = vault.access(caps, callerTaskId, item, 'use', { consume: true });
+              if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+              const creds = JSON.parse(vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' })) as any[];
+              const domains = item.domains;
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? 'http://127.0.0.1:9222'), { expectDomains: domains, mode: 'login', credential: creds[0] });
+              return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
+            }
+            if (p === '/api/vault/passkey/release' && method === 'POST') {
+              this.passkeys.release(String(b.authenticatorId ?? ''));
+              return this.json(res, 200, { released: true });
+            }
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+      }
+
+      // ── agent mailbox: address + inbox reads (§8; the inbound webhook is an
+      // unauthenticated shared-secret route handled before the session gate) ──
+      if (p === '/api/agent-mail' && method === 'GET') {
+        const { AgentMail } = await import('../autonomy/agent-mail.js');
+        const mail = new AgentMail(store);
+        return this.json(res, 200, { address: mail.address(), configured: mail.configured(),
+          messages: mail.recent({ since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
       }
 
       // cards (payment resources; SPEC §7.6). Provision/list/fund.

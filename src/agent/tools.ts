@@ -244,6 +244,58 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'check_agent_mail',
+    description:
+      'Read the karmax agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Use it to complete "check your email for a code / confirmation link" steps: returns recent messages with any verification `code` and `link` already extracted. For a code sent to the user\'s own address instead, escalate with request_credential/raise_to_parent.',
+    parameters: {
+      type: 'object',
+      properties: {
+        match: { type: 'string', description: 'Filter to messages mentioning this (e.g. the site name or sender).' },
+        since: { type: 'number', description: 'Only messages received after this epoch-ms timestamp.' },
+      },
+    },
+  },
+  {
+    name: 'enroll_passkey',
+    description:
+      'Enroll a NEW passkey that belongs to karmax on the account open in your browser (you cannot use the user\'s own passkeys — the OS biometric is theirs). karmax prepares a virtual authenticator (origin-verified against `domain`); you then trigger the site\'s "create a passkey / add passkey" button; then call save_passkey with the returned authenticator_id. After this, use_passkey logs in with no 2FA prompt.',
+    parameters: {
+      type: 'object',
+      properties: {
+        domain: { type: 'string', description: 'The site you are enrolling on, e.g. "example.com".' },
+        cdp_url: { type: 'string', description: 'Browser DevTools endpoint (default http://127.0.0.1:9222).' },
+      },
+      required: ['domain'],
+    },
+  },
+  {
+    name: 'save_passkey',
+    description: 'After you triggered the site\'s passkey-create button (see enroll_passkey), store the newly created credential in the vault as a passkey item.',
+    parameters: {
+      type: 'object',
+      properties: {
+        authenticator_id: { type: 'string', description: 'The id returned by enroll_passkey.' },
+        label: { type: 'string' },
+        domains: { type: 'array', items: { type: 'string' } },
+        username: { type: 'string' },
+      },
+      required: ['authenticator_id'],
+    },
+  },
+  {
+    name: 'use_passkey',
+    description:
+      'Log in with a karmax-enrolled passkey: karmax loads the stored credential into a virtual authenticator on the page; you then trigger the site\'s "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticator_id (call the passkey release route when done), or needs_approval/not_in_vault.',
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
+        cdp_url: { type: 'string' },
+      },
+    },
+  },
+  {
     name: 'find_task',
     description: 'Find a task by project id and human-facing project-local number (#100).',
     parameters: { type: 'object', properties: { project_id: { type: 'string' }, number: { type: 'number' } }, required: ['project_id', 'number'] },
@@ -494,6 +546,23 @@ export function platformToolHandlers(
         id: args?.id, type: args?.type, label: args?.label, domains: args?.domains,
         username: args?.username, envVar: args?.env_var, secrets: args?.secrets,
       }));
+    },
+    async check_agent_mail(args) {
+      const q = new URLSearchParams();
+      if (args?.match) q.set('match', String(args.match));
+      if (args?.since) q.set('since', String(args.since));
+      return JSON.stringify(await platformRequest('GET', `/api/agent-mail${q.toString() ? `?${q}` : ''}`));
+    },
+    async enroll_passkey(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/enroll', { domain: args?.domain, cdpUrl: args?.cdp_url }));
+    },
+    async save_passkey(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/save', {
+        authenticatorId: String(args?.authenticator_id ?? ''), label: args?.label, domains: args?.domains, username: args?.username,
+      }));
+    },
+    async use_passkey(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain, cdpUrl: args?.cdp_url }));
     },
     async find_task(args) {
       return JSON.stringify(await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tasks/by-num/${Number(args?.number)}`));

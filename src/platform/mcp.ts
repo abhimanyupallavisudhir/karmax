@@ -375,6 +375,41 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/store', a)),
   );
   server.registerTool(
+    'check_agent_mail',
+    {
+      description:
+        'Read the karmax agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Completes "check your email for a code / link" steps: returns recent messages with any verification code and link already extracted.',
+      inputSchema: { match: z.string().optional(), since: z.number().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('GET', `/api/agent-mail${a.match || a.since ? `?${new URLSearchParams({ ...(a.match ? { match: a.match } : {}), ...(a.since ? { since: String(a.since) } : {}) })}` : ''}`)),
+  );
+  server.registerTool(
+    'enroll_passkey',
+    {
+      description:
+        'Enroll a NEW passkey belonging to karmax on the account open in your browser (the user\'s own passkeys are unusable — the OS biometric is theirs). karmax preps a virtual authenticator (origin-verified); you trigger the site\'s "create a passkey" button; then call save_passkey with the returned authenticatorId. Afterwards use_passkey logs in with no 2FA prompt.',
+      inputSchema: { domain: z.string(), cdpUrl: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/enroll', a)),
+  );
+  server.registerTool(
+    'save_passkey',
+    {
+      description: 'After triggering the site\'s passkey-create button (see enroll_passkey), store the newly created credential in the vault as a passkey item.',
+      inputSchema: { authenticatorId: z.string(), label: z.string().optional(), domains: z.array(z.string()).optional(), username: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/save', a)),
+  );
+  server.registerTool(
+    'use_passkey',
+    {
+      description:
+        'Log in with a karmax-enrolled passkey: karmax loads the stored credential into a virtual authenticator on the page; you trigger the site\'s "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticatorId (release it when done via platform_request POST /api/vault/passkey/release), or needs_approval/not_in_vault.',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), cdpUrl: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/login', a)),
+  );
+  server.registerTool(
     'describe_platform',
     { description: 'Describe the complete administrative API available through platform_request.', inputSchema: {} },
     async () => wrap(async () => PLATFORM_API_CATALOG),

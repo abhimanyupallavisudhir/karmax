@@ -24,8 +24,8 @@ import { paths } from '../config/paths.js';
  * request for it (one-shot pass / task grant extension, §7).
  */
 
-export type VaultItemType = 'login' | 'api-key' | 'ssh-key' | 'env' | 'note';
-export type VaultFieldName = 'password' | 'totp' | 'secret' | 'privateKey' | 'env' | 'note';
+export type VaultItemType = 'login' | 'api-key' | 'ssh-key' | 'env' | 'passkey' | 'note';
+export type VaultFieldName = 'password' | 'totp' | 'secret' | 'privateKey' | 'env' | 'passkey' | 'note';
 
 /** The secret fields each item type may carry (write-only through the API). */
 export const ITEM_FIELDS: Record<VaultItemType, VaultFieldName[]> = {
@@ -33,6 +33,9 @@ export const ITEM_FIELDS: Record<VaultItemType, VaultFieldName[]> = {
   'api-key': ['secret'],
   'ssh-key': ['privateKey'],
   env: ['env'],
+  // A passkey stores the CDP virtual-authenticator credential as one JSON blob
+  // ({credentialId, privateKey, rpId, userHandle, signCount}); §8.
+  passkey: ['passkey'],
   note: ['note'],
 };
 
@@ -57,7 +60,9 @@ export interface VaultItem {
   /** Which secret fields currently have stored values (never the values). */
   fields: VaultFieldName[];
   policy: VaultItemPolicy;
-  provenance: { source: string; taskId?: string; at: number };
+  /** `source`: manual | connector:<name> | task:<id>. `externalId` lets a
+   *  connector re-sync onto the same item instead of duplicating it (§9). */
+  provenance: { source: string; taskId?: string; externalId?: string; at: number };
   updatedAt: number;
 }
 
@@ -184,6 +189,19 @@ export class VaultItems {
     return this.list().filter((i) => (i.domains ?? []).some((d) => domainMatches(host, d)));
   }
 
+  /** The item a connector previously mirrored for `externalId`, if any (§9). */
+  findByExternal(source: string, externalId: string): VaultItem | undefined {
+    return this.list().find((i) => i.provenance.source === source && i.provenance.externalId === externalId);
+  }
+
+  /** Internal: read a stored secret WITHOUT the capability/policy gate — for
+   *  trusted host-side machinery only (connector write-back, passkey load).
+   *  Never expose the result to an agent; the gated path is `resolveField`. */
+  readSecret(item: VaultItem, field: VaultFieldName): string | undefined {
+    if (!item.fields.includes(field)) return undefined;
+    return this.requireBroker().resolve(itemHandle(item.id, field), { taskId: item.provenance.taskId, caps: [`use-credential:item:${item.id}:${field}`, `use-credential:*`] });
+  }
+
   /**
    * Create/update an item. Sparse-update semantics throughout: secret fields
    * are write-only (a provided non-empty string replaces the vault entry;
@@ -200,7 +218,7 @@ export class VaultItems {
     envVar?: string;
     policy?: Partial<VaultItemPolicy>;
     secrets?: Partial<Record<VaultFieldName, string>>;
-    provenance?: { source: string; taskId?: string };
+    provenance?: { source: string; taskId?: string; externalId?: string };
   }): VaultItem {
     if (!ITEM_FIELDS[args.type]) throw new Error(`unknown vault item type "${args.type}"`);
     const prior = args.id ? this.get(args.id) : undefined;
@@ -235,12 +253,24 @@ export class VaultItems {
         use: args.policy?.use ?? prior?.policy.use ?? 'auto',
         reveal: args.policy?.reveal ?? prior?.policy.reveal ?? 'ask',
       },
-      provenance: prior?.provenance ?? { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), at: Date.now() },
+      provenance: prior?.provenance ?? { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), at: Date.now() },
       updatedAt: Date.now(),
     };
     this.store.kvSet(KV_ITEMS, JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
     // Key material may have changed — drop any materialized copies.
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
+    return item;
+  }
+
+  /** Bind an item to a connector's external id (write-back round-trips, §9).
+   *  Provenance is otherwise birth-data and never mutated by `save`. */
+  setExternalId(id: string, externalId: string): VaultItem {
+    const all = this.list();
+    const item = all.find((i) => i.id === id);
+    if (!item) throw new Error(`no vault item ${id}`);
+    item.provenance = { ...item.provenance, externalId };
+    item.updatedAt = Date.now();
+    this.store.kvSet(KV_ITEMS, JSON.stringify(all));
     return item;
   }
 

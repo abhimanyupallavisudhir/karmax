@@ -664,4 +664,29 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const third: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: { authorization: `Bearer ${other.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ itemId: item.id }) })).json();
     expect(third.status).toBe('needs_approval');
   });
+
+  it('lists the external-store connectors (describe, unauthenticated CLIs report not-ready)', async () => {
+    const conns: any = await (await fetch(`${base}/api/vault/connectors`, { headers: auth() })).json();
+    expect(conns.map((c: any) => c.name).sort()).toEqual(['1password', 'bitwarden', 'pass']);
+    // In CI none of the CLIs are configured, so each reports a clear reason.
+    for (const c of conns) { expect(typeof c.available).toBe('boolean'); expect(c.detail).toBeTruthy(); }
+  });
+
+  it('agent mailbox: shared-secret ingest, code extraction, and reads', async () => {
+    const addr: any = await (await fetch(`${base}/api/agent-mail`, { headers: auth() })).json();
+    expect(addr.address).toMatch(/@/);
+    // ingest requires the configured shared secret
+    const prev = process.env.KARMAX_AGENT_MAIL_SECRET;
+    process.env.KARMAX_AGENT_MAIL_SECRET = 'shh';
+    try {
+      const rejected = await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: addr.address, from: 'x@y.com', text: 'code 314159' }) });
+      expect(rejected.status).toBe(401);
+      const ok = await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer shh' }, body: JSON.stringify({ to: addr.address, from: 'noreply@github.com', subject: 'Verify', text: 'Your code is 314159' }) });
+      expect(ok.status).toBe(200);
+      const inbox: any = await (await fetch(`${base}/api/agent-mail?match=github`, { headers: auth() })).json();
+      expect(inbox.messages[0].code).toBe('314159');
+    } finally {
+      if (prev === undefined) delete process.env.KARMAX_AGENT_MAIL_SECRET; else process.env.KARMAX_AGENT_MAIL_SECRET = prev;
+    }
+  });
 });

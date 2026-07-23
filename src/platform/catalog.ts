@@ -50,6 +50,13 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/vault/fill (zero-exposure browser fill via CDP; body {itemId?|domain?, field?, selector, cdpUrl?})',
     'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access; body {itemId?|domain?, field?, mode?, why})',
     'POST /api/vault/requests/:id/resolve (human: body {action: once|task|always|deny, itemId?})',
+    'GET /api/vault/connectors (Bitwarden/1Password/pass mirror status)',
+    'POST /api/vault/connectors/:name/connect|config|list|sync|write-back (selective mirror + opt-in write-back)',
+    'POST /api/vault/passkey/enroll|save|login|release (agent-enrolled passkeys via CDP virtual authenticator)',
+  ],
+  agentMail: [
+    'GET /api/agent-mail?since=&match=&limit= (agent inbox address + messages, verification code/link extracted)',
+    'POST /api/agent-mail/ingest (inbound mail webhook; shared-secret authenticated, not a karmax token)',
   ],
   wiki: [
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',

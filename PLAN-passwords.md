@@ -311,12 +311,35 @@ item lifecycle and the full pull model over HTTP).
    grantor recorded, merged into the grant at every mint — extending a
    running task without touching frozen workflow input), and `always`
    flipping item policy; Access-requests card in Settings.
-4. **Connectors** (not built) — Bitwarden, 1Password service accounts, pass;
-   selective mirror + write-back; Connectors card.
-5. **Account creation autonomy** (not built) — agent email connector +
-   `check_agent_mail`; registration prompt guidance (generate password →
-   register → enroll agent passkey → `store_credential`); passkey
-   virtual-authenticator enrollment/login.
+4. **Connectors** ✅ — `Connectors` + `CredentialConnector`
+   (`src/autonomy/connectors.ts`): Bitwarden (`bw`), 1Password service-account
+   (`op`), and unix `pass`, each shelling out to the store's own CLI (injectable
+   `Exec` for tests), availability probed like git preflight. Selective mirror:
+   `list()` enumerates, `sync(name, ids)` pulls the selected items and writes
+   them as VaultItems (provenance `connector:<name>` + `externalId`, so a
+   re-sync updates in place rather than duplicating). Opt-in `writeBack` pushes
+   an agent-created item back out. Unlock secrets (bw session key / op token)
+   live in the vault under `connector:<name>:auth`. `/api/vault/connectors`
+   surface + a Connectors card in Settings.
+5. **Account creation autonomy** ✅ — **Agent mailbox**
+   (`src/autonomy/agent-mail.ts`): a per-install dedicated address (never the
+   user's inbox), an inbound `POST /api/agent-mail/ingest` webhook
+   (shared-secret authenticated, before the session gate), code/link extraction,
+   and `check_agent_mail` on both rails. **Passkeys**
+   (`src/autonomy/passkey.ts` over shared `cdp.ts`): agent-enrolled via a CDP
+   virtual authenticator (origin-verified), the manager holds the CDP session
+   across the agent's create/sign-in click under a TTL; enrolled credentials
+   store as `passkey` VaultItems; `enroll_passkey`/`save_passkey`/`use_passkey`
+   tools. (Registration prompt guidance — the generate→register→enroll→store
+   playbook — is left to per-task prompting / a future skill, not hard-coded.)
+
+Implementation notes (phases 4–5):
+- The CDP session-holding for passkeys is the one piece of cross-request state:
+  a virtual authenticator is bound to the DevTools session that created it, so
+  `PasskeyManager` keeps that WebSocket open (TTL-bounded, explicit release)
+  between `enroll_passkey` and `save_passkey`. `cdp.ts` is shared with §5B fill.
+- Connectors deliberately re-instantiate per request (cheap; CLIs are the state)
+  and never cache secrets in memory beyond the call.
 
 Implementation notes:
 - Existing installs keep their seeded role profiles (`seedProfiles` does not

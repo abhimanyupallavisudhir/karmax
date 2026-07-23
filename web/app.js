@@ -6767,7 +6767,9 @@ function globalSettingsView(embedded = false) {
     ${authorizationCard('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
     ${vaultCard()}
+    ${connectorsCard()}
     ${vaultRequestsCard()}
+    ${agentMailCard()}
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
     <div class="card" id="accounts-card">
@@ -7105,6 +7107,76 @@ async function wireVaultCards() {
   await renderRequests();
 }
 
+// ── connectors: mirror an external password store into the vault (§9) ─────────
+function connectorsCard() {
+  return `<div class="card" id="connectors-card">
+    <div class="section-h">Password-store connectors</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Mirror selected items from Bitwarden, 1Password, or unix <code>pass</code> into the vault above. This is a <b>selective mirror</b>, not a live proxy — agents always resolve credentials from the karmax vault, so a store being down never blocks them. Connect the store's CLI (installed on this host), pick items, and sync.</p>
+    <div class="connectors-list">Loading…</div>
+  </div>`;
+}
+async function wireConnectorsCard() {
+  const box = $('#connectors-card');
+  if (!box) return;
+  const list = box.querySelector('.connectors-list');
+  let conns = [];
+  try { conns = await api('/api/vault/connectors'); } catch { list.innerHTML = '<span style="color:var(--ink-3)">Connectors need a credential broker.</span>'; return; }
+  list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}" style="flex-wrap:wrap">
+    <div style="flex:1;min-width:180px"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not ready</span>'}
+      <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · last sync: ${c.config.lastSync.count} item(s)` : ''}</div></div>
+    ${c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : 'op service-account token'}" style="min-width:160px" /><button class="btn sm" data-conn-connect>Connect</button>`}
+    ${c.canPush ? `<label style="font-size:11px" title="Let agents push accounts they create back to this store"><input type="checkbox" class="conn-writeback" ${c.config?.writeBack ? 'checked' : ''}/> write-back</label>` : ''}
+    <button class="btn sm" data-conn-list ${c.available ? '' : 'disabled'}>Browse &amp; sync</button>
+    <div class="conn-items" style="flex-basis:100%;margin-top:6px"></div></div>`).join('')
+    || '<span style="color:var(--ink-3)">No connectors.</span>';
+  list.querySelectorAll('[data-conn]').forEach((row) => {
+    const name = row.dataset.conn;
+    row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
+      const secret = row.querySelector('.conn-secret').value;
+      try { await api(`/api/vault/connectors/${name}/connect`, { method: 'POST', body: JSON.stringify({ secret }) }); toast('Connected'); wireConnectorsCard(); } catch (e) { toast(e.message, true); }
+    });
+    row.querySelector('.conn-writeback')?.addEventListener('change', async (e) => {
+      try { await api(`/api/vault/connectors/${name}/config`, { method: 'POST', body: JSON.stringify({ writeBack: e.target.checked }) }); toast('Saved'); } catch (err) { toast(err.message, true); }
+    });
+    row.querySelector('[data-conn-list]')?.addEventListener('click', async () => {
+      const target = row.querySelector('.conn-items');
+      target.innerHTML = 'Loading…';
+      try {
+        const items = await api(`/api/vault/connectors/${name}/list`, { method: 'POST', body: '{}' });
+        target.innerHTML = items.length
+          ? `<div style="max-height:200px;overflow:auto;border:1px solid var(--line,#333);border-radius:6px;padding:6px">${items.map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0"><input type="checkbox" class="conn-pick" value="${esc(i.externalId)}"/> ${esc(i.label)} <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div>
+            <button class="btn sm primary" data-conn-sync style="margin-top:6px">Sync selected</button>`
+          : '<span style="color:var(--ink-3)">No mirrorable items.</span>';
+        target.querySelector('[data-conn-sync]')?.addEventListener('click', async () => {
+          const externalIds = [...target.querySelectorAll('.conn-pick:checked')].map((b) => b.value);
+          if (!externalIds.length) { toast('Select items first', true); return; }
+          try { const r = await api(`/api/vault/connectors/${name}/sync`, { method: 'POST', body: JSON.stringify({ externalIds }) }); toast(`Mirrored ${r.count} item(s)`); wireVaultCards(); wireConnectorsCard(); } catch (e) { toast(e.message, true); }
+        });
+      } catch (e) { target.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; }
+    });
+  });
+}
+
+// ── agent mailbox: dedicated inbox for accounts agents register (§8) ──────────
+function agentMailCard() {
+  return `<div class="card" id="agent-mail-card">
+    <div class="section-h">Agent mailbox</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">A dedicated inbox for accounts your agents register — never your personal email. Point an inbound-mail webhook (own catch-all domain, or a hosted inbox) at <code>POST /api/agent-mail/ingest</code> (shared-secret authenticated) and set <code>KARMAX_AGENT_MAIL_DOMAIN</code>. Agents read codes/links with <code>check_agent_mail</code>.</p>
+    <div class="agent-mail-body">Loading…</div>
+  </div>`;
+}
+async function wireAgentMailCard() {
+  const box = $('#agent-mail-card');
+  if (!box) return;
+  const body = box.querySelector('.agent-mail-body');
+  let data = { address: '', configured: false, messages: [] };
+  try { data = await api('/api/agent-mail'); } catch {}
+  body.innerHTML = `<div class="form-row"><label>Agent address</label><input value="${esc(data.address)}" readonly class="mono" style="width:100%" /></div>
+    ${data.configured ? '' : '<div class="task-sub" style="color:var(--warn,#e0b15a);margin-bottom:6px">No mail domain configured — set KARMAX_AGENT_MAIL_DOMAIN to receive real mail. The address above still accepts test ingestion.</div>'}
+    <div style="font-weight:600;margin:6px 0 4px">Recent messages</div>
+    ${data.messages.length ? data.messages.map((m) => `<div class="queue-item"><div style="flex:1"><b>${esc(m.subject || '(no subject)')}</b> ${m.code ? `<span class="chip" style="color:var(--ok,#4ec9a3)">code ${esc(m.code)}</span>` : ''}<div class="task-sub" style="color:var(--ink-3)">from ${esc(m.from)}${m.link ? ` · <a href="${esc(m.link)}" target="_blank" rel="noopener">link</a>` : ''}</div></div></div>`).join('') : '<span style="color:var(--ink-3)">No messages yet.</span>'}`;
+}
+
 // Which accounts an agent may use (SPEC §7.3/§6.2) — a checkbox pool, all checked
 // by default. The checked set becomes the agent's credential + lease-rotation pool.
 function accountChecks(p, handles, logins) {
@@ -7391,6 +7463,8 @@ function wireGlobalSettings(organizationId) {
   hydrateWorkflows();
   hydrateGitProfiles();
   wireVaultCards();
+  wireConnectorsCard();
+  wireAgentMailCard();
   wirePaymentsCard('global');
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
