@@ -225,7 +225,13 @@ the declaration.
    label now point at the Secrets import. `GET .../secrets` returns
    `suggestions` parsed from `.env.example`/`.env.sample`/`.env.template` in
    local checkouts or the managed clone; the Secrets card offers them as
-   one-click chips.
+   one-click chips. *Hosted:* suggestions also read enrolled GitHub
+   repositories through the App's contents API (`GitHubAppService.fileContents`),
+   so a hosted project with no host checkout still gets them. The §5 migration
+   is live as `POST /api/projects/:id/import-copyglobs` (+ Secrets-card
+   button): `.env`-shaped matches parse into env secrets, small text files
+   become file-shaped secrets, large/binary files become seed objects, then
+   `copyGlobs` is cleared.
 3. **Project objects.** Local content-addressed store, `seed`/`readonly`
    mounts, checkpoint-delta capture, Review-gated `writeback` promotion; hosted
    backend is an S3 bucket behind the same interface.
@@ -252,8 +258,19 @@ the declaration.
    repo's own docker-compose file into one-click proposals with ready
    connection templates for postgres/mysql/redis/mongo;
    `/api/projects/:id/services` + `/compose-import` routes and a Settings →
-   Services card. Per-world launch is worktree-backend-only for now (host
-   Docker on 127.0.0.1); container/remote worlds get a warning pointing at
-   external-via-Secret, and in-environment services for cloud worlds remain
-   the PLAN-cloud environment-build follow-up. devcontainer.json import also
-   remains follow-up work.
+   Services card. *Cloud worlds:* launch goes THROUGH the world contract
+   (`world.exec` docker; seeds ride the world filesystem under a git-excluded
+   `.karmax-services/`), so any backend whose environment includes Docker —
+   including E2B/Daytona sandboxes — runs its services next to the code with
+   `{host}`=127.0.0.1 correct in that world's own network namespace; a world
+   without Docker warns and points at external-via-Secret. Host containers
+   carry `karmax.task` + `karmax.home` labels; teardown and the boot-time
+   orphan sweep (`sweepOrphanedServiceContainers`, mirrors `reapOrphans`) go
+   by label, scoped to this installation. Checkpoints pin object-mount
+   versions (`WorldCheckpoint.objectMounts`), so restore re-materializes
+   exactly what the checkpoint saw regardless of later promotions. The shared
+   `worldRuntimeEnv` resolver injects service+secret env into agent turns, the
+   interactive terminal, and review-action runs alike. Remaining follow-ups:
+   PLAN-cloud environment builds (bake Docker + images into cloud templates so
+   in-sandbox services are fast and guaranteed rather than
+   template-dependent), and devcontainer.json import.

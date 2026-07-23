@@ -122,6 +122,32 @@ describe('object mounts in worlds (real worktree + checkpoint)', () => {
     await world.destroy();
   });
 
+  it('restores mounts at their CHECKPOINT-TIME versions, ignoring later promotions', async () => {
+    const objectStore = new LocalObjectStore(path.join(dir, 'objects'));
+    const projects = new ProjectObjects(store, objectStore);
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(home));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker);
+    const project = store.createProject('Pin', { repos: [repo] });
+    await projects.put(project.id, { path: 'fixtures/pinned.txt', mode: 'seed', data: Buffer.from('v1') });
+
+    const world = await worlds.create('worktree', { taskId: 'pin1', repo, base: 'main', target: 'main' });
+    world.handle.meta = { ...world.handle.meta,
+      objectMounts: await materializeObjectMounts(world, await projects.resolved(project.id)) };
+    store.registerWorld(world.handle, project.id);
+    const checkpoint = await checkpoints.checkpoint(world.handle as any);
+    expect(checkpoint.objectMounts).toEqual([expect.objectContaining({ path: 'fixtures/pinned.txt' })]);
+
+    // The project moves on; the checkpoint must not.
+    await projects.promote(project.id, 'fixtures/pinned.txt', Buffer.from('v2-promoted-later'));
+    const restored = await checkpoints.restore(checkpoint.id);
+    const restoredWorld = await worlds.open(restored);
+    expect(await restoredWorld.readFile('fixtures/pinned.txt')).toBe('v1');
+    await restoredWorld.destroy();
+    await world.destroy().catch(() => undefined);
+  });
+
   it('maps world-relative paths to their enclosing repo', async () => {
     const world = await new WorktreeProvider(home).create({ taskId: 'obj2', repo, base: 'main', target: 'main' });
     const enclosing = enclosingRepo(world.handle, 'fixtures/dev.sqlite');

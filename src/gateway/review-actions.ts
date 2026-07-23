@@ -61,7 +61,8 @@ export class ReviewActionRunner {
   private commandPoll: NodeJS.Timeout;
 
   constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService,
-    private access?: import('../world/access.js').WorldAccessService) {
+    private access?: import('../world/access.js').WorldAccessService,
+    private broker?: import('../autonomy/broker.js').CredentialBroker) {
     this.commandPoll = setInterval(() => {
       for (const rec of this.procs.values()) {
         this.store.heartbeatExecution(rec.procId);
@@ -108,7 +109,11 @@ export class ReviewActionRunner {
     let process: WorldProcess;
     try {
       const world = await this.worlds.open(opts.world);
-      process = await world.startProcess({ command: opts.command });
+      // The same project runtime env agent turns get (PLAN-state): a human's
+      // "run tests" must see the DATABASE_URL the agent's run saw.
+      const { worldRuntimeEnv } = await import('../world/runtime-env.js');
+      const env = worldRuntimeEnv(this.store, this.broker, world.handle, opts.taskId);
+      process = await world.startProcess({ command: opts.command, ...(Object.keys(env).length ? { env } : {}) });
     } catch (error) {
       this.store.appendExecutionFrame(procId, `${error instanceof Error ? error.message : String(error)}\n`, 'system');
       this.store.finishExecution(procId, null, 'failed');

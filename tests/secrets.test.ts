@@ -112,6 +112,39 @@ describe('envExampleNames', () => {
   });
 });
 
+describe('importCopyGlobs (the copyGlobs exit ramp)', () => {
+  it('classifies matched files into env secrets, file secrets, and objects', async () => {
+    const { Store } = await import('../src/store/db.js');
+    const { LocalObjectStore } = await import('../src/store/objects.js');
+    const { ProjectObjects } = await import('../src/store/project-objects.js');
+    const { importCopyGlobs } = await import('../src/store/state-import.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cg-'));
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-cgstate-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.env'), 'DATABASE_URL=postgres://x\nSTRIPE_KEY=sk_1\n');
+      fs.writeFileSync(path.join(dir, 'service-account.json'), '{"key":"small text"}');
+      fs.writeFileSync(path.join(dir, 'weights.bin'), Buffer.from([0, 1, 2, 3]));
+      const store = new Store(':memory:');
+      const project = store.createProject('CG', { repos: [dir], copyGlobs: ['.env', '*.json', 'weights.bin'] });
+      const broker = new CredentialBroker(new Vault(path.join(state, 'vault')));
+      const secrets = new ProjectSecrets(store, broker);
+      const objects = new ProjectObjects(store, new LocalObjectStore(path.join(state, 'objects')));
+      const result = await importCopyGlobs({ project, secrets, objects });
+      expect(result.envSecrets.sort()).toEqual(['DATABASE_URL', 'STRIPE_KEY']);
+      expect(result.fileSecrets).toEqual(['service-account.json']);
+      expect(result.objects).toEqual(['weights.bin']);
+      // .env parsed into env secrets; the json became a file-shaped secret at its path.
+      expect(secrets.env(project.id, {}).DATABASE_URL).toBe('postgres://x');
+      expect(secrets.files(project.id, {})).toEqual([
+        { path: 'service-account.json', mode: 0o600, value: '{"key":"small text"}' }]);
+      expect(objects.list(project.id)).toEqual([expect.objectContaining({ path: 'weights.bin', mode: 'seed', bytes: 4 })]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(state, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('materializeFileSecrets (real worktree)', () => {
   let home: string;
   let repo: string;

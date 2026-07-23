@@ -23,7 +23,8 @@ import { ProjectObjects } from '../store/project-objects.js';
 import { ProjectServices } from '../store/project-services.js';
 import { materializeFileSecrets } from '../world/secrets.js';
 import { materializeObjectMounts } from '../world/mounts.js';
-import { destroyWorldServices, launchWorldServices, serviceEnvManifest } from '../world/services.js';
+import { destroyWorldServices, launchWorldServices } from '../world/services.js';
+import { worldRuntimeEnv } from '../world/runtime-env.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
@@ -319,20 +320,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
   }
 
-  /** JIT env-shaped project secrets for a subprocess in this world (PLAN-state
-   *  §3.1): resolved from the vault per spawn, never persisted in the handle or
-   *  journaled. Empty when the project has none or resolution fails — the turn
-   *  then runs without them rather than not at all. */
+  /** JIT project runtime env (service connections + env-shaped secrets) for a
+   *  subprocess in this world (PLAN-state §3.1/§3.3): resolved from the vault
+   *  per spawn, never persisted in the handle or journaled. Empty on failure —
+   *  the turn then runs without them rather than not at all. */
   function secretEnvFor(handle: WorldHandle, taskId?: string): Record<string, string> {
-    const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : undefined;
-    if (!projectId) return {};
-    try {
-      // Per-world service connection env first (throwaway values recorded on
-      // the handle), then vault-resolved secrets — secrets win on a name clash.
-      return { ...serviceEnvManifest(handle.meta), ...projectSecrets.env(projectId, { taskId }) };
-    } catch {
-      return serviceEnvManifest(handle.meta);
-    }
+    return worldRuntimeEnv(store, deps.broker, handle, taskId);
   }
 
   function brokerAuthFor(handle: WorldHandle, taskId?: string): GitBrokerAuth {
@@ -501,15 +494,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // Launch per-world service instances (PLAN-state §3.3): a private
         // container per declared service, seeded from the object store, its
         // connection env recorded on the handle (per-world throwaway values,
-        // not secrets). Host-Docker services are reachable on 127.0.0.1 only
-        // from host-side worlds — other backends surface a warning instead.
+        // not secrets). Launch goes THROUGH the world's own exec, so a cloud
+        // sandbox with Docker runs its services next to the code; a world
+        // without Docker degrades to a warning pointing at external-via-Secret.
         if (projectId) {
           try {
-            const services = new ProjectServices(store).list(projectId);
-            const perWorld = services.filter((s) => s.kind === 'per-world');
-            if (perWorld.length && args.kind !== 'worktree') {
-              record(args.taskId, 'world.warning', { warning: `per-world services (${perWorld.map((s) => s.name).join(', ')}) are launched for worktree worlds only — declare them external (a connection Secret) for ${args.kind} worlds` });
-            } else if (perWorld.length) {
+            const perWorld = new ProjectServices(store).list(projectId).filter((s) => s.kind === 'per-world');
+            if (perWorld.length) {
               const seeds = new Map<string, Buffer>();
               if (deps.objects) {
                 const projectObjects = new ProjectObjects(store, deps.objects);
@@ -519,7 +510,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   if (mount) seeds.set(service.seedObject, await projectObjects.data(projectId, mount.object));
                 }
               }
-              const launched = await launchWorldServices(args.taskId, perWorld, seeds);
+              const launched = await launchWorldServices(world, args.taskId, perWorld, seeds);
               for (const warning of launched.warnings) record(args.taskId, 'world.warning', { warning });
               if (launched.containers.length) {
                 world.handle.meta = { ...world.handle.meta,

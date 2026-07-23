@@ -138,11 +138,19 @@ export function envExampleNames(dirs: string[]): string[] {
       } catch {
         continue;
       }
-      for (const line of text.split('\n')) {
-        const m = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-        if (m) names.add(m[1]!);
-      }
+      for (const name of envExampleNamesFromText(text)) names.add(name);
     }
+  }
+  return [...names];
+}
+
+/** The name-extraction half of {@link envExampleNames}, for content that
+ * arrives without a filesystem (the GitHub contents API on hosted). */
+export function envExampleNamesFromText(text: string): string[] {
+  const names = new Set<string>();
+  for (const line of text.split('\n')) {
+    const m = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+    if (m) names.add(m[1]!);
   }
   return [...names];
 }

@@ -163,6 +163,10 @@ export interface WorldCheckpoint {
     headSha?: string;
   }>;
   filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
+  /** Object-mount versions AT CHECKPOINT TIME (PLAN-state §3.2): restore
+   *  re-materializes exactly these shas (blobs are content-addressed and
+   *  kept), so a later promotion cannot change what a restored world sees. */
+  objectMounts?: Array<{ path: string; object: string; mode: 'seed' | 'readonly' | 'writeback' }>;
   createdAt: number;
 }
 

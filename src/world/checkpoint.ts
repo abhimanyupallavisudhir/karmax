@@ -52,7 +52,7 @@ export class WorldCheckpointService {
       const status = await world.exec('git', ['status', '--porcelain=v1', '-z'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
-        if (change.path === '.env' || change.path.startsWith('.karmax-injection/')) continue;
+        if (change.path === '.env' || change.path.startsWith('.karmax-injection/') || change.path.startsWith('.karmax-services/')) continue;
         const relative = worldRepos(world.handle).length > 1 ? `${repo.name}/${change.path}` : change.path;
         if (secretFiles.has(relative) || readonlyMounts.has(relative)) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
@@ -91,9 +91,11 @@ export class WorldCheckpointService {
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
     await this.objects.put(objectKey, encrypted);
+    const mountManifest = objectMountManifest(handle.meta);
     const checkpoint: WorldCheckpoint = {
       id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
+      ...(mountManifest.length ? { objectMounts: mountManifest } : {}),
       repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length }, createdAt: Date.now(),
     };
     this.store.saveWorldCheckpoint(checkpoint);
@@ -132,12 +134,19 @@ export class WorldCheckpointService {
       branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
       ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
       network: executionConfig.network, environment: executionConfig.environment, resources: executionConfig.resources });
-    // Object mounts materialize first (current project versions), then the
-    // delta applies on top — the task's own modified copies win.
+    // Object mounts materialize first, then the delta applies on top — the
+    // task's own modified copies win. Pinned checkpoint-time versions are
+    // preferred (blobs are content-addressed and kept, so a promotion since
+    // the checkpoint cannot change what this world sees); checkpoints from
+    // before pinning fall back to the registry's current versions.
     let mountManifest: Array<{ path: string; object: string; mode: 'seed' | 'readonly' | 'writeback' }> = [];
     try {
-      mountManifest = await materializeObjectMounts(world,
-        await new ProjectObjects(this.store, this.objects).resolved(checkpoint.projectId));
+      const projectObjects = new ProjectObjects(this.store, this.objects);
+      const mounts = checkpoint.objectMounts?.length
+        ? await Promise.all(checkpoint.objectMounts.map(async (m) => ({
+            path: m.path, mode: m.mode, object: m.object, data: await projectObjects.data(checkpoint.projectId, m.object) })))
+        : await projectObjects.resolved(checkpoint.projectId);
+      mountManifest = await materializeObjectMounts(world, mounts);
     } catch { /* world remains usable without them */ }
     for (const file of delta.files) {
       const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;

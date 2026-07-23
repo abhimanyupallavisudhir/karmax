@@ -178,6 +178,24 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(after.services).toEqual([]);
   });
 
+  it('imports copyGlobs into secrets/objects and clears the setting', async () => {
+    const os = await import('node:os');
+    const dir = fs.mkdtempSync(`${os.tmpdir()}/karmax-cgimp-`);
+    fs.writeFileSync(`${dir}/.env`, 'IMPORTED_KEY=v1\n');
+    fs.writeFileSync(`${dir}/notes.txt`, 'small text file');
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Globby' }) })).json();
+    h.store.updateProjectConfig(project.id, { repos: [dir], copyGlobs: ['.env', 'notes.txt'] } as any);
+    const result: any = await (await fetch(`${base}/api/projects/${project.id}/import-copyglobs`, {
+      method: 'POST', headers: auth(), body: '{}' })).json();
+    expect(result.envSecrets).toEqual(['IMPORTED_KEY']);
+    expect(result.fileSecrets).toEqual(['notes.txt']);
+    expect(result.cleared).toBe(true);
+    expect(h.store.getProject(project.id)!.config.copyGlobs).toEqual([]);
+    const listed: any = await (await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })).json();
+    expect(listed.secrets.map((s: any) => s.name).sort()).toEqual(['IMPORTED_KEY', 'NOTES_TXT']);
+  });
+
   it('suggests secret names from the repo’s .env.example', async () => {
     const os = await import('node:os');
     const dir = fs.mkdtempSync(`${os.tmpdir()}/karmax-envex-`);

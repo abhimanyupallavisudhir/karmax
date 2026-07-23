@@ -49,6 +49,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/git-profiles/preflight?projectId=', 'POST /api/git-profiles/default',
     'GET|POST /api/projects/:projectId/secrets (POST {name, value?, file?, mode?} upserts; {env: "<pasted .env>"} bulk-imports; values are write-only)',
     'DELETE /api/projects/:projectId/secrets/:name',
+    'POST /api/projects/:projectId/import-copyglobs (classify copyGlobs matches into secrets/objects, then clear copyGlobs)',
   ],
   wiki: [
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',

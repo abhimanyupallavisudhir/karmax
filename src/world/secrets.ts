@@ -22,24 +22,31 @@ export async function materializeFileSecrets(world: World, files: ResolvedFileSe
     // The enclosing repo: the only one (single-repo world) or the one whose
     // subdirectory prefixes the path. A path outside every repo needs no
     // exclusion — no repo's status can see it.
-    const repo = repos.length <= 1 ? repos[0] : repos.find((r) => rel === r.name || rel.startsWith(`${r.name}/`));
-    if (repo) {
-      const inRepo = repos.length > 1 && rel.startsWith(`${repo.name}/`) ? rel.slice(repo.name.length + 1) : rel;
-      const pattern = `/${inRepo}`;
-      // Exclude WORKTREE-scoped, not via the shared info/exclude (--git-path
-      // resolves that to the common dir, which would leak the pattern into the
-      // user's own checkout and sibling worlds). Same mechanism as the git
-      // identity: enable worktreeConfig (additive, idempotent) and point this
-      // worktree's core.excludesFile at an exclude file in its private git dir.
-      await world.exec('bash', ['-c',
-        `set -e; git config extensions.worktreeConfig true; d="$(git rev-parse --absolute-git-dir)"; mkdir -p "$d/info"; ` +
-        `grep -qxF "$1" "$d/info/exclude" 2>/dev/null || echo "$1" >> "$d/info/exclude"; ` +
-        `git config --worktree core.excludesFile "$d/info/exclude"`,
-        'karmax-secret-exclude', pattern], { cwd: repo.root }).catch(() => undefined);
-    }
+    await ensureWorldExcluded(world, rel);
     written.push(rel);
   }
   return written;
+}
+
+/**
+ * Git-exclude a world-relative path WORKTREE-scoped, not via the shared
+ * info/exclude (--git-path resolves that to the common dir, which would leak
+ * the pattern into the user's own checkout and sibling worlds). Same mechanism
+ * as the git identity: enable worktreeConfig (additive, idempotent) and point
+ * this worktree's core.excludesFile at an exclude file in its private git dir.
+ * Best-effort: backends without a shell keep the file; manifests are the net.
+ */
+export async function ensureWorldExcluded(world: World, rel: string): Promise<void> {
+  const repos = worldRepos(world.handle);
+  const repo = repos.length <= 1 ? repos[0] : repos.find((r) => rel === r.name || rel.startsWith(`${r.name}/`));
+  if (!repo) return; // outside every repo — no status can see it
+  const inRepo = repos.length > 1 && rel.startsWith(`${repo.name}/`) ? rel.slice(repo.name.length + 1) : rel;
+  const pattern = `/${inRepo}`;
+  await world.exec('bash', ['-c',
+    `set -e; git config extensions.worktreeConfig true; d="$(git rev-parse --absolute-git-dir)"; mkdir -p "$d/info"; ` +
+    `grep -qxF "$1" "$d/info/exclude" 2>/dev/null || echo "$1" >> "$d/info/exclude"; ` +
+    `git config --worktree core.excludesFile "$d/info/exclude"`,
+    'karmax-exclude', pattern], { cwd: repo.root }).catch(() => undefined);
 }
 
 /** The manifest of secret-materialized paths a handle carries (never values). */

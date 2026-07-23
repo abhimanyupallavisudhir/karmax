@@ -6548,7 +6548,8 @@ async function hydrateProjectSecrets(proj) {
       ${suggestions.length ? `<div style="margin-top:6px;font-size:12px;color:var(--ink-3)">Named by this repo's .env example: ${suggestions.map((n) => `<button class="btn sm project-secret-suggest" data-name="${esc(n)}">＋ ${esc(n)}</button>`).join(' ')}</div>` : ''}
       <div class="inline-form" style="margin-top:8px"><input id="project-secret-name" placeholder="DATABASE_URL" style="max-width:190px"><input id="project-secret-value" type="password" placeholder="value (write-only)" style="flex:1;min-width:140px"><input id="project-secret-file" placeholder="as file at path (optional)" style="max-width:190px"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
       <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Values go to the vault and are never shown again. Re-saving a name with a blank value keeps the stored one.</div>
-      <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# comments, blank lines, and empty values are skipped" style="width:100%"></textarea><div class="inline-form"><button class="btn sm primary" id="project-secret-import">Import</button></div></details>`;
+      <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# comments, blank lines, and empty values are skipped" style="width:100%"></textarea><div class="inline-form"><button class="btn sm primary" id="project-secret-import">Import</button></div></details>
+      ${(proj.config.copyGlobs || []).length ? `<div class="inline-form" style="margin-top:6px"><button class="btn sm primary" id="project-copyglobs-import">Import copyGlobs (${esc((proj.config.copyGlobs || []).join(', '))}) into Secrets/Data</button></div><div style="font-size:11px;color:var(--ink-3)">.env files become secrets, other small text files become file secrets, large/binary files become Data objects — then copyGlobs is cleared and cloud worlds get them too.</div>` : ''}`;
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
       $('#project-secret-name').value = button.dataset.name;
       $('#project-secret-value').focus();
@@ -6573,6 +6574,16 @@ async function hydrateProjectSecrets(proj) {
         const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ env: $('#project-secret-env').value }) });
         toast(`Imported ${result.imported.length} ${result.imported.length === 1 ? 'secret' : 'secrets'}`);
         await hydrateProjectSecrets(proj);
+      } catch (error) { toast(error.message, true); }
+    });
+    $('#project-copyglobs-import')?.addEventListener('click', async () => {
+      try {
+        const result = await api(`/api/projects/${proj.id}/import-copyglobs`, { method: 'POST', body: '{}' });
+        const total = result.envSecrets.length + result.fileSecrets.length + result.objects.length;
+        toast(total ? `Imported ${total} item(s); copyGlobs cleared` : 'No matching files found to import', !total);
+        await loadProjects();
+        await hydrateProjectSecrets(projectById(proj.id));
+        await hydrateProjectObjects(projectById(proj.id));
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { box.textContent = error.message; }

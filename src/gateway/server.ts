@@ -129,6 +129,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/secrets(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/objects(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/services(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/import-copyglobs$/.test(p)) return 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/objects\/promote$/.test(p)) return 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
@@ -321,7 +322,7 @@ export class Gateway {
   private fanout: DurableEventFanout;
 
   constructor(private deps: GatewayDeps) {
-    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess);
+    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.broker);
     this.fanout = new DurableEventFanout(deps.store, deps.bus);
   }
 
@@ -473,7 +474,10 @@ export class Gateway {
         kind: 'terminal', label: 'Interactive terminal', command: '$SHELL', server: false,
         openUrls: [], runnerLeaseId: worldLeaseId });
       const world = await this.deps.worlds.open(handle);
-      term = await world.openPty({ cols: 80, rows: 24 });
+      // The terminal sees the same project runtime env agent turns get.
+      const { worldRuntimeEnv } = await import('../world/runtime-env.js');
+      const runtimeEnv = worldRuntimeEnv(this.deps.store, this.deps.broker, world.handle, taskId);
+      term = await world.openPty({ cols: 80, rows: 24, ...(Object.keys(runtimeEnv).length ? { env: runtimeEnv } : {}) });
       this.deps.store.setExecutionRunning(executionId);
       this.deps.store.appendExecutionFrame(executionId, 'Terminal opened.\n', 'system');
     } catch (error) {
@@ -2437,8 +2441,10 @@ export class Gateway {
         try {
           if (method === 'GET' && !name) {
             // Suggestions: the names the repo's own .env example files declare
-            // (phase 2) — resolvable from a local checkout or the managed clone.
-            const { envExampleNames } = await import('../autonomy/project-secrets.js');
+            // (phase 2). Local checkouts and managed clones read from disk;
+            // enrolled GitHub repositories — the only shape hosted has — read
+            // through the App's contents API, so hosted suggests too.
+            const { envExampleNames, envExampleNamesFromText } = await import('../autonomy/project-secrets.js');
             const { managedRepoPath } = await import('../world/worktree.js');
             const { expandPath } = await import('../util/expand.js');
             const fs = await import('node:fs');
@@ -2448,8 +2454,17 @@ export class Gateway {
               const managed = managedRepoPath(source);
               return fs.existsSync(managed) ? managed : undefined;
             }).filter((dir): dir is string => Boolean(dir));
+            const names = new Set(envExampleNames(dirs));
+            if (this.deps.githubApp) {
+              for (const linked of store.listProjectRepositories(project.id)) {
+                for (const file of ['.env.example', '.env.sample', '.env.template']) {
+                  const text = await this.deps.githubApp.fileContents(linked.repository, file);
+                  if (text) for (const n of envExampleNamesFromText(text)) names.add(n);
+                }
+              }
+            }
             const existing = new Set(secrets.list(project.id).map((s) => s.name));
-            const suggestions = envExampleNames(dirs).filter((n) => !existing.has(n)).sort();
+            const suggestions = [...names].filter((n) => !existing.has(n)).sort();
             return this.json(res, 200, { secrets: secrets.list(project.id), suggestions });
           }
           if (method === 'POST' && !name) {
@@ -2466,6 +2481,29 @@ export class Gateway {
             secrets.delete(project.id, name);
             return this.json(res, 200, { ok: true });
           }
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
+      // The copyGlobs exit ramp (PLAN-state §5): classify the matched
+      // gitignored files into secrets/objects, then clear copyGlobs — the
+      // project stops depending on the host checkout.
+      const importCopyGlobsMatch = p.match(/^\/api\/projects\/([^/]+)\/import-copyglobs$/);
+      if (importCopyGlobsMatch && method === 'POST') {
+        const project = store.getProject(importCopyGlobsMatch[1]!);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+        try {
+          const { importCopyGlobs } = await import('../store/state-import.js');
+          const { ProjectSecrets } = await import('../autonomy/project-secrets.js');
+          const { ProjectObjects } = await import('../store/project-objects.js');
+          const result = await importCopyGlobs({ project,
+            secrets: new ProjectSecrets(store, this.deps.broker),
+            ...(this.deps.objects ? { objects: new ProjectObjects(store, this.deps.objects) } : {}) });
+          const imported = result.envSecrets.length + result.fileSecrets.length + result.objects.length;
+          if (imported) store.updateProjectConfig(project.id, { copyGlobs: [] } as any);
+          return this.json(res, 200, { ...result, cleared: imported > 0 });
         } catch (e) {
           return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
         }
