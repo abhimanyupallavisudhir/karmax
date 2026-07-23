@@ -458,16 +458,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
           repositoryIds: linkedRepositories.map((candidate) => candidate.repository.id) };
         // Inject project secrets (PLAN-state §3.1): file-shaped ones are written
-        // 0600 + git-excluded now; env-shaped ones resolve JIT per subprocess.
-        // The handle records only the materialization manifest — paths and
-        // names, never values. Failure degrades to a warning: the world is
-        // still usable, and the missing secret surfaces where it is first used.
+        // 0600 + git-excluded now — uniformly across backends, remote included
+        // (writeFile/exec are provider duties); env-shaped ones resolve JIT per
+        // subprocess. The handle records only the materialization manifest —
+        // paths and names, never values. Failure degrades to a warning: the
+        // world is still usable, and the missing secret surfaces at first use.
         if (projectId) {
           try {
             const secrets = projectSecrets.list(projectId);
-            if (secrets.length && remote) {
-              record(args.taskId, 'world.warning', { warning: 'project secrets are not yet injected into remote worlds' });
-            } else if (secrets.length) {
+            if (secrets.length) {
               const manifest = await materializeFileSecrets(world, projectSecrets.files(projectId, { taskId: args.taskId }));
               const envNames = projectSecrets.envNames(projectId);
               world.handle.meta = { ...world.handle.meta,
@@ -932,15 +931,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Git-profile credentials for the agent subprocess (PLAN-git-config.md
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(() => {
-            const local = !isRemote(args.worldHandle.kind);
-            const gitEnv = local ? gitEnvFor(args.worldHandle, args.taskId) : {};
-            // Project secrets first so they can never shadow karmax's own vars.
-            const secretEnv = local ? secretEnvFor(args.worldHandle, args.taskId) : {};
+            const gitEnv = isRemote(args.worldHandle.kind) ? {} : gitEnvFor(args.worldHandle, args.taskId);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
-            const extraEnv = { ...secretEnv, ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
-            return Object.keys(extraEnv).length ? { extraEnv } : {};
+            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            // Env-shaped project secrets travel as their own field: adapters
+            // merge them lowest-precedence locally and forward them by name
+            // across the remote allowlist boundary (PLAN-state phase 2).
+            const secretEnv = secretEnvFor(args.worldHandle, args.taskId);
+            return { ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
+              ...(Object.keys(secretEnv).length ? { secretEnv } : {}) };
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),

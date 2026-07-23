@@ -119,7 +119,7 @@ export class E2BWorldProvider implements WorldProvider {
       const { repos, root, warnings } = await provisionGitRepos(provisioner, spec, {
         root: ROOT, home: HOME,
         sshUrlError: 'E2B worlds require repositories as SSH Git URLs (for example git@github.com:org/repo.git), not local paths or HTTPS URLs',
-        copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote E2B world',
+        copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote E2B world — import them as project Secrets (Settings → Secrets), which inject into every backend',
       });
       // Clone credentials exist only during trusted provisioning. The agent's
       // execution environment gets a read/write checkout but no reusable secret;

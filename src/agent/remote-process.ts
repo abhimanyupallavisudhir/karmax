@@ -107,8 +107,10 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
 }
 
 /** Minimal environment passed across the trust boundary. Authentication lives in
- * the seeded home; only explicit turn-scoped values and provider tuning cross. */
-export function remoteAgentEnv(provider: Provider, home: string, source: Record<string, string | undefined>): Record<string, string> {
+ * the seeded home; only explicit turn-scoped values and provider tuning cross.
+ * `forward` names additional keys the caller vouches for — the project's own
+ * env-shaped secrets (PLAN-state §3.1), which the sandboxed code must see. */
+export function remoteAgentEnv(provider: Provider, home: string, source: Record<string, string | undefined>, forward: string[] = []): Record<string, string> {
   const out: Record<string, string> = {
     ...(provider === 'claude' ? { CLAUDE_CONFIG_DIR: home } : { CODEX_HOME: home }),
   };
@@ -121,6 +123,7 @@ export function remoteAgentEnv(provider: Provider, home: string, source: Record<
     'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING', 'CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH',
     'CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH', 'CLAUDE_CODE_QUESTION_PREVIEW_FORMAT',
     'ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+    ...forward,
   ]) {
     const value = source[key];
     if (value) out[key] = value;

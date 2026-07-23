@@ -105,7 +105,7 @@ export class DaytonaWorldProvider implements WorldProvider {
       const provisioned = await provisionGitRepos(provisioner, spec, {
         root, home,
         sshUrlError: 'Daytona worlds require repositories as SSH Git URLs, not local paths or HTTPS URLs',
-        copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote Daytona world',
+        copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote Daytona world — import them as project Secrets (Settings → Secrets), which inject into every backend',
       });
       await provisionRun(provisioner, `rm -f ${quote(path.posix.join(home, '.ssh'))}/karmax-auth-*`);
       const handle: WorldHandle = {

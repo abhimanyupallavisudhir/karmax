@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { ProjectSecret } from '../domain/types.js';
 import { CredentialBroker } from './broker.js';
 import { worldRelativePath } from '../world/types.js';
@@ -121,6 +123,28 @@ export class ProjectSecrets {
     if (!this.broker) throw new Error('project secrets: no credential broker configured');
     return this.broker;
   }
+}
+
+/** Secret names a repo's .env example files declare (PLAN-state phase 2): the
+ * repo already names its secrets — onboarding only has to ask for the values.
+ * Unlike parseEnv, blank values count here: `STRIPE_KEY=` IS the declaration. */
+export function envExampleNames(dirs: string[]): string[] {
+  const names = new Set<string>();
+  for (const dir of dirs) {
+    for (const file of ['.env.example', '.env.sample', '.env.template']) {
+      let text: string;
+      try {
+        text = fs.readFileSync(path.join(dir, file), 'utf8');
+      } catch {
+        continue;
+      }
+      for (const line of text.split('\n')) {
+        const m = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+        if (m) names.add(m[1]!);
+      }
+    }
+  }
+  return [...names];
 }
 
 /** Parse .env text: KEY=value lines, optional `export `, quotes, # comments. */

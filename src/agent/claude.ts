@@ -333,8 +333,11 @@ export class ClaudeAdapter implements AgentAdapter {
       provider: 'claude',
       configHome: input.resolvedAuth?.configHome,
       // A captured setup-token login: re-supply it (scrubbedEnv strips it by default),
-      // plus any JIT-resolved subprocess env (git profile credentials, §4B).
+      // plus any JIT-resolved subprocess env (git profile credentials, §4B) and the
+      // project's env-shaped secrets (PLAN-state §3.1) — secrets first, so they can
+      // never shadow karmax's own variables.
       extra: {
+        ...(input.secretEnv ?? {}),
         ...(input.extraEnv ?? {}),
         ...(input.resolvedAuth?.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } : {}),
       },
@@ -342,7 +345,7 @@ export class ClaudeAdapter implements AgentAdapter {
     if (remoteHome) env = remoteAgentEnv('claude', remoteHome.absolute, {
       ...env,
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
-    });
+    }, Object.keys(input.secretEnv ?? {}));
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
@@ -451,7 +454,7 @@ export class ClaudeAdapter implements AgentAdapter {
         //    task attribution and an escalating kill.
         spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
           if (remote && remoteHome) {
-            const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env);
+            const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env, Object.keys(input.secretEnv ?? {}));
             if (remoteHome.runtimeBin) remoteEnv.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
             return spawnRemoteAgentProcess({
               world: input.world,

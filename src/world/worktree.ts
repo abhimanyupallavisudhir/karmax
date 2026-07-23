@@ -150,10 +150,8 @@ export class WorktreeProvider implements WorldProvider {
    * configured remote for optional push/PR policy. Concurrent first tasks share
    * one in-process clone promise so they cannot race a partially-created repo. */
   private async managedClone(source: string, spec: WorldSpec): Promise<string> {
-    const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
-    const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
-    const parent = path.join(this.home, '.repositories');
-    const destination = path.join(parent, `${name}-${hash}`);
+    const destination = managedRepoPath(source, this.home);
+    const parent = path.dirname(destination);
     const existing = managedRepoClones.get(destination);
     if (existing) return existing;
     const clone = this.cloneManagedRepo(source, destination, parent, spec);
@@ -367,6 +365,14 @@ class WorktreeWorld implements World {
 /** The repo's basename (its worktree subdirectory name in a multi-repo world). */
 function repoName(repo: string): string {
   return (repo.split(/[/:]/).filter(Boolean).pop() ?? 'repo').replace(/\.git$/i, '');
+}
+
+/** Where a configured network source's managed clone lives (whether or not it
+ * exists yet) — the stable host-side checkout host features may inspect. */
+export function managedRepoPath(source: string, home = paths().worlds): string {
+  const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
+  const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
+  return path.join(home, '.repositories', `${name}-${hash}`);
 }
 
 /** Git's common network transports, including file:// for self-hosted remotes. */

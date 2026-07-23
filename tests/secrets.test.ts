@@ -6,6 +6,8 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { ProjectSecrets, parseEnv, secretHandle } from '../src/autonomy/project-secrets.js';
 import { materializeFileSecrets, secretFileManifest } from '../src/world/secrets.js';
+import { envExampleNames } from '../src/autonomy/project-secrets.js';
+import { remoteAgentEnv } from '../src/agent/remote-process.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 
@@ -84,6 +86,29 @@ describe('ProjectSecrets', () => {
     secrets.env(projectId, { taskId: 't1' });
     const grants = broker.audit_log().filter((e) => e.granted);
     expect(grants.some((e) => e.handle === secretHandle(projectId, 'KEY') && e.taskId === 't1')).toBe(true);
+  });
+});
+
+describe('remote env forwarding (phase 2)', () => {
+  it('forwards declared secret names across the allowlist boundary, nothing else', () => {
+    const source = { KARMAX_TOKEN: 'kt', DATABASE_URL: 'postgres://x', HOST_ONLY: 'leak' };
+    const env = remoteAgentEnv('claude', '/home/user/.claude-home', source, ['DATABASE_URL']);
+    expect(env.DATABASE_URL).toBe('postgres://x');
+    expect(env.KARMAX_TOKEN).toBe('kt');
+    expect(env.HOST_ONLY).toBeUndefined();
+  });
+});
+
+describe('envExampleNames', () => {
+  it('collects names from .env example files, blank values included', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-envex-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.env.example'), '# infra\nDATABASE_URL=\nexport STRIPE_KEY=sk_replace_me\nnot a line\n');
+      expect(envExampleNames([dir]).sort()).toEqual(['DATABASE_URL', 'STRIPE_KEY']);
+      expect(envExampleNames([path.join(dir, 'missing')])).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

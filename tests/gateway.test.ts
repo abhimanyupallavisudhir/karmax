@@ -129,6 +129,19 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(after.secrets.map((s: any) => s.name)).toEqual(['STRIPE_KEY']);
   });
 
+  it('suggests secret names from the repo’s .env.example', async () => {
+    const os = await import('node:os');
+    const dir = fs.mkdtempSync(`${os.tmpdir()}/karmax-envex-`);
+    fs.writeFileSync(`${dir}/.env.example`, 'DATABASE_URL=\nOPENAI_API_KEY=\n');
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Suggestive' }) })).json();
+    h.store.updateProjectConfig(project.id, { repos: [dir] } as any);
+    await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'DATABASE_URL', value: 'postgres://dev' }) });
+    const listed: any = await (await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })).json();
+    expect(listed.suggestions).toEqual(['OPENAI_API_KEY']); // declared minus already-defined
+  });
+
   it('deletes provider worlds before committing project deletion', async () => {
     const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
       body: JSON.stringify({ name: 'Disposable' }) })).json();

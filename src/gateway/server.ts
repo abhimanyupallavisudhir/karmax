@@ -2400,7 +2400,23 @@ export class Gateway {
         const secrets = new ProjectSecrets(store, this.deps.broker);
         const name = projectSecretsMatch[2] ? decodeURIComponent(projectSecretsMatch[2]) : undefined;
         try {
-          if (method === 'GET' && !name) return this.json(res, 200, { secrets: secrets.list(project.id) });
+          if (method === 'GET' && !name) {
+            // Suggestions: the names the repo's own .env example files declare
+            // (phase 2) — resolvable from a local checkout or the managed clone.
+            const { envExampleNames } = await import('../autonomy/project-secrets.js');
+            const { managedRepoPath } = await import('../world/worktree.js');
+            const { expandPath } = await import('../util/expand.js');
+            const fs = await import('node:fs');
+            const dirs = (project.config.repos ?? []).map((source) => {
+              const local = expandPath(source);
+              if (fs.existsSync(local)) return local;
+              const managed = managedRepoPath(source);
+              return fs.existsSync(managed) ? managed : undefined;
+            }).filter((dir): dir is string => Boolean(dir));
+            const existing = new Set(secrets.list(project.id).map((s) => s.name));
+            const suggestions = envExampleNames(dirs).filter((n) => !existing.has(n)).sort();
+            return this.json(res, 200, { secrets: secrets.list(project.id), suggestions });
+          }
           if (method === 'POST' && !name) {
             const b = await this.body(req);
             if (typeof b.env === 'string') return this.json(res, 200, { imported: secrets.importEnv(project.id, b.env) });

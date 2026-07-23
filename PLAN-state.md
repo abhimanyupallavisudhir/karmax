@@ -215,6 +215,17 @@ the declaration.
 2. **Secrets in cloud worlds.** E2B provisioning-time env + file
    materialization; Daytona opaque substitution. Deprecate `copyGlobs` behind
    the import flow. Hosted onboarding asks for values named by `.env.example`.
+   *Shipped:* injection is uniform across backends — file secrets materialize
+   through the same `world.writeFile`/`exec` provider duties remote worlds
+   already implement (no provisioning-time special case needed), and env
+   secrets travel as their own `secretEnv` turn input that adapters merge
+   lowest-precedence locally and forward BY NAME across the remote env
+   allowlist (`remoteAgentEnv(..., forward)`), so per-spawn JIT resolution
+   works identically in E2B/Daytona. `copyGlobs` warnings and its settings
+   label now point at the Secrets import. `GET .../secrets` returns
+   `suggestions` parsed from `.env.example`/`.env.sample`/`.env.template` in
+   local checkouts or the managed clone; the Secrets card offers them as
+   one-click chips.
 3. **Project objects.** Local content-addressed store, `seed`/`readonly`
    mounts, checkpoint-delta capture, Review-gated `writeback` promotion; hosted
    backend is an S3 bucket behind the same interface.

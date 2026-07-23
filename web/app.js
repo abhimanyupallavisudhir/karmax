@@ -6537,13 +6537,18 @@ async function hydrateProjectGitProfile(proj) {
 async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box) return;
   try {
-    const { secrets } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
     box.innerHTML = `
       ${secrets.map((s) => `<div class="queue-item"><div style="flex:1"><b>${esc(s.name)}</b> <span class="chip">${s.file ? `file · ${esc(s.file)}` : 'env var'}</span></div><button class="btn sm project-secret-delete" data-name="${esc(s.name)}">Remove</button></div>`).join('')
         || '<p class="task-sub">No secrets yet. Add the values your code reads at runtime — each task world gets them as env vars (or a file), and they never enter git, checkpoints, or events.</p>'}
+      ${suggestions.length ? `<div style="margin-top:6px;font-size:12px;color:var(--ink-3)">Named by this repo's .env example: ${suggestions.map((n) => `<button class="btn sm project-secret-suggest" data-name="${esc(n)}">＋ ${esc(n)}</button>`).join(' ')}</div>` : ''}
       <div class="inline-form" style="margin-top:8px"><input id="project-secret-name" placeholder="DATABASE_URL" style="max-width:190px"><input id="project-secret-value" type="password" placeholder="value (write-only)" style="flex:1;min-width:140px"><input id="project-secret-file" placeholder="as file at path (optional)" style="max-width:190px"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
       <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Values go to the vault and are never shown again. Re-saving a name with a blank value keeps the stored one.</div>
       <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# comments, blank lines, and empty values are skipped" style="width:100%"></textarea><div class="inline-form"><button class="btn sm primary" id="project-secret-import">Import</button></div></details>`;
+    box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
+      $('#project-secret-name').value = button.dataset.name;
+      $('#project-secret-value').focus();
+    }));
     box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm(`Remove secret ${button.dataset.name}? Its stored value is deleted from the vault.`)) return;
       try { await api(`/api/projects/${proj.id}/secrets/${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' }); await hydrateProjectSecrets(proj); }

@@ -95,6 +95,10 @@ export interface TurnInput {
    *  git profile's GIT_SSH_COMMAND / GH_TOKEN (PLAN-git-config.md §4B), so an agent
    *  that pushes or runs `gh` does so as the project's git account. */
   extraEnv?: Record<string, string>;
+  /** Env-shaped project secrets (PLAN-state §3.1), resolved JIT (never journaled).
+   *  Kept apart from extraEnv because remote worlds pass env across the trust
+   *  boundary through an allowlist — these names are forwarded explicitly. */
+  secretEnv?: Record<string, string>;
   /** MCP servers the workflow gives its agents, beyond the platform baseline (SPEC §7.5). */
   agentMcp?: import('../contrib/manifests.js').AgentMcpServer[];
 }
