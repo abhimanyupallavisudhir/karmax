@@ -246,13 +246,15 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'check_agent_mail',
     description:
-      'Read the karmax agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Use it to complete "check your email for a code / confirmation link" steps: returns recent messages with any verification `code` and `link` already extracted. For a code sent to the user\'s own address instead, escalate with request_credential/raise_to_parent.',
+      'Read your organization\'s agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Use it to complete "check your email for a code / confirmation link" steps: returns the address to register with plus recent messages with any verification `code` and `link` already extracted. Mailboxes are per organization; you can only read your own. For a code sent to the user\'s own address instead, escalate with raise_to_parent.',
     parameters: {
       type: 'object',
       properties: {
+        organization_id: { type: 'string', description: 'Your organization id (named in your prompt).' },
         match: { type: 'string', description: 'Filter to messages mentioning this (e.g. the site name or sender).' },
         since: { type: 'number', description: 'Only messages received after this epoch-ms timestamp.' },
       },
+      required: ['organization_id'],
     },
   },
   {
@@ -551,7 +553,8 @@ export function platformToolHandlers(
       const q = new URLSearchParams();
       if (args?.match) q.set('match', String(args.match));
       if (args?.since) q.set('since', String(args.since));
-      return JSON.stringify(await platformRequest('GET', `/api/agent-mail${q.toString() ? `?${q}` : ''}`));
+      const org = encodeURIComponent(String(args?.organization_id ?? ''));
+      return JSON.stringify(await platformRequest('GET', `/api/organizations/${org}/agent-mail${q.toString() ? `?${q}` : ''}`));
     },
     async enroll_passkey(args) {
       return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/enroll', { domain: args?.domain, cdpUrl: args?.cdp_url }));

@@ -322,10 +322,17 @@ item lifecycle and the full pull model over HTTP).
    live in the vault under `connector:<name>:auth`. `/api/vault/connectors`
    surface + a Connectors card in Settings.
 5. **Account creation autonomy** ✅ — **Agent mailbox**
-   (`src/autonomy/agent-mail.ts`): a per-install dedicated address (never the
-   user's inbox), an inbound `POST /api/agent-mail/ingest` webhook
-   (shared-secret authenticated, before the session gate), code/link extraction,
-   and `check_agent_mail` on both rails. **Passkeys**
+   (`src/autonomy/agent-mail.ts`): a **per-organization** dedicated address
+   (the organization is the tenant boundary — a shared inbox would let one
+   tenant's agents read another's confirmation mails). Each org gets a random,
+   unguessable local part; the inbound `POST /api/agent-mail/ingest` webhook
+   (shared-secret authenticated, before the session gate) routes each message
+   to the organization owning the recipient (subaddress `+tags` fold in;
+   unknown recipients are dropped, never leaked into any tenant). Reads live at
+   `GET /api/organizations/:id/agent-mail`, so requestScope + the org-scoped
+   token check enforce tenancy — a cross-org agent token gets 403 (tested).
+   Code/link extraction and `check_agent_mail(organizationId, …)` on both
+   rails. **Passkeys**
    (`src/autonomy/passkey.ts` over shared `cdp.ts`): agent-enrolled via a CDP
    virtual authenticator (origin-verified), the manager holds the CDP session
    across the agent's create/sign-in click under a TTL; enrolled credentials
@@ -340,6 +347,13 @@ Implementation notes (phases 4–5):
   between `enroll_passkey` and `save_passkey`. `cdp.ts` is shared with §5B fill.
 - Connectors deliberately re-instantiate per request (cheap; CLIs are the state)
   and never cache secrets in memory beyond the call.
+- **Hosted-tenancy caveat (open):** the mailbox is organization-scoped, but the
+  vault items, connectors, and payment cards remain *installation* resources —
+  the same scope as Git accounts and agent logins (their cards say
+  "installation resource"). Correct for self-hosted; before hosted GA these
+  need organization-scoping the same way (items gain an `organizationId`,
+  routes move under `/api/organizations/:id/…`, Settings cards render per
+  org), tracked with the broader hosted work in PLAN-cloud.md.
 
 Implementation notes:
 - Existing installs keep their seeded role profiles (`seedProfiles` does not

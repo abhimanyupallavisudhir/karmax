@@ -55,8 +55,8 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/vault/passkey/enroll|save|login|release (agent-enrolled passkeys via CDP virtual authenticator)',
   ],
   agentMail: [
-    'GET /api/agent-mail?since=&match=&limit= (agent inbox address + messages, verification code/link extracted)',
-    'POST /api/agent-mail/ingest (inbound mail webhook; shared-secret authenticated, not a karmax token)',
+    'GET /api/organizations/:organizationId/agent-mail?since=&match=&limit= (per-organization agent inbox: address + messages, verification code/link extracted)',
+    'POST /api/agent-mail/ingest (inbound mail webhook; shared-secret authenticated, routed to the recipient organization)',
   ],
   wiki: [
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',

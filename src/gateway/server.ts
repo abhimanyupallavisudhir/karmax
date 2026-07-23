@@ -100,6 +100,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The wiki is the skills store: reads need the scope's read capability, edits
   // reuse skill:write (agents and developers can both grow it).
   if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
+  // The agent mailbox is a credential surface, org-scoped by its path (the
+  // token/session check enforces the tenant boundary from requestScope).
+  if (/^\/api\/organizations\/[^/]+\/agent-mail$/.test(p)) return read ? 'credential:read' : 'credential:write';
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
@@ -122,11 +125,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // Connectors: describe is read; connect/sync/config/write-back are admin.
   if (p.startsWith('/api/vault/connectors')) return read ? 'credential:read' : 'credential:write';
   if (p.startsWith('/api/vault')) return 'credential:read';
-  // Agent mailbox (PLAN-passwords.md §8): the inbound webhook authenticates with
-  // its own shared secret (like the GitHub webhook), so it needs no capability;
-  // reading/config is credential:read/write.
+  // The agent-mail inbound webhook authenticates with its own shared secret
+  // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
-  if (p.startsWith('/api/agent-mail')) return read ? 'credential:read' : 'credential:write';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return 'safe-mode:write';
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -676,7 +677,10 @@ export class Gateway {
       const { AgentMail } = await import('../autonomy/agent-mail.js');
       const b = await this.body(req);
       if (!b.to || !b.from) return this.json(res, 400, { error: 'to and from are required' });
-      return this.json(res, 200, new AgentMail(this.deps.store).ingest({ to: String(b.to), from: String(b.from), subject: b.subject ? String(b.subject) : undefined, text: String(b.text ?? '') }));
+      // Routed by recipient to the owning organization; unknown recipients are
+      // dropped (never leaked into any tenant's inbox). Never echo the message.
+      const { delivered } = new AgentMail(this.deps.store).ingest({ to: String(b.to), from: String(b.from), subject: b.subject ? String(b.subject) : undefined, text: String(b.text ?? '') });
+      return this.json(res, 200, { delivered });
     }
     const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
     if (githubManifestCallback && method === 'GET' && this.deps.githubApp && this.deps.identity) {
@@ -2507,13 +2511,18 @@ export class Gateway {
         }
       }
 
-      // ── agent mailbox: address + inbox reads (§8; the inbound webhook is an
-      // unauthenticated shared-secret route handled before the session gate) ──
-      if (p === '/api/agent-mail' && method === 'GET') {
+      // ── agent mailbox: per-organization address + inbox reads (§8; the
+      // inbound webhook is an unauthenticated shared-secret route handled
+      // before the session gate). The org in the path is what requestScope +
+      // the token check enforce, so one tenant's agents can never read
+      // another's confirmation mails.
+      const mailMatch = p.match(/^\/api\/organizations\/([^/]+)\/agent-mail$/);
+      if (mailMatch && method === 'GET') {
         const { AgentMail } = await import('../autonomy/agent-mail.js');
         const mail = new AgentMail(store);
-        return this.json(res, 200, { address: mail.address(), configured: mail.configured(),
-          messages: mail.recent({ since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
+        const organizationId = mailMatch[1]!;
+        return this.json(res, 200, { organizationId, address: mail.address(organizationId), configured: mail.configured(),
+          messages: mail.recent(organizationId, { since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
       }
 
       // cards (payment resources; SPEC §7.6). Provision/list/fund.

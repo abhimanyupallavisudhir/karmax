@@ -672,8 +672,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     for (const c of conns) { expect(typeof c.available).toBe('boolean'); expect(c.detail).toBeTruthy(); }
   });
 
-  it('agent mailbox: shared-secret ingest, code extraction, and reads', async () => {
-    const addr: any = await (await fetch(`${base}/api/agent-mail`, { headers: auth() })).json();
+  it('agent mailbox: per-org address, shared-secret ingest, reads, and tenant isolation', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    expect(orgId).toBeTruthy();
+    const addr: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
     expect(addr.address).toMatch(/@/);
     // ingest requires the configured shared secret
     const prev = process.env.KARMAX_AGENT_MAIL_SECRET;
@@ -681,10 +684,18 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     try {
       const rejected = await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: addr.address, from: 'x@y.com', text: 'code 314159' }) });
       expect(rejected.status).toBe(401);
-      const ok = await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer shh' }, body: JSON.stringify({ to: addr.address, from: 'noreply@github.com', subject: 'Verify', text: 'Your code is 314159' }) });
-      expect(ok.status).toBe(200);
-      const inbox: any = await (await fetch(`${base}/api/agent-mail?match=github`, { headers: auth() })).json();
+      const ok: any = await (await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer shh' }, body: JSON.stringify({ to: addr.address, from: 'noreply@github.com', subject: 'Verify', text: 'Your code is 314159' }) })).json();
+      expect(ok.delivered).toBe(true);
+      // mail to an address no organization owns is dropped
+      const dropped: any = await (await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer shh' }, body: JSON.stringify({ to: 'stranger@agent.local', from: 'x@y.com', text: 'code 999999' }) })).json();
+      expect(dropped.delivered).toBe(false);
+      const inbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail?match=github`, { headers: auth() })).json();
       expect(inbox.messages[0].code).toBe('314159');
+      // an agent token scoped to ANOTHER organization cannot read this inbox
+      const foreign = h.tokens.mint({ taskId: 'task_mail', profileId: 'do', principal: 'user:test',
+        organizationId: 'org_other', ceiling: ['credential:read'], grantorCaps: ['credential:read'] });
+      const denied = await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: { authorization: `Bearer ${foreign.token}` } });
+      expect(denied.status).toBe(403);
     } finally {
       if (prev === undefined) delete process.env.KARMAX_AGENT_MAIL_SECRET; else process.env.KARMAX_AGENT_MAIL_SECRET = prev;
     }

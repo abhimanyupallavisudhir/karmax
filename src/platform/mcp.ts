@@ -378,10 +378,10 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'check_agent_mail',
     {
       description:
-        'Read the karmax agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Completes "check your email for a code / link" steps: returns recent messages with any verification code and link already extracted.',
-      inputSchema: { match: z.string().optional(), since: z.number().optional() },
+        'Read your organization\'s agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Completes "check your email for a code / link" steps: returns the address to register with plus recent messages with any verification code and link already extracted. Mailboxes are per organization; you can only read your own.',
+      inputSchema: { organizationId: z.string(), match: z.string().optional(), since: z.number().optional() },
     },
-    async (a) => wrap(() => ops.platformRequest('GET', `/api/agent-mail${a.match || a.since ? `?${new URLSearchParams({ ...(a.match ? { match: a.match } : {}), ...(a.since ? { since: String(a.since) } : {}) })}` : ''}`)),
+    async (a) => wrap(() => ops.platformRequest('GET', `/api/organizations/${encodeURIComponent(a.organizationId)}/agent-mail${a.match || a.since ? `?${new URLSearchParams({ ...(a.match ? { match: a.match } : {}), ...(a.since ? { since: String(a.since) } : {}) })}` : ''}`)),
   );
   server.registerTool(
     'enroll_passkey',

@@ -8,8 +8,17 @@ import crypto from 'node:crypto';
  * verification code so an agent can complete "check your email" steps on its
  * own. Existing accounts on the user's personal mail still escalate to a human.
  *
- * Storage is deliberately simple: a bounded, store-backed message list (kv).
- * The address is stable per installation; the domain is configured once (an own
+ * Mailboxes are **per organization** — the organization is karmax's tenant
+ * boundary, and a shared inbox would let one tenant's agents read another's
+ * confirmation mails. Each organization gets its own address with a random,
+ * unguessable local part; the ingest webhook routes each message to the
+ * organization that owns the recipient address and silently drops mail for
+ * unknown recipients (a catch-all domain forwards everything). Reads go through
+ * the organization-scoped route, so the token/session machinery enforces that
+ * an agent only ever sees its own organization's inbox.
+ *
+ * Storage is deliberately simple: a bounded, store-backed message list (kv) per
+ * organization. The domain is configured once for the installation (an own
  * catch-all domain, or a hosted inbox provider). With no domain configured the
  * mailbox still works for local/dev ingestion under `agent.local`.
  */
@@ -32,8 +41,10 @@ export interface AgentMailStore {
   kvSet(k: string, v: string): void;
 }
 
-const KV_MESSAGES = 'agent-mail:messages';
-const KV_ADDRESS = 'agent-mail:address';
+const kvMessages = (organizationId: string) => `agent-mail:messages:${organizationId}`;
+const kvAddress = (organizationId: string) => `agent-mail:address:${organizationId}`;
+/** Reverse route: local part → owning organization (what ingest consults). */
+const kvOwner = (localPart: string) => `agent-mail:owner:${localPart}`;
 const MAX_MESSAGES = 200;
 
 /** Pull a one-time code out of mail text — 4–8 digits, or a 6–8 char
@@ -59,13 +70,15 @@ export function extractLink(body: string): string | undefined {
 export class AgentMail {
   constructor(private store: AgentMailStore, private domain = process.env.KARMAX_AGENT_MAIL_DOMAIN) {}
 
-  /** The installation's stable agent address; minted on first read. */
-  address(): string {
-    const existing = this.store.kvGet(KV_ADDRESS);
+  /** The organization's stable agent address; minted (with its reverse-route
+   *  entry) on first read. Random local part: unguessable across tenants. */
+  address(organizationId: string): string {
+    const existing = this.store.kvGet(kvAddress(organizationId));
     if (existing) return existing;
-    const local = `agent-${crypto.randomBytes(4).toString('hex')}`;
+    const local = `agent-${crypto.randomBytes(6).toString('hex')}`;
     const address = `${local}@${this.domain || 'agent.local'}`;
-    this.store.kvSet(KV_ADDRESS, address);
+    this.store.kvSet(kvAddress(organizationId), address);
+    this.store.kvSet(kvOwner(local), organizationId);
     return address;
   }
 
@@ -73,16 +86,29 @@ export class AgentMail {
     return !!this.domain;
   }
 
-  private all(): AgentMessage[] {
+  /** Which organization owns a recipient address (subaddress tags stripped:
+   *  `agent-ab12+github@…` routes like `agent-ab12@…`). */
+  ownerOf(to: string): string | undefined {
+    const local = to.split('@')[0]?.split('+')[0]?.trim().toLowerCase();
+    return local ? this.store.kvGet(kvOwner(local)) : undefined;
+  }
+
+  private all(organizationId: string): AgentMessage[] {
     try {
-      return JSON.parse(this.store.kvGet(KV_MESSAGES) ?? '[]');
+      return JSON.parse(this.store.kvGet(kvMessages(organizationId)) ?? '[]');
     } catch {
       return [];
     }
   }
 
-  /** Ingest an inbound message (the mail webhook). Returns the stored record. */
-  ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number }): AgentMessage {
+  /**
+   * Ingest an inbound message (the mail webhook), routed to the organization
+   * owning the recipient address. Mail for an unknown recipient is dropped —
+   * a catch-all domain forwards everything, including strangers' typos.
+   */
+  ingest(msg: { from: string; to: string; subject?: string; text: string; receivedAt?: number }): { delivered: boolean; message?: AgentMessage } {
+    const organizationId = this.ownerOf(msg.to);
+    if (!organizationId) return { delivered: false };
     const record: AgentMessage = {
       id: `msg_${crypto.randomBytes(8).toString('hex')}`,
       from: msg.from,
@@ -93,14 +119,14 @@ export class AgentMail {
       ...(extractLink(msg.text) ? { link: extractLink(msg.text) } : {}),
       receivedAt: msg.receivedAt ?? Date.now(),
     };
-    const next = [...this.all(), record].slice(-MAX_MESSAGES);
-    this.store.kvSet(KV_MESSAGES, JSON.stringify(next));
-    return record;
+    const next = [...this.all(organizationId), record].slice(-MAX_MESSAGES);
+    this.store.kvSet(kvMessages(organizationId), JSON.stringify(next));
+    return { delivered: true, message: record };
   }
 
-  /** Recent messages, newest first — the `check_agent_mail` read. */
-  recent(opts: { since?: number; limit?: number; match?: string } = {}): AgentMessage[] {
-    let msgs = this.all().filter((m) => (opts.since ? m.receivedAt > opts.since : true));
+  /** Recent messages for one organization, newest first. */
+  recent(organizationId: string, opts: { since?: number; limit?: number; match?: string } = {}): AgentMessage[] {
+    let msgs = this.all(organizationId).filter((m) => (opts.since ? m.receivedAt > opts.since : true));
     if (opts.match) {
       const needle = opts.match.toLowerCase();
       msgs = msgs.filter((m) => `${m.subject ?? ''} ${m.from} ${m.text}`.toLowerCase().includes(needle));

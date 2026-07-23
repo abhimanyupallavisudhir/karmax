@@ -20,28 +20,47 @@ describe('agent mail code/link extraction (§8)', () => {
   });
 });
 
-describe('AgentMail inbox', () => {
-  it('mints a stable address (agent.local without a configured domain)', () => {
+describe('AgentMail inbox (per-organization tenancy)', () => {
+  it('mints one stable address per organization (agent.local without a domain)', () => {
     const store = memStore();
     const mail = new AgentMail(store);
-    const a = mail.address();
-    expect(a).toMatch(/^agent-[0-9a-f]{8}@agent\.local$/);
-    expect(mail.address()).toBe(a); // stable
+    const a = mail.address('org_a');
+    const b = mail.address('org_b');
+    expect(a).toMatch(/^agent-[0-9a-f]{12}@agent\.local$/);
+    expect(mail.address('org_a')).toBe(a); // stable
+    expect(b).not.toBe(a); // distinct per tenant
     expect(mail.configured()).toBe(false);
     expect(new AgentMail(store, 'agents.example.com').configured()).toBe(true);
   });
 
-  it('ingests messages with extracted code/link and reads them newest-first', () => {
+  it('routes ingest by recipient and keeps tenants isolated', () => {
     const mail = new AgentMail(memStore());
-    const addr = mail.address();
-    mail.ingest({ from: 'noreply@github.com', to: addr, subject: 'Confirm', text: 'code 112233\nhttps://github.com/verify/x', receivedAt: 1000 });
-    mail.ingest({ from: 'noreply@vercel.com', to: addr, subject: 'Welcome', text: 'nothing useful', receivedAt: 2000 });
-    const recent = mail.recent();
-    expect(recent[0]!.from).toBe('noreply@vercel.com'); // newest first
-    const gh = recent.find((m) => m.from.includes('github'))!;
-    expect(gh.code).toBe('112233');
-    expect(gh.link).toContain('/verify/');
-    expect(mail.recent({ match: 'github' })).toHaveLength(1);
-    expect(mail.recent({ since: 1500 }).map((m) => m.from)).toEqual(['noreply@vercel.com']);
+    const a = mail.address('org_a');
+    const b = mail.address('org_b');
+    expect(mail.ingest({ from: 'noreply@github.com', to: a, subject: 'Confirm', text: 'code 112233\nhttps://github.com/verify/x' }).delivered).toBe(true);
+    expect(mail.ingest({ from: 'noreply@vercel.com', to: b, subject: 'Welcome', text: 'code 445566' }).delivered).toBe(true);
+    // subaddress tags route to the base mailbox
+    expect(mail.ingest({ from: 'x@y.com', to: a.replace('@', '+github@'), text: 'tagged' }).delivered).toBe(true);
+    // unknown recipients are dropped, not leaked into any tenant
+    expect(mail.ingest({ from: 'x@y.com', to: 'stranger@agent.local', text: 'code 999999' }).delivered).toBe(false);
+
+    const inboxA = mail.recent('org_a');
+    const inboxB = mail.recent('org_b');
+    expect(inboxA.map((m) => m.from)).toEqual(['x@y.com', 'noreply@github.com']);
+    expect(inboxB.map((m) => m.from)).toEqual(['noreply@vercel.com']);
+    expect(inboxA.find((m) => m.from.includes('github'))!.code).toBe('112233');
+    expect(inboxB[0]!.code).toBe('445566');
+    // no cross-tenant visibility in either direction
+    expect(JSON.stringify(inboxA)).not.toContain('445566');
+    expect(JSON.stringify(inboxB)).not.toContain('112233');
+  });
+
+  it('filters by match and since', () => {
+    const mail = new AgentMail(memStore());
+    const a = mail.address('org_a');
+    mail.ingest({ from: 'noreply@github.com', to: a, text: 'one', receivedAt: 1000 });
+    mail.ingest({ from: 'noreply@vercel.com', to: a, text: 'two', receivedAt: 2000 });
+    expect(mail.recent('org_a', { match: 'github' })).toHaveLength(1);
+    expect(mail.recent('org_a', { since: 1500 }).map((m) => m.from)).toEqual(['noreply@vercel.com']);
   });
 });

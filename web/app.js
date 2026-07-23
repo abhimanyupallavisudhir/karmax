@@ -7161,16 +7161,16 @@ async function wireConnectorsCard() {
 function agentMailCard() {
   return `<div class="card" id="agent-mail-card">
     <div class="section-h">Agent mailbox</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">A dedicated inbox for accounts your agents register — never your personal email. Point an inbound-mail webhook (own catch-all domain, or a hosted inbox) at <code>POST /api/agent-mail/ingest</code> (shared-secret authenticated) and set <code>KARMAX_AGENT_MAIL_DOMAIN</code>. Agents read codes/links with <code>check_agent_mail</code>.</p>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">This organization's dedicated inbox for accounts its agents register — never your personal email, and never readable by other organizations. Point an inbound-mail webhook (own catch-all domain, or a hosted inbox) at <code>POST /api/agent-mail/ingest</code> (shared-secret authenticated) and set <code>KARMAX_AGENT_MAIL_DOMAIN</code>. Agents read codes/links with <code>check_agent_mail</code>.</p>
     <div class="agent-mail-body">Loading…</div>
   </div>`;
 }
-async function wireAgentMailCard() {
+async function wireAgentMailCard(organizationId) {
   const box = $('#agent-mail-card');
   if (!box) return;
   const body = box.querySelector('.agent-mail-body');
   let data = { address: '', configured: false, messages: [] };
-  try { data = await api('/api/agent-mail'); } catch {}
+  try { data = await api(`/api/organizations/${encodeURIComponent(organizationId || 'org_personal')}/agent-mail`); } catch {}
   body.innerHTML = `<div class="form-row"><label>Agent address</label><input value="${esc(data.address)}" readonly class="mono" style="width:100%" /></div>
     ${data.configured ? '' : '<div class="task-sub" style="color:var(--warn,#e0b15a);margin-bottom:6px">No mail domain configured — set KARMAX_AGENT_MAIL_DOMAIN to receive real mail. The address above still accepts test ingestion.</div>'}
     <div style="font-weight:600;margin:6px 0 4px">Recent messages</div>
@@ -7464,7 +7464,7 @@ function wireGlobalSettings(organizationId) {
   hydrateGitProfiles();
   wireVaultCards();
   wireConnectorsCard();
-  wireAgentMailCard();
+  wireAgentMailCard(organizationId);
   wirePaymentsCard('global');
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
