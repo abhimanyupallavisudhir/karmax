@@ -65,6 +65,21 @@ describe('Store', () => {
     expect(store.getProject(p.id)!.config.defaultBase).toBe('main');
   });
 
+  it('rejects reserved routing names for projects and organizations', () => {
+    // A project is addressed at /<org>/<project> by the slug of its name, and an
+    // organization owns the top URL segment — a name that slugifies to a built-in
+    // route word (wiki, settings, dashboard, api, …) would be unreachable.
+    for (const name of ['wiki', 'Settings', 'DASHBOARD', 'inbox', 'api', 'tasks', 'queue', ' Wiki ']) {
+      expect(() => store.createProject(name)).toThrow(/reserved/i);
+      expect(() => store.createOrganization({ name })).toThrow(/reserved/i);
+    }
+    // An explicit organization slug is checked too, not just the derived one.
+    expect(() => store.createOrganization({ name: 'Fine name', slug: 'settings' })).toThrow(/reserved/i);
+    // Ordinary names still work, and a name merely containing a reserved word is fine.
+    expect(() => store.createProject('My Wiki Notes')).not.toThrow();
+    expect(store.createOrganization({ name: 'Acme' }).slug).toBe('acme');
+  });
+
   it('creates and lists tasks in order', () => {
     const p = store.createProject('Acme');
     const t1 = store.createTask({
