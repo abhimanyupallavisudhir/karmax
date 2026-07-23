@@ -473,6 +473,7 @@ export class Store {
 
   createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Project {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+    assertRoutableName('project', name);
     validateProjectExecutionConfig(config);
     const p: Project = { id: newId('proj'), organizationId, name, createdAt: Date.now(), config };
     this.db
@@ -662,6 +663,7 @@ export class Store {
   // ─── Organizations, teams, and repository catalogue ───────────────────
 
   createOrganization(input: { name: string; slug?: string; kind?: Organization['kind']; ownerUserId?: string }): Organization {
+    assertRoutableName('organization', input.name, input.slug);
     const slug = uniqueSlug(input.slug ?? input.name, (candidate) => !!this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate));
     const organization: Organization = {
       id: newId('org'), name: input.name.trim() || 'Untitled organization', slug,
@@ -2975,6 +2977,33 @@ function uniqueSlug(value: string, used: (candidate: string) => boolean): string
   let candidate = base;
   for (let n = 2; used(candidate); n++) candidate = `${base}-${n}`;
   return candidate;
+}
+
+/** Path segments the web router and gateway own. An organization owns the top URL
+ *  segment by its slug, and a project is addressed at `/<org>/<project>` by the
+ *  slug of its name — so a name that slugifies to one of these words would be
+ *  shadowed by a built-in route and unreachable in the console (e.g. a project
+ *  named "wiki" collides with the organization wiki view). Reject those names at
+ *  creation. Keep this in sync with `web/app.js` (`parseRoute` / `ORG_VIEWS`) and
+ *  the gateway's `/api` + `/ws` prefixes. */
+const RESERVED_ROUTE_SLUGS = new Set([
+  // gateway-owned top-level prefixes
+  'api', 'ws',
+  // top-level routes / legacy org paths (an org slug is the first URL segment)
+  'invite', 'projects', 'organization', 'organizations',
+  // organization-level views — ORG_VIEWS (a project slug is the segment after the org)
+  'dashboard', 'settings', 'inbox', 'wiki', 'profile',
+  // project-level tabs
+  'tasks', 'queue', 'activity',
+]);
+
+/** Throw a user-facing error if `name` (or an explicit `slug`) resolves to a
+ *  reserved routing word. Applied at the single creation choke points for
+ *  projects and organizations. */
+function assertRoutableName(kind: 'project' | 'organization', name: string, slug?: string): void {
+  const s = slugify(slug ?? name);
+  if (RESERVED_ROUTE_SLUGS.has(s))
+    throw new Error(`"${s}" is a reserved name and can't be used for a ${kind}. Please choose a different name.`);
 }
 
 function validateProjectExecutionConfig(config: ProjectConfig): void {

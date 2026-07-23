@@ -860,8 +860,11 @@ export class Gateway {
       if (p === '/api/organizations' && method === 'POST') {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         const b = await this.body(req);
-        const organization = store.createOrganization({ name: String(b.name ?? 'My organization'),
-          slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: session.userId });
+        let organization;
+        try {
+          organization = store.createOrganization({ name: String(b.name ?? 'My organization'),
+            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: session.userId });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         this.deps.authorization?.bootstrapOrganizationOwner(`user:${session.userId}`, session.userId, organization.id);
         return this.json(res, 200, organization);
       }
@@ -1122,7 +1125,10 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
-          const project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
+          let project;
+          try {
+            project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
           await this.spawnProjectPrepTask(token, project.id);
           return this.json(res, 200, project);
@@ -1355,7 +1361,10 @@ export class Gateway {
         if (this.deps.hosted)
           return this.json(res, 400, { error: 'hosted projects must be created inside an organization' });
         const b = await this.body(req);
-        const project = store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true));
+        let project;
+        try {
+          project = store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         await this.spawnProjectPrepTask(token, project.id);
         return this.json(res, 200, project);
       }
