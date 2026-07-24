@@ -16,6 +16,7 @@ import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity } from './activity.js';
 import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
   spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
+import { worldWorkingDirectory } from '../world/types.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -213,7 +214,7 @@ export class CodexAdapter implements AgentAdapter {
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
     const model = input.profile.model ?? undefined;
     const effort = codexReasoningEffort(model ?? 'gpt-5.5', input.profile.effort);
-    const cwd = input.world.handle.root;
+    const cwd = worldWorkingDirectory(input.world.handle);
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const remote = isRemoteAgentWorld(input.world);
@@ -628,7 +629,7 @@ export class CodexAdapter implements AgentAdapter {
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
     const model = input.profile.model ?? 'gpt-5.5';
     const effort = codexReasoningEffort(model, input.profile.effort);
-    const cwd = input.world.handle.root;
+    const cwd = worldWorkingDirectory(input.world.handle);
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome, ...(input.extraEnv ? { extra: input.extraEnv } : {}) });

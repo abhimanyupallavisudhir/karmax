@@ -1,5 +1,5 @@
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
-import { WorldHandle, worldRepos } from '../world/types.js';
+import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
 
 /**
@@ -64,7 +64,7 @@ export function assemblePrompt(args: AssembleArgs): string {
     toolsPreamble: preamble,
     title: args.task.title,
     prompt: args.task.prompt,
-    worldPath: args.world.root,
+    worldPath: worldWorkingDirectory(args.world),
     worldRepos: describeRepos(args.world),
     branch: args.world.branch,
     base: args.world.base,
@@ -88,9 +88,9 @@ export function assemblePrompt(args: AssembleArgs): string {
 function describeRepos(world: WorldHandle): string {
   const repos = worldRepos(world);
   if (repos.length <= 1) return '';
-  const lines = repos.map((r) => `- ${r.name}/ — checkout of ${r.repo}`).join('\n');
+  const lines = repos.map((r) => `- ${r.root}/ — checkout of ${r.repo}${r.role === 'project-wiki' ? ' (project wiki)' : ''}`).join('\n');
   return (
-    `This world spans ${repos.length} repositories, each checked out in its own subdirectory of the working directory ` +
-    `(all on branch ${world.branch}). \`cd\` into a subdirectory to run git/build commands for that repo:\n${lines}`
+    `This world spans ${repos.length} repositories inside the world boundary ${world.root} ` +
+    `(all on branch ${world.branch}). Use these checkout paths for repository-specific work:\n${lines}`
   );
 }

@@ -310,11 +310,13 @@ export interface WorldHandleRef {
   /** Stable path inside the environment; unlike `root`, never denotes a control-plane path. */
   workspaceRoot?: string;
   root: string;
+  /** Default agent/process directory inside the world boundary. */
+  workdir?: string;
   branch: string;
   base: string;
   repo?: string;
   target?: string;
-  repos?: { name: string; repo: string; root: string; branch: string; base: string; target?: string; baseSha?: string; localPath?: string }[];
+  repos?: { name: string; role?: 'project-wiki'; repo: string; root: string; branch: string; base: string; target?: string; baseSha?: string; localPath?: string }[];
   meta?: Record<string, unknown>;
   warnings?: string[];
 }
