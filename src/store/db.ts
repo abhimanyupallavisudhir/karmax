@@ -405,12 +405,19 @@ export class Store {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(organizationId)');
     if (!cols.some((c) => c.name === 'intentId')) this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT');
     if (!cols.some((c) => c.name === 'attemptNumber')) this.db.exec('ALTER TABLE tasks ADD COLUMN attemptNumber INTEGER');
-    // Existing rows become single-attempt intents. This is deliberately idempotent.
+    // Legacy rows become single-attempt intents. Alternate attempts already point
+    // at their root intent and must never acquire an intent row of their own:
+    // doing so makes the alternate look like a second top-level task after boot.
     this.db.exec(`
       UPDATE tasks SET intentId = id WHERE intentId IS NULL;
       UPDATE tasks SET attemptNumber = 1 WHERE attemptNumber IS NULL;
       INSERT OR IGNORE INTO task_intents (id, principalAttemptId, createdAt)
-        SELECT id, id, createdAt FROM tasks;
+        SELECT id, id, createdAt FROM tasks WHERE id = intentId;
+      DELETE FROM task_intents
+        WHERE EXISTS (
+          SELECT 1 FROM tasks
+          WHERE tasks.id = task_intents.id AND tasks.intentId <> task_intents.id
+        );
       CREATE INDEX IF NOT EXISTS idx_tasks_intent ON tasks(intentId, attemptNumber);
     `);
     if (!cols.some((c) => c.name === 'notes')) {
@@ -1553,7 +1560,8 @@ export class Store {
   /** One row per logical task: only the current principal appears in list/search. */
   listTasks(projectId: string): TaskRecord[] {
     const rows = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
-      JOIN task_intents i ON i.principalAttemptId=t.id JOIN tasks root ON root.id=i.id
+      JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+      JOIN tasks root ON root.id=i.id
       WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId) as any[];
     return this.attachTags(projectId, rows.map(rowToTask));
   }
