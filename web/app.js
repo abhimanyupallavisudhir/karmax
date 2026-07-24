@@ -7046,6 +7046,7 @@ async function wireVaultCards(organizationId) {
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}${i.provenance?.source?.startsWith('task:') ? ' · created by an agent' : ''} · secrets: ${esc((i.fields || []).join(', ') || 'none')}</div></div>
           <label style="font-size:11px">use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <label style="font-size:11px">reveal <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
           <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button></div>`).join('')
       : '<span style="color:var(--ink-3)">No vault items yet.</span>';
     list.querySelectorAll('[data-vi]').forEach((row) => {
@@ -7059,6 +7060,16 @@ async function wireVaultCards(organizationId) {
       row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
       row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
     });
+    list.querySelectorAll('[data-vi-rotate]').forEach((b) => b.addEventListener('click', async () => {
+      const item = items.find((x) => x.id === b.dataset.viRotate);
+      const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
+      const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
+      if (!value) return;
+      try {
+        const r = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
+        toast(r.propagated?.connector ? `Secret updated (also pushed to ${r.propagated.connector})` : 'Secret updated');
+      } catch (e) { toast(e.message, true); }
+    }));
     list.querySelectorAll('[data-vi-del]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm('Delete this vault item (and its secrets)?')) return;
       try { await api(`/api/vault/items/${b.dataset.viDel}${oq}`, { method: 'DELETE' }); renderItems(); } catch (e) { toast(e.message, true); }
@@ -7096,8 +7107,8 @@ async function wireVaultCards(organizationId) {
     rbox.innerHTML = (pending.length
       ? pending.map((r) => `<div class="queue-item" data-vreq="${esc(r.id)}">
           <div style="flex:1"><b>${r.itemId ? esc(itemLabel(r.itemId)) : `${esc(r.domain || '?')} <span class="chip" style="color:var(--warn,#e0b15a)">not in vault</span>`}</b>
-            <span class="chip">${esc(r.mode)}</span>
-            <div class="task-sub" style="color:var(--ink-3)">task <a data-spa href="#" onclick="return false">${esc(r.taskId)}</a>${r.why ? ` — ${esc(r.why)}` : ''}</div></div>
+            ${r.kind === 'reset' ? '<span class="chip" style="color:var(--warn,#e0b15a)">reported invalid</span>' : `<span class="chip">${esc(r.mode)}</span>`}
+            <div class="task-sub" style="color:var(--ink-3)">task <a data-spa href="#" onclick="return false">${esc(r.taskId)}</a>${r.why ? ` — ${esc(r.why)}` : ''}${r.kind === 'reset' ? '<br>The stored secret failed. Fix it (Update secret in the vault above, or send the task a follow-up with the reset code), then grant to let the agent retry.' : ''}</div></div>
           ${r.itemId ? '' : `<select class="vreq-bind"><option value="">bind to item…</option>${items.map((i) => `<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`}
           <button class="btn sm" data-vreq-act="once">Once</button>
           <button class="btn sm" data-vreq-act="task">This task</button>

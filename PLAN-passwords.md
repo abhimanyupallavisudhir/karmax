@@ -383,6 +383,32 @@ Implementation notes (phases 4–5):
    nothing. `GET/POST /api/agent-mail/providers|connect` + an "Agent email
    service" card (installation-wide; hidden without `settings:write`) above the
    per-org mailbox card.
+8. **Full-lifecycle password management (rotate / reset / propagate)** ✅ —
+   what turns "use a password" into "manage a password like a human":
+   - *Rotation rides the use-grant.* An agent that changed a password on the
+     site may update the granted item's **secrets** via `store_credential`
+     (`/api/vault/store`): a stale value locks everyone out, so writing the new
+     secret is authorized by the same `covered()` check as using it. Metadata/
+     policy/label edits on a foreign item stay a human / `credential:write`
+     action (the rotation path ignores everything but `secrets`, 403s
+     otherwise); audited as `vault.rotated`. Ungranted tasks still 403.
+   - *`kind: "reset"` escalation.* When a stored secret is rejected by the site
+     and the agent cannot self-reset (recovery goes to the human's inbox, not
+     the agent mailbox), `request_credential(kind: 'reset')` **always parks**
+     — even for a fully granted item, since granted access to a wrong password
+     is useless. The request card shows "reported invalid" with the fix path:
+     update the secret (per-item **Update secret** button in the vault card) or
+     send the code as a task follow-up, then grant to unblock the retry.
+     Agent-mailbox accounts need none of this: forgot-password →
+     `check_agent_mail` → new password → rotation, fully autonomous.
+   - *Field-level source propagation.* `CredentialConnector.updateSecret`
+     (Bitwarden: get-item → edit one field; 1Password: `op item edit`
+     assignment; pass: replace line 1 / the `otpauth://` line, notes preserved)
+     plus `Connectors.propagate`: after a rotation (agent or human) of a
+     mirrored-in item, the changed fields push back to the source store —
+     best-effort, gated on that connector's write-back toggle; the karmax vault
+     is already correct regardless. `push` (create-new) and `updateSecret`
+     (edit-existing) stay distinct so write-back can never clobber notes.
 
 Implementation notes:
 - Existing installs keep their seeded role profiles (`seedProfiles` does not

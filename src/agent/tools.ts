@@ -181,14 +181,15 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_credential',
     description:
-      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that this task was not granted. Identify it by item_id or by the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human — stop and report, they will grant/add it and you can retry), or denied (do not re-ask).',
+      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that this task was not granted, identified by item_id or the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human — stop and report, they will grant/add it and you can retry), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human will fix the item or send you the reset code.',
     parameters: {
       type: 'object',
       properties: {
         item_id: { type: 'string', description: 'A vault item id (list them via platform_request GET /api/vault/items).' },
         domain: { type: 'string', description: 'The site this credential is for, e.g. "github.com" — used when you do not know the item id.' },
         mode: { type: 'string', enum: ['use', 'reveal'], description: 'use = fill/inject without seeing the secret (default); reveal = you need the plaintext.' },
-        why: { type: 'string', description: 'Why you need it (shown to the human).' },
+        kind: { type: 'string', enum: ['access', 'reset'], description: 'reset = the stored secret appears invalid; always parks for the human.' },
+        why: { type: 'string', description: 'Why you need it / what failed (shown to the human).' },
       },
       required: ['why'],
     },
@@ -225,7 +226,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'store_credential',
     description:
-      'Save a credential you just created (a registered account, generated password, captured TOTP seed, minted API key or SSH key) into the user\'s vault so it outlives this task. Secret values go in `secrets` and are write-only. You may update only items this task created.',
+      'Save a credential into the user\'s vault so it outlives this task. Two uses: (1) a credential you just created (registered account, generated password, captured TOTP seed, minted API/SSH key); (2) ROTATION — after you change a password on a site, immediately update the granted item\'s `secrets` here (pass its `id`; metadata is ignored), or everyone is locked out with the stale value. Rotation is allowed for any item this task may use; full edits only for items this task created.',
     parameters: {
       type: 'object',
       properties: {
@@ -524,7 +525,7 @@ export function platformToolHandlers(
     },
     async request_credential(args) {
       const r: any = await platformRequest('POST', '/api/vault/requests', {
-        itemId: args?.item_id, domain: args?.domain, mode: args?.mode, why: args?.why ? String(args.why) : undefined,
+        itemId: args?.item_id, domain: args?.domain, mode: args?.mode, kind: args?.kind, why: args?.why ? String(args.why) : undefined,
       });
       // Mirror request_spend: a parked request surfaces at the Review gate.
       if (r?.status === 'needs_approval' || r?.status === 'not_in_vault') {

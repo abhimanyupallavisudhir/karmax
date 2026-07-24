@@ -181,6 +181,21 @@ describe('the pull model: requests + human resolutions (§7)', () => {
     expect(items.requests({ status: 'pending' })).toHaveLength(0);
   });
 
+  it('a reset report always parks, even when the task is fully granted (the secret is wrong)', () => {
+    const { items } = makeService();
+    const item = items.save({ type: 'login', label: 'gh', secrets: { password: 'stale' } });
+    const caps = [`use-credential:item:${item.id}`]; // covered + policy auto → access would be granted
+    const r = items.request({ taskId: 't1', caps, itemId: item.id, kind: 'reset', why: 'site rejected the stored password' });
+    expect(r.status).toBe('needs_approval');
+    const req = items.requests({ status: 'pending' })[0]!;
+    expect(req.kind).toBe('reset');
+    // the human fixes the secret, then grants retry — the pass unblocks a re-fill
+    items.save({ id: item.id, type: 'login', secrets: { password: 'fresh' } });
+    items.resolve(req.id, { action: 'once', by: 'user:alice' });
+    expect(items.access(caps, 't1', items.get(item.id)!, 'use', { consume: true }).status).toBe('granted');
+    expect(items.resolveField(items.get(item.id)!, 'password', { mode: 'reveal' })).toBe('fresh');
+  });
+
   it('denied requests do not grant and record the resolution', () => {
     const { items } = makeService();
     const item = items.save({ type: 'login', label: 'gh', policy: { use: 'ask' }, secrets: { password: 'p' } });

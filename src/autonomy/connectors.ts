@@ -52,8 +52,14 @@ export interface CredentialConnector {
   list(): Promise<ExternalItem[]>;
   /** Fetch the selected items with their secrets. */
   pull(externalIds: string[]): Promise<ExternalSecretItem[]>;
-  /** Optional write-back of an agent-created item. */
+  /** Optional write-back of an agent-created item (creates a NEW entry). */
   push?(item: ExternalSecretItem): Promise<{ externalId: string }>;
+  /**
+   * Optional field-level update of an EXISTING entry, preserving everything
+   * else (notes, other fields). This is how a rotated password propagates back
+   * without the blind-overwrite data loss that `push` avoids by only creating.
+   */
+  updateSecret?(externalId: string, field: VaultFieldName, value: string): Promise<void>;
 }
 
 /** Injectable runner so tests can stub the CLIs. Returns {stdout} or throws. */
@@ -107,6 +113,18 @@ export class BitwardenConnector implements CredentialConnector {
     }
     return out;
   }
+  /** Field-level edit: read the item JSON, change one field, `bw edit` it back —
+   *  every other field (username, notes, uris, totp) is preserved. */
+  async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
+    const item = JSON.parse(await this.exec('bw', ['get', 'item', externalId], { env: this.env() }));
+    item.login = item.login ?? {};
+    if (field === 'password') item.login.password = value;
+    else if (field === 'totp') item.login.totp = value;
+    else if (field === 'note') item.notes = value;
+    else throw new Error(`Bitwarden write-back does not support the "${field}" field`);
+    const encoded = Buffer.from(JSON.stringify(item)).toString('base64');
+    await this.exec('bw', ['edit', 'item', externalId, encoded], { env: this.env() });
+  }
 }
 
 function normalizeBitwarden(it: any): ExternalItem | undefined {
@@ -159,6 +177,18 @@ export class OnePasswordConnector implements CredentialConnector {
         domains: (full.urls ?? []).map((u: any) => hostOf(u?.href)).filter(Boolean), fields: Object.keys(secrets) as VaultFieldName[], secrets });
     }
     return out;
+  }
+  /** Field-level edit via `op item edit` — assignments touch only the named
+   *  field, leaving notes and everything else in the item intact. */
+  async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
+    const assignment =
+      field === 'password' ? `password=${value}`
+      : field === 'secret' ? `credential=${value}`
+      : field === 'totp' ? `one-time password[otp]=${value}`
+      : field === 'note' ? `notesPlain=${value}`
+      : undefined;
+    if (!assignment) throw new Error(`1Password write-back does not support the "${field}" field`);
+    await this.exec('op', ['item', 'edit', externalId, assignment], { env: this.env() });
   }
 }
 
@@ -214,6 +244,34 @@ export class PassConnector implements CredentialConnector {
         fields: Object.keys(secrets) as VaultFieldName[], secrets });
     }
     return out;
+  }
+  /**
+   * Field-level update that preserves the notes on lines 2+: read the whole
+   * entry, replace only line 1 (password) or the `otpauth://` line (totp), and
+   * re-insert. This is why "line 1 is the password" is enforced precisely.
+   */
+  async updateSecret(externalId: string, field: VaultFieldName, value: string): Promise<void> {
+    let body: string;
+    try {
+      body = await this.exec('pass', ['show', externalId]);
+    } catch (e) {
+      throw new Error(gpgHint(e));
+    }
+    const lines = body.replace(/\r/g, '').replace(/\n$/, '').split('\n');
+    if (field === 'password') {
+      lines[0] = value;
+    } else if (field === 'totp') {
+      const idx = lines.findIndex((l, i) => i > 0 && l.trim().startsWith('otpauth://'));
+      if (idx >= 0) lines[idx] = value;
+      else lines.push(value); // no existing seed → append one
+    } else {
+      throw new Error(`pass write-back does not support the "${field}" field`);
+    }
+    try {
+      await this.exec('pass', ['insert', '-m', '-f', externalId], { input: lines.join('\n') + '\n' });
+    } catch (e) {
+      throw new Error(gpgHint(e));
+    }
   }
   /**
    * Write-back creates a NEW entry (under `karmax/…`) for an agent-created
@@ -406,4 +464,38 @@ export class Connectors {
     this.items.setExternalId(item.id, result.externalId);
     return result;
   }
+
+  /**
+   * Propagate rotated secret fields of a mirrored-in item back to its source
+   * store, field-level (notes preserved). Called after a rotation when the
+   * source connector has write-back enabled; a no-op (best-effort) otherwise.
+   * Returns the fields it actually pushed. Unlike `writeBack`, this is FOR
+   * connector-sourced items — the update-existing counterpart to push-create.
+   */
+  async propagate(itemId: string, fields: VaultFieldName[]): Promise<{ connector: string; fields: VaultFieldName[] } | undefined> {
+    const item = this.items.get(itemId);
+    if (!item || !item.provenance.source.startsWith('connector:') || !item.provenance.externalId) return undefined;
+    const name = item.provenance.source.slice('connector:'.length);
+    const connector = this.get(name);
+    if (!connector?.updateSecret || !this.config(name).writeBack) return undefined;
+    const pushed: VaultFieldName[] = [];
+    for (const field of fields) {
+      if (!item.fields.includes(field)) continue;
+      const value = this.items.readSecret(item, field);
+      if (value === undefined) continue;
+      await connector.updateSecret(item.provenance.externalId, field, value);
+      pushed.push(field);
+    }
+    return pushed.length ? { connector: name, fields: pushed } : undefined;
+  }
+}
+
+/** The standard registry (Bitwarden + 1Password + pass), one construction shared
+ *  by every gateway call site so the wiring cannot drift. */
+export function defaultConnectors(store: ConnectorStore, items: VaultItems, broker: CredentialBroker | undefined, organizationId: string): Connectors {
+  const connectors = new Connectors(store, items, broker, organizationId);
+  connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden')));
+  connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password')));
+  connectors.register(new PassConnector());
+  return connectors;
 }

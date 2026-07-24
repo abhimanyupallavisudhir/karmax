@@ -48,7 +48,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?})',
     'POST /api/vault/resolve (plaintext reveal, per-item grant + policy gated; body {itemId?|domain?, field?})',
     'POST /api/vault/fill (zero-exposure browser fill via CDP; body {itemId?|domain?, field?, selector, cdpUrl?})',
-    'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access; body {itemId?|domain?, field?, mode?, why})',
+    'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access or report a wrong secret; body {itemId?|domain?, field?, mode?, kind?: access|reset, why})',
     'POST /api/vault/requests/:id/resolve (human: body {action: once|task|always|deny, itemId?})',
     'GET /api/vault/connectors (Bitwarden/1Password/pass mirror status)',
     'POST /api/vault/connectors/:name/connect|config|list|sync|write-back (selective mirror + opt-in write-back)',

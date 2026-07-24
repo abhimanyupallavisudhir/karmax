@@ -338,8 +338,8 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'request_credential',
     {
       description:
-        'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) this task was not granted, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human: stop and report, retry after they grant/add it; denied → do not re-ask.',
-      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), why: z.string() },
+        'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) this task was not granted, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human: stop and report, retry after they grant/add it; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends you the reset code.',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), kind: z.enum(['access', 'reset']).optional(), why: z.string() },
     },
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/requests', a)),
   );
@@ -365,7 +365,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'store_credential',
     {
       description:
-        'Save a credential you just created (registered account, generated password, captured TOTP seed, minted API/SSH key) into the user\'s vault so it outlives this task. Secrets are write-only: login → {password, totp}, api-key → {secret}, ssh-key → {privateKey}, env → {env}, note → {note}. You may update only items this task created.',
+        'Save a credential into the user\'s vault so it outlives this task. Two uses: (1) a credential you just created (registered account, generated password, captured TOTP seed, minted API/SSH key); (2) ROTATION — after you change a password on a site, immediately update the granted item\'s secrets here (pass its id; metadata is ignored), or everyone is locked out with the stale value. Secrets are write-only: login → {password, totp}, api-key → {secret}, ssh-key → {privateKey}, env → {env}, note → {note}. Rotation is allowed for any item this task may use; full edits only for items this task created.',
       inputSchema: {
         id: z.string().optional(), type: z.enum(['login', 'api-key', 'ssh-key', 'env', 'note']), label: z.string(),
         domains: z.array(z.string()).optional(), username: z.string().optional(), envVar: z.string().optional(),

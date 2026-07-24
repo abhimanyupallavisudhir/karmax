@@ -78,6 +78,11 @@ export interface CredentialAccessRequest {
   domain?: string;
   field?: VaultFieldName;
   mode: AccessMode;
+  /** `access` (default) = the task lacks a grant/policy approval. `reset` = the
+   *  stored secret appears WRONG (login rejected it) and the agent cannot
+   *  self-reset because recovery goes to the human's own inbox — fix the item
+   *  (or send the reset code as a follow-up), then grant to let it retry. */
+  kind?: 'access' | 'reset';
   why?: string;
   status: 'pending' | 'granted' | 'denied';
   resolution?: { action: 'once' | 'task' | 'always' | 'deny'; by: string; at: number };
@@ -444,8 +449,9 @@ export class VaultItems {
    * (no matching item; parked with the domain so the human can add one or say
    * "create it yourself") | denied (hard policy no).
    */
-  request(args: { taskId: string; projectId?: string; caps: Capability[]; itemId?: string; domain?: string; field?: VaultFieldName; mode?: AccessMode; why?: string }): { status: AccessStatus | 'not_in_vault'; reason?: string; requestId?: string; itemId?: string } {
+  request(args: { taskId: string; projectId?: string; caps: Capability[]; itemId?: string; domain?: string; field?: VaultFieldName; mode?: AccessMode; kind?: 'access' | 'reset'; why?: string }): { status: AccessStatus | 'not_in_vault'; reason?: string; requestId?: string; itemId?: string } {
     const mode: AccessMode = args.mode === 'reveal' ? 'reveal' : 'use';
+    const kind = args.kind === 'reset' ? 'reset' : 'access';
     const item = args.itemId
       ? this.get(args.itemId)
       : args.domain
@@ -453,24 +459,29 @@ export class VaultItems {
         : undefined;
     if (!item) {
       if (!args.itemId && !args.domain) throw new Error('itemId or domain required');
-      const parked = this.park({ ...args, mode, itemId: undefined });
-      this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { domain: args.domain, itemId: args.itemId, mode, status: 'not_in_vault' } });
+      const parked = this.park({ ...args, mode, kind, itemId: undefined });
+      this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { domain: args.domain, itemId: args.itemId, mode, kind, status: 'not_in_vault' } });
       return { status: 'not_in_vault', reason: args.itemId ? `no vault item ${args.itemId}` : `no vault item matches ${args.domain}`, requestId: parked.id };
     }
-    const decision = this.access(args.caps, args.taskId, item, mode);
-    if (decision.status === 'granted') return { status: 'granted', itemId: item.id };
-    if (decision.status === 'denied') {
-      this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, status: 'denied' } });
-      return { status: 'denied', reason: decision.reason, itemId: item.id };
+    // A reset report ALWAYS parks for the human — the whole point is that the
+    // stored secret failed, so "granted" access to a wrong password is useless.
+    if (kind !== 'reset') {
+      const decision = this.access(args.caps, args.taskId, item, mode);
+      if (decision.status === 'granted') return { status: 'granted', itemId: item.id };
+      if (decision.status === 'denied') {
+        this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, status: 'denied' } });
+        return { status: 'denied', reason: decision.reason, itemId: item.id };
+      }
     }
-    const parked = this.park({ ...args, mode, itemId: item.id });
-    this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, status: 'needs_approval' } });
-    return { status: 'needs_approval', reason: decision.reason, requestId: parked.id, itemId: item.id };
+    const parked = this.park({ ...args, mode, kind, itemId: item.id });
+    this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { itemId: item.id, mode, kind, status: 'needs_approval' } });
+    return { status: 'needs_approval', reason: kind === 'reset' ? `reported invalid: "${item.label}" — the human will update it (or send a reset code)` : undefined, requestId: parked.id, itemId: item.id };
   }
 
-  private park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; why?: string }): CredentialAccessRequest {
+  private park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string }): CredentialAccessRequest {
     const all = this.requests();
     const existing = all.find((r) => r.status === 'pending' && r.taskId === args.taskId && r.mode === args.mode
+      && (r.kind ?? 'access') === (args.kind ?? 'access')
       && (args.itemId ? r.itemId === args.itemId : !r.itemId && r.domain === args.domain));
     if (existing) return existing;
     const req: CredentialAccessRequest = {
@@ -481,6 +492,7 @@ export class VaultItems {
       ...(args.domain ? { domain: args.domain } : {}),
       ...(args.field ? { field: args.field } : {}),
       mode: args.mode,
+      ...(args.kind === 'reset' ? { kind: 'reset' as const } : {}),
       ...(args.why ? { why: args.why } : {}),
       status: 'pending',
       createdAt: Date.now(),

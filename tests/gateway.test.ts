@@ -665,6 +665,35 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(third.status).toBe('needs_approval');
   });
 
+  it('rotation rides the use-grant: a granted task updates a foreign item\'s secret, nothing else', async () => {
+    const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'login', label: 'Rotatable', domains: 'rot.example.com', policy: { use: 'auto', reveal: 'auto' }, secrets: { password: 'old' },
+    }) })).json();
+    const granted = h.tokens.mint({ taskId: 'task_rot', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'vault:store', 'use-credential:*'], grantorCaps: ['credential:read', 'vault:store', `use-credential:item:${item.id}`] });
+    const grantedAuth = { authorization: `Bearer ${granted.token}`, 'content-type': 'application/json' };
+    // secrets-only update on an item this task did NOT create → allowed by the grant
+    const rotated: any = await (await fetch(`${base}/api/vault/store`, { method: 'POST', headers: grantedAuth, body: JSON.stringify({ id: item.id, type: 'login', secrets: { password: 'new' } }) })).json();
+    expect(rotated.id).toBe(item.id);
+    const value: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ itemId: item.id }) })).json();
+    expect(value.value).toBe('new');
+    // metadata-only update on a foreign item → refused
+    const meta = await fetch(`${base}/api/vault/store`, { method: 'POST', headers: grantedAuth, body: JSON.stringify({ id: item.id, type: 'login', label: 'hijacked' }) });
+    expect(meta.status).toBe(403);
+    const listed: any = await (await fetch(`${base}/api/vault/items`, { headers: auth() })).json();
+    expect(listed.find((i: any) => i.id === item.id).label).toBe('Rotatable');
+    // an UNgranted task cannot rotate
+    const ungranted = h.tokens.mint({ taskId: 'task_norot', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'vault:store', 'use-credential:*'], grantorCaps: ['credential:read', 'vault:store'] });
+    const denied = await fetch(`${base}/api/vault/store`, { method: 'POST', headers: { authorization: `Bearer ${ungranted.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ id: item.id, type: 'login', secrets: { password: 'evil' } }) });
+    expect(denied.status).toBe(403);
+    // a reset report parks with its kind for the human
+    const reset: any = await (await fetch(`${base}/api/vault/requests`, { method: 'POST', headers: grantedAuth, body: JSON.stringify({ itemId: item.id, kind: 'reset', why: 'site rejected it' }) })).json();
+    expect(reset.status).toBe('needs_approval');
+    const reqs: any = await (await fetch(`${base}/api/vault/requests?status=pending`, { headers: auth() })).json();
+    expect(reqs.find((r: any) => r.id === reset.requestId).kind).toBe('reset');
+  });
+
   it('lists the external-store connectors (describe, unauthenticated CLIs report not-ready)', async () => {
     const conns: any = await (await fetch(`${base}/api/vault/connectors`, { headers: auth() })).json();
     expect(conns.map((c: any) => c.name).sort()).toEqual(['1password', 'bitwarden', 'pass']);

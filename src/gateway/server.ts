@@ -2325,7 +2325,7 @@ export class Gateway {
         if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, vault.list());
         if (p === '/api/vault/items' && method === 'POST') {
           const b = await this.body(req);
-          return this.json(res, 200, vault.save({
+          const saved = vault.save({
             id: b.id ? String(b.id) : undefined,
             type: b.type,
             label: String(b.label ?? ''),
@@ -2336,38 +2336,79 @@ export class Gateway {
             policy: b.policy,
             secrets: b.secrets,
             provenance: { source: 'manual' },
-          }));
+          });
+          // A human rotating a mirrored item's secret propagates to the source
+          // store too (field-level, notes preserved) when write-back is on.
+          let propagated;
+          if (b.id && b.secrets && Object.keys(b.secrets).length && saved.provenance.source.startsWith('connector:')) {
+            try {
+              const { defaultConnectors } = await import('../autonomy/connectors.js');
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+                .propagate(saved.id, Object.keys(b.secrets) as any);
+            } catch (e) {
+              propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
+            }
+          }
+          return this.json(res, 200, { ...saved, ...(propagated ? { propagated } : {}) });
         }
         const viDel = p.match(/^\/api\/vault\/items\/([^/]+)$/);
         if (viDel && method === 'DELETE') {
           vault.delete(viDel[1]!);
           return this.json(res, 200, { deleted: true });
         }
-        // Agent write-back (§7 store_credential): create freely; update only
-        // items this same task created — an agent must not overwrite the
-        // user's existing credentials through the narrow vault:store power.
+        // Agent write-back (§7 store_credential). Two distinct powers:
+        //  • CREATE (and fully update items this same task created) — the
+        //    narrow vault:store, as before.
+        //  • ROTATE the SECRETS of any item the task's grant covers for use —
+        //    when an agent changes a password on the site, the stored value is
+        //    stale for everyone until it's updated, so rotation rides the same
+        //    authorization as using the credential. Metadata/policy/label edits
+        //    on someone else's item remain a human/credential:write action:
+        //    the rotation path ignores everything except `secrets`.
         if (p === '/api/vault/store' && method === 'POST') {
           const b = await this.body(req);
           if (!callerTaskId && !allows(caps, 'credential:write')) return this.json(res, 400, { error: 'a task-agent token is required' });
-          if (b.id) {
-            const prior = vault.get(String(b.id));
-            if (!prior) return this.json(res, 404, { error: `no vault item ${b.id}` });
-            if (callerTaskId && prior.provenance.taskId !== callerTaskId && !allows(caps, 'credential:write'))
-              return this.json(res, 403, { error: 'vault:store may only update items this task created' });
+          const prior = b.id ? vault.get(String(b.id)) : undefined;
+          if (b.id && !prior) return this.json(res, 404, { error: `no vault item ${b.id}` });
+          const ownItem = !prior || !callerTaskId || prior.provenance.taskId === callerTaskId || allows(caps, 'credential:write');
+          let saved;
+          if (ownItem) {
+            saved = vault.save({
+              id: prior?.id,
+              type: b.type,
+              label: String(b.label ?? ''),
+              domains: Array.isArray(b.domains) ? b.domains.map(String) : undefined,
+              username: b.username ? String(b.username) : undefined,
+              tags: Array.isArray(b.tags) ? b.tags.map(String) : undefined,
+              envVar: b.envVar ? String(b.envVar) : undefined,
+              policy: b.policy,
+              secrets: b.secrets,
+              provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
+            });
+          } else {
+            // Rotation of a foreign item: allowed iff the task's grant covers it.
+            if (!vault.covered(caps, callerTaskId, prior!))
+              return this.json(res, 403, { error: 'this task was not granted this credential — request_credential first, or create your own item' });
+            const secretFields = Object.keys(b.secrets ?? {});
+            if (!secretFields.length)
+              return this.json(res, 403, { error: 'only the secrets of a granted item can be updated (metadata and policy stay with its owner)' });
+            saved = vault.save({ id: prior!.id, type: prior!.type, secrets: b.secrets });
+            store.appendAudit({ principalId: `task:${callerTaskId}`, action: 'vault.rotated',
+              detail: { itemId: prior!.id, label: prior!.label, fields: secretFields } });
           }
-          const saved = vault.save({
-            id: b.id ? String(b.id) : undefined,
-            type: b.type,
-            label: String(b.label ?? ''),
-            domains: Array.isArray(b.domains) ? b.domains.map(String) : undefined,
-            username: b.username ? String(b.username) : undefined,
-            tags: Array.isArray(b.tags) ? b.tags.map(String) : undefined,
-            envVar: b.envVar ? String(b.envVar) : undefined,
-            policy: b.policy,
-            secrets: b.secrets,
-            provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
-          });
-          return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields });
+          // Best-effort propagation of rotated fields back to the item's source
+          // store (§9 updateSecret) — the vault is already correct either way.
+          let propagated;
+          if (prior && saved.provenance.source.startsWith('connector:') && b.secrets) {
+            try {
+              const { defaultConnectors } = await import('../autonomy/connectors.js');
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+                .propagate(saved.id, Object.keys(b.secrets) as any);
+            } catch (e) {
+              propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
+            }
+          }
+          return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields, ...(propagated ? { propagated } : {}) });
         }
         // Plaintext reveal (§5C) — per-item grant + reveal policy, audited.
         if (p === '/api/vault/resolve' && method === 'POST') {
@@ -2430,6 +2471,7 @@ export class Gateway {
             domain: b.domain ? String(b.domain) : undefined,
             field: b.field,
             mode: b.mode,
+            kind: b.kind === 'reset' ? 'reset' : undefined,
             why: b.why ? String(b.why) : undefined,
           }));
         }
@@ -2448,11 +2490,8 @@ export class Gateway {
         // ── external store connectors (§9) ──
         if (p.startsWith('/api/vault/connectors')) {
           if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
-          const { Connectors, BitwardenConnector, OnePasswordConnector, PassConnector } = await import('../autonomy/connectors.js');
-          const connectors = new Connectors(store, vault, this.deps.broker, organizationId);
-          connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden')));
-          connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password')));
-          connectors.register(new PassConnector());
+          const { defaultConnectors } = await import('../autonomy/connectors.js');
+          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId);
           if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
           const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
           if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });

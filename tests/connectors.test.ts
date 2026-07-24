@@ -130,6 +130,64 @@ describe('Connectors sync into the vault (§9)', () => {
     expect(items.list().filter((i) => i.provenance.externalId === 'bw1')).toHaveLength(1);
   });
 
+  it('updateSecret is field-level: pass rewrites only line 1, keeping notes', async () => {
+    const inserted: string[] = [];
+    const exec: Exec = async (cmd, args, opts) => {
+      const key = [cmd, ...args].join(' ');
+      if (key.startsWith('pass show')) return 'oldpw\nusername: alice\nnote line\notpauth://totp/x?secret=OLD\n';
+      if (key.startsWith('pass insert')) { inserted.push(opts!.input!); return ''; }
+      throw new Error(`unexpected: ${key}`);
+    };
+    const c = new PassConnector(exec);
+    await c.updateSecret('github.com', 'password', 'newpw');
+    expect(inserted[0]).toBe('newpw\nusername: alice\nnote line\notpauth://totp/x?secret=OLD\n');
+    await c.updateSecret('github.com', 'totp', 'otpauth://totp/x?secret=NEW');
+    expect(inserted[1]).toContain('secret=NEW');
+    expect(inserted[1]).toContain('note line'); // notes survive both edits
+  });
+
+  it('updateSecret for Bitwarden edits one field of the fetched item', async () => {
+    const edits: any[] = [];
+    const exec: Exec = async (cmd, args) => {
+      const key = [cmd, ...args].join(' ');
+      if (key.startsWith('bw get item bw1')) return JSON.stringify({ id: 'bw1', type: 1, name: 'GH', notes: 'keep me', login: { username: 'octo', password: 'old' } });
+      if (key.startsWith('bw edit item bw1')) { edits.push(JSON.parse(Buffer.from(args[3]!, 'base64').toString())); return '{}'; }
+      throw new Error(`unexpected: ${key}`);
+    };
+    const c = new BitwardenConnector(() => 'sess', exec);
+    await c.updateSecret('bw1', 'password', 'new');
+    expect(edits[0].login.password).toBe('new');
+    expect(edits[0].notes).toBe('keep me');
+    expect(edits[0].login.username).toBe('octo');
+  });
+
+  it('propagate pushes rotated fields of a mirrored item to its source (write-back gated)', async () => {
+    const { items, store, broker } = makeVault();
+    const updates: any[] = [];
+    const exec: Exec = async (cmd, args, opts) => {
+      const key = [cmd, ...args].join(' ');
+      if (key.startsWith('bw status')) return JSON.stringify({ status: 'unlocked' });
+      if (key.startsWith('bw list items')) return JSON.stringify([{ id: 'bw1', type: 1, name: 'GH', login: { password: 'old', uris: [{ uri: 'https://gh.com' }] } }]);
+      if (key.startsWith('bw get item bw1')) return JSON.stringify({ id: 'bw1', type: 1, name: 'GH', login: { password: 'old' } });
+      if (key.startsWith('bw edit item bw1')) { updates.push(JSON.parse(Buffer.from(args[3]!, 'base64').toString())); return '{}'; }
+      throw new Error(`unexpected: ${key}${opts ? '' : ''}`);
+    };
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new BitwardenConnector(() => 'sess', exec));
+    const { itemIds } = await connectors.sync('bitwarden', ['bw1']);
+    // rotate the vault secret, then propagate
+    items.save({ id: itemIds[0], type: 'login', secrets: { password: 'rotated' } });
+    // write-back off → no push
+    expect(await connectors.propagate(itemIds[0]!, ['password'])).toBeUndefined();
+    connectors.setConfig('bitwarden', { writeBack: true });
+    const result = await connectors.propagate(itemIds[0]!, ['password']);
+    expect(result).toEqual({ connector: 'bitwarden', fields: ['password'] });
+    expect(updates[0].login.password).toBe('rotated');
+    // agent-created (non-connector) items are not propagate's business
+    const own = items.save({ type: 'login', label: 'mine', secrets: { password: 'x' } });
+    expect(await connectors.propagate(own.id, ['password'])).toBeUndefined();
+  });
+
   it('write-back is opt-in and round-trips via the connector push', async () => {
     const { items, store, broker } = makeVault();
     const pushed: any[] = [];
