@@ -52,10 +52,12 @@ upgrades, remote-world cost policy, and the laptop↔cloud Git handoff.
 - The [Temporal CLI](https://temporal.io/setup/install-temporal-cli) at
   `~/.temporalio/bin/temporal` (or set `TEMPORAL_CLI`). `npm start` runs the dev
   server for you.
-- A Claude Code and/or Codex login for real work. Connect and choose agents in
-  **Settings**; each task role can use either provider. API keys are also
-  supported for either provider. A fallback provider is used only when a role
-  has not explicitly selected one.
+- A coding-agent login or API key for real work. Connect and choose agents in
+  **Settings**; each task role can use Claude, Codex, or OpenCode, and a fallback
+  provider is used only when a role has not explicitly selected one. OpenCode is
+  supported over stable ACP and can run Kimi, Gemini, Grok, and other models,
+  including supported subscription logins. With no usable credential, karmax
+  runs a **mock agent** and prints a loud warning — it will not do real work.
 - Docker (optional) for the container world provider.
 
 To do real work, open **Settings**, point the project at a git repo directory,
@@ -69,7 +71,7 @@ merged into your target branch.
 | Durable execution on **Temporal** (activity/workflow split, signals, queries, updates, child workflows, continue-as-new) | ✅ real dev server, dynamic ports |
 | Workflows: **software-dev ↔ goal** (switchable in-flight), **merge-only**; legacy just-do/script-exec replay | ✅ |
 | Coordinators (lease pattern, crash-safe, continue-as-new): **merge-queue, token/account, budget** | ✅ |
-| Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK + Messages API), Codex (OpenAI), mock** | ✅ |
+| Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK + Messages API), Codex (app-server/OpenAI), OpenCode (ACP), mock** | ✅ |
 | Worlds: **local git worktree**, **Docker**, **E2B**, and **Daytona**, with checkpoint/park/hibernate lifecycle | ✅ |
 | Capability model + attenuation + **workflow-minted scoped tokens**; **platform MCP server** (permission-checked) | ✅ |
 | **Credential broker** (vault-backed, AES-GCM at rest, JIT, scoped, audited; handles only) | ✅ |

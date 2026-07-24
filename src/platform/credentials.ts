@@ -9,7 +9,7 @@
  * ConfigHomeManager / env / the broker) and resolution is a pure function, so both
  * are trivially testable and safe to import anywhere.
  */
-export type Provider = 'claude' | 'codex';
+export type Provider = string;
 export type CredKind = 'login' | 'ambient' | 'key';
 
 export interface Credential {
@@ -38,31 +38,32 @@ export interface CredentialSources {
   /** ConfigHomeManager.list() output. */
   logins: { provider: string; account: string; path: string; loggedIn: boolean }[];
   /** Ambient (~/.claude / ~/.codex) login present? */
-  ambient: { claude: boolean; codex: boolean };
+  ambient: Record<string, boolean>;
   /** Resolved ambient homes. Optional keeps pure callers/tests backwards compatible. */
-  ambientHomes?: { claude?: string; codex?: string };
+  ambientHomes?: Record<string, string | undefined>;
   /** ANTHROPIC_API_KEY / OPENAI_API_KEY present in the environment? */
-  envKeys: { claude: boolean; codex: boolean };
+  envKeys: Record<string, boolean>;
   /** Broker-registered API-key handles (e.g. "claude:work"). */
   handles: string[];
 }
-
-const isProvider = (p: string): p is Provider => p === 'claude' || p === 'codex';
 
 /** Enumerate every usable credential from the gathered sources. */
 export function enumerateCredentials(s: CredentialSources): Credential[] {
   const out: Credential[] = [];
   for (const l of s.logins) {
-    if (!l.loggedIn || !isProvider(l.provider)) continue;
+    if (!l.loggedIn || !l.provider) continue;
     out.push({ key: `login:${l.provider}:${l.account}`, provider: l.provider, kind: 'login', label: `${l.provider}:${l.account}`, configHome: l.path, account: l.account });
   }
-  if (s.ambient.claude) out.push({ key: 'ambient:claude', provider: 'claude', kind: 'ambient', label: 'claude (ambient ~/.claude)', configHome: s.ambientHomes?.claude });
-  if (s.ambient.codex) out.push({ key: 'ambient:codex', provider: 'codex', kind: 'ambient', label: 'codex (ambient ~/.codex)', configHome: s.ambientHomes?.codex });
-  if (s.envKeys.claude) out.push({ key: 'key:claude', provider: 'claude', kind: 'key', label: 'ANTHROPIC_API_KEY' });
-  if (s.envKeys.codex) out.push({ key: 'key:codex', provider: 'codex', kind: 'key', label: 'OPENAI_API_KEY' });
+  for (const [provider, present] of Object.entries(s.ambient)) {
+    if (present) out.push({ key: `ambient:${provider}`, provider, kind: 'ambient',
+      label: `${provider} (ambient login)`, configHome: s.ambientHomes?.[provider] });
+  }
+  for (const [provider, present] of Object.entries(s.envKeys)) {
+    if (present) out.push({ key: `key:${provider}`, provider, kind: 'key', label: `${provider} API key (environment)` });
+  }
   for (const h of s.handles) {
     const prov = h.split(':')[0] ?? '';
-    if (!isProvider(prov)) continue;
+    if (!prov) continue;
     out.push({ key: `key:handle:${h}`, provider: prov, kind: 'key', label: `API key: ${h}`, apiKeyHandle: h });
   }
   return out;

@@ -8,6 +8,7 @@ import { WorldRegistry } from '../world/registry.js';
 import { World, WorldHandle, WorldKind, worldWorkingDirectory } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
+import { credentialAliases, credentialMatchesProfile, credentialProvider, isAgentProvider } from '../agent/provider-registry.js';
 import { AgentAdapter } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { acquireAgentSlot, awaitAgentResources } from './agent-slots.js';
@@ -157,19 +158,21 @@ function signalKillMessage(raw: string): string {
 /** Split an account ref that may be "<provider>:<name>" or just "<name>". */
 function splitAccountRef(ref: string, fallback: Provider): { provider: Provider; name: string } {
   const [maybeProv, ...rest] = ref.split(':');
-  const isProv = rest.length > 0 && (maybeProv === 'claude' || maybeProv === 'codex' || maybeProv === 'mock');
+  const isProv = rest.length > 0 && isAgentProvider(maybeProv);
   return { provider: (isProv ? maybeProv : fallback) as Provider, name: isProv ? rest.join(':') : ref };
 }
 
 /** Derive a single AuthSource from the first usable entry of allowedAccounts
  *  (`login:<provider>:<account>` → configHome; `key:<handle>` → apiKeyHandle). */
-function firstAllowedToAuth(allowed: string[] | undefined, provider: Provider): AuthSource | undefined {
+function firstAllowedToAuth(allowed: string[] | undefined, provider: Provider, modelProvider: string = provider): AuthSource | undefined {
   if (!allowed?.length) return undefined;
-  // Prefer a login for the profile's provider; else the first login; else a key.
+  // Subscription homes are harness-specific: a Kimi OAuth home cannot be handed
+  // to OpenCode merely because OpenCode is running a Kimi model.
   const logins = allowed.filter((a) => a.startsWith('login:'));
-  const preferred = logins.find((a) => a.slice('login:'.length).startsWith(`${provider}:`)) ?? logins[0];
+  const preferred = logins.find((a) => a.slice('login:'.length).startsWith(`${provider}:`));
   if (preferred) return { kind: 'configHome', account: preferred.slice('login:'.length) };
-  const key = allowed.find((a) => a.startsWith('key:'));
+  const aliases = credentialAliases(modelProvider);
+  const key = allowed.find((a) => a.startsWith('key:') && aliases.some((p) => a.slice('key:'.length).startsWith(`${p}:`)));
   if (key) return { kind: 'apiKeyHandle', handle: key.slice('key:'.length) };
   return undefined;
 }
@@ -572,21 +575,65 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     /** The effective provider for a role's turn (task override → seeded profile),
      *  so the workflow can lease an account of the right provider (SPEC §6.2). */
-    async resolveProvider(args: { role: AgentRole; task: TaskInput }): Promise<Provider> {
+    async resolveProvider(args: { role: AgentRole; task: TaskInput }): Promise<string> {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
-      return (args.task.agents?.[args.role]?.provider ?? baseProfile.provider) as Provider;
+      return applyAgentSpec(baseProfile, args.task.agents?.[args.role]).provider;
     },
 
     /** The ordered, enabled credential keys for a turn's provider, per the credential
      *  policy resolved global→project→task (SPEC §7/§9). The coordinator leases the
      *  first available one from this list. Empty ⇒ passthrough to the profile default. */
-    async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: 'claude' | 'codex' }): Promise<string[]> {
+    async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: string; role?: AgentRole; task?: TaskInput }): Promise<string[]> {
       const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
-      const { enumerateCredentials, credentialsForProvider } = await import('../platform/credentials.js');
+      const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
       const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker });
       const all = enumerateCredentials(sources);
       const layers = readPolicyLayers((k) => store.kvGet(k), { projectId: args.projectId, taskId: args.taskId });
-      return credentialsForProvider(all, args.provider, layers).map((c) => c.key);
+      const profile = args.role && args.task
+        ? applyAgentSpec(
+          profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId),
+          args.task.agents?.[args.role],
+        )
+        : undefined;
+      const modelProvider = profile ? credentialProvider(profile) : args.provider;
+      const keyNamespaces = new Set(credentialAliases(modelProvider));
+      const profileAllows = (key: string, handle?: string) =>
+        !profile?.allowedAccounts?.length
+        || profile.allowedAccounts.includes(key)
+        || (!!handle && profile.allowedAccounts.includes(`key:${handle}`));
+      const ordered = resolveCredentials(all, layers)
+        .filter((c) =>
+          (profile ? credentialMatchesProfile(profile, c) : keyNamespaces.has(c.provider))
+          && profileAllows(c.key, c.apiKeyHandle),
+        );
+      // A native OpenCode fork is stored in the source XDG home. Lease that
+      // exact login first so account concurrency, quota failures, and policy
+      // attribution remain honest; never reopen one account after leasing
+      // another. Ambient/API-key sessions have no stored source home.
+      const resume = args.role ? args.task?.agents?.[args.role]?.resumeFrom : undefined;
+      if (profile?.provider === 'opencode' && resume?.taskId) {
+        const srcRole = resume.role ?? args.role!;
+        const raw = store.kvGet(`sessionmeta:${resume.taskId}:${srcRole}`);
+        if (raw) {
+          try {
+            const meta = JSON.parse(raw) as { home?: string; provider?: string };
+            if (meta.home && (!meta.provider || meta.provider === 'opencode')) {
+              const index = ordered.findIndex((credential) =>
+                credential.provider === 'opencode' && credential.configHome === meta.home,
+              );
+              // This is not merely a preference: another free OpenCode account
+              // cannot resolve the source session. Restrict the lease request so
+              // the coordinator waits for this home instead of skipping to a
+              // different account.
+              if (index >= 0) return [ordered[index]!.key];
+              return [];
+            }
+          } catch {
+            /* malformed historical metadata — adapter will report the missing session */
+          }
+        }
+      }
+      return ordered.map((c) => c.key);
     },
 
     async runAgentTurn(args: RunAgentTurnArgs) {
@@ -690,7 +737,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // use comes from the profile's allowedAccounts set (SPEC §7.3/§6.2) — first
       // matching entry — falling back to the legacy single `auth` field.
       let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
-      const effAuth = profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider);
+      const effAuth = profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider, credentialProvider(profile));
       if (effAuth?.kind === 'apiKeyHandle' && effAuth.handle && deps.broker) {
         const apiKey = deps.broker.resolve(effAuth.handle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
@@ -734,7 +781,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
         // The config home THIS turn runs under — where the source session must be
         // visible for the provider to resolve it. Shared by both resume paths below.
-        const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), profile.provider === 'codex' ? '.codex' : '.claude');
+        const ambientHome =
+          profile.provider === 'codex' ? '.codex'
+          : profile.provider === 'kimi' ? '.kimi-code'
+          : profile.provider === 'grok' ? '.grok'
+          : profile.provider === 'opencode' ? path.join('.local', 'share', 'opencode')
+          : '.claude';
+        const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), ambientHome);
         if (spec.resumeFrom.sessionId) {
           // A raw pasted provider session id = "continue THIS exact session" (resume,
           // not fork). Materialize it into this turn's (home × world) so the provider
@@ -748,6 +801,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // a session to a file; make it visible in this turn's (home × world) or fail.
           const materialized =
             profile.provider === 'mock' || apiRail
+              || profile.provider === 'opencode' || profile.provider === 'kimi' || profile.provider === 'grok'
               ? true
               : materializeFork({ provider: profile.provider, session, forkHome, worldPath: worldWorkingDirectory(world.handle) });
           if (!materialized) {
@@ -773,17 +827,51 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (metaRaw) { try { const m = JSON.parse(metaRaw); srcHome = m.home || undefined; srcProvider = m.provider || undefined; } catch { /* ignore */ } }
           let forked = false;
           if (srcSession && (!srcProvider || srcProvider === profile.provider)) {
-            if (remoteSubscriptionRail) {
-              const sourceHandle = store.currentWorld(spec.resumeFrom.taskId) as WorldHandle | undefined;
-              if (sourceHandle && isRemote(sourceHandle.kind)) {
-                try {
-                  const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
-                  forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
-                } catch { /* source world may have expired; try the durable local home below */ }
-              }
+            // OpenCode sessions live inside the harness's isolated XDG data home.
+            // A native fork must start in the SOURCE home; otherwise account
+            // rotation can hand session/fork to a different empty store. The
+            // credential resolver above requests only this account.
+            const openCodeSourceConnected =
+              profile.provider !== 'opencode'
+              || !srcHome
+              || !!deps.configHomes?.list().some((account) =>
+                account.provider === 'opencode'
+                && account.path === srcHome
+                && account.loggedIn,
+              );
+            if (
+              profile.provider === 'opencode'
+              && srcHome
+              && (!openCodeSourceConnected || resolvedAuth?.configHome !== srcHome)
+            ) {
+              record(args.taskId, 'session.fork-failed', {
+                session: srcSession,
+                reason: 'source-account-unavailable',
+              });
+              throw ApplicationFailure.create({
+                message: 'Cannot fork this OpenCode session because its source login is disabled, disconnected, or was not leased. Enable that OpenCode account and retry.',
+                type: 'agent-error',
+                nonRetryable: true,
+              });
             }
-            if (!forked) forked = materializeFork({ provider: profile.provider, session: srcSession,
-              forkHome, worldPath: worldWorkingDirectory(world.handle), srcHome });
+            // OpenCode advertises ACP session/fork and resolves its own opaque
+            // ids. Kimi and Grok currently do not; their native harnesses are not
+            // admitted, and any historical profile uses the honest replay path.
+            if (profile.provider === 'opencode') {
+              forked = true;
+            } else if (profile.provider !== 'kimi' && profile.provider !== 'grok') {
+              if (remoteSubscriptionRail) {
+                const sourceHandle = store.currentWorld(spec.resumeFrom.taskId) as WorldHandle | undefined;
+                if (sourceHandle && isRemote(sourceHandle.kind)) {
+                  try {
+                    const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
+                    forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
+                  } catch { /* source world may have expired; try the durable local home below */ }
+                }
+              }
+              if (!forked) forked = materializeFork({ provider: profile.provider, session: srcSession,
+                forkHome, worldPath: worldWorkingDirectory(world.handle), srcHome });
+            }
             if (forked) {
               session = srcSession;
               fork = true; // adapter branches a NEW session id from it (native fork)

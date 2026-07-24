@@ -12,7 +12,7 @@ import { SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 import type { AgentRole, TaskInput, TaskView } from './contract.js';
 
-type Provider = 'claude' | 'codex' | 'mock';
+type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
 type Grant = { accountId: string; configHome?: string; apiKeyHandle?: string };
 
 const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
@@ -107,17 +107,22 @@ export function createAgentTurnLeaser(
       if (accountPool <= 0) return admitted(turnId, role, undefined, fn);
 
       const resolved = await core.resolveProvider({ role, task: host.task() }).catch(() => undefined);
-      const provider = resolved === 'claude' || resolved === 'codex' || resolved === 'mock' ? resolved : undefined;
-      if (!provider) return admitted(turnId, role, undefined, fn);
+      const credentialProvider = typeof resolved === 'string' && resolved ? resolved : undefined;
+      if (!credentialProvider) return admitted(turnId, role, undefined, fn);
       const allowed =
-        provider === 'claude' || provider === 'codex'
-          ? await core.resolveCredentialOrder({ taskId: host.taskId, projectId: host.projectId, provider }).catch(() => undefined)
+        credentialProvider !== 'mock'
+          ? await core.resolveCredentialOrder({ taskId: host.taskId, projectId: host.projectId, provider: credentialProvider, role, task: host.task() }).catch(() => undefined)
+          : undefined;
+      const provider =
+        credentialProvider === 'claude' || credentialProvider === 'codex' || credentialProvider === 'opencode'
+        || credentialProvider === 'kimi' || credentialProvider === 'grok' || credentialProvider === 'mock'
+          ? credentialProvider
           : undefined;
 
-      await coord.leaseAccount(host.taskId, turnId, provider, allowed);
+      await coord.leaseAccount(host.taskId, turnId, credentialProvider, allowed);
       const beforeWait = host.status();
       host.setStatus('waiting');
-      host.setWaitingFor({ kind: 'account', provider });
+      host.setWaitingFor({ kind: 'account', provider: credentialProvider });
       await host.publish();
       await condition(() => grants.has(turnId) || host.cancelled());
       const grant = grants.get(turnId);
@@ -133,7 +138,7 @@ export function createAgentTurnLeaser(
         host.setWaitingFor(undefined);
         host.setStatus(beforeWait === 'waiting' ? 'active' : beforeWait);
         await host.publish();
-        throw new CredentialUnavailable(`No usable ${provider} credential; every allowed credential needs attention.`);
+        throw new CredentialUnavailable(`No usable ${credentialProvider} credential; every allowed credential needs attention.`);
       }
 
       const passthrough = !grant || grant.accountId === '(passthrough)';

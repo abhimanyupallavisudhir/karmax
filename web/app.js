@@ -394,9 +394,11 @@ const NODES = [
 ];
 
 // Provider → model choices for the agent field (free-text also allowed).
+const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 const MODELS = {
   claude: ['claude-sonnet-5', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-fable-5'],
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
+  opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   mock: ['mock'],
 };
 function modelOptions(provider) {
@@ -583,7 +585,7 @@ function renderAgentField(f, spec, inherited) {
   const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div class="agent-controls">
-      <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+      <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
         <input class="af-model" placeholder="model" value="${esc(e.model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
@@ -591,6 +593,7 @@ function renderAgentField(f, spec, inherited) {
       </div>
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
+    <input class="af-model-provider" placeholder="credential provider (auto from model, e.g. kimi)" value="${esc(e.modelProvider || '')}" title="Optional. Separates the coding harness from the API-key/subscription pool; OpenCode normally derives this from the model prefix." style="width:100%;margin-top:6px;padding:7px 10px" />
     <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> ${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
@@ -684,12 +687,12 @@ function renderConfirmerField(f, own, inherited, alt) {
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
+const normSpec = (s) => (s ? { provider: s.provider, modelProvider: s.modelProvider || '', model: s.model || '', effort: s.effort || '' } : null);
 // Canonical shape of a confirm layer for changed-vs-inherited comparison.
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
+      ? { kind: 'agent', provider: l.provider || '', modelProvider: l.modelProvider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
@@ -703,9 +706,11 @@ function readConfirmerLayers(box) {
     }
     const ab = row.querySelector('.agent-field');
     const spec = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
+    const modelProvider = ab.querySelector('.af-model-provider')?.value.trim();
     const model = ab.querySelector('.af-model').value.trim();
     const effort = ab.querySelector('.af-effort').value;
     if (model) spec.model = model;
+    if (modelProvider) spec.modelProvider = modelProvider;
     if (effort) spec.effort = effort;
     const resumeFrom = readResume(ab);
     if (resumeFrom) spec.resumeFrom = resumeFrom;
@@ -738,9 +743,11 @@ function collectForm(root, fields) {
       if (!box) continue;
       const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
       const spec = { provider: box.querySelector('.af-provider').value };
+      const modelProvider = box.querySelector('.af-model-provider')?.value.trim();
       const model = box.querySelector('.af-model').value.trim();
       const effort = box.querySelector('.af-effort').value;
       if (model) spec.model = model;
+      if (modelProvider) spec.modelProvider = modelProvider;
       if (effort) spec.effort = effort;
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
@@ -922,9 +929,11 @@ function wireAgentFields(root) {
       const sync = () => {
         const inh = JSON.parse(unifiedBox.getAttribute('data-inherit') || 'null');
         const cur = { provider: unifiedBox.querySelector('.af-provider').value };
+        const modelProvider = unifiedBox.querySelector('.af-model-provider')?.value.trim();
         const model = unifiedBox.querySelector('.af-model').value.trim();
         const effort = unifiedBox.querySelector('.af-effort').value;
         if (model) cur.model = model;
+        if (modelProvider) cur.modelProvider = modelProvider;
         if (effort) cur.effort = effort;
         reset.hidden = sameJson(normSpec(cur), normSpec(inh));
       };
@@ -1051,9 +1060,11 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     if (!box) return false;
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
     const spec = { provider: box.querySelector('.af-provider').value };
+    const modelProvider = box.querySelector('.af-model-provider')?.value.trim();
     const model = box.querySelector('.af-model').value.trim();
     const effort = box.querySelector('.af-effort').value;
     if (model) spec.model = model;
+    if (modelProvider) spec.modelProvider = modelProvider;
     if (effort) spec.effort = effort;
     return !sameJson(normSpec(spec), normSpec(inh));
   }
@@ -1089,6 +1100,7 @@ function resetAgentField(box, attr = 'data-inherit') {
   const prov = box.querySelector('.af-provider');
   prov.value = inh.provider || 'claude';
   box.querySelector('.af-model').value = inh.model || '';
+  if (box.querySelector('.af-model-provider')) box.querySelector('.af-model-provider').value = inh.modelProvider || '';
   refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
   const eff = box.querySelector('.af-effort');
   if (eff && inh.effort) eff.value = inh.effort;
@@ -5099,7 +5111,10 @@ function waitingLabel(w) {
 // session). Claude: --resume … --fork-session; Codex: `codex fork <id>` (SPEC §10.5, #3).
 function forkCommandFor(sess, worldPath) {
   if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex fork ${sess.id}`;
-  return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
+  if (sess.provider === 'claude') return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
+  // ACP makes forking available to karmax protocol-to-protocol. Until a harness
+  // documents an equivalent safe terminal command, don't manufacture one.
+  return '';
 }
 
 // Credential-policy editor (SPEC §7/§9): order credentials by precedence and
@@ -5154,7 +5169,8 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const acct = canManage && c.kind === 'login';
       // Compact inline chip: the kind is obvious from the label (a login is
       // provider:account; ambient is its home path; a key gets a 🔑), so no chip.
-      const label = c.kind === 'ambient' ? (c.provider === 'codex' ? '~/.codex' : '~/.claude') : c.label;
+      const ambientHomes = { claude: '~/.claude', codex: '~/.codex', opencode: '~/.local/share/opencode', kimi: '~/.kimi-code', grok: '~/.grok' };
+      const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
       return `<div class="cred-row${isOn ? '' : ' off'}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
@@ -5445,9 +5461,11 @@ function collectParamEdits(root, fields) {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
       const spec = { provider: box.querySelector('.af-provider').value };
+      const modelProvider = box.querySelector('.af-model-provider')?.value.trim();
       const model = box.querySelector('.af-model').value.trim();
       const effort = box.querySelector('.af-effort')?.value;
       if (model) spec.model = model;
+      if (modelProvider) spec.modelProvider = modelProvider;
       if (effort) spec.effort = effort;
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
@@ -7116,10 +7134,14 @@ function globalSettingsView(embedded = false) {
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
       <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude or Codex account to use its subscription. Each gets an isolated config home you can switch between (dodges token limits). karmax opens the provider's own login — you complete it; karmax never types your credentials.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude, Codex, or explicitly supported OpenCode subscription. Each gets an isolated config home you can switch between. karmax opens the provider's own login — you complete it; karmax never types your credentials.</p>
       <div class="form-row"><label>Connect a login</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <select id="login-provider"><option>claude</option><option>codex</option></select>
+          <select id="login-provider"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select>
+          <select id="login-opencode-target" hidden title="Subscription routed through OpenCode">
+            <option value="xai|xAI Grok OAuth (Headless / Remote / VPS)">SuperGrok / Grok or X Premium (device code)</option>
+            <option value="xai|xAI Grok OAuth (SuperGrok Subscription)">SuperGrok / Grok or X Premium (local browser)</option>
+          </select>
           <input id="login-name" placeholder="account name (e.g. personal)" style="flex:1;min-width:120px" />
           <select id="login-browser" title="Browser MCP baseline for this profile">
             <option value="none">no browser MCP</option>
@@ -7129,12 +7151,17 @@ function globalSettingsView(embedded = false) {
           <button class="btn primary" id="login-connect">Connect</button>
         </div>
         <div id="login-result" style="font-size:12px;margin-top:6px"></div>
+        <div id="login-opencode-note" hidden style="font-size:11px;color:var(--ink-3);margin-top:4px">OpenCode stores this subscription in its isolated home. Kimi and Google consumer subscriptions are not claimed here; use a Kimi/Google API key (or Google Vertex credentials) instead.</div>
       </div>
 
       <div style="font-weight:600;margin:14px 0 4px">Register an API key</div>
       <div class="form-row"><label>Register a key</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <select id="acct-provider"><option>claude</option><option>codex</option></select>
+          <input id="acct-provider" list="model-provider-options" value="kimi" placeholder="model provider" style="width:150px" />
+          <datalist id="model-provider-options">
+            <option value="kimi"><option value="xai"><option value="google"><option value="openai"><option value="anthropic">
+            <option value="moonshotai"><option value="openrouter"><option value="groq"><option value="mistral"><option value="deepseek">
+          </datalist>
           <input id="acct-name" placeholder="account name (e.g. work)" style="flex:1;min-width:120px" />
           <input id="acct-key" type="password" placeholder="API key" style="flex:1;min-width:160px" />
           <button class="btn" id="acct-add">Register</button>
@@ -7414,7 +7441,7 @@ function profileRow(p, handles, logins, scope) {
     <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span> ${usedBy}
       ${inherited ? '<span class="chip" title="Using the organization/installation default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
     <div class="agent-profile-controls">
-      <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
+      <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <div class="combo pf-model-combo" style="flex:1;min-width:140px">
         <input class="pf-model" placeholder="model" value="${esc(p.model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
@@ -7423,6 +7450,8 @@ function profileRow(p, handles, logins, scope) {
       ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
+    <div class="form-row" style="margin-top:8px"><label>Credential provider (optional)</label><input class="pf-model-provider" placeholder="auto from harness/model; e.g. kimi, google, xai" value="${esc(p.modelProvider || '')}" /></div>
+    <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
     <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins)}</div></div>
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
@@ -7483,6 +7512,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
     const allowedAccounts = allRefs.length && checked.length < allRefs.length ? checked : undefined;
     const knobs = {
       provider: card.querySelector('.pf-provider').value,
+      modelProvider: card.querySelector('.pf-model-provider').value.trim() || undefined,
       model: card.querySelector('.pf-model').value.trim() || undefined,
       effort: card.querySelector('.pf-effort').value || undefined,
       maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
@@ -7737,17 +7767,23 @@ function wireGlobalSettings(organizationId) {
     const provider = $('#login-provider').value;
     const account = $('#login-name').value.trim();
     const browserMcp = $('#login-browser').value;
+    const [modelProvider, authMethod] = provider === 'opencode'
+      ? $('#login-opencode-target').value.split('|', 2)
+      : [];
     const out = $('#login-result');
     if (!account) return toast('account name required', true);
     out.textContent = 'Launching provider login…';
     out.style.color = 'var(--ink-2)';
     try {
       const btn = $('#login-connect'); btn.disabled = true;
-      const r = await api('/api/accounts/connect', { method: 'POST', body: JSON.stringify({ provider, account, browserMcp }) });
+      const r = await api('/api/accounts/connect', {
+        method: 'POST',
+        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod }),
+      });
       btn.disabled = false;
       if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
       else if (r.status === 'awaiting_oauth' && r.loginUrl) {
-        out.innerHTML = `Open this URL to finish signing in (karmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>`;
+        out.innerHTML = `Open this URL to finish signing in (karmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}`;
         out.style.color = 'var(--ink-1)';
       } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
       $('#login-name').value = '';
@@ -7755,6 +7791,13 @@ function wireGlobalSettings(organizationId) {
       hydrateProfiles('global', undefined, organizationId);
     } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
   });
+  const syncLoginTarget = () => {
+    const show = $('#login-provider')?.value === 'opencode';
+    if ($('#login-opencode-target')) $('#login-opencode-target').hidden = !show;
+    if ($('#login-opencode-note')) $('#login-opencode-note').hidden = !show;
+  };
+  $('#login-provider')?.addEventListener('change', syncLoginTarget);
+  syncLoginTarget();
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
       const wf = b.dataset.save;

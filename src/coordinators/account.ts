@@ -41,7 +41,7 @@ import {
  * are stored in state and converted to sleeps here; the wall-clock/timezone math
  * that PRODUCES a reset instant lives in the reporting activity (SPEC §3.1).
  */
-export type AccountProvider = 'claude' | 'codex' | 'mock';
+export type AccountProvider = string;
 /** available → leasable; exhausted → auto-refreshes at resetAt; manual-off → user
  *  turned it off; needs-attention → a HARD failure (billing/auth) that needs a human. */
 export type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';

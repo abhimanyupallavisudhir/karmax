@@ -18,7 +18,7 @@ import {
   accountCoordinatorId,
 } from '../coordinators/names.js';
 
-type AccountProvider = 'claude' | 'codex' | 'mock';
+type AccountProvider = string;
 type CredKind = 'login' | 'ambient' | 'key';
 type LimitWindow = '5h' | 'weekly' | 'model';
 type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';

@@ -30,7 +30,8 @@ A fourth principle governs all three: **declare, don't guess.** Events, actions,
 
 - **Durable execution engine: Temporal.** This is the spine and is non-negotiable for v1. It provides the durability, event delivery, timers, retries, child workflows, and state queries that the platform would otherwise reimplement badly. See §3.
 - **Language: TypeScript end-to-end** (Temporal TS SDK for workflows/activities, the gateway, and the web UI), for cohesion and shared types across the workflow contract and the UI. (Temporal also supports Python/Go/Java if a different choice is made later; the spec assumes TS.)
-- **Coding agents: Claude Agent SDK and Codex (app-server / SDK)**, behind a provider-adapter interface (§7).
+- **Coding agents:** native Claude Agent SDK and Codex app-server adapters, plus
+  the stable Agent Client Protocol (ACP) for provider-neutral harnesses (§7).
 - **Secrets: a credential broker** backed by a vault (HashiCorp Vault, a cloud secret manager, or 1Password Unified Access). See §8.
 - **Worlds: a provider interface** with local and pluggable remote/sandboxed backends (§11).
 - **Remote access: Tailscale (default) or Cloudflare Tunnel + Access** (§12).
@@ -345,8 +346,23 @@ A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capa
 
 - **Claude** → Claude Agent SDK (same harness as Claude Code; session resume/fork; hooks; MCP).
 - **Codex** → Codex app-server / SDK (structured items/turns/threads; approvals pause a turn; resumable threads).
+- **OpenCode** → the versioned, stable ACP v1 contract.
+  Karmax negotiates capabilities instead of parsing terminal output: structured
+  messages/tool calls/plans, permissions, images, cancellation, per-session MCP,
+  and native load/resume/fork where the harness advertises them.
 
-`auth` references an **auth source**: either a subscription **config home** (a `CODEX_HOME`/`CLAUDE_CONFIG_DIR` directory) or an API-key **credential handle** (§8). Never a raw key inline.
+Kimi Code and Grok Build's native harnesses are not admitted while their ACP
+servers lack stable `session/fork` parity. Kimi and xAI remain model-provider
+namespaces and are available through OpenCode using API keys.
+
+`provider` names the **coding harness**. `modelProvider` optionally names the
+credential namespace (`kimi`, `google`, `xai`, `openai`, …); for OpenCode it is
+normally inferred from the `provider/model` model id. This separation lets the
+same OpenCode harness run Kimi, Gemini, Grok, Anthropic, OpenAI, OpenRouter, or
+another supported backend without pretending the model vendor is the harness.
+
+`auth` references an **auth source**: either a subscription **config home** or an
+API-key **credential handle** (§8). Never a raw key inline.
 
 ### 7.2 The per-turn execution model
 
@@ -364,9 +380,27 @@ Between turns — where all waits live — the agent is only a stored session ID
 
 ### 7.3 Config homes under `~/.karmax`
 
-karmax mints **one config home per (account × profile)** under `~/.karmax`, and injects the right `CODEX_HOME` / `CLAUDE_CONFIG_DIR` at process spawn. This is the official isolation mechanism for both tools and isolates auth, settings, sessions, MCP servers, and skills. Because these are environment variables read at process startup, they apply identically to the CLI, the app-server, and the SDK subprocess. The config home also carries browser MCP config (§7.5). Local CLI agents may load the platform MCP from it; remote Claude exposes the same handlers through its host SDK server, and remote Codex exposes them as app-server dynamic tools over the existing PTY. Consequently a cloud world never needs an inbound route to a locally hosted Karmax merely to use platform tools.
+karmax mints **one config home per (account × profile)** under `~/.karmax`, and
+injects the harness's documented home variables at process spawn:
+`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or OpenCode's XDG homes. This isolates auth,
+settings, sessions, MCP servers, and skills. Because these variables are read at
+process startup, they apply identically to local CLIs, app servers, and SDK
+subprocesses. ACP harnesses receive browser/platform/workflow MCP servers in
+`session/new`, `session/load`, or `session/fork`, so no provider-private config
+format is parsed. Remote Claude exposes the same handlers through its host SDK
+server, remote Codex exposes them as app-server dynamic tools over the existing
+PTY, and ACP uses its standard session contract. Consequently a cloud world never
+needs an inbound route to a locally hosted Karmax merely to use platform tools.
+Historical Kimi/Grok home handling is retained only for workflow replay while
+those native harnesses are not admitted.
 
-**Gotcha — scrub the environment for *login* isolation, not as a sandbox.** Spawn each agent with a **clean environment per spawn**: unset any inherited `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` so one account's key can't leak across profiles, and inject only the target profile's `CODEX_HOME`/`CLAUDE_CONFIG_DIR`. This mechanism isolates **logins** (auth, settings, sessions, MCP, skills) — it is deliberately **not** a filesystem or process sandbox. The agent still runs as the karmax user against the real home directory; *containing what an agent can read/write/execute is the **world's** job* (§11 — the default worktree is a trusted "runs on your machine" posture; the container/microVM providers are the real boundary), never the config home's. The one requirement this places on the config home: `CODEX_HOME`/`CLAUDE_CONFIG_DIR` must capture *all* account-scoped state, so two profiles sharing the real home cannot cross-contaminate logins. If a tool stashes account state outside its config dir, tighten that capture — do **not** reach for scrubbing the home directory, which conflates login isolation (this section) with sandboxing (§11).
+**Gotcha — scrub the environment for *login* isolation, not as a sandbox.**
+Spawn each agent with a **clean environment per spawn**: unset inherited model
+API keys, inject only the leased credential and target harness home, and use
+documented ephemeral config channels (for example OpenCode config content and
+Kimi's `KIMI_MODEL_*` variables). This mechanism isolates **logins**; it is
+deliberately **not** a filesystem or process sandbox. Containing what an agent
+can read/write/execute is the **world's** job (§11).
 
 ### 7.4 Agent communication
 
@@ -519,7 +553,11 @@ that canonical set.
 
 The `agent` field type is the reusable control for choosing the agent that runs a role — used both in the task form (per-role override) and in the project/global settings (per-role defaults). It collects an **AgentSpec**: `{ provider, model, effort?, resumeFrom? }`.
 
-- **provider** ∈ `claude | codex` (and `mock` for tests). **model** is a provider-scoped list with a free-text escape (Claude: `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`, …; Codex: `gpt-4.1`, …). **effort** ∈ `low | medium | high | xhigh | max` where the provider/model supports it.
+- **provider** ∈ `claude | codex | opencode` (and `mock` for
+  tests). **modelProvider** optionally selects the model credential namespace.
+  **model** is a harness-scoped list with a free-text escape; OpenCode uses
+  `provider/model` ids. **effort** ∈ `low | medium | high | xhigh | max` where
+  the harness/model advertises it.
 - **resumeFrom** continues a prior agent session: either a **task search** picker (find a previous task; resume its stored session for that role) or a directly-entered **conversation/session id**. The chosen session is passed to `runAgentTurn` as the initial session (§7.2), so the agent continues with its prior context (forking, not mutating, the source).
 
 The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.

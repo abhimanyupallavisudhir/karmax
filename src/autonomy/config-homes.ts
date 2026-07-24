@@ -3,11 +3,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { paths } from '../config/paths.js';
 import { Provider } from '../domain/types.js';
+import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 
 /**
  * Config homes (SPEC §7.3). karmax mints one config home per (account × profile)
  * and injects the right CODEX_HOME / CLAUDE_CONFIG_DIR at process spawn — the
- * official isolation mechanism for both tools (auth, settings, sessions, MCP).
+ * official isolation mechanism for each admitted tool (auth, settings,
+ * sessions, MCP).
  *
  * Gotcha (§7.3): spawn each agent with a SCRUBBED, fully isolated environment —
  * unset inherited API keys so they don't leak across profiles.
@@ -76,6 +78,8 @@ export class ConfigHomeManager {
       const toml = Object.entries(servers).map(([name, server]) => codexMcpServer(name, server)).join('');
       fs.writeFileSync(file, preserved.trimEnd() + toml);
     }
+    // ACP transports receive MCP servers in session/new and session/load.
+    // Keeping them out of provider-specific files avoids duplicate servers.
   }
 
   /**
@@ -195,10 +199,12 @@ function readJson(file: string): any {
 /** Is a config home logged in? Checks the provider's own credential file and the
  *  karmax token file we write when a `setup-token` flow prints a token. */
 export function isLoggedIn(provider: string, home: string): boolean {
-  const candidates =
-    provider === 'codex'
-      ? ['auth.json', KARMAX_TOKEN_FILE]
-      : ['.credentials.json', '.claude/.credentials.json', KARMAX_TOKEN_FILE];
+  if (isAcpProvider(provider) && hasAcpHomeLogin(provider, home)) return true;
+  const candidates = provider === 'codex'
+    ? ['auth.json', KARMAX_TOKEN_FILE]
+    : provider === 'claude'
+      ? ['.credentials.json', '.claude/.credentials.json', KARMAX_TOKEN_FILE]
+      : [KARMAX_TOKEN_FILE];
   return candidates.some((f) => fs.existsSync(path.join(home, f)));
 }
 
@@ -219,7 +225,12 @@ export function capturedToken(home: string): string | undefined {
  *  A setup-token-only home (just `karmax-oauth.json`) is NOT fully authed, so
  *  `connect` re-runs login to upgrade it to a full, usage-pollable credential (#6). */
 export function isFullyAuthed(provider: string, home: string): boolean {
-  const native = provider === 'codex' ? ['auth.json'] : ['.credentials.json', '.claude/.credentials.json'];
+  if (isAcpProvider(provider)) return hasAcpHomeLogin(provider, home);
+  const native = provider === 'codex'
+    ? ['auth.json']
+    : provider === 'claude'
+      ? ['.credentials.json', '.claude/.credentials.json']
+      : [];
   return native.some((f) => fs.existsSync(path.join(home, f)));
 }
 
@@ -240,9 +251,14 @@ export function scrubbedEnv(opts: { provider: Provider; configHome?: string; ext
   delete env.ANTHROPIC_API_KEY;
   delete env.OPENAI_API_KEY;
   delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete env.KIMI_MODEL_API_KEY;
+  delete env.KIMI_MODEL_NAME;
+  delete env.KIMI_MODEL_BASE_URL;
+  for (const provider of MODEL_PROVIDERS) delete env[apiKeyEnv(provider)];
   if (opts.configHome) {
     if (opts.provider === 'claude') env.CLAUDE_CONFIG_DIR = opts.configHome;
     if (opts.provider === 'codex') env.CODEX_HOME = opts.configHome;
+    if (isAcpProvider(opts.provider)) Object.assign(env, acpHomeEnv(opts.provider, opts.configHome));
   }
   return { ...env, ...(opts.extra ?? {}) };
 }

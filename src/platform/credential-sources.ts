@@ -1,5 +1,6 @@
 import { ClaudeAdapter } from '../agent/claude.js';
 import { CodexAdapter } from '../agent/codex.js';
+import { apiKeyEnv, hasAcpAmbientLogin, LOGIN_PROVIDERS, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { CredentialSources, CredPolicy } from './credentials.js';
@@ -17,9 +18,23 @@ export function gatherCredentialSources(deps: { configHomes?: ConfigHomeManager;
   const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
   return {
     logins: deps.configHomes?.list() ?? [],
-    ambient: { claude: ClaudeAdapter.hasAmbientLogin(), codex: CodexAdapter.hasAmbientSubscription() },
+    ambient: {
+      claude: ClaudeAdapter.hasAmbientLogin(),
+      codex: CodexAdapter.hasAmbientSubscription(),
+      opencode: hasAcpAmbientLogin('opencode'),
+    },
     ambientHomes: { claude: claudeHome, codex: codexHome },
-    envKeys: { claude: !!process.env.ANTHROPIC_API_KEY, codex: !!process.env.OPENAI_API_KEY },
+    envKeys: {
+      // Keep the historical harness namespaces for existing policies/profiles,
+      // and expose model-provider namespaces for model-agnostic harnesses.
+      claude: !!process.env.ANTHROPIC_API_KEY,
+      codex: !!process.env.OPENAI_API_KEY,
+      ...Object.fromEntries(
+        MODEL_PROVIDERS
+          .filter((provider) => provider !== 'anthropic' && provider !== 'openai')
+          .map((provider) => [provider, !!process.env[apiKeyEnv(provider)]]),
+      ),
+    },
     handles: agentAccountHandles(deps.broker?.listHandles() ?? []),
   };
 }
@@ -28,7 +43,11 @@ export function gatherCredentialSources(deps: { configHomes?: ConfigHomeManager;
  * provider keys, GitHub App keys). Only model-provider account handles belong
  * in agent account selection. */
 export function agentAccountHandles(handles: string[]): string[] {
-  return handles.filter((handle) => /^(?:claude|codex):[^:]+$/.test(handle));
+  const providers = new Set<string>([...LOGIN_PROVIDERS, ...MODEL_PROVIDERS, 'grok']);
+  return handles.filter((handle) => {
+    const [provider, account, extra] = handle.split(':');
+    return !!provider && !!account && !extra && providers.has(provider);
+  });
 }
 
 // ── credential-policy persistence (kv, overlay-resolved global→project→task) ──

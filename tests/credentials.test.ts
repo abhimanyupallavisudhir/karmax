@@ -19,9 +19,10 @@ const keys = (cs: { key: string }[]) => cs.map((c) => c.key);
 
 describe('credential enumeration', () => {
   it('hides infrastructure vault handles from agent account selection', () => {
-    expect(agentAccountHandles(['claude:work', 'codex:personal', 'checkpoint:encryption-key',
+    expect(agentAccountHandles(['claude:work', 'codex:personal', 'kimi:design', 'xai:grok',
+      'checkpoint:encryption-key',
       'github-app:private-key', 'world-provider:org:e2b:api-key']))
-      .toEqual(['claude:work', 'codex:personal']);
+      .toEqual(['claude:work', 'codex:personal', 'kimi:design', 'xai:grok']);
   });
 
   it('lists logged-in logins, ambient logins, env keys, and broker handles', () => {

@@ -1,0 +1,68 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  acpHomeEnv,
+  credentialAliases,
+  credentialMatchesProfile,
+  credentialProvider,
+  hasAcpHomeLogin,
+  isAgentProvider,
+  isLoginProvider,
+} from '../src/agent/provider-registry.js';
+
+describe('agent/model provider separation', () => {
+  it('admits OpenCode but keeps native Kimi and Grok harnesses disabled', () => {
+    expect(isAgentProvider('opencode')).toBe(true);
+    expect(isLoginProvider('opencode')).toBe(true);
+    expect(isAgentProvider('kimi')).toBe(false);
+    expect(isAgentProvider('grok')).toBe(false);
+  });
+
+  it('infers OpenCode credentials from the model prefix and accepts an explicit override', () => {
+    expect(credentialProvider({ provider: 'opencode', model: 'kimi/k3' })).toBe('kimi');
+    expect(credentialProvider({ provider: 'opencode', model: 'custom/model', modelProvider: 'google' })).toBe('google');
+    expect(credentialProvider({ provider: 'kimi', model: 'k3' })).toBe('kimi');
+  });
+
+  it('keeps legacy harness key namespaces compatible with model-vendor names', () => {
+    expect(credentialAliases('anthropic')).toEqual(['claude', 'anthropic']);
+    expect(credentialAliases('openai')).toEqual(['codex', 'openai']);
+    expect(credentialAliases('xai')).toEqual(['grok', 'xai']);
+  });
+
+  it('accepts model-vendor keys but only harness-native subscription homes', () => {
+    const profile = { provider: 'opencode' as const, model: 'kimi/k3' };
+    expect(credentialMatchesProfile(profile, { provider: 'kimi', kind: 'key' })).toBe(true);
+    expect(credentialMatchesProfile(profile, { provider: 'opencode', kind: 'ambient' })).toBe(true);
+    expect(credentialMatchesProfile(profile, { provider: 'kimi', kind: 'login' })).toBe(false);
+  });
+});
+
+describe('official ACP config homes', () => {
+  let dir: string | undefined;
+
+  afterEach(() => {
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('maps each harness to its documented startup home', () => {
+    expect(acpHomeEnv('opencode', '/h')).toEqual({
+      XDG_DATA_HOME: '/h/data',
+      XDG_CONFIG_HOME: '/h/config',
+      OPENCODE_CONFIG_DIR: '/h/config/opencode',
+    });
+    expect(acpHomeEnv('kimi', '/h')).toEqual({ KIMI_CODE_HOME: '/h' });
+    expect(acpHomeEnv('grok', '/h')).toEqual({ GROK_HOME: '/h' });
+  });
+
+  it('recognizes Kimi’s credentials directory without depending on a token filename', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-kimi-home-'));
+    fs.mkdirSync(path.join(dir, 'credentials'));
+    expect(hasAcpHomeLogin('kimi', dir)).toBe(false);
+    fs.writeFileSync(path.join(dir, 'credentials', 'kimi-code.json'), '{}');
+    expect(hasAcpHomeLogin('kimi', dir)).toBe(true);
+  });
+});
