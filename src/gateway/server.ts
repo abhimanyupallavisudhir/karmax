@@ -338,6 +338,9 @@ export class Gateway {
   private modelCatalog?: { at: number; value: ModelCatalog };
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
   private fanout: DurableEventFanout;
+  /** Remotes verified during this gateway process. Persisted links are retried
+   * once after every restart so interrupted first pushes self-heal. */
+  private wikiRemotesReady = new Set<string>();
 
   constructor(private deps: GatewayDeps) {
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess);
@@ -415,6 +418,11 @@ export class Gateway {
       void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
     });
 
+    // Deployment migration for projects that predate companion wiki repos.
+    // Complete this before binding the listener so scheduled/immediate task
+    // starts cannot race the backfill, and a local migration error cannot leave
+    // a half-started HTTP server behind.
+    for (const project of this.deps.store.listProjects()) await this.ensureProjectWiki(project);
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       server.once('error', onError);
@@ -1575,6 +1583,8 @@ export class Gateway {
         }
         if (method === 'POST') {
           const b = await this.body(req);
+          const project = store.getProject(projectId);
+          if (project) await this.ensureProjectWiki(project, session.userId);
           const task = await api.createTask(token, { projectId, ...b });
           return this.json(res, 200, task);
         }
@@ -1749,6 +1759,9 @@ export class Gateway {
       }
       const queueMatch = p.match(/^\/api\/tasks\/([^/]+)\/queue$/);
       if (queueMatch && method === 'POST') {
+        const queued = store.getTask(queueMatch[1]!);
+        const project = queued ? store.getProject(queued.projectId) : undefined;
+        if (project) await this.ensureProjectWiki(project, session.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
@@ -2809,9 +2822,19 @@ export class Gateway {
   private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
     const root = ensureProjectWikiRepository(paths().content, project.id);
     if (!this.deps.store.projectWiki(project.id)) this.deps.store.setProjectWikiRepository(project.id);
-    if (!userId || !this.deps.githubApp?.status(userId).userAuthorized) return;
     const current = this.deps.store.projectWiki(project.id)?.repository;
-    const connections = this.deps.store.listGitConnections(project.organizationId ?? 'org_personal');
+    if (current && this.wikiRemotesReady.has(project.id)) return;
+    if (!this.deps.githubApp) return;
+    const organizationId = project.organizationId ?? 'org_personal';
+    const candidates = [...new Set([
+      ...(userId ? [userId] : []),
+      ...this.deps.store.listOrganizationMemberships(organizationId)
+        .sort((a, b) => Number(b.role === 'owner') - Number(a.role === 'owner'))
+        .map((membership) => membership.userId),
+    ])];
+    const actor = candidates.find((candidate) => this.deps.githubApp!.status(candidate).userAuthorized);
+    if (!actor) return;
+    const connections = this.deps.store.listGitConnections(organizationId);
     const attachedConnectionIds = [...new Set(this.deps.store.listProjectRepositories(project.id)
       .map((candidate) => candidate.repository.gitConnectionId).filter((id): id is string => Boolean(id)))];
     const connection = current?.gitConnectionId
@@ -2823,9 +2846,9 @@ export class Gateway {
     try {
       const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
       const name = `${base}-wiki-${project.id.slice(-8)}`;
-      const repository = current ?? this.deps.store.listRepositories(project.organizationId ?? 'org_personal')
+      const repository = current ?? this.deps.store.listRepositories(organizationId)
         .find((candidate) => candidate.gitConnectionId === connection.id && candidate.name === name)
-        ?? await this.deps.githubApp.createRepository(connection.id, userId, {
+        ?? await this.deps.githubApp.createRepository(connection.id, actor, {
           name, description: `Karmax project wiki for ${project.name}`,
           private: true, defaultBranch: 'main', autoInit: false,
         });
@@ -2833,6 +2856,7 @@ export class Gateway {
       // platform-owned repository out of the ordinary project repo picker.
       this.deps.store.setProjectWikiRepository(project.id, repository.id);
       setProjectWikiRemote(root, repository.sshUrl, this.deps.githubApp.repositorySshKey(repository.id, 'write'));
+      this.wikiRemotesReady.add(project.id);
     } catch (error) {
       console.warn(`[karmax] could not create wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
     }

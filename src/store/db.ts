@@ -1409,14 +1409,22 @@ export class Store {
   recordOrganizationWikiVersion(input: {
     organizationId: string;
     path: string;
-    operation: 'write' | 'delete' | 'move';
+    operation: 'baseline' | 'write' | 'delete' | 'move';
     kind?: 'skill' | 'memory';
     content?: string;
     principal?: string;
     previousPath?: string;
-  }): void {
+    /** Insert only when this path has no recorded history. Used to snapshot
+     * pre-versioning content immediately before its first mutation. */
+    ifEmpty?: boolean;
+  }): boolean {
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      if (input.ifEmpty && this.db.prepare(`SELECT 1 FROM organization_wiki_versions
+          WHERE organizationId=? AND path=? LIMIT 1`).get(input.organizationId, input.path)) {
+        this.db.exec('COMMIT');
+        return false;
+      }
       const version = Number((this.db.prepare(`SELECT COALESCE(MAX(version), 0) + 1 n
         FROM organization_wiki_versions WHERE organizationId=? AND path=?`)
         .get(input.organizationId, input.path) as any).n);
@@ -1427,6 +1435,7 @@ export class Store {
           input.kind ?? null, input.content ?? null, input.principal ?? null,
           input.previousPath ?? null, Date.now());
       this.db.exec('COMMIT');
+      return true;
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;

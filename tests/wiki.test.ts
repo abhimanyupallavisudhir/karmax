@@ -30,6 +30,8 @@ import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { Gateway } from '../src/gateway/server.js';
+import { KarmaxBus } from '../src/contrib/bus.js';
 
 /**
  * The org/project wiki (skills, memories, prompts — one content system). Cheap
@@ -464,7 +466,9 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       // Editing a built-in writes its override; deleting the override restores the default.
       k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' });
       expect(k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).versions[0])
-        .toMatchObject({ version: 1, operation: 'write', content: expect.stringContaining('Our own rules.') });
+        .toMatchObject({ version: 2, operation: 'write', content: expect.stringContaining('Our own rules.') });
+      expect(k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).versions[1])
+        .toMatchObject({ version: 1, operation: 'baseline', content: expect.stringContaining('# How to work') });
       const edited = k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any;
       expect(edited.page).toMatchObject({ builtin: true, overridden: true });
       expect(k.deleteWikiPage(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).deleted).toBe(true);
@@ -481,6 +485,20 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       });
       expect(k.organizationWikiHistory(rw, organization.id, 'rules/original').versions[0])
         .toMatchObject({ operation: 'move', path: 'rules/renamed', previousPath: 'rules/original' });
+      // A page that predates the version-history feature is captured before its
+      // first overwrite, so the prior state remains recoverable.
+      const organizationRoot = wikiRoot(contentDir, 'organization', organization.id);
+      writeWikiPage(organizationRoot, 'legacy/page', 'Before history.', 'memory', { create: true });
+      k.saveWikiPage(rw, 'organization', organization.id, {
+        path: 'legacy/page',
+        content: 'After history.',
+        kind: 'memory',
+      });
+      expect(k.organizationWikiHistory(rw, organization.id, 'legacy/page').versions)
+        .toMatchObject([
+          { version: 2, operation: 'write', content: 'After history.' },
+          { version: 1, operation: 'baseline', content: 'Before history.' },
+        ]);
       expect(k.searchWiki(rw, 'project', project.id, 'ship').hits.length).toBeGreaterThan(0);
       expect(k.deleteWikiPage(rw, 'project', project.id, 'guides/shipping').deleted).toBe(true);
       // Read-only token: reads fine, writes denied.
@@ -530,6 +548,84 @@ describe('project wiki git branches', () => {
       expect(prompt).toContain('Task-branch instructions.');
       expect(prompt).not.toContain('Canonical instructions.');
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+});
+
+describe('existing project wiki remote backfill', () => {
+  it('uses an authorized organization owner and completes before the gateway becomes ready', async () => {
+    const home = tmp();
+    const remotes = path.join(home, 'remotes');
+    fs.mkdirSync(remotes);
+    const previousHome = process.env.KARMAX_HOME;
+    const previousGit = {
+      count: process.env.GIT_CONFIG_COUNT,
+      key: process.env.GIT_CONFIG_KEY_0,
+      value: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.KARMAX_HOME = home;
+    process.env.GIT_CONFIG_COUNT = '1';
+    process.env.GIT_CONFIG_KEY_0 = `url.file://${remotes}/.insteadOf`;
+    process.env.GIT_CONFIG_VALUE_0 = 'git@github.com:acme/';
+
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Backfill org', ownerUserId: 'owner' });
+    const project = store.createProject('Existing project', {}, organization.id);
+    const connection = store.upsertGitConnection({
+      organizationId: organization.id,
+      provider: 'github',
+      installationId: '42',
+      accountLogin: 'acme',
+      accountType: 'Organization',
+    });
+    const actors: string[] = [];
+    const githubApp = {
+      status: (userId?: string) => ({ userAuthorized: userId === 'owner' }),
+      async createRepository(_connectionId: string, userId: string, input: { name: string }) {
+        actors.push(userId);
+        execFileSync('git', ['init', '-q', '--bare', path.join(remotes, `${input.name}.git`)]);
+        return store.upsertRepository({
+          organizationId: organization.id,
+          provider: 'github',
+          providerId: '77',
+          owner: 'acme',
+          name: input.name,
+          sshUrl: `git@github.com:acme/${input.name}.git`,
+          defaultBranch: 'main',
+          private: true,
+          gitConnectionId: connection.id,
+        });
+      },
+      repositorySshKey: () => 'unused-for-file-transport',
+    };
+    const worlds = new WorldRegistry();
+    const gateway = new Gateway({
+      store,
+      worlds,
+      githubApp,
+      bus: new KarmaxBus(),
+      tokens: new TokenAuthority(),
+      staticDir: fs.mkdtempSync(path.join(home, 'static-')),
+    } as any);
+    try {
+      const listening = await gateway.listen(49_000);
+      await listening.close();
+      expect(actors).toEqual(['owner']);
+      const linked = store.projectWiki(project.id)?.repository;
+      expect(linked).toMatchObject({ private: true, gitConnectionId: connection.id });
+      expect(execFileSync('git', ['--git-dir', path.join(remotes, `${linked!.name}.git`),
+        'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim()).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      store.close();
+      if (previousHome === undefined) delete process.env.KARMAX_HOME;
+      else process.env.KARMAX_HOME = previousHome;
+      if (previousGit.count === undefined) delete process.env.GIT_CONFIG_COUNT;
+      else process.env.GIT_CONFIG_COUNT = previousGit.count;
+      if (previousGit.key === undefined) delete process.env.GIT_CONFIG_KEY_0;
+      else process.env.GIT_CONFIG_KEY_0 = previousGit.key;
+      if (previousGit.value === undefined) delete process.env.GIT_CONFIG_VALUE_0;
+      else process.env.GIT_CONFIG_VALUE_0 = previousGit.value;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

@@ -1837,6 +1837,21 @@ export class KarmaxApi {
     const root = view.root;
     const previousPath = args.prevPath ? safeWikiPath(args.prevPath) : undefined;
     const nextPath = safeWikiPath(args.path);
+    if (scope === 'organization') {
+      const baselinePath = previousPath ?? nextPath;
+      const existing = readWikiPage(root, baselinePath)
+        ?? resolveBuiltins(root).find((entry) => entry.path === baselinePath);
+      if (existing && !(args.create && !previousPath))
+        this.deps.store.recordOrganizationWikiVersion({
+          organizationId: id,
+          path: baselinePath,
+          operation: 'baseline',
+          kind: existing.kind,
+          content: existing.content,
+          principal: view.principal,
+          ifEmpty: true,
+        });
+    }
     if (previousPath && previousPath !== nextPath) moveWikiPage(root, previousPath, nextPath);
     const page = writeWikiPage(root, args.path, args.content, args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
     if (scope === 'project') commitProjectWiki(root, `wiki: update ${page.path}`);
@@ -1850,11 +1865,22 @@ export class KarmaxApi {
   deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string, selector: { taskId?: string; branch?: string } = {}) {
     const view = this.wikiScope(token, scope, id, true, selector);
     const root = view.root;
-    const existing = readWikiPage(root, rel);
+    const safe = safeWikiPath(rel);
+    const existing = readWikiPage(root, safe);
+    if (scope === 'organization' && existing)
+      this.deps.store.recordOrganizationWikiVersion({
+        organizationId: id,
+        path: safe,
+        operation: 'baseline',
+        kind: existing.kind,
+        content: existing.content,
+        principal: view.principal,
+        ifEmpty: true,
+      });
     const deleted = deleteWikiPage(root, rel);
     if (deleted && scope === 'project') commitProjectWiki(root, `wiki: delete ${safeWikiPath(rel)}`);
     if (deleted && scope === 'organization') this.deps.store.recordOrganizationWikiVersion({
-      organizationId: id, path: safeWikiPath(rel), operation: 'delete', kind: existing?.kind,
+      organizationId: id, path: safe, operation: 'delete', kind: existing?.kind,
       content: existing?.content, principal: view.principal,
     });
     return { deleted };
