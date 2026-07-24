@@ -2644,11 +2644,34 @@ export class Gateway {
         const secrets = new ProjectSecrets(store, this.deps.broker);
         const name = projectSecretsMatch[2] ? decodeURIComponent(projectSecretsMatch[2]) : undefined;
         try {
+          // The lazy-onboarding sugar over secret@1 RESOURCE attachments (the
+          // canonical store): the shapes below stay stable, but writes land as
+          // attachments, so they appear in Resources and lease like any other.
+          const secretAttachments = () => store.listResourceAttachments(project.id)
+            .filter((a) => a.driver === 'secret@1')
+            .map((a) => ({ id: a.id, name: a.target.kind === 'environment' ? a.target.name : a.name,
+              ...(a.target.kind === 'path' ? { file: a.target.path } : {}) }));
+          const upsertSecretAttachment = (secretName: string, value: string | undefined, file?: string) => {
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(secretName)) throw new Error('secret name must be env-var-shaped (letters, digits, _)');
+            const prior = secretAttachments().find((s) => s.name === secretName);
+            const credential = `secret:${project.id}:${secretName}`;
+            if (value?.length) this.deps.broker!.registerHandle(credential, value);
+            else if (!prior && !this.deps.broker!.hasHandle(credential)) throw new Error(`secret ${secretName} has no stored value — provide one`);
+            const target = file ? { kind: 'path' as const, path: file } : { kind: 'environment' as const, name: secretName };
+            if (prior) {
+              store.updateResourceAttachment(prior.id, { target });
+              return secretAttachments().find((s) => s.name === secretName)!;
+            }
+            store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+              name: secretName, driver: 'secret@1', target, access: 'read', isolation: 'fork',
+              source: {}, credentialHandles: [credential], publish: 'discard' });
+            return secretAttachments().find((s) => s.name === secretName)!;
+          };
           if (method === 'GET' && !name) {
-            // Suggestions: the names the repo's own .env example files declare
-            // (phase 2). Local checkouts and managed clones read from disk;
-            // enrolled GitHub repositories — the only shape hosted has — read
-            // through the App's contents API, so hosted suggests too.
+            // Suggestions: the names the repo's own .env example files declare.
+            // Local checkouts and managed clones read from disk; enrolled
+            // GitHub repositories — the only shape hosted has — read through
+            // the App's contents API, so hosted suggests too.
             const { envExampleNames, envExampleNamesFromText } = await import('../autonomy/project-secrets.js');
             const { managedRepoPath } = await import('../world/worktree.js');
             const { expandPath } = await import('../util/expand.js');
@@ -2659,31 +2682,45 @@ export class Gateway {
               const managed = managedRepoPath(source);
               return fs.existsSync(managed) ? managed : undefined;
             }).filter((dir): dir is string => Boolean(dir));
-            const names = new Set(envExampleNames(dirs));
+            const names2 = new Set(envExampleNames(dirs));
             if (this.deps.githubApp) {
               for (const linked of store.listProjectRepositories(project.id)) {
                 for (const file of ['.env.example', '.env.sample', '.env.template']) {
                   const text = await this.deps.githubApp.fileContents(linked.repository, file);
-                  if (text) for (const n of envExampleNamesFromText(text)) names.add(n);
+                  if (text) for (const n of envExampleNamesFromText(text)) names2.add(n);
                 }
               }
             }
-            const existing = new Set(secrets.list(project.id).map((s) => s.name));
-            const suggestions = [...names].filter((n) => !existing.has(n)).sort();
-            return this.json(res, 200, { secrets: secrets.list(project.id), suggestions });
+            // Legacy kv-layer records still list; new writes are attachments.
+            const legacy = secrets.list(project.id);
+            const attached = secretAttachments();
+            const merged = [...attached.map(({ id: _id, ...s }) => s),
+              ...legacy.filter((s) => !attached.some((a) => a.name === s.name))];
+            const existing = new Set(merged.map((s) => s.name));
+            const suggestions = [...names2].filter((n) => !existing.has(n)).sort();
+            return this.json(res, 200, { secrets: merged, suggestions });
           }
           if (method === 'POST' && !name) {
             const b = await this.body(req);
-            if (typeof b.env === 'string') return this.json(res, 200, { imported: secrets.importEnv(project.id, b.env) });
+            if (typeof b.env === 'string') {
+              const { parseEnv } = await import('../autonomy/project-secrets.js');
+              const entries = parseEnv(b.env);
+              if (!entries.length) return this.json(res, 400, { error: 'no KEY=value lines found' });
+              return this.json(res, 200, { imported: entries.map((e) => upsertSecretAttachment(e.name, e.value).name) });
+            }
             if (!b.name) return this.json(res, 400, { error: 'name required (or env: "<pasted .env>" to bulk-import)' });
-            const rec = secrets.save(project.id, { name: String(b.name),
-              value: b.value != null && b.value !== '' ? String(b.value) : undefined,
-              file: b.file ? String(b.file) : undefined,
-              mode: b.mode != null && b.mode !== '' ? Number(b.mode) : undefined });
-            return this.json(res, 200, { secret: rec }); // never echoes the value
+            const rec = upsertSecretAttachment(String(b.name),
+              b.value != null && b.value !== '' ? String(b.value) : undefined,
+              b.file ? String(b.file) : undefined);
+            const { id: _id, ...shape } = rec;
+            return this.json(res, 200, { secret: shape }); // never echoes the value
           }
           if (method === 'DELETE' && name) {
-            secrets.delete(project.id, name);
+            const attached = secretAttachments().find((s) => s.name === name);
+            if (attached) {
+              await this.deps.resources?.deleteAttachment(attached.id).catch(() => store.deleteResourceAttachment(attached.id));
+              this.deps.broker.deleteHandle(`secret:${project.id}:${name}`);
+            } else secrets.delete(project.id, name);
             return this.json(res, 200, { ok: true });
           }
         } catch (e) {

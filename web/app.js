@@ -6602,26 +6602,23 @@ async function hydrateProjectGitProfile(proj) {
     });
   } catch (error) { box.textContent = error.message; }
 }
+// The lazy-onboarding strip inside the Resources card: quick-add a secret,
+// one-click .env.example suggestions, paste-.env import, copyGlobs exit ramp.
+// Writes land as secret@1 resource attachments; the list above shows them.
 async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box) return;
   try {
-    const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    const { suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    const refresh = () => hydrateProjectResources(projectById(proj.id));
     box.innerHTML = `
-      ${secrets.map((s) => `<div class="queue-item"><div style="flex:1"><b>${esc(s.name)}</b> <span class="chip">${s.file ? `file · ${esc(s.file)}` : 'env var'}</span></div><button class="btn sm project-secret-delete" data-name="${esc(s.name)}">Remove</button></div>`).join('')
-        || '<p class="task-sub">No secrets yet. Add the values your code reads at runtime — each task world gets them as env vars (or a file), and they never enter git, checkpoints, or events.</p>'}
       ${suggestions.length ? `<div style="margin-top:6px;font-size:12px;color:var(--ink-3)">Named by this repo's .env example: ${suggestions.map((n) => `<button class="btn sm project-secret-suggest" data-name="${esc(n)}">＋ ${esc(n)}</button>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:8px"><input id="project-secret-name" placeholder="DATABASE_URL" style="max-width:190px"><input id="project-secret-value" type="password" placeholder="value (write-only)" style="flex:1;min-width:140px"><input id="project-secret-file" placeholder="as file at path (optional)" style="max-width:190px"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
+      <div class="inline-form" style="margin-top:8px"><input id="project-secret-name" placeholder="DATABASE_URL" style="max-width:190px"><input id="project-secret-value" type="password" placeholder="value (write-only)" style="flex:1;min-width:140px"><input id="project-secret-file" placeholder="as file at path (optional)" style="max-width:190px"><button class="btn sm primary" id="project-secret-save">Add secret</button></div>
       <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Values go to the vault and are never shown again. Re-saving a name with a blank value keeps the stored one.</div>
       <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# comments, blank lines, and empty values are skipped" style="width:100%"></textarea><div class="inline-form"><button class="btn sm primary" id="project-secret-import">Import</button></div></details>
-      ${(proj.config.copyGlobs || []).length ? `<div class="inline-form" style="margin-top:6px"><button class="btn sm primary" id="project-copyglobs-import">Import copyGlobs (${esc((proj.config.copyGlobs || []).join(', '))}) into Secrets/Data</button></div><div style="font-size:11px;color:var(--ink-3)">.env files become secrets, other small text files become file secrets, large/binary files become Data objects — then copyGlobs is cleared and cloud worlds get them too.</div>` : ''}`;
+      ${(proj.config.copyGlobs || []).length ? `<div class="inline-form" style="margin-top:6px"><button class="btn sm primary" id="project-copyglobs-import">Import copyGlobs (${esc((proj.config.copyGlobs || []).join(', '))}) into Resources</button></div><div style="font-size:11px;color:var(--ink-3)">.env files become secrets, other small text files become file secrets, large/binary files become data — then copyGlobs is cleared and cloud worlds get them too.</div>` : ''}`;
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
       $('#project-secret-name').value = button.dataset.name;
       $('#project-secret-value').focus();
-    }));
-    box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm(`Remove secret ${button.dataset.name}? Its stored value is deleted from the vault.`)) return;
-      try { await api(`/api/projects/${proj.id}/secrets/${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' }); await hydrateProjectSecrets(proj); }
-      catch (error) { toast(error.message, true); }
     }));
     $('#project-secret-save')?.addEventListener('click', async () => {
       const name = $('#project-secret-name').value.trim();
@@ -6630,14 +6627,14 @@ async function hydrateProjectSecrets(proj) {
         await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ name,
           value: $('#project-secret-value').value || undefined, file: $('#project-secret-file').value.trim() || undefined }) });
         toast(`🟢 Saved ${name}. The value went to the vault and is never shown again.`);
-        await hydrateProjectSecrets(proj);
+        await refresh();
       } catch (error) { toast(error.message, true); }
     });
     $('#project-secret-import')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ env: $('#project-secret-env').value }) });
         toast(`Imported ${result.imported.length} ${result.imported.length === 1 ? 'secret' : 'secrets'}`);
-        await hydrateProjectSecrets(proj);
+        await refresh();
       } catch (error) { toast(error.message, true); }
     });
     $('#project-copyglobs-import')?.addEventListener('click', async () => {
@@ -6646,35 +6643,7 @@ async function hydrateProjectSecrets(proj) {
         const total = result.envSecrets.length + result.fileSecrets.length + result.objects.length;
         toast(total ? `Imported ${total} item(s); copyGlobs cleared` : 'No matching files found to import', !total);
         await loadProjects();
-        await hydrateProjectSecrets(projectById(proj.id));
-        await hydrateProjectObjects(projectById(proj.id));
-      } catch (error) { toast(error.message, true); }
-    });
-  } catch (error) { box.textContent = error.message; }
-}
-async function hydrateProjectObjects(proj) {
-  const box = $('#project-objects-box'); if (!box) return;
-  const fmtBytes = (n) => n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MiB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KiB` : `${n} B`;
-  try {
-    const { objects } = await api(`/api/projects/${encodeURIComponent(proj.id)}/objects`);
-    box.innerHTML = `
-      ${objects.map((o) => `<div class="queue-item"><div style="flex:1"><b>${esc(o.path)}</b> <span class="chip">${esc(o.mode)}</span> <span class="chip">${fmtBytes(o.bytes)}</span> <span class="chip" title="${esc(o.object)}">${esc(o.object.slice(0, 8))}${o.history?.length ? ` · v${o.history.length + 1}` : ''}</span></div><a class="btn sm" href="/api/projects/${encodeURIComponent(proj.id)}/objects/data?path=${encodeURIComponent(o.path)}" download>Download</a><button class="btn sm project-object-delete" data-path="${esc(o.path)}">Remove</button></div>`).join('')
-        || '<p class="task-sub">No data objects yet. Declare files too big or too binary for git — fixtures, dev-db seeds, model weights. Each task world gets a fresh copy; changed copies can be promoted to a new version at Review.</p>'}
-      <div class="inline-form" style="margin-top:8px"><input type="file" id="project-object-file" style="flex:1;min-width:160px"><input id="project-object-path" placeholder="path in world (defaults to file name)" style="max-width:230px"><select id="project-object-mode"><option value="seed">seed — fresh per world</option><option value="readonly">readonly — shared immutable</option><option value="writeback">writeback — promotable</option></select><button class="btn sm primary" id="project-object-save">Add object</button></div>`;
-    box.querySelectorAll('.project-object-delete').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm(`Remove the object mount at ${button.dataset.path}? Stored versions are kept for history.`)) return;
-      try { await api(`/api/projects/${proj.id}/objects?path=${encodeURIComponent(button.dataset.path)}`, { method: 'DELETE' }); await hydrateProjectObjects(proj); }
-      catch (error) { toast(error.message, true); }
-    }));
-    $('#project-object-save')?.addEventListener('click', async () => {
-      const file = $('#project-object-file').files[0];
-      if (!file) return toast('Choose a file first', true);
-      const mountPath = $('#project-object-path').value.trim() || file.name;
-      try {
-        const dataUrl = await new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = () => reject(new Error('could not read file')); r.readAsDataURL(file); });
-        await api(`/api/projects/${proj.id}/objects`, { method: 'POST', body: JSON.stringify({ path: mountPath, mode: $('#project-object-mode').value, dataBase64: String(dataUrl).split(',')[1] || '' }) });
-        toast(`Added ${mountPath}`);
-        await hydrateProjectObjects(proj);
+        await refresh();
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { box.textContent = error.message; }
@@ -6764,6 +6733,7 @@ async function hydrateProjectEnvironment(proj) {
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { box.textContent = error.message; }
+}
 async function hydrateProjectResources(proj) {
   const box = $('#project-resources'); if (!box) return;
   try {
@@ -6777,6 +6747,7 @@ async function hydrateProjectResources(proj) {
           <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
         <button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button>
       </div>`).join('') || '<p class="task-sub">No resources yet. Tasks currently receive only their repositories and environment.</p>'}</div>
+      <div class="settings-divider"></div><div id="project-secrets-box"></div>
       <div class="settings-divider"></div><div class="section-h">Attach a resource</div>
       <div class="settings-grid">
         <label class="form-row">Name<input id="resource-name" placeholder="Training data"></label>
@@ -6858,6 +6829,7 @@ async function hydrateProjectResources(proj) {
         catch (error) { toast(error.message, true); }
       });
     });
+    hydrateProjectSecrets(proj);
   } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
 }
 
