@@ -54,16 +54,17 @@ export function credentialFile(home: string, index: number): string {
 }
 
 export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec, options: ProvisionRepoOptions):
-  Promise<{ root: string; repos: WorldRepo[]; warnings: string[] }> {
+  Promise<{ root: string; repos: WorldRepo[]; warnings: string[]; ephemeralPaths: string[] }> {
   const branch = spec.branch ?? `karmax/${spec.taskId}`;
   const sources = (spec.repos?.length ? spec.repos : spec.repo ? [spec.repo] : []).map((value) => value.trim()).filter(Boolean);
   const warnings: string[] = [];
+  const ephemeralPaths: string[] = [];
   if (sources.some((source) => !isSshRemote(source))) throw new Error(options.sshUrlError);
   const root = options.root;
   if (!sources.length) {
     await runOrThrow(target, `mkdir -p ${quote(root)} && git -C ${quote(root)} init -q -b ${quote(spec.base || 'main')}`);
     await configureRepo(target, root, spec, branch, false);
-    return { root, repos: [], warnings };
+    return { root, repos: [], warnings, ephemeralPaths };
   }
   const multi = sources.length > 1;
   const names = uniqueNames(sources.map(remoteName));
@@ -93,33 +94,36 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     const baseSha = resolved.stdout.trim();
     if (!/^[0-9a-f]{40,64}$/i.test(baseSha)) throw new Error(`repository "${source}" has no resolvable base commit`);
     await configureRepo(target, repoRoot, spec, branch, true, remoteRefExists, base);
-    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base, target: targetBranch, baseSha });
+    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base,
+      ...(targetBranch ? { target: targetBranch } : {}), targetPinned: Boolean(branchPolicy?.target), baseSha });
   }
   if (spec.copyGlobs?.length) {
     let copied = 0;
     for (let index = 0; index < repos.length; index++) {
       const source = spec.copySources?.[index];
       if (!source) continue;
-      copied += await uploadCopyGlobs(target, source, repos[index]!.root, spec.copyGlobs);
+      const uploaded = await uploadCopyGlobs(target, source, repos[index]!.root, spec.copyGlobs);
+      copied += uploaded.length;
+      ephemeralPaths.push(...uploaded.map((file) => multi ? `${repos[index]!.name}/${file}` : file));
     }
     if (!copied) warnings.push(options.copyGlobsWarning);
   }
-  return { root, repos, warnings };
+  return { root, repos, warnings, ephemeralPaths };
 }
 
-async function uploadCopyGlobs(target: ProvisionTarget, sourceRoot: string, remoteRoot: string, globs: string[]): Promise<number> {
-  if (!fs.existsSync(sourceRoot)) return 0;
+async function uploadCopyGlobs(target: ProvisionTarget, sourceRoot: string, remoteRoot: string, globs: string[]): Promise<string[]> {
+  if (!fs.existsSync(sourceRoot)) return [];
   const entries = fs.readdirSync(sourceRoot, { withFileTypes: true });
-  let copied = 0;
+  const copied = new Set<string>();
   for (const glob of globs) {
     const pattern = globToRegExp(glob);
     for (const entry of entries) {
       if (!entry.isFile() || !pattern.test(entry.name)) continue;
       await target.writeFile(path.posix.join(remoteRoot, entry.name), fs.readFileSync(path.join(sourceRoot, entry.name)));
-      copied++;
+      copied.add(entry.name);
     }
   }
-  return copied;
+  return [...copied];
 }
 
 function globToRegExp(glob: string): RegExp {

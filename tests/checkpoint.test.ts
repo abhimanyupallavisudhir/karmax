@@ -32,10 +32,11 @@ describe('portable world checkpoints', () => {
     const objects = new LocalObjectStore(path.join(dir, 'objects'));
     const checkpoints = new WorldCheckpointService(store, worlds, objects, broker);
     const world = await worlds.create('worktree', { taskId: task.id, repos: [repo], base: 'main' });
-    world.handle.meta = { projectId: project.id };
+    world.handle.meta = { projectId: project.id, ephemeralPaths: ['private.bin'] };
     world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
     const stale = { ...world.handle };
     await world.writeFileBuffer!('binary.dat', Buffer.from([0, 1, 2, 255]));
+    await world.writeFile('private.bin', 'injected credential material');
     await world.writeFile('tracked.txt', 'after\n');
     expect((await world.exec('git', ['mv', 'tracked.txt', 'renamed.txt'])).code).toBe(0);
 
@@ -51,6 +52,7 @@ describe('portable world checkpoints', () => {
     await expect(restored.readFile('tracked.txt')).rejects.toThrow();
     expect(await restored.readFile('renamed.txt')).toBe('after\n');
     expect([...await restored.readFileBuffer('binary.dat')]).toEqual([0, 1, 2, 255]);
+    await expect(restored.readFile('private.bin')).rejects.toThrow();
     expect(() => store.assertCurrentWorld(stale)).toThrow(/stale world generation/);
 
     await restored.destroy();

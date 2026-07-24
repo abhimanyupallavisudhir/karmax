@@ -38,6 +38,9 @@ export interface WorldRepo {
   base: string;
   /** Protected branch this repo lands on. Defaults to the world's target. */
   target?: string;
+  /** Whether `target` is an explicit per-repository policy. A non-pinned target
+   * is retained for inspection but merge receives the task's live target. */
+  targetPinned?: boolean;
   /** Immutable commit from which this attempt started. */
   baseSha?: string;
 }
@@ -91,7 +94,8 @@ export interface WorldSpec {
   target?: string;
   /** Check out this existing branch instead of creating karmax/<taskId> (merge-only). */
   branch?: string;
-  /** Gitignored files (globs) to copy into the world (SPEC §5.2). */
+  /** @deprecated Host-local compatibility input. Resource attachments replace
+   * this for hosted/non-Git project state (SPEC §11.4). */
   copyGlobs?: string[];
   /** Host checkouts corresponding to `repos`, used only by the trusted
    * provisioner to upload requested gitignored files into a remote clone. */
@@ -126,7 +130,7 @@ export function worldRepos(handle: WorldHandle): WorldRepo[] {
   if (handle.repos?.length) return handle.repos;
   if (handle.repo) {
     return [{ name: handle.repo.split('/').filter(Boolean).pop() ?? handle.id, repo: handle.repo, root: handle.root,
-      branch: handle.branch, base: handle.base, target: handle.target }];
+      branch: handle.branch, base: handle.base, target: handle.target, targetPinned: false }];
   }
   return [];
 }
@@ -136,6 +140,12 @@ export function worldRepos(handle: WorldHandle): WorldRepo[] {
  * the URL selected in project Settings. */
 export function worldRepoSource(repo: WorldRepo): string {
   return repo.source ?? repo.repo;
+}
+
+/** Resolve a repo's merge/publish destination without letting the task's
+ * creation-time target shadow a later in-flight target update. */
+export function worldRepoTarget(repo: WorldRepo, liveTarget: string): string {
+  return repo.targetPinned === false ? liveTarget : (repo.target ?? liveTarget);
 }
 
 export interface ExecResult {

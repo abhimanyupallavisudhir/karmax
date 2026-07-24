@@ -1,9 +1,15 @@
 /** Agent-readable map of the first-party HTTP surface used by platform_request. */
 export const PLATFORM_API_CATALOG = {
   note: 'Every route is authenticated and capability checked. Colon-prefixed names are path parameters.',
+  resources: ['GET /api/resource-drivers'],
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
     'GET|POST /api/projects/:projectId/workflow-pins',
+    'GET|POST /api/projects/:projectId/resources', 'GET|PATCH|DELETE /api/projects/:projectId/resources/:resourceId',
+    'POST /api/projects/:projectId/resources/:resourceId/import',
+    'GET /api/projects/:projectId/resources/scan',
+    'POST /api/projects/:projectId/resources/:resourceId/uploads',
+    'PUT|POST|DELETE /api/resource-uploads/:uploadId?projectId=',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
@@ -27,6 +33,8 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/tasks/:taskId/review-action', 'GET /api/tasks/:taskId/review-action/:procId',
     'POST /api/tasks/:taskId/review-action/:procId/stop', 'GET /api/tasks/:taskId/artifact?path=',
     'GET /api/tasks/:taskId/desktop', 'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
+    'GET /api/tasks/:taskId/resources', 'POST /api/tasks/:taskId/resources/:resourceId/promote',
+    'POST /api/tasks/:taskId/resources/:resourceId/discard',
   ],
   automation: [
     'GET /api/workflows', 'POST /api/workflows/install', 'POST /api/projects/:projectId/propose-workflow-edit',

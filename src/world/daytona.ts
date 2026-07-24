@@ -115,6 +115,7 @@ export class DaytonaWorldProvider implements WorldProvider {
         repo: provisioned.repos[0]?.repo, repos: provisioned.repos,
         sealedProviderRef: this.seal({ sandboxId: sandbox.id, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) }),
         meta: { releaseOnCompletion: true, environmentFlavor: flavor,
+          ...(provisioned.ephemeralPaths.length ? { ephemeralPaths: provisioned.ephemeralPaths } : {}),
           ...((selectedSnapshot ?? selectedImage) ? { environmentArtifact: selectedSnapshot ?? selectedImage } : {}) },
         ...(provisioned.warnings.length ? { warnings: provisioned.warnings } : {}),
       };

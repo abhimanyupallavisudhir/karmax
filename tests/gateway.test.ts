@@ -520,6 +520,38 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(typeof login.loggedIn).toBe('boolean');
   });
 
+  it('attaches redacted resources and completes a resumable binary upload', async () => {
+    const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Resource API' }) }).then((response) => response.json());
+    const secretResponse = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Token', driver: 'secret@1', target: { kind: 'environment', name: 'MODEL_TOKEN' },
+        access: 'read', isolation: 'fork', publish: 'discard', secret: 'never-return-this' }) });
+    expect(secretResponse.status).toBe(200);
+    const secret: any = await secretResponse.json();
+    expect(secret.credentialConfigured).toBe(true);
+    expect(JSON.stringify(secret)).not.toContain('never-return-this');
+    expect(secret.credentialHandles).toBeUndefined();
+
+    const volume: any = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Model', driver: 'volume@1', target: { kind: 'path', path: 'resources/model' },
+        access: 'write', isolation: 'fork', publish: 'review' }) }).then((response) => response.json());
+    const upload: any = await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}/uploads`,
+      { method: 'POST', headers: auth() }).then((response) => response.json());
+    const bytes = Buffer.from('fine-tuned-model-weights');
+    const part = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}&path=model.bin&part=0`,
+      { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: bytes });
+    expect(part.status).toBe(200);
+    const complete = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}`,
+      { method: 'POST', headers: auth() });
+    expect(complete.status).toBe(200);
+    const revision: any = await complete.json();
+    expect(revision.bytes).toBe(bytes.length);
+    expect(revision.sealedRef).toBeUndefined();
+    const listed = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() }).then((response) => response.json()) as any[];
+    expect(listed.find((resource) => resource.id === volume.id).revision.bytes).toBe(bytes.length);
+    expect(JSON.stringify(listed)).not.toContain('sealedRef');
+  });
+
   it('seeds a brand-new project with the karmax-ready prep task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
     // workflow's onActivate prep task automatically (SPEC §4.6) — no manual
