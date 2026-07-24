@@ -39,6 +39,7 @@ import { DaytonaWorldProvider } from './world/daytona.js';
 import { WorldHandoffService } from './world/handoff.js';
 import { WorldAccessService } from './world/access.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from './world/resources.js';
+import { sweepOrphanedServiceContainers } from './world/services.js';
 
 const VERSION = '1.0.0';
 
@@ -212,6 +213,8 @@ async function main() {
   const orphans = reapOrphans();
   if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process group(s) from a prior run`);
   if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live karmax instance untouched`);
+  const serviceOrphans = await sweepOrphanedServiceContainers((taskId) => store.worldState(taskId)).catch(() => 0);
+  if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
 
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');

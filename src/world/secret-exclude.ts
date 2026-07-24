@@ -1,0 +1,22 @@
+import type { World } from './types.js';
+import { worldRelativePath, worldRepos } from './types.js';
+
+/** Git-exclude a materialized secret only in this worktree. Using the shared
+ * repository's info/exclude would leak the rule into sibling task worlds and
+ * the user's checkout. */
+export async function ensureWorldExcluded(world: World, value: string): Promise<void> {
+  const rel = worldRelativePath(value);
+  const repos = worldRepos(world.handle);
+  const repo = repos.length <= 1 ? repos[0] : repos.find((candidate) =>
+    rel === candidate.name || rel.startsWith(`${candidate.name}/`));
+  if (!repo) return;
+  const inRepo = repos.length > 1 && rel.startsWith(`${repo.name}/`)
+    ? rel.slice(repo.name.length + 1) : rel;
+  const pattern = `/${inRepo}`;
+  await world.exec('bash', ['-c',
+    'set -e; git config extensions.worktreeConfig true; '
+    + 'd="$(git rev-parse --absolute-git-dir)"; mkdir -p "$d/info"; '
+    + 'grep -qxF "$1" "$d/info/exclude" 2>/dev/null || echo "$1" >> "$d/info/exclude"; '
+    + 'git config --worktree core.excludesFile "$d/info/exclude"',
+    'karmax-exclude', pattern], { cwd: repo.root }).catch(() => undefined);
+}

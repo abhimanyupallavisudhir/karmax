@@ -21,7 +21,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
+import { AgentSpec, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -40,6 +40,7 @@ import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCook
 import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
+import { managedRepoPath } from '../world/worktree.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -135,6 +136,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/resources/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/(?:secrets|services|environment)(?:\/|$)/.test(p))
+    return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
@@ -1427,6 +1430,178 @@ export class Gateway {
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
+      // Product-facing secret view over typed resource attachments. Values are
+      // write-only; .env example files provide lazy suggestions.
+      const projectSecrets = p.match(/^\/api\/projects\/([^/]+)\/secrets(?:\/([^/]+))?$/);
+      if (projectSecrets && ['GET', 'POST', 'DELETE'].includes(method)) {
+        const project = store.getProject(projectSecrets[1]!);
+        if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
+        if (!this.deps.broker || !this.deps.resources)
+          return this.json(res, 503, { error: 'project resources are unavailable' });
+        const resources = store.listResourceAttachments(project.id, true)
+          .filter((resource) => resource.driver === 'secret@1');
+        const encodedName = projectSecrets[2] ? decodeURIComponent(projectSecrets[2]) : undefined;
+        if (method === 'GET' && !encodedName) {
+          const names = await discoverEnvironmentNames(project, store, this.deps.githubApp);
+          const existing = new Set(resources.map((resource) => resource.target.kind === 'environment'
+            ? resource.target.name : resource.name));
+          return this.json(res, 200, { secrets: resources.map((resource) => ({
+            ...redactResource(resource),
+            file: resource.target.kind === 'path' ? resource.target.path : undefined,
+            variable: resource.target.kind === 'environment' ? resource.target.name : undefined,
+          })), suggestions: [...names].filter((name) => !existing.has(name)).sort() });
+        }
+        if (method === 'POST' && !encodedName) {
+          const body = await this.body(req);
+          const entries: Array<{ name: string; value: string; file?: string }> =
+            typeof body.env === 'string' ? parseEnvironmentValues(body.env)
+            : body.name ? [{ name: String(body.name), value: body.value == null ? '' : String(body.value),
+              file: body.file ? String(body.file) : undefined }] : [];
+          if (!entries.length) return this.json(res, 400, { error: 'name/value or pasted env required' });
+          const saved: ResourceAttachment[] = [];
+          try {
+            for (const entry of entries) {
+              const existing = resources.find((resource) =>
+                resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
+              if (existing) {
+                const handle = existing.credentialHandles[0] ?? `resource:${existing.id}:credential`;
+                if (entry.value) this.deps.broker.registerHandle(handle, entry.value);
+                saved.push(store.updateResourceAttachment(existing.id, {
+                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
+                  credentialHandles: [handle], enabled: true,
+                }));
+              } else {
+                if (!entry.value) continue;
+                const id = newId('resource'), handle = `resource:${id}:credential`;
+                this.deps.broker.registerHandle(handle, entry.value);
+                saved.push(store.createResourceAttachment({ id, organizationId: project.organizationId,
+                  projectId: project.id, name: entry.name, driver: 'secret@1',
+                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
+                  access: 'read', isolation: 'fork', source: { discovered: typeof body.env === 'string' },
+                  credentialHandles: [handle], publish: 'discard' }));
+              }
+            }
+            return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource) });
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        if (method === 'DELETE' && encodedName) {
+          const resource = resources.find((candidate) => candidate.id === encodedName || candidate.name === encodedName
+            || (candidate.target.kind === 'environment' && candidate.target.name === encodedName));
+          if (!resource) return this.json(res, 404, { error: 'secret not found' });
+          await this.deps.resources.deleteAttachment(resource.id);
+          return this.json(res, 200, { deleted: true });
+        }
+      }
+
+      // Environment recipe, repo-derived proposal, and immutable provider build.
+      const projectEnvironment = p.match(/^\/api\/projects\/([^/]+)\/environment(?:\/(proposal|build))?$/);
+      if (projectEnvironment && ['GET', 'PUT', 'POST'].includes(method)) {
+        const project = store.getProject(projectEnvironment[1]!);
+        if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
+        const { ProjectEnvironment, proposeEnvironment } = await import('../store/project-environment.js');
+        const environments = new ProjectEnvironment(store);
+        const sub = projectEnvironment[2];
+        try {
+          if (method === 'GET' && !sub) {
+            const spec = environments.spec(project.id);
+            return this.json(res, 200, { spec: spec ?? null,
+              digest: spec ? environments.digest(spec) : null, builds: environments.builds(project.id) });
+          }
+          if (method === 'PUT' && !sub) {
+            const body = await this.body(req);
+            const list = (value: unknown) => Array.isArray(value) ? value.map(String)
+              : typeof value === 'string' ? value.split('\n') : [];
+            const spec = environments.setSpec(project.id, { image: body.image ? String(body.image) : undefined,
+              setup: list(body.setup), boot: list(body.boot), includeDocker: Boolean(body.includeDocker) });
+            return this.json(res, 200, { spec, digest: environments.digest(spec) });
+          }
+          if (method === 'GET' && sub === 'proposal') {
+            const dirs = projectRepositoryDirectories(project);
+            const { ProjectServices } = await import('../store/project-services.js');
+            return this.json(res, 200, proposeEnvironment(dirs, {
+              hasPerWorldServices: new ProjectServices(store).list(project.id)
+                .some((service) => service.kind === 'per-world'),
+            }));
+          }
+          if (method === 'POST' && sub === 'build') {
+            const spec = environments.spec(project.id);
+            if (!spec) return this.json(res, 400, { error: 'accept or configure an environment proposal first' });
+            const body = await this.body(req);
+            const provider = String(body.provider ?? store.effectiveProjectConfig(project).worldProvider ?? 'worktree');
+            const digest = environments.digest(spec);
+            const connection = ['e2b', 'daytona'].includes(provider)
+              ? this.deps.providerConnections?.resolve(project.organizationId, provider) : undefined;
+            environments.recordBuild(project.id, { provider, digest, status: 'building' });
+            const { buildEnvironment } = await import('../world/environment-build.js');
+            void buildEnvironment({ provider, projectId: project.id, digest, spec,
+              ...(connection ? { connection: { apiKey: connection.apiKey,
+                apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target } } : {}) })
+              .then((result) => environments.recordBuild(project.id,
+                { provider, digest, ref: result.ref, status: 'ready' }))
+              .catch((error) => environments.recordBuild(project.id,
+                { provider, digest, status: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 800) }));
+            return this.json(res, 202, { building: { provider, digest } });
+          }
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      // Service recipes. Per-world services consume Task 253 resources as
+      // optional read-only seeds; they never introduce a parallel object store.
+      const projectServices = p.match(/^\/api\/projects\/([^/]+)\/services(?:\/(compose-import))?$/);
+      if (projectServices && ['GET', 'POST', 'DELETE'].includes(method)) {
+        const project = store.getProject(projectServices[1]!);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        const { ProjectServices, composeServiceProposals } = await import('../store/project-services.js');
+        const services = new ProjectServices(store);
+        try {
+          if (method === 'GET' && projectServices[2] === 'compose-import') {
+            const { readDevcontainer } = await import('../store/project-environment.js');
+            const proposals = [];
+            for (const dir of projectRepositoryDirectories(project)) {
+              const devcontainer = readDevcontainer(dir);
+              const candidates = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml',
+                ...(devcontainer?.composeFiles ?? []),
+                '.devcontainer/docker-compose.yml', '.devcontainer/docker-compose.yaml'];
+              for (const candidate of candidates) {
+                const filename = path.join(dir, candidate);
+                if (!fs.existsSync(filename)) continue;
+                proposals.push(...composeServiceProposals(fs.readFileSync(filename, 'utf8')));
+                break;
+              }
+            }
+            const existing = new Set(services.list(project.id).map((service) => service.name));
+            return this.json(res, 200, { proposals: proposals.filter((service) => !existing.has(service.name)) });
+          }
+          if (method === 'GET') return this.json(res, 200, { services: services.list(project.id) });
+          if (method === 'POST' && !projectServices[2]) {
+            const body = await this.body(req);
+            if (body.seedResourceId) {
+              const resource = store.getResourceAttachment(String(body.seedResourceId));
+              if (!resource || resource.projectId !== project.id || resource.target.kind !== 'path')
+                return this.json(res, 400, { error: 'seed resource must be a path resource in this project' });
+            }
+            if (body.connectionResourceId) {
+              const resource = store.getResourceAttachment(String(body.connectionResourceId));
+              if (!resource || resource.projectId !== project.id || !credentialResource(resource))
+                return this.json(res, 400, { error: 'connection resource must be a secret/service attachment in this project' });
+            }
+            return this.json(res, 200, { service: services.save(project.id, body as any) });
+          }
+          if (method === 'DELETE') {
+            const name = url.searchParams.get('name');
+            if (!name) return this.json(res, 400, { error: 'name required' });
+            services.delete(project.id, name);
+            return this.json(res, 200, { deleted: true });
+          }
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
       const projectResources = p.match(/^\/api\/projects\/([^/]+)\/resources$/);
       if (projectResources) {
         const project = store.getProject(projectResources[1]!);
@@ -3660,6 +3835,52 @@ function applyExecutionOverride(config: ProjectConfig, override: Record<string, 
     else next[key] = override[key];
   }
   return next as ProjectConfig;
+}
+
+function projectRepositoryDirectories(project: Project): string[] {
+  return (project.config.repos ?? []).map((source) => {
+    const local = expandPath(source);
+    if (fs.existsSync(local)) return local;
+    const managed = managedRepoPath(source);
+    return fs.existsSync(managed) ? managed : undefined;
+  }).filter((value): value is string => Boolean(value));
+}
+
+async function discoverEnvironmentNames(project: Project, store: Store,
+  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<Set<string>> {
+  const names = new Set<string>();
+  const add = (text: string) => {
+    for (const line of text.split('\n')) {
+      const match = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+      if (match) names.add(match[1]!);
+    }
+  };
+  for (const dir of projectRepositoryDirectories(project)) for (const file of
+    ['.env.example', '.env.sample', '.env.template']) {
+    try { add(fs.readFileSync(path.join(dir, file), 'utf8')); } catch {}
+  }
+  if (githubApp) for (const linked of store.listProjectRepositories(project.id)) for (const file of
+    ['.env.example', '.env.sample', '.env.template']) {
+    const text = await githubApp.fileContents(linked.repository, file);
+    if (text) add(text);
+  }
+  return names;
+}
+
+function parseEnvironmentValues(text: string): Array<{ name: string; value: string }> {
+  const values: Array<{ name: string; value: string }> = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    let value = match[2]!.trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+      value = value.slice(1, -1);
+    else value = value.replace(/\s+#.*$/, '');
+    if (value) values.push({ name: match[1]!, value });
+  }
+  return values;
 }
 
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {

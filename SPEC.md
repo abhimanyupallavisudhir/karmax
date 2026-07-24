@@ -692,6 +692,19 @@ never silently grants writable production access. A generated
 `.karmax/resources.yaml` is optional export, not required repository structure.
 Most tasks inherit project attachments without showing another form.
 
+Settings presents this one model through four task-oriented views: **Secrets**
+(write-only vault values, lazily suggested from `.env.example`-style declarations),
+**Data** (versioned resource revisions and uploads), **Services** (external
+connections or isolated per-world containers proposed from Compose/devcontainer),
+and **Environment** (a reviewable image/setup/boot recipe proposed from tracked
+devcontainer and lock files). These are product views, not independent storage
+systems: service seeds and connection credentials reference resource attachment
+ids, and environment builds are immutable provider accelerators keyed by their
+recipe digest. Per-world services are provisioned and destroyed with the world.
+An accepted file-shaped secret is materialized mode 0600, excluded through that
+worktree's private Git exclude configuration, scrubbed before checkpoint/merge,
+and never becomes a resource revision.
+
 `copyGlobs` is a deprecated, self-hosted compatibility/import adapter. Historical
 projects remain readable, but new hosted projects use vault injection and resource
 revisions. A copied ignored file is task-private and non-publishable; it is never

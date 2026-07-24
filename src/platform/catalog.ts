@@ -10,6 +10,10 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/projects/:projectId/resources/scan',
     'POST /api/projects/:projectId/resources/:resourceId/uploads',
     'PUT|POST|DELETE /api/resource-uploads/:uploadId?projectId=',
+    'GET|POST /api/projects/:projectId/secrets', 'DELETE /api/projects/:projectId/secrets/:name',
+    'GET|POST|DELETE /api/projects/:projectId/services', 'GET /api/projects/:projectId/services/compose-import',
+    'GET|PUT /api/projects/:projectId/environment', 'GET /api/projects/:projectId/environment/proposal',
+    'POST /api/projects/:projectId/environment/build',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',

@@ -158,10 +158,8 @@ export class WorktreeProvider implements WorldProvider {
    * configured remote for optional push/PR policy. Concurrent first tasks share
    * one in-process clone promise so they cannot race a partially-created repo. */
   private async managedClone(source: string, spec: WorldSpec): Promise<string> {
-    const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
-    const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
-    const parent = path.join(this.home, '.repositories');
-    const destination = path.join(parent, `${name}-${hash}`);
+    const destination = managedRepoPath(source, this.home);
+    const parent = path.dirname(destination);
     const existing = managedRepoClones.get(destination);
     if (existing) return existing;
     const clone = this.cloneManagedRepo(source, destination, parent, spec);
@@ -375,6 +373,14 @@ class WorktreeWorld implements World {
     if (safe === '.') throw new Error('path is a directory');
     return path.join(this.handle.root, ...safe.split('/'));
   }
+}
+
+/** Stable host-side checkout location for network repositories. Onboarding can
+ * inspect it without imposing any repository layout on the user. */
+export function managedRepoPath(source: string, home = paths().worlds): string {
+  const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
+  const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
+  return path.join(home, '.repositories', `${name}-${hash}`);
 }
 
 /** The repo's basename (its worktree subdirectory name in a multi-repo world). */

@@ -60,18 +60,19 @@ export class ContainerWorldProvider implements WorldProvider {
     const base = await this.worktrees.create(spec); // host worktree on karmax/<taskId>
     const name = `karmax-${spec.taskId}`.replace(/[^a-zA-Z0-9_.-]/g, '-');
     await docker(['rm', '-f', name]); // clear any stale container
+    const image = spec.environment?.image ?? IMAGE;
     const run = await docker([
       'run', '-d', '--name', name,
       ...containerLimitArgs(),
       '-v', `${base.handle.root}:/work`,
       '-w', '/work',
-      IMAGE, 'sleep', 'infinity',
+      image, 'sleep', 'infinity',
     ]);
     if (run.code !== 0) {
       await base.destroy();
       throw new Error(`failed to start container: ${run.stderr}`);
     }
-    const handle: WorldHandle = { ...base.handle, kind: 'container', meta: { container: name, image: IMAGE } };
+    const handle: WorldHandle = { ...base.handle, kind: 'container', meta: { container: name, image } };
     return new ContainerWorld(handle);
   }
 

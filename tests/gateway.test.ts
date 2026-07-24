@@ -552,6 +552,65 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(listed)).not.toContain('sealedRef');
   });
 
+  it('offers proposal-driven secrets, environment, and per-world services over typed resources', async () => {
+    const repo = await h.makeRepo('project-onboarding');
+    fs.mkdirSync(`${repo}/.devcontainer`);
+    fs.writeFileSync(`${repo}/.env.example`, 'DATABASE_URL=\nMODEL_TOKEN=\n');
+    fs.writeFileSync(`${repo}/package-lock.json`, '{}');
+    fs.writeFileSync(`${repo}/.devcontainer/devcontainer.json`, JSON.stringify({
+      image: 'node:22-slim',
+      postCreateCommand: 'npm run setup',
+      dockerComposeFile: '../compose.yaml',
+    }));
+    fs.writeFileSync(`${repo}/compose.yaml`, `services:
+  database:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: local
+      POSTGRES_DB: app
+`);
+    await git(repo, ['add', '.']);
+    await git(repo, ['commit', '-m', 'add project declarations']);
+
+    const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Onboarding API', config: { repos: [repo], worldProvider: 'container' } }) })
+      .then((response) => response.json());
+
+    const suggested: any = await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })
+      .then((response) => response.json());
+    expect(suggested.suggestions).toEqual(['DATABASE_URL', 'MODEL_TOKEN']);
+    const imported = await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ env: 'MODEL_TOKEN=private-value\nDATABASE_URL=postgres://external' }) });
+    expect(imported.status).toBe(200);
+    expect(JSON.stringify(await imported.json())).not.toContain('private-value');
+
+    const proposal: any = await fetch(`${base}/api/projects/${project.id}/environment/proposal`, { headers: auth() })
+      .then((response) => response.json());
+    expect(proposal.spec).toMatchObject({ image: 'node:22-slim', setup: ['npm run setup', 'npm ci'] });
+    const savedEnvironment = await fetch(`${base}/api/projects/${project.id}/environment`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify(proposal.spec),
+    });
+    expect(savedEnvironment.status).toBe(200);
+
+    const compose: any = await fetch(`${base}/api/projects/${project.id}/services/compose-import`, { headers: auth() })
+      .then((response) => response.json());
+    expect(compose.proposals[0]).toMatchObject({
+      name: 'database', kind: 'per-world', image: 'postgres:16', containerPort: 5432,
+      urlEnv: 'DATABASE_URL',
+    });
+    const service = await fetch(`${base}/api/projects/${project.id}/services`, {
+      method: 'POST', headers: auth(), body: JSON.stringify(compose.proposals[0]),
+    });
+    expect(service.status).toBe(200);
+
+    const secrets: any = await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })
+      .then((response) => response.json());
+    expect(secrets.suggestions).toEqual([]);
+    expect(secrets.secrets.every((secret: any) => secret.credentialConfigured)).toBe(true);
+    expect(JSON.stringify(secrets)).not.toContain('postgres://external');
+  });
+
   it('seeds a brand-new project with the karmax-ready prep task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
     // workflow's onActivate prep task automatically (SPEC §4.6) — no manual

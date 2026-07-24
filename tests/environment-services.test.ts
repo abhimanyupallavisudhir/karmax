@@ -1,0 +1,121 @@
+import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { ProjectEnvironment, parseDevcontainer, proposeEnvironment, stripJsonComments } from '../src/store/project-environment.js';
+import { buildEnvironment, bootCommands, environmentDockerfile, setupCommands, type BuilderSandbox } from '../src/world/environment-build.js';
+import { ProjectServices, composeServiceProposals } from '../src/store/project-services.js';
+import { launchWorldServices } from '../src/world/services.js';
+
+function memoryKv() {
+  const values = new Map<string, string>();
+  return { kvGet: (key: string) => values.get(key), kvSet: (key: string, value: string) => void values.set(key, value) };
+}
+
+describe('project environment proposals and builds', () => {
+  it('stores build-relevant recipes and tracks immutable provider artifacts', () => {
+    const environment = new ProjectEnvironment(memoryKv());
+    const spec = environment.setSpec('p', { image: 'node:22', setup: ['npm ci', ''], boot: ['echo boot'] });
+    const digest = environment.digest(spec);
+    expect(environment.digest({ ...spec, boot: ['changed'] })).toBe(digest);
+    expect(environment.digest({ ...spec, setup: ['changed'] })).not.toBe(digest);
+    environment.recordBuild('p', { provider: 'container', digest, status: 'building' });
+    expect(environment.readyBuild('p', 'container', digest)).toBeUndefined();
+    environment.recordBuild('p', { provider: 'container', digest, status: 'ready', ref: 'image:tag' });
+    expect(environment.readyBuild('p', 'container', digest)?.ref).toBe('image:tag');
+  });
+
+  it('parses JSONC devcontainers and proposes setup from tracked declarations', () => {
+    const parsed = parseDevcontainer(`{
+      // comment-like text inside strings must survive
+      "image": "example.invalid/http://node",
+      "onCreateCommand": ["npm", "install", "--some flag"],
+      "postCreateCommand": { "db": "npm run db:setup" },
+      "dockerComposeFile": "compose.yaml",
+    }`);
+    expect(parsed.setup).toEqual(["npm install '--some flag'", 'npm run db:setup']);
+    expect(JSON.parse(stripJsonComments('{"url":"http://x", /* c */ "ok":true,}'))).toEqual({ url: 'http://x', ok: true });
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-env-proposal-'));
+    try {
+      fs.mkdirSync(path.join(dir, '.devcontainer'));
+      fs.writeFileSync(path.join(dir, '.devcontainer/devcontainer.json'),
+        '{"image":"node:22","postCreateCommand":"npm run setup","dockerComposeFile":"compose.yaml"}');
+      fs.writeFileSync(path.join(dir, '.devcontainer/compose.yaml'), 'services: {}');
+      fs.writeFileSync(path.join(dir, 'package-lock.json'), '{}');
+      const proposal = proposeEnvironment([dir], { hasPerWorldServices: true });
+      expect(proposal.spec).toMatchObject({ image: 'node:22', setup: ['npm run setup', 'npm ci'], includeDocker: true });
+      expect(proposal.composeFiles).toEqual([path.join(dir, '.devcontainer/compose.yaml')]);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('realizes host and fake-E2B builds and includes Docker when requested', async () => {
+    expect(await buildEnvironment({ provider: 'worktree', projectId: 'p', digest: 'd', spec: {} })).toEqual({ ref: 'host' });
+    const dockerfile = environmentDockerfile({ image: 'node:22-slim', setup: ['npm ci'], includeDocker: true });
+    expect(dockerfile).toContain('get.docker.com');
+    expect(dockerfile).toContain('RUN npm ci');
+    expect(setupCommands({ includeDocker: true })[0]).toContain('get.docker.com');
+    expect(bootCommands({ includeDocker: true })[0]).toContain('dockerd');
+
+    const calls: string[] = [];
+    let killed = false;
+    const builder: BuilderSandbox = {
+      async run(command) { calls.push(command); return { exitCode: 0, stderr: '', stdout: '' }; },
+      async createSnapshot(name) { calls.push(name); return { snapshotId: 'snapshot-1' }; },
+      async kill() { killed = true; },
+    };
+    expect(await buildEnvironment({ provider: 'e2b', projectId: 'p', digest: 'd',
+      spec: { setup: ['npm ci'] }, createBuilderSandbox: async () => builder })).toEqual({ ref: 'snapshot-1' });
+    expect(calls).toContain('npm ci');
+    expect(killed).toBe(true);
+  });
+});
+
+describe('service proposals', () => {
+  it('derives isolated service recipes from Compose and stores typed resource references', () => {
+    const proposals = composeServiceProposals(`
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    ports: ["15432:5432"]
+  built:
+    build: .
+`);
+    expect(proposals).toEqual([expect.objectContaining({
+      name: 'postgres', kind: 'per-world', containerPort: 5432, urlEnv: 'DATABASE_URL',
+      urlTemplate: 'postgres://app:secret@{host}:{port}/app',
+    })]);
+    const services = new ProjectServices(memoryKv());
+    expect(services.save('p', { ...proposals[0]!, seedResourceId: 'resource-1',
+      seedContainerPath: '/docker-entrypoint-initdb.d/seed.sql' }).seedResourceId).toBe('resource-1');
+  });
+
+  it('provisions through the world contract and mounts an existing typed resource as its seed', async () => {
+    const calls: string[][] = [];
+    const world: any = {
+      handle: { kind: 'e2b', id: 'world-1', root: '/workspace/project', branch: 'task', base: 'main' },
+      async exec(command: string, args: string[]) {
+        calls.push([command, ...args]);
+        if (args[0] === 'version') return { code: 0, stdout: '27.0', stderr: '' };
+        if (args[0] === 'inspect') return { code: 0, stdout: '172.17.0.5\n', stderr: '' };
+        return { code: 0, stdout: 'container-id\n', stderr: '' };
+      },
+    };
+    const resources = new Map([['seed-resource', {
+      id: 'seed-resource', target: { kind: 'path', path: 'resources/database-seed' },
+    } as any]]);
+    const launched = await launchWorldServices(world, 'task-1', [{
+      name: 'database', kind: 'per-world', image: 'postgres:16', containerPort: 5432,
+      urlEnv: 'DATABASE_URL', urlTemplate: 'postgres://app@{host}:{port}/app',
+      seedResourceId: 'seed-resource', seedContainerPath: '/docker-entrypoint-initdb.d',
+    }], resources);
+    expect(launched.env.DATABASE_URL).toBe('postgres://app@172.17.0.5:5432/app');
+    const run = calls.find((call) => call[0] === 'docker' && call[1] === 'run')!;
+    expect(run).toContain('/workspace/project/resources/database-seed:/docker-entrypoint-initdb.d:ro');
+    expect(run.join(' ')).toContain('karmax.task=task-1');
+  });
+});
