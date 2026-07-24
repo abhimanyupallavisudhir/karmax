@@ -47,8 +47,10 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',
     'GET|PUT|DELETE /api/organizations/:organizationId/wiki/page?path= (PUT body {path, content, kind: skill|memory, create?, prevPath?})',
     'GET /api/organizations/:organizationId/wiki/search?q=',
+    'GET /api/organizations/:organizationId/wiki/history?path= (append-only database version history)',
     'GET /api/projects/:projectId/wiki?path=', 'GET|PUT|DELETE /api/projects/:projectId/wiki/page?path=',
     'GET /api/projects/:projectId/wiki/search?q=',
+    'GET /api/projects/:projectId/wiki/refs (filterable branch/task views; pass taskId= or branch= to reads)',
   ],
   payments: ['GET /api/payments/providers', 'POST /api/payments/connect', 'GET|POST /api/cards', 'POST /api/cards/:id/fund'],
   administration: [

@@ -81,7 +81,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
       actions: actions(), state: { worldReady: !!world }, branch: world?.branch, base,
-      world, worldPath: world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
+      world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
   const publish = async () => core.publishView(taskId, view());

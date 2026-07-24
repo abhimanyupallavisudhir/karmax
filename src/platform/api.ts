@@ -30,6 +30,7 @@ import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
+import { commitProjectWiki, ensureProjectWikiRepository, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -60,6 +61,19 @@ export interface TriggerArmer {
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
 const agentSnapshotKey = (taskId: string) => `task-agents:${taskId}`;
+const wikiFiles = (root: string): string[] => {
+  const out: string[] = [];
+  const walk = (rel: string) => {
+    for (const entry of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
+      if (entry.name === '.git') continue;
+      const file = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(file);
+      else out.push(file);
+    }
+  };
+  walk('');
+  return out;
+};
 
 function principalRefOf(principal: string, kind?: 'agent' | 'human' | 'system'): PrincipalRef | undefined {
   if (principal.startsWith('user:')) return { kind: 'user', userId: principal.slice(5) };
@@ -169,8 +183,10 @@ export class KarmaxApi {
   private gitBrokerAuth(projectId: string): GitBrokerAuth {
     if (!this.deps.githubApp) throw new Error('Git collaboration requires a connected GitHub App');
     const linked = this.deps.store.listProjectRepositories(projectId);
+    const wiki = this.deps.store.projectWiki(projectId)?.repository;
     return async (repo) => {
-      const repository = linked.find((candidate) => candidate.repository.sshUrl === repo.repo)?.repository;
+      const repository = linked.find((candidate) => candidate.repository.sshUrl === repo.repo)?.repository
+        ?? (wiki?.sshUrl === repo.repo ? wiki : undefined);
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       return this.deps.githubApp!.brokerCredentials(repository);
     };
@@ -1725,17 +1741,48 @@ export class KarmaxApi {
   // Reads need the scope's read capability; writes reuse skill:write (the wiki
   // IS the skills store). All paths are traversal-checked inside src/wiki.
 
-  /** Resolve + authorize one wiki scope; returns its on-disk root. */
-  private wikiScope(token: string, scope: string, id: string, write: boolean): string {
+  /** Resolve + authorize one wiki scope. Project wikis default to the caller
+   * task's checkout; humans may explicitly select another task or branch. */
+  private wikiScope(
+    token: string,
+    scope: string,
+    id: string,
+    write: boolean,
+    selector: { taskId?: string; branch?: string } = {},
+  ): { root: string; branch?: string; taskId?: string; writable: boolean; principal: string } {
     if (scope !== 'organization' && scope !== 'project') throw new Error('wiki scope must be organization or project');
+    let caller;
     if (scope === 'project') {
       const project = this.deps.store.getProject(id);
       if (!project) throw new Error(`no project ${id}`);
-      this.require(token, write ? 'skill:write' : 'project:read', { projectId: id, organizationId: project.organizationId });
+      caller = this.require(token, write ? 'skill:write' : 'project:read', { projectId: id, organizationId: project.organizationId });
+      const canonical = ensureProjectWikiRepository(this.deps.contentDir ?? paths().content, id);
+      const requestedTask = selector.taskId ?? (caller.taskId && caller.taskId !== '*' ? caller.taskId : undefined);
+      if (requestedTask) {
+        const task = this.deps.store.getTask(requestedTask);
+        if ((!task || task.projectId !== id) && selector.taskId) throw new Error('wiki task must belong to this project');
+        const handle = task
+          ? (this.deps.store.currentWorld(requestedTask) ?? task.lastView?.world) as WorldHandle | undefined
+          : undefined;
+        const repo = handle ? worldRepos(handle).find((candidate) => candidate.role === 'project-wiki') : undefined;
+        if (repo && fs.existsSync(repo.root))
+          return { root: repo.root, branch: repo.branch, taskId: requestedTask, writable: true, principal: caller.principal };
+        const branch = handle?.branch;
+        if (branch && projectWikiBranches(canonical).includes(branch))
+          return { root: projectWikiBranchView(this.deps.contentDir ?? paths().content, id, branch),
+            branch, taskId: requestedTask, writable: false, principal: caller.principal };
+        if (selector.taskId) throw new Error('that task has no available project-wiki checkout');
+      }
+      if (selector.branch && selector.branch !== PROJECT_WIKI_BRANCH) {
+        if (write) throw new Error('select a task world to edit a non-default wiki branch');
+        return { root: projectWikiBranchView(this.deps.contentDir ?? paths().content, id, selector.branch),
+          branch: selector.branch, writable: false, principal: caller.principal };
+      }
+      return { root: canonical, branch: PROJECT_WIKI_BRANCH, writable: true, principal: caller.principal };
     } else {
-      this.require(token, write ? 'skill:write' : 'organization:read', { organizationId: id });
+      caller = this.require(token, write ? 'skill:write' : 'organization:read', { organizationId: id });
+      return { root: wikiRoot(this.deps.contentDir ?? paths().content, scope, id), writable: true, principal: caller.principal };
     }
-    return wikiRoot(this.deps.contentDir ?? paths().content, scope, id);
   }
 
   /** One navigation call: a skill path returns the page; anything else lists
@@ -1744,16 +1791,17 @@ export class KarmaxApi {
    *  task) and `tocText`, the exact rendered table of contents agents receive
    *  (importance order, [more…] folds). The organization tree includes the
    *  built-ins, resolved through their on-disk overrides when edited. */
-  readWiki(token: string, scope: WikiScope, id: string, rel = '') {
-    const root = this.wikiScope(token, scope, id, false);
+  readWiki(token: string, scope: WikiScope, id: string, rel = '', selector: { taskId?: string; branch?: string } = {}) {
+    const view = this.wikiScope(token, scope, id, false, selector);
+    const root = view.root;
     const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
     const builtins = scope === 'organization' ? resolveBuiltins(root) : [];
     const builtin = builtins.find((b) => b.path === safeWikiPath(rel));
-    if (builtin) return { scope, id, path: builtin.path, page: builtin };
+    if (builtin) return { scope, id, path: builtin.path, page: builtin, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
     const page = rel ? readWikiPage(root, rel) : undefined;
-    if (page) return { scope, id, path: page.path, page };
+    if (page) return { scope, id, path: page.path, page, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
     const toc = listWiki(root, rel);
-    if (rel) return { scope, id, path: safeWikiPath(rel), toc };
+    if (rel) return { scope, id, path: safeWikiPath(rel), toc, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
     // `default` entries are inlined into every task's prompt (built-ins first).
     const unconditional = [
       ...builtins
@@ -1766,13 +1814,13 @@ export class KarmaxApi {
     // in full as their own cards) — the same rendering agents get.
     const exclude = new Set(unconditional.map((u) => u.path));
     const tocText = renderWikiToc(toc, { scope, id, exclude });
-    return { scope, id, path: '', toc, unconditional, tocText };
+    return { scope, id, path: '', toc, unconditional, tocText, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
   }
 
   /** Rank pages, labels, and folders of one scope against a typed query — what
    *  the task-form `@proj:…`/`@org:…` mention dropdown searches. */
-  suggestWiki(token: string, scope: WikiScope, id: string, query: string) {
-    const root = this.wikiScope(token, scope, id, false);
+  suggestWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
+    const root = this.wikiScope(token, scope, id, false, selector).root;
     return { scope, id, query, suggestions: suggestWiki(root, query) };
   }
 
@@ -1783,20 +1831,225 @@ export class KarmaxApi {
     scope: WikiScope,
     id: string,
     args: { path: string; content: string; kind?: 'skill' | 'memory'; create?: boolean; prevPath?: string },
+    selector: { taskId?: string; branch?: string } = {},
   ) {
-    const root = this.wikiScope(token, scope, id, true);
-    if (args.prevPath && safeWikiPath(args.prevPath) !== safeWikiPath(args.path)) moveWikiPage(root, args.prevPath, args.path);
-    return writeWikiPage(root, args.path, args.content, args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
+    const view = this.wikiScope(token, scope, id, true, selector);
+    const root = view.root;
+    const previousPath = args.prevPath ? safeWikiPath(args.prevPath) : undefined;
+    const nextPath = safeWikiPath(args.path);
+    if (scope === 'organization') {
+      const baselinePath = previousPath ?? nextPath;
+      const existing = readWikiPage(root, baselinePath)
+        ?? resolveBuiltins(root).find((entry) => entry.path === baselinePath);
+      if (existing && !(args.create && !previousPath))
+        this.deps.store.recordOrganizationWikiVersion({
+          organizationId: id,
+          path: baselinePath,
+          operation: 'baseline',
+          kind: existing.kind,
+          content: existing.content,
+          principal: view.principal,
+          ifEmpty: true,
+        });
+    }
+    if (previousPath && previousPath !== nextPath) moveWikiPage(root, previousPath, nextPath);
+    const page = writeWikiPage(root, args.path, args.content, args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
+    if (scope === 'project') commitProjectWiki(root, `wiki: update ${page.path}`);
+    else this.deps.store.recordOrganizationWikiVersion({ organizationId: id, path: page.path,
+      operation: previousPath && previousPath !== nextPath ? 'move' : 'write', kind: page.kind,
+      content: page.content, principal: view.principal,
+      previousPath: previousPath && previousPath !== nextPath ? previousPath : undefined });
+    return page;
   }
 
-  deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string) {
-    const root = this.wikiScope(token, scope, id, true);
-    return { deleted: deleteWikiPage(root, rel) };
+  deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string, selector: { taskId?: string; branch?: string } = {}) {
+    const view = this.wikiScope(token, scope, id, true, selector);
+    const root = view.root;
+    const safe = safeWikiPath(rel);
+    const existing = readWikiPage(root, safe);
+    if (scope === 'organization' && existing)
+      this.deps.store.recordOrganizationWikiVersion({
+        organizationId: id,
+        path: safe,
+        operation: 'baseline',
+        kind: existing.kind,
+        content: existing.content,
+        principal: view.principal,
+        ifEmpty: true,
+      });
+    const deleted = deleteWikiPage(root, rel);
+    if (deleted && scope === 'project') commitProjectWiki(root, `wiki: delete ${safeWikiPath(rel)}`);
+    if (deleted && scope === 'organization') this.deps.store.recordOrganizationWikiVersion({
+      organizationId: id, path: safe, operation: 'delete', kind: existing?.kind,
+      content: existing?.content, principal: view.principal,
+    });
+    return { deleted };
   }
 
-  searchWiki(token: string, scope: WikiScope, id: string, query: string) {
-    const root = this.wikiScope(token, scope, id, false);
+  searchWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
+    const root = this.wikiScope(token, scope, id, false, selector).root;
     return { scope, id, query, hits: searchWiki(root, query) };
+  }
+
+  wikiViews(token: string, projectId: string) {
+    const view = this.wikiScope(token, 'project', projectId, false);
+    const branches = projectWikiBranches(view.root);
+    const tasks = this.deps.store.listTasks(projectId).flatMap((task) => {
+      const handle = (this.deps.store.currentWorld(task.id) ?? task.lastView?.world) as WorldHandle | undefined;
+      if (!handle || !worldRepos(handle).some((repo) => repo.role === 'project-wiki') && !branches.includes(handle.branch)) return [];
+      return [{ id: task.id, num: task.num, title: task.title, branch: handle.branch,
+        status: task.lastView?.status ?? (task.params.draft ? 'draft' : 'queued') }];
+    });
+    return { defaultBranch: PROJECT_WIKI_BRANCH, branches, tasks };
+  }
+
+  organizationWikiHistory(token: string, organizationId: string, rel?: string) {
+    this.wikiScope(token, 'organization', organizationId, false);
+    return { versions: this.deps.store.organizationWikiHistory(organizationId, rel ? safeWikiPath(rel) : undefined) };
+  }
+
+  /** Provider-aware variants used at the HTTP/MCP edge. Local worlds stay on
+   * the fast synchronous path; remote worlds are snapshotted through the World
+   * interface so the same wiki operations see their live branch. */
+  async readWikiResolved(token: string, scope: WikiScope, id: string, rel = '',
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
+    if (!remote) return this.readWiki(token, scope, id, rel, selector);
+    try {
+      return this.readWikiFromRoot(scope, id, rel, remote.root, {
+        branch: remote.repo.branch, taskId: remote.taskId, writable: true,
+      });
+    } finally { await remote.release(); }
+  }
+
+  async searchWikiResolved(token: string, scope: WikiScope, id: string, query: string,
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
+    if (!remote) return this.searchWiki(token, scope, id, query, selector);
+    try { return { scope, id, query, hits: searchWiki(remote.root, query) }; }
+    finally { await remote.release(); }
+  }
+
+  async suggestWikiResolved(token: string, scope: WikiScope, id: string, query: string,
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
+    if (!remote) return this.suggestWiki(token, scope, id, query, selector);
+    try { return { scope, id, query, suggestions: suggestWiki(remote.root, query) }; }
+    finally { await remote.release(); }
+  }
+
+  async saveWikiPageResolved(token: string, scope: WikiScope, id: string,
+    args: { path: string; content: string; kind?: 'skill' | 'memory'; create?: boolean; prevPath?: string },
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
+    if (!remote) return this.saveWikiPage(token, scope, id, args, selector);
+    try {
+      if (args.prevPath && safeWikiPath(args.prevPath) !== safeWikiPath(args.path))
+        moveWikiPage(remote.root, args.prevPath, args.path);
+      const page = writeWikiPage(remote.root, args.path, args.content,
+        args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
+      await remote.flush(`wiki: update ${page.path}`);
+      return page;
+    } finally { await remote.release(); }
+  }
+
+  async deleteWikiPageResolved(token: string, scope: WikiScope, id: string, rel: string,
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
+    if (!remote) return this.deleteWikiPage(token, scope, id, rel, selector);
+    try {
+      const deleted = deleteWikiPage(remote.root, rel);
+      if (deleted) await remote.flush(`wiki: delete ${safeWikiPath(rel)}`);
+      return { deleted };
+    } finally { await remote.release(); }
+  }
+
+  private readWikiFromRoot(scope: WikiScope, id: string, rel: string, root: string,
+    view: { branch?: string; taskId?: string; writable: boolean }) {
+    const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
+    const builtins = scope === 'organization' ? resolveBuiltins(root) : [];
+    const builtin = builtins.find((b) => b.path === safeWikiPath(rel));
+    if (builtin) return { scope, id, path: builtin.path, page: builtin, view };
+    const page = rel ? readWikiPage(root, rel) : undefined;
+    if (page) return { scope, id, path: page.path, page, view };
+    const toc = listWiki(root, rel);
+    if (rel) return { scope, id, path: safeWikiPath(rel), toc, view };
+    const unconditional = [
+      ...builtins.filter(isDefaultDelivered)
+        .map((b) => ({ ...entryOf(b), body: parseFrontmatter(b.content).body.trim() || b.content })),
+      ...collectDefaultPages(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
+    ];
+    toc.children = [...builtins.map(entryOf), ...(toc.children ?? [])];
+    const exclude = new Set(unconditional.map((u) => u.path));
+    return { scope, id, path: '', toc, unconditional,
+      tocText: renderWikiToc(toc, { scope, id, exclude }), view };
+  }
+
+  private async remoteWikiSnapshot(token: string, projectId: string, write: boolean,
+    selector: { taskId?: string; branch?: string }) {
+    const project = this.deps.store.getProject(projectId);
+    if (!project) throw new Error(`no project ${projectId}`);
+    const caller = this.require(token, write ? 'skill:write' : 'project:read',
+      { projectId, organizationId: project.organizationId });
+    const taskId = selector.taskId ?? (caller.taskId && caller.taskId !== '*' ? caller.taskId : undefined);
+    if (!taskId || selector.branch) return undefined;
+    const task = this.deps.store.getTask(taskId);
+    if (!task || task.projectId !== projectId) {
+      if (selector.taskId) throw new Error('wiki task must belong to this project');
+      return undefined;
+    }
+    const handle = (this.deps.store.currentWorld(taskId) ?? task.lastView?.world) as WorldHandle | undefined;
+    const repo = handle ? worldRepos(handle).find((candidate) => candidate.role === 'project-wiki') : undefined;
+    if (!handle || !repo || fs.existsSync(repo.root)) return undefined;
+    const access = await this.openCollaborationWorld(taskId, handle);
+    const prefix = path.posix.relative(handle.root.replace(/\\/g, '/'), repo.root.replace(/\\/g, '/'));
+    if (prefix.startsWith('..')) {
+      await access.release();
+      throw new Error('project wiki is outside the task world');
+    }
+    const contentDir = this.deps.contentDir ?? paths().content;
+    fs.mkdirSync(contentDir, { recursive: true });
+    const root = fs.mkdtempSync(path.join(contentDir, '.wiki-snapshot-'));
+    try {
+      const all = await access.world.listFiles();
+      const inside = all.filter((file) => !prefix || file === prefix || file.startsWith(`${prefix}/`));
+      const relative = (file: string) => prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
+      for (const file of inside) {
+        const rel = relative(file);
+        if (!rel || rel.startsWith('.git/')) continue;
+        const target = path.join(root, rel);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, await access.world.readFileBuffer(file));
+      }
+      const before = new Set(inside.map(relative).filter(Boolean));
+      return {
+        root, repo, taskId,
+        flush: async (message: string) => {
+          const after = wikiFiles(root);
+          for (const old of before) if (!after.includes(old))
+            await access.world.exec('rm', ['-rf', path.posix.join(repo.root, old)]);
+          for (const rel of after) {
+            const destination = prefix ? path.posix.join(prefix, rel) : rel;
+            const value = fs.readFileSync(path.join(root, rel));
+            if (access.world.writeFileBuffer) await access.world.writeFileBuffer(destination, value);
+            else await access.world.writeFile(destination, value.toString('utf8'));
+          }
+          const added = await access.world.exec('git', ['add', '-A'], { cwd: repo.root });
+          if (added.code !== 0) throw new Error(added.stderr || added.stdout);
+          const committed = await access.world.exec('git', ['commit', '-q', '-m', message], { cwd: repo.root });
+          if (committed.code !== 0 && !/nothing to commit/i.test(`${committed.stdout}${committed.stderr}`))
+            throw new Error(committed.stderr || committed.stdout);
+        },
+        release: async () => {
+          fs.rmSync(root, { recursive: true, force: true });
+          await access.release();
+        },
+      };
+    } catch (error) {
+      fs.rmSync(root, { recursive: true, force: true });
+      await access.release();
+      throw error;
+    }
   }
 
   /** Propose a workflow-repo edit through the dogfooded merge-only PR gate (§4.4). */

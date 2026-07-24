@@ -63,6 +63,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   if (adapterOverride) adapters.set(provider, adapterOverride);
   const profiles = new ProfileResolver(store, provider);
   const bus = new KarmaxBus();
+  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
 
   const tokens = new TokenAuthority(store);
   const payments = new MockPaymentProvider(store);
@@ -78,12 +79,12 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
     client,
     tokens,
     payments,
+    contentDir,
     taskQueue: TASK_QUEUE,
   };
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);
   let runPromise = worker.run();
 
-  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus });
   const gateways: Array<() => Promise<void>> = [];
 
@@ -140,6 +141,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
       await c.close();
       await server.stop();
       fs.rmSync(worldsHome, { recursive: true, force: true });
+      fs.rmSync(contentDir, { recursive: true, force: true });
     },
     async makeRepo(name: string) {
       const repo = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-repo-${name}-`));

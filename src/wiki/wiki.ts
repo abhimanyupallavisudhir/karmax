@@ -661,6 +661,9 @@ export function buildWikiPromptContext(args: {
   contentDir: string;
   organizationId?: string;
   projectId?: string;
+  /** Live task-world checkout for the project wiki. When absent, use the
+   * canonical repository under `contentDir` (human/default-branch reads). */
+  projectRoot?: string;
   /** External override for the built-in instructions (tests/deployments). */
   builtinInstructions?: string;
   /** Task text (prompt + follow-ups) scanned for `@proj:…`/`@org:…` tags. */
@@ -682,7 +685,9 @@ export function buildWikiPromptContext(args: {
   if (args.projectId) scopes.push({ scope: 'project', id: args.projectId, heading: 'Project' });
   let hasWiki = false;
   for (const { scope, id, heading } of scopes) {
-    const root = wikiRoot(args.contentDir, scope, id);
+    const root = scope === 'project' && args.projectRoot
+      ? args.projectRoot
+      : wikiRoot(args.contentDir, scope, id);
     const tree = listWiki(root);
     // Inlined in full: every ref this task resolves to (context field defaults +
     // inline prompt tags). The built-in `default` entries are inlined above

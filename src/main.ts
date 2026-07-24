@@ -191,6 +191,7 @@ async function main() {
     runners,
     payments,
     configHomes,
+    contentDir: p.content,
     taskQueue: TASK_QUEUE,
   });
   await workerManager.start();
