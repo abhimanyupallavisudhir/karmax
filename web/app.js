@@ -1757,7 +1757,7 @@ function connectWs() {
         S.liveOutput = ev.payload.text;
         updateLiveBubble();
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message') {
-        if (S.taskTab === 'checkin') renderTaskPage();
+        if (S.taskTab === 'checkin') scheduleTaskPageRender();
         else renderTaskEvents();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
@@ -1846,6 +1846,14 @@ function renderShell() {
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
+  // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
+  // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
+  // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
+  // them. Snapshot the focused row's stable identity and re-focus the matching row.
+  const active = document.activeElement;
+  const focusedKey = active && rail.contains(active)
+    ? (active.dataset.id ? `[data-id="${active.dataset.id}"]` : active.id ? `#${active.id}` : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
+    : null;
   rail.innerHTML = `
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
@@ -1865,6 +1873,7 @@ function renderRail() {
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
+  if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
 }
 
 function switchTab(tab) {
@@ -1889,9 +1898,13 @@ function captureFocus(root) {
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
     st.selectionStart = el.selectionStart;
     st.selectionEnd = el.selectionEnd;
-    // A multi-line field scrolls its own content; a fresh element resets to the
-    // top, so snapshot the internal scroll and put it back with the caret.
+    // A field scrolls its own content; a fresh element resets to the top-left, so
+    // snapshot the internal scroll and put it back with the caret. scrollLeft is
+    // the one that bites in a single-line <input>: setSelectionRange restores the
+    // caret but does NOT re-scroll the box to reveal it, so a long line otherwise
+    // snaps back to its start on every WS-driven repaint while the caret stays put.
     st.scrollTop = el.scrollTop;
+    st.scrollLeft = el.scrollLeft;
   }
   return st;
 }
@@ -1911,6 +1924,7 @@ function restoreFocus(root, st) {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
   if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
+  if (typeof st.scrollLeft === 'number') el.scrollLeft = st.scrollLeft;
 }
 
 // A background (WebSocket-driven) refresh repaints #main by swapping its
@@ -1944,6 +1958,19 @@ function flushBgRender() {
   if (main && interactionInFlight(main)) return; // still busy — wait for the next release
   bgRenderQueued = false;
   renderMain();
+}
+
+// A live agent emits a burst of conversation.message / agent.activity events (each
+// tool call is one), and every one used to fire a full renderTaskPage() rebuild
+// synchronously — so a single turn could repaint the whole page a dozen times in a
+// frame, which is what made scrolling the conversation feel janky. Coalesce the
+// WS-driven repaints into one per animation frame: the last state wins and the
+// browser paints once, at a frame boundary.
+let taskPageRenderQueued = false;
+function scheduleTaskPageRender() {
+  if (taskPageRenderQueued) return;
+  taskPageRenderQueued = true;
+  requestAnimationFrame(() => { taskPageRenderQueued = false; renderTaskPage(); });
 }
 
 // ── main content ───────────────────────────────────────────────────────────
@@ -3612,14 +3639,23 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    // paramDefaults keys off the fetched view's workflow, so it follows the batch.
-    S.paramDefaults = await loadParamDefaults(taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
+  // Param defaults only feed the Parameters tab, and resolving them costs a git
+  // subprocess (defaultBranch) on the server — so they used to add that latency to
+  // the *front* of every task open (the paint waited on them). They key off the
+  // task's (project, workflow), which never change while it's open, so load them
+  // once, after the first paint, and repaint only if the user is still here and
+  // actually looking at the Parameters tab.
+  loadParamDefaults(taskId).then((d) => {
+    if (S.selected !== taskId) return; // navigated away before it landed
+    S.paramDefaults = d;
+    if (S.taskTab === 'parameters') renderTaskPage();
+  });
 }
 async function refreshTask() {
   if (!S.selected) return;
@@ -3644,7 +3680,10 @@ async function refreshTask() {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    S.paramDefaults = await loadParamDefaults(id);
+    // paramDefaults are NOT refetched here: they key off (project, workflow), which
+    // can't change under a live task, so the value from openTask still holds. This
+    // refresh runs on every `view.updated` WS push — re-resolving defaults would
+    // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
   } catch {}
   renderTaskPage();
 }
@@ -3988,6 +4027,13 @@ function wireWorkflowMode(v) {
         ? 'Goal mode enabled — the agent will continue autonomously'
         : 'Software Dev mode enabled — the task will stop at Review');
       await Promise.all([refreshTask(), refreshTasks()]);
+      // The workflow just changed, and param defaults key off it — reload them here
+      // (refreshTask deliberately doesn't, to avoid a git subprocess per WS refresh).
+      loadParamDefaults(v.taskId).then((d) => {
+        if (S.selected !== v.taskId) return;
+        S.paramDefaults = d;
+        if (S.taskTab === 'parameters') renderTaskPage();
+      });
     } catch (e) {
       select.value = prior;
       select.disabled = !v.workflowSwitchable;

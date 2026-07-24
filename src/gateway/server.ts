@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
+import type { TaskView } from '../domain/types.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -1571,11 +1572,23 @@ export class Gateway {
           const limit = Number(url.searchParams.get('limit') ?? '0');
           const offset = Number(url.searchParams.get('offset') ?? '0');
           const page = limit > 0 ? filtered.slice(offset, offset + limit) : filtered;
+          // The list only needs each task's chip/queue fields (stage/status/state/
+          // waitingFor/mergeQueue/…), never its conversation. Dropping the heavy view
+          // fields — `messages`, `transcripts`, `reviewInfo` — shrinks this response by
+          // ~80% (they were the bulk of a multi-MB payload for a few hundred tasks).
+          // It matters because loadTasks() refetches the whole list on navigation AND
+          // on every WS-debounced refresh, so the fat body was paid over and over. The
+          // full view is still served per task by /api/tasks/:id when a task is opened.
+          const trimListView = (v: TaskView | undefined) => {
+            if (!v) return v;
+            const { messages: _m, transcripts: _t, reviewInfo: _r, ...rest } = v;
+            return rest;
+          };
           // enrich with the freshest live view where possible
           const enriched = await Promise.all(
             page.map(async (t) => {
               const view = await api.getTaskView(token, t.id).catch(() => t.lastView);
-              return { ...t, lastView: view ?? t.lastView };
+              return { ...t, lastView: trimListView(view ?? t.lastView) };
             }),
           );
           if (limit > 0) return this.json(res, 200, { tasks: enriched, total: filtered.length, offset });
