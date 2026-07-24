@@ -16,12 +16,43 @@ describe('Store', () => {
     const dbPath = path.join(dir, 'karmax.db');
     // an older build persisted a role default with maxTurns
     const s1 = new Store(dbPath);
-    s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude', capabilities: [], maxTurns: 24 } as any);
+    s1.upsertProfile({ id: 'do-default', name: 'Do', role: 'do', provider: 'claude',
+      capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'], maxTurns: 24 } as any);
     s1.upsertProfile({ id: 'custom-big', name: 'Big', role: 'do', provider: 'claude', capabilities: [], maxTurns: 99 } as any);
     // reopening runs migrateData
     const s2 = new Store(dbPath);
     expect(s2.getProfile('do-default')!.maxTurns).toBeUndefined(); // legacy cap stripped
+    expect(s2.getProfile('do-default')!.capabilities).toEqual(expect.arrayContaining(['task:git:publish', 'task:git:import']));
+    expect(s2.getProfile('do-default')!.capabilities).not.toContain('task:world:read');
     expect(s2.getProfile('custom-big')!.maxTurns).toBe(99); // non-default profiles untouched
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('migrates expanded legacy project infrastructure defaults back to organization inheritance', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-policy-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = {
+      defaultBase: 'main', repos: ['/repo'], worldProvider: 'worktree', runnerPoolId: null,
+      resources: { cpu: 2, memoryMb: 2048 },
+      network: { allowDomains: [], allowCidrs: [], unrestricted: false },
+      environment: {}, monthlyBudgetMicros: null, hibernateAfterMs: 7 * 24 * 60 * 60 * 1000,
+    };
+    const s1 = new Store(dbPath);
+    const migrated = s1.createProject('Legacy', legacy as any);
+    const intentional = s1.createProject('Intentional restriction', {
+      ...legacy, network: { unrestricted: false, allowDomains: ['internal.example'], allowCidrs: [] },
+    } as any);
+    s1.close();
+
+    const s2 = new Store(dbPath);
+    expect(s2.getProject(migrated.id)!.config).toEqual({
+      defaultBase: 'main', repos: ['/repo'], worldProvider: 'worktree',
+    });
+    expect(s2.effectiveProjectConfig(migrated.id).network).toEqual({ unrestricted: true });
+    expect(s2.getProject(intentional.id)!.config.network).toEqual({
+      unrestricted: false, allowDomains: ['internal.example'], allowCidrs: [],
+    });
+    s2.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -32,6 +63,21 @@ describe('Store', () => {
     expect(lists).toHaveLength(1);
     expect(lists[0]!.name).toBe('Tasks');
     expect(store.getProject(p.id)!.config.defaultBase).toBe('main');
+  });
+
+  it('rejects reserved routing names for projects and organizations', () => {
+    // A project is addressed at /<org>/<project> by the slug of its name, and an
+    // organization owns the top URL segment — a name that slugifies to a built-in
+    // route word (wiki, settings, dashboard, api, …) would be unreachable.
+    for (const name of ['wiki', 'Settings', 'DASHBOARD', 'inbox', 'api', 'tasks', 'queue', ' Wiki ']) {
+      expect(() => store.createProject(name)).toThrow(/reserved/i);
+      expect(() => store.createOrganization({ name })).toThrow(/reserved/i);
+    }
+    // An explicit organization slug is checked too, not just the derived one.
+    expect(() => store.createOrganization({ name: 'Fine name', slug: 'settings' })).toThrow(/reserved/i);
+    // Ordinary names still work, and a name merely containing a reserved word is fine.
+    expect(() => store.createProject('My Wiki Notes')).not.toThrow();
+    expect(store.createOrganization({ name: 'Acme' }).slug).toBe('acme');
   });
 
   it('creates and lists tasks in order', () => {
@@ -61,16 +107,43 @@ describe('Store', () => {
     const second = store.createTask({ projectId: p.id, listId: first.listId, title: first.title, workflow: first.workflow, workflowVersion: first.workflowVersion, params: { prompt: 'second', draft: true }, intentId: first.intentId });
     expect(second.attemptNumber).toBe(2);
     expect(second.num).toBeUndefined();
-    expect(store.listPrincipalTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(store.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(store.listTaskAttempts(p.id).map((t) => t.id)).toEqual([first.id, second.id]);
     const cancelled = { taskId: first.id, title: first.title, workflow: first.workflow, stage: 'cancelled' as const, status: 'cancelled' as const, messages: [], actions: [], state: {}, updatedAt: 1 };
     store.saveView(first.id, cancelled);
     expect(store.attemptGroup(first.id)!.principalAttemptId).toBe(second.id);
-    expect(store.listPrincipalTasks(p.id).map((t) => t.id)).toEqual([second.id]);
-    expect(store.listPrincipalTasks(p.id)[0]!.num).toBe(first.num); // logical # is stable
+    expect(store.listTasks(p.id).map((t) => t.id)).toEqual([second.id]);
+    expect(store.listTasks(p.id)[0]!.num).toBe(first.num); // logical # is stable
     expect(store.getTaskByNum(p.id, first.num!)!.id).toBe(second.id); // permalink follows principal
     expect(store.attemptGroup(second.id)!.confirmer).toEqual({ mode: 'agent' });
     expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'agent' })).not.toThrow();
     expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'human' })).toThrow(/freezes/);
+  });
+
+  it('does not turn persisted attempts into top-level tasks on restart', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-attempt-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const s1 = new Store(dbPath);
+    const p = s1.createProject('Acme');
+    const first = s1.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'first' } });
+    const second = s1.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'second' }, intentId: first.intentId });
+    s1.close();
+
+    // Re-running schema migrations must create an intent only for the root task.
+    const s2 = new Store(dbPath);
+    expect(s2.db.prepare('SELECT id FROM task_intents WHERE id=?').get(second.id)).toBeUndefined();
+    expect(s2.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+
+    // Repair databases already polluted by the old migration.
+    s2.db.prepare('INSERT INTO task_intents (id, principalAttemptId, createdAt) VALUES (?, ?, ?)')
+      .run(second.id, second.id, second.createdAt);
+    s2.close();
+    const s3 = new Store(dbPath);
+    expect(s3.db.prepare('SELECT id FROM task_intents WHERE id=?').get(second.id)).toBeUndefined();
+    expect(s3.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(s3.attemptsOf(first.id)).toHaveLength(2);
+    s3.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('grants exactly one Merge commitment and makes the winner principal', () => {
@@ -82,6 +155,18 @@ describe('Store', () => {
     const group = store.attemptGroup(first.id)!;
     expect(group.committedAttemptId).toBe(second.id);
     expect(group.principalAttemptId).toBe(second.id);
+  });
+
+  it('hydrates tags onto attempt-group records (task page reads these)', () => {
+    const p = store.createProject('Acme');
+    const t = store.createTask({ projectId: p.id, title: 'Tagged', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const tag = store.createTag({ projectId: p.id, name: 'dontmerge' });
+    store.setTaskTags(t.id, [tag.id]);
+    // The task page resolves its record via attemptGroup — its attempts must carry tags,
+    // just like listPrincipalTasks does, or the tag renders on the list but not the page.
+    const group = store.attemptGroup(t.id)!;
+    expect(group.attempts.find((a) => a.id === t.id)?.tags).toEqual([tag.id]);
+    expect(store.attemptsOf(t.id).find((a) => a.id === t.id)?.tags).toEqual([tag.id]);
   });
 
   it('numbers queued tasks per project, each starting at #1 (task 10.6)', () => {

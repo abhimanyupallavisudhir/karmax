@@ -18,17 +18,330 @@ export type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock
 
 export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | (string & {});
 
+// ─── Tenancy and collaboration ────────────────────────────────────────────────
+
+/** Immutable references are persisted; display names are resolved at the edge. */
+export type PrincipalRef =
+  | { kind: 'user'; userId: string }
+  | { kind: 'team'; teamId: string }
+  | { kind: 'task-agent'; taskId: string; role: string };
+
+/** Project access may also target the entire containing organization. This is
+ * deliberately project-specific; @all is not a valid task assignee. */
+export type ProjectPrincipalRef = PrincipalRef | { kind: 'organization'; organizationId: string };
+
+export type ConfirmationTarget = PrincipalRef | { kind: 'project-role'; projectId: string; role: string };
+
+export interface ConfirmationPolicy {
+  targets: ConfirmationTarget[];
+  rule: 'any' | 'all' | { quorum: number };
+}
+
+export interface Organization {
+  id: string;
+  name: string;
+  slug: string;
+  kind: 'personal' | 'team';
+  createdAt: number;
+}
+
+export interface OrganizationMembership {
+  organizationId: string;
+  userId: string;
+  role: 'owner' | 'admin' | 'member';
+  joinedAt: number;
+}
+
+export interface OrganizationInvitation {
+  id: string;
+  organizationId: string;
+  email: string;
+  role: OrganizationMembership['role'];
+  /** Authorization is selected explicitly; membership role is an internal
+   * ownership invariant, not a second permissions system. */
+  profileId?: string;
+  invitedBy: string;
+  createdAt: number;
+  expiresAt: number;
+  acceptedAt?: number;
+}
+
+export interface Team {
+  id: string;
+  organizationId: string;
+  projectId?: string;
+  name: string;
+  slug: string;
+  createdAt: number;
+}
+
+export interface TeamMembership {
+  teamId: string;
+  userId: string;
+  role: 'member';
+  joinedAt: number;
+}
+
+export interface ProjectMembership {
+  projectId: string;
+  principal: ProjectPrincipalRef;
+  role: 'owner' | 'admin' | 'member' | 'reviewer' | (string & {});
+  joinedAt: number;
+}
+
+export interface Repository {
+  id: string;
+  organizationId: string;
+  provider: 'github';
+  providerId?: string;
+  owner: string;
+  name: string;
+  sshUrl: string;
+  defaultBranch: string;
+  private: boolean;
+  gitConnectionId?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProjectRepository {
+  projectId: string;
+  repositoryId: string;
+  baseBranch?: string;
+  targetBranch?: string;
+  order: number;
+}
+
+export interface GitConnection {
+  id: string;
+  organizationId: string;
+  provider: 'github';
+  installationId: string;
+  accountLogin: string;
+  accountType?: 'User' | 'Organization';
+  createdAt: number;
+  suspendedAt?: number;
+}
+
+export interface InboxItem {
+  id: string;
+  organizationId: string;
+  userId: string;
+  eventSeq: number;
+  taskId: string;
+  kind: 'assigned' | 'mentioned' | 'review-requested' | 'escalated' | 'update';
+  unread: boolean;
+  actionable: boolean;
+  createdAt: number;
+  readAt?: number;
+}
+
+export interface DeliveryPreferences {
+  userId: string;
+  organizationId: string;
+  browser: boolean;
+  email: boolean;
+  slack: boolean;
+  routine: boolean;
+}
+
+export interface OrganizationIdentityPolicy {
+  organizationId: string;
+  oidcProviderId?: string;
+  verifiedDomains: string[];
+  enforceSso: boolean;
+  scimTokenId?: string;
+  updatedAt: number;
+}
+
+export interface WorldCheckpoint {
+  id: string;
+  worldId: string;
+  generation: number;
+  projectId: string;
+  runnerPoolId: string;
+  environmentDigest: string;
+  repos: Array<{
+    repositoryId: string;
+    checkoutPath: string;
+    baseSha: string;
+    branch: string;
+    headSha?: string;
+  }>;
+  filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
+  createdAt: number;
+}
+
+export interface RunnerPool {
+  id: string;
+  organizationId: string;
+  name: string;
+  provider: string;
+  region?: string;
+  mode: 'managed' | 'customer';
+  capacity: { activeWorlds: number; cpu: number; memoryMb: number; gpu: number };
+  createdAt: number;
+  enabled: boolean;
+}
+
+/** One organization-owned connection to a remote execution provider. Secrets
+ * live only in the encrypted credential broker; this record is safe to return
+ * through the UI/API and to include in tenant exports. Keeping one connection
+ * per provider makes the common case genuinely one-click while runner pools
+ * remain the capacity/policy layer above it. */
+export interface WorldProviderConnection {
+  id: string;
+  organizationId: string;
+  provider: 'e2b' | 'daytona' | (string & {});
+  name: string;
+  credentialHandle: string;
+  config: {
+    /** Provider-native launch artifact for ordinary headless worlds. */
+    template?: string;
+    snapshot?: string;
+    image?: string;
+    /** Optional provider-native desktop variant. E2B defaults to its public
+     * `desktop` template; Daytona defaults to its VNC-capable stock image. */
+    desktopTemplate?: string;
+    desktopSnapshot?: string;
+    desktopImage?: string;
+    apiUrl?: string;
+    target?: string;
+  };
+  enabled: boolean;
+  status: 'untested' | 'ready' | 'error';
+  lastCheckedAt?: number;
+  lastError?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface UsageEvent {
+  id: string;
+  organizationId: string;
+  projectId?: string;
+  taskId?: string;
+  worldId?: string;
+  provider: string;
+  kind: 'world.active' | 'checkpoint.storage' | 'preview.active' | 'agent.tokens';
+  quantity: number;
+  unit: 'second' | 'byte-second' | 'token';
+  costMicros: number;
+  startedAt: number;
+  endedAt: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PromotedArtifact {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  taskId: string;
+  objectKey: string;
+  sha256: string;
+  bytes: number;
+  mediaType: string;
+  name: string;
+  createdAt: number;
+  expiresAt?: number;
+}
+
+export interface ExecutionRecord {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  taskId: string;
+  worldId: string;
+  generation: number;
+  kind: 'review-action' | 'terminal' | 'preview' | 'agent' | 'command';
+  label: string;
+  command?: string;
+  server: boolean;
+  openUrls: string[];
+  state: 'starting' | 'running' | 'stop-requested' | 'succeeded' | 'failed' | 'cancelled' | 'lost';
+  startedAt: number;
+  heartbeatAt: number;
+  endedAt?: number;
+  exitCode?: number | null;
+  runnerLeaseId?: string;
+}
+
+export interface ExecutionFrame {
+  executionId: string;
+  seq: number;
+  ts: number;
+  stream: 'stdout' | 'stderr' | 'system';
+  data: string;
+}
+
+export interface PreviewLease {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  taskId: string;
+  worldId: string;
+  generation: number;
+  port: number;
+  public: boolean;
+  tokenHash?: string;
+  runnerLeaseId?: string;
+  provider: string;
+  createdBy: string;
+  createdAt: number;
+  expiresAt: number;
+  revokedAt?: number;
+  /** Exact per-lease browser hostname approved for on-demand TLS. */
+  hostname?: string;
+}
+
+/** Plain, serializable reference to a task world. Workflows and trusted server
+ * code carry this opaque handle; only the selected provider is allowed to
+ * interpret `root` and `meta`. The gateway replaces it with the public
+ * `worldAvailable`/`worldProvider` projection before sending a view to a client.
+ * `root` may be a virtual path in a remote sandbox. */
+export interface WorldHandleRef {
+  /** V2 lifecycle fields are additive so historical v1 Temporal histories replay. */
+  version?: 1 | 2;
+  /** Replay-compatible provider id. V2 accepts registry strings, not a closed union. */
+  kind: string;
+  /** Canonical V2 spelling; `kind` remains while V1 histories exist. */
+  provider?: string;
+  id: string;
+  generation?: number;
+  runnerPoolId?: string;
+  environmentDigest?: string;
+  checkpointId?: string;
+  /** Provider-interpreted encrypted reference. Never contains a plaintext sandbox id/token. */
+  sealedProviderRef?: string;
+  /** Stable path inside the environment; unlike `root`, never denotes a control-plane path. */
+  workspaceRoot?: string;
+  root: string;
+  /** Default agent/process directory inside the world boundary. */
+  workdir?: string;
+  branch: string;
+  base: string;
+  repo?: string;
+  target?: string;
+  repos?: { name: string; role?: 'project-wiki'; repo: string; root: string; branch: string; base: string; target?: string; baseSha?: string; localPath?: string }[];
+  meta?: Record<string, unknown>;
+  warnings?: string[];
+}
+
 // ─── Project / list / task records (the metadata index) ──────────────────────
 
 export interface Project {
   id: string;
+  /** Every project belongs to exactly one tenant. Optional only while reading
+   * historical workflow/test fixtures created before the organization migration. */
+  organizationId?: string;
   name: string;
   createdAt: number;
   config: ProjectConfig;
 }
 
 export interface ProjectConfig {
-  /** Repo directories software-dev operates on (worktrees branch off these). */
+  /** Repository sources: local filesystem paths for local worlds, SSH Git URLs
+   * for hosted worlds. */
   repos?: string[];
   /** Default base branch worlds branch off (e.g. "main"). */
   defaultBase?: string;
@@ -53,9 +366,37 @@ export interface ProjectConfig {
   /** role -> agent profile id. */
   defaultProfiles?: Record<string, string>;
   /** World backend. */
-  worldProvider?: 'worktree' | 'container';
-  /** Snapshot-on-park resumable worlds (§11.3). */
+  worldProvider?: string;
+  /** Resume provider-backed worlds after a parked wait (§11.3). */
   resumeWorlds?: boolean;
+  /** Hosted execution pool and declared resources. */
+  runnerPoolId?: string;
+  resources?: { cpu?: number; memoryMb?: number; gpu?: number };
+  /** Remote-world egress policy. Normal coding uses unrestricted internet;
+   * allowlists are an explicit organization-level hardening mode. */
+  network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
+  /** Immutable remote environment selector. Provider adapters resolve this to
+   * their image/snapshot primitive and stamp the result on the world handle. */
+  environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
+  /** Hard monthly provider-cost ceiling; provisioning queues once exhausted. */
+  monthlyBudgetMicros?: number;
+  /** Parked-world retention before portable hibernation (default seven days). */
+  hibernateAfterMs?: number;
+}
+
+/** Organization-owned defaults for task execution. Projects may select another
+ * connected provider/pool or set a tighter budget, but sandbox shape, lifecycle,
+ * and network posture have one obvious home. */
+export interface OrganizationExecutionPolicy {
+  worldProvider?: string;
+  runnerPoolId?: string;
+  resources?: ProjectConfig['resources'];
+  network?: ProjectConfig['network'];
+  /** Headless includes screenshot-capable browser MCPs. Desktop additionally
+   * enables provider-native Xvfb/XFCE/noVNC computer use. */
+  environment?: ProjectConfig['environment'];
+  monthlyBudgetMicros?: number;
+  hibernateAfterMs?: number;
 }
 
 // ─── Git & GitHub configuration (PLAN-git-config.md) ────────────────────────
@@ -117,11 +458,29 @@ export interface TaskRecord {
   listId: string;
   title: string;
   workflow: string; // workflow definition name
+  /**
+   * Workflow definition that started the current Temporal execution. Normally
+   * identical to `workflow`; it stays fixed while a compatible workflow mode
+   * (software-dev ↔ goal) changes in-flight, preserving the real replay pin.
+   */
+  executionWorkflow?: string;
   workflowVersion: string; // pinned at creation (SPEC §4.4)
   params: TaskParams;
   createdAt: number;
   order: number;
   parentTaskId?: string;
+  /** Immutable creator provenance. */
+  createdBy?: PrincipalRef;
+  /** One accountable actor; assignment never grants project access. */
+  assignee?: PrincipalRef;
+  /** Optional executing agent while a human remains accountable. */
+  delegate?: PrincipalRef;
+  /** Explicit principals allowed/required to decide at Review. */
+  confirmationPolicy?: ConfirmationPolicy;
+  /** Materialized subscribers. Team expansion happens when an event is emitted. */
+  subscribers?: PrincipalRef[];
+  /** Resolved human review audience for search/UI; recalculated from policy. */
+  reviewers?: string[];
   /**
    * Free-form human notes about the task (SPEC §10). Purely cosmetic — shown only
    * in the UI and never assembled into any agent prompt. The human jots whatever
@@ -143,6 +502,16 @@ export interface TaskParams {
   prompt: string;
   /** Images attached to the initial prompt (references, never inline bytes). */
   images?: ImageRef[];
+  /**
+   * Wiki pages inlined into this task's agent context, as `@proj:…`/`@org:…`
+   * tokens (a page, a whole `@proj:tag:<label>`, or a folder `@proj:<section>/*`).
+   * The task-form "wiki context" field seeds this with `@proj:tag:default` and
+   * `@org:tag:default` so `default`-labelled pages are inlined by default; a task
+   * opts out by clearing them. Absent (API/quick-add) ⇒ the default tokens apply.
+   * Resolved fresh each turn by `buildWikiPromptContext` (SPEC §5.4), UNION any
+   * `@…` tags written inline in the prompt/follow-ups.
+   */
+  wikiContext?: string[];
   base?: string;
   target?: string;
   /** role -> profile id overrides. */
@@ -351,7 +720,8 @@ export interface ReviewAction {
 export interface ReviewInfo {
   /**
    * Terse orientation — WHAT to verify, not a narrative of what was done. One line.
-   * Prose about the work belongs in the conversation/messages, not here.
+   * Prose about the work belongs in the conversation/messages, not here. Agent-authored
+   * captions are limited to 280 characters at the create_review_info tool boundary.
    */
   caption?: string;
   /** Click-to-verify affordances (SPEC §5.5): the primary review payload. */
@@ -448,7 +818,8 @@ export interface AgentSpec {
  * for the task to proceed to PR/merge; a revise verdict or a follow-up sends the
  * task back to Do, and the next Review replays the sequence from the first layer.
  * Zero layers ⇒ auto-confirm (e.g. "agent review, then a final human confirmation"
- * is `[{ kind: 'agent', … }, { kind: 'human' }]`; auto-confirm is `[]`).
+ * is `[{ kind: 'agent', … }, { kind: 'human', audience: ['@creator'] }]`;
+ * auto-confirm is `[]`).
  *
  * A `human` layer waits for a person to click Confirm. An `agent` layer runs a
  * Confirm-agent turn that reviews the work and returns a structured verdict
@@ -462,8 +833,15 @@ export interface AgentSpec {
  * layer, agent ⇒ one agent layer.
  */
 export type ConfirmMode = 'human' | 'auto' | 'agent';
+/** Stable workflow-owned audience selectors. Human-readable names are resolved
+ * at the UI edge; workflows persist ids/special selectors so renames are safe. */
+export type HumanAudience = string[];
 export interface ConfirmLayer extends Partial<AgentSpec> {
   kind: 'human' | 'agent';
+  /** Human layers only. Supported selectors are @creator, @all, @owners,
+   * @project, @team:<slug>, user:<id>, and legacy team:<id>. Multiple selectors mean any matching
+   * person may satisfy this layer; use sequential layers for sequential gates. */
+  audience?: HumanAudience;
   /** Agent layers: the review-request message template sent each time the task
    *  reaches Review — optional instructions/guidance ("ensure X, Y and Z"), with
    *  {{prompt}} / {{response}} placeholders for the task prompt and the Do agent's
@@ -509,6 +887,11 @@ export interface TaskView {
   num?: number;
   title: string;
   workflow: string;
+  /** Compatible workflow modes this execution can adopt without replacing its
+   * pinned Temporal workflow. The UI renders these as the in-flight mode picker. */
+  workflowOptions?: string[];
+  /** False once confirmation / the point of no return has begun. */
+  workflowSwitchable?: boolean;
   stage: Stage;
   status: TaskStatus;
   /**
@@ -536,6 +919,18 @@ export interface TaskView {
   branch?: string;
   base?: string;
   targetBranch?: string;
+  /** Provider-owned world reference. `worldPath` remains as a display/back-compat
+   * hint only; gateway operations must resolve this handle through WorldRegistry.
+   * The gateway strips this field from public responses. */
+  world?: WorldHandleRef;
+  /** Safe client projection: whether provider-backed world operations such as a
+   * terminal are available. Added by the gateway, not workflow code. */
+  worldAvailable?: boolean;
+  /** Safe client projection of the selected backend. Provider-owned ids and
+   * metadata are intentionally never included. */
+  worldProvider?: WorldHandleRef['kind'];
+  /** Safe projection indicating that provider-native noVNC check-in exists. */
+  worldDesktop?: boolean;
   worldPath?: string;
   pr?: { url: string; number: number };
   mergeQueue?: { position: number; total: number };
@@ -547,7 +942,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
@@ -663,17 +1058,7 @@ export interface TaskInput {
 /** Plain serializable world handle + conversation state needed to resume a failed
  * software-dev task. Mirrors world/types without importing Node-facing world code. */
 export interface TaskRecoveryCheckpoint {
-  world: {
-    kind: 'worktree' | 'container' | 'memory';
-    id: string;
-    root: string;
-    branch: string;
-    base: string;
-    repo?: string;
-    target?: string;
-    repos?: { name: string; repo: string; root: string; branch: string; base: string }[];
-    meta?: Record<string, unknown>;
-  };
+  world: WorldHandleRef;
   messages: Message[];
   transcripts?: { role: string; label: string; messages: Message[] }[];
   reviewInfo?: ReviewInfo;

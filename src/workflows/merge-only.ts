@@ -15,7 +15,8 @@ import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
 import { renderConfirmPrompt } from '../domain/confirm-prompt.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer, remotePolicyOf } from './contract.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer,
+  releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
 import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -115,7 +116,7 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
     return {
       taskId, title: input.title, workflow: 'merge-only', stage, status, messages: msgs, reviewInfo,
       actions: actions(), state: { checks, mergeGranted, targetLocked }, branch: world?.branch, base, targetBranch: target,
-      worldPath: world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
+      world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
       editableParams: editableParamsNow(), waitingFor, agentTurn, mergeQueue,
       updatedAt: workflowInfo().historyLength,
     };
@@ -197,7 +198,8 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
 
   await publish();
   // Open a world on the EXISTING branch under review.
-  world = (await core.createWorld({ taskId, repo: input.project.repos?.[0], base: target, branch: input.branch, gitProfile: input.project.gitProfile, kind: 'worktree' })) as WorldHandleLike;
+  const worldKind = input.project.worldProvider ?? 'worktree';
+  world = (await core.createWorld({ taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repo: input.project.repos?.[0], base: target, branch: input.branch, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
   if (leaser) await leaser.init();
 
   // Workflow-repo edits must pass tests + replay-compat before they can merge.
@@ -233,20 +235,31 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
         }
       } else {
         // A human layer: one Approve click passes ONE layer.
+        waitingFor = { kind: 'human', audience: layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
         await condition(() => confirmed || cancelled);
+        waitingFor = undefined;
         confirmed = false; // consumed by this layer
       }
     }
     if (!cancelled && !leftToHuman) confirmed = true;
+    if (leftToHuman) waitingFor = { kind: 'human', audience: ['@creator'] };
   }
   await publish();
   await condition(() => confirmed || cancelled);
+  waitingFor = undefined;
   if (cancelled || (input.workflowEdit && !checks?.passed && !confirmed)) {
     stage = 'cancelled';
     status = 'cancelled';
     await publish();
-    if (world) await core.destroyWorld(world as any);
+    if (world) {
+      const remoteWorld = releaseWorldOnCompletion(world);
+      await core.destroyWorld(world as any);
+      if (remoteWorld) {
+        world = undefined;
+        await publish();
+      }
+    }
     return { stage };
   }
 
@@ -262,7 +275,9 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
   // Commit `target` to the merge-queue domain — no await between locking and
   // reading it, so a queued edit can't desync the domain (SPEC §5.5).
   targetLocked = true;
-  const domain = `${world!.repo ?? input.projectId}:${target}`;
+  // The authoritative repo keys the domain (see mergeDomains in software-dev):
+  // a cloud world from a local checkout serializes with worktree worlds of it.
+  const domain = `${world!.repos?.[0]?.localPath ?? world!.repo ?? input.projectId}:${target}`;
   await coord.enqueueMerge(domain, taskId);
   if (managedTurns) {
     status = 'waiting';
@@ -307,6 +322,11 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
   status = 'done';
   reviewInfo = { ...reviewInfo, summary: `Merged into ${target} as ${result.sha?.slice(0, 8)}.` };
   await publish();
+  const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
   await core.destroyWorld(world as any);
+  if (remoteWorld) {
+    world = undefined;
+    await publish();
+  }
   return { stage, sha: result.sha };
 }

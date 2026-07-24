@@ -1,0 +1,11 @@
+.git
+.karmax
+node_modules
+coverage
+**/.secrets
+**/.env
+**/.env.*
+!**/.env.example
+**/*.key
+**/*.pem
+*.log

@@ -11,7 +11,8 @@ import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer } from './contract.js';
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer,
+  releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
 import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
@@ -80,7 +81,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
       actions: actions(), state: { worldReady: !!world }, branch: world?.branch, base,
-      worldPath: world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
+      world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
   const publish = async () => core.publishView(taskId, view());
@@ -144,7 +145,8 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
   });
 
   await publish();
-  world = (await core.createWorld({ taskId, repos: input.project.repos, base, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind: 'worktree' })) as WorldHandleLike;
+  const worldKind = input.project.worldProvider ?? 'worktree';
+  world = (await core.createWorld({ taskId, ...(remoteWorldProvider(worldKind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind: worldKind })) as WorldHandleLike;
   if (leaser) await leaser.init();
 
   let infraRetries = 0;
@@ -204,8 +206,10 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
         // no verdict → degrade this layer to the human gate below
       }
       // A human layer: one Confirm click passes ONE layer; a follow-up → back to Do.
+      waitingFor = { kind: 'human', audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
       await publish();
       await condition(() => confirmed || cancelled || msgs.length > seen);
+      waitingFor = undefined;
       if (cancelled) break;
       if (!confirmed) backToDo = true;
       confirmed = false; // consumed by this layer
@@ -218,10 +222,20 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
 
   // No merge machinery: the world IS the deliverable. Commit the work to the
   // task branch so it persists, and keep the worktree for inspection.
-  if (!cancelled && world) await core.commitWork(world as any, `karmax: ${input.title}`);
+  if (!cancelled && world) {
+    await core.commitWork(world as any, `karmax: ${input.title}`);
+    if (remoteWorldProvider(world.provider ?? world.kind)) await core.publishTaskBranch(world as any);
+  }
   stage = cancelled ? 'cancelled' : 'done';
   status = cancelled ? 'cancelled' : 'done';
   await publish();
-  if (cancelled && world) await core.destroyWorld(world as any);
+  if (world && (cancelled || releaseWorldOnCompletion(world))) {
+    const remote = remoteWorldProvider(world.provider ?? world.kind);
+    await core.destroyWorld(world as any);
+    if (remote) {
+      world = undefined;
+      await publish();
+    }
+  }
   return { stage };
 }

@@ -154,7 +154,7 @@ export class WorkflowManager {
   schemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
     return [...new Set(this.store.list().map((p) => p.name))]
       .map((name) => this.store.resolve(name)!)
-      .filter((m) => m.kind !== 'coordinator')
+      .filter((m) => m.kind !== 'coordinator' && m.selectable !== false)
       .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
   }
 

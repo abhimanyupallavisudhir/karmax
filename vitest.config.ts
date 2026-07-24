@@ -9,7 +9,9 @@ export default defineConfig({
     // Run them ONE AT A TIME in a SINGLE process so we never have several heavy
     // servers/workers alive at once (which can exhaust RAM). See TESTING.md.
     pool: 'forks',
-    poolOptions: { forks: { singleFork: true } },
+    // Vitest 4 replaces `singleFork` with this equivalent pair.
+    maxWorkers: 1,
+    isolate: false,
     fileParallelism: false,
     maxConcurrency: 1,
     // Make sure a hung integration test is killed rather than left holding a

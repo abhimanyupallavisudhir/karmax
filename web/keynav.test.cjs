@@ -34,8 +34,13 @@ eval(extractConst('KEY_NAMES').replace('const KEY_NAMES =', 'global.KEY_NAMES ='
 eval(extractFn('parseKeybinding'));
 eval(extractFn('stepMatches'));
 eval(extractFn('chordCandidates'));
+eval(extractFn('isBareModifier'));
 eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
+eval(extractFn('adjacentCheckinPane'));
+eval(extractConst('firstLine').replace('const firstLine =', 'global.firstLine ='));
+eval(extractFn('quickTaskSubmitMode'));
+eval(extractFn('quickTaskPayload'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
@@ -45,11 +50,13 @@ const ev = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: f
 ok(JSON.stringify(parseKeybinding('n')) === JSON.stringify([{ key: 'n' }]), 'single key');
 ok(JSON.stringify(parseKeybinding('g t')) === JSON.stringify([{ key: 'g' }, { key: 't' }]), 'two-step chord');
 ok(JSON.stringify(parseKeybinding('meta+k')) === JSON.stringify([{ key: 'k', meta: true }]), 'meta modifier');
+ok(JSON.stringify(parseKeybinding('meta+shift+F')) === JSON.stringify([{ key: 'F', meta: true, shift: true }]), 'global-search modifier chord');
 ok(JSON.stringify(parseKeybinding('cmd+K')) === JSON.stringify([{ key: 'K', meta: true }]), 'cmd alias + case preserved');
 ok(JSON.stringify(parseKeybinding('Escape')) === JSON.stringify([{ key: 'escape' }]), 'named key normalizes');
 ok(JSON.stringify(parseKeybinding('ArrowDown')) === JSON.stringify([{ key: 'arrowdown' }]), 'arrow key normalizes');
 ok(JSON.stringify(parseKeybinding('?')) === JSON.stringify([{ key: '?' }]), 'shifted punctuation is its own key');
 ok(JSON.stringify(parseKeybinding('[')) === JSON.stringify([{ key: '[' }]), 'bracket binds as a plain key (task-page tab cycling)');
+ok(JSON.stringify(parseKeybinding('}')) === JSON.stringify([{ key: '}' }]), 'brace binds as a plain key (Check-in pane cycling)');
 ok(parseKeybinding('').length === 0, 'empty binding → no steps');
 
 // ── stepMatches ──
@@ -62,6 +69,8 @@ ok(!stepMatches({ key: 'c' }, ev('C')), 'case-sensitive: C (shift) is not c');
 ok(stepMatches({ key: 'J' }, ev('J', { shiftKey: true })), 'uppercase binding matches shifted key');
 ok(stepMatches({ key: 'k', meta: true }, ev('k', { metaKey: true })), 'meta+k matches Cmd');
 ok(stepMatches({ key: 'k', meta: true }, ev('k', { ctrlKey: true })), 'meta+k also matches Ctrl (Linux/Windows)');
+ok(stepMatches(parseKeybinding('meta+shift+F')[0], ev('F', { ctrlKey: true, shiftKey: true })), 'Ctrl+Shift+F opens global search');
+ok(!stepMatches(parseKeybinding('meta+shift+F')[0], ev('f', { ctrlKey: true })), 'Ctrl+F remains the browser find shortcut');
 ok(!stepMatches({ key: 'k', meta: true }, ev('k')), 'meta+k needs the modifier');
 ok(stepMatches({ key: 'escape' }, ev('Escape')), 'named keys match case-insensitively');
 ok(!stepMatches({ key: 'j' }, ev('j', { altKey: true })), 'alt held blocks a bare binding');
@@ -85,8 +94,20 @@ ok(chordCandidates(cmds, [ev('g')], ev('z')).length === 0, 'g then unknown → n
 ok(chordCandidates(cmds, [], ev('k', { ctrlKey: true })).map((c) => c.id).join() === 'pal', 'Ctrl+K finds meta+k');
 ok(chordCandidates(cmds, [], ev('t')).length === 0, "bare 't' is not a command (only after 'g')");
 
+// ── shifted chords survive the Shift keydown (g P / g W / g D / g S) ──
+// The dispatcher skips bare-modifier keydowns so pressing Shift for the second
+// step of a shifted chord doesn't reset the pending prefix. Model `g` → `Shift`
+// → `P`: the Shift event is ignored, so the buffer still holds `g` when `P`/`S`
+// lands. (Uses a fresh command whose second step needs Shift.)
+ok(isBareModifier('Shift') && isBareModifier('Control') && isBareModifier('Alt') && isBareModifier('Meta'), 'the four bare modifiers are recognized');
+ok(!isBareModifier('g') && !isBareModifier('S'), 'ordinary keys are not bare modifiers');
+const shiftedCmds = [{ id: 'nav.global', keys: parseKeybinding('g S') }];
+ok(isBareModifier('Shift'), 'Shift keydown between g and S is skipped, so the g prefix survives');
+ok(chordCandidates(shiftedCmds, [ev('g')], ev('S', { shiftKey: true })).map((c) => c.id).join() === 'nav.global', 'g then Shift+S resolves once the Shift event is ignored');
+
 // ── fmtKeys ──
 ok(fmtKeys('meta+k') === 'Ctrl+k', 'meta renders as Ctrl+ on non-mac');
+ok(fmtKeys('meta+shift+F') === 'Ctrl+⇧F', 'global search renders its full shortcut');
 ok(fmtKeys('g t') === 'g t', 'chords keep their spacing');
 ok(fmtKeys('Escape') === 'Esc' && fmtKeys('ArrowDown') === '↓', 'named keys get glyphs');
 setPlatform('MacIntel');
@@ -99,6 +120,23 @@ ok(fuzzyScore('ct', 'Confirm task') >= 0, 'subsequence matches');
 ok(fuzzyScore('conf', 'Confirm task') > fuzzyScore('cnf', 'Confirm task'), 'consecutive runs beat scattered letters');
 ok(fuzzyScore('task', 'Confirm task') > 0, 'word-boundary bonus applies');
 ok(fuzzyScore('gq', 'Go to queues') >= 0, 'initials-style query matches');
+
+// ── Check-in sidebar cycling ──
+const panes = ['do', 'merge', 'terminal'];
+ok(adjacentCheckinPane(panes, 'do', 1) === 'merge', 'Check-in moves to the next pane');
+ok(adjacentCheckinPane(panes, 'terminal', 1) === 'do', 'Check-in next wraps to the first pane');
+ok(adjacentCheckinPane(panes, 'do', -1) === 'terminal', 'Check-in previous wraps to the terminal');
+
+// ── Quick-add submission modes ──
+ok(quickTaskSubmitMode(ev('Enter')) === 'form', 'Enter opens the full task form');
+ok(quickTaskSubmitMode(ev('Enter', { metaKey: true })) === 'add', 'Cmd/Ctrl+Enter starts the task');
+ok(quickTaskSubmitMode(ev('Enter', { ctrlKey: true })) === 'add', 'Ctrl+Enter starts the task');
+ok(quickTaskSubmitMode(ev('Enter', { altKey: true })) === 'draft', 'Alt+Enter saves a draft');
+ok(quickTaskSubmitMode(ev('x', { altKey: true })) === null, 'non-Enter keys do not submit the quick task');
+const sent = quickTaskPayload('run it', 'script-exec', [], false);
+const draft = quickTaskPayload('save it', 'software-dev', ['image-1'], true);
+ok(sent.quick === true && sent.command === 'run it' && sent.draft === undefined, 'quick send starts immediately');
+ok(draft.quick === true && draft.draft === true && draft.images[0] === 'image-1', 'quick draft uses the same payload plus draft=true');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

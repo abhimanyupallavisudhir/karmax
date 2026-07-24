@@ -1,13 +1,17 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, worldRepos } from './types.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos, worldWorkingDirectory } from './types.js';
 import { git, gitOrThrow, isGitRepo, ensureIdentity } from './git.js';
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
+import { openLocalPty, startLocalProcess } from './local-execution.js';
 
 const pexec = promisify(execFile);
+const managedRepoClones = new Map<string, Promise<string>>();
 
 /**
  * Local git-worktree world (SPEC §11.2, the default backend). Each task gets an
@@ -32,19 +36,27 @@ export class WorktreeProvider implements WorldProvider {
       .map((s) => s?.trim())
       .filter((s): s is string => !!s);
 
-    // Resolve + validate each source to its git toplevel up-front, so a bad path
-    // fails before we start creating worktrees.
-    const resolvedSources: string[] = [];
+    // Resolve local paths and materialize network sources as persistent managed
+    // checkouts. Project Settings deliberately accepts both forms; worktrees
+    // always need a local repository to branch from.
+    const resolvedSources: Array<{ repo: string; source: string; managed: boolean }> = [];
     for (const s of sources) {
       const r = expandPath(s);
-      if (!(await isGitRepo(r))) {
+      if (await isGitRepo(r)) {
+        resolvedSources.push({ repo: await gitOrThrow(r, ['rev-parse', '--show-toplevel']), source: s, managed: false });
+      } else if (isNetworkGitSource(s)) {
+        resolvedSources.push({ repo: await this.managedClone(s, spec), source: s, managed: true });
+      } else {
         throw new Error(
           `Configured repository "${s}" is not a git repository (resolved to "${r}"). ` +
-            `Fix the repository path in project Settings (an absolute path, or one starting with ~), ` +
-            `or run \`git init\` there.`,
+            `Fix the repository in project Settings (a Git URL, an absolute path, or one starting with ~), ` +
+            `or run \`git init\` at that path.`,
         );
       }
-      resolvedSources.push(await gitOrThrow(r, ['rev-parse', '--show-toplevel']));
+    }
+    if (spec.scratch && resolvedSources.length) {
+      const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
+      resolvedSources.unshift({ repo: scratch, source: 'scratch', managed: false });
     }
 
     const repos: WorldRepo[] = [];
@@ -55,16 +67,20 @@ export class WorktreeProvider implements WorldProvider {
       repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings));
     } else if (resolvedSources.length === 1) {
       // Single repo: the worktree IS the world root (unchanged layout).
-      repos.push(await this.addWorktree(resolvedSources[0]!, root, repoName(resolvedSources[0]!), branch, spec, warnings));
+      const resolved = resolvedSources[0]!;
+      repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
+        this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined));
     } else {
       // Multi-repo: the world root is a parent dir holding one worktree per repo,
       // each in a subdirectory named after the repo (deduped on collision).
       if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(root, { recursive: true });
-      const names = uniqueNames(resolvedSources.map(repoName));
+      const names = uniqueNames(resolvedSources.map((resolved) => repoName(resolved.source)));
       for (let i = 0; i < resolvedSources.length; i++) {
         const name = names[i]!;
-        repos.push(await this.addWorktree(resolvedSources[i]!, path.join(root, name), name, branch, spec, warnings));
+        const resolved = resolvedSources[i]!;
+        repos.push(await this.addWorktree(resolved.repo, path.join(root, name), name, branch,
+          this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined));
       }
     }
 
@@ -86,7 +102,8 @@ export class WorktreeProvider implements WorldProvider {
    * Add a `karmax/<taskId>` worktree for one repo at `wt`, off `spec.base`
    * (falling back to HEAD if that ref is absent). Returns the `WorldRepo` record.
    */
-  private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec, warnings?: string[]): Promise<WorldRepo> {
+  private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec,
+    warnings?: string[], source?: string): Promise<WorldRepo> {
     // Resolve a real base ref per repo; fall back to HEAD if the named base is absent.
     let baseRef = spec.base;
     const verify = await git(repo, ['rev-parse', '--verify', `${spec.base}`]);
@@ -123,7 +140,65 @@ export class WorktreeProvider implements WorldProvider {
     // Copy gitignored files the project names (e.g. .env) into this repo's worktree.
     if (spec.copyGlobs?.length) await this.copyGlobs(repo, wt, spec.copyGlobs);
 
-    return { name, repo, root: wt, branch, base: spec.base };
+    return { name, repo, ...(source ? { source } : {}), root: wt, branch, base: spec.base, target: spec.target };
+  }
+
+  /** Apply a first-class repository attachment's per-repo branch policy. */
+  private repoSpec(spec: WorldSpec, source: string): WorldSpec {
+    const policy = spec.repositoryBranches?.[source];
+    return policy ? { ...spec, base: policy.base, target: policy.target } : spec;
+  }
+
+  /** Clone a configured URL once into Karmax-owned storage. The clone is the
+   * stable merge target shared by task worktrees; its origin remains the user's
+   * configured remote for optional push/PR policy. Concurrent first tasks share
+   * one in-process clone promise so they cannot race a partially-created repo. */
+  private async managedClone(source: string, spec: WorldSpec): Promise<string> {
+    const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
+    const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
+    const parent = path.join(this.home, '.repositories');
+    const destination = path.join(parent, `${name}-${hash}`);
+    const existing = managedRepoClones.get(destination);
+    if (existing) return existing;
+    const clone = this.cloneManagedRepo(source, destination, parent, spec);
+    managedRepoClones.set(destination, clone);
+    try {
+      return await clone;
+    } finally {
+      if (managedRepoClones.get(destination) === clone) managedRepoClones.delete(destination);
+    }
+  }
+
+  private async cloneManagedRepo(source: string, destination: string, parent: string, spec: WorldSpec): Promise<string> {
+    if (await isGitRepo(destination)) return destination;
+    fs.mkdirSync(parent, { recursive: true });
+    const temporary = `${destination}.tmp-${process.pid}-${crypto.randomUUID()}`;
+    const credentialDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-clone-'));
+    const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
+    const env: Record<string, string> = {};
+    try {
+      if (key) {
+        const keyPath = path.join(credentialDir, 'repository.key');
+        fs.writeFileSync(keyPath, key.endsWith('\n') ? key : `${key}\n`, { mode: 0o600 });
+        env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+      } else if (/^(?:ssh:\/\/|[^\s/@]+@[^\s/:]+:)/i.test(source) && !process.env.GIT_SSH_COMMAND) {
+        // A first-ever GitHub clone must not stop on an interactive host-key
+        // question; accept-new preserves mismatch protection on later connects.
+        env.GIT_SSH_COMMAND = 'ssh -o StrictHostKeyChecking=accept-new';
+      }
+      const cloned = await git(parent, ['clone', '-q', '--origin', 'origin', source, temporary],
+        { timeoutMs: 10 * 60_000, env });
+      if (cloned.code !== 0) throw new Error(`Could not clone configured repository "${source}": ${cloned.stderr || cloned.stdout}`);
+      if (fs.existsSync(destination)) {
+        if (await isGitRepo(destination)) return destination;
+        throw new Error(`Managed repository path is not a git repository: ${destination}`);
+      }
+      fs.renameSync(temporary, destination);
+      return destination;
+    } finally {
+      fs.rmSync(temporary, { recursive: true, force: true });
+      fs.rmSync(credentialDir, { recursive: true, force: true });
+    }
   }
 
   async open(handle: WorldHandle): Promise<World> {
@@ -222,7 +297,7 @@ class WorktreeWorld implements World {
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     try {
       const { stdout, stderr } = await pexec(cmd, args, {
-        cwd: opts.cwd ?? this.handle.root,
+        cwd: opts.cwd ?? worldWorkingDirectory(this.handle),
         timeout: opts.timeoutMs ?? 120_000,
         maxBuffer: 64 * 1024 * 1024,
         env: opts.env ? { ...process.env, ...opts.env } : process.env,
@@ -234,13 +309,36 @@ class WorktreeWorld implements World {
   }
 
   async readFile(relPath: string): Promise<string> {
-    return fs.promises.readFile(path.join(this.handle.root, relPath), 'utf8');
+    return fs.promises.readFile(this.filePath(relPath), 'utf8');
+  }
+
+  async readFileBuffer(relPath: string): Promise<Buffer> {
+    return fs.promises.readFile(this.filePath(relPath));
   }
 
   async writeFile(relPath: string, content: string): Promise<void> {
-    const abs = path.join(this.handle.root, relPath);
+    const abs = this.filePath(relPath);
     await fs.promises.mkdir(path.dirname(abs), { recursive: true });
     await fs.promises.writeFile(abs, content);
+  }
+  async writeFileBuffer(relPath: string, content: Buffer): Promise<void> {
+    const abs = this.filePath(relPath);
+    await fs.promises.mkdir(path.dirname(abs), { recursive: true });
+    await fs.promises.writeFile(abs, content);
+  }
+
+  async startProcess(spec: WorldProcessSpec): Promise<WorldProcess> {
+    return startLocalProcess(this.handle.root, {
+      ...spec,
+      cwd: spec.cwd ?? worldWorkingDirectory(this.handle),
+    });
+  }
+
+  async openPty(spec: WorldPtySpec = {}): Promise<WorldPty> {
+    return openLocalPty(this.handle.root, {
+      ...spec,
+      cwd: spec.cwd ?? worldWorkingDirectory(this.handle),
+    });
   }
 
   async listFiles(): Promise<string[]> {
@@ -268,11 +366,22 @@ class WorktreeWorld implements World {
     }
     if (fs.existsSync(this.handle.root)) fs.rmSync(this.handle.root, { recursive: true, force: true });
   }
+
+  private filePath(relPath: string): string {
+    const safe = worldRelativePath(relPath);
+    if (safe === '.') throw new Error('path is a directory');
+    return path.join(this.handle.root, ...safe.split('/'));
+  }
 }
 
 /** The repo's basename (its worktree subdirectory name in a multi-repo world). */
 function repoName(repo: string): string {
-  return repo.split('/').filter(Boolean).pop() ?? 'repo';
+  return (repo.split(/[/:]/).filter(Boolean).pop() ?? 'repo').replace(/\.git$/i, '');
+}
+
+/** Git's common network transports, including file:// for self-hosted remotes. */
+function isNetworkGitSource(source: string): boolean {
+  return /^(?:(?:https?|ssh|git|file):\/\/|[^\s/@]+@[^\s/:]+:)[^\s]+$/i.test(source.trim());
 }
 
 /** Disambiguate colliding repo basenames by suffixing `-2`, `-3`, … in order. */

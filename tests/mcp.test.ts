@@ -8,6 +8,10 @@ import { KarmaxApi } from '../src/platform/api.js';
 import { createPlatformMcpServer, apiOps, httpOps } from '../src/platform/mcp.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
+import { CredentialBroker } from '../src/autonomy/broker.js';
+import { Vault } from '../src/autonomy/vault.js';
+import { WorldProviderConnectionService } from '../src/world/connections.js';
+import { WorldRegistry } from '../src/world/registry.js';
 
 describe('platform MCP server (capability-checked tool calls)', () => {
   let store: Store;
@@ -16,12 +20,15 @@ describe('platform MCP server (capability-checked tool calls)', () => {
   let contentDir: string;
   let currentToken: string;
   let client: Client;
+  let worlds: WorldRegistry;
 
   beforeEach(async () => {
     store = new Store(':memory:');
     tokens = new TokenAuthority();
     contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
-    api = new KarmaxApi({ store, client: {} as any, taskQueue: 'karmax', tokens, contentDir });
+    const providerConnections = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(path.join(contentDir, 'vault'))));
+    worlds = new WorldRegistry();
+    api = new KarmaxApi({ store, client: {} as any, taskQueue: 'karmax', tokens, contentDir, providerConnections, worlds });
     const server = createPlatformMcpServer(apiOps(api, () => currentToken));
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
     await server.connect(serverT);
@@ -40,13 +47,47 @@ describe('platform MCP server (capability-checked tool calls)', () => {
         'create_task', 'save_skill', 'signal_task', 'reorder_queue', 'propose_workflow_edit',
         'search_tasks', 'list_tags', 'tag_task', 'set_task_priority',
         'find_task', 'list_agents', 'get_conversation', 'fork_agent', 'message_agent',
-        'list_events', 'describe_platform', 'platform_request',
+        'list_events', 'publish_task_branch', 'import_task_branch', 'refresh_upstream', 'describe_platform', 'platform_request', 'list_world_providers',
+        'connect_world_provider', 'test_world_provider', 'disconnect_world_provider',
+        'get_execution_policy', 'set_execution_policy',
       ]),
     );
     const described: any = await client.callTool({ name: 'describe_platform', arguments: {} });
     const catalog = JSON.parse(described.content[0].text);
     expect(catalog.administration).toContain('GET|POST /api/users');
     expect(catalog.payments).toContain('GET|POST /api/cards');
+    expect(catalog.cloud).toContain('GET /api/organizations/:organizationId/world-providers');
+    expect(catalog.cloud).toContain('GET|PUT /api/organizations/:organizationId/execution-policy');
+  });
+
+  it('does not expose direct cross-world filesystem inspection', async () => {
+    const names = (await client.listTools()).tools.map((tool) => tool.name);
+    expect(names).not.toContain('list_world_files');
+    expect(names).not.toContain('read_world_file');
+  });
+
+  it('lets an authorized agent connect and disconnect a provider without reading its secret', async () => {
+    const organization = store.createOrganization({ name: 'Automation', ownerUserId: 'a' });
+    currentToken = tokens.mintPrincipal('user:a', ['organization:read', 'organization:edit'], undefined, 60_000, organization.id).token;
+    const connected: any = await client.callTool({ name: 'connect_world_provider', arguments: {
+      organizationId: organization.id, provider: 'e2b', apiKey: 'write-only-secret', template: 'node-22',
+    } });
+    expect(connected.isError).toBeFalsy();
+    expect(connected.content[0].text).not.toContain('write-only-secret');
+    const listed: any = await client.callTool({ name: 'list_world_providers', arguments: { organizationId: organization.id } });
+    expect(JSON.parse(listed.content[0].text)[0]).toMatchObject({ provider: 'e2b', credentialConfigured: true });
+    expect(listed.content[0].text).not.toContain('write-only-secret');
+    const configured: any = await client.callTool({ name: 'set_execution_policy', arguments: {
+      organizationId: organization.id, worldProvider: 'e2b', unrestrictedInternet: true,
+      cpu: 4, memoryMb: 8192, hibernateAfterDays: 2,
+    } });
+    expect(configured.isError).toBeFalsy();
+    expect(JSON.parse(configured.content[0].text).organization).toMatchObject({
+      worldProvider: 'e2b', resources: { cpu: 4, memoryMb: 8192 }, network: { unrestricted: true },
+      hibernateAfterMs: 2 * 86_400_000,
+    });
+    const removed: any = await client.callTool({ name: 'disconnect_world_provider', arguments: { organizationId: organization.id, provider: 'e2b' } });
+    expect(JSON.parse(removed.content[0].text)).toEqual({ deleted: true });
   });
 
   it('lets an agent tag, prioritize, and search tasks by attribute', async () => {

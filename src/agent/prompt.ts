@@ -1,5 +1,5 @@
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
-import { WorldHandle, worldRepos } from '../world/types.js';
+import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
 
 /**
@@ -13,9 +13,14 @@ import { agentRoleDef, manifest } from '../contrib/manifests.js';
 
 const TOOLS_PREAMBLE = `You are running inside karmax, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
 - create_sub_task(title, prompt): spawn a child task the parent awaits.
-- create_review_info(caption?, actions?): attach click-to-verify affordances for the Review stage — the exact commands/artifacts a human clicks to check your work, NOT a prose summary (that goes in your messages). Each action is a "run" (a shell command run in this world — e.g. start a server/app; set server:true + openUrls for a long-lived one) or an "open" (a produced file or URL to open). The changed-files list is added automatically.
+- create_review_info(caption?, actions?): optional click-to-verify affordances for the Review stage. Use only when relevant: "run" actions for verification commands or starting an app/server (set server:true + openUrls to open it), and "open" actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output. The optional caption says WHAT to verify and is limited to 280 characters. Put summaries of changes/answers in your normal response, or in a file only when requested. The changed-files list is added automatically.
 - save_skill(name, content): persist a reusable skill for future tasks.
+- read_wiki(scope, id, path?) and search_wiki(scope, id, query): navigate and grep the organization/project wikis (skills, memories, prompts). Your instructions include each wiki's table of contents and scope ids; read_wiki with a section path expands any [more…] fold. These run host-side, so they work from every world, including cloud sandboxes.
 - find_task(projectId, number), list_agents(taskId), get_conversation(taskId, role), fork_agent(...), and message_agent(...): discover work by its human #number and robustly inspect or continue another task agent without mutating its original session.
+- message_agent(taskId, message): ask a collaborator to commit and publish its work.
+- publish_task_branch(): publish your clean committed branch for collaborators.
+- import_task_branch(sourceTaskId): fetch a collaborator's published branch into a namespaced local ref, then inspect/test/cherry-pick or merge it normally.
+- refresh_upstream(branch?): fetch the latest upstream branch into refs/remotes/origin before merging or rebasing.
 - list_events(taskId?, since?) and describe_platform(): inspect karmax event/diagnostic context and discover the automation surface.
 - platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by karmax for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, safe mode, settings, review actions, and future UI operations.
 - signal_completion(summary?): optional structured completion summary. Provider-reported successful turn completion is authoritative; this tool is not required.
@@ -59,7 +64,7 @@ export function assemblePrompt(args: AssembleArgs): string {
     toolsPreamble: preamble,
     title: args.task.title,
     prompt: args.task.prompt,
-    worldPath: args.world.root,
+    worldPath: worldWorkingDirectory(args.world),
     worldRepos: describeRepos(args.world),
     branch: args.world.branch,
     base: args.world.base,
@@ -83,9 +88,9 @@ export function assemblePrompt(args: AssembleArgs): string {
 function describeRepos(world: WorldHandle): string {
   const repos = worldRepos(world);
   if (repos.length <= 1) return '';
-  const lines = repos.map((r) => `- ${r.name}/ — checkout of ${r.repo}`).join('\n');
+  const lines = repos.map((r) => `- ${r.root}/ — checkout of ${r.repo}${r.role === 'project-wiki' ? ' (project wiki)' : ''}`).join('\n');
   return (
-    `This world spans ${repos.length} repositories, each checked out in its own subdirectory of the working directory ` +
-    `(all on branch ${world.branch}). \`cd\` into a subdirectory to run git/build commands for that repo:\n${lines}`
+    `This world spans ${repos.length} repositories inside the world boundary ${world.root} ` +
+    `(all on branch ${world.branch}). Use these checkout paths for repository-specific work:\n${lines}`
   );
 }

@@ -65,6 +65,7 @@ describe('install a workflow from git and run a task on it (real dev server)', (
     closeClient = c.close;
 
     const store = new Store(':memory:');
+    store.claimPersonalOrganization('a');
     const tokens = new TokenAuthority();
     const workflows = new WorkflowManager(mgr, new WorkflowRepoLoader(cacheHome), PackageStore.withBundled());
     api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, workflows });

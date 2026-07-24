@@ -1,0 +1,164 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { provisionGitRepos, type ProvisionTarget } from '../src/world/provision-git.js';
+import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
+
+const pexec = promisify(execFile);
+
+function fakeTarget(handler: (command: string) => { stdout?: string; stderr?: string; code?: number } | undefined) {
+  const commands: string[] = [];
+  const target: ProvisionTarget = {
+    async run(command) {
+      commands.push(command);
+      const result = handler(command) ?? {};
+      return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', code: result.code ?? 0 };
+    },
+    async writeFile() {},
+  };
+  return { target, commands };
+}
+
+const OPTIONS = { root: '/w', home: '/home/u', sshUrlError: 'ssh only', copyGlobsWarning: 'no globs' };
+
+describe('shared cloud world git provisioning', () => {
+  afterEach(() => {
+    delete process.env.KARMAX_WORLD_CLONE_RETRIES;
+    delete process.env.KARMAX_WORLD_CLONE_RETRY_MS;
+  });
+
+  it('retries a transient clone failure after clearing the partial checkout', async () => {
+    process.env.KARMAX_WORLD_CLONE_RETRY_MS = '0';
+    let cloneAttempts = 0;
+    const { target, commands } = fakeTarget((command) => {
+      if (command.includes('git clone')) return { code: ++cloneAttempts === 1 ? 128 : 0, stderr: 'early EOF' };
+      if (command.includes('rev-parse')) return { stdout: `${'a'.repeat(40)}\n` };
+      return undefined;
+    });
+    const { repos } = await provisionGitRepos(target, { taskId: 't1', base: 'main', repo: 'git@github.com:acme/app.git' }, OPTIONS);
+    expect(cloneAttempts).toBe(2);
+    expect(commands.some((command) => command.startsWith("rm -rf '/w'"))).toBe(true);
+    expect(repos[0]).toMatchObject({ repo: 'git@github.com:acme/app.git', baseSha: 'a'.repeat(40) });
+  });
+
+  it('gives up after the configured retry budget with the underlying error', async () => {
+    process.env.KARMAX_WORLD_CLONE_RETRIES = '1';
+    process.env.KARMAX_WORLD_CLONE_RETRY_MS = '0';
+    let cloneAttempts = 0;
+    const { target } = fakeTarget((command) => {
+      if (command.includes('git clone')) { cloneAttempts++; return { code: 128, stderr: 'connection reset' }; }
+      return undefined;
+    });
+    await expect(provisionGitRepos(target, { taskId: 't1', base: 'main', repo: 'git@github.com:acme/app.git' }, OPTIONS))
+      .rejects.toThrow(/connection reset/);
+    expect(cloneAttempts).toBe(2);
+  });
+
+  it('rejects non-SSH sources with the provider message before running any command', async () => {
+    const { target, commands } = fakeTarget(() => undefined);
+    await expect(provisionGitRepos(target, { taskId: 't1', base: 'main', repo: 'https://github.com/acme/app.git' }, OPTIONS))
+      .rejects.toThrow('ssh only');
+    expect(commands).toHaveLength(0);
+  });
+
+  it('keeps a scratch workspace beside a companion repository', async () => {
+    const { target, commands } = fakeTarget((command) => {
+      if (command.includes('rev-parse')) return { stdout: `${'a'.repeat(40)}\n` };
+      return undefined;
+    });
+    const provisioned = await provisionGitRepos(target, {
+      taskId: 't1', base: 'main', repo: 'git@github.com:acme/project-wiki.git', scratch: true,
+    }, OPTIONS);
+    expect(provisioned.workdir).toBe('/w/scratch');
+    expect(provisioned.repos[0]).toMatchObject({
+      repo: 'git@github.com:acme/project-wiki.git',
+      root: '/w/project-wiki',
+    });
+    expect(commands.some((command) => command.includes("git -C '/w/scratch' init"))).toBe(true);
+  });
+});
+
+/** Drives provisioning against a plain host directory, standing in for a cloud
+ * sandbox. Test-only url rewriting maps the SSH-shaped remote to a local bare
+ * repo, exercising the exact provisioning command stream without a network. */
+function hostTarget(env: Record<string, string>): ProvisionTarget {
+  return {
+    async run(command, timeoutMs) {
+      try {
+        const { stdout, stderr } = await pexec('bash', ['-c', command], {
+          timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' },
+        });
+        return { stdout, stderr, code: 0 };
+      } catch (e: any) {
+        return { stdout: e.stdout ?? '', stderr: e.stderr ?? String(e?.message ?? e), code: e.code ?? 1 };
+      }
+    },
+    async writeFile(remotePath, content) {
+      await fs.promises.mkdir(path.dirname(remotePath), { recursive: true });
+      await fs.promises.writeFile(remotePath, content);
+    },
+  };
+}
+
+describe('seeding a cloud world from its local checkout', () => {
+  const cleanups: string[] = [];
+  afterEach(() => { for (const dir of cleanups.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+
+  async function makeRepoPair(prefix: string): Promise<{ root: string; source: string; env: Record<string, string> }> {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    cleanups.push(root);
+    const source = path.join(root, 'source');
+    fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+    await gitOrThrow(root, ['clone', '-q', '--bare', source, path.join(root, 'remote.git')]);
+    const env = {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
+      GIT_CONFIG_VALUE_0: 'git@example:',
+    };
+    return { root, source, env };
+  }
+
+  it('forks off the local branch state when the checkout is ahead of origin', async () => {
+    const { root, source, env } = await makeRepoPair('karmax-provision-seed-');
+    // The local checkout moves ahead of origin — the state local-only merges
+    // leave behind. The world must fork off the LOCAL branch state.
+    fs.writeFileSync(path.join(source, 'local-only.txt'), 'never pushed\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'local-only work']);
+    const localMain = (await git(source, ['rev-parse', 'main'])).stdout.trim();
+
+    const world = path.join(root, 'world');
+    const { repos, warnings } = await provisionGitRepos(hostTarget(env), {
+      taskId: 'seeded-task', repos: ['git@example:remote.git'], base: 'main', copySources: [source],
+    }, { root: world, home: root, sshUrlError: 'ssh required', copyGlobsWarning: 'no host checkout' });
+
+    expect(warnings).toEqual([]);
+    expect(repos[0]).toMatchObject({ repo: 'git@example:remote.git', localPath: source, baseSha: localMain });
+    expect((await git(world, ['rev-parse', 'refs/remotes/origin/main'])).stdout.trim()).toBe(localMain);
+    expect((await git(world, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim()).toBe('karmax/seeded-task');
+    expect(fs.readFileSync(path.join(world, 'local-only.txt'), 'utf8')).toContain('never pushed');
+    expect(fs.existsSync(path.join(world, '.karmax-seed.bundle'))).toBe(false);
+  });
+
+  it('reviews a branch that exists only in the local checkout', async () => {
+    const { root, source, env } = await makeRepoPair('karmax-provision-branch-');
+    await gitOrThrow(source, ['branch', 'karmax/other-task']);
+
+    const world = path.join(root, 'world');
+    const { repos } = await provisionGitRepos(hostTarget(env), {
+      taskId: 'review-task', repos: ['git@example:remote.git'], base: 'main', branch: 'karmax/other-task',
+      copySources: [source],
+    }, { root: world, home: root, sshUrlError: 'ssh required', copyGlobsWarning: 'no host checkout' });
+
+    expect(repos[0]!.branch).toBe('karmax/other-task');
+    expect((await git(world, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim()).toBe('karmax/other-task');
+  });
+});

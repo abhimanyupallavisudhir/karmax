@@ -8,7 +8,7 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
 import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, isFullyAuthed, capturedToken, tokenToInject } from '../src/autonomy/config-homes.js';
 import { LoginManager, defaultLoginCommand } from '../src/autonomy/login.js';
-import { remoteAccessPlan } from '../src/remote/access.js';
+import { RemoteAccessController, remoteAccessPlan } from '../src/remote/access.js';
 
 describe('config homes + scrubbed env (SPEC §7.3)', () => {
   it('mints one home per (account × provider) and scrubs inherited keys', () => {
@@ -28,7 +28,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
 
   it('resolves a browser + platform MCP baseline (SPEC §7.5)', () => {
     const servers = mcpServerMap({ browser: 'chrome-devtools', platform: { command: 'node', args: ['mcp.js'] } });
-    expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] });
+    expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@1.6.0'] });
     expect(servers['karmax']).toEqual({ command: 'node', args: ['mcp.js'] });
     expect(mcpServerMap({ browser: 'none' })).toEqual({});
   });
@@ -49,15 +49,19 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
   it('writes the karmax platform MCP into a config home with the gateway URL (task #4)', async () => {
     const { platformMcpSpec } = await import('../src/autonomy/config-homes.js');
     const spec = platformMcpSpec('http://127.0.0.1:4505');
-    expect(spec.command).toBe('npx');
+    expect(spec.command).toBe(process.execPath);
+    expect(spec.args).toContain('--import');
+    expect(spec.args.some((a) => a.includes('tsx/dist/loader'))).toBe(true);
     expect(spec.args.some((a) => a.includes('stdio'))).toBe(true);
+    expect(spec.forwardEnv).toEqual(['KARMAX_TOKEN']);
     expect(spec.env?.KARMAX_GATEWAY_URL).toBe('http://127.0.0.1:4505');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-plat-'));
     const mgr = new ConfigHomeManager(dir);
     const home = mgr.ensure('claude', 'work');
     mgr.writeMcpConfig(home, 'claude', { platform: spec });
     const cfg = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
-    expect(cfg.mcpServers.karmax.command).toBe('npx');
+    expect(cfg.mcpServers.karmax.command).toBe(process.execPath);
+    expect(cfg.mcpServers.karmax.forwardEnv).toBeUndefined();
     expect(cfg.mcpServers.karmax.env.KARMAX_GATEWAY_URL).toContain('4505');
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -79,6 +83,35 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(toml).toContain('command = "npx"');
     expect(toml).toContain('model = "custom"');
     expect(toml).toContain('[mcp_servers.keep]');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('forwards the scoped token to Codex MCP and upgrades existing homes without clobbering other servers', async () => {
+    const { platformMcpSpec } = await import('../src/autonomy/config-homes.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mcp-refresh-'));
+    const mgr = new ConfigHomeManager(dir);
+    const codexHome = mgr.ensure('codex', 'work');
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), `model = "custom"\n\n[mcp_servers.keep]\ncommand = "keep"\n\n[mcp_servers.karmax]\ncommand = "npx"\nargs = ["tsx", "old.ts"]\n`);
+    const claudeHome = mgr.ensure('claude', 'work');
+    fs.writeFileSync(path.join(claudeHome, '.claude.json'), JSON.stringify({ mcpServers: { keep: { command: 'keep', args: [] }, karmax: { command: 'npx', args: ['tsx', 'old.ts'] } } }));
+
+    mgr.refreshPlatformMcp('http://127.0.0.1:9876');
+
+    const toml = fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8');
+    expect(toml.match(/^\[mcp_servers\.karmax]$/gm)).toHaveLength(1);
+    expect(toml).toContain(`command = ${JSON.stringify(process.execPath)}`);
+    expect(toml).toContain('env_vars = ["KARMAX_TOKEN"]');
+    expect(toml).toContain('KARMAX_GATEWAY_URL = "http://127.0.0.1:9876"');
+    expect(toml).toContain('[mcp_servers.keep]');
+    expect(toml).toContain('model = "custom"');
+
+    const claude = JSON.parse(fs.readFileSync(path.join(claudeHome, '.claude.json'), 'utf8'));
+    expect(claude.mcpServers.keep.command).toBe('keep');
+    expect(claude.mcpServers.karmax).toEqual(expect.objectContaining({
+      command: platformMcpSpec('http://127.0.0.1:9876').command,
+      env: { KARMAX_GATEWAY_URL: 'http://127.0.0.1:9876' },
+    }));
+    expect(claude.mcpServers.karmax.forwardEnv).toBeUndefined();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
@@ -229,6 +262,68 @@ describe('remote access plan (SPEC §12)', () => {
   it('falls back to guidance when no tunnel tool is installed', async () => {
     const plan = await remoteAccessPlan(4173, { hasPassword: true, detect: async () => false });
     expect(plan.method).toBe('none');
+    expect(plan.guidance).not.toMatch(/cloudflared|ngrok|funnel/i);
+  });
+  it('reports a missing Tailscale executable as installable, not logged out', async () => {
+    const missing = Object.assign(new Error('spawn tailscale ENOENT'), { code: 'ENOENT', stdout: '', stderr: '' });
+    const controller = new RemoteAccessController({ port: () => 4173, run: async () => { throw missing; } });
+    expect(await controller.status()).toMatchObject({
+      method: 'none',
+      state: 'unavailable',
+      canEnable: false,
+    });
+  });
+  it('detects and enables the private Tailscale route without touching an existing Serve app', async () => {
+    let serve = 'No serve config';
+    const calls: string[][] = [];
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        calls.push(args);
+        if (args[0] === 'status') return { stdout: JSON.stringify({
+          BackendState: 'Running',
+          Self: { DNSName: 'laptop.example.ts.net.' },
+        }), stderr: '' };
+        if (args.join(' ') === 'serve status --json') return { stdout: serve, stderr: '' };
+        if (args[0] === 'serve' && args[1] === '--bg') {
+          serve = 'https://laptop.example.ts.net\n|-- / proxy http://127.0.0.1:4173';
+          return { stdout: 'Serve started', stderr: '' };
+        }
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+    });
+    expect(await controller.status()).toMatchObject({ state: 'available', canEnable: true });
+    expect(await controller.enable()).toMatchObject({
+      state: 'ready',
+      url: 'https://laptop.example.ts.net',
+      canDisable: true,
+    });
+    expect(calls).toContainEqual(['serve', '--bg', 'http://127.0.0.1:4173']);
+  });
+  it('refuses to overwrite another Tailscale Serve route', async () => {
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => args[0] === 'status'
+        ? { stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }), stderr: '' }
+        : { stdout: 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:9000', stderr: '' },
+    });
+    expect(await controller.enable()).toMatchObject({ state: 'conflict', canEnable: false, canDisable: false });
+  });
+  it('reports a hosted HTTPS installation as ready without invoking Tailscale', async () => {
+    const controller = new RemoteAccessController({
+      port: () => 4505,
+      hosted: true,
+      publicUrl: 'https://karmax.example.com',
+      run: async () => { throw new Error('must not run'); },
+    });
+    expect(await controller.status()).toEqual({
+      method: 'hosted',
+      state: 'ready',
+      url: 'https://karmax.example.com',
+      detail: 'This hosted installation already uses authenticated HTTPS.',
+      canEnable: false,
+      canDisable: false,
+    });
   });
 });
 
@@ -299,7 +394,12 @@ describe('PTY terminal check-in (SPEC §5.5)', () => {
       if (v?.worldPath) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    const wsUrl = base.replace('http', 'ws') + `/ws/terminal?taskId=${task.id}&token=${encodeURIComponent(token)}`;
+    const ticket: any = await (await fetch(`${base}/api/tasks/${task.id}/terminal-ticket`, {
+      method: 'POST', headers: auth, body: '{}',
+    })).json();
+    expect(ticket.gatewayUrl).toBe(base);
+    expect(ticket.expiresAt).toBeGreaterThan(Date.now());
+    const wsUrl = base.replace('http', 'ws') + `/ws/terminal?taskId=${task.id}&ticket=${encodeURIComponent(ticket.ticket)}`;
     const got = await new Promise<string>((resolve) => {
       const ws = new WebSocket(wsUrl);
       let buf = '';

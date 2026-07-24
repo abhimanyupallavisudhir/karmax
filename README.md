@@ -18,20 +18,46 @@ npm start          # boots Temporal (SQLite) + worker + gateway, prints a URL
 Then open the printed `http://127.0.0.1:<port>` (ports are chosen dynamically —
 nothing is hardcoded).
 
+### Use Karmax from your phone
+
+For a local installation, install [Tailscale](https://tailscale.com/download) on
+the Karmax computer and your phone, then sign in to the same tailnet. In Karmax,
+open **Organization settings → Access** and choose **Turn on
+private access**. Karmax shows the private `https://….ts.net` address to open on
+your phone. It stays bound to localhost; Tailscale Serve supplies private HTTPS
+and never exposes it to the public internet.
+
+For hosted Karmax, open its normal `https://karmax.example.com` address on the
+phone and sign in. In either case, choose **Add Karmax to this phone** in the
+same Access card (or use the browser's **Add to Home Screen**) for a standalone
+app-like window. A Karmax-specific iOS or Android app is not required; the
+responsive installable web app provides the full task, review, and check-in UI.
+The Tailscale mobile app is only needed for a private local installation.
+
+To host the complete HTTPS control plane on a VPS, install Docker and run:
+
+```bash
+./deploy/karmax up karmax.example.com
+```
+
+It generates and retains all deployment secrets and starts PostgreSQL, Temporal,
+Karmax, and Caddy. GitHub, E2B, and Daytona are connected from Organization
+settings after the first login—no environment-file editing or SSH-based repo
+setup. See [the hosted deployment guide](deploy/README.md) for DNS, backups,
+upgrades, remote-world cost policy, and the laptop↔cloud Git handoff.
+
 **Requirements**
 
 - Node ≥ 22 (uses the built-in `node:sqlite`).
 - The [Temporal CLI](https://temporal.io/setup/install-temporal-cli) at
   `~/.temporalio/bin/temporal` (or set `TEMPORAL_CLI`). `npm start` runs the dev
   server for you.
-- A coding-agent credential for real work (auto-detected, in order):
-  `ANTHROPIC_API_KEY` → a Claude Code login (`~/.claude/.credentials.json`, via
-  the Claude Agent SDK) → `OPENAI_API_KEY` (Codex) → an OpenCode login or
-  `KIMI_API_KEY` (OpenCode with its default Kimi model). OpenCode is supported
-  over stable ACP; Kimi, Gemini, and Grok models are available through it, and
-  its isolated homes can connect supported SuperGrok subscriptions.
-  With none, karmax runs a
-  **mock agent** and prints a loud warning — it will not do real work.
+- A coding-agent login or API key for real work. Connect and choose agents in
+  **Settings**; each task role can use Claude, Codex, or OpenCode, and a fallback
+  provider is used only when a role has not explicitly selected one. OpenCode is
+  supported over stable ACP and can run Kimi, Gemini, Grok, and other models,
+  including supported subscription logins. With no usable credential, karmax
+  runs a **mock agent** and prints a loud warning — it will not do real work.
 - Docker (optional) for the container world provider.
 
 To do real work, open **Settings**, point the project at a git repo directory,
@@ -43,10 +69,10 @@ merged into your target branch.
 | Area | Status |
 |---|---|
 | Durable execution on **Temporal** (activity/workflow split, signals, queries, updates, child workflows, continue-as-new) | ✅ real dev server, dynamic ports |
-| Workflows: **software-dev, just-do, script-exec, goal, merge-only** | ✅ |
+| Workflows: **software-dev ↔ goal** (switchable in-flight), **merge-only**; legacy just-do/script-exec replay | ✅ |
 | Coordinators (lease pattern, crash-safe, continue-as-new): **merge-queue, token/account, budget** | ✅ |
-| Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK), Codex (app-server), OpenCode (ACP), mock** | ✅ |
-| Worlds: **local git worktree** + **Docker container**, swappable provider interface | ✅ |
+| Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK + Messages API), Codex (app-server/OpenAI), OpenCode (ACP), mock** | ✅ |
+| Worlds: **local git worktree**, **Docker**, **E2B**, and **Daytona**, with checkpoint/park/hibernate lifecycle | ✅ |
 | Capability model + attenuation + **workflow-minted scoped tokens**; **platform MCP server** (permission-checked) | ✅ |
 | **Credential broker** (vault-backed, AES-GCM at rest, JIT, scoped, audited; handles only) | ✅ |
 | **PR-test-approve gate** via merge-only (dogfooded) | ✅ |
@@ -57,7 +83,7 @@ merged into your target branch.
 | Virtual-card **budget lease** (hard cap + review-gate threshold) | ✅ |
 | Cheap check-in: **PTY terminal** in the world (WebSocket) + transcript view | ✅ |
 | Immutable defaults + overlay resolution + **global safe mode** + per-workflow fallback | ✅ |
-| Remote access guidance (Tailscale / Cloudflare Tunnel) | ✅ |
+| Hosted control plane: organizations/teams/RBAC, GitHub App onboarding, runner pools, isolated previews, backup/restore, one-command VPS stack | ✅ |
 
 ## Architecture
 
@@ -78,7 +104,7 @@ merged into your target branch.
 ## Testing
 
 ```bash
-npm test          # 55 tests: real Temporal, real git, mock agent (hermetic)
+npm test          # real Temporal, real git, mock agent (hermetic)
 npm run typecheck
 ```
 
@@ -100,6 +126,6 @@ OPENAI_API_KEY=… npx vitest run tests/live-agent.test.ts
   the dev server wedges after you edit workflow code (running singletons replay
   old history against new code). Worlds/worktrees are preserved.
 - First boot asks you to create the administrator account; every later browser
-  session uses Better Auth login. **Never** expose karmax on a naked public
-  tunnel — keep it behind Tailscale or Cloudflare Access as defense in depth.
+  session uses Better Auth login. **Never** expose local Karmax through Funnel
+  or a naked public tunnel; use the built-in private Tailscale Serve setup.
 - `KARMAX_HOME` overrides the data home (default `~/.karmax`).

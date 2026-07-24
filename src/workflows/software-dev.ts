@@ -36,7 +36,7 @@ import {
   ParentResponse,
   SubTaskResponse,
 } from './contract.js';
-import { remotePolicyOf } from './contract.js';
+import { releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider } from './contract.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
 
 const core = proxyActivities<coreActivities>({
@@ -86,6 +86,9 @@ export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
  * returns what it applied. `setTarget` above is the back-compat shim for `target`.
  */
 export const updateParamsUpdate = defineUpdate<{ applied: string[] }, [Record<string, unknown>]>('updateParams');
+/** Switch between the two compatible policies sharing this execution. This is a
+ * mode update, not a Temporal workflow-type hot swap; the execution stays pinned. */
+export const changeWorkflowUpdate = defineUpdate<{ workflow: 'software-dev' | 'goal' }, ['software-dev' | 'goal']>('changeWorkflow');
 export const viewQuery = defineQuery<TaskView>('view');
 /**
  * Live follow-up feed for in-flight injection (SPEC §5.6). A running agent turn
@@ -149,8 +152,13 @@ const MAX_SHELL_NUDGES = 3;
  * scratch or single-repo world yields one domain, exactly as before.)
  */
 function mergeDomains(world: WorldHandleLike | undefined, target: string, projectId: string): string[] {
-  const repos = world?.repos?.length ? world.repos.map((r) => r.repo) : world?.repo ? [world.repo] : [projectId];
-  return [...new Set(repos.map((r) => `${r}:${target}`))].sort();
+  // Key on the AUTHORITATIVE repo: a cloud world provisioned from a local
+  // checkout (`localPath`) lands its merge in that checkout, so it must
+  // serialize with worktree worlds of the same repo — not under its SSH URL.
+  const domains = world?.repos?.length
+    ? world.repos.map((repo) => `${repo.localPath ?? repo.repo}:${repo.target ?? target}`)
+    : [`${world?.repo ?? projectId}:${target}`];
+  return [...new Set(domains)].sort();
 }
 
 /**
@@ -179,15 +187,21 @@ export async function softwareDevV1_2(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.2.0');
 }
 
+/** Compatible software-dev/goal mode switching. */
+export async function softwareDevV1_3(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.3.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0'): Promise<{ stage: Stage; sha?: string }> {
+async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0'): Promise<{ stage: Stage; sha?: string }> {
   const liveAgentStates = behaviorVersion !== '1.0.0';
-  const providerTerminalCompletion = behaviorVersion === '1.2.0';
+  const providerTerminalCompletion = behaviorVersion === '1.2.0' || behaviorVersion === '1.3.0';
+  const modeSwitching = behaviorVersion === '1.3.0';
   const taskId = input.taskId;
   const recovery = input.recovery;
   let stage: Stage = recovery ? 'do' : 'setup';
@@ -199,6 +213,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       : [];
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';
+  let goalMode = !!input.goalMode;
   let confirmed = false;
   let cancelled = false;
   let retryRequested = false;
@@ -252,7 +267,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   // their layer equivalents. A child with a `parentTaskId` always routes Review to
   // its parent regardless (parent-as-confirmer, SPEC §5.3), so this only governs
   // top-level tasks.
-  const confirmLayers = confirmLayersOf(input.confirm, !!input.autoConfirm);
+  // Goal owns the zero-layer policy dynamically. Keeping the normal Software Dev
+  // layers separately means switching back restores the task's original gate.
+  const softwareDevConfirmLayers = confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, { accountId: string; configHome?: string; apiKeyHandle?: string }>();
   let turnSeq = 0;
@@ -261,7 +278,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
 
-  const kind = input.project.worldProvider === 'container' ? 'container' : 'worktree';
+  const kind = input.project.worldProvider ?? 'worktree';
 
   // ── in-flight param edits (SPEC §4.5/§5.5) ──
   // A working copy of the per-role agent overrides that later turns re-read, so a
@@ -422,10 +439,19 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   }
 
   function buildView(): TaskView {
+    const workflowSwitchable =
+      modeSwitching &&
+      !confirmed &&
+      !cancelled &&
+      !pointOfNoReturnPassed &&
+      (stage === 'setup' || stage === 'do' || stage === 'review');
     return {
       taskId,
       title: input.title,
-      workflow: 'software-dev',
+      workflow: modeSwitching ? (goalMode ? 'goal' : 'software-dev') : 'software-dev',
+      ...(modeSwitching
+        ? { workflowOptions: ['software-dev', 'goal'], workflowSwitchable }
+        : {}),
       stage,
       status,
       messages: msgs,
@@ -448,7 +474,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       branch: world?.branch,
       base,
       targetBranch: target,
-      worldPath: world?.root,
+      world,
+      worldPath: world?.workdir ?? world?.root,
       pr,
       mergeQueue: mergeQueuePos,
       subTasks: subTaskIds.length ? subTaskIds : undefined,
@@ -543,9 +570,54 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     return true;
   });
   setHandler(updateParamsUpdate, (patch) => applyParamPatch(patch), { validator: validateParamPatch });
+  setHandler(
+    changeWorkflowUpdate,
+    async (workflow) => {
+      const nextGoalMode = workflow === 'goal';
+      if (nextGoalMode === goalMode) return { workflow };
+      goalMode = nextGoalMode;
+      liveInput.goalMode = goalMode;
+      liveInput.workflow = workflow;
+      if (goalMode) {
+        // This both redirects an in-flight Do turn (the adapter polls follow-ups)
+        // and wakes a Software Dev task already waiting at Review. In the latter
+        // case the workflow returns to Do instead of auto-approving potentially
+        // partial work that pre-dated the mode switch.
+        msgs.push({
+          id: `mode-${msgs.length}`,
+          role: 'user',
+          text: 'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.',
+          ts: msgs.length,
+        });
+      }
+      await publish();
+      return { workflow };
+    },
+    {
+      validator: (workflow) => {
+        if (workflow !== 'software-dev' && workflow !== 'goal')
+          throw ApplicationFailure.nonRetryable(`unsupported workflow mode "${workflow}"`, 'WorkflowModeInvalid');
+        if (workflow === (goalMode ? 'goal' : 'software-dev')) return;
+        if (
+          !modeSwitching ||
+          confirmed ||
+          cancelled ||
+          pointOfNoReturnPassed ||
+          (stage !== 'setup' && stage !== 'do' && stage !== 'review')
+        )
+          throw ApplicationFailure.nonRetryable(
+            'the workflow can only switch between Software Dev and Goal before confirmation begins',
+            'WorkflowModeLocked',
+          );
+      },
+    },
+  );
 
   // ── Resolve wrapper (SPEC §5.2) ──
   async function withResolve<T>(stageName: string, fn: () => Promise<T>): Promise<T> {
+    // Usually identical to stageName, except the Confirm agent runs inside the
+    // public Review stage. Preserve the actual UI stage for a later human retry.
+    const resumeStage = stage;
     let lastError = '';
     for (;;) {
       let attempt = 0;
@@ -693,6 +765,12 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       await condition(() => retryRequested || cancelled);
       waitingFor = undefined;
       if (cancelled) throw new Cancelled();
+      // A human/parent retry resumes the stage that failed. Leaving this as
+      // `escalated` made the live view claim the task was still escalated while
+      // its replacement agent turn was already running (task #240). This is a
+      // pure state correction before the existing next publish/activity, so it
+      // does not insert a new Temporal command into historical workflow replay.
+      stage = resumeStage;
       status = 'active';
       error = undefined;
     }
@@ -1106,7 +1184,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   await publish();
   if (!world) {
     world = (await withResolve('setup', () =>
-      core.createWorld({ taskId, repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
+      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
     )) as WorldHandleLike;
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
@@ -1134,7 +1212,15 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
 
     // v1.2 advances only after an adapter observed the provider's successful terminal
     // event. v1.0/v1.1 retain their immutable signal/idle semantics for replay.
-    const turnFinished = providerTerminalCompletion ? !!turn.providerCompleted : turn.completed;
+    // Software Dev treats a clean provider return as the turn boundary and asks
+    // its confirmer to judge the result. Goal has no reviewer, so v1.3 requires
+    // the agent's explicit completion marker; a merely clean-but-partial return
+    // is re-prompted instead of silently auto-merging.
+    const turnFinished = providerTerminalCompletion
+      ? modeSwitching && goalMode
+        ? !!turn.completed
+        : !!turn.providerCompleted
+      : turn.completed;
     const finishing = turnFinished || (!providerTerminalCompletion && turn.needsInput) || turn.raise;
 
     // While children are still running, the parent doesn't leave the Do loop:
@@ -1241,11 +1327,13 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     {
       // Legacy goal versions required signal_completion. v1.2 treats the provider's
       // verified successful terminal event as the authoritative turn boundary.
-      if (input.goalMode && !turnFinished && !turn.raise) {
+      if (goalMode && !turnFinished && !turn.raise) {
         msgs.push({
           id: `kg-${msgs.length}`,
           role: 'user',
-          text: providerTerminalCompletion
+          text: modeSwitching
+            ? 'Keep going until the goal is fully complete and verified, then call signal_completion. Do not call it for partial progress.'
+            : providerTerminalCompletion
             ? 'Keep going until the goal is fully complete, then finish with the result.'
             : 'Keep going until the goal is fully complete, then call signal_completion.',
           ts: msgs.length,
@@ -1321,7 +1409,11 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       // would push a zero-/partial-work diff straight through to merge unseen: a stall
       // degrades to a single human gate. (In goal mode the loop above already
       // guarantees completed|raise here, so the guard changes no reachable goal path.)
-      const gates: ConfirmLayer[] = confirmLayers.length || turnFinished || turn.raise ? confirmLayers : [{ kind: 'human' }];
+      const confirmLayers: ConfirmLayer[] = modeSwitching
+        ? (goalMode ? (turn.raise ? [{ kind: 'human', audience: ['@creator'] }] : []) : softwareDevConfirmLayers)
+        : softwareDevConfirmLayers;
+      const gates: ConfirmLayer[] = confirmLayers.length || turnFinished || turn.raise
+        ? confirmLayers : [{ kind: 'human', audience: ['@creator'] }];
       let backToDo = false;
       for (let li = 0; li < gates.length && !backToDo; li++) {
         const layer = gates[li]!;
@@ -1352,7 +1444,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
         }
         // A human layer: wait for the Confirm click — one click passes ONE layer — or a
         // follow-up, which sends the task back to Do.
-        if (gateDetail) waitingFor = { kind: 'human', detail: gateDetail };
+        waitingFor = { kind: 'human', ...(gateDetail ? { detail: gateDetail } : {}),
+          audience: layer.kind === 'human' && layer.audience?.length ? layer.audience : ['@creator'] };
         await publish();
         await condition(() => confirmed || cancelled || msgs.length > seen);
         waitingFor = undefined;
@@ -1523,6 +1616,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     await condition(() => retryRequested || cancelled);
     waitingFor = undefined;
     if (cancelled) return await abort();
+    stage = 'merge';
+    status = 'active';
     error = undefined;
     mergeAttempts = 0; // a human/parent retry grants a fresh loop-back budget
   }
@@ -1531,7 +1626,12 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   status = 'done';
   reviewInfo = { ...reviewInfo, summary: `Merged into ${target} at ${world!.repo ?? '(scratch repo)'} as ${sha?.slice(0, 8)}.` };
   await publish();
+  const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
   await core.destroyWorld(world as any);
+  if (remoteWorld) {
+    world = undefined;
+    await publish();
+  }
   return { stage, sha };
   } catch (e) {
     if (e instanceof Cancelled || (isCancellation(e) && cancelled)) return await abort();
@@ -1544,7 +1644,14 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     status = 'cancelled';
     await cancelChildren(liveAgentStates); // don't strand children when we go away
     await publish();
-    if (world) await core.destroyWorld(world as any);
+    if (world) {
+      const remoteWorld = releaseWorldOnCompletion(world);
+      await core.destroyWorld(world as any);
+      if (remoteWorld) {
+        world = undefined;
+        await publish();
+      }
+    }
     return { stage } as { stage: Stage };
   }
 }

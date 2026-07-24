@@ -23,12 +23,11 @@ describe('resolveParams (overlay: task → project → global → default)', () 
     const r = resolveParams(sd, {
       task: { prompt: 'do it', base: 'feature' },
       project: { base: 'develop', target: 'develop', repos: ['/r'] },
-      global: { target: 'main', worldProvider: 'container' },
+      global: { target: 'main' },
     });
     expect(r.prompt).toBe('do it');
     expect(r.base).toBe('feature'); // task wins
     expect(r.target).toBe('develop'); // project wins over global
-    expect(r.worldProvider).toBe('container'); // global used (no task/project)
     expect(r.remote).toBe('none'); // field default
   });
 
@@ -100,11 +99,10 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
       target: 'release',
       repos: ['~/code/app'],
       copyGlobs: ['.env'],
-      worldProvider: 'container',
       remote: 'pr',
       'agent:do': { provider: 'codex', model: 'gpt-4.1', effort: 'high' },
     };
-    const input = assembleTaskInput(sd, resolved, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
+    const input = assembleTaskInput(sd, resolved, { taskId: 't1', projectId: 'p1', title: 'X', project: { worldProvider: 'container' } });
     expect(input.prompt).toBe('build X');
     expect(input.base).toBe('main');
     expect(input.target).toBe('release');
@@ -133,7 +131,7 @@ describe('assembleTaskInput (binds resolved values into TaskInput)', () => {
       { kind: 'human' },
     ];
     const input = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers } }, { taskId: 't1', projectId: 'p1', title: 'X', project: {} });
-    expect(input.confirm).toEqual({ layers });
+    expect(input.confirm).toEqual({ layers: [layers[0], { kind: 'human', audience: ['@creator'] }] });
     const auto = assembleTaskInput(sd, { prompt: 'build X', confirm: { layers: [] } }, { taskId: 't2', projectId: 'p1', title: 'X', project: {} });
     expect(auto.confirm).toEqual({ layers: [] });
   });
@@ -161,13 +159,25 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
     expect(s).toBe(stored);
   });
 
+  it('merges shared defaults beneath workflow-specific settings', () => {
+    const get = (_scope: string, workflow: string) => workflow === '__common__'
+      ? { base: 'shared', target: 'main' } : workflow === 'software-dev' ? { base: 'workflow' } : undefined;
+    expect(projectSettingsFor(get, project, 'software-dev')).toMatchObject({ base: 'workflow', target: 'main' });
+  });
+
   it('globalSettingsFor returns {} when absent', () => {
     expect(globalSettingsFor(() => undefined, 'software-dev')).toEqual({});
   });
+
+  it('never leaks legacy installation defaults into a new organization', () => {
+    const get = (scope: string) => scope === 'global' ? { base: 'legacy-secret' } : undefined;
+    expect(globalSettingsFor(get, 'software-dev', 'org_team')).toEqual({});
+    expect(globalSettingsFor(get, 'software-dev', 'org_personal')).toEqual({ base: 'legacy-secret' });
+  });
 });
 
-describe('quick-task defaults (separate overlay for the quick-add box)', () => {
-  // The creation-time chain for a quick task in a project (highest → lowest):
+describe('quick-task agent defaults (separate overlay for the quick-add box)', () => {
+  // The creation-time chain for an agent field on a quick task (highest → lowest):
   // task → project-quick → global-quick → project-general → global-general → default.
   const chain = (layers: {
     task?: Record<string, unknown>;
@@ -184,55 +194,66 @@ describe('quick-task defaults (separate overlay for the quick-add box)', () => {
     expect(quickScopeKey('p1')).not.toBe('global');
   });
 
-  it('global-quick overrides the general defaults for a quick task', () => {
-    const r = chain({ globalQuick: { confirm: { mode: 'auto' } }, global: { confirm: { mode: 'human' } } });
-    expect(r.confirm).toEqual({ mode: 'auto' });
+  it('global-quick overrides the regular agent defaults for a quick task', () => {
+    const r = chain({ globalQuick: { 'agent:do': { provider: 'codex' } }, global: { 'agent:do': { provider: 'claude' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'codex' });
   });
 
-  it('global-quick inherits (falls through) to the general global default when unset', () => {
-    const r = chain({ globalQuick: {}, global: { worldProvider: 'container' } });
-    expect(r.worldProvider).toBe('container');
+  it('organization-quick inherits the regular organization agent when unset', () => {
+    const r = chain({ globalQuick: {}, global: { 'agent:do': { provider: 'claude' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
   });
 
   it('project-quick overrides global-quick', () => {
-    const r = chain({ projectQuick: { confirm: { mode: 'human' } }, globalQuick: { confirm: { mode: 'auto' } } });
-    expect(r.confirm).toEqual({ mode: 'human' });
+    const r = chain({ projectQuick: { 'agent:do': { provider: 'claude' } }, globalQuick: { 'agent:do': { provider: 'codex' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
   });
 
   it('project-quick inherits from global-quick before the project general default', () => {
-    const r = chain({ globalQuick: { confirm: { mode: 'auto' } }, project: { confirm: { mode: 'human' } } });
-    expect(r.confirm).toEqual({ mode: 'auto' }); // global-quick wins over project-general
+    const r = chain({ globalQuick: { 'agent:do': { provider: 'codex' } }, project: { 'agent:do': { provider: 'claude' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'codex' });
   });
 
-  it('project-quick falls through to the project general default when neither quick layer sets it', () => {
-    const r = chain({ project: { target: 'prod' }, global: { target: 'main' } });
-    expect(r.target).toBe('prod');
+  it('project-quick falls through to the regular project agent when neither quick layer sets it', () => {
+    const r = chain({ project: { 'agent:do': { provider: 'claude' } }, global: { 'agent:do': { provider: 'codex' } } });
+    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
   });
 
   it('a task override still beats every default layer', () => {
-    const r = chain({ task: { base: 'feature' }, projectQuick: { base: 'pq' }, globalQuick: { base: 'gq' }, project: { base: 'p' }, global: { base: 'g' } });
-    expect(r.base).toBe('feature');
+    const r = chain({
+      task: { 'agent:do': { provider: 'mock' } },
+      projectQuick: { 'agent:do': { provider: 'claude' } },
+      globalQuick: { 'agent:do': { provider: 'codex' } },
+    });
+    expect(r['agent:do']).toMatchObject({ provider: 'mock' });
   });
 
   it('quick*SettingsFor read the namespaced rows and default to {}', () => {
     const rows: Record<string, Record<string, unknown>> = {
-      'quick:global::software-dev': { confirm: { mode: 'auto' } },
-      'quick:p1::software-dev': { base: 'qb' },
+      'quick:global::software-dev': { confirm: { mode: 'auto' }, 'agent:do': { provider: 'codex' } },
+      'quick:p1::software-dev': { base: 'qb', 'agent:merge': { provider: 'claude' } },
     };
     const get = (scopeKey: string, wf: string) => rows[`${scopeKey}::${wf}`];
-    expect(quickGlobalSettingsFor(get, 'software-dev')).toEqual({ confirm: { mode: 'auto' } });
-    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({ base: 'qb' });
+    expect(quickGlobalSettingsFor(get, 'software-dev')).toEqual({ 'agent:do': { provider: 'codex' } });
+    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({ 'agent:merge': { provider: 'claude' } });
     expect(quickGlobalSettingsFor(() => undefined, 'software-dev')).toEqual({});
     expect(quickProjectSettingsFor(() => undefined, 'p1', 'software-dev')).toEqual({});
+  });
+
+  it('can disable the shared Quick overlay without deleting its values', () => {
+    const get = (_scope: string, workflow: string) => workflow === '__common__' ? { _enabled: false, 'agent:do': { provider: 'codex' } } : undefined;
+    expect(quickProjectSettingsFor(get, 'p1', 'software-dev')).toEqual({});
   });
 });
 
 describe('settingsToProjectConfig (mirror back to ProjectConfig)', () => {
-  it('maps base/target to defaultBase/defaultTarget and binds project fields', () => {
+  it('maps base/target to defaultBase/defaultTarget and binds workflow project fields', () => {
     const cfg = settingsToProjectConfig(sd, { base: 'main', target: 'prod', repos: ['~/r'], worldProvider: 'container' });
     expect(cfg.defaultBase).toBe('main');
     expect(cfg.defaultTarget).toBe('prod');
     expect(cfg.repos).toEqual([path.join(os.homedir(), 'r')]);
+    // "Agent environment" is now a task default (bind:'project'), so it mirrors back
+    // to ProjectConfig.worldProvider like the other project-bound fields.
     expect(cfg.worldProvider).toBe('container');
   });
 });

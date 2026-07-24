@@ -17,6 +17,11 @@ export interface ToolSchema {
 const MAX_OUTPUT = 12_000;
 const truncate = (s: string) => (s.length > MAX_OUTPUT ? s.slice(0, MAX_OUTPUT) + '\n…(truncated)' : s);
 
+/** Review captions are orientation, not a second place for the agent's final answer. */
+export const MAX_REVIEW_TEXT_LENGTH = 280;
+
+const reviewTextLength = (value: string) => [...value].length;
+
 /**
  * The tools every real agent gets: do real work in the world (bash/read/write)
  * plus the platform tools (SPEC §5.2). signal_completion is an optional structured
@@ -53,11 +58,15 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_review_info',
     description:
-      "Attach click-to-verify affordances for the Review stage — the exact things a human clicks to check your work, NOT a prose summary of what you did (that belongs in your messages). Provide `actions`: each is either a `run` (a shell command executed in the task's world — e.g. start a server or app; set `server: true` for a long-lived process and list `openUrls` to open once it's up) or an `open` (a produced artifact to open: a world-relative file path — PDF, notebook, image, video — or an absolute URL, in `target`). Add a one-line `caption` saying what to verify. The changed-files list is added automatically.",
+      "Optional. Attach click-to-verify affordances only when they are relevant: `run` actions for useful verification commands (including starting an app/server; set `server: true` and use `openUrls` to open it), and `open` actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output and must not be attached as an `open` action. `caption` is optional, at most 280 characters, and says WHAT to verify. Put summaries of changes/answers in your normal response, or in a file only when the task requests one. The changed-files list is added automatically.",
     parameters: {
       type: 'object',
       properties: {
-        caption: { type: 'string', description: 'One line: WHAT to verify (not a narrative of what you did).' },
+        caption: {
+          type: 'string',
+          maxLength: MAX_REVIEW_TEXT_LENGTH,
+          description: 'Optional, at most 280 characters: WHAT to verify (not a summary of what you did).',
+        },
         actions: {
           type: 'array',
           items: {
@@ -68,16 +77,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
               command: { type: 'string', description: 'run: the shell command executed in the world.' },
               server: { type: 'boolean', description: 'run: command is a long-lived server/watcher (stream logs + Stop).' },
               openUrls: { type: 'array', items: { type: 'string' }, description: 'run: URLs to open once it is up.' },
-              target: { type: 'string', description: 'open: a world-relative file path or an absolute URL.' },
+              target: { type: 'string', description: 'open: a human-readable output (not source code), as a world-relative path or absolute URL.' },
             },
             required: ['kind', 'label'],
           },
         },
-        // Legacy free-form fields, still accepted for back-compat.
-        summary: { type: 'string' },
-        links: { type: 'array', items: { type: 'object', properties: { label: { type: 'string' }, url: { type: 'string' } } } },
-        diff: { type: 'string' },
-        html: { type: 'string' },
       },
     },
   },
@@ -134,6 +138,33 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'read_wiki',
+    description:
+      'Navigate an organization or project wiki (skills, memories, prompts). No path → the full table of contents (this also expands any [more…] fold); a section path → that section listed in full; a skill/memory path → its complete markdown plus attached files. Your prompt names the scope ids that apply to your task.',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['organization', 'project'] },
+        id: { type: 'string', description: 'The organization or project id.' },
+        path: { type: 'string', description: 'Wiki-relative folder path of a section or skill; omit for the full TOC.' },
+      },
+      required: ['scope', 'id'],
+    },
+  },
+  {
+    name: 'search_wiki',
+    description: 'Grep every page of an organization or project wiki with a case-insensitive regular expression; returns file:line matches.',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['organization', 'project'] },
+        id: { type: 'string', description: 'The organization or project id.' },
+        query: { type: 'string' },
+      },
+      required: ['scope', 'id', 'query'],
+    },
+  },
+  {
     name: 'request_spend',
     description:
       'Request to pay for something with the project card. Amount in cents. Returns granted (charged), needs_approval, needs_funding, or denied. If not granted, stop and report — the human will fund/approve, then you can retry.',
@@ -171,6 +202,21 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'message_agent',
     description: 'Send a follow-up to an original or forked task agent; it is injected live when running.',
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, message: { type: 'string' } }, required: ['task_id', 'message'] },
+  },
+  {
+    name: 'publish_task_branch',
+    description: 'Publish this task’s clean, committed Git branch so another agent can import it. Commit first.',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'import_task_branch',
+    description: 'Fetch another task’s published branch into a namespaced local ref for inspection, testing, cherry-picking, or merging.',
+    parameters: { type: 'object', properties: { source_task_id: { type: 'string' } }, required: ['source_task_id'] },
+  },
+  {
+    name: 'refresh_upstream',
+    description: 'Fetch the latest upstream base/target branch into refs/remotes/origin. Optionally name another branch.',
+    parameters: { type: 'object', properties: { branch: { type: 'string' } } },
   },
   {
     name: 'list_events',
@@ -240,6 +286,24 @@ export const SDK_NATIVE_TOOLS = new Set(['bash', 'read_file', 'write_file']);
  *  never drift — the drift that hid `respond_to_sub_task` from Claude-Code agents. */
 export const PLATFORM_TOOL_SCHEMAS: ToolSchema[] = TOOL_SCHEMAS.filter((t) => !SDK_NATIVE_TOOLS.has(t.name));
 
+/** Turn-local controls that must mutate the current activity result. Durable
+ * platform operations are served by the gateway-backed stdio `karmax` MCP. */
+export const SDK_CONTROL_TOOL_NAMES = new Set([
+  'create_review_info',
+  'create_sub_task',
+  'respond_to_sub_task',
+  'raise_to_parent',
+  'wait_for_subtasks',
+  'request_spend',
+  'signal_completion',
+  'resolve_decision',
+  'confirm_decision',
+]);
+
+export const SDK_CONTROL_TOOL_SCHEMAS: ToolSchema[] = PLATFORM_TOOL_SCHEMAS.filter((tool) =>
+  SDK_CONTROL_TOOL_NAMES.has(tool.name),
+);
+
 /** Returns name → executor for the platform tools, bound to a world + context. */
 export function platformToolHandlers(
   world: World,
@@ -270,6 +334,17 @@ export function platformToolHandlers(
       return `wrote ${args?.path}`;
     },
     async create_review_info(args) {
+      // `summary` is no longer advertised, but validate it too for old/resumed
+      // sessions which may still call the legacy shape. Both fields occupy the
+      // same textual orientation slot in Review.
+      for (const field of ['caption', 'summary'] as const) {
+        const value = args?.[field];
+        if (typeof value !== 'string') continue;
+        const length = reviewTextLength(value);
+        if (length > MAX_REVIEW_TEXT_LENGTH) {
+          return `review info rejected: ${field} is ${length} characters; the maximum is ${MAX_REVIEW_TEXT_LENGTH}. Shorten it and retry.`;
+        }
+      }
       ctx.createReviewInfo({
         caption: args?.caption,
         actions: Array.isArray(args?.actions) ? args.actions : undefined,
@@ -310,6 +385,16 @@ export function platformToolHandlers(
       ctx.saveSkill({ name: String(args?.name ?? 'skill'), content: String(args?.content ?? '') });
       return 'skill saved';
     },
+    async read_wiki(args) {
+      const scope = args?.scope === 'organization' ? 'organizations' : 'projects';
+      const id = encodeURIComponent(String(args?.id ?? ''));
+      return JSON.stringify(await platformRequest('GET', `/api/${scope}/${id}/wiki?path=${encodeURIComponent(String(args?.path ?? ''))}`));
+    },
+    async search_wiki(args) {
+      const scope = args?.scope === 'organization' ? 'organizations' : 'projects';
+      const id = encodeURIComponent(String(args?.id ?? ''));
+      return JSON.stringify(await platformRequest('GET', `/api/${scope}/${id}/wiki/search?q=${encodeURIComponent(String(args?.query ?? ''))}`));
+    },
     async request_spend(args) {
       const r = await ctx.requestSpend({
         amount: Number(args?.amount ?? 0),
@@ -339,6 +424,15 @@ export function platformToolHandlers(
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       await platformRequest('POST', `/api/tasks/${taskId}/signal`, { signal: 'followUp', role: args?.role ?? 'do', text: args?.message });
       return 'message delivered';
+    },
+    async publish_task_branch() {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/publish', {}));
+    },
+    async import_task_branch(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/import', { sourceTaskId: String(args?.source_task_id ?? '') }));
+    },
+    async refresh_upstream(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/git/refresh-upstream', { branch: args?.branch ? String(args.branch) : undefined }));
     },
     async list_events(args) {
       return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/events?since=${Number(args?.since ?? 0)}`));

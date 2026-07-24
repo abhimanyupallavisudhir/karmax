@@ -1,5 +1,6 @@
 import {
   defineSignal,
+  defineUpdate,
   defineQuery,
   setHandler,
   condition,
@@ -16,6 +17,8 @@ import {
   SIG_REGISTER_ACCOUNTS,
   SIG_REPORT_EXHAUSTED,
   SIG_SET_ACCOUNT_AVAILABILITY,
+  UPD_REPORT_EXHAUSTED,
+  UPD_SET_ACCOUNT_AVAILABILITY,
   QRY_ACCOUNTS,
 } from './names.js';
 
@@ -110,6 +113,8 @@ export const registerAccountsSignal = defineSignal<[{ accounts: RegisteredAccoun
 export const reportExhaustedSignal = defineSignal<[{ accountId: string; window: LimitWindow; resetAt: number; note?: string }]>(SIG_REPORT_EXHAUSTED);
 /** Manual availability override (UI/MCP). `resetAt` sets a new reset instant. */
 export const setAccountAvailabilitySignal = defineSignal<[{ accountId: string; status: AccountStatus; resetAt?: number }]>(SIG_SET_ACCOUNT_AVAILABILITY);
+export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; window: LimitWindow; resetAt: number; note?: string }]>(UPD_REPORT_EXHAUSTED);
+export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
 
 // A long backstop poll so the park loop periodically re-checks even absent a
@@ -226,7 +231,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     const a = accounts.find((x) => x.id === accountId);
     if (a && a.inUse > 0) a.inUse--;
   });
-  setHandler(reportExhaustedSignal, ({ accountId, window, resetAt, note }) => {
+  const reportExhausted = ({ accountId, window, resetAt, note }: { accountId: string; window: LimitWindow; resetAt: number; note?: string }) => {
     const a = accounts.find((x) => x.id === accountId);
     if (!a) return;
     a.status = 'exhausted';
@@ -238,8 +243,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     // is accurate while it cools down.
     a.inUse = 0;
     log.info(`account ${accountId} exhausted (${window}), resets at ${resetAt}`);
-  });
-  setHandler(setAccountAvailabilitySignal, ({ accountId, status, resetAt }) => {
+  };
+  const setAvailability = ({ accountId, status, resetAt }: { accountId: string; status: AccountStatus; resetAt?: number }) => {
     const a = accounts.find((x) => x.id === accountId);
     if (!a) return;
     a.status = status;
@@ -250,7 +255,14 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     } else if (resetAt != null) {
       a.resetAt = resetAt;
     }
-  });
+  };
+  // Signals remain public for backwards compatibility and direct/manual callers.
+  // Activities use updates, whose acknowledged result means this mutation has
+  // actually run before a failed turn can request another lease.
+  setHandler(reportExhaustedSignal, reportExhausted);
+  setHandler(reportExhaustedUpdate, reportExhausted);
+  setHandler(setAccountAvailabilitySignal, setAvailability);
+  setHandler(setAccountAvailabilityUpdate, setAvailability);
   setHandler(accountsQuery, (): AccountsView => ({
     accounts: accounts.map((a) => ({
       id: a.id,

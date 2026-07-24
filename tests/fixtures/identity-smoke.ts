@@ -7,6 +7,7 @@ import { KarmaxBus } from '../../src/contrib/bus.js';
 import { ContributionRegistry } from '../../src/contrib/registry.js';
 import { Overlays } from '../../src/store/overlays.js';
 import { findFreePortFrom } from '../../src/util/ports.js';
+import { WorldRegistry } from '../../src/world/registry.js';
 
 const identity = await IdentityService.open(':memory:', { baseURL: 'http://localhost:4505' });
 const first = await identity.bootstrap({ name: 'Admin', email: 'admin@example.com', password: 'long-enough-password' });
@@ -39,6 +40,7 @@ const gateway = new Gateway({
   agentInfo: { provider: 'mock', reason: 'identity smoke' },
   identity: httpIdentity,
   authorization,
+  worlds: new WorldRegistry(),
 });
 const running = await gateway.listen(port);
 const base = running.url;

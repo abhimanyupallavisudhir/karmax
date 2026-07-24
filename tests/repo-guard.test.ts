@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { WorkflowExecutionAlreadyStartedError } from '@temporalio/client';
+import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
@@ -19,12 +21,14 @@ describe('repo-required guard (empty-repo footgun)', () => {
   let store: Store;
   let api: KarmaxApi;
   let token: string;
+  let tokens: TokenAuthority;
   let started: unknown[][];
   let startError: Error | undefined;
 
   beforeEach(() => {
     store = new Store(':memory:');
-    const tokens = new TokenAuthority();
+    store.claimPersonalOrganization('a');
+    tokens = new TokenAuthority();
     started = [];
     startError = undefined;
     const client = {
@@ -68,6 +72,22 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(task.workflow).toBe('software-dev');
     expect(started).toHaveLength(1); // guard passed → workflow started
     expect((started[0]![1] as any).args[0].resolveAgentEnabled).toBe(false);
+  });
+
+  it('requires a first-class organization repository in hosted mode', async () => {
+    const p = store.createProject('Hosted', { worldProvider: 'e2b', repos: ['git@github.com:acme/app.git'] });
+    api = new KarmaxApi({ store, client: { workflow: { start: async (...a: unknown[]) => { started.push(a); return {}; } } } as any,
+      taskQueue: 'tq', tokens, hosted: true });
+    await expect(api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' }))
+      .rejects.toThrow(/attached GitHub repository/);
+    const repository = store.upsertRepository({ organizationId: p.organizationId!, provider: 'github',
+      owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'trunk', private: true });
+    store.attachProjectRepository({ projectId: p.id, repositoryId: repository.id });
+    await expect(api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x',
+      params: { repos: ['git@github.com:other/not-attached.git'] } })).rejects.toThrow(/not attached/);
+    const task = await api.createTask(token, { projectId: p.id, workflow: 'software-dev', prompt: 'x' });
+    expect(task.workflow).toBe('software-dev');
+    expect(store.getProject(p.id)?.config).toMatchObject({ repos: [repository.sshUrl], defaultBase: 'trunk', defaultTarget: 'trunk' });
   });
 
   it('snapshots and reports the exact unified Codex selection for every enabled runtime role', async () => {
@@ -133,6 +153,31 @@ describe('repo-required guard (empty-repo footgun)', () => {
     const queued = await api.queueTask(token, draft.id);
     expect(queued.num).toBe(1);
     expect(queued.params.draft).toBe(false);
+    expect((started[0]![1] as any).workflowIdReusePolicy).toBe(WorkflowIdReusePolicy.REJECT_DUPLICATE);
+  });
+
+  it('repairs a stale draft when Temporal already accepted its workflow', async () => {
+    const p = store.createProject('LostAcknowledgement', { repos: ['/some/repo'] });
+    const draft = await api.createTask(token, {
+      projectId: p.id,
+      workflow: 'software-dev',
+      prompt: 'x',
+      draft: true,
+    });
+
+    // This is what a retry sees when the earlier start reached Temporal but its
+    // acknowledgement did not reach Karmax: durable execution exists, metadata
+    // still says draft.
+    startError = new WorkflowExecutionAlreadyStartedError(
+      'Workflow execution already started',
+      draft.id,
+      'softwareDev@1.0.0',
+    );
+    const queued = await api.queueTask(token, draft.id);
+
+    expect(queued.num).toBe(1);
+    expect(queued.params.draft).toBe(false);
+    expect(store.getTask(draft.id)).toMatchObject({ num: 1, params: { draft: false } });
   });
 
   // The scratch-sandbox incident: the guard and the world builder read different

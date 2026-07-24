@@ -137,7 +137,11 @@ function persistTokenWhenPrinted(child: ChildProcess, home: string): void {
     if (m) {
       written = true;
       try {
-        fs.writeFileSync(path.join(home, KARMAX_TOKEN_FILE), JSON.stringify({ token: m[1] }));
+        // Owner-only: this file holds a plaintext provider credential. The
+        // chmod also covers rotation, where the file already exists.
+        const file = path.join(home, KARMAX_TOKEN_FILE);
+        fs.writeFileSync(file, JSON.stringify({ token: m[1] }), { mode: 0o600 });
+        fs.chmodSync(file, 0o600);
       } catch {
         /* home vanished — ignore */
       }

@@ -28,7 +28,7 @@ function ensureQuietRuntime() {
 
 export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, opts: WorkerOpts = {}): Promise<WorkerHandle> {
   ensureQuietRuntime();
-  const connection = await NativeConnection.connect({ address: conn.address });
+  const connection = await NativeConnection.connect({ address: conn.address, apiKey: conn.apiKey, tls: conn.tls });
   // Resource caps. The Worker's reusable-VM cache and task-execution pools
   // default to sizes that scale with CPU cores; on a multi-core box several of
   // these (one per test file, plus the dev server) can exhaust RAM. These caps

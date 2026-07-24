@@ -1,4 +1,4 @@
-import { WorkflowNotFoundError, type Client } from '@temporalio/client';
+import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
@@ -17,7 +17,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -29,9 +29,18 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { paths } from '../config/paths.js';
 import { defaultProvider } from '../agent/adapters.js';
+import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiPage, moveWikiPage, collectDefaultPages, isDefaultDelivered, searchWiki, suggestWiki, safeWikiPath, parseFrontmatter, renderWikiToc, resolveBuiltins, BUILTIN_WIKI_ENTRIES } from '../wiki/wiki.js';
+import { commitProjectWiki, ensureProjectWikiRepository, projectWikiBranches, projectWikiBranchView, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver } from '../agent/profiles.js';
 import type { AuthorizationService } from './authorization.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { confirmLayersOf } from '../domain/confirm.js';
+import type { KarmaxBus } from '../contrib/bus.js';
+import type { WorldRegistry } from '../world/registry.js';
+import type { WorldHandle } from '../world/types.js';
+import { worldRepos } from '../world/types.js';
+import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, type GitBrokerAuth } from '../world/git-broker.js';
+import type { WorldAccessService } from '../world/access.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -52,6 +61,29 @@ export interface TriggerArmer {
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
 const agentSnapshotKey = (taskId: string) => `task-agents:${taskId}`;
+const wikiFiles = (root: string): string[] => {
+  const out: string[] = [];
+  const walk = (rel: string) => {
+    for (const entry of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
+      if (entry.name === '.git') continue;
+      const file = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(file);
+      else out.push(file);
+    }
+  };
+  walk('');
+  return out;
+};
+
+function principalRefOf(principal: string, kind?: 'agent' | 'human' | 'system'): PrincipalRef | undefined {
+  if (principal.startsWith('user:')) return { kind: 'user', userId: principal.slice(5) };
+  const taskAgent = principal.match(/^task-agent:([^:]+):(.+)$/);
+  if (taskAgent) return { kind: 'task-agent', taskId: taskAgent[1]!, role: taskAgent[2]! };
+  // Older callers used the bare user id as the token principal. Token kind is
+  // authoritative here; retain that human provenance so @creator remains a
+  // useful route for migrated installations and API clients.
+  return kind === 'human' ? { kind: 'user', userId: principal } : undefined;
+}
 
 /** Deepest cause message — unwraps Temporal's WorkflowUpdateFailedError → the
  *  validator's ApplicationFailure so the user sees the real "why". */
@@ -107,6 +139,18 @@ export interface KarmaxApiDeps {
   authorization?: AuthorizationService;
   /** Provider selected by the host/harness; avoids re-detecting ambient creds. */
   defaultAgentProvider?: Provider;
+  /** Enforce hosted control-plane invariants without consulting mutable ambient env. */
+  hosted?: boolean;
+  /** Organization-scoped cloud provider credentials. Kept optional for the
+   * small unit-test API harnesses; production always supplies it. */
+  providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  /** World access for permission-checked collaboration tools. */
+  worlds?: WorldRegistry;
+  worldAccess?: WorldAccessService;
+  githubApp?: import('../integrations/github-app.js').GitHubAppService;
+  /** Wake live gateway subscribers when platform-side actions append events. The
+   * durable event table remains the source of truth when this is absent. */
+  bus?: KarmaxBus;
 }
 
 /**
@@ -124,7 +168,159 @@ export class KarmaxApi {
     this.armer = armer;
   }
 
-  private require(token: string, tool: string, scope?: { projectId?: string; taskId?: string }) {
+  private collaborationTask(token: string, tool: 'publish_task_branch' | 'import_task_branch' | 'refresh_upstream') {
+    const caller = this.require(token, tool);
+    if (!caller.taskId || caller.taskId === '*') throw new CapabilityError(`${tool} requires a task-agent token`);
+    const task = this.deps.store.getTask(caller.taskId);
+    if (!task) throw new Error('calling task not found');
+    const project = this.deps.store.getProject(task.projectId);
+    if (!project?.organizationId) throw new Error('calling task project is unavailable');
+    const handle = (this.deps.store.currentWorld(task.id) ?? task.lastView?.world) as WorldHandle | undefined;
+    if (!handle) throw new Error('calling task has no recoverable world');
+    return { task, project, handle };
+  }
+
+  private gitBrokerAuth(projectId: string): GitBrokerAuth {
+    if (!this.deps.githubApp) throw new Error('Git collaboration requires a connected GitHub App');
+    const linked = this.deps.store.listProjectRepositories(projectId);
+    const wiki = this.deps.store.projectWiki(projectId)?.repository;
+    return async (repo) => {
+      const repository = linked.find((candidate) => candidate.repository.sshUrl === repo.repo)?.repository
+        ?? (wiki?.sshUrl === repo.repo ? wiki : undefined);
+      if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
+      return this.deps.githubApp!.brokerCredentials(repository);
+    };
+  }
+
+  private async openCollaborationWorld(taskId: string, handle: WorldHandle) {
+    if (this.deps.worldAccess) return this.deps.worldAccess.open(taskId, handle);
+    if (!this.deps.worlds) throw new Error('world access is unavailable');
+    return { world: await this.deps.worlds.open(handle), handle, release: async () => {} };
+  }
+
+  async publishTaskBranch(token: string): Promise<{ branch: string; pushed: string[] }> {
+    const { task, handle } = this.collaborationTask(token, 'publish_task_branch');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      for (const repo of worldRepos(access.world.handle)) {
+        const dirty = await access.world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+        if (dirty.code !== 0) throw new Error(`could not inspect ${repo.name}: ${dirty.stderr || dirty.stdout}`);
+        if (dirty.stdout.trim()) throw new Error(`repo "${repo.name}" has uncommitted changes; commit them before publishing`);
+      }
+      const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId));
+      if (!result.pushed.length || result.skipped.length)
+        throw new Error(`could not publish ${result.skipped.length ? result.skipped.join(', ') : 'task branch'}`);
+      const event = { taskId: task.id, type: 'push.branch', ts: Date.now(), payload: {
+        branch: access.handle.branch, repos: result.pushed, reason: 'agent-collaboration' } };
+      const seq = this.deps.store.appendEvent(event);
+      this.deps.bus?.emit({ ...event, seq });
+      return { branch: access.handle.branch, pushed: result.pushed };
+    } finally { await access.release(); }
+  }
+
+  async importTaskBranch(token: string, sourceTaskId: string) {
+    const { task, handle } = this.collaborationTask(token, 'import_task_branch');
+    const source = this.deps.store.getTask(sourceTaskId);
+    if (!source || source.projectId !== task.projectId) throw new Error('source task must belong to the same project');
+    const sourceHandle = (this.deps.store.currentWorld(sourceTaskId) ?? source.lastView?.world) as WorldHandle | undefined;
+    if (!sourceHandle) throw new Error('source task has no published world branch');
+    const published = this.deps.store.eventsSince(sourceTaskId, 0).some((event) => event.type === 'push.branch'
+      && (event.payload as { branch?: string } | undefined)?.branch === sourceHandle.branch);
+    if (!published) throw new Error('source branch is not published yet; message its agent and ask it to commit and call publish_task_branch');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      const refs = await brokerImportTaskBranch(access.world, sourceHandle, sourceTaskId,
+        this.gitBrokerAuth(task.projectId));
+      return { sourceTaskId, refs };
+    } finally { await access.release(); }
+  }
+
+  async refreshUpstream(token: string, branch?: string) {
+    const { task, handle } = this.collaborationTask(token, 'refresh_upstream');
+    const access = await this.openCollaborationWorld(task.id, handle);
+    try {
+      return { refs: await brokerRefreshUpstream(access.world, this.gitBrokerAuth(task.projectId), branch) };
+    } finally { await access.release(); }
+  }
+
+  listWorldProviderConnections(token: string, organizationId: string) {
+    this.require(token, 'organization:read', { organizationId });
+    return this.deps.providerConnections?.list(organizationId) ?? [];
+  }
+
+  saveWorldProviderConnection(token: string, input: {
+    organizationId: string;
+    provider: string;
+    apiKey?: string;
+    name?: string;
+    config?: import('../domain/types.js').WorldProviderConnection['config'];
+    enabled?: boolean;
+  }) {
+    this.require(token, 'organization:edit', { organizationId: input.organizationId });
+    if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
+    return this.deps.providerConnections.save(input);
+  }
+
+  async testWorldProviderConnection(token: string, organizationId: string, provider: string) {
+    this.require(token, 'organization:edit', { organizationId });
+    if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
+    return this.deps.providerConnections.test(organizationId, provider);
+  }
+
+  deleteWorldProviderConnection(token: string, organizationId: string, provider: string) {
+    this.require(token, 'organization:edit', { organizationId });
+    if (!this.deps.providerConnections) throw new Error('world provider connections are unavailable');
+    const active = this.deps.store.organizationResources(organizationId).worlds
+      .filter((handle) => (handle.provider ?? handle.kind) === provider);
+    if (active.length) throw new Error(`${active.length} task world(s) still use ${provider}; finish or delete them first`);
+    return { deleted: Boolean(this.deps.providerConnections.delete(organizationId, provider)) };
+  }
+
+  getExecutionPolicy(token: string, input: { organizationId: string; projectId?: string }) {
+    if (!input.projectId) {
+      this.require(token, 'organization:read', { organizationId: input.organizationId });
+      return { organization: this.deps.store.getOrganizationExecutionPolicy(input.organizationId) };
+    }
+    const project = this.deps.store.getProject(input.projectId);
+    if (!project || project.organizationId !== input.organizationId) throw new Error('project does not belong to this organization');
+    this.require(token, 'project:settings:read', { organizationId: input.organizationId, projectId: project.id });
+    return {
+      organization: this.deps.store.getOrganizationExecutionPolicy(input.organizationId),
+      override: executionConfigOf(project.config),
+      effective: executionConfigOf(this.deps.store.effectiveProjectConfig(project)),
+    };
+  }
+
+  setExecutionPolicy(token: string, input: { organizationId: string; projectId?: string;
+    policy: Partial<OrganizationExecutionPolicy> & Record<string, unknown> }) {
+    const project = input.projectId ? this.deps.store.getProject(input.projectId) : undefined;
+    if (input.projectId && (!project || project.organizationId !== input.organizationId))
+      throw new Error('project does not belong to this organization');
+    this.require(token, project ? 'project:settings:write' : 'organization:edit',
+      { organizationId: input.organizationId, ...(project ? { projectId: project.id } : {}) });
+    // Null means "inherit" for project overrides. At organization scope it
+    // means "restore the built-in default", so never persist null policy values.
+    const policy = project ? input.policy
+      : Object.fromEntries(Object.entries(input.policy).map(([key, value]) => [key, value == null ? undefined : value]));
+    const candidate = project
+      ? this.deps.store.effectiveProjectConfig({ ...project, config: applyExecutionConfig(project.config, policy) })
+      : policy;
+    const provider = typeof candidate.worldProvider === 'string' ? candidate.worldProvider : undefined;
+    if (provider && !['worktree', 'container', 'memory'].includes(provider)
+      && !this.deps.providerConnections?.available(input.organizationId, provider))
+      throw new Error(`${provider} is not connected and verified`);
+    const runnerPoolId = typeof candidate.runnerPoolId === 'string' ? candidate.runnerPoolId : undefined;
+    if (runnerPoolId) {
+      const pool = this.deps.store.getRunnerPool(runnerPoolId);
+      if (!pool || pool.organizationId !== input.organizationId) throw new Error('runner pool does not belong to this organization');
+      if (provider && pool.provider !== provider) throw new Error('runner pool provider must match the execution provider');
+    }
+    if (project) this.deps.store.setProjectExecutionPolicy(project.id, policy);
+    else this.deps.store.setOrganizationExecutionPolicy(input.organizationId, policy as OrganizationExecutionPolicy);
+    return this.getExecutionPolicy(token, input);
+  }
+
+  private require(token: string, tool: string, scope?: { projectId?: string; taskId?: string; organizationId?: string }) {
     const cap = TOOL_CAPABILITY[tool] ?? tool;
     const r = this.deps.tokens.check(token, cap, scope);
     if (!r.ok) throw new CapabilityError(r.reason ?? `denied: ${cap}`);
@@ -142,6 +338,18 @@ export class KarmaxApi {
   private assertRepoConfigured(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
     const needsRepo = (manifest.params ?? []).some((p) => p.name === 'repos');
     if (!needsRepo) return; // scratch-only workflow (declares no repo) — fine.
+    if (this.deps.hosted) {
+      const linked = this.deps.store.listProjectRepositories(project.id);
+      if (!linked.length) {
+        throw new Error(
+          `Workflow "${manifest.name}" works on a repository, but hosted project "${project.name}" has no attached ` +
+            `GitHub repository. Connect the organization GitHub App and attach a repository to this project before running the task.`,
+        );
+      }
+      const enrolled = new Set(linked.map((candidate) => candidate.repository.sshUrl));
+      const outside = effectiveRepos(resolved, project.config).filter((repository) => !enrolled.has(repository));
+      if (outside.length) throw new Error(`Hosted project "${project.name}" references a repository that is not attached to it: ${outside[0]}`);
+    }
     // Guard on the EFFECTIVE repo list the world will be built from (the resolved
     // settings overlay, falling back to project config) — the same value that
     // reaches createWorld — not project.config alone. Those two can diverge (an
@@ -166,6 +374,8 @@ export class KarmaxApi {
       prompt?: string;
       /** Images attached to the initial prompt (references, never inline bytes). */
       images?: ImageRef[];
+      /** Wiki context to inline, as `@proj:…`/`@org:…` tokens (see TaskParams.wikiContext). */
+      wikiContext?: string[];
       workflow?: string;
       base?: string;
       target?: string;
@@ -185,6 +395,9 @@ export class KarmaxApi {
       authorizationProfile?: string;
       /** Total mutually-exclusive attempts to create and queue up front. */
       attempts?: number;
+      assignee?: PrincipalRef;
+      delegate?: PrincipalRef;
+      confirmationPolicy?: ConfirmationPolicy;
     },
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'create_task', { projectId: args.projectId });
@@ -208,6 +421,9 @@ export class KarmaxApi {
     // Image attachments ride alongside the prompt but aren't a manifest param, so
     // carry them explicitly (references only — bytes live in the attachment store).
     if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
+    // Wiki context (which pages to inline) isn't a manifest param either; a
+    // top-level arg (MCP/API) is folded in like the form sends it via `params`.
+    if (args.wikiContext && taskOverrides.wikiContext === undefined) taskOverrides.wikiContext = args.wikiContext;
     const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
     // Refuse to *run* a repo-oriented workflow whose effective repo list is empty
     // (drafts may still be saved without one, then checked again at queueTask).
@@ -215,6 +431,17 @@ export class KarmaxApi {
     if (!args.draft) this.assertRepoConfigured(manifest, project, resolved);
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
+    const callerRef = principalRefOf(caller.principal, caller.kind);
+    // A legacy unscoped human token may predate organization membership. Do not
+    // persist it as an organization principal (which would also auto-subscribe
+    // an outsider); claimed/current installations always retain the creator.
+    const createdBy = callerRef?.kind === 'user'
+      && !this.deps.store.organizationMembership(project.organizationId ?? 'org_personal', callerRef.userId)
+      ? undefined : callerRef;
+    // Human routing belongs to each workflow confirm layer. Keep accepting the
+    // old task-level policy only for API/backward compatibility; the UI never
+    // creates one and new workflows publish their current audience with the wait.
+    const confirmationPolicy = args.confirmationPolicy;
     // A repeatable "series" (Model A) — forced on by a cron/recurring trigger.
     const repeatable = !!taskOverrides.repeatable || forcesRepeatable(normalizeTriggers(taskOverrides));
     // Persist only the task's OWN overrides (sparse), not the resolved snapshot.
@@ -239,7 +466,15 @@ export class KarmaxApi {
         const field = manifest.params.find((f) => f.type === 'confirmer');
         return field ? resolved[field.name] : undefined;
       })(),
+      createdBy,
+      assignee: args.assignee,
+      delegate: args.delegate,
+      confirmationPolicy,
     });
+    if (!args.draft) {
+      try { this.assertHumanRoutes(task, manifest, resolved); }
+      catch (error) { this.deps.store.deleteTask(task.id); throw error; }
+    }
     // Cosmetic human notes live in a dedicated column, never in `params`, so they
     // are structurally incapable of reaching the agent (SPEC §10). Persist them the
     // same way whether the task is queued now or saved as a draft.
@@ -263,7 +498,8 @@ export class KarmaxApi {
       for (let n = 1; n < attemptCount; n++) {
         const alt = this.deps.store.createTask({ projectId: task.projectId, listId: task.listId, title: task.title,
           workflow: task.workflow, workflowVersion: task.workflowVersion, params: { ...copied, draft: true, archived: false },
-          parentTaskId: task.parentTaskId, intentId: task.intentId });
+          parentTaskId: task.parentTaskId, intentId: task.intentId, createdBy: task.createdBy,
+          assignee: task.assignee, delegate: task.delegate, confirmationPolicy: task.confirmationPolicy });
         if (task.notes) this.deps.store.setTaskNotes(alt.id, task.notes);
         createdAlternates.push(alt);
       }
@@ -317,7 +553,7 @@ export class KarmaxApi {
       taskId: task.id,
       projectId: args.projectId,
       title,
-      project: project.config,
+      project: this.deps.store.effectiveProjectConfig(project),
     });
     input.createdAt = task.createdAt;
     input.workflow = workflow;
@@ -364,11 +600,11 @@ export class KarmaxApi {
   private async resolveTaskParams(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, quick = false): Promise<ValueMap> {
     const getSettings = (s: string, w: string) => this.deps.store.getSettings(s, w);
     const projectVals = projectSettingsFor(getSettings, project, manifest.name);
-    const globalVals = globalSettingsFor(getSettings, manifest.name);
+    const globalVals = globalSettingsFor(getSettings, manifest.name, project.organizationId);
     // Quick tasks layer the quick-task defaults (project-quick → global-quick) above
     // the general defaults; a full-form task skips them entirely (SPEC §10.4).
     const layers: (ValueMap | undefined)[] = quick
-      ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name), projectVals, globalVals]
+      ? [taskOverrides, quickProjectSettingsFor(getSettings, project.id, manifest.name), quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
     this.materializeUnifiedAgents(resolved, project.id);
@@ -387,6 +623,17 @@ export class KarmaxApi {
       }
     }
     return resolved;
+  }
+
+  /** Resolve one full-form field without materializing agents or probing repository
+   * defaults. Used by sparse reset handling, where only the inherited value matters. */
+  private resolveTaskField(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, field: string): unknown {
+    const getSettings = (scope: string, workflow: string) => this.deps.store.getSettings(scope, workflow);
+    return resolveParamsLayers(manifest, [
+      taskOverrides,
+      projectSettingsFor(getSettings, project, manifest.name),
+      globalSettingsFor(getSettings, manifest.name, project.organizationId),
+    ])[field];
   }
 
   /** Turn the compact Agent setting into concrete per-role input. Profile defaults
@@ -532,13 +779,14 @@ export class KarmaxApi {
     const group = this.deps.store.attemptGroup(task.id);
     const confirmerField = manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField && group?.confirmer !== undefined) resolved[confirmerField.name] = group.confirmer;
+    this.assertHumanRoutes(task, manifest, resolved);
     // Same guard as createTask, on the resolved effective repos, before we clear the draft.
     this.assertRepoConfigured(manifest, project, resolved);
     const input = assembleTaskInput(manifest, resolved, {
       taskId: task.id,
       projectId: task.projectId,
       title: task.title,
-      project: project.config,
+      project: this.deps.store.effectiveProjectConfig(project),
     });
     input.createdAt = task.createdAt;
     input.workflow = task.workflow;
@@ -551,6 +799,27 @@ export class KarmaxApi {
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     return { startType, input, version: manifest.version };
+  }
+
+  private assertHumanRoutes(task: TaskRecord, manifest: WorkflowManifest, resolved: ValueMap): void {
+    const field = manifest.params.find((candidate) => candidate.type === 'confirmer');
+    if (!field) return;
+    const value = resolved[field.name];
+    if (!value || typeof value !== 'object') return;
+    for (const layer of confirmLayersOf(value as import('../domain/types.js').ConfirmConfig)) {
+      if (layer.kind !== 'human') continue;
+      const audience = layer.audience?.length ? layer.audience : ['@creator'];
+      if (!this.deps.store.humanAudience(task.id, audience).length) {
+        const project = this.deps.store.getProject(task.projectId);
+        // A pre-collaboration/local database can contain historical tasks before
+        // its personal organization is claimed. Do not make those tasks
+        // unrecoverable; once an organization has people, every route must
+        // resolve before new work can run.
+        if (project?.organizationId
+          && this.deps.store.listOrganizationMemberships(project.organizationId).length === 0) continue;
+        throw new Error(`Review route ${audience.join(', ')} does not resolve to a human in this organization`);
+      }
+    }
   }
 
   /**
@@ -604,15 +873,28 @@ export class KarmaxApi {
     // remain stable when already-numbered work is queued again.
     try {
       await withTimeout(
-        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
+        this.deps.client.workflow.start(startType, {
+          taskQueue: this.deps.taskQueue,
+          workflowId: task.id,
+          // Queueing is idempotent. In particular, never create a second run if
+          // the first one finished before a lost start acknowledgement is retried.
+          workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,
+          args: [input],
+        }),
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      this.deps.store.restoreDraft(taskId, !hadNumber);
-      throw new Error(
-        `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
-          `It's still saved as a draft — check that Temporal is healthy and try again.`,
-      );
+      // A start acknowledgement can be lost after Temporal durably accepted the
+      // workflow. The retry then reports "already started"; that is proof of
+      // acceptance for this task's unique workflow ID, not a queue failure.
+      // Keep the task queued and repair the stale draft metadata.
+      if (!(e instanceof WorkflowExecutionAlreadyStartedError)) {
+        this.deps.store.restoreDraft(taskId, !hadNumber);
+        throw new Error(
+          `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
+            `It's still saved as a draft — check that Temporal is healthy and try again.`,
+        );
+      }
     }
     const started = this.resolveStart(task.workflow, task.workflowVersion);
     if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
@@ -645,7 +927,7 @@ export class KarmaxApi {
    * each trigger fire of a repeatable series, and by "Run again".
    */
   async spawnRun(token: string, seriesId: string): Promise<TaskRecord> {
-    this.require(token, 'create_task');
+    const caller = this.require(token, 'create_task');
     const series = this.deps.store.getTask(seriesId);
     if (!series) throw new Error(`no task ${seriesId}`);
     const run = this.deps.store.createTask({
@@ -656,6 +938,10 @@ export class KarmaxApi {
       workflowVersion: series.workflowVersion,
       params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId },
       parentTaskId: series.parentTaskId,
+      createdBy: principalRefOf(caller.principal) ?? series.createdBy,
+      assignee: series.assignee,
+      delegate: series.delegate,
+      confirmationPolicy: series.confirmationPolicy,
     });
     const { startType, input } = await this.buildStart(run);
     try {
@@ -746,14 +1032,30 @@ export class KarmaxApi {
     this.require(token, 'edit_task');
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
-    const { profiles, _authorization } = task.params;
+    const { archived, profiles, priority, _authorization } = task.params;
     const meta = {
+      ...(archived !== undefined ? { archived } : {}),
       ...(profiles !== undefined ? { profiles } : {}),
+      ...(priority !== undefined ? { priority } : {}),
       ...(_authorization !== undefined ? { _authorization } : {}),
     };
-    const confirmerField = this.resolveStart(task.workflow, task.workflowVersion)?.manifest.params.find((f) => f.type === 'confirmer');
-    if (confirmerField && Object.prototype.hasOwnProperty.call(params, confirmerField.name)) {
-      this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, params[confirmerField.name]);
+    const start = this.resolveStart(task.workflow, task.workflowVersion);
+    const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
+    if (confirmerField) {
+      let confirmer = Object.prototype.hasOwnProperty.call(params, confirmerField.name)
+        ? params[confirmerField.name]
+        : undefined;
+      // Full-form replacement is sparse: a field reset to its inherited default
+      // is intentionally omitted. The logical task also owns an effective confirmer
+      // snapshot shared by all attempts, so refresh that snapshot from the current
+      // defaults instead of leaving a previously autosaved partial value behind.
+      if (confirmer === undefined && opts.replace && start) {
+        const project = this.deps.store.getProject(task.projectId);
+        if (project) confirmer = this.resolveTaskField(start.manifest, project, params as ValueMap, confirmerField.name);
+      }
+      if (confirmer !== undefined) {
+        this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, confirmer);
+      }
     }
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     // Authorization is platform metadata, never a workflow-form field.
@@ -862,7 +1164,7 @@ export class KarmaxApi {
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks', { projectId });
-    return this.deps.store.listPrincipalTasks(projectId);
+    return this.deps.store.listTasks(projectId);
   }
 
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
@@ -887,6 +1189,10 @@ export class KarmaxApi {
       params: { ...workflowParams, draft: true, archived: false },
       parentTaskId: source.parentTaskId,
       intentId: group.intentId,
+      createdBy: source.createdBy,
+      assignee: source.assignee,
+      delegate: source.delegate,
+      confirmationPolicy: source.confirmationPolicy,
     });
     if (source.notes) this.deps.store.setTaskNotes(attempt.id, source.notes);
     if (source.tags?.length) this.deps.store.setTaskTags(attempt.id, source.tags);
@@ -969,11 +1275,12 @@ export class KarmaxApi {
    * `TaskQuery`. Returns the filtered+sorted list, optional groups, and total.
    */
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
-    this.require(token, 'search_tasks', { projectId });
+    const caller = this.require(token, 'search_tasks', { projectId });
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
-    const tasks = this.deps.store.listPrincipalTasks(projectId);
+    const tasks = this.deps.store.listTasks(projectId);
     const tags = this.deps.store.listTags(projectId);
-    return evaluateQuery(tasks, q, { now, tags });
+    const principal = principalRefOf(caller.principal);
+    return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });
   }
 
   /** The searchable-field registry the UI reads to build its filter/sort/group menus. */
@@ -1160,6 +1467,7 @@ export class KarmaxApi {
       START_TIMEOUT_MS,
     );
     this.deps.store.setTaskWorkflowVersion(taskId, version);
+    this.deps.store.setTaskExecutionWorkflow(taskId, task.workflow);
     const started = this.resolveStart(task.workflow, version);
     if (started) this.saveAgentSnapshot(taskId, started.manifest, input);
     // Close the short acceptance→first-publish window so the UI cannot offer a
@@ -1176,12 +1484,31 @@ export class KarmaxApi {
     });
   }
 
-  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<void> {
+  async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
-    this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
+    const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
+    if (signal === SIG.confirm && scopedTask?.lastView?.waitingFor?.kind === 'human') {
+      const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
+      if (!userId) throw new CapabilityError('only a human selected by this workflow step can confirm');
+      if (!this.deps.store.humanMayAct(taskId, userId))
+        throw new CapabilityError('this workflow confirmation step is assigned to someone else');
+      this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
+        payload: { userId, audience: scopedTask.lastView.waitingFor.audience ?? ['@creator'], satisfied: true } });
+    } else if (signal === SIG.confirm && scopedTask?.confirmationPolicy) {
+      const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
+      if (!userId) throw new CapabilityError('only an explicitly targeted human can satisfy this confirmation policy');
+      const vote = this.deps.store.voteConfirmation(taskId, userId);
+      if (!vote.authorized) throw new CapabilityError('you are not a reviewer for this task');
+      this.deps.store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
+        payload: { userId, votes: vote.votes, required: vote.required, satisfied: vote.satisfied } });
+      if (!vote.satisfied) return;
+    }
     const terminal = this.deps.store.getTask(taskId)?.lastView;
     if (terminal?.status === 'failed' && terminal.workflow === 'software-dev' && !terminal.pointOfNoReturnPassed) {
-      if (signal === SIG.retry) return await this.recoverFailedTask(taskId);
+      if (signal === SIG.retry) {
+        await this.recoverFailedTask(taskId);
+        return;
+      }
       if (signal === SIG.followUp) {
         const now = Date.now();
         const msg: Message = { id: `u${now}`, role: 'user', text: text ?? '', ts: now, ...(images?.length ? { images } : {}) };
@@ -1190,7 +1517,8 @@ export class KarmaxApi {
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
         (target ?? messages).push(msg);
         this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() });
-        return;
+        this.publishConversationMessage(taskId, role, msg);
+        return msg;
       }
       if (signal === SIG.cancel) {
         this.deps.store.saveView(taskId, {
@@ -1205,10 +1533,11 @@ export class KarmaxApi {
       }
     }
     const handle = this.deps.client.workflow.getHandle(taskId);
+    let followUp: Message | undefined;
     try {
       if (signal === SIG.followUp) {
         const now = Date.now();
-        const msg: Message = {
+        followUp = {
           id: `u${now}`,
           role: 'user',
           text: text ?? '',
@@ -1217,7 +1546,12 @@ export class KarmaxApi {
         };
         // `role` (the addressed agent) is optional — single-agent workflows ignore it
         // and route every follow-up to their sole conversation.
-        await handle.signal(SIG.followUp, msg, role);
+        await handle.signal(SIG.followUp, followUp, role);
+        // A signal mutates workflow memory immediately, but workflows deliberately
+        // publish their full cached view only at lifecycle boundaries. Journal the
+        // accepted message separately so every open conversation can render it
+        // mid-turn without changing replay-sensitive workflow command histories.
+        this.publishConversationMessage(taskId, role, followUp);
       } else {
         await handle.signal(signal);
       }
@@ -1246,6 +1580,18 @@ export class KarmaxApi {
       }
       throw e;
     }
+    return followUp;
+  }
+
+  private publishConversationMessage(taskId: string, role: string | undefined, message: Message): void {
+    const event = {
+      taskId,
+      type: 'conversation.message',
+      ts: message.ts,
+      payload: { role: role ?? 'do', message },
+    };
+    const seq = this.deps.store.appendEvent(event);
+    this.deps.bus?.emit({ ...event, seq });
   }
 
   async setTarget(token: string, taskId: string, branch: string): Promise<boolean> {
@@ -1271,6 +1617,33 @@ export class KarmaxApi {
     try {
       const result = (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
       this.updateAgentSnapshot(taskId, patch, result.applied);
+      return result;
+    } catch (e) {
+      throw new Error(unwrapCause(e));
+    }
+  }
+
+  /**
+   * Change the policy of a compatible running workflow without replacing its
+   * Temporal execution. The workflow update is authoritative and validates the
+   * lifecycle window; only after it accepts do we change the searchable record.
+   */
+  async changeWorkflow(
+    token: string,
+    taskId: string,
+    workflow: string,
+  ): Promise<{ workflow: 'software-dev' | 'goal' }> {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    if (!task) throw new Error(`no task ${taskId}`);
+    if (workflow !== 'software-dev' && workflow !== 'goal') {
+      throw new Error('only Software Dev and Goal are compatible in-flight');
+    }
+    try {
+      const result = (await this.deps.client.workflow
+        .getHandle(taskId)
+        .executeUpdate('changeWorkflow', { args: [workflow] })) as { workflow: 'software-dev' | 'goal' };
+      this.deps.store.setTaskWorkflow(taskId, result.workflow);
       return result;
     } catch (e) {
       throw new Error(unwrapCause(e));
@@ -1364,6 +1737,321 @@ export class KarmaxApi {
     return { path: file };
   }
 
+  // ── Wiki (org/project skills, memories, prompts — SPEC §4.4 content) ──────
+  // Reads need the scope's read capability; writes reuse skill:write (the wiki
+  // IS the skills store). All paths are traversal-checked inside src/wiki.
+
+  /** Resolve + authorize one wiki scope. Project wikis default to the caller
+   * task's checkout; humans may explicitly select another task or branch. */
+  private wikiScope(
+    token: string,
+    scope: string,
+    id: string,
+    write: boolean,
+    selector: { taskId?: string; branch?: string } = {},
+  ): { root: string; branch?: string; taskId?: string; writable: boolean; principal: string } {
+    if (scope !== 'organization' && scope !== 'project') throw new Error('wiki scope must be organization or project');
+    let caller;
+    if (scope === 'project') {
+      const project = this.deps.store.getProject(id);
+      if (!project) throw new Error(`no project ${id}`);
+      caller = this.require(token, write ? 'skill:write' : 'project:read', { projectId: id, organizationId: project.organizationId });
+      const canonical = ensureProjectWikiRepository(this.deps.contentDir ?? paths().content, id);
+      const requestedTask = selector.taskId ?? (caller.taskId && caller.taskId !== '*' ? caller.taskId : undefined);
+      if (requestedTask) {
+        const task = this.deps.store.getTask(requestedTask);
+        if ((!task || task.projectId !== id) && selector.taskId) throw new Error('wiki task must belong to this project');
+        const handle = task
+          ? (this.deps.store.currentWorld(requestedTask) ?? task.lastView?.world) as WorldHandle | undefined
+          : undefined;
+        const repo = handle ? worldRepos(handle).find((candidate) => candidate.role === 'project-wiki') : undefined;
+        if (repo && fs.existsSync(repo.root))
+          return { root: repo.root, branch: repo.branch, taskId: requestedTask, writable: true, principal: caller.principal };
+        const branch = handle?.branch;
+        if (branch && projectWikiBranches(canonical).includes(branch))
+          return { root: projectWikiBranchView(this.deps.contentDir ?? paths().content, id, branch),
+            branch, taskId: requestedTask, writable: false, principal: caller.principal };
+        if (selector.taskId) throw new Error('that task has no available project-wiki checkout');
+      }
+      if (selector.branch && selector.branch !== PROJECT_WIKI_BRANCH) {
+        if (write) throw new Error('select a task world to edit a non-default wiki branch');
+        return { root: projectWikiBranchView(this.deps.contentDir ?? paths().content, id, selector.branch),
+          branch: selector.branch, writable: false, principal: caller.principal };
+      }
+      return { root: canonical, branch: PROJECT_WIKI_BRANCH, writable: true, principal: caller.principal };
+    } else {
+      caller = this.require(token, write ? 'skill:write' : 'organization:read', { organizationId: id });
+      return { root: wikiRoot(this.deps.contentDir ?? paths().content, scope, id), writable: true, principal: caller.principal };
+    }
+  }
+
+  /** One navigation call: a skill path returns the page; anything else lists
+   *  the (sub)tree — the same call expands a TOC `[more…]` fold. The full tree
+   *  also carries the `default`-labelled entries' bodies (inlined into every
+   *  task) and `tocText`, the exact rendered table of contents agents receive
+   *  (importance order, [more…] folds). The organization tree includes the
+   *  built-ins, resolved through their on-disk overrides when edited. */
+  readWiki(token: string, scope: WikiScope, id: string, rel = '', selector: { taskId?: string; branch?: string } = {}) {
+    const view = this.wikiScope(token, scope, id, false, selector);
+    const root = view.root;
+    const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
+    const builtins = scope === 'organization' ? resolveBuiltins(root) : [];
+    const builtin = builtins.find((b) => b.path === safeWikiPath(rel));
+    if (builtin) return { scope, id, path: builtin.path, page: builtin, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
+    const page = rel ? readWikiPage(root, rel) : undefined;
+    if (page) return { scope, id, path: page.path, page, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
+    const toc = listWiki(root, rel);
+    if (rel) return { scope, id, path: safeWikiPath(rel), toc, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
+    // `default` entries are inlined into every task's prompt (built-ins first).
+    const unconditional = [
+      ...builtins
+        .filter(isDefaultDelivered)
+        .map((b) => ({ ...entryOf(b), body: parseFrontmatter(b.content).body.trim() || b.content })),
+      ...collectDefaultPages(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
+    ];
+    toc.children = [...builtins.map(entryOf), ...(toc.children ?? [])];
+    // The TOC lists every entry except the `default` ones inlined above (shown
+    // in full as their own cards) — the same rendering agents get.
+    const exclude = new Set(unconditional.map((u) => u.path));
+    const tocText = renderWikiToc(toc, { scope, id, exclude });
+    return { scope, id, path: '', toc, unconditional, tocText, view: { branch: view.branch, taskId: view.taskId, writable: view.writable } };
+  }
+
+  /** Rank pages, labels, and folders of one scope against a typed query — what
+   *  the task-form `@proj:…`/`@org:…` mention dropdown searches. */
+  suggestWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
+    const root = this.wikiScope(token, scope, id, false, selector).root;
+    return { scope, id, query, suggestions: suggestWiki(root, query) };
+  }
+
+  /** Create (`create` guards against overwriting), update, or — via `prevPath`
+   *  — rename an entry. `kind` picks SKILL.md vs MEMORY.md at creation only. */
+  saveWikiPage(
+    token: string,
+    scope: WikiScope,
+    id: string,
+    args: { path: string; content: string; kind?: 'skill' | 'memory'; create?: boolean; prevPath?: string },
+    selector: { taskId?: string; branch?: string } = {},
+  ) {
+    const view = this.wikiScope(token, scope, id, true, selector);
+    const root = view.root;
+    const previousPath = args.prevPath ? safeWikiPath(args.prevPath) : undefined;
+    const nextPath = safeWikiPath(args.path);
+    if (scope === 'organization') {
+      const baselinePath = previousPath ?? nextPath;
+      const existing = readWikiPage(root, baselinePath)
+        ?? resolveBuiltins(root).find((entry) => entry.path === baselinePath);
+      if (existing && !(args.create && !previousPath))
+        this.deps.store.recordOrganizationWikiVersion({
+          organizationId: id,
+          path: baselinePath,
+          operation: 'baseline',
+          kind: existing.kind,
+          content: existing.content,
+          principal: view.principal,
+          ifEmpty: true,
+        });
+    }
+    if (previousPath && previousPath !== nextPath) moveWikiPage(root, previousPath, nextPath);
+    const page = writeWikiPage(root, args.path, args.content, args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
+    if (scope === 'project') commitProjectWiki(root, `wiki: update ${page.path}`);
+    else this.deps.store.recordOrganizationWikiVersion({ organizationId: id, path: page.path,
+      operation: previousPath && previousPath !== nextPath ? 'move' : 'write', kind: page.kind,
+      content: page.content, principal: view.principal,
+      previousPath: previousPath && previousPath !== nextPath ? previousPath : undefined });
+    return page;
+  }
+
+  deleteWikiPage(token: string, scope: WikiScope, id: string, rel: string, selector: { taskId?: string; branch?: string } = {}) {
+    const view = this.wikiScope(token, scope, id, true, selector);
+    const root = view.root;
+    const safe = safeWikiPath(rel);
+    const existing = readWikiPage(root, safe);
+    if (scope === 'organization' && existing)
+      this.deps.store.recordOrganizationWikiVersion({
+        organizationId: id,
+        path: safe,
+        operation: 'baseline',
+        kind: existing.kind,
+        content: existing.content,
+        principal: view.principal,
+        ifEmpty: true,
+      });
+    const deleted = deleteWikiPage(root, rel);
+    if (deleted && scope === 'project') commitProjectWiki(root, `wiki: delete ${safeWikiPath(rel)}`);
+    if (deleted && scope === 'organization') this.deps.store.recordOrganizationWikiVersion({
+      organizationId: id, path: safe, operation: 'delete', kind: existing?.kind,
+      content: existing?.content, principal: view.principal,
+    });
+    return { deleted };
+  }
+
+  searchWiki(token: string, scope: WikiScope, id: string, query: string, selector: { taskId?: string; branch?: string } = {}) {
+    const root = this.wikiScope(token, scope, id, false, selector).root;
+    return { scope, id, query, hits: searchWiki(root, query) };
+  }
+
+  wikiViews(token: string, projectId: string) {
+    const view = this.wikiScope(token, 'project', projectId, false);
+    const branches = projectWikiBranches(view.root);
+    const tasks = this.deps.store.listTasks(projectId).flatMap((task) => {
+      const handle = (this.deps.store.currentWorld(task.id) ?? task.lastView?.world) as WorldHandle | undefined;
+      if (!handle || !worldRepos(handle).some((repo) => repo.role === 'project-wiki') && !branches.includes(handle.branch)) return [];
+      return [{ id: task.id, num: task.num, title: task.title, branch: handle.branch,
+        status: task.lastView?.status ?? (task.params.draft ? 'draft' : 'queued') }];
+    });
+    return { defaultBranch: PROJECT_WIKI_BRANCH, branches, tasks };
+  }
+
+  organizationWikiHistory(token: string, organizationId: string, rel?: string) {
+    this.wikiScope(token, 'organization', organizationId, false);
+    return { versions: this.deps.store.organizationWikiHistory(organizationId, rel ? safeWikiPath(rel) : undefined) };
+  }
+
+  /** Provider-aware variants used at the HTTP/MCP edge. Local worlds stay on
+   * the fast synchronous path; remote worlds are snapshotted through the World
+   * interface so the same wiki operations see their live branch. */
+  async readWikiResolved(token: string, scope: WikiScope, id: string, rel = '',
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
+    if (!remote) return this.readWiki(token, scope, id, rel, selector);
+    try {
+      return this.readWikiFromRoot(scope, id, rel, remote.root, {
+        branch: remote.repo.branch, taskId: remote.taskId, writable: true,
+      });
+    } finally { await remote.release(); }
+  }
+
+  async searchWikiResolved(token: string, scope: WikiScope, id: string, query: string,
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
+    if (!remote) return this.searchWiki(token, scope, id, query, selector);
+    try { return { scope, id, query, hits: searchWiki(remote.root, query) }; }
+    finally { await remote.release(); }
+  }
+
+  async suggestWikiResolved(token: string, scope: WikiScope, id: string, query: string,
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, false, selector) : undefined;
+    if (!remote) return this.suggestWiki(token, scope, id, query, selector);
+    try { return { scope, id, query, suggestions: suggestWiki(remote.root, query) }; }
+    finally { await remote.release(); }
+  }
+
+  async saveWikiPageResolved(token: string, scope: WikiScope, id: string,
+    args: { path: string; content: string; kind?: 'skill' | 'memory'; create?: boolean; prevPath?: string },
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
+    if (!remote) return this.saveWikiPage(token, scope, id, args, selector);
+    try {
+      if (args.prevPath && safeWikiPath(args.prevPath) !== safeWikiPath(args.path))
+        moveWikiPage(remote.root, args.prevPath, args.path);
+      const page = writeWikiPage(remote.root, args.path, args.content,
+        args.kind === 'memory' ? 'memory' : 'skill', { create: args.create });
+      await remote.flush(`wiki: update ${page.path}`);
+      return page;
+    } finally { await remote.release(); }
+  }
+
+  async deleteWikiPageResolved(token: string, scope: WikiScope, id: string, rel: string,
+    selector: { taskId?: string; branch?: string } = {}) {
+    const remote = scope === 'project' ? await this.remoteWikiSnapshot(token, id, true, selector) : undefined;
+    if (!remote) return this.deleteWikiPage(token, scope, id, rel, selector);
+    try {
+      const deleted = deleteWikiPage(remote.root, rel);
+      if (deleted) await remote.flush(`wiki: delete ${safeWikiPath(rel)}`);
+      return { deleted };
+    } finally { await remote.release(); }
+  }
+
+  private readWikiFromRoot(scope: WikiScope, id: string, rel: string, root: string,
+    view: { branch?: string; taskId?: string; writable: boolean }) {
+    const entryOf = ({ content: _c, files: _f, ...entry }: (typeof BUILTIN_WIKI_ENTRIES)[number]) => entry;
+    const builtins = scope === 'organization' ? resolveBuiltins(root) : [];
+    const builtin = builtins.find((b) => b.path === safeWikiPath(rel));
+    if (builtin) return { scope, id, path: builtin.path, page: builtin, view };
+    const page = rel ? readWikiPage(root, rel) : undefined;
+    if (page) return { scope, id, path: page.path, page, view };
+    const toc = listWiki(root, rel);
+    if (rel) return { scope, id, path: safeWikiPath(rel), toc, view };
+    const unconditional = [
+      ...builtins.filter(isDefaultDelivered)
+        .map((b) => ({ ...entryOf(b), body: parseFrontmatter(b.content).body.trim() || b.content })),
+      ...collectDefaultPages(root, toc).map(({ files: _files, content: _content, ...rest }) => rest),
+    ];
+    toc.children = [...builtins.map(entryOf), ...(toc.children ?? [])];
+    const exclude = new Set(unconditional.map((u) => u.path));
+    return { scope, id, path: '', toc, unconditional,
+      tocText: renderWikiToc(toc, { scope, id, exclude }), view };
+  }
+
+  private async remoteWikiSnapshot(token: string, projectId: string, write: boolean,
+    selector: { taskId?: string; branch?: string }) {
+    const project = this.deps.store.getProject(projectId);
+    if (!project) throw new Error(`no project ${projectId}`);
+    const caller = this.require(token, write ? 'skill:write' : 'project:read',
+      { projectId, organizationId: project.organizationId });
+    const taskId = selector.taskId ?? (caller.taskId && caller.taskId !== '*' ? caller.taskId : undefined);
+    if (!taskId || selector.branch) return undefined;
+    const task = this.deps.store.getTask(taskId);
+    if (!task || task.projectId !== projectId) {
+      if (selector.taskId) throw new Error('wiki task must belong to this project');
+      return undefined;
+    }
+    const handle = (this.deps.store.currentWorld(taskId) ?? task.lastView?.world) as WorldHandle | undefined;
+    const repo = handle ? worldRepos(handle).find((candidate) => candidate.role === 'project-wiki') : undefined;
+    if (!handle || !repo || fs.existsSync(repo.root)) return undefined;
+    const access = await this.openCollaborationWorld(taskId, handle);
+    const prefix = path.posix.relative(handle.root.replace(/\\/g, '/'), repo.root.replace(/\\/g, '/'));
+    if (prefix.startsWith('..')) {
+      await access.release();
+      throw new Error('project wiki is outside the task world');
+    }
+    const contentDir = this.deps.contentDir ?? paths().content;
+    fs.mkdirSync(contentDir, { recursive: true });
+    const root = fs.mkdtempSync(path.join(contentDir, '.wiki-snapshot-'));
+    try {
+      const all = await access.world.listFiles();
+      const inside = all.filter((file) => !prefix || file === prefix || file.startsWith(`${prefix}/`));
+      const relative = (file: string) => prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
+      for (const file of inside) {
+        const rel = relative(file);
+        if (!rel || rel.startsWith('.git/')) continue;
+        const target = path.join(root, rel);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, await access.world.readFileBuffer(file));
+      }
+      const before = new Set(inside.map(relative).filter(Boolean));
+      return {
+        root, repo, taskId,
+        flush: async (message: string) => {
+          const after = wikiFiles(root);
+          for (const old of before) if (!after.includes(old))
+            await access.world.exec('rm', ['-rf', path.posix.join(repo.root, old)]);
+          for (const rel of after) {
+            const destination = prefix ? path.posix.join(prefix, rel) : rel;
+            const value = fs.readFileSync(path.join(root, rel));
+            if (access.world.writeFileBuffer) await access.world.writeFileBuffer(destination, value);
+            else await access.world.writeFile(destination, value.toString('utf8'));
+          }
+          const added = await access.world.exec('git', ['add', '-A'], { cwd: repo.root });
+          if (added.code !== 0) throw new Error(added.stderr || added.stdout);
+          const committed = await access.world.exec('git', ['commit', '-q', '-m', message], { cwd: repo.root });
+          if (committed.code !== 0 && !/nothing to commit/i.test(`${committed.stdout}${committed.stderr}`))
+            throw new Error(committed.stderr || committed.stdout);
+        },
+        release: async () => {
+          fs.rmSync(root, { recursive: true, force: true });
+          await access.release();
+        },
+      };
+    } catch (error) {
+      fs.rmSync(root, { recursive: true, force: true });
+      await access.release();
+      throw error;
+    }
+  }
+
   /** Propose a workflow-repo edit through the dogfooded merge-only PR gate (§4.4). */
   async proposeWorkflowEdit(
     token: string,
@@ -1388,6 +2076,7 @@ export class KarmaxApi {
         prompt: args.title, branch: args.branch, target: args.target, repo: args.repo, workflowEdit: true,
         _authorization: { ...authorization, principal: caller.principal },
       },
+      createdBy: principalRefOf(caller.principal),
     });
     const input = {
       taskId: task.id,
@@ -1397,7 +2086,7 @@ export class KarmaxApi {
       prompt: args.title,
       branch: args.branch,
       target: args.target,
-      project: { ...project.config, repos: [args.repo] },
+      project: { ...this.deps.store.effectiveProjectConfig(project), repos: [args.repo] },
       workflowEdit: true,
       grant: authorization.capabilities,
       grantPrincipal: caller.principal,
@@ -1439,7 +2128,7 @@ export class KarmaxApi {
   workflowSchemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
     const taskSchemas = this.deps.workflows
       ? this.deps.workflows.schemas()
-      : MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
+      : MANIFESTS.filter((m) => m.kind !== 'coordinator' && m.selectable !== false).map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
     const settingsOnly = MANIFESTS
       .filter((m) => m.kind === 'coordinator' && m.params.length)
       .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
@@ -1464,4 +2153,18 @@ export class KarmaxApi {
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
     return this.deps.workflows.install(args);
   }
+}
+
+const EXECUTION_POLICY_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
+function executionConfigOf(config: import('../domain/types.js').ProjectConfig): Partial<OrganizationExecutionPolicy> {
+  return Object.fromEntries(EXECUTION_POLICY_KEYS.filter((key) => config[key] !== undefined).map((key) => [key, config[key]]));
+}
+function applyExecutionConfig(config: import('../domain/types.js').ProjectConfig, patch: Record<string, unknown>) {
+  const next: Record<string, unknown> = { ...config };
+  for (const key of EXECUTION_POLICY_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    if (patch[key] == null) delete next[key];
+    else next[key] = patch[key];
+  }
+  return next as import('../domain/types.js').ProjectConfig;
 }

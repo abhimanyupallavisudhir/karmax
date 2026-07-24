@@ -10,8 +10,8 @@ import {
   SIG_CANCEL_ACCOUNT,
   SIG_RETURN_ACCOUNT,
   SIG_REGISTER_ACCOUNTS,
-  SIG_REPORT_EXHAUSTED,
-  SIG_SET_ACCOUNT_AVAILABILITY,
+  UPD_REPORT_EXHAUSTED,
+  UPD_SET_ACCOUNT_AVAILABILITY,
   QRY_QUEUE,
   QRY_ACCOUNTS,
   mergeQueueId,
@@ -147,25 +147,19 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
     async reportAccountExhausted(args: { accountId: string; window: LimitWindow; resetHint?: string; note?: string }): Promise<{ resetAt: number }> {
       const { resetAtFromHint } = await import('../agent/limits.js');
       const resetAt = resetAtFromHint(args.resetHint, args.window, Date.now());
-      try {
-        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_REPORT_EXHAUSTED, {
+      await client.workflow.getHandle(accountCoordinatorId()).executeUpdate(UPD_REPORT_EXHAUSTED, {
+        args: [{
           accountId: args.accountId,
           window: args.window,
           resetAt,
           ...(args.note ? { note: args.note } : {}),
-        });
-      } catch {
-        /* coordinator gone — nothing to update */
-      }
+        }],
+      });
       return { resetAt };
     },
     /** Manual availability override (UI/MCP): force a login on/off, edit its reset. */
     async setAccountAvailability(args: { accountId: string; status: AccountStatus; resetAt?: number }): Promise<void> {
-      try {
-        await client.workflow.getHandle(accountCoordinatorId()).signal(SIG_SET_ACCOUNT_AVAILABILITY, args);
-      } catch {
-        /* coordinator gone */
-      }
+      await client.workflow.getHandle(accountCoordinatorId()).executeUpdate(UPD_SET_ACCOUNT_AVAILABILITY, { args: [args] });
     },
     /** Full account availability view for the dashboard (empty if not running). */
     async accountsView(): Promise<{ accounts: unknown[]; waiting: number }> {

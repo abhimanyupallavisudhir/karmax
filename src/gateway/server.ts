@@ -2,10 +2,11 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { WebSocketServer } from 'ws';
+import { fileURLToPath } from 'node:url';
+import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
+import type { TaskView } from '../domain/types.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -21,7 +22,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { Provider, ProjectConfig } from '../domain/types.js';
+import { AgentSpec, Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -31,6 +32,18 @@ import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabili
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
+import { WorldRegistry } from '../world/registry.js';
+import { worldHandleForView } from '../world/resolve.js';
+import type { ObjectStore } from '../store/objects.js';
+import { newId } from '../util/id.js';
+import { DurableEventFanout } from './fanout.js';
+import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
+  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
+import type { RemoteAccessController } from '../remote/access.js';
+import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
+import { paths } from '../config/paths.js';
+import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
+import { worldWorkingRelativePath } from '../world/types.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -52,19 +65,52 @@ export interface GatewayDeps {
   version?: string;
   identity?: IdentityService;
   authorization?: AuthorizationService;
+  worlds: WorldRegistry;
+  githubApp?: import('../integrations/github-app.js').GitHubAppService;
+  providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  handoffs?: import('../world/handoff.js').WorldHandoffService;
+  runners?: import('../world/runners.js').RunnerPoolService;
+  worldAccess?: import('../world/access.js').WorldAccessService;
+  objects?: ObjectStore;
+  cellId?: string;
+  hosted?: boolean;
+  remoteAccess?: RemoteAccessController;
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
- * again for task operations; this layer covers the direct administrative routes. */
-function capabilityForRequest(method: string, p: string, url?: URL): string | undefined {
+ * again for task operations; this layer covers the direct administrative routes.
+ * Returns the required capability, `'none'` for routes that intentionally need
+ * no capability, or undefined for a route this catalog does not know — callers
+ * apply the conservative fallback, and tests assert the catalog stays complete. */
+export function routeCapability(method: string, p: string, url?: URL): string | undefined {
   const read = method === 'GET';
-  if (p === '/api/meta' || p === '/api/session') return undefined;
+  if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   if (p === '/api/platform') return 'workflow:read';
-  if (p === '/api/logout') return undefined;
+  if (p === '/api/logout') return 'none';
   if (p === '/api/dashboard') return 'diagnostic:read';
+  if (p === '/api/remote-access') return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
+  if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
+  if (p === '/api/invitations/accept') return 'none';
+  if (p.startsWith('/api/inbox')) return read ? 'inbox:read' : 'inbox:write';
+  if (p === '/api/organizations') return read ? 'organization:read' : 'organization:create';
+  if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
+  if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url|refresh)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
+  if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
+  // The wiki is the skills store: reads need the scope's read capability, edits
+  // reuse skill:write (agents and developers can both grow it).
+  if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
+  if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
+  if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
   if (p === '/api/authorization/profiles' && read) return 'task:create';
   if (p.startsWith('/api/authorization') || p.startsWith('/api/audit')) return read ? 'authorization:read' : 'authorization:write';
   if (p.startsWith('/api/accounts') || p.startsWith('/api/git-profiles')) return read ? 'credential:read' : 'credential:write';
@@ -87,23 +133,36 @@ function capabilityForRequest(method: string, p: string, url?: URL): string | un
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
+  if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/(tags|views)\//.test(p)) return read ? 'task:read' : 'task:edit';
-  if (/^\/api\/projects\/[^/]+\/activate-workflow$/.test(p)) return 'workflow:install';
   if (/^\/api\/projects\/[^/]+\/workflow-pins$/.test(p)) return read ? 'workflow:read' : 'workflow:edit';
   if (/^\/api\/projects\/[^/]+\/propose-workflow-edit$/.test(p)) return 'workflow:edit';
   if (/\/events$/.test(p) || p === '/api/activity') return 'task:event:read';
   if (/\/(sessions|agents|conversation)$/.test(p)) return 'task:conversation:read';
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
+  if (p === '/api/agent/git/publish') return 'task:git:publish';
+  if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
   if (/\/file$/.test(p)) return 'task:conversation:read';
-  if (/\/review-action/.test(p) || /\/artifact$/.test(p)) return 'task:review:execute';
+  if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
+  if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
+  if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/signal$/.test(p)) return 'task:signal';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
   if (p === '/api/skills') return 'skill:write';
-  return read ? 'project:read' : 'settings:write';
+  return undefined;
+}
+
+function capabilityForRequest(method: string, p: string, url?: URL): string | undefined {
+  const explicit = routeCapability(method, p, url);
+  if (explicit) return explicit === 'none' ? undefined : explicit;
+  // Uncataloged routes fail toward broad-read / admin-write rather than open.
+  return method === 'GET' ? 'project:read' : 'settings:write';
 }
 
 function requestHeaders(headers: Record<string, string | string[] | undefined>): Headers {
@@ -115,16 +174,116 @@ function requestHeaders(headers: Record<string, string | string[] | undefined>):
   return out;
 }
 
+function principalFromBody(value: unknown): PrincipalRef {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('principal is required');
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind === 'user' && typeof candidate.userId === 'string' && candidate.userId) return { kind: 'user', userId: candidate.userId };
+  if (candidate.kind === 'team' && typeof candidate.teamId === 'string' && candidate.teamId) return { kind: 'team', teamId: candidate.teamId };
+  if (candidate.kind === 'task-agent' && typeof candidate.taskId === 'string' && typeof candidate.role === 'string' && candidate.taskId && candidate.role)
+    return { kind: 'task-agent', taskId: candidate.taskId, role: candidate.role };
+  throw new Error('invalid principal reference');
+}
+
+function projectPrincipalFromBody(value: unknown, organizationId: string): ProjectPrincipalRef {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const candidate = value as Record<string, unknown>;
+    if (candidate.kind === 'organization' && candidate.organizationId === organizationId)
+      return { kind: 'organization', organizationId };
+  }
+  return principalFromBody(value);
+}
+
+function isWorldHandle(value: unknown): value is Record<string, unknown> & { kind: string; id: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.kind === 'string' && candidate.kind.length > 0
+    && typeof candidate.id === 'string'
+    && typeof candidate.root === 'string'
+    && typeof candidate.branch === 'string'
+    && typeof candidate.base === 'string';
+}
+
+function worldHandleIsRemote(handle: { kind: string; provider?: unknown }): boolean {
+  const provider = typeof handle.provider === 'string' ? handle.provider : handle.kind;
+  return !['worktree', 'container', 'memory'].includes(provider);
+}
+
+function isTaskView(value: Record<string, unknown>): boolean {
+  return typeof value.taskId === 'string'
+    && typeof value.workflow === 'string'
+    && typeof value.stage === 'string'
+    && typeof value.status === 'string'
+    && Array.isArray(value.actions)
+    && !!value.state
+    && typeof value.state === 'object';
+}
+
+// SPA path for an organization's settings page (/<org>/settings). Falls back to
+// the pre-organization /settings alias, which the client still resolves, when the
+// org (or its slug) is unknown.
+function organizationSettingsPath(store: Store, organizationId: string): string {
+  const slug = store.getOrganization(organizationId)?.slug;
+  return slug ? `/${slug}/settings` : '/settings';
+}
+
+/**
+ * Build the public wire projection of gateway data. Provider handles are
+ * capabilities: even though they contain no API key, exposing sandbox ids,
+ * repository locations, or recovery metadata creates an unnecessary second
+ * interface to the execution plane. Clients get only availability + provider;
+ * every operation remains an authenticated gateway request scoped to a task.
+ */
+export function toPublicPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(toPublicPayload);
+  if (!value || typeof value !== 'object' || Buffer.isBuffer(value)) return value;
+  if (isWorldHandle(value)) return { kind: value.kind };
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return value;
+
+  const input = value as Record<string, unknown>;
+  const taskView = isTaskView(input);
+  const state = input.state && typeof input.state === 'object' && !Array.isArray(input.state)
+    ? input.state as Record<string, unknown>
+    : undefined;
+  const handle = isWorldHandle(input.world)
+    ? input.world
+    : isWorldHandle(state?.recoveryWorld) ? state.recoveryWorld : undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(input)) {
+    if (key === 'recoveryWorld' && isWorldHandle(item)) continue;
+    if (taskView && key === 'world') continue;
+    if (taskView && key === 'worldPath' && handle && worldHandleIsRemote(handle)) continue;
+    out[key] = toPublicPayload(item);
+  }
+  if (taskView) {
+    out.worldAvailable = Boolean(handle || input.worldPath);
+    if (handle) {
+      out.worldProvider = handle.provider ?? handle.kind;
+      const handleMeta = handle.meta && typeof handle.meta === 'object'
+        ? handle.meta as Record<string, unknown>
+        : undefined;
+      if (handleMeta?.environmentFlavor === 'desktop') out.worldDesktop = true;
+    }
+  }
+  return out;
+}
+
 /** Conventional gateway port. If it's taken we walk upward (findFreePortFrom),
  *  so the UI URL stays stable across restarts. Override with KARMAX_PORT. */
 export const DEFAULT_GATEWAY_PORT = 4505;
 
 const USER_CAPS = ['*'];
+const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+const MAX_PREVIEW_REQUEST_BYTES = 16 * 1024 * 1024;
+const PREVIEW_REQUEST_HEADERS = new Set([
+  'accept', 'accept-language', 'content-type', 'if-match', 'if-modified-since',
+  'if-none-match', 'if-unmodified-since', 'range', 'user-agent',
+]);
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.cjs': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
   '.ts': 'text/plain; charset=utf-8',
@@ -140,6 +299,7 @@ const MIME: Record<string, string> = {
   '.yaml': 'text/plain; charset=utf-8',
   '.toml': 'text/plain; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
   '.ico': 'image/x-icon',
 };
 
@@ -166,21 +326,38 @@ interface Session {
   user: string;
   apiToken: string;
   userId?: string;
+  email?: string;
 }
 
 export class Gateway {
   private sessions = new Map<string, Session>();
+  private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   private server?: http.Server;
   private safeMode = process.env.KARMAX_SAFE_MODE === '1';
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
-  private reviewActions = new ReviewActionRunner();
+  private reviewActions: ReviewActionRunner;
   private attachments = new AttachmentStore();
   private modelCatalog?: { at: number; value: ModelCatalog };
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
+  private fanout: DurableEventFanout;
+  /** Remotes verified during this gateway process. Persisted links are retried
+   * once after every restart so interrupted first pushes self-heal. */
+  private wikiRemotesReady = new Set<string>();
 
-  constructor(private deps: GatewayDeps) {}
+  constructor(private deps: GatewayDeps) {
+    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess);
+    this.fanout = new DurableEventFanout(deps.store, deps.bus);
+  }
 
   private newSession(user = 'me'): { sid: string; session: Session } {
+    // Passwordless/password-only local mode predates Better Auth, but still uses
+    // the same tenant invariants as hosted mode. Materialize its stable local
+    // principal as owner of the migrated personal organization.
+    this.deps.store.claimPersonalOrganization(user, user === 'me' ? undefined : user);
+    for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
+      if (!this.deps.store.userIsProjectMember(project.id, user))
+        this.deps.store.setProjectMembership(project.id, { kind: 'user', userId: user }, 'owner');
+    }
     const sid = `s_${crypto.randomBytes(18).toString('hex')}`;
     const apiToken = this.deps.tokens.mintPrincipal(`user:${user}`, USER_CAPS).token;
     const session: Session = { user, apiToken };
@@ -188,8 +365,9 @@ export class Gateway {
     return { sid, session };
   }
 
-  async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; port: number; close: () => Promise<void> }> {
+  async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
+    const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
     const server = http.createServer((req, res) => this.handle(req, res).catch((e) => this.fail(res, e)));
     this.server = server;
 
@@ -199,11 +377,20 @@ export class Gateway {
     const wssEvents = new WebSocketServer({ noServer: true });
     const wssTerm = new WebSocketServer({ noServer: true });
     const wssAction = new WebSocketServer({ noServer: true });
+    const wssPreview = new WebSocketServer({ noServer: true });
     server.on('upgrade', (req, socket, head) => {
       const { pathname } = new URL(req.url ?? '/', 'http://localhost');
-      if (pathname === '/ws') wssEvents.handleUpgrade(req, socket, head, (ws) => wssEvents.emit('connection', ws, req));
+      const isolatedPreview = Boolean(configuredPreviewOrigin());
+      const onPreviewOrigin = isolatedPreview && this.requestIsPreviewOrigin(req);
+      if (onPreviewOrigin && pathname.startsWith('/preview/'))
+        wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
+      else if (onPreviewOrigin) socket.destroy();
+      else if (pathname === '/ws') wssEvents.handleUpgrade(req, socket, head, (ws) => wssEvents.emit('connection', ws, req));
       else if (pathname === '/ws/terminal') wssTerm.handleUpgrade(req, socket, head, (ws) => wssTerm.emit('connection', ws, req));
       else if (pathname === '/ws/review-action') wssAction.handleUpgrade(req, socket, head, (ws) => wssAction.emit('connection', ws, req));
+      else if ((!isolatedPreview && pathname.startsWith('/preview/')) ||
+        (!isolatedPreview && /^\/api\/tasks\/[^/]+\/preview\/\d+/.test(pathname)))
+        wssPreview.handleUpgrade(req, socket, head, (ws) => wssPreview.emit('connection', ws, req));
       else socket.destroy();
     });
     wssEvents.on('connection', async (ws, req) => {
@@ -211,14 +398,14 @@ export class Gateway {
       const auth = await this.socketAuth(req, url);
       if (!auth) { ws.close(4401, 'unauthorized'); return; }
       const scoped = this.deps.tokens.verify(auth.apiToken);
-      const off = this.deps.bus.onAny((ev) => {
+      const off = this.fanout.on((ev) => {
         const projectId = this.deps.store.getTask(ev.taskId)?.projectId;
         if (scoped?.projectId && projectId !== scoped.projectId) return;
         if (!this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId: ev.taskId } : undefined).ok) {
           const humanCaps = auth.userId && projectId ? this.deps.authorization?.capabilities(`user:${auth.userId}`, projectId) : [];
           if (!allows(humanCaps ?? [], 'task:event:read')) return;
         }
-        try { ws.send(JSON.stringify(ev)); } catch { /* ignore */ }
+        try { ws.send(JSON.stringify(toPublicPayload(ev))); } catch { /* ignore */ }
       });
       ws.on('close', off);
       ws.on('error', off);
@@ -228,11 +415,20 @@ export class Gateway {
       void this.terminal(ws, req).catch(() => { try { ws.close(); } catch {} });
     });
     wssAction.on('connection', (ws, req) => this.reviewActionStream(ws, req));
+    wssPreview.on('connection', (ws, req) => {
+      ws.on('error', () => {});
+      void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
+    });
 
+    // Deployment migration for projects that predate companion wiki repos.
+    // Complete this before binding the listener so scheduled/immediate task
+    // starts cannot race the backfill, and a local migration error cannot leave
+    // a half-started HTTP server behind.
+    for (const project of this.deps.store.listProjects()) await this.ensureProjectWiki(project);
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       server.once('error', onError);
-      server.listen(port, '127.0.0.1', () => {
+      server.listen(port, bindHost, () => {
         server.off('error', onError);
         // Keep an operational listener after the startup race; errors are exposed
         // by endpoint-specific handling instead of becoming uncaught events.
@@ -240,61 +436,86 @@ export class Gateway {
         resolve();
       });
     });
+    const internalUrl = `http://127.0.0.1:${port}`;
+    const directHost = bindHost === '0.0.0.0' || bindHost === '::' ? '127.0.0.1' : bindHost;
+    const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '') || `http://${directHost}:${port}`;
     return {
-      url: `http://127.0.0.1:${port}`,
+      url: publicUrl,
+      internalUrl,
       port,
       close: () =>
         new Promise<void>((resolve) => {
           this.reviewActions.stopAll();
+          this.fanout.close();
           // `WebSocketServer.close()` does not terminate existing upgraded
           // sockets, and `http.Server.close()` waits for them forever. A stale
           // browser/test connection therefore used to wedge shutdown and leave
           // the Temporal worker/runtime installed. Close clients explicitly,
           // then force any remaining HTTP keep-alive sockets to drain.
-          for (const wss of [wssEvents, wssTerm, wssAction]) {
+          for (const wss of [wssEvents, wssTerm, wssAction, wssPreview]) {
             for (const ws of wss.clients) ws.terminate();
           }
           wssEvents.close();
           wssTerm.close();
           wssAction.close();
+          wssPreview.close();
           server.close(() => resolve());
           server.closeAllConnections();
         }),
     };
   }
 
-  /** PTY check-in (SPEC §5.5): an ephemeral terminal in the task's on-disk world. */
+  /** PTY check-in (SPEC §5.5): an ephemeral provider-owned terminal in the task world. */
   private async terminal(ws: import('ws').WebSocket, req: http.IncomingMessage) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const taskId = url.searchParams.get('taskId') ?? '';
     const task = this.deps.store.getTask(taskId);
-    const auth = await this.socketAuth(req, url, task?.projectId);
+    const ticket = url.searchParams.get('ticket') ?? '';
+    const ticketRecord = ticket ? this.terminalTickets.get(ticket) : undefined;
+    if (ticketRecord) this.terminalTickets.delete(ticket); // one connection only
+    const auth = ticketRecord && ticketRecord.taskId === taskId && ticketRecord.expiresAt > Date.now()
+      ? ticketRecord.session
+      : await this.socketAuth(req, url, task?.projectId);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
     if (!this.deps.tokens.check(auth.apiToken, 'task:edit', { projectId: task?.projectId, taskId }).ok) {
       ws.close(4403, 'forbidden'); return;
     }
-    const cwd = task?.lastView?.worldPath;
-    if (!cwd) {
+    const projectRecord = task ? this.deps.store.getProject(task.projectId) : undefined;
+    const project = projectRecord ? this.deps.store.effectiveProjectConfig(projectRecord) : undefined;
+    const handle = worldHandleForView(task?.lastView, taskId, project);
+    if (!handle) {
       ws.send(JSON.stringify({ type: 'data', data: 'No world for this task yet.\r\n' }));
       ws.close();
       return;
     }
-    let pty: any;
+    if (!task || !projectRecord?.organizationId) { ws.close(4404, 'task project unavailable'); return; }
+    let term: import('../world/types.js').WorldPty;
+    let worldLeaseId: string | undefined;
+    const executionId = newId('execution');
     try {
-      pty = await import('node-pty');
-    } catch {
-      ws.send(JSON.stringify({ type: 'data', data: 'PTY unavailable (node-pty not installed).\r\n' }));
+      if (this.deps.worlds.get(handle.kind).capabilities?.remote && projectRecord && this.deps.runners) {
+        const lease = await this.deps.runners.acquire({ project: projectRecord, taskId, worldId: handle.id, provider: handle.kind });
+        worldLeaseId = lease.leaseId;
+      }
+      this.deps.store.createExecution({ id: executionId, organizationId: projectRecord.organizationId,
+        projectId: projectRecord.id, taskId, worldId: handle.id, generation: handle.generation ?? 1,
+        kind: 'terminal', label: 'Interactive terminal', command: '$SHELL', server: false,
+        openUrls: [], runnerLeaseId: worldLeaseId });
+      const world = await this.deps.worlds.open(handle);
+      term = await world.openPty({ cols: 80, rows: 24 });
+      this.deps.store.setExecutionRunning(executionId);
+      this.deps.store.appendExecutionFrame(executionId, 'Terminal opened.\n', 'system');
+    } catch (error) {
+      if (this.deps.store.execution(executionId)) {
+        this.deps.store.appendExecutionFrame(executionId, `${String((error as Error)?.message ?? error)}\n`, 'system');
+        this.deps.store.finishExecution(executionId, null, 'failed');
+      }
+      if (worldLeaseId && this.deps.worldAccess) await this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, worldLeaseId);
+      else if (worldLeaseId) this.deps.runners?.release(worldLeaseId, handle.kind);
+      ws.send(JSON.stringify({ type: 'data', data: `Terminal unavailable: ${String((error as Error)?.message ?? error)}\r\n` }));
       ws.close();
       return;
     }
-    // Use bash with a clean prompt for a predictable check-in terminal.
-    const term = pty.spawn('bash', ['--norc', '-i'], {
-      name: 'xterm-color',
-      cols: 80,
-      rows: 24,
-      cwd,
-      env: { ...process.env, PS1: 'karmax:\\W$ ' },
-    });
     // Task-manager registry: the PTY (and anything the user runs in it) shows up
     // in the dashboard Processes panel under its task, and can be killed there.
     const { trackProcess } = await import('../util/processes.js');
@@ -305,25 +526,40 @@ export class Gateway {
           label: 'task terminal (bash)',
           taskId,
           startedAt: Date.now(),
-          kill: () => { try { term.kill(); } catch { /* already gone */ } },
+          kill: () => { try { void term.close(); } catch { /* already gone */ } },
         })
       : () => {};
-    term.onData((d: string) => { try { ws.send(JSON.stringify({ type: 'data', data: d })); } catch {} });
-    term.onExit(() => { untrack(); try { ws.close(); } catch {} });
+    let finalized = false;
+    let clientClosed = false;
+    const heartbeat = setInterval(() => this.deps.store.heartbeatExecution(executionId), 30_000);
+    heartbeat.unref();
+    const finish = (code: number | null, cancelled = false) => {
+      if (finalized) return;
+      finalized = true;
+      clearInterval(heartbeat);
+      untrack();
+      this.deps.store.finishExecution(executionId, code, cancelled ? 'cancelled' : undefined);
+      if (worldLeaseId && this.deps.worldAccess) void this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, worldLeaseId);
+      else if (worldLeaseId) this.deps.runners?.release(worldLeaseId, handle.kind);
+    };
+    term.onData((d: string) => {
+      this.deps.store.appendExecutionFrame(executionId, d);
+      try { ws.send(JSON.stringify({ type: 'data', data: d })); } catch {}
+    });
+    term.onExit((code) => { finish(code, clientClosed); try { ws.close(); } catch {} });
     ws.on('message', (raw) => {
       let msg: any;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'input') term.write(msg.data);
       else if (msg.type === 'resize') term.resize(msg.cols || 80, msg.rows || 24);
     });
-    // Closing the socket (navigating away OR the user hitting "Kill terminal")
-    // tears the whole thing down — not just the shell, but every process it
-    // spawned. node-pty runs the shell as a session leader (its pid == the
-    // session id), so we kill the entire session: `pkill -s` reaps foreground
-    // AND background jobs, which a bare process-group kill would miss (bash job
-    // control puts each pipeline in its own group). The group kill + term.kill()
-    // are belt-and-suspenders fallbacks.
-    ws.on('close', () => killPtySession(term));
+    // The provider owns complete teardown (including descendants in a local PTY
+    // session, or the remote PTY lease in a cloud sandbox).
+    ws.on('close', () => {
+      clientClosed = true;
+      finish(null, true);
+      void term.close();
+    });
   }
 
   /** Stream a running review action's output to the UI. `procId` names a process
@@ -332,7 +568,7 @@ export class Gateway {
   private async reviewActionStream(ws: import('ws').WebSocket, req: http.IncomingMessage) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const procId = url.searchParams.get('procId') ?? '';
-    const rec = this.reviewActions.get(procId);
+    const rec = this.reviewActions.status(procId);
     if (!rec) {
       try { ws.send(JSON.stringify({ type: 'exit', code: -1, data: 'No such action process.\n' })); } catch {}
       ws.close();
@@ -363,6 +599,29 @@ export class Gateway {
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
+    const previewOrigin = configuredPreviewOrigin();
+    const onPreviewOrigin = Boolean(previewOrigin && this.requestIsPreviewOrigin(req));
+    // Repository applications are untrusted. In hosted mode they get an origin
+    // that exposes only opaque preview leases, never Karmax API/static routes or
+    // the reviewer's authenticated application cookies.
+    if (onPreviewOrigin && !p.startsWith('/preview/')) return this.json(res, 404, { error: 'not found' });
+    if (previewOrigin && !onPreviewOrigin && p.startsWith('/preview/')) {
+      const leaseId = p.match(/^\/preview\/([^/]+)/)?.[1];
+      if (!leaseId) return this.json(res, 404, { error: 'not found' });
+      res.writeHead(307, { location: `${previewLeaseOrigin(decodeURIComponent(leaseId))}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
+      return void res.end();
+    }
+    if (p.startsWith('/preview/')) return this.serveLeasedPreview(req, res, url);
+    // Caddy's on-demand TLS policy asks only for the exact opaque hostname of a
+    // live preview lease. This replaces manual wildcard certificates while
+    // preventing arbitrary public certificate issuance through the catch-all.
+    if (p === '/api/tls/preview-allow' && req.method === 'GET') {
+      const domain = (url.searchParams.get('domain') ?? '').trim().toLowerCase();
+      res.writeHead(this.deps.store.previewHostnameAllowed(domain) ? 204 : 403,
+        { 'cache-control': 'no-store', 'content-length': '0' });
+      return void res.end();
+    }
+    if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/api/')) return this.api(req, res, url);
     if (p === '/ws') return; // handled by ws
     return this.static(p, res);
@@ -376,20 +635,112 @@ export class Gateway {
     if (p === '/api/session' && method === 'GET') {
       if (this.deps.identity) {
         const current = await this.deps.identity.session(requestHeaders(req.headers));
-        if (current) return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user });
+        if (current) return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user,
+          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null });
         return this.json(res, 200, {
           authRequired: true,
           authenticated: false,
           setupRequired: !this.deps.identity.hasUsers(),
           signupAvailable: this.deps.identity.hasUsers(),
+          sso: this.deps.identity.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
         });
       }
+      // Legacy sessions are single-user by construction; minting one on a
+      // hosted multi-tenant cell would hand out owner access to a stranger.
+      if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
       const authRequired = !!this.deps.password;
       if (!authRequired) {
         const { sid } = this.newSession();
         return this.json(res, 200, { authRequired: false, token: sid, user: 'me' });
       }
       return this.json(res, 200, { authRequired: true });
+    }
+    if (p.startsWith('/api/auth/') && this.deps.identity) {
+      const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim();
+      const origin = process.env.KARMAX_PUBLIC_URL || `${forwardedProto || 'http'}://${req.headers.host || 'localhost'}`;
+      const body = method === 'GET' || method === 'HEAD' ? undefined : await this.rawBody(req, 2 * 1024 * 1024);
+      const response = await this.deps.identity.auth.handler(new Request(new URL(`${p}${url.search}`, origin), {
+        method, headers: requestHeaders(req.headers), ...(body ? { body } : {}),
+      }));
+      return this.sendWebResponse(res, response);
+    }
+    if (p === '/api/sso/start' && method === 'POST' && this.deps.identity) {
+      try {
+        const b = await this.body(req);
+        return this.sendWebResponse(res, await this.deps.identity.beginSso(String(b.callbackURL ?? '/'), requestHeaders(req.headers)));
+      } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
+    if (p === '/api/github/webhook' && method === 'POST' && this.deps.githubApp) {
+      try {
+        const raw = await this.rawBody(req, 2 * 1024 * 1024);
+        const result = await this.deps.githubApp.handleWebhook(
+          String(req.headers['x-github-event'] ?? ''), String(req.headers['x-github-delivery'] ?? ''), raw,
+          typeof req.headers['x-hub-signature-256'] === 'string' ? req.headers['x-hub-signature-256'] : undefined,
+        );
+        return this.json(res, 200, result);
+      } catch (error) {
+        return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
+    if (githubManifestCallback && method === 'GET' && this.deps.githubApp && this.deps.identity) {
+      const code = url.searchParams.get('code') ?? '';
+      // Query-form state remains accepted for setup links created by the prior
+      // release; new manifests use the validator-safe path form.
+      const state = githubManifestCallback[1] ? decodeURIComponent(githubManifestCallback[1]) : url.searchParams.get('state') ?? '';
+      const identity = await this.deps.identity.session(requestHeaders(req.headers));
+      if (!identity || !code || !state) return this.githubCallbackPage(res, 400, 'The GitHub App setup callback is incomplete.');
+      const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
+      if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub App setup link is invalid, expired, or belongs to another user.');
+      try {
+        await this.deps.githubApp.convertManifest(code);
+        const installState = this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id);
+        res.writeHead(303, { location: this.deps.githubApp.installationUrl(installState) });
+        return void res.end();
+      } catch (error) {
+        return this.githubCallbackPage(res, 502, `GitHub App setup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (p === '/api/github/oauth/callback' && method === 'GET' && this.deps.githubApp && this.deps.identity) {
+      const code = url.searchParams.get('code') ?? '';
+      const state = url.searchParams.get('state') ?? '';
+      const identity = await this.deps.identity.session(requestHeaders(req.headers));
+      if (!identity || !code || !state) return this.githubCallbackPage(res, 400, 'The GitHub authorization callback is incomplete.');
+      const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
+      if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub authorization link is invalid, expired, or belongs to another user.');
+      try {
+        await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req));
+        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
+          await this.ensureProjectWiki(project, identity.user.id);
+        res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
+        return void res.end();
+      } catch (error) {
+        return this.githubCallbackPage(res, 502, `GitHub authorization failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (p === '/api/github/callback' && method === 'GET' && this.deps.githubApp && this.deps.identity) {
+      const installationId = url.searchParams.get('installation_id') ?? '';
+      const state = url.searchParams.get('state') ?? '';
+      const identity = await this.deps.identity.session(requestHeaders(req.headers));
+      if (!identity || !installationId || !state) return this.githubCallbackPage(res, 400, 'The GitHub installation callback is incomplete.');
+      const pending = this.deps.store.consumeGithubInstallState(state, identity.user.id);
+      if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub installation link is invalid, expired, or belongs to another user.');
+      try {
+        await this.deps.githubApp.connectInstallation(pending.organizationId, installationId);
+        const status = this.deps.githubApp.status(identity.user.id);
+        if (status.oauthConfigured && !status.userAuthorized) {
+          const oauthState = this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id);
+          const publicUrl = this.githubPublicUrl(req);
+          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl) });
+          return void res.end();
+        }
+        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
+          await this.ensureProjectWiki(project, identity.user.id);
+        res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=connected&organizationId=${encodeURIComponent(pending.organizationId)}` });
+        return void res.end();
+      } catch (error) {
+        return this.githubCallbackPage(res, 502, `GitHub could not be connected: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     if (p === '/api/login' && method === 'POST') {
       const b = await this.body(req);
@@ -399,6 +750,7 @@ export class Gateway {
           return this.sendWebResponse(res, response);
         } catch { return this.json(res, 401, { error: 'invalid email or password' }); }
       }
+      if (this.deps.hosted) return this.json(res, 503, { error: 'hosted mode requires the identity service' });
       if (this.deps.password && b.password === this.deps.password) {
         const { sid } = this.newSession();
         return this.json(res, 200, { token: sid, user: 'me' });
@@ -414,6 +766,10 @@ export class Gateway {
           requestHeaders(req.headers),
         );
         this.deps.authorization?.bootstrapAdministrator(user.id);
+        this.deps.store.claimPersonalOrganization(user.id, user.name);
+        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === 'org_personal')) {
+          this.deps.store.setProjectMembership(project.id, { kind: 'user', userId: user.id }, 'owner');
+        }
         return this.sendWebResponse(res, response);
       } catch (e) { return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
     }
@@ -437,7 +793,21 @@ export class Gateway {
         version: this.deps.version ?? '1.0.0',
         safeMode: this.safeMode,
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
+        cellId: this.deps.cellId ?? 'local',
+        hosted: this.deps.hosted ?? false,
+        worldProviders: this.deps.worlds.catalog(),
+        sso: this.deps.identity?.oidcProviderId ? { providerId: this.deps.identity.oidcProviderId } : null,
       });
+    }
+    if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
+    if (p === '/api/health/ready' && method === 'GET') {
+      try {
+        this.deps.store.db.prepare('SELECT 1').get();
+        await withTimeout(this.deps.client.workflowService.getSystemInfo({}), 2_000);
+        return this.json(res, 200, { ok: true, database: 'ready', temporal: 'ready', ts: Date.now() });
+      } catch {
+        return this.json(res, 503, { ok: false, ts: Date.now() });
+      }
     }
 
     // Serve an image attachment. Auth via `?token=` (session id) because a plain
@@ -471,8 +841,15 @@ export class Gateway {
 
     // ── authenticated endpoints ──
     const requestedScope = this.requestScope(p, url);
-    const session = await this.auth(req, requestedScope.projectId);
-    if (!session) return this.json(res, 401, { error: 'unauthorized' });
+    const auditScope = requestedScope.projectId ? `project:${requestedScope.projectId}`
+      : requestedScope.organizationId ? `organization:${requestedScope.organizationId}` : 'global';
+    const session = await this.auth(req, requestedScope.projectId, requestedScope.organizationId);
+    if (!session) {
+      // Denials are audited too: cross-tenant probing must be visible to an
+      // administrator, not only successful requests.
+      this.deps.authorization?.audit('anonymous', 'http.denied.unauthenticated', auditScope, { path: p, method });
+      return this.json(res, 401, { error: 'unauthorized' });
+    }
     const token = session.apiToken;
     const { api, store } = this.deps;
 
@@ -487,10 +864,18 @@ export class Gateway {
       // exception.
       const collectionAllowed = !checked.ok && p === '/api/projects' && method === 'GET' && !!session.userId &&
         this.deps.store.listProjects().some((project) => allows(this.deps.authorization?.capabilities(`user:${session.userId}`, project.id) ?? [], required));
-      if (!checked.ok && !collectionAllowed) return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
-      if (checked.ok) authRecord = checked.record;
+      const organizationCollectionAllowed = !checked.ok && p === '/api/organizations' && !!session.userId && (
+        method === 'POST' || this.deps.store.listOrganizations(session.userId).some((organization) =>
+          allows(this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, organization.id) ?? [], required))
+      );
       const principal = checked.record?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
-      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, scope.projectId ? `project:${scope.projectId}` : 'global', { path: p });
+      if (!checked.ok && !collectionAllowed && !organizationCollectionAllowed) {
+        this.deps.authorization?.audit(principal, `http.denied.${required}`, auditScope,
+          { path: p, method, reason: checked.reason ?? `missing capability ${required}` });
+        return this.json(res, 403, { error: checked.reason ?? `missing capability ${required}` });
+      }
+      if (checked.ok) authRecord = checked.record;
+      this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, auditScope, { path: p });
     }
 
     try {
@@ -501,6 +886,406 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
+      if (p === '/api/remote-access' && method === 'GET') {
+        if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
+        return this.json(res, 200, await this.deps.remoteAccess.status());
+      }
+      if (p === '/api/remote-access' && method === 'POST') {
+        if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
+        const b = await this.body(req);
+        if (b.action === 'enable') return this.json(res, 200, await this.deps.remoteAccess.enable());
+        if (b.action === 'disable') return this.json(res, 200, await this.deps.remoteAccess.disable());
+        return this.json(res, 400, { error: 'action must be enable or disable' });
+      }
+
+      // Organization is the hosted tenant boundary. Collection discovery is
+      // filtered by membership; every nested request was minted an
+      // organization-scoped token above, so identifiers cannot cross tenants.
+      if (p === '/api/organizations' && method === 'GET') {
+        const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
+        return this.json(res, 200, canAuditAll ? store.listOrganizations() : store.listOrganizations(session.userId));
+      }
+      if (p === '/api/organizations' && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const b = await this.body(req);
+        let organization;
+        try {
+          organization = store.createOrganization({ name: String(b.name ?? 'My organization'),
+            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: session.userId });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        this.deps.authorization?.bootstrapOrganizationOwner(`user:${session.userId}`, session.userId, organization.id);
+        return this.json(res, 200, organization);
+      }
+      if (p === '/api/invitations/accept' && method === 'POST') {
+        if (!session.userId || !session.email) return this.json(res, 400, { error: 'a verified account is required' });
+        const b = await this.body(req);
+        const membership = store.acceptOrganizationInvitation(String(b.token ?? ''), session.userId, session.email);
+        this.deps.authorization?.grant(`user:${session.userId}`, {
+          principalId: `user:${session.userId}`, scopeKey: `organization:${membership.organizationId}`,
+          profileId: membership.profileId ?? 'developer',
+        });
+        return this.json(res, 200, membership);
+      }
+
+      const organizationMatch = p.match(/^\/api\/organizations\/([^/]+)$/);
+      if (organizationMatch && method === 'GET') return this.json(res, 200, store.getOrganization(organizationMatch[1]!) ?? null);
+      const organizationExecution = p.match(/^\/api\/organizations\/([^/]+)\/execution-policy$/);
+      if (organizationExecution) {
+        const organizationId = organizationExecution[1]!;
+        if (method === 'GET') return this.json(res, 200, store.getOrganizationExecutionPolicy(organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const policy = b.policy && typeof b.policy === 'object' ? b.policy : {};
+          try {
+            if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
+              && !this.deps.providerConnections?.available(organizationId, String(policy.worldProvider)))
+              throw new Error(`${policy.worldProvider} is not connected and verified`);
+            if (policy.runnerPoolId) {
+              const pool = store.getRunnerPool(String(policy.runnerPoolId));
+              if (!pool || pool.organizationId !== organizationId) throw new Error('runner pool does not belong to this organization');
+              if (policy.worldProvider && pool.provider !== policy.worldProvider) throw new Error('runner pool provider must match the default provider');
+            }
+            return this.json(res, 200, store.setOrganizationExecutionPolicy(organizationId, policy));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
+      const organizationExport = p.match(/^\/api\/organizations\/([^/]+)\/export$/);
+      if (organizationExport && method === 'GET') {
+        const value = store.exportOrganization(organizationExport[1]!);
+        res.setHeader('Content-Disposition', `attachment; filename="karmax-${organizationExport[1]!}-export.json"`);
+        return this.json(res, 200, value);
+      }
+      if (organizationMatch && method === 'DELETE') {
+        const organizationId = organizationMatch[1]!;
+        const organization = store.getOrganization(organizationId);
+        if (!organization) return this.json(res, 404, { error: 'organization not found' });
+        if (organization.kind === 'personal' || organization.id === 'org_personal')
+          return this.json(res, 400, { error: 'the installation personal organization cannot be deleted' });
+        const b = await this.body(req);
+        if (String(b.confirmSlug ?? '') !== organization.slug)
+          return this.json(res, 400, { error: `type the organization slug (${organization.slug}) to confirm deletion` });
+
+        // External resources go first. These operations are idempotent, so an
+        // outage never commits a deceptively successful partial deletion.
+        const resources = store.organizationResources(organizationId);
+        const projects = store.listProjects().filter((project) => project.organizationId === organizationId);
+        for (const project of projects) await this.removeProjectExternalResources(project.id, 'organization deleted');
+        await this.deps.githubApp?.disconnectOrganization(organizationId);
+        for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
+          this.deps.providerConnections?.delete(organizationId, connection.provider);
+        store.deleteOrganization(organizationId);
+        for (const attachmentId of resources.attachmentIds)
+          if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
+        return this.json(res, 200, { deleted: true, organizationId });
+      }
+      const identityPolicy = p.match(/^\/api\/organizations\/([^/]+)\/identity-policy$/);
+      if (identityPolicy) {
+        if (method === 'GET') return this.json(res, 200, store.getOrganizationIdentityPolicy(identityPolicy[1]!));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setOrganizationIdentityPolicy({ organizationId: identityPolicy[1]!,
+            oidcProviderId: b.oidcProviderId ? String(b.oidcProviderId) : undefined,
+            verifiedDomains: Array.isArray(b.verifiedDomains) ? b.verifiedDomains.map(String) : [], enforceSso: Boolean(b.enforceSso) }));
+        }
+      }
+      const scimToken = p.match(/^\/api\/organizations\/([^/]+)\/scim-token$/);
+      if (scimToken && method === 'POST') return this.json(res, 200, store.rotateScimToken(scimToken[1]!));
+      const organizationMembers = p.match(/^\/api\/organizations\/([^/]+)\/members$/);
+      if (organizationMembers) {
+        const organizationId = organizationMembers[1]!;
+        if (method === 'GET') {
+          const users = new Map((this.deps.identity?.listUsers() ?? []).map((user) => [user.id, user]));
+          return this.json(res, 200, store.listOrganizationMemberships(organizationId).map((membership) => {
+            const user = users.get(membership.userId);
+            const grant = this.deps.authorization?.grants(`user:${membership.userId}`).find((candidate) => candidate.scopeKey === `organization:${organizationId}`);
+            return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'administrator' : 'developer'),
+              protectedOwner: membership.role === 'owner', ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
+          }));
+        }
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const existing = store.organizationMembership(organizationId, String(b.userId));
+          const membership = store.setOrganizationMembership(organizationId, String(b.userId), existing?.role === 'owner' ? 'owner' : 'member');
+          const profileId = String(b.profileId ?? 'developer');
+          this.deps.authorization?.grant(`user:${session.userId}`, {
+            principalId: `user:${membership.userId}`, scopeKey: `organization:${organizationId}`,
+            profileId,
+          });
+          return this.json(res, 200, membership);
+        }
+      }
+      const organizationMember = p.match(/^\/api\/organizations\/([^/]+)\/members\/([^/]+)$/);
+      if (organizationMember && method === 'DELETE') {
+        store.deprovisionOrganizationUser(organizationMember[1]!, organizationMember[2]!);
+        this.deps.authorization?.revoke(`user:${session.userId}`, `user:${organizationMember[2]!}`, `organization:${organizationMember[1]!}`);
+        return this.json(res, 200, { ok: true });
+      }
+      const invitations = p.match(/^\/api\/organizations\/([^/]+)\/invitations$/);
+      if (invitations) {
+        const organizationId = invitations[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listOrganizationInvitations(organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.createOrganizationInvitation({ organizationId, email: String(b.email ?? ''),
+            role: 'member', profileId: String(b.profileId ?? 'developer'), invitedBy: `user:${session.userId}` }));
+        }
+      }
+      const organizationTeams = p.match(/^\/api\/organizations\/([^/]+)\/teams$/);
+      if (organizationTeams) {
+        const organizationId = organizationTeams[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listTeams(organizationId, url.searchParams.get('projectId') ?? undefined));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.createTeam({ organizationId, name: String(b.name ?? ''),
+            projectId: b.projectId ? String(b.projectId) : undefined, slug: b.slug ? String(b.slug) : undefined }));
+        }
+      }
+      const organizationTeam = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)$/);
+      if (organizationTeam) {
+        const team = store.getTeam(organizationTeam[2]!);
+        if (!team || team.organizationId !== organizationTeam[1]) return this.json(res, 404, { error: 'team not found' });
+        try {
+          if (method === 'PATCH') {
+            const b = await this.body(req);
+            return this.json(res, 200, store.updateTeam(team.id, { name: String(b.name ?? '') }));
+          }
+          if (method === 'DELETE') {
+            store.deleteTeam(team.id);
+            return this.json(res, 200, { ok: true });
+          }
+        } catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const teamMembers = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)\/members$/);
+      if (teamMembers) {
+        if (store.getTeam(teamMembers[2]!)?.organizationId !== teamMembers[1]) return this.json(res, 404, { error: 'team not found' });
+        if (method === 'GET') {
+          const users = new Map((this.deps.identity?.listUsers() ?? []).map((user) => [user.id, user]));
+          return this.json(res, 200, store.listTeamMemberships(teamMembers[2]!).map((membership) => {
+            const user = users.get(membership.userId);
+            return { ...membership, ...(user ? { user: { id: user.id, name: user.name, email: user.email } } : {}) };
+          }));
+        }
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setTeamMembership(teamMembers[2]!, String(b.userId)));
+        }
+      }
+      const teamMember = p.match(/^\/api\/organizations\/([^/]+)\/teams\/([^/]+)\/members\/([^/]+)$/);
+      if (teamMember && method === 'DELETE') {
+        if (store.getTeam(teamMember[2]!)?.organizationId !== teamMember[1]) return this.json(res, 404, { error: 'team not found' });
+        store.removeTeamMembership(teamMember[2]!, teamMember[3]!);
+        return this.json(res, 200, { ok: true });
+      }
+      const gitConnections = p.match(/^\/api\/organizations\/([^/]+)\/git-connections$/);
+      if (gitConnections) {
+        const organizationId = gitConnections[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listGitConnections(organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub App is not configured' });
+          const connected = await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? ''));
+          for (const project of store.listProjects().filter((candidate) => candidate.organizationId === organizationId))
+            await this.ensureProjectWiki(project, session.userId);
+          return this.json(res, 200, connected);
+        }
+      }
+      const githubAppSetup = p.match(/^\/api\/organizations\/([^/]+)\/github\/app$/);
+      if (githubAppSetup) {
+        if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
+        if (method === 'GET') return this.json(res, 200, this.deps.githubApp.status(session.userId));
+        if (method === 'PUT') {
+          if (!this.deps.tokens.check(token, 'user:write').ok)
+            return this.json(res, 403, { error: 'Only a Karmax installation administrator can configure the shared GitHub App' });
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, this.deps.githubApp.configure({ appId: b.appId, appSlug: String(b.appSlug ?? ''),
+              privateKey: String(b.privateKey ?? '').replace(/\\n/g, '\n'), webhookSecret: b.webhookSecret ? String(b.webhookSecret) : undefined,
+              clientId: b.clientId ? String(b.clientId) : undefined, clientSecret: b.clientSecret ? String(b.clientSecret) : undefined }));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
+      const githubManifest = p.match(/^\/api\/organizations\/([^/]+)\/github\/app-manifest$/);
+      if (githubManifest && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
+        if (!this.deps.tokens.check(token, 'user:write').ok)
+          return this.json(res, 403, { error: 'Only a Karmax installation administrator can create the shared GitHub App' });
+        if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
+        const b = await this.body(req);
+        const state = store.createGithubInstallState(githubManifest[1]!, session.userId);
+        try {
+          const publicUrl = this.githubPublicUrl(req, b.publicUrl);
+          return this.json(res, 200, this.deps.githubApp.manifest(publicUrl, state));
+        }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const githubAuthorize = p.match(/^\/api\/organizations\/([^/]+)\/github\/authorize$/);
+      if (githubAuthorize && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
+        const state = store.createGithubInstallState(githubAuthorize[1]!, session.userId);
+        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, this.githubPublicUrl(req)) }); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const githubInstallUrl = p.match(/^\/api\/organizations\/([^/]+)\/github\/install-url$/);
+      if (githubInstallUrl && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
+        const state = store.createGithubInstallState(githubInstallUrl[1]!, session.userId);
+        return this.json(res, 200, { url: this.deps.githubApp.installationUrl(state) });
+      }
+      const githubRefresh = p.match(/^\/api\/organizations\/([^/]+)\/github\/refresh$/);
+      if (githubRefresh && method === 'POST') {
+        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        try {
+          const repositories: import('../domain/types.js').Repository[] = [];
+          for (const connection of store.listGitConnections(githubRefresh[1]!))
+            repositories.push(...await this.deps.githubApp.reconcile(connection));
+          for (const project of store.listProjects().filter((candidate) => candidate.organizationId === githubRefresh[1]))
+            await this.ensureProjectWiki(project, session.userId);
+          return this.json(res, 200, { repositories, count: repositories.length });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const organizationRepositories = p.match(/^\/api\/organizations\/([^/]+)\/repositories$/);
+      if (organizationRepositories) {
+        const organizationId = organizationRepositories[1]!;
+        if (method === 'GET') return this.json(res, 200,
+          store.listRepositories(organizationId).filter((repository) => !store.repositoryIsProjectWiki(repository.id)));
+        if (method === 'POST') {
+          if (this.deps.hosted) return this.json(res, 400, { error: 'Hosted repositories must be imported through the GitHub App' });
+          const b = await this.body(req);
+          return this.json(res, 200, store.upsertRepository({ organizationId, provider: 'github',
+            providerId: b.providerId ? String(b.providerId) : undefined, owner: String(b.owner ?? ''), name: String(b.name ?? ''),
+            sshUrl: String(b.sshUrl ?? ''), defaultBranch: String(b.defaultBranch ?? 'main'), private: b.private !== false,
+            gitConnectionId: b.gitConnectionId ? String(b.gitConnectionId) : undefined }));
+        }
+      }
+      const createOrganizationRepository = p.match(/^\/api\/organizations\/([^/]+)\/repositories\/create$/);
+      if (createOrganizationRepository && method === 'POST') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        const b = await this.body(req);
+        const connection = store.getGitConnection(String(b.gitConnectionId ?? ''));
+        if (!connection || connection.organizationId !== createOrganizationRepository[1])
+          return this.json(res, 404, { error: 'GitHub connection not found in this organization' });
+        try {
+          return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, session.userId,
+            { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined, private: b.private !== false }));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
+      if (organizationProjects) {
+        const organizationId = organizationProjects[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          let project;
+          try {
+            project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+          if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
+          await this.ensureProjectWiki(project, session.userId);
+          await this.spawnProjectPrepTask(token, project.id);
+          return this.json(res, 200, project);
+        }
+      }
+      const runnerPools = p.match(/^\/api\/organizations\/([^/]+)\/runner-pools$/);
+      if (runnerPools) {
+        const organizationId = runnerPools[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listRunnerPools(organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.createRunnerPool({ organizationId, name: String(b.name ?? 'Runner pool'),
+            provider: String(b.provider ?? 'e2b'), region: b.region ? String(b.region) : undefined,
+            mode: b.mode === 'customer' ? 'customer' : 'managed', enabled: b.enabled !== false,
+            capacity: { activeWorlds: Math.max(1, Number(b.capacity?.activeWorlds ?? 20)),
+              cpu: Math.max(1, Number(b.capacity?.cpu ?? 40)), memoryMb: Math.max(128, Number(b.capacity?.memoryMb ?? 81920)),
+              gpu: Math.max(0, Number(b.capacity?.gpu ?? 0)) } }));
+        }
+      }
+      const runnerPool = p.match(/^\/api\/organizations\/([^/]+)\/runner-pools\/([^/]+)$/);
+      if (runnerPool) {
+        const current = store.getRunnerPool(runnerPool[2]!);
+        if (!current || current.organizationId !== runnerPool[1]) return this.json(res, 404, { error: 'runner pool not found' });
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, store.createRunnerPool({ ...current,
+              name: b.name == null ? current.name : String(b.name),
+              region: b.region === null ? undefined : b.region == null ? current.region : String(b.region),
+              enabled: b.enabled == null ? current.enabled : Boolean(b.enabled),
+              capacity: b.capacity && typeof b.capacity === 'object' ? {
+                activeWorlds: Math.max(1, Number(b.capacity.activeWorlds ?? current.capacity.activeWorlds)),
+                cpu: Math.max(1, Number(b.capacity.cpu ?? current.capacity.cpu)),
+                memoryMb: Math.max(128, Number(b.capacity.memoryMb ?? current.capacity.memoryMb)),
+                gpu: Math.max(0, Number(b.capacity.gpu ?? current.capacity.gpu)),
+              } : current.capacity }));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+        if (method === 'DELETE') {
+          try { return this.json(res, 200, { deleted: Boolean(store.deleteRunnerPool(current.id)) }); }
+          catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
+      const worldProviders = p.match(/^\/api\/organizations\/([^/]+)\/world-providers$/);
+      if (worldProviders && method === 'GET') {
+        return this.json(res, 200, this.deps.providerConnections?.list(worldProviders[1]!) ?? []);
+      }
+      const worldProvider = p.match(/^\/api\/organizations\/([^/]+)\/world-providers\/([^/]+)$/);
+      if (worldProvider) {
+        const organizationId = worldProvider[1]!;
+        const provider = worldProvider[2]!;
+        if (!this.deps.providerConnections) return this.json(res, 503, { error: 'provider connections are unavailable' });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          try {
+            return this.json(res, 200, this.deps.providerConnections.save({ organizationId, provider,
+              apiKey: b.apiKey ? String(b.apiKey) : undefined, name: b.name ? String(b.name) : undefined,
+              config: b.config && typeof b.config === 'object' ? b.config as any : {}, enabled: b.enabled !== false }));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+        if (method === 'DELETE') {
+          const active = store.organizationResources(organizationId).worlds
+            .filter((handle) => (handle.provider ?? handle.kind) === provider);
+          if (active.length) return this.json(res, 409, { error: `${active.length} task world(s) still use ${provider}; finish or delete them first` });
+          return this.json(res, 200, { deleted: Boolean(this.deps.providerConnections.delete(organizationId, provider)) });
+        }
+      }
+      const testWorldProvider = p.match(/^\/api\/organizations\/([^/]+)\/world-providers\/([^/]+)\/test$/);
+      if (testWorldProvider && method === 'POST') {
+        if (!this.deps.providerConnections) return this.json(res, 503, { error: 'provider connections are unavailable' });
+        try { return this.json(res, 200, await this.deps.providerConnections.test(testWorldProvider[1]!, testWorldProvider[2]!)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const usage = p.match(/^\/api\/organizations\/([^/]+)\/usage$/);
+      if (usage && method === 'GET') return this.json(res, 200, store.usageSummary(usage[1]!,
+        Number(url.searchParams.get('from') ?? 0), Number(url.searchParams.get('to') ?? Date.now())));
+
+      if (p === '/api/inbox' && method === 'GET') {
+        if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        const items = store.listInbox(session.userId, requestedScope.organizationId,
+          { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) });
+        return this.json(res, 200, items.map((item) => {
+          const task = store.getTask(item.taskId);
+          return { ...item, task: task ? { id: task.id, num: task.num, title: task.title, projectId: task.projectId } : undefined };
+        }));
+      }
+      const inboxItem = p.match(/^\/api\/inbox\/([^/]+)$/);
+      if (inboxItem && method === 'PATCH') {
+        if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
+        const b = await this.body(req);
+        return this.json(res, 200, store.markInbox(session.userId, inboxItem[1]!, b.unread !== false) ?? null);
+      }
+      if (p === '/api/inbox/preferences') {
+        if (!session.userId || !requestedScope.organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        if (method === 'GET') return this.json(res, 200, store.getDeliveryPreferences(session.userId, requestedScope.organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setDeliveryPreferences({ userId: session.userId, organizationId: requestedScope.organizationId,
+            browser: b.browser !== false, email: Boolean(b.email), slack: Boolean(b.slack), routine: b.routine !== false }));
+        }
+      }
+
       // Multiple human accounts + karmax authorization. Better Auth owns the
       // account/session records; these routes only attach karmax grants.
       if (p === '/api/users' && method === 'GET') {
@@ -559,8 +1344,16 @@ export class Gateway {
         return this.json(res, 200, {
           host: hostStats(),
           agentSlots: { ...safety, capacity: queue.capacity, inUse: queue.current.length, waiting: queue.queue.length },
+          controlPlane: store.operationalSnapshot(),
+          providers: this.deps.worlds.catalog(),
           ts: Date.now(),
         });
+      }
+      if (p === '/api/metrics' && method === 'GET') {
+        const value = prometheusMetrics(store.operationalSnapshot());
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+          'content-length': String(Buffer.byteLength(value)), 'cache-control': 'no-store' });
+        return void res.end(value);
       }
 
       // Task manager (dashboard Processes panel): every process karmax is
@@ -606,15 +1399,30 @@ export class Gateway {
       if (p === '/api/projects' && method === 'GET') {
         const projects = store.listProjects();
         if (authRecord?.projectId) return this.json(res, 200, projects.filter((x) => x.id === authRecord!.projectId));
+        // An organization-scoped token discovers its own tenant's projects only.
+        if (authRecord?.organizationId) return this.json(res, 200,
+          projects.filter((x) => (x.organizationId ?? 'org_personal') === authRecord!.organizationId));
         if (session.userId && this.deps.authorization) {
           const principal = `user:${session.userId}`;
           return this.json(res, 200, projects.filter((x) => allows(this.deps.authorization!.capabilities(principal, x.id), 'project:read')));
         }
+        // Identity-backed deployments never legitimately reach here: a session
+        // that cannot be attributed to a user or a scoped token sees nothing.
+        // The bare return is single-user legacy mode (no identity service).
+        if (this.deps.identity) return this.json(res, 200, []);
         return this.json(res, 200, projects);
       }
       if (p === '/api/projects' && method === 'POST') {
+        if (this.deps.hosted)
+          return this.json(res, 400, { error: 'hosted projects must be created inside an organization' });
         const b = await this.body(req);
-        return this.json(res, 200, store.createProject(b.name ?? 'New project', normalizeConfig(b.config)));
+        let project;
+        try {
+          project = store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        await this.ensureProjectWiki(project, session.userId);
+        await this.spawnProjectPrepTask(token, project.id);
+        return this.json(res, 200, project);
       }
       const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
       if (projMatch) {
@@ -622,12 +1430,136 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.getProject(id) ?? null);
         if (method === 'PATCH') {
           const b = await this.body(req);
-          return this.json(res, 200, store.updateProjectConfig(id, normalizeConfig(b.config)));
+          try {
+            const config = normalizeConfig(b.config);
+            const project = store.getProject(id);
+            if (config.worldProvider && !['worktree', 'container', 'memory'].includes(config.worldProvider) && project?.organizationId &&
+                !this.deps.providerConnections?.available(project.organizationId, config.worldProvider)) {
+              throw new Error(`${config.worldProvider} is not connected. Connect and verify it in Organization settings first.`);
+            }
+            if (config.runnerPoolId) {
+              const pool = store.getRunnerPool(config.runnerPoolId);
+              if (!pool || pool.organizationId !== project?.organizationId) throw new Error('runner pool does not belong to this project organization');
+              if (config.worldProvider && pool.provider !== config.worldProvider) throw new Error('runner pool provider must match the execution provider');
+            }
+            return this.json(res, 200, store.updateProjectConfig(id, config));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
         if (method === 'DELETE') {
+          if (!store.getProject(id)) return this.json(res, 404, { error: 'project not found' });
+          const resources = await this.removeProjectExternalResources(id, 'project deleted');
           store.deleteProject(id);
-          return this.json(res, 200, { ok: true });
+          for (const attachmentId of resources.attachmentIds)
+            if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
+          return this.json(res, 200, { deleted: true, projectId: id });
         }
+      }
+      const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
+      if (projectExecution) {
+        const project = store.getProject(projectExecution[1]!);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        if (method === 'GET') return this.json(res, 200, {
+          override: pickExecutionConfig(project.config),
+          organization: store.getOrganizationExecutionPolicy(project.organizationId!),
+          effective: pickExecutionConfig(store.effectiveProjectConfig(project)),
+        });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const override = b.override && typeof b.override === 'object' ? b.override : {};
+          try {
+            const candidate = { ...project, config: applyExecutionOverride(project.config, override) };
+            const effective = store.effectiveProjectConfig(candidate);
+            if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
+              && !this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider))
+              throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
+            if (effective.runnerPoolId) {
+              const pool = store.getRunnerPool(effective.runnerPoolId);
+              if (!pool || pool.organizationId !== project.organizationId) throw new Error('runner pool does not belong to this organization');
+              if (pool.provider !== effective.worldProvider) throw new Error('runner pool provider must match the execution provider');
+            }
+            const saved = store.setProjectExecutionPolicy(project.id, override);
+            return this.json(res, 200, { override: pickExecutionConfig(saved.config), organization: store.getOrganizationExecutionPolicy(project.organizationId!), effective: pickExecutionConfig(effective) });
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
+      const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
+      if (projectMembers) {
+        const projectId = projectMembers[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listProjectMemberships(projectId).map((membership) => {
+          if (membership.principal.kind !== 'user') return { ...membership,
+            profileId: this.deps.authorization?.profile(membership.role, projectId)?.id
+              ?? (membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer') };
+          const grant = this.deps.authorization?.grants(`user:${membership.principal.userId}`).find((candidate) => candidate.scopeKey === `project:${projectId}`);
+          return { ...membership, profileId: grant?.profileId ?? (membership.role === 'owner' || membership.role === 'admin' ? 'maintainer' : 'developer'), protectedOwner: membership.role === 'owner' };
+        }));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const project = store.getProject(projectId);
+          if (!project?.organizationId) return this.json(res, 404, { error: 'project organization not found' });
+          const principal = projectPrincipalFromBody(b.principal, project.organizationId);
+          const profileId = String(b.profileId ?? 'developer');
+          if (this.deps.authorization && !this.deps.authorization.profile(profileId, projectId))
+            return this.json(res, 400, { error: `unknown authorization profile ${profileId}` });
+          const previous = store.listProjectMemberships(projectId).find((member) => JSON.stringify(member.principal) === JSON.stringify(principal));
+          const membership = store.setProjectMembership(projectId, principal, previous?.role === 'owner' ? 'owner'
+            : principal.kind === 'user' ? 'member' : profileId);
+          if (principal.kind === 'user') {
+            this.deps.authorization?.grant(`user:${session.userId}`, { principalId: `user:${principal.userId}`,
+              scopeKey: `project:${projectId}`, profileId });
+          }
+          return this.json(res, 200, membership);
+        }
+      }
+      const projectMember = p.match(/^\/api\/projects\/([^/]+)\/members\/(user|team|organization)\/([^/]+)$/);
+      if (projectMember && method === 'DELETE') {
+        const principal = projectMember[2] === 'user'
+          ? { kind: 'user' as const, userId: projectMember[3]! }
+          : projectMember[2] === 'team' ? { kind: 'team' as const, teamId: projectMember[3]! }
+          : { kind: 'organization' as const, organizationId: projectMember[3]! };
+        store.removeProjectMembership(projectMember[1]!, principal);
+        if (principal.kind === 'user') this.deps.authorization?.revoke(`user:${session.userId}`,
+          `user:${principal.userId}`, `project:${projectMember[1]!}`);
+        return this.json(res, 200, { ok: true });
+      }
+      const projectRepositories = p.match(/^\/api\/projects\/([^/]+)\/repositories$/);
+      if (projectRepositories) {
+        const projectId = projectRepositories[1]!;
+        if (method === 'GET') return this.json(res, 200, store.listProjectRepositories(projectId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const attached = store.attachProjectRepository({ projectId, repositoryId: String(b.repositoryId),
+            baseBranch: b.baseBranch ? String(b.baseBranch) : undefined,
+            targetBranch: b.targetBranch ? String(b.targetBranch) : undefined,
+            order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined });
+          const project = store.getProject(projectId);
+          if (project) await this.ensureProjectWiki(project, session.userId);
+          return this.json(res, 200, attached);
+        }
+      }
+      const projectRepositorySources = p.match(/^\/api\/projects\/([^/]+)\/repository-sources$/);
+      if (projectRepositorySources) {
+        const project = store.getProject(projectRepositorySources[1]!);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        if (method === 'GET') return this.json(res, 200, { repos: project.config.repos ?? [] });
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          try {
+            const repos = Array.isArray(b.repos) ? b.repos.map(String) : [];
+            if (this.deps.hosted) {
+              const known = new Set(store.listRepositories(project.organizationId!).map((repository) => repository.sshUrl));
+              const unknown = repos.filter((repo: string) => !known.has(repo));
+              if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
+            }
+            const saved = store.setProjectRepositorySources(project.id, repos);
+            await this.ensureProjectWiki(saved, session.userId);
+            return this.json(res, 200, saved); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+      }
+      const projectRepository = p.match(/^\/api\/projects\/([^/]+)\/repositories\/([^/]+)$/);
+      if (projectRepository && method === 'DELETE') {
+        store.detachProjectRepository(projectRepository[1]!, projectRepository[2]!);
+        return this.json(res, 200, { ok: true });
       }
       const tasksMatch = p.match(/^\/api\/projects\/([^/]+)\/tasks$/);
       if (tasksMatch) {
@@ -641,11 +1573,23 @@ export class Gateway {
           const limit = Number(url.searchParams.get('limit') ?? '0');
           const offset = Number(url.searchParams.get('offset') ?? '0');
           const page = limit > 0 ? filtered.slice(offset, offset + limit) : filtered;
+          // The list only needs each task's chip/queue fields (stage/status/state/
+          // waitingFor/mergeQueue/…), never its conversation. Dropping the heavy view
+          // fields — `messages`, `transcripts`, `reviewInfo` — shrinks this response by
+          // ~80% (they were the bulk of a multi-MB payload for a few hundred tasks).
+          // It matters because loadTasks() refetches the whole list on navigation AND
+          // on every WS-debounced refresh, so the fat body was paid over and over. The
+          // full view is still served per task by /api/tasks/:id when a task is opened.
+          const trimListView = (v: TaskView | undefined) => {
+            if (!v) return v;
+            const { messages: _m, transcripts: _t, reviewInfo: _r, ...rest } = v;
+            return rest;
+          };
           // enrich with the freshest live view where possible
           const enriched = await Promise.all(
             page.map(async (t) => {
               const view = await api.getTaskView(token, t.id).catch(() => t.lastView);
-              return { ...t, lastView: view ?? t.lastView };
+              return { ...t, lastView: trimListView(view ?? t.lastView) };
             }),
           );
           if (limit > 0) return this.json(res, 200, { tasks: enriched, total: filtered.length, offset });
@@ -653,15 +1597,11 @@ export class Gateway {
         }
         if (method === 'POST') {
           const b = await this.body(req);
+          const project = store.getProject(projectId);
+          if (project) await this.ensureProjectWiki(project, session.userId);
           const task = await api.createTask(token, { projectId, ...b });
           return this.json(res, 200, task);
         }
-      }
-      const activateMatch = p.match(/^\/api\/projects\/([^/]+)\/activate-workflow$/);
-      if (activateMatch && method === 'POST') {
-        const projectId = activateMatch[1]!;
-        const b = await this.body(req);
-        return this.json(res, 200, await this.activateWorkflow(token, projectId, b.workflow));
       }
 
       // ── search / organization (a view is a saved query — PLAN-search-views) ──
@@ -759,6 +1699,33 @@ export class Gateway {
         await api.setTaskPriority(token, priorityMatch[1]!, Number(b.priority ?? 0));
         return this.json(res, 200, { ok: true });
       }
+      const responsibilityMatch = p.match(/^\/api\/tasks\/([^/]+)\/responsibility$/);
+      if (responsibilityMatch) {
+        if (method === 'GET') {
+          const task = store.getTask(responsibilityMatch[1]!);
+          return this.json(res, 200, task ? { createdBy: task.createdBy, assignee: task.assignee,
+            delegate: task.delegate, confirmationPolicy: task.confirmationPolicy, subscribers: task.subscribers } : null);
+        }
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          return this.json(res, 200, store.setTaskResponsibility(responsibilityMatch[1]!, {
+            assignee: b.assignee === null ? null : b.assignee === undefined ? undefined : principalFromBody(b.assignee),
+            delegate: b.delegate === null ? null : b.delegate === undefined ? undefined : principalFromBody(b.delegate),
+            confirmationPolicy: b.confirmationPolicy === null ? null : b.confirmationPolicy,
+          }));
+        }
+      }
+      const subscribersMatch = p.match(/^\/api\/tasks\/([^/]+)\/subscribers$/);
+      if (subscribersMatch) {
+        if (method === 'GET') return this.json(res, 200, store.subscribersFor(subscribersMatch[1]!));
+        if (method === 'POST' || method === 'DELETE') {
+          const b = await this.body(req);
+          const principal = principalFromBody(b.principal);
+          if (method === 'POST') store.subscribeTask(subscribersMatch[1]!, principal);
+          else store.unsubscribeTask(subscribersMatch[1]!, principal);
+          return this.json(res, 200, { subscribers: store.subscribersFor(subscribersMatch[1]!) });
+        }
+      }
 
       // tasks
       // Resolve a per-project sequential number (SPEC §10.6) → its canonical id, so a
@@ -806,6 +1773,9 @@ export class Gateway {
       }
       const queueMatch = p.match(/^\/api\/tasks\/([^/]+)\/queue$/);
       if (queueMatch && method === 'POST') {
+        const queued = store.getTask(queueMatch[1]!);
+        const project = queued ? store.getProject(queued.projectId) : undefined;
+        if (project) await this.ensureProjectWiki(project, session.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
@@ -828,30 +1798,18 @@ export class Gateway {
         // A draft has no running workflow — edit its stored params in place; they
         // re-resolve at queue time (SPEC §10.4).
         if (t.params?.draft) {
-          const confirmerField = manifest(t.workflow)?.params.find((f) => f.type === 'confirmer');
-          if (confirmerField && Object.prototype.hasOwnProperty.call(b.params ?? {}, confirmerField.name)) {
-            try {
-              store.setIntentConfirmer(t.intentId ?? t.id, confirmerField.name, b.params[confirmerField.name]);
-            } catch (e) {
-              return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
-            }
+          try {
+            // Use the same full-form replacement path as armed tasks. Besides
+            // preserving platform metadata, it keeps the shared confirmer snapshot
+            // in sync when a reset removes the sparse task-level override.
+            const updated = await api.updateArmedParams(token, id, b.params ?? {}, {
+              replace: b.replace === true,
+              keepArmed: false,
+            });
+            return this.json(res, 200, updated);
+          } catch (e) {
+            return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
           }
-          // Replace the workflow-field overrides wholesale (b.params is the form's
-          // full set of own overrides) so a field reset to its default is actually
-          // removed — a merge would leave the stale override behind. Lifecycle +
-          // organizational meta (draft/archived/profiles/priority) is preserved across
-          // the edit — priority is set via its own endpoint and must survive a form save.
-          const { draft, archived, profiles, priority, _authorization } = t.params;
-          const meta = { ...(draft !== undefined ? { draft } : {}), ...(archived !== undefined ? { archived } : {}), ...(profiles !== undefined ? { profiles } : {}), ...(priority !== undefined ? { priority } : {}), ...(_authorization !== undefined ? { _authorization } : {}) };
-          const replace = b.replace === true;
-          const next = replace ? { ...meta, ...b.params } : { ...t.params, ...b.params };
-          // Never trust workflow-form JSON for platform authorization metadata.
-          if (_authorization !== undefined) next._authorization = _authorization;
-          store.updateTaskParams(id, next);
-          // Keep the title tracking the edited prompt (title was derived from it).
-          const prompt = b.params?.prompt;
-          if (typeof prompt === 'string' && prompt.trim()) store.setTaskTitle(id, (prompt.split('\n')[0] ?? '').slice(0, 80));
-          return this.json(res, 200, store.getTask(id) ?? null);
         }
         // Once queued, params are frozen except the ones the workflow declares
         // in-flight-editable (SPEC §4.5/§5.5). Forward to its validated update and
@@ -862,6 +1820,15 @@ export class Gateway {
           // Authoritative read: reflect the just-applied update, not a snapshot that
           // may pre-date the workflow's next publish.
           return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id, { live: true }) });
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const workflowMatch = p.match(/^\/api\/tasks\/([^/]+)\/workflow$/);
+      if (workflowMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.changeWorkflow(token, workflowMatch[1]!, String(b.workflow ?? '')));
         } catch (e) {
           return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
         }
@@ -897,8 +1864,8 @@ export class Gateway {
       const signalMatch = p.match(/^\/api\/tasks\/([^/]+)\/signal$/);
       if (signalMatch && method === 'POST') {
         const b = await this.body(req);
-        await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
-        return this.json(res, 200, { ok: true });
+        const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
+        return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
       const targetMatch = p.match(/^\/api\/tasks\/([^/]+)\/target$/);
       if (targetMatch && method === 'POST') {
@@ -921,6 +1888,88 @@ export class Gateway {
       if (runsMatch && method === 'GET') {
         return this.json(res, 200, store.runsOf(runsMatch[1]!));
       }
+      const executionsMatch = p.match(/^\/api\/tasks\/([^/]+)\/executions$/);
+      if (executionsMatch && method === 'GET') {
+        return this.json(res, 200, store.listExecutions(executionsMatch[1]!));
+      }
+      const terminalTicketMatch = p.match(/^\/api\/tasks\/([^/]+)\/terminal-ticket$/);
+      if (terminalTicketMatch && method === 'POST') {
+        const taskId = terminalTicketMatch[1]!;
+        if (!store.getTask(taskId)) return this.json(res, 404, { error: 'task not found' });
+        const ticket = crypto.randomBytes(24).toString('base64url');
+        const expiresAt = Date.now() + 5 * 60_000;
+        for (const [candidate, record] of this.terminalTickets) if (record.expiresAt <= Date.now()) this.terminalTickets.delete(candidate);
+        this.terminalTickets.set(ticket, { taskId, session, expiresAt });
+        const attachArgv = this.deps.hosted ? ['karmax'] : [process.execPath, fileURLToPath(new URL('../../bin/karmax.js', import.meta.url))];
+        return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
+      }
+      const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
+      if (checkoutMatch && method === 'GET') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        try { return this.json(res, 200, this.deps.handoffs.checkout(checkoutMatch[1]!)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const materializeMatch = p.match(/^\/api\/tasks\/([^/]+)\/materialize-local$/);
+      if (materializeMatch && method === 'POST') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        if (this.deps.hosted) return this.json(res, 409, { error: 'use the Git checkout handoff when Karmax is hosted remotely' });
+        const taskId = materializeMatch[1]!;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
+        try { return this.json(res, 200, await this.deps.handoffs.materialize(taskId, view)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/git/publish' && method === 'POST') {
+        try { return this.json(res, 200, await api.publishTaskBranch(token)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/git/import' && method === 'POST') {
+        const b = await this.body(req);
+        try { return this.json(res, 200, await api.importTaskBranch(token, String(b.sourceTaskId ?? ''))); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/git/refresh-upstream' && method === 'POST') {
+        const b = await this.body(req);
+        try { return this.json(res, 200, await api.refreshUpstream(token, b.branch ? String(b.branch) : undefined)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const desktopMatch = p.match(/^\/api\/tasks\/([^/]+)\/desktop$/);
+      if (desktopMatch && method === 'GET') {
+        const taskId = desktopMatch[1]!;
+        const task = store.getTask(taskId);
+        const handle = worldHandleForView(task?.lastView, taskId, task ? store.effectiveProjectConfig(task.projectId) : undefined);
+        if (!handle) return this.json(res, 404, { error: 'no world for this task' });
+        let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
+        try {
+          access = this.deps.worldAccess
+            ? await this.deps.worldAccess.open(taskId, handle, { dedicated: true })
+            : undefined;
+          const world = access?.world ?? await this.deps.worlds.open(handle);
+          if (!world.desktopSession) throw new Error('this world has no desktop experience');
+          const desktop = await world.desktopSession();
+          const expiresAt = Date.now() + 5 * 60_000;
+          if (access?.runnerLeaseId && task) {
+            const project = store.getProject(task.projectId)!;
+            store.createPreviewLease({ id: newId('desktop'), organizationId: project.organizationId!,
+              projectId: project.id, taskId, worldId: access.handle.id, generation: access.handle.generation ?? 1,
+              port: 6080, public: false, runnerLeaseId: access.runnerLeaseId, provider: access.handle.kind,
+              createdBy: authRecord?.principal ?? session.user, createdAt: Date.now(), expiresAt });
+          }
+          return this.json(res, 200, { ...desktop, expiresAt });
+        } catch (error) {
+          await access?.release();
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const refreshFromGithub = p.match(/^\/api\/tasks\/([^/]+)\/refresh-from-github$/);
+      if (refreshFromGithub && method === 'POST') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        const taskId = refreshFromGithub[1]!;
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
+        if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
+        try { return this.json(res, 200, await this.deps.handoffs.refresh(taskId, view)); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       // ── review actions (SPEC §5.5): click-to-verify affordances ──
       // Start a "run" action (or resolve an "open" one). The command is looked up
       // from the task's stored review info by index — the client only sends the
@@ -935,7 +1984,8 @@ export class Gateway {
         const view = (await api.getTaskView(token, taskId, { live: true }).catch(() => undefined)) ?? store.getTask(taskId)?.lastView;
         const action = view?.reviewInfo?.actions?.[Number(b.index)];
         if (!action) return this.json(res, 404, { error: 'no such review action' });
-        const worldPath = view?.worldPath;
+        const task = store.getTask(taskId);
+        const handle = worldHandleForView(view, taskId, task ? store.effectiveProjectConfig(task.projectId) : undefined);
         if (action.kind === 'open') {
           const target = String(action.target ?? '');
           if (/^https?:\/\//i.test(target)) return this.json(res, 200, { kind: 'open', url: target, external: true });
@@ -945,10 +1995,10 @@ export class Gateway {
         }
         // kind: 'run'
         if (!action.command) return this.json(res, 400, { error: 'run action has no command' });
-        if (!worldPath) return this.json(res, 400, { error: 'no world for this task yet' });
-        const rec = this.reviewActions.start({
+        if (!handle) return this.json(res, 400, { error: 'no world for this task yet' });
+        const rec = await this.reviewActions.start({
           taskId,
-          cwd: worldPath,
+          world: handle,
           label: action.label,
           command: action.command,
           server: action.server,
@@ -968,6 +2018,135 @@ export class Gateway {
       const artifactMatch = p.match(/^\/api\/tasks\/([^/]+)\/artifact$/);
       if (artifactMatch && method === 'GET') {
         return this.serveArtifact(res, artifactMatch[1]!, url.searchParams.get('path') ?? '');
+      }
+      const artifactList = p.match(/^\/api\/tasks\/([^/]+)\/artifacts$/);
+      if (artifactList && method === 'GET') return this.json(res, 200, store.listPromotedArtifacts(artifactList[1]!));
+      const artifactPromote = p.match(/^\/api\/tasks\/([^/]+)\/artifacts\/promote$/);
+      if (artifactPromote && method === 'POST') {
+        if (!this.deps.objects) return this.json(res, 503, { error: 'promoted artifact storage is not configured' });
+        const taskId = artifactPromote[1]!;
+        const task = store.getTask(taskId);
+        const project = task ? store.getProject(task.projectId) : undefined;
+        const b = await this.body(req);
+          const relPath = String(b.path ?? '');
+        if (!task || !project?.organizationId || !relPath) return this.json(res, 400, { error: 'task and artifact path are required' });
+        const handle = worldHandleForView(task.lastView, taskId, store.effectiveProjectConfig(project));
+        if (!handle) return this.json(res, 404, { error: 'no world for this task' });
+        let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
+        try {
+          access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+          const world = access?.world ?? await this.deps.worlds.open(handle);
+          const data = await world.readFileBuffer(worldWorkingRelativePath(handle, relPath));
+          if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
+          const id = newId('artifact');
+          const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
+          const mediaType = String(b.mediaType ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream');
+          const objectKey = `artifacts/${project.organizationId}/${project.id}/${taskId}/${id}`;
+          await this.deps.objects.put(objectKey, data, mediaType);
+          const ttlMs = b.ttlMs == null ? undefined : Math.max(60_000, Math.min(Number(b.ttlMs), 365 * 24 * 60 * 60 * 1000));
+          const artifact = store.savePromotedArtifact({ id, organizationId: project.organizationId, projectId: project.id,
+            taskId, objectKey, sha256: crypto.createHash('sha256').update(data).digest('hex'), bytes: data.length,
+            mediaType, name, createdAt: Date.now(), ...(ttlMs ? { expiresAt: Date.now() + ttlMs } : {}) });
+          return this.json(res, 200, artifact);
+        } finally { await access?.release(); }
+      }
+      const promotedArtifact = p.match(/^\/api\/artifacts\/([^/]+)$/);
+      if (promotedArtifact) {
+        const artifact = store.getPromotedArtifact(promotedArtifact[1]!);
+        if (!artifact || (artifact.expiresAt != null && artifact.expiresAt <= Date.now())) return this.json(res, 404, { error: 'artifact not found' });
+        if (method === 'GET') {
+          if (!this.deps.objects) return this.json(res, 503, { error: 'artifact storage is unavailable' });
+          const data = await this.deps.objects.get(artifact.objectKey);
+          if (crypto.createHash('sha256').update(data).digest('hex') !== artifact.sha256)
+            return this.json(res, 502, { error: 'artifact integrity check failed' });
+          res.writeHead(200, { 'content-type': artifact.mediaType, 'content-length': String(data.length),
+            'content-disposition': `inline; filename="${artifact.name.replace(/["\\\r\n]/g, '_')}"`,
+            'cache-control': 'private, no-store' });
+          return void res.end(data);
+        }
+        if (method === 'DELETE') {
+          store.deletePromotedArtifact(artifact.id);
+          await this.deps.objects?.delete(artifact.objectKey);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const previewMatch = p.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
+      if (previewMatch && PREVIEW_METHODS.has(method)) {
+        const taskId = previewMatch[1]!;
+        const port = Number(previewMatch[2]);
+        const task = store.getTask(taskId);
+        const project = task ? store.getProject(task.projectId) : undefined;
+        const handle = worldHandleForView(task?.lastView, taskId, project ? store.effectiveProjectConfig(project) : undefined);
+        if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
+        if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
+        const isolatedOrigin = configuredPreviewOrigin();
+        if (isolatedOrigin) {
+          const rawToken = newPreviewToken();
+          let runnerLeaseId: string | undefined;
+          if (this.deps.worlds.get(handle.kind).capabilities?.remote && this.deps.runners)
+            runnerLeaseId = (await this.deps.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind })).leaseId;
+          let lease: import('../domain/types.js').PreviewLease;
+          try {
+            lease = store.createPreviewLease({ id: newId('preview'), organizationId: project.organizationId,
+              projectId: project.id, taskId, worldId: handle.id, generation: handle.generation ?? 1, port,
+              public: false, tokenHash: hashPreviewToken(rawToken), runnerLeaseId, provider: handle.kind,
+              createdBy: authRecord?.principal ?? session.user, createdAt: Date.now(),
+              expiresAt: Date.now() + previewAccessTtlMs() });
+          } catch (error) {
+            if (runnerLeaseId) this.deps.runners?.release(runnerLeaseId, handle.kind);
+            throw error;
+          }
+          res.writeHead(307, { location: previewLeaseUrl(lease.id,
+            `${previewMatch[3] ?? '/'}${url.search}`, rawToken), 'referrer-policy': 'no-referrer' });
+          return void res.end();
+        }
+        return this.servePreview(req, res, taskId, port,
+          `${previewMatch[3] ?? '/'}${url.search}`, `/api/tasks/${encodeURIComponent(taskId)}/preview/${port}`);
+      }
+      const previewLeases = p.match(/^\/api\/tasks\/([^/]+)\/preview-leases$/);
+      if (previewLeases && method === 'GET') return this.json(res, 200, store.listPreviewLeases(previewLeases[1]!));
+      if (previewLeases && method === 'POST') {
+        const taskId = previewLeases[1]!;
+        const task = store.getTask(taskId);
+        const project = task ? store.getProject(task.projectId) : undefined;
+        const handle = worldHandleForView(task?.lastView, taskId, project ? store.effectiveProjectConfig(project) : undefined);
+        const b = await this.body(req);
+        const port = Number(b.port);
+        if (!task || !project?.organizationId || !handle) return this.json(res, 404, { error: 'task world not found' });
+        if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
+        if (!reviewPorts(task.lastView).has(port)) return this.json(res, 400, { error: 'port was not declared by a review action' });
+        const ttlMs = Math.max(60_000, Math.min(Number(b.ttlMs ?? 60 * 60_000), 24 * 60 * 60_000));
+        const isPublic = b.public === true;
+        // Isolated previews cannot use the main-app session cookie by design,
+        // so private and public leases both get a scoped bearer. Locally, a
+        // private lease keeps the convenient authenticated-session behavior.
+        const tokenRequired = isPublic || Boolean(configuredPreviewOrigin());
+        const rawToken = tokenRequired ? newPreviewToken() : undefined;
+        let runnerLeaseId: string | undefined;
+        if (this.deps.worlds.get(handle.kind).capabilities?.remote && this.deps.runners)
+          runnerLeaseId = (await this.deps.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind })).leaseId;
+        let lease: import('../domain/types.js').PreviewLease;
+        try {
+          lease = store.createPreviewLease({ id: newId('preview'), organizationId: project.organizationId,
+            projectId: project.id, taskId, worldId: handle.id, generation: handle.generation ?? 1, port,
+            public: isPublic, ...(rawToken ? { tokenHash: hashPreviewToken(rawToken) } : {}),
+            runnerLeaseId, provider: handle.kind, createdBy: authRecord?.principal ?? session.user,
+            createdAt: Date.now(), expiresAt: Date.now() + ttlMs });
+        } catch (error) {
+          if (runnerLeaseId) this.deps.runners?.release(runnerLeaseId, handle.kind);
+          throw error;
+        }
+        return this.json(res, 200, { ...lease, tokenHash: undefined,
+          url: previewLeaseUrl(lease.id, '/', rawToken) });
+      }
+      const previewLease = p.match(/^\/api\/preview-leases\/([^/]+)$/);
+      if (previewLease && method === 'DELETE') {
+        const lease = store.revokePreviewLease(previewLease[1]!);
+        if (!lease) return this.json(res, 404, { error: 'preview lease not found' });
+        const handle = store.currentWorld(lease.worldId) as import('../world/types.js').WorldHandle | undefined;
+        if (handle && this.deps.worldAccess) await this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, lease.runnerLeaseId);
+        else if (lease.runnerLeaseId) this.deps.runners?.release(lease.runnerLeaseId, lease.provider);
+        return this.json(res, 200, { ok: true });
       }
       // Conversation file links are readable wherever the conversation itself
       // is readable. They use the same world confinement as review artifacts,
@@ -994,19 +2173,38 @@ export class Gateway {
       if (sessMatch && method === 'GET') {
         const id = sessMatch[1]!;
         const t = store.getTask(id);
-        // Each role → { id, home?, provider? } so the UI can build a CLI resume
-        // command targeting the right CONFIG_DIR/CODEX_HOME (provider sessions are
-        // home-bound). `home` is omitted for API-key/stateless sessions.
-        const out: Record<string, { id: string; home?: string; provider?: string }> = {};
+        // Include the exact effective agent selection captured at queue time (and
+        // kept current after an accepted in-flight retune). Besides powering the
+        // CLI fork command, the expanded task form uses this to prefill a newly
+        // selected fork with the source agent's provider/model/effort.
+        const agents = (await api.getTaskView(token, id).catch(() => undefined))?.agents;
+        const out: Record<string, { id: string; home?: string; provider?: string; model?: string; effort?: AgentSpec['effort'] }> = {};
         for (const role of ['do', 'merge', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'confirm']) {
           const sessionTaskId = role === 'confirm' ? (t?.intentId ?? id) : id;
           const s = store.kvGet(`session:${sessionTaskId}:${role}`);
           if (!s) continue;
           let home: string | undefined;
           let provider: string | undefined;
+          let model: string | undefined;
+          let effort: AgentSpec['effort'];
           const meta = store.kvGet(`sessionmeta:${sessionTaskId}:${role}`);
-          if (meta) { try { const m = JSON.parse(meta); home = m.home || undefined; provider = m.provider || undefined; } catch { /* ignore */ } }
-          out[role] = { id: s, ...(home ? { home } : {}), ...(provider ? { provider } : {}) };
+          if (meta) {
+            try {
+              const m = JSON.parse(meta);
+              home = m.home || undefined;
+              provider = m.provider || undefined;
+              model = m.model || undefined;
+              effort = m.effort || undefined;
+            } catch { /* ignore */ }
+          }
+          const spec = agents?.[role];
+          out[role] = {
+            id: s,
+            ...(home ? { home } : {}),
+            ...(spec?.provider || provider ? { provider: spec?.provider ?? provider } : {}),
+            ...(spec?.model || model ? { model: spec?.model ?? model } : {}),
+            ...(spec?.effort || effort ? { effort: spec?.effort ?? effort } : {}),
+          };
         }
         return this.json(res, 200, out);
       }
@@ -1051,6 +2249,47 @@ export class Gateway {
         await api.moveAgentQueueItem(token, String(b.turnId), b.beforeTurnId ? String(b.beforeTurnId) : undefined);
         return this.json(res, 200, { ok: true });
       }
+      // Wiki — org/project skills, memories, and general prompts. One route
+      // family per scope; KarmaxApi enforces read/write capabilities and path
+      // safety, so the wiki works identically for humans (UI) and agents
+      // (read_wiki/search_wiki/platform_request, including from cloud worlds).
+      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search|suggest|refs|history))?$/);
+      if (wikiMatch) {
+        const scope = wikiMatch[1] === 'projects' ? ('project' as const) : ('organization' as const);
+        const id = wikiMatch[2]!;
+        const sub = wikiMatch[3];
+        const selector = {
+          ...(url.searchParams.get('taskId') ? { taskId: String(url.searchParams.get('taskId')) } : {}),
+          ...(url.searchParams.get('branch') ? { branch: String(url.searchParams.get('branch')) } : {}),
+        };
+        try {
+          if (!sub && method === 'GET') return this.json(res, 200, await api.readWikiResolved(token, scope, id, url.searchParams.get('path') ?? '', selector));
+          if (sub === 'page') {
+            if (method === 'GET') {
+              const read = await api.readWikiResolved(token, scope, id, String(url.searchParams.get('path') ?? ''), selector);
+              return 'page' in read ? this.json(res, 200, read.page) : this.json(res, 404, { error: 'wiki page not found' });
+            }
+            if (method === 'PUT') {
+              const b = await this.body(req);
+              return this.json(res, 200, await api.saveWikiPageResolved(token, scope, id, {
+                path: String(b.path ?? ''), content: String(b.content ?? ''), kind: b.kind === 'memory' ? 'memory' : 'skill',
+                create: b.create === true, prevPath: b.prevPath ? String(b.prevPath) : undefined,
+              }, selector));
+            }
+            if (method === 'DELETE') return this.json(res, 200, await api.deleteWikiPageResolved(token, scope, id, String(url.searchParams.get('path') ?? ''), selector));
+          }
+          if (sub === 'search' && method === 'GET') return this.json(res, 200, await api.searchWikiResolved(token, scope, id, String(url.searchParams.get('q') ?? ''), selector));
+          if (sub === 'suggest' && method === 'GET') return this.json(res, 200, await api.suggestWikiResolved(token, scope, id, String(url.searchParams.get('q') ?? ''), selector));
+          if (sub === 'refs' && method === 'GET' && scope === 'project') return this.json(res, 200, api.wikiViews(token, id));
+          if (sub === 'history' && method === 'GET' && scope === 'organization')
+            return this.json(res, 200, api.organizationWikiHistory(token, id, url.searchParams.get('path') ?? undefined));
+        } catch (error) {
+          if (error instanceof CapabilityError) throw error;
+          const conflict = /already exists/.test(String((error as Error)?.message));
+          return this.json(res, conflict ? 409 : 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
       // platform API surface used by the MCP server (save skill / propose edit)
       if (p === '/api/skills' && method === 'POST') {
         const b = await this.body(req);
@@ -1170,8 +2409,9 @@ export class Gateway {
       // accounts: API-key handles (broker; secrets write-only) + config-home
       // logins (SPEC §7.3 — switchable per-account subscriptions).
       if (p === '/api/accounts' && method === 'GET') {
+        const { agentAccountHandles } = await import('../platform/credential-sources.js');
         return this.json(res, 200, {
-          handles: this.deps.broker?.listHandles() ?? [],
+          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? []),
           // never expose the home's absolute path to the browser
           logins: (this.deps.configHomes?.list() ?? []).map((a) => ({ provider: a.provider, account: a.account, loggedIn: a.loggedIn })),
         });
@@ -1325,9 +2565,9 @@ export class Gateway {
         return this.json(res, 200, { ok: true, maxConcurrent: n });
       }
 
-      // Proactive quota (#6): real usage % + reset for each pollable Claude login.
+      // Proactive quota (#6): real usage % + reset for each pollable subscription.
       // GET returns the cached snapshots; recheck re-probes on demand (the button).
-      // Codex/API-key/setup-token creds aren't pollable → they show reactive status.
+      // API-key/setup-token creds aren't pollable → they show reactive status.
       if (p === '/api/accounts/usage' && method === 'GET') {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
@@ -1347,9 +2587,9 @@ export class Gateway {
             const snap = JSON.parse(cached);
             usage[c.key] = canPoll ? { ...snap, stale: isUsageStale(snap, Date.now()) } : snap;
           }
-          // Explain absence on a Claude login that CAN'T be polled (setup-token, no
-          // full `.credentials.json`) so the dashboard shows a reason, not a blank.
-          else if (!canPoll && c.provider === 'claude' && c.kind !== 'key') usage[c.key] = { ok: false, reason: 'setup-token' };
+          // Explain absence on a login that CAN'T be polled (setup-token, no full
+          // native credential) so the dashboard shows a reason, not a blank.
+          else if (!canPoll && c.kind !== 'key') usage[c.key] = { ok: false, reason: 'setup-token' };
         }
         return this.json(res, 200, { usage, pollable });
       }
@@ -1411,8 +2651,17 @@ export class Gateway {
         if (!m) return this.json(res, 404, { error: 'no workflow' });
         const gs = (s: string, w: string) => store.getSettings(s, w);
         const project = store.getProject(projectId);
-        const globalVals = globalSettingsFor(gs, wf);
-        const projectVals = project ? projectSettingsFor(gs, project, wf) : {};
+        const organizationId = url.searchParams.get('organizationId') ?? project?.organizationId;
+        const globalVals = { ...globalSettingsFor(gs, wf, organizationId ?? undefined) };
+        const projectVals = project ? { ...projectSettingsFor(gs, project, wf) } : {};
+        // "Agent environment" (worldProvider) is stored in the execution policy, not
+        // the settings rows — surface the real organization default + project override
+        // so the Task Defaults form shows and inherits the true selection (§11).
+        if (organizationId && globalVals.worldProvider === undefined) {
+          const orgProvider = store.getOrganizationExecutionPolicy(organizationId).worldProvider;
+          if (orgProvider !== undefined) globalVals.worldProvider = orgProvider;
+        }
+        if (project?.config.worldProvider !== undefined) projectVals.worldProvider = project.config.worldProvider;
         // Detect the repo's real default branch so placeholders show it (not "main").
         const repo0 = project?.config.repos?.[0] ? expandPath(project.config.repos[0]) : undefined;
         const db = repo0 ? await defaultBranch(repo0).catch(() => undefined) : undefined;
@@ -1424,11 +2673,10 @@ export class Gateway {
           }
           return out;
         };
-        // Quick-task defaults (SPEC §10.4): a separate overlay that only applies to
-        // tasks added from the quick box. Global-quick inherits from global-general;
-        // project-quick inherits from global-quick (primary) with project-general as
-        // the alternative source (the two "Reset to inherited" buttons in the UI).
-        const globalQuickVals = quickGlobalSettingsFor(gs, wf);
+        // Quick-task agent defaults (SPEC §10.4): an agent-only overlay for tasks
+        // added from the quick box. Project Quick agents inherit through the
+        // organization Quick agents into the regular project/organization agents.
+        const globalQuickVals = quickGlobalSettingsFor(gs, wf, organizationId ?? undefined);
         const projectQuickVals = project ? quickProjectSettingsFor(gs, project.id, wf) : {};
         return this.json(res, 200, {
           task: { own: {}, inherited: enrich(resolveParams(m, { project: projectVals, global: globalVals }), {}) },
@@ -1437,16 +2685,39 @@ export class Gateway {
           globalQuick: { own: globalQuickVals, inherited: enrich(resolveParams(m, { global: globalVals }), globalQuickVals) },
           projectQuick: {
             own: projectQuickVals,
-            // Primary inherited: the full quick chain minus project-quick itself
-            // (global-quick → project-general → global-general → default).
             inherited: enrich(resolveParamsLayers(m, [globalQuickVals, projectVals, globalVals]), { ...projectVals, ...globalVals, ...globalQuickVals, ...projectQuickVals }),
-            // Alternative inherited source: the project's general defaults.
-            inheritedAlt: enrich(resolveParams(m, { project: projectVals, global: globalVals }), { ...projectVals, ...globalVals, ...projectQuickVals }),
           },
         });
       }
 
       // settings (global + per-project, per workflow)
+      const organizationSettings = p.match(/^\/api\/organizations\/([^/]+)\/settings\/([^/]+)$/);
+      if (organizationSettings) {
+        const [_, organizationId, wf] = organizationSettings;
+        if (method === 'GET') return this.json(res, 200, globalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          const values = b.values ?? {};
+          store.setSettings(`organization:${organizationId}`, wf!, values);
+          // The organization "Agent environment" default lives in the execution
+          // policy (so runner-pool compatibility and effectiveProjectConfig agree);
+          // mirror a non-empty selection there. Blank at organization scope means
+          // "unchanged" — the top-level default is always a concrete provider.
+          if (values.worldProvider)
+            store.setOrganizationExecutionPolicy(organizationId!, { worldProvider: values.worldProvider as string });
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const organizationQuickSettings = p.match(/^\/api\/organizations\/([^/]+)\/quick-settings\/([^/]+)$/);
+      if (organizationQuickSettings) {
+        const [_, organizationId, wf] = organizationQuickSettings;
+        if (method === 'GET') return this.json(res, 200, quickGlobalSettingsFor((s, w) => store.getSettings(s, w), wf!, organizationId));
+        if (method === 'PUT') {
+          const b = await this.body(req);
+          store.setSettings(`quick:organization:${organizationId}`, wf!, b.values ?? {});
+          return this.json(res, 200, { ok: true });
+        }
+      }
       const gset = p.match(/^\/api\/settings\/global\/([^/]+)$/);
       if (gset) {
         const wf = gset[1]!;
@@ -1477,6 +2748,11 @@ export class Gateway {
           // Mirror bound-project fields into ProjectConfig for back-compat.
           const m = manifest(wf);
           if (m) store.updateProjectConfig(projectId, settingsToProjectConfig(m, values));
+          // "Agent environment" is canonically an execution-policy value; mirror it so
+          // effectiveProjectConfig, runner-pool compatibility, and the Compute section
+          // stay coherent (empty ⇒ clear the override and inherit the organization).
+          if (Object.prototype.hasOwnProperty.call(values, 'worldProvider'))
+            store.setProjectExecutionPolicy(projectId, { worldProvider: (values.worldProvider as string) || null });
           return this.json(res, 200, { ok: true });
         }
       }
@@ -1547,20 +2823,77 @@ export class Gateway {
     }
   }
 
-  private async activateWorkflow(token: string, projectId: string, workflow: string) {
-    const m = manifest(workflow);
-    const spawned: string[] = [];
-    if (m?.onActivate?.spawnTask) {
-      const t = m.onActivate.spawnTask;
-      const task = await this.deps.api.createTask(token, {
+  /**
+   * Seed a brand-new project with its preparation task (SPEC §4.6). A new project's
+   * tasks default to the `software-dev` workflow, so we seed that workflow's
+   * `onActivate` prep task — "make this project karmax-ready" — as the first task on
+   * the list. It's created as a **draft**: a project is usually created (name only)
+   * before its repository is configured, and a repo-oriented task can't run without
+   * one — so the prep task waits on the list for the user to queue once the repo is
+   * set, rather than failing creation or running against an empty sandbox.
+   * Best-effort: a failure here must never fail project creation.
+   */
+  private async spawnProjectPrepTask(token: string, projectId: string): Promise<void> {
+    const prep = manifest('software-dev')?.onActivate?.spawnTask;
+    if (!prep) return;
+    try {
+      await this.deps.api.createTask(token, {
         projectId,
-        title: t.title,
-        prompt: t.prompt,
-        workflow: t.workflow,
+        title: prep.title,
+        prompt: prep.prompt,
+        workflow: prep.workflow,
+        draft: true,
       });
-      spawned.push(task.id);
+    } catch (error) {
+      console.warn(`[karmax] could not spawn prep task for ${projectId}:`, error instanceof Error ? error.message : error);
     }
-    return { activated: workflow, requires: m?.requires ?? [], spawnedTasks: spawned };
+  }
+
+  /** Initialize the local canonical wiki immediately. When GitHub is fully
+   * connected and the creating human authorized, also create its private
+   * companion remote; otherwise the local repo remains ready and this is
+   * retried naturally when a project is next set up. */
+  private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
+    const root = ensureProjectWikiRepository(paths().content, project.id);
+    if (!this.deps.store.projectWiki(project.id)) this.deps.store.setProjectWikiRepository(project.id);
+    const current = this.deps.store.projectWiki(project.id)?.repository;
+    if (current && this.wikiRemotesReady.has(project.id)) return;
+    if (!this.deps.githubApp) return;
+    const organizationId = project.organizationId ?? 'org_personal';
+    const candidates = [...new Set([
+      ...(userId ? [userId] : []),
+      ...this.deps.store.listOrganizationMemberships(organizationId)
+        .sort((a, b) => Number(b.role === 'owner') - Number(a.role === 'owner'))
+        .map((membership) => membership.userId),
+    ])];
+    const actor = candidates.find((candidate) => this.deps.githubApp!.status(candidate).userAuthorized);
+    if (!actor) return;
+    const connections = this.deps.store.listGitConnections(organizationId);
+    const attachedConnectionIds = [...new Set(this.deps.store.listProjectRepositories(project.id)
+      .map((candidate) => candidate.repository.gitConnectionId).filter((id): id is string => Boolean(id)))];
+    const connection = current?.gitConnectionId
+      ? connections.find((candidate) => candidate.id === current.gitConnectionId)
+      : attachedConnectionIds.length === 1
+      ? connections.find((candidate) => candidate.id === attachedConnectionIds[0])
+      : connections.length === 1 ? connections[0] : undefined;
+    if (!connection) return;
+    try {
+      const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
+      const name = `${base}-wiki-${project.id.slice(-8)}`;
+      const repository = current ?? this.deps.store.listRepositories(organizationId)
+        .find((candidate) => candidate.gitConnectionId === connection.id && candidate.name === name)
+        ?? await this.deps.githubApp.createRepository(connection.id, actor, {
+          name, description: `Karmax project wiki for ${project.name}`,
+          private: true, defaultBranch: 'main', autoInit: false,
+        });
+      // Link before the push so even a transient network failure keeps this
+      // platform-owned repository out of the ordinary project repo picker.
+      this.deps.store.setProjectWikiRepository(project.id, repository.id);
+      setProjectWikiRemote(root, repository.sshUrl, this.deps.githubApp.repositorySshKey(repository.id, 'write'));
+      this.wikiRemotesReady.add(project.id);
+    } catch (error) {
+      console.warn(`[karmax] could not create wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
+    }
   }
 
   private async availableModels(refresh = false): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
@@ -1633,9 +2966,9 @@ export class Gateway {
     await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).registerAccounts(pool).catch(() => undefined);
   }
 
-  /** Probe usage for the pollable Claude logins (all, or just `only`) and cache the
+  /** Probe usage for pollable subscription logins (all, or just `only`) and cache the
    *  snapshots in kv under `usage:<credKey>`. Drives the dashboard's real %; a probe
-   *  shells out `claude -p '/usage'` in an isolated dir so it can't race a leased home.
+   *  asks the provider's native CLI for account quota without spending a model turn.
    *  Overlapping rechecks (auto-refresh + button, multiple tabs) share one in-flight
    *  probe per login rather than spawning duplicate CLIs. */
   private usageProbes = new Map<string, Promise<unknown>>();
@@ -1643,15 +2976,16 @@ export class Gateway {
     const { store } = this.deps;
     const { enumerateCredentials } = await import('../platform/credentials.js');
     const { gatherCredentialSources } = await import('../platform/credential-sources.js');
-    const { probeClaudeUsage, isUsagePollable } = await import('../agent/usage.js');
+    const { probeClaudeUsage, probeCodexUsage, isUsagePollable } = await import('../agent/usage.js');
     const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }))
       .filter((c) => isUsagePollable(c) && (!only || c.key === only));
     const out: Record<string, unknown> = {};
     await Promise.all(creds.map(async (c) => {
       let probe = this.usageProbes.get(c.key);
       if (!probe) {
-        // ambient uses ~/.claude (no configHome); a login uses its own home.
-        probe = probeClaudeUsage({ configHome: c.kind === 'ambient' ? undefined : c.configHome })
+        // Ambient uses the provider's default home; a managed login uses its own.
+        const configHome = c.kind === 'ambient' ? undefined : c.configHome;
+        probe = (c.provider === 'codex' ? probeCodexUsage({ configHome }) : probeClaudeUsage({ configHome }))
           .then((snap) => { store.kvSet(`usage:${c.key}`, JSON.stringify(snap)); return snap; })
           .finally(() => this.usageProbes.delete(c.key));
         this.usageProbes.set(c.key, probe);
@@ -1729,41 +3063,389 @@ export class Gateway {
     }
   }
 
-  /** Serve a produced artifact (an `open` action's file target) from the task's
-   *  world, so the UI can open a PDF/image/video/notebook it generated. Path is
-   *  confined to the world root — no traversal outside it. */
+  /** Serve an artifact through its world provider. The browser never receives a
+   * host/sandbox path and remote worlds need no public filesystem endpoint.
+   * `sourceFile` (conversation file links) defaults unknown extensions to an
+   * inline text view instead of a download, for a useful source view. */
   private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
-    const worldPath = this.deps.store.getTask(taskId)?.lastView?.worldPath;
-    if (!worldPath) return this.json(res, 404, { error: 'no world for this task' });
+    const task = this.deps.store.getTask(taskId);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
+    if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
+    // Relative artifact paths are authored from the agent's default cwd, while
+    // provider file APIs are rooted at the whole world boundary. Absolute
+    // citations may name any checkout inside that boundary.
+    const root = String(handle.root ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+    const normalized = relPath.replace(/\\/g, '/');
+    if (normalized.startsWith('/')) {
+      if (normalized !== root && !normalized.startsWith(`${root}/`))
+        return this.json(res, 400, { error: 'path escapes world' });
+      relPath = normalized.slice(root.length + 1) || '.';
+    } else {
+      try { relPath = worldWorkingRelativePath(handle, relPath); }
+      catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
+    let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
     try {
-      const root = await fs.promises.realpath(path.resolve(worldPath));
-      const requested = path.resolve(root, relPath);
-      if (requested !== root && !requested.startsWith(root + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
-      // A lexical prefix check does not catch a symlink in the world pointing
-      // outside it. Confine the resolved target too before reading any bytes.
-      const file = await fs.promises.realpath(requested);
-      if (file !== root && !file.startsWith(root + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
-      const stat = await fs.promises.stat(file);
-      if (stat.isDirectory()) return this.json(res, 400, { error: 'path is a directory' });
-      const data = await fs.promises.readFile(file);
-      const inferredType = ARTIFACT_MIME[path.extname(file).toLowerCase()];
+      access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+      const world = access?.world ?? await this.deps.worlds.open(handle);
+      // A symlink inside a host-visible world must not read outside it (the
+      // provider's lexical traversal guard cannot see link targets). Remote
+      // sandboxes confine reads at the provider boundary instead.
+      const hostBase = path.resolve(handle.root ?? '');
+      const hostPath = relPath === '.' ? hostBase : path.resolve(hostBase, relPath);
+      if (fs.existsSync(hostPath)) {
+        const real = await fs.promises.realpath(hostPath);
+        const realBase = await fs.promises.realpath(hostBase).catch(() => hostBase);
+        if (real !== realBase && !real.startsWith(realBase + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
+      }
+      const data = await world.readFileBuffer(relPath);
+      const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
       const looksTextual = !data.subarray(0, 8192).includes(0);
       res.writeHead(200, {
         'content-type': inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
         'content-length': String(data.length),
-        'content-disposition': `inline; filename="${path.basename(file).replace(/["\\\r\n]/g, '_')}"`,
+        'content-disposition': `inline; filename="${path.basename(relPath).replace(/["\\\r\n]/g, '_')}"`,
         'cache-control': 'no-store',
         'x-content-type-options': 'nosniff',
       });
       res.end(data);
-    } catch {
-      this.json(res, 404, { error: 'artifact not found' });
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error);
+      this.json(res, /escape|relative/i.test(message) ? 400 : 404, { error: /escape|relative/i.test(message) ? message : 'artifact not found' });
+    } finally { await access?.release(); }
+  }
+
+  /** Reverse proxy for services inside a remote world. Provider traffic tokens
+   * stay server-side. Request credentials are deliberately not forwarded: the
+   * repository application receives only a small HTTP header allowlist. */
+  private async servePreview(req: http.IncomingMessage, res: http.ServerResponse, taskId: string,
+    port: number, requestPath: string, proxyBase: string) {
+    const task = this.deps.store.getTask(taskId);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
+    if (!handle) return this.json(res, 404, { error: 'no world for this task' });
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) return this.json(res, 400, { error: 'invalid preview port' });
+    const method = req.method ?? 'GET';
+    if (!PREVIEW_METHODS.has(method)) {
+      res.writeHead(405, { allow: [...PREVIEW_METHODS].join(', ') });
+      return void res.end();
+    }
+    let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
+    try {
+      const body = method === 'GET' || method === 'HEAD' ? undefined : await this.rawBody(req, MAX_PREVIEW_REQUEST_BYTES);
+      access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+      const world = access?.world ?? await this.deps.worlds.open(handle);
+      if (!world.fetchPort) throw new Error('this world provider does not expose remote previews');
+      const forwarded: Record<string, string> = {};
+      for (const name of PREVIEW_REQUEST_HEADERS) {
+        const value = req.headers[name];
+        if (typeof value === 'string') forwarded[name] = value;
+        else if (Array.isArray(value)) forwarded[name] = value.join(', ');
+      }
+      const response = await world.fetchPort(port, requestPath, { method, headers: forwarded, body });
+      const headers: Record<string, string> = {};
+      for (const name of ['content-type', 'cache-control', 'etag', 'last-modified', 'location',
+        'content-range', 'accept-ranges', 'vary']) {
+        if (response.headers[name]) headers[name] = response.headers[name]!;
+      }
+      if (headers.location) headers.location = previewLocation(taskId, port, headers.location, proxyBase) ?? '';
+      if (!headers.location) delete headers.location;
+      headers['content-length'] = String(response.body.length);
+      headers['referrer-policy'] = 'no-referrer';
+      headers['x-content-type-options'] = 'nosniff';
+      res.writeHead(response.status, headers);
+      res.end(method === 'HEAD' ? undefined : response.body);
+    } catch (error) {
+      const tooLarge = error instanceof AttachmentError && /too large/i.test(error.message);
+      this.json(res, tooLarge ? 413 : 502,
+        { error: tooLarge ? error.message : `preview unavailable: ${String((error as Error)?.message ?? error)}` });
+    } finally { await access?.release(); }
+  }
+
+  private async serveLeasedPreview(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+    const match = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
+    const lease = match ? this.deps.store.previewLease(match[1]!) : undefined;
+    if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.json(res, 404, { error: 'preview not found or expired' });
+    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase())
+      return this.json(res, 404, { error: 'preview not found or expired' });
+    const current = this.deps.store.currentWorld(lease.worldId);
+    if (!current || (current.generation ?? 1) !== lease.generation) return this.json(res, 410, { error: 'preview world generation is no longer current' });
+    if (lease.tokenHash) {
+      const queryToken = url.searchParams.get('token') ?? '';
+      const cookieToken = previewCookieValue(typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined, lease.id);
+      const supplied = queryToken || cookieToken;
+      if (!previewTokenMatches(lease.tokenHash, supplied))
+        return this.json(res, 401, { error: 'invalid preview token' });
+      // Exchange the URL bearer for an HttpOnly, lease-path-scoped cookie. This
+      // makes relative CSS/JS and HMR sockets work without leaking the token via
+      // Referer, browser history, or application JavaScript.
+      if (queryToken && (req.method === 'GET' || req.method === 'HEAD')) {
+        const query = new URLSearchParams(url.searchParams);
+        query.delete('token');
+        res.writeHead(303, { location: `${url.pathname}${query.size ? `?${query}` : ''}`,
+          'set-cookie': previewCookieHeader(lease.id, queryToken, lease.expiresAt),
+          'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+        return void res.end();
+      }
+      if (queryToken) res.setHeader('set-cookie', previewCookieHeader(lease.id, queryToken, lease.expiresAt));
+    } else {
+      const session = await this.auth(req, lease.projectId, lease.organizationId);
+      if (!session || !this.deps.tokens.check(session.apiToken, 'task:read', { projectId: lease.projectId, taskId: lease.taskId }).ok)
+        return this.json(res, 401, { error: 'unauthorized' });
+    }
+    const requestPath = `${match?.[2] ?? '/'}${url.searchParams.has('token')
+      ? (() => { const q = new URLSearchParams(url.searchParams); q.delete('token'); return q.size ? `?${q}` : ''; })()
+      : url.search}`;
+    return this.servePreview(req, res, lease.taskId, lease.port, requestPath,
+      `/preview/${encodeURIComponent(lease.id)}`);
+  }
+
+  /** Authenticated bidirectional proxy for HMR/live-reload sockets in a task
+   * preview. The browser sees only Karmax; provider URLs and access tokens stay
+   * on this side of the trust boundary. */
+  private async previewWebSocket(browser: import('ws').WebSocket, req: http.IncomingMessage): Promise<void> {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    let taskId: string;
+    let port: number;
+    let requestPath: string;
+    const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
+    if (taskMatch) {
+      if (configuredPreviewOrigin()) { browser.close(4403, 'use isolated preview origin'); return; }
+      taskId = decodeURIComponent(taskMatch[1]!);
+      port = Number(taskMatch[2]);
+      const task = this.deps.store.getTask(taskId);
+      const auth = await this.socketAuth(req, url, task?.projectId);
+      if (!task || !auth || !this.deps.tokens.check(auth.apiToken, 'task:review:execute', { projectId: task.projectId, taskId }).ok) {
+        browser.close(4403, 'forbidden'); return;
+      }
+      const query = new URLSearchParams(url.searchParams); query.delete('token');
+      requestPath = `${taskMatch[3] ?? '/'}${query.size ? `?${query}` : ''}`;
+    } else {
+      const leaseMatch = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
+      const lease = leaseMatch ? this.deps.store.previewLease(leaseMatch[1]!) : undefined;
+      if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
+        browser.close(4404, 'preview expired'); return;
+      }
+      const current = this.deps.store.currentWorld(lease.worldId);
+      if (!current || (current.generation ?? 1) !== lease.generation) { browser.close(4410, 'world changed'); return; }
+      if (lease.tokenHash) {
+        const queryToken = url.searchParams.get('token') ?? '';
+        const cookieToken = previewCookieValue(typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined, lease.id);
+        if (!previewTokenMatches(lease.tokenHash, queryToken || cookieToken)) {
+          browser.close(4401, 'invalid token'); return;
+        }
+      } else {
+        const auth = await this.auth(req, lease.projectId, lease.organizationId);
+        if (!auth || !this.deps.tokens.check(auth.apiToken, 'task:read', { projectId: lease.projectId, taskId: lease.taskId }).ok) {
+          browser.close(4401, 'unauthorized'); return;
+        }
+      }
+      taskId = lease.taskId;
+      port = lease.port;
+      const query = new URLSearchParams(url.searchParams); query.delete('token');
+      requestPath = `${leaseMatch?.[2] ?? '/'}${query.size ? `?${query}` : ''}`;
+    }
+    const task = this.deps.store.getTask(taskId);
+    const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
+    if (!handle) { browser.close(4404, 'world unavailable'); return; }
+    const access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
+    const world = access?.world ?? await this.deps.worlds.open(handle);
+    if (!world.previewSocketTarget) { await access?.release(); browser.close(4400, 'provider has no WebSocket previews'); return; }
+    let target: Awaited<ReturnType<NonNullable<typeof world.previewSocketTarget>>>;
+    try { target = await world.previewSocketTarget(port, requestPath); }
+    catch { await access?.release(); browser.close(1011, 'preview upstream unavailable'); return; }
+    const protocols = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map((value) => value.trim()).filter(Boolean);
+    const upstream = new WebSocketClient(target.url, protocols, { headers: target.headers });
+    const pending: Array<{ data: import('ws').RawData; binary: boolean }> = [];
+    browser.on('message', (data, binary) => {
+      if (upstream.readyState === WebSocketClient.OPEN) upstream.send(data, { binary });
+      else if (upstream.readyState === WebSocketClient.CONNECTING && pending.length < 100) pending.push({ data, binary });
+    });
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      void access?.release();
+    };
+    browser.on('close', (code, reason) => {
+      release();
+      if (upstream.readyState === WebSocketClient.CONNECTING) upstream.terminate();
+      else if (upstream.readyState === WebSocketClient.OPEN) upstream.close(code || 1000, reason.toString());
+    });
+    browser.on('error', () => { release(); upstream.terminate(); });
+    upstream.on('open', () => {
+      for (const message of pending.splice(0)) upstream.send(message.data, { binary: message.binary });
+    });
+    upstream.on('message', (data, binary) => { if (browser.readyState === browser.OPEN) browser.send(data, { binary }); });
+    upstream.on('close', (code, reason) => { release(); if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
+    upstream.on('error', () => { release(); if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
+  }
+
+  /** SCIM 2.0 provisioning boundary. A tenant-scoped bearer token is stored only
+   * as a hash; deprovisioning removes every org/team/project grant and revokes
+   * browser + platform sessions without deleting an identity used by another org. */
+  private async scim(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+    const match = url.pathname.match(/^\/scim\/v2\/([^/]+)\/(Users|Groups)(?:\/([^/]+))?$/);
+    if (!match || !this.deps.identity) return this.scimJson(res, 404, { detail: 'resource not found' });
+    const organizationId = decodeURIComponent(match[1]!);
+    const token = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+    if (!this.deps.store.verifyScimToken(organizationId, token)) return this.scimJson(res, 401, { detail: 'invalid bearer token' });
+    const resource = match[2]!;
+    const id = match[3] ? decodeURIComponent(match[3]) : undefined;
+    const method = req.method ?? 'GET';
+    try {
+      const body = method === 'GET' || method === 'DELETE' ? {} : await this.body(req);
+      if (resource === 'Users') {
+        if (method === 'GET' && id) {
+          const user = this.deps.identity.listUsers().find((candidate) => candidate.id === id);
+          if (!user || !this.deps.store.organizationMembership(organizationId, id)) return this.scimJson(res, 404, { detail: 'user not found' });
+          return this.scimJson(res, 200, scimUser(user));
+        }
+        if (method === 'GET') {
+          const filter = url.searchParams.get('filter')?.match(/^userName\s+eq\s+"([^"]+)"$/i)?.[1]?.toLowerCase();
+          const members = new Set(this.deps.store.listOrganizationMemberships(organizationId).map((member) => member.userId));
+          const users = this.deps.identity.listUsers().filter((user) => members.has(user.id) && (!filter || user.email.toLowerCase() === filter));
+          return this.scimJson(res, 200, scimList(users.map((user) => scimUser(user))));
+        }
+        if (method === 'POST') {
+          const email = String(body.userName ?? body.emails?.find((entry: any) => entry.primary)?.value ?? '').trim().toLowerCase();
+          if (!email) return this.scimJson(res, 400, { detail: 'userName is required' });
+          let user = this.deps.identity.listUsers().find((candidate) => candidate.email.toLowerCase() === email);
+          if (!user) user = await this.deps.identity.createUser({ name: String(body.displayName ?? body.name?.formatted ?? email.split('@')[0]),
+            email, password: crypto.randomBytes(24).toString('base64url') });
+          this.deps.store.setOrganizationMembership(organizationId, user.id, 'member');
+          this.deps.authorization?.grant('system:scim', { principalId: `user:${user.id}`,
+            scopeKey: `organization:${organizationId}`, profileId: 'developer',
+            capabilities: ['organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*'] });
+          return this.scimJson(res, 201, scimUser(user));
+        }
+        if ((method === 'PATCH' || method === 'PUT') && id) {
+          const activeOperation = body.Operations?.find((operation: any) => String(operation.path ?? '').toLowerCase() === 'active');
+          const active = activeOperation ? activeOperation.value !== false : body.active !== false;
+          if (!active) {
+            this.deps.store.deprovisionOrganizationUser(organizationId, id);
+            this.deps.identity.revokeUserSessions(id);
+          } else if (!this.deps.store.organizationMembership(organizationId, id)) this.deps.store.setOrganizationMembership(organizationId, id, 'member');
+          const user = this.deps.identity.listUsers().find((candidate) => candidate.id === id);
+          return this.scimJson(res, 200, user ? scimUser(user, active) : { id, active });
+        }
+        if (method === 'DELETE' && id) {
+          this.deps.store.deprovisionOrganizationUser(organizationId, id);
+          this.deps.identity.revokeUserSessions(id);
+          res.writeHead(204); return void res.end();
+        }
+      }
+      if (resource === 'Groups') {
+        if (method === 'GET' && id) {
+          const team = this.deps.store.getTeam(id);
+          if (!team || team.organizationId !== organizationId) return this.scimJson(res, 404, { detail: 'group not found' });
+          return this.scimJson(res, 200, scimGroup(team, this.deps.store.listTeamMemberships(team.id)));
+        }
+        if (method === 'GET') return this.scimJson(res, 200, scimList(this.deps.store.listTeams(organizationId)
+          .map((team) => scimGroup(team, this.deps.store.listTeamMemberships(team.id)))));
+        if (method === 'POST') {
+          const team = this.deps.store.createTeam({ organizationId, name: String(body.displayName ?? 'Team') });
+          for (const member of body.members ?? []) if (this.deps.store.organizationMembership(organizationId, String(member.value)))
+            this.deps.store.setTeamMembership(team.id, String(member.value));
+          return this.scimJson(res, 201, scimGroup(team, this.deps.store.listTeamMemberships(team.id)));
+        }
+        if ((method === 'PUT' || method === 'PATCH') && id) {
+          const team = this.deps.store.getTeam(id);
+          if (!team || team.organizationId !== organizationId) return this.scimJson(res, 404, { detail: 'group not found' });
+          const members = body.members ?? body.Operations?.find((operation: any) => String(operation.path ?? '').toLowerCase() === 'members')?.value;
+          if (Array.isArray(members)) {
+            this.deps.store.db.prepare('DELETE FROM team_memberships WHERE teamId=?').run(team.id);
+            for (const member of members) if (this.deps.store.organizationMembership(organizationId, String(member.value)))
+              this.deps.store.setTeamMembership(team.id, String(member.value));
+          }
+          return this.scimJson(res, 200, scimGroup(team, this.deps.store.listTeamMemberships(team.id)));
+        }
+      }
+      return this.scimJson(res, 405, { detail: 'method not supported' });
+    } catch (error) {
+      return this.scimJson(res, /owner/i.test(String((error as Error)?.message)) ? 409 : 400,
+        { detail: error instanceof Error ? error.message : String(error) });
     }
   }
 
+  private scimJson(res: http.ServerResponse, status: number, body: unknown) {
+    const value = JSON.stringify(body);
+    res.writeHead(status, { 'content-type': 'application/scim+json', 'content-length': String(Buffer.byteLength(value)) });
+    res.end(value);
+  }
+
   // ── helpers ──
-  private async auth(req: http.IncomingMessage, projectId?: string): Promise<Session | undefined> {
+  private async removeProjectExternalResources(projectId: string, reason: string) {
+    const project = this.deps.store.getProject(projectId);
+    if (!project) throw new Error('project not found');
+    const resources = this.deps.store.projectResources(projectId);
+    for (const task of this.deps.store.listTasks(projectId)) {
+      try { await this.deps.client.workflow.getHandle(task.id).terminate(reason); }
+      catch (error) { if (!isWorkflowGone(error)) throw error; }
+    }
+    // Finalize billing before metadata disappears. Queued leases produce zero
+    // usage; active leases keep the elapsed provider cost in the org ledger.
+    for (const lease of resources.leases) {
+      if (this.deps.runners) this.deps.runners.release(lease.id, lease.provider);
+      else this.deps.store.releaseWorldLease(lease.id);
+    }
+    for (const handle of resources.worlds) {
+      try {
+        // Do not use registry recovery here: deletion must never restore a cold
+        // checkpoint merely to destroy the newly restored generation.
+        const world = await this.deps.worlds.get(handle.kind).open(handle as import('../world/types.js').WorldHandle);
+        await world.destroy();
+      } catch (error) { if (!isWorldGone(error)) throw error; }
+    }
+    if (resources.objectKeys.length && !this.deps.objects)
+      throw new Error('object store is unavailable; project resources were not fully deleted');
+    for (const key of resources.objectKeys) await this.deps.objects!.delete(key);
+    return resources;
+  }
+
+  private requestIsPreviewOrigin(req: http.IncomingMessage): boolean {
+    const origin = configuredPreviewOrigin();
+    if (!origin) return false;
+    try {
+      const requested = new URL(`http://${String(req.headers.host ?? '').trim()}`);
+      const base = new URL(origin);
+      return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
+        && requested.port === base.port;
+    } catch { return false; }
+  }
+
+  private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {
+    // Behind a reverse proxy, the browser is the one component that always
+    // knows the URL the human actually opened. An authenticated setup request
+    // may supply that origin instead of relying on frequently-misconfigured
+    // forwarded headers.
+    if (typeof browserUrl === 'string' && browserUrl.trim()) {
+      const parsed = new URL(browserUrl.trim());
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password)
+        throw new Error('The browser URL for GitHub setup must be an http(s) URL');
+      return parsed.origin;
+    }
+    const configured = process.env.KARMAX_PUBLIC_URL?.trim();
+    if (configured) return new URL(configured).origin;
+    const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() || 'http';
+    const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? 'localhost').split(',')[0]?.trim();
+    return new URL(`${proto}://${host}`).origin;
+  }
+
+  /** GitHub must see exactly the same origin throughout manifest, install, and
+   * OAuth callbacks. Persist the admin's browser origin during setup so a stale
+   * reverse-proxy/environment value cannot reappear midway through the flow. */
+  private githubPublicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {
+    if (browserUrl != null) {
+      const value = this.publicUrl(req, browserUrl);
+      this.deps.store.kvSet(GITHUB_APP_PUBLIC_URL_KEY, value);
+      return value;
+    }
+    return this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY) ?? this.publicUrl(req);
+  }
+
+  private async auth(req: http.IncomingMessage, projectId?: string, organizationId?: string): Promise<Session | undefined> {
     const h = req.headers['authorization'];
     const sid = h?.startsWith('Bearer ') ? h.slice(7) : undefined;
     if (sid) {
@@ -1776,16 +3458,26 @@ export class Gateway {
     const identity = await this.deps.identity.session(requestHeaders(req.headers));
     if (!identity) return undefined;
     const principal = `user:${identity.user.id}`;
-    const caps = this.deps.authorization?.capabilities(principal, projectId) ?? [];
+    const resolvedOrganizationId = organizationId ?? (projectId ? this.deps.store.getProject(projectId)?.organizationId : undefined);
+    if (resolvedOrganizationId) {
+      const policy = this.deps.store.getOrganizationIdentityPolicy(resolvedOrganizationId);
+      if (policy.enforceSso && (!policy.oidcProviderId
+        || !this.deps.identity.providersForUser(identity.user.id).includes(policy.oidcProviderId))) return undefined;
+      if (policy.enforceSso && policy.verifiedDomains.length && this.deps.store.organizationMembership(resolvedOrganizationId, identity.user.id)) {
+        const domain = identity.user.email.split('@')[1]?.toLowerCase();
+        if (!domain || !policy.verifiedDomains.includes(domain)) return undefined;
+      }
+    }
+    const caps = this.deps.authorization?.capabilities(principal, projectId, resolvedOrganizationId) ?? [];
     const fingerprint = JSON.stringify(caps.slice().sort());
-    const cacheKey = `${identity.session.id}:${projectId ?? 'global'}`;
+    const cacheKey = `${identity.session.id}:${resolvedOrganizationId ?? 'global'}:${projectId ?? '*'}`;
     let cached = this.identityTokens.get(cacheKey);
     if (!cached || cached.fingerprint !== fingerprint || !this.deps.tokens.verify(cached.apiToken)) {
       if (cached) this.deps.tokens.revoke(cached.apiToken);
-      cached = { apiToken: this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000).token, fingerprint };
+      cached = { apiToken: this.deps.tokens.mintPrincipal(principal, caps, projectId, 10 * 60 * 1000, resolvedOrganizationId).token, fingerprint };
       this.identityTokens.set(cacheKey, cached);
     }
-    return { user: identity.user.name, userId: identity.user.id, apiToken: cached.apiToken };
+    return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken };
   }
   /** Browser WebSockets carry Better Auth cookies. The legacy test/embed gateway
    * instead has a JSON session id, which may be passed explicitly in the query
@@ -1800,14 +3492,23 @@ export class Gateway {
     }
     return this.auth(req, projectId);
   }
-  private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string } {
+  private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {
     const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1]
       ?? url.searchParams.get('projectId') ?? undefined;
-    const taskId = pathname.match(/^\/api\/tasks\/([^/]+)/)?.[1] ?? url.searchParams.get('taskId') ?? undefined;
+    const artifact = pathname.match(/^\/api\/artifacts\/([^/]+)/)?.[1];
+    const artifactRecord = artifact ? this.deps.store.getPromotedArtifact(artifact) : undefined;
+    const previewId = pathname.match(/^\/api\/preview-leases\/([^/]+)/)?.[1];
+    const previewRecord = previewId ? this.deps.store.previewLease(previewId) : undefined;
+    const taskId = pathname.match(/^\/api\/tasks\/([^/]+)/)?.[1] ?? artifactRecord?.taskId ?? previewRecord?.taskId
+      ?? url.searchParams.get('taskId') ?? undefined;
     const taskProject = taskId ? this.deps.store.getTask(taskId)?.projectId : undefined;
-    return { projectId: projectId ?? taskProject, ...(taskId ? { taskId } : {}) };
+    const resolvedProjectId = projectId ?? taskProject;
+    const organizationId = pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1]
+      ?? url.searchParams.get('organizationId')
+      ?? (resolvedProjectId ? this.deps.store.getProject(resolvedProjectId)?.organizationId : undefined);
+    return { projectId: resolvedProjectId, organizationId, ...(taskId ? { taskId } : {}) };
   }
   private async sendWebResponse(res: http.ServerResponse, response: Response) {
     const body = Buffer.from(await response.arrayBuffer());
@@ -1819,62 +3520,167 @@ export class Gateway {
     res.end(body);
   }
   private json(res: http.ServerResponse, status: number, obj: unknown) {
-    const body = JSON.stringify(obj ?? null);
-    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+    const body = JSON.stringify(toPublicPayload(obj ?? null));
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8',
+      'x-karmax-cell': this.deps.cellId ?? 'local' });
+    res.end(body);
+  }
+  private githubCallbackPage(res: http.ServerResponse, status: number, message: string) {
+    const body = `<!doctype html><meta charset="utf-8"><title>Karmax · GitHub</title><main style="font:16px system-ui;max-width:42rem;margin:12vh auto;padding:2rem"><h1>GitHub connection</h1><p>${escapeHtml(message)}</p><p><a href="/organization">Return to Karmax</a></p></main>`;
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(body)),
+      'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
   private async body(req: http.IncomingMessage): Promise<any> {
-    const chunks: Buffer[] = [];
-    for await (const c of req) chunks.push(c as Buffer);
-    if (!chunks.length) return {};
+    const value = await this.rawBody(req, 2 * 1024 * 1024);
+    if (!value.length) return {};
     try {
-      return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      return JSON.parse(value.toString('utf8'));
     } catch {
       return {};
     }
   }
-  /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`
-   *  (the JSON `body()` reader is unbounded — binary uploads must be capped). */
+  /** Read a request body into a Buffer, aborting if it exceeds `maxBytes`. */
   private async rawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
     const chunks: Buffer[] = [];
     let total = 0;
+    let exceeded = false;
     for await (const c of req) {
       total += (c as Buffer).length;
       if (total > maxBytes) {
-        req.destroy();
-        throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
+        exceeded = true;
+        continue;
       }
-      chunks.push(c as Buffer);
+      if (!exceeded) chunks.push(c as Buffer);
     }
+    if (exceeded) throw new AttachmentError(`upload too large (> ${maxBytes} bytes)`);
     return Buffer.concat(chunks);
   }
   private fail(res: http.ServerResponse, e: unknown) {
     try {
-      this.json(res, 500, { error: String((e as Error)?.message ?? e) });
+      this.json(res, e instanceof AttachmentError && /too large/i.test(e.message) ? 413 : 500,
+        { error: String((e as Error)?.message ?? e) });
     } catch {
       /* ignore */
     }
   }
 }
 
-/** Tear down a check-in PTY and everything running inside it. The interactive
- *  shell node-pty spawned is a session leader (pid == session id), so killing
- *  the whole session reaps its children — foreground and background jobs alike.
- *  `pkill -s` is the thorough path; the process-group kill and `term.kill()` are
- *  fallbacks for platforms without pkill or if the session id trick misses. */
-function killPtySession(term: { pid?: number; kill?: () => void }): void {
-  const pid = term?.pid;
-  if (typeof pid === 'number') {
-    try { spawn('pkill', ['-KILL', '-s', String(pid)], { stdio: 'ignore' }).on('error', () => {}); } catch { /* no pkill */ }
-    try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+/** Keep a service's loopback redirect inside the authenticated preview proxy.
+ * External HTTP(S) redirects remain explicit; non-web schemes are discarded. */
+export function previewLocation(taskId: string, port: number, value: string,
+  proxyBase = `/api/tasks/${encodeURIComponent(taskId)}/preview/${port}`): string | undefined {
+  try {
+    const target = new URL(value, `http://localhost:${port}`);
+    if (!['http:', 'https:'].includes(target.protocol)) return undefined;
+    if (['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(target.hostname)) {
+      return `${proxyBase}${target.pathname}${target.search}${target.hash}`;
+    }
+    return target.toString();
+  } catch {
+    return undefined;
   }
-  try { term.kill?.(); } catch { /* already dead */ }
+}
+
+function previewAccessTtlMs(): number {
+  const value = Number(process.env.KARMAX_REVIEW_PREVIEW_TTL_MS);
+  return Number.isFinite(value) && value >= 60_000 ? Math.min(value, 24 * 60 * 60_000) : 8 * 60 * 60_000;
+}
+
+function reviewPorts(view: import('../domain/types.js').TaskView | undefined): Set<number> {
+  const ports = new Set<number>();
+  for (const action of view?.reviewInfo?.actions ?? []) {
+    for (const value of action.openUrls ?? []) {
+      try {
+        const url = new URL(value);
+        if (!['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(url.hostname)) continue;
+        const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+        if (Number.isInteger(port) && port > 0 && port <= 65_535) ports.add(port);
+      } catch { /* non-URL review text is not a preview declaration */ }
+    }
+  }
+  return ports;
+}
+
+const SCIM_USER_SCHEMA = 'urn:ietf:params:scim:schemas:core:2.0:User';
+const SCIM_GROUP_SCHEMA = 'urn:ietf:params:scim:schemas:core:2.0:Group';
+function scimUser(user: { id: string; email: string; name: string }, active = true) {
+  return { schemas: [SCIM_USER_SCHEMA], id: user.id, userName: user.email, displayName: user.name,
+    name: { formatted: user.name }, emails: [{ value: user.email, primary: true }], active };
+}
+function scimGroup(team: { id: string; name: string }, members: Array<{ userId: string }>) {
+  return { schemas: [SCIM_GROUP_SCHEMA], id: team.id, displayName: team.name,
+    members: members.map((member) => ({ value: member.userId })) };
+}
+function scimList(Resources: unknown[]) {
+  return { schemas: ['urn:ietf:params:scim:api:messages:2.0:ListResponse'], totalResults: Resources.length,
+    startIndex: 1, itemsPerPage: Resources.length, Resources };
+}
+
+function prometheusMetrics(snapshot: Record<string, unknown>): string {
+  const lines = ['# HELP karmax_info Karmax control-plane information.', '# TYPE karmax_info gauge', 'karmax_info 1'];
+  const scalar = (name: string, help: string, value: unknown) => {
+    lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${Number(value ?? 0)}`);
+  };
+  scalar('karmax_organizations', 'Organizations in this cell.', snapshot.organizations);
+  scalar('karmax_projects', 'Projects in this cell.', snapshot.projects);
+  scalar('karmax_event_cursor', 'Latest durable gateway event sequence.', snapshot.eventCursor);
+  scalar('karmax_database_bytes', 'SQLite control-plane database bytes.', snapshot.databaseBytes);
+  const grouped = (metric: string, help: string, values: unknown) => {
+    lines.push(`# HELP ${metric} ${help}`, `# TYPE ${metric} gauge`);
+    for (const [state, count] of Object.entries((values ?? {}) as Record<string, unknown>))
+      lines.push(`${metric}{state="${state.replace(/["\\]/g, '_')}"} ${Number(count)}`);
+  };
+  grouped('karmax_tasks', 'Tasks by durable status.', snapshot.tasks);
+  grouped('karmax_worlds', 'World generations by lifecycle state.', snapshot.worlds);
+  grouped('karmax_runner_leases', 'Runner leases by state.', snapshot.runnerLeases);
+  grouped('karmax_executions', 'Interactive executions by state.', snapshot.executions);
+  grouped('karmax_deliveries', 'Notification outbox rows by state.', snapshot.deliveries);
+  return `${lines.join('\n')}\n`;
+}
+
+function isWorkflowGone(error: unknown): boolean {
+  const value = error as { name?: string; message?: string };
+  return value?.name === 'WorkflowNotFoundError' || /workflow.*(?:not found|already (?:closed|completed|terminated))/i.test(value?.message ?? '');
+}
+
+function isWorldGone(error: unknown): boolean {
+  const value = error as { message?: string };
+  return /(?:not found|does not exist|already (?:destroyed|removed)|no such sandbox|no world)/i.test(value?.message ?? '');
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
 }
 
 /** Expand ~ / $HOME in repo paths so a configured repo resolves to a real dir. */
-function normalizeConfig(config: ProjectConfig = {}): ProjectConfig {
+function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = false): ProjectConfig {
+  if (process.env.KARMAX_DEPLOYMENT === 'hosted') {
+    const worldProvider = config.worldProvider ?? (defaultHostedProvider
+      ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
+      : undefined);
+    if (worldProvider && ['worktree', 'container', 'memory'].includes(worldProvider))
+      throw new Error('hosted projects require a remote world provider');
+    if (worldProvider) config = { ...config, worldProvider };
+  }
   if (Array.isArray(config.repos)) {
     return { ...config, repos: config.repos.filter(Boolean).map(expandPath) };
   }
   return config;
+}
+
+const EXECUTION_CONFIG_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
+
+function pickExecutionConfig(config: ProjectConfig): Partial<ProjectConfig> {
+  return Object.fromEntries(EXECUTION_CONFIG_KEYS.filter((key) => config[key] !== undefined).map((key) => [key, config[key]])) as Partial<ProjectConfig>;
+}
+
+function applyExecutionOverride(config: ProjectConfig, override: Record<string, unknown>): ProjectConfig {
+  const next: Record<string, unknown> = { ...config };
+  for (const key of EXECUTION_CONFIG_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(override, key)) continue;
+    if (override[key] == null) delete next[key];
+    else next[key] = override[key];
+  }
+  return next as ProjectConfig;
 }

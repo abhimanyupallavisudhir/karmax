@@ -43,7 +43,8 @@ A fourth principle governs all three: **declare, don't guess.** Events, actions,
 
 | Concept | Definition |
 |---|---|
-| **Project** | A namespace owning task lists, settings, active workflows, and configuration. The top-level container. |
+| **Organization** | The tenant boundary owning memberships, teams, projects, repository connections, execution policy, runner pools, identity policy, usage, and audit. |
+| **Project** | An organization-scoped namespace owning task lists, settings, active workflows, and configuration. |
 | **Task list** | An ordered list of tasks within a project. The primary surface a user interacts with. |
 | **Task** | A unit of intent. Has a workflow, parameters, a message history, a stage, and a view-model. In v1 a task runs exactly one execution. |
 | **Workflow** | A durable orchestration *definition* (code) describing how a task is carried out. Versioned, tested, agent-editable. See §4. |
@@ -130,7 +131,7 @@ Each workflow lives in its own git repo under `~/.karmax/workflows/<name>/`:
 - `requires: [...]` — other workflows this one depends on (e.g. software-dev `requires: ['merge-queue']`). Activating a workflow activates the transitive closure.
 - `events: {...}` — the typed event types this workflow emits, each with a schema (§5).
 - `capabilities: [...]` — capabilities this workflow's agents may need (the ceiling; §8).
-- `onActivate` — an optional hook run when the workflow is added to a project (§4.6).
+- `onActivate` — an optional preparation task the workflow contributes; the default workflow's runs automatically when a project is created (§4.6).
 - `ui: [...]` — slot contributions (§10).
 - `commands: [...]` — command/keybinding registrations (§10).
 
@@ -151,6 +152,10 @@ This PR gate is **the single most important safety boundary in the system**: age
 
 > **Rule of thumb: content the agent reads is free to edit; code that auto-runs is gated.**
 
+**The wiki is that content system's home.** Each organization and each project owns a wiki under `~/.karmax/content/wiki/<scope>/<id>/` — skills, memories, and prompts are all the same thing to the system. An entry is a **folder** holding a `SKILL.md` or `MEMORY.md` in the standard Agent Skills format (YAML frontmatter, then markdown); the folder name is its title, any other files (scripts, images, even further md files) ride along without becoming entries, and folders without a page file are sections that nest the tree. Frontmatter carries `name`/`description` plus two delivery controls: `delivery: unconditional | indexed` (default indexed) and `importance: <number>` (default 0). An *indexed* entry appears in the **table of contents** agents receive; an *unconditional* entry's full body is sent with every prompt — a scope's "general prompt" is simply an unconditional entry, and the built-in karmax working instructions ship as a bundled default at `@builtin/how-to-work` — an on-disk entry at that exact path is its editable override (the §9 overlay model: editing customizes, deleting the override restores the default; the rest of the `@` namespace stays reserved and built-in identities never rename). Every agent turn receives, in order: the built-in instructions, then per scope (organization, then project) its unconditional entries in full followed by the indexed TOC (names + descriptions only, expanded to every leaf, siblings ordered by importance). When a TOC's estimated tokens exceed 20k, each penultimate list of ≥10 entries keeps its 9 most important and folds the rest behind a `[more…]` link naming the exact expansion call. Agents navigate with `read_wiki` (TOC / section / full page) and grep with `search_wiki`; both are gateway-backed platform tools that run host-side, so they work identically from local worktrees and cloud sandboxes. Reads need the scope's read capability; writes reuse `skill:write` (the wiki *is* the skills store).
+
+Project and organization wiki persistence deliberately differ. A **project wiki is a dedicated Git repository** whose canonical checkout is the directory above. Existing folders migrate in place into its `main` baseline. The wiki repository is provisioned into every task world as a platform-owned companion repo on the task's branch, participates in review and the ordinary multi-repo merge, and is read/written through that live checkout for task-agent calls (including remote-provider worlds). A connected GitHub setup creates a private, project-owned wiki remote and isolated deploy keys; deployment backfills existing projects before accepting task traffic, and later task creation retries incomplete setup. The repository is hidden from the project's normal development-repository picker. The wiki page can inspect the canonical branch, another Git branch, or a task world's live branch through one filterable selector; arbitrary detached branch views are read-only, while a selected live task checkout is editable. The **organization wiki remains filesystem/database state**, shared across the organization, with every write/move/delete appended to an in-database version history; content that predates versioning is first captured as an immutable baseline immediately before its first mutation.
+
 ### 4.5 Versioning and in-flight changes
 
 Finite task workflows rarely need in-flight migration — let running tasks drain on their pinned version. Long-lived coordinators (§6) are the exception: their durable state outlives any code version, so coordinator edits require tested state migrations and Temporal patching for in-flight executions. See §9 for why safe mode does not rescue them.
@@ -160,19 +165,29 @@ Finite task workflows rarely need in-flight migration — let running tasks drai
 Two manifest mechanisms, kept deliberately minimal:
 
 - `requires` — declared workflow dependencies, resolved transitively on activation.
-- `onActivate` — when a workflow is added to a project, it may spawn a **task** (run by an agent) to prepare the project. For software-dev this spawns a "make this project karmax-ready" task: ensure git is initialized in each repo; for brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees, and fix them.
+- `onActivate` — a workflow may declare a **task** (run by an agent) to prepare a project for it. A new project's tasks default to the software-dev workflow, so on project creation karmax automatically seeds software-dev's prep task — "make this project karmax-ready": ensure git is initialized in each repo; for brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees, and fix them. It's seeded as a **draft** (a project is usually named before its repo is set, and a repo-oriented task can't run without one), so it waits on the list for the user to queue once the repository is configured. (There is no separate "activate a workflow on a project" step — a task selects its workflow directly.)
 
 **Design note.** The bootstrap is *itself a karmax task*, which is the philosophy applied to the system's own setup. Do not generalize this into a large lifecycle-event framework; `requires` plus `onActivate` (and optionally `onDeactivate` later) is sufficient.
 
 ### 4.7 Standard workflows shipped in v1
 
 - **software-dev** — branch/world → do → review → PR (optional) → merge → end, with resolve and sub-tasks. Detailed in §5.
-- **just-do** — a single straightforward agent call, no merge machinery.
-- **script-exec** — run a script/command as a task.
-- **goal** — like software-dev, but auto-confirms after the provider reports a verified successful turn completion. `signal_completion` may attach a structured summary but is not required.
+- **goal** — software-dev in autonomous completion mode: keep the Do agent moving
+  until it explicitly reports verified completion, then auto-confirm. A merely
+  successful provider return is not enough in Goal mode; it causes another turn.
+  Software-dev and goal are compatible policies over the same pipeline,
+  so a task may switch between them during Setup, Do, or an unconfirmed Review.
+  Switching software-dev → goal at Review sends the work back through Do rather
+  than implicitly approving a possibly partial review. The execution's Temporal
+  type/version remains pinned throughout; only its policy changes.
 - **merge-only** — the review-and-merge half of software-dev (no Do stage). Starts at the review gate, then optional PR, then merge. Used to review agents' PRs, including edits to workflow repos.
 - **merge-queue** (coordinator) — leases the single merge slot per target branch (§6).
 - **token/account coordinator** — tracks per-account limits and leases agent-account capacity (§6, §7).
+
+`just-do` and `script-exec` remain registered only for replay and API
+backward-compatibility; they are not selectable for new tasks. The normal
+software-dev/goal pair covers user-facing work, and software-dev activation uses
+goal for its automated project-readiness task.
 
 ---
 
@@ -204,7 +219,7 @@ Merge is the point of no return.
 
 **Merge.** Enqueue in the merge-queue coordinator for the target branch; on grant, run the **merge agent** in the world; release the lease; → End. The merge commit is the **point of no return**: before it, the task may be cancelled; after it, not.
 
-**Resolve (cross-cutting).** On an unhandled error at any stage, route first to **auto-resolve** (scripted handlers keyed on error signature — retries, known fix scripts). On miss/novelty, spawn the **Resolve agent** with a context bundle. On fix → resume the originating stage; on failure → escalate to the human via the task UI. Fixes the Resolve agent discovers are saved as skills.
+**Resolve (cross-cutting).** On an unhandled error at any stage, route first to **auto-resolve** (scripted handlers keyed on error signature — retries, known fix scripts). Provider-originated failures keep their structured classification through this path: transient usage/session limits mark the current credential exhausted and rotate to another compatible login or park until its reset; transport/provider outages and recoverable process interruptions retry the checkpointed session without spending a Resolve turn. Persistent faults such as invalid configuration, permissions, disk exhaustion, or credentials that require funding/re-auth remain human decision points rather than being retried blindly. On an auto-resolve miss/novelty, spawn the **Resolve agent** with a context bundle. On fix → resume the originating stage; on failure → escalate to the human via the task UI. A human/parent Retry leaves Escalated immediately and restores the originating public stage while the replacement work is waiting or running. Fixes the Resolve agent discovers are saved as skills.
 
 ### 5.3 Transition rules
 
@@ -305,7 +320,7 @@ A scarce shared resource is owned by a **singleton coordinator workflow** with a
 ### 6.1a Agent-turn queue (host capacity)
 
 - One host-wide singleton, `agent-queue`, leases capacity only around model subprocesses; workflows waiting at Review, on accounts, timers, or I/O do not consume it.
-- Capacity defaults to 3 and is persisted as **Global settings → Host capacity → Concurrent agent turns**. `KARMAX_MAX_ACT` remains a distinct worker-throughput limit for all activities, and per-login concurrency remains an account-pool limit.
+- Capacity defaults to 3 and is persisted as **Organization settings → Host capacity → Concurrent agent turns**, explicitly labeled installation-wide. `KARMAX_MAX_ACT` remains a distinct worker-throughput limit for all activities, and per-login concurrency remains an account-pool limit.
 - Waiting turns and active leases are explicit coordinator state. The coordinator contributes the reorderable **Agent queue** to the host-owned **Queues** page alongside the merge queue.
 - The worker applies live free-memory/load gates after lease grant. Those adaptive safety checks are separate from the configured counting-semaphore capacity because only an activity can inspect live host resources.
 - Current turns enroll by stable turn ID at the existing activity boundary, preserving replay compatibility for workflow histories recorded before this coordinator existed. Dead-task leases are reclaimed after a liveness check.
@@ -356,7 +371,7 @@ API-key **credential handle** (§8). Never a raw key inline.
 The task view reports the turn's resource boundaries separately: `waitingFor: account` while credential capacity is being leased, `waitingFor: agentSlot` / `agentTurn: waiting-slot` after the account grant while host admission is pending, and `agentTurn: running` only after the activity has acquired the host slot. The workflow publishes the post-grant transition immediately; it must not leave the last account-wait snapshot visible for the duration of a running turn.
 
 1. Spins up / resumes the agent session (via session/thread ID stored in workflow state).
-2. Lets the agent work until the provider emits a verified successful terminal event. Failed, interrupted, cancelled, truncated, or transport-ended terminal states throw even if partial text exists; infrastructure interruptions retry and resume the checkpointed provider session.
+2. Lets the agent work until the provider emits a verified successful terminal event. Failed, interrupted, cancelled, truncated, or transport-ended terminal states throw even if partial text exists. Structured assistant errors (quota, authentication, billing, overload/server failure, output truncation) and provider-marked text-only API errors are classified before a later generic terminal result can erase their cause; recoverable infrastructure interruptions retry and resume the checkpointed provider session.
 3. Captures output, events, and the new session ID; exits — the process dies, RAM is reclaimed.
 
 Between turns — where all waits live — the agent is only a stored session ID. **RAM is consumed strictly during turns, never during waits**, regardless of whether a wait is five seconds or five hours. This is the fix for the naive "long-lived agent process" design that exhausts system resources.
@@ -368,10 +383,16 @@ Between turns — where all waits live — the agent is only a stored session ID
 karmax mints **one config home per (account × profile)** under `~/.karmax`, and
 injects the harness's documented home variables at process spawn:
 `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or OpenCode's XDG homes. This isolates auth,
-settings, and sessions. ACP harnesses receive browser/platform/workflow MCP
-servers in `session/new`, `session/load`, or `session/fork`, so no
-provider-private config format is parsed. Historical Kimi/Grok home handling is
-retained only for workflow replay while those harnesses are not admitted.
+settings, sessions, MCP servers, and skills. Because these variables are read at
+process startup, they apply identically to local CLIs, app servers, and SDK
+subprocesses. ACP harnesses receive browser/platform/workflow MCP servers in
+`session/new`, `session/load`, or `session/fork`, so no provider-private config
+format is parsed. Remote Claude exposes the same handlers through its host SDK
+server, remote Codex exposes them as app-server dynamic tools over the existing
+PTY, and ACP uses its standard session contract. Consequently a cloud world never
+needs an inbound route to a locally hosted Karmax merely to use platform tools.
+Historical Kimi/Grok home handling is retained only for workflow replay while
+those native harnesses are not admitted.
 
 **Gotcha — scrub the environment for *login* isolation, not as a sandbox.**
 Spawn each agent with a **clean environment per spawn**: unset inherited model
@@ -410,7 +431,7 @@ The philosophy is maximal autonomy within bounded, auditable controls:
 
 A flat set of namespaced capabilities (`task:create`, `task:conversation:fork`, `project:settings:write`, `credential:write`, `merge-into:<repo>:<branch>`, ...). Principals are **humans, tasks, and system services**. Grants are scoped global/project; a token records its originating task for provenance but that id is not itself an object ACL. Project scope controls visibility across tasks, which lets an authorized agent discover and coordinate peer tasks without receiving global access.
 
-Humans choose one of four job-shaped authorization profiles rather than a permission checklist: **Developer**, **Project maintainer**, **Automation operator**, and **Administrator**. The profiles and the default for new tasks are ordinary configurable policy at global scope with project overlays. See `PLAN-authorization.md` for the capability matrix.
+Humans choose one of four job-shaped authorization profiles rather than a permission checklist: **Developer**, **Project maintainer**, **Automation operator**, and **Administrator**. Membership establishes scope; it is not a second role system. A hidden protected-owner marker exists solely to preserve one recovery principal and grants no separate authority. Profiles are configurable at organization scope with project overlays. See `PLAN-authorization.md` for the capability matrix.
 
 ### 8.2 Attenuation
 
@@ -485,15 +506,14 @@ The host shell and core modules are **first-party**, built on the same contribut
 
 - **Task list** — the primary surface (per project / task list).
 - **Merge queue UI** — ordered queue, reorder, position, cancel.
-- **Settings** — project and global settings, including each active workflow's project-level UI (e.g. for software-dev: repo directories with folder pickers, default agent profiles per role, default merge-to branch, gitignored-files-to-copy, GitHub PR toggle).
-- **User page & notifications.**
+- **Settings** — matching organization and project surfaces with a pane-per-section rail: the rail is real navigation (exactly one section visible at a time, the URL hash naming the open pane so deep links and background re-renders land on the same section), ordered Git & GitHub → Compute → Agent logins → Task defaults → Payments → People & authorization → Workflows → Advanced. Each section title carries a one-line plain-language purpose instead of decorative numbering, and saves confirm in place on the pressed button rather than via corner toasts naming wire ids. Agent logins are organization-owned; the project section links directly to that organization section and only edits project credential precedence. Shared task fields render once and are consumed by every workflow declaring them; dedicated workflow blocks contain only genuinely unique fields. Both settings surfaces present ONE agent for Do and Merge by default with a "Separate Do and Merge agent configurations" checkbox (the same unified shape as the task form and Quick defaults), and the Review route is edited beside those agents — there is no standing Confirm-agent profile in the UI; review agents are configured per layer in the route. Repository selection/creation belongs to the project that uses it, while project access belongs under People & authorization.
+- **Inbox** — one full page opened from the top-bar attention icon; never a second sidebar destination or notification popover.
 
-Human/agent responsibility is specified in `PLAN-collaboration.md`. In short,
-identity and authorization do not by themselves make tasks multi-user: tasks
-need immutable creator provenance, one accountable assignee, an optional agent
-delegate, explicit subscribers, and named user/team confirmation policies. The
-per-user inbox is a materialized projection of task events and resolved
-responsibility—not a project-wide list of every task needing attention.
+Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
+not reproduce issue-tracker assignee/delegate/reviewer/follower state. Each
+workflow human wait declares the exact user/team/special audience for that step;
+the per-user inbox is a materialized projection of those workflow events.
+- **Wiki** — the organization and project wikis (§4.4): a tree of skills/memories with a rendered page view, a frontmatter-as-form editor (raw YAML behind a toggle, markdown preview), and an Index showing exactly what agents receive each turn: every unconditional entry in full, then the rendered table of contents (names + descriptions, importance order, [more…] folds). The project wiki is a project tab with a type-to-filter branch/task-world selector; the organization wiki is the bottom-left rail link.
 - **Dashboard** — agent runs, token/limit status across accounts, resources used.
 - **The final composed app UI** with the keyboard-navigation registry.
 
@@ -501,9 +521,9 @@ responsibility—not a project-wide list of every task needing attention.
 
 Just as a workflow declares its events (§5), capabilities (§8), and UI slots (§10.1), it declares its **parameters**: a typed `params` schema in the manifest. This single declaration drives three surfaces, so there is exactly one source of truth and no per-surface guessing (the "declare, don't guess" rule, §0):
 
-1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, world provider, copy-globs, PR toggle).
-2. **The project-settings form** — per-enabled-workflow defaults at the project scope.
-3. **The global-settings form** — the same per-workflow form at the user scope.
+1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, copy-globs, PR toggle, and workflow-owned Review route).
+2. **The project-settings form** — shared task defaults plus workflow-unique fields at project scope. Repository sources render once as a repeatable datalist accepting connected GitHub SSH URLs or, when self-hosted, local paths.
+3. **The organization-settings form** — the matching shared-default model at organization scope (the schema retains the historical `global` spelling on the wire). Shared values live in `__common__`; historical workflow rows remain compatible overlays.
 
 **Field model.** Each parameter is a `FieldSpec`: `{ name, type, label, help?, required?, options?, default?, scopes, bind, role? }`.
 
@@ -512,8 +532,14 @@ Just as a workflow declares its events (§5), capabilities (§8), and UI slots (
 - `bind` tells the host where a resolved value lands in the workflow input (`prompt | top | project | profile`), so the same generic assembler maps any workflow's fields into its `TaskInput` with no per-workflow code.
 
 This generalizes the §10.2 declared-action argument descriptor — the same renderer draws action forms and parameter forms.
+The `repos` declaration also tells Karmax that the workflow requires project
+source code. Its wire shape remains a project-bound list for compatibility, but
+the first-party UI edits the canonical project sources once: attached GitHub
+repository records for hosted/cloud use, or local paths/SSH URLs for self-hosted
+use. Karmax synchronizes historical per-workflow rows so they cannot override
+that canonical set.
 
-**Defaults resolution is the overlay model (§9).** A field's effective value is `task override → project setting → global setting → field default`. Settings forms write to the project and global (user) overlays; the task form reads the resolved defaults and lets the user override per-task. Safe mode resolves field defaults only.
+**Defaults resolution is the overlay model (§9).** A field's effective value is `task override → project setting → organization setting → field default`. Settings forms write to project and organization overlays; the task form reads resolved defaults and lets the user override per-task. Safe mode resolves field defaults only.
 
 **Drafts.** The expanded task form can **save as draft** instead of queueing. A draft is a stored task record with its parameters but no started workflow; it can be edited and later **queued** (which starts the workflow with the stored params) or deleted. This makes the task form a first-class composition surface, not a fire-and-forget dialog.
 
@@ -530,38 +556,43 @@ The `agent` field type is the reusable control for choosing the agent that runs 
 
 The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.
 
-**Quick-task defaults.** A task can be created two ways: from the expanded task form (§10.4.1) where every field is set explicitly, or from the **quick one-line composer**, which sets only a prompt and takes everything else from defaults. Those two paths can want *different* defaults — e.g. quick captures should auto-confirm while considered, full-form tasks should not. So alongside the general per-workflow defaults, each of the project- and global-settings pages carries a **"Quick task defaults"** section: the same declared field schema, saved to a separate `quick:`-namespaced overlay that applies **only** to tasks added from the quick box (`create_task({ quick: true })`).
+**Quick-task defaults.** Each scope has one **Different agents for Quick tasks?** switch. Off means quick tasks use the regular agent defaults. On enables one shared, agent-only `quick:` overlay; project Quick agent defaults inherit from the organization Quick agent defaults. Branches, Review route, remote policy, and other task defaults never diverge merely because the Quick composer was used.
 
 Quick defaults are purely opt-in and inherit from the general defaults until a field is set, so the overlay stack for a quick task is (highest → lowest precedence):
 
 ```
-task override → project-quick → global-quick → project-general → global-general → field default
+agent task override → project-quick agent → global-quick agent → project-general agent → global-general agent → agent field default
 ```
 
-This realizes the two inheritances the settings UI exposes: the **global** quick defaults inherit from the general global defaults (one "Reset to inherited" button per field); the **project** quick defaults inherit from *either* the global quick defaults (their natural parent) *or* the project's general defaults (two "Reset to inherited" buttons per field — ↺ Global quick / ↺ Project default — each snapping the field to that source). Full-form tasks skip the quick layers entirely, so the two paths stay independent.
+Disabling a scope's Quick overlay removes it from this chain without deleting its values. Full-form tasks skip the Quick layers entirely.
 
 ### 10.6 URLs and task numbers — every view is bookmarkable
 
-The console is a single-page app, but every page has its own **URL** so a specific task, project, settings page, or the dashboard can be bookmarked, shared, and reached with the browser's back/forward buttons. The URL — not an in-memory tab variable — is the single source of truth for *{active project, active tab, open task}*. The gateway already serves `index.html` for any non-asset path (the SPA fallback), so the client owns routing via the History API; a deep link like `/t/42` loads the app and reconciles state to that URL on boot.
+The console is a single-page app, but every page has its own **URL** so a specific task, project, settings page, or the dashboard can be bookmarked, shared, and reached with the browser's back/forward buttons. The URL — not an in-memory tab variable — is the single source of truth for *{active organization, active project, active tab, open task}*. The gateway already serves `index.html` for any non-asset path (the SPA fallback), so the client owns routing via the History API; a deep link like `/acme/web/tasks/42` loads the app and reconciles state to that URL on boot.
 
-**The scheme (all host-owned).** Projects are addressed by a **slug of their name**, not their opaque id, so a bookmark reads like `/projects/acme-web/settings`:
+**The scheme (all host-owned).** Every page lives under its **organization's slug** — the tenant is the top path segment — so the org is always explicit in the URL and switching orgs re-homes the whole namespace. Projects are addressed by a **slug of their name**, not their opaque id, nested beneath their org, so a bookmark reads like `/acme/web/settings`:
 
 ```
-/                                    → home (redirects to a project's task list)
-/dashboard                           → global dashboard
-/settings                            → global settings
-/projects/:name/tasks                → task list          (the primary surface)
-/projects/:name/queue                → merge queue
-/projects/:name/activity             → activity feed
-/projects/:name/settings             → project settings
-/projects/:name/tasks/:num           → a task permalink (opens the drawer over its list)
+/                                    → home (redirects into the current org)
+/<org>                               → org home (redirects to a project or the dashboard)
+/<org>/dashboard                     → organization dashboard
+/<org>/settings                      → organization settings
+/<org>/inbox                         → inbox
+/<org>/wiki                          → organization wiki (bottom-left rail link)
+/<org>/<project>                     → task list          (the primary surface)
+/<org>/<project>/queue               → merge queue
+/<org>/<project>/activity            → activity feed
+/<org>/<project>/wiki                → project wiki (a project tab)
+/<org>/<project>/settings            → project settings
+/<org>/<project>/tasks/:num          → a task permalink (opens the drawer over its list)
+/<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
 ```
 
-The `/projects/` prefix keeps project names out of the top-level namespace, so a project called "dashboard" or "settings" can never shadow a reserved route. The slug resolves to a project by matching the slugified name (case-insensitive); names are expected distinct, and on the rare collision the first-created project wins. Because the console loads the full project list at boot, slug↔project resolution is entirely client-side — no round-trip to open a deep link.
+Organizations carry a persisted `slug` (falling back to a slug of the name for records that predate it). A small set of reserved second-segment words (`dashboard`, `settings`, `inbox`, `wiki`) name organization-level views rather than projects, so those never round-trip through a project slug; every other second segment is a project. Project slugs need only be unique **within their org** — the slug resolves to a project by matching the slugified name (case-insensitive), scoped to the URL's org; names are expected distinct, and on the rare collision the first-created project wins. Because the console loads the full org + project list at boot, org↔project↔slug resolution is entirely client-side — no round-trip to open a deep link. Pre-organization URLs (`/dashboard`, `/organization`, `/settings`, `/projects/:name/…`) are still parsed and then **canonicalised** (History `replaceState`) to the org-prefixed form, so old bookmarks and server-issued redirects keep working.
 
 **Workflows do not own URLs.** This is the answer to "does a workflow own its page?": no. Every page is a first-party **core UI module** (§10.3) whose *route* is host-owned; a workflow only ever *augments* a host page through the declared contribution system (§10.1) — a slot, a widget, an action, a param field — never by claiming a path. The merge queue is the illustrative case: it looks "produced by a workflow," but it is a host route that *projects* the merge-queue **coordinator's** query state (`{queue, current}`, §6.1) joined with each task's `mergeQueue` position. The coordinator is queried; it does not render or route. The same holds for the dashboard (projects the account coordinator's query). Keeping routes host-owned means the URL space is finite, stable, and knowable without loading any workflow package.
 
-**Task numbers (`num`).** Each queued task carries a simple, human-facing sequential id — numbered **per project**, so every project runs its own `#1`, `#2`, … assigned when the task is first queued, alongside the opaque `id`. A never-queued draft has no `num`; if queued work is later moved back to drafts, it retains its number and permalink. The **`id` never changes**: it is the Temporal `workflowId`, the event key, and the session key, so it must stay stable for replay and cross-task signalling. `num` is purely the human/URL handle: the UI shows `#num` everywhere a task is named (list rows, drawer header, merge queue, notifications, sub-task links), the permalink is `/projects/:name/tasks/:num`, and it is a search key — both the task search box and the "Fork a previous agent" picker match on `#num` as well as title. The store owns `num` (unique per `(projectId, num)`, with legacy queued work backfilled per project in creation order); the gateway resolves `(:projectId, :num) → id` (so a permalink to an archived/not-yet-loaded task still opens) and mirrors `num` onto the task view (the workflow only knows the opaque `id`).
+**Task numbers (`num`).** Each queued task carries a simple, human-facing sequential id — numbered **per project**, so every project runs its own `#1`, `#2`, … assigned when the task is first queued, alongside the opaque `id`. A never-queued draft has no `num`; if queued work is later moved back to drafts, it retains its number and permalink. The **`id` never changes**: it is the Temporal `workflowId`, the event key, and the session key, so it must stay stable for replay and cross-task signalling. `num` is purely the human/URL handle: the UI shows `#num` everywhere a task is named (list rows, drawer header, merge queue, notifications, sub-task links), the permalink is `/<org>/<project>/tasks/:num`, and it is a search key — both the task search box and the "Fork a previous agent" picker match on `#num` as well as title. The store owns `num` (unique per `(projectId, num)`, with legacy queued work backfilled per project in creation order); the gateway resolves `(:projectId, :num) → id` (so a permalink to an archived/not-yet-loaded task still opens) and mirrors `num` onto the task view (the workflow only knows the opaque `id`).
 
 ---
 
@@ -572,47 +603,109 @@ The `/projects/` prefix keeps project names out of the top-level namespace, so a
 A world is accessed through a small interface so the backend is swappable without touching workflows:
 
 ```
-create()        # provision the environment
-exec(cmd)       # run a command
-fs              # read/write files
-pty()           # interactive terminal (powers cheap check-in)
-snapshot()      # checkpoint (powers resume-while-parked)
+create()/open()             # provision or reconnect from a durable handle
+exec()/startProcess()       # bounded commands and streaming executions
+read/write/list files       # provider-confined filesystem operations
+openPty()                   # interactive terminal (powers cheap check-in)
+fetchPort()                 # authenticated service preview via the gateway
+park()/status()             # sleep inactive compute and inspect lifecycle
 destroy()
-events          # lifecycle webhooks -> signals (ready, died, ...)
 ```
 
 `createWorld` dispatches to the configured provider. The workflow talks only to this interface, so local-worktree → container → remote sandbox changes nothing upstream.
 
+Pool, resources, network posture, organization cloud budget, and parked-world
+retention form one organization **compute** policy (Settings → Compute). Projects
+inherit it; their sparse override is limited to a pool exception and a tighter
+project budget. The **provider choice itself is a different axis** — the *agent
+environment* (worktree / container / E2B / Daytona). It is a **task default**
+(§10.4), edited beside the base/target branches, so it inherits organization →
+project → task like any other field and a single task can pick a different
+environment without a project-wide change (it binds to `input.project.worldProvider`,
+which every world-creating workflow reads). Its canonical value still lives in the
+execution policy, so runner-pool compatibility and the effective-config merge stay
+coherent; the Compute section shows the effective environment read-only and scopes
+its pool list to it. Provider-specific template/snapshot/image settings stay on
+that provider connection. General coding defaults to unrestricted outbound
+internet; a domain/CIDR allowlist is an explicit enterprise hardening mode.
+
+When a self-hosted project stores a local repository path but selects a remote
+world provider, `createWorld` resolves the repository's existing `origin` (or
+sole remote) and normalizes ordinary HTTP(S) git URLs to SSH. The local path is
+not sent to the provider. A GitHub App is optional for this path; it exists for
+hosted repository discovery/creation, webhooks, and repository-scoped keys.
+GitHub App manifests include a webhook only when Karmax is on a publicly
+reachable HTTPS origin. Local/private instances reconcile repository access on
+demand; installation lifecycle events are received automatically and are never
+listed as manifest subscriptions.
+
 **Multi-repo worlds.** A project may configure several `repos`; a task's world then checks out **one worktree per repo**, each on the same `karmax/<taskId>` branch off its own base. A single repo keeps the flat layout (the world root *is* the worktree); with several, the world root is a parent directory holding one subdirectory per repo (named after it, deduped on collision), so the agent sees `frontend/`, `backend/`, … side by side and works across them. The finalize-merge lands the branch in **every** repo, stopping at the first conflict for the merge agent to resolve — a re-run re-merges already-landed repos as no-ops (partial-merge recoverable, not atomic). The world handle carries the full `repos[]`; older single-repo handles are read through a compatibility shim (`worldRepos`).
+
+For the local worktree provider, a configured network Git URL is materialized
+once as a Karmax-managed local checkout under the worlds data directory; task
+worktrees branch from that checkout exactly as they do from a user-supplied
+local path. The handle retains the configured URL separately for repository
+enrollment and checkpoint identity. Clone credentials are ephemeral (a selected
+GitHub repository's read-only deploy key, then a Git profile, then host Git/SSH)
+and are never written into the checkout or durable handle.
 
 A multi-repo task must serialize against *every* repo it touches, not just one — so it takes a slot in the merge queue (§6.1) of **each** repo. To keep concurrent multi-repo merges deadlock-free, slots are acquired by **ordered acquisition** (lock ordering): the task's repos are sorted into one global order and their slots claimed one at a time in that order, holding each while it waits for the next. Because all tasks request shared repos in the same order, a task only ever waits on a repo ordered *after* everything it already holds, so the wait-for graph is acyclic and the classic three-task cycle (A&B, A&C, B&C) cannot deadlock. Slots are released after the finalize-merge (and on cancel/abort); an orphaned lease is reclaimed by the coordinator's liveness check.
 
 ### 11.2 Backends
 
 - **Local (default):** git worktree; or a local container / devcontainer for isolation on the host.
-- **Sandboxed/remote (pluggable):**
-  - microVM, strong isolation for untrusted code: **E2B** (Firecracker, agent-native, SSH/PTY, lifecycle webhooks, snapshots), **Northflank** (Kata/Firecracker/gVisor, bring-your-own-cloud).
-  - container, faster/persistent "agent lives inside it": **Daytona**, **Cloudflare Sandboxes** (PTY, snapshots, egress-proxy credential injection).
-  - GPU-heavy: **Modal**.
-- **Remote dev env / your own infra:** the container provider pointed at a remote Docker host, or self-hosted Coder/Gitpod.
+- **Sandboxed/remote (pluggable):** a managed microVM/container provider behind
+  the same provider contract. The first target is E2B; Daytona is the second
+  conformance implementation; Modal is reserved for GPU/special workloads.
+- **Remote dev env / your own infra:** an outbound-connected Karmax runner pool
+  on a local machine, customer VPC, or (later) Kubernetes/Kata fleet.
+
+The hosted design deliberately distinguishes an immutable project **Environment**
+(what runs), a **Runner pool** (where it runs), a per-attempt **World** (mutable
+workspace), and an ephemeral **Execution** (agent/command/PTY/service). A logical
+world belongs to one attempt, but it does not keep one VM running: compute is
+leased only while an execution is active. See `PLAN-cloud.md` for provider
+selection, pricing, lifecycle, GitHub/SSH, runner, and multi-tenant design.
 
 ### 11.3 Ties to the rest of the spec
 
 - The provider **PTY** powers the "open a terminal in the world" check-in against remote worlds.
-- The provider **snapshot** powers the resume-while-parked model: when a workflow parks, snapshot the world and let it sleep to zero; restore on the next turn. This is the cloud equivalent of tearing the agent down between turns and keeps remote worlds cheap while idle.
-- Provider **lifecycle events** become signals into the workflow.
+- Provider **park/open** powers resume-while-parked: when a workflow waits on a
+  human, the provider pauses compute while retaining the filesystem, and the
+  next provider operation reconnects and resumes it. E2B's inactivity timeout
+  is a second backstop if an explicit park is missed.
+- Provider lifecycle state is projected through workflow events; webhook-driven
+  failure signals are a future contract extension, not required for the first
+  hosted backend.
 - A provider's secure credential injection feeds scoped secrets (§8) into a world without putting them in the agent's context.
 
-**v1 scope:** ship local-worktree + one container provider, with the interface designed so a managed sandbox is a drop-in.
+**Implemented scope:** local worktrees, local Docker containers, E2B, and Daytona
+all implement the same execution contract. Remote worlds park while a task waits,
+resume on demand, proxy HTTP/WebSocket previews through the authenticated gateway,
+checkpoint portably, and return Git changes through the host-side broker without
+retaining write credentials after provisioning. Organization-scoped runner pools,
+capacity/budget leases, usage attribution, portable restore, and generation fencing
+complete the managed-runner baseline described in `PLAN-cloud.md`.
 
 ---
 
 ## 12. Remote access (phone / off-laptop)
 
-karmax serves its web UI on localhost; a mesh or tunnel makes it reachable. This is purely an access layer, orthogonal to the core.
+For a self-hosted/local installation, karmax serves its web UI on localhost; a
+mesh or tunnel makes it reachable. This is purely an access layer, orthogonal to
+the core. Karmax Cloud instead serves the authenticated gateway directly; its
+control/execution split is specified in `PLAN-cloud.md`.
+
+The gateway binds to loopback by default. A hosted deployment sets
+`KARMAX_HOST=0.0.0.0` behind a TLS reverse proxy and
+`KARMAX_PUBLIC_URL=https://karmax.example.com`. Browser/auth URLs use the public
+origin, while agent/MCP service traffic remains on the loopback control-plane
+URL and never hairpins through the public proxy.
 
 - **Default (private, just you):** **Tailscale** — phone joins the tailnet and reaches the laptop directly; use **Tailscale Serve** for a private `https://*.ts.net` URL (HTTPS is required for some phone-browser features). Nothing is exposed publicly.
-- **Public URL with auth (business / multiple people):** **Cloudflare Tunnel** (outbound-only `cloudflared`, no open ports, no public IP) **with Cloudflare Access** (SSO/OTP) and WAF in front.
+- **Public URL with auth (business / multiple people):** the hosted cell image
+  behind Caddy or a managed TLS load balancer, with Karmax identity/authorization
+  always enabled; an edge access proxy/WAF is optional defense in depth.
 - **Quick one-off:** ngrok (random URL; demos only).
 
 **Non-negotiable:** never put a naked public tunnel in front of karmax — it can move money and drive agents. Keep it private behind Tailscale, or public only behind Cloudflare Access, **and** give karmax its own auth regardless (defense in depth).
@@ -643,7 +736,7 @@ Invariants: dependents bind to the **task**, never to an attempt; at most one at
 
 - Approval-based privilege elevation and fine-grained per-field/data-row policy beyond global/project scope.
 - A workflow **distribution/marketplace**.
-- **Broadcast agent comms** beyond simple fan-out; **mid-turn interruption** (turn cancellation).
+- **Broadcast agent comms** beyond the implemented simple fan-out.
 - **Agentic payment protocols** (e.g. mandate-based / tokenized agent payment rails) layered behind the v1 budget-lease abstraction.
 - Additional world providers and richer dashboard analytics.
 
@@ -651,20 +744,20 @@ Invariants: dependents bind to the **task**, never to an attempt; at most one at
 
 ## 14. v1 build checklist
 
-- [ ] Temporal cluster + worker scaffold; deterministic workflow / activity split.
-- [ ] Gateway (HTTP → signal/query/update) + the platform MCP server with scoped-token checks.
-- [ ] Projects, task lists, tasks; the task view-model contract.
-- [ ] Workflow package format (manifest, repo layout, `requires`, `onActivate`); version-pinning per execution.
-- [ ] Workflows: software-dev, just-do, script-exec, goal, merge-only; merge-queue and token/account coordinators (lease pattern + continue-as-new + crash-safe leases).
-- [ ] Per-turn agent loop with session resume; provider adapters for Claude and Codex; per-(account×profile) config homes with scrubbed env.
-- [ ] Capability model + attenuation + workflow-minted scoped tokens; PR-test-approve gate via merge-only.
-- [ ] Credential broker (vault-backed, JIT, scoped, audited); credential handles only.
-- [ ] Contribution system: slots, declared event schemas, command/keymap registry; the generic auto-render floor + declarative tier + sandboxed-iframe escape hatch.
-- [ ] Core UI: task list, merge-queue UI, settings (incl. per-workflow project UI), user/notifications, dashboard, keyboard navigation.
-- [ ] World provider interface + local-worktree + one container provider; cheap PTY check-in + transcript view.
-- [ ] Immutable defaults + overlay resolution + global safe mode + per-workflow fallback.
-- [ ] Remote access via Tailscale (default) / Cloudflare Tunnel + Access; karmax's own auth.
-- [ ] Virtual-card budget per profile/task with hard cap + review-gate threshold.
+- [x] Temporal cluster + worker scaffold; deterministic workflow / activity split.
+- [x] Gateway (HTTP → signal/query/update) + the platform MCP server with scoped-token checks.
+- [x] Projects, task lists, tasks; the task view-model contract.
+- [x] Workflow package format (manifest, repo layout, `requires`, `onActivate`); version-pinning per execution.
+- [x] Workflows: software-dev, just-do, script-exec, goal, merge-only; merge-queue and token/account coordinators (lease pattern + continue-as-new + crash-safe leases).
+- [x] Per-turn agent loop with session resume; provider adapters for Claude and Codex; per-(account×profile) config homes with scrubbed env.
+- [x] Capability model + attenuation + workflow-minted scoped tokens; PR-test-approve gate via merge-only.
+- [x] Credential broker (vault-backed, JIT, scoped, audited); credential handles only.
+- [x] Contribution system: slots, declared event schemas, command/keymap registry; the generic auto-render floor + declarative tier + sandboxed-iframe escape hatch.
+- [x] Core UI: task list, merge-queue UI, settings (incl. per-workflow project UI), user/notifications, dashboard, keyboard navigation.
+- [x] World provider interface + local-worktree + one container provider; cheap PTY check-in + transcript view.
+- [x] Immutable defaults + overlay resolution + global safe mode + per-workflow fallback.
+- [x] Remote access via Tailscale (default) / Cloudflare Tunnel + Access; karmax's own auth.
+- [x] Virtual-card budget per profile/task with hard cap + review-gate threshold.
 
 ---
 

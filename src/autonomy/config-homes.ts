@@ -59,7 +59,10 @@ export class ConfigHomeManager {
     if (provider === 'claude') {
       const file = path.join(home, '.claude.json');
       const cur = readJson(file);
-      cur.mcpServers = { ...(cur.mcpServers ?? {}), ...servers };
+      cur.mcpServers = {
+        ...(cur.mcpServers ?? {}),
+        ...Object.fromEntries(Object.entries(servers).map(([name, server]) => [name, claudeMcpServer(server)])),
+      };
       fs.writeFileSync(file, JSON.stringify(cur, null, 2));
     } else if (provider === 'codex') {
       // Minimal TOML for [mcp_servers.<name>] (command + args + env).
@@ -72,17 +75,49 @@ export class ConfigHomeManager {
         'mcp_servers.playwright',
         'mcp_servers.karmax',
       ]);
-      const toml = Object.entries(servers)
-        .map(([name, s]) => {
-          const envLines = s.env ? Object.entries(s.env).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join('\n') : '';
-          return `\n[mcp_servers.${name}]\ncommand = ${JSON.stringify(s.command)}\nargs = ${JSON.stringify(s.args)}\n${s.env ? `\n[mcp_servers.${name}.env]\n${envLines}\n` : ''}`;
-        })
-        .join('');
+      const toml = Object.entries(servers).map(([name, server]) => codexMcpServer(name, server)).join('');
       fs.writeFileSync(file, preserved.trimEnd() + toml);
     }
     // ACP transports receive MCP servers in session/new and session/load.
     // Keeping them out of provider-specific files avoids duplicate servers.
   }
+
+  /**
+   * Refresh only karmax's platform bridge in every existing config home.
+   *
+   * Account homes outlive application versions, so limiting MCP configuration to
+   * the one-time login flow strands old launch commands forever. In particular,
+   * the historical `npx tsx` bridge depended on the agent's current worktree and
+   * did not ask Codex to forward the per-turn KARMAX_TOKEN. Refreshing at boot
+   * upgrades those durable homes while preserving their browser and user servers.
+   */
+  refreshPlatformMcp(gatewayUrl: string): void {
+    const platform = platformMcpSpec(gatewayUrl);
+    for (const { provider, path: home } of this.list()) {
+      if (provider === 'claude') {
+        const file = path.join(home, '.claude.json');
+        const cur = readJson(file);
+        cur.mcpServers = { ...(cur.mcpServers ?? {}), karmax: claudeMcpServer(platform) };
+        fs.writeFileSync(file, JSON.stringify(cur, null, 2));
+      } else if (provider === 'codex') {
+        const file = path.join(home, 'config.toml');
+        const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+        const preserved = removeTomlTables(existing, ['mcp_servers.karmax']);
+        fs.writeFileSync(file, preserved.trimEnd() + codexMcpServer('karmax', platform));
+      }
+    }
+  }
+}
+
+function claudeMcpServer(server: McpServerSpec): Omit<McpServerSpec, 'forwardEnv'> {
+  const { forwardEnv: _forwardEnv, ...config } = server;
+  return config;
+}
+
+function codexMcpServer(name: string, server: McpServerSpec): string {
+  const envLines = server.env ? Object.entries(server.env).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join('\n') : '';
+  const forwarded = server.forwardEnv?.length ? `env_vars = ${JSON.stringify(server.forwardEnv)}\n` : '';
+  return `\n[mcp_servers.${name}]\ncommand = ${JSON.stringify(server.command)}\nargs = ${JSON.stringify(server.args)}\n${forwarded}${server.env ? `\n[mcp_servers.${name}.env]\n${envLines}\n` : ''}`;
 }
 
 /** Remove TOML tables (and their child tables) while leaving all other text intact. */
@@ -107,6 +142,8 @@ export interface McpServerSpec {
   command: string;
   args: string[];
   env?: Record<string, string>;
+  /** Parent-process variables Codex must explicitly allow into the MCP child. */
+  forwardEnv?: string[];
 }
 export interface McpBaseline {
   browser?: BrowserMcp;
@@ -114,11 +151,15 @@ export interface McpBaseline {
   platform?: McpServerSpec;
 }
 
+export const CHROME_DEVTOOLS_MCP_VERSION = '1.6.0';
+export const PLAYWRIGHT_MCP_VERSION = '0.0.78';
+export const PLAYWRIGHT_VERSION = '1.61.1';
+
 /** Resolve a baseline spec to concrete stdio MCP server commands. */
 export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
   const out: Record<string, McpServerSpec> = {};
-  if (spec.browser === 'chrome-devtools') out['chrome-devtools'] = { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] };
-  else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', '@playwright/mcp@latest'] };
+  if (spec.browser === 'chrome-devtools') out['chrome-devtools'] = { command: 'npx', args: ['-y', `chrome-devtools-mcp@${CHROME_DEVTOOLS_MCP_VERSION}`] };
+  else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`] };
   if (spec.platform) out['karmax'] = spec.platform;
   return out;
 }
@@ -131,7 +172,20 @@ export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
  */
 export function platformMcpSpec(gatewayUrl: string): McpServerSpec {
   const entry = fileURLToPath(new URL('../mcp/stdio.ts', import.meta.url));
-  return { command: 'npx', args: ['tsx', entry], env: { KARMAX_GATEWAY_URL: gatewayUrl } };
+  // Launch through karmax's own tsx loader. `npx tsx` resolves from the agent's
+  // worktree and expands into npm -> shell -> tsx CLI -> Node; if any wrapper is
+  // killed, Codex reports only "Stream closed". This is one process, starts
+  // faster, and is independent of the task world's node_modules.
+  const loader = import.meta.resolve('tsx');
+  return {
+    command: process.execPath,
+    args: ['--import', loader, entry],
+    env: { KARMAX_GATEWAY_URL: gatewayUrl },
+    // Codex intentionally does not inherit arbitrary parent env vars into stdio
+    // MCP servers. The token is short-lived and task-scoped; explicitly forward
+    // that one value instead of persisting it in the durable config home.
+    forwardEnv: ['KARMAX_TOKEN'],
+  };
 }
 
 function readJson(file: string): any {

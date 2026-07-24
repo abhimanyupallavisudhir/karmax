@@ -36,7 +36,7 @@ export interface Harness {
   restartWorker(): Promise<void>;
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
-  startGateway(opts?: { password?: string }): Promise<{ url: string; close: () => Promise<void> }>;
+  startGateway(opts?: { password?: string }): Promise<{ url: string; internalUrl: string; close: () => Promise<void> }>;
 }
 
 /** Boots a full karmax backend (Temporal + worker + deps) for integration tests. */
@@ -47,6 +47,9 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   const client = c.client;
 
   const store = new Store(':memory:');
+  // Direct API tests use this stable human principal. Production establishes
+  // the same membership during first-account setup or invitation acceptance.
+  store.claimPersonalOrganization('a');
   // Production seeds role profiles before constructing the API. Do the same in
   // the harness so API-created tasks honor the requested hermetic provider and
   // never auto-detect a developer's real Claude/Codex login.
@@ -60,8 +63,9 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   if (adapterOverride) adapters.set(provider, adapterOverride);
   const profiles = new ProfileResolver(store, provider);
   const bus = new KarmaxBus();
+  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
 
-  const tokens = new TokenAuthority();
+  const tokens = new TokenAuthority(store);
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry();
   paymentRegistry.register(payments);
@@ -75,13 +79,13 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
     client,
     tokens,
     payments,
+    contentDir,
     taskQueue: TASK_QUEUE,
   };
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);
   let runPromise = worker.run();
 
-  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider });
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus });
   const gateways: Array<() => Promise<void>> = [];
 
   return {
@@ -124,6 +128,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
         configHomes,
         login,
         password: opts?.password,
+        worlds,
       });
       const started = await gw.listen();
       gateways.push(started.close);
@@ -136,6 +141,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
       await c.close();
       await server.stop();
       fs.rmSync(worldsHome, { recursive: true, force: true });
+      fs.rmSync(contentDir, { recursive: true, force: true });
     },
     async makeRepo(name: string) {
       const repo = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-repo-${name}-`));

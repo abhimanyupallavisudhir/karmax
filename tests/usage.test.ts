@@ -3,7 +3,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { parseUsagePanel, labelToEpoch, probeClaudeUsage, isUsageStale, USAGE_TTL_MS } from '../src/agent/usage.js';
+import {
+  parseUsagePanel,
+  parseCodexRateLimits,
+  labelToEpoch,
+  probeClaudeUsage,
+  probeCodexUsage,
+  isUsagePollable,
+  isUsageStale,
+  USAGE_TTL_MS,
+} from '../src/agent/usage.js';
 
 /**
  * Hermetic verification of the proactive-quota parser + probe (#6). The panel text
@@ -37,6 +46,27 @@ const STATS_FOOTER = [
 
 const NOW = Date.UTC(2026, 6, 4, 18, 0, 0); // Jul 4 2026, 18:00 UTC
 
+const CODEX_LIMITS = {
+  rateLimits: {
+    limitId: 'codex',
+    primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: Math.floor((NOW + 2 * 60 * 60_000) / 1000) },
+    secondary: { usedPercent: 34, windowDurationMins: 10_080, resetsAt: Math.floor((NOW + 5 * 86_400_000) / 1000) },
+  },
+  rateLimitsByLimitId: {
+    codex: {
+      limitId: 'codex',
+      primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: Math.floor((NOW + 2 * 60 * 60_000) / 1000) },
+      secondary: { usedPercent: 34, windowDurationMins: 10_080, resetsAt: Math.floor((NOW + 5 * 86_400_000) / 1000) },
+    },
+    codex_spark: {
+      limitId: 'codex_spark',
+      limitName: 'GPT Spark',
+      primary: { usedPercent: 7, windowDurationMins: 10_080, resetsAt: Math.floor((NOW + 6 * 86_400_000) / 1000) },
+      secondary: null,
+    },
+  },
+};
+
 describe('parseUsagePanel', () => {
   it('parses session %, weekly %, per-model %, resets + timezone', () => {
     const r = parseUsagePanel(FULL_PANEL, NOW);
@@ -66,6 +96,34 @@ describe('parseUsagePanel', () => {
   it('clamps out-of-range percentages', () => {
     const r = parseUsagePanel('Current session: 250% used · resets Jul 5, 2:19am (Europe/London)', NOW);
     expect(r.ok && r.session?.pct).toBe(100);
+  });
+});
+
+describe('parseCodexRateLimits', () => {
+  it('maps Codex rolling + weekly windows and per-model buckets to dashboard usage', () => {
+    const r = parseCodexRateLimits(CODEX_LIMITS, NOW);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.session).toMatchObject({ pct: 12, resetLabel: '', resetAt: NOW + 2 * 60 * 60_000 });
+    expect(r.week).toMatchObject({ pct: 34, resetLabel: '', resetAt: NOW + 5 * 86_400_000 });
+    expect(r.models).toEqual([
+      expect.objectContaining({ name: 'GPT Spark', pct: 7, resetAt: NOW + 6 * 86_400_000 }),
+    ]);
+  });
+
+  it('labels a sole multi-day window as weekly and accepts the legacy single-bucket view', () => {
+    const r = parseCodexRateLimits({
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 3, windowDurationMins: 10_080, resetsAt: Math.floor((NOW + 86_400_000) / 1000) },
+      },
+    }, NOW);
+    expect(r.ok && r.session).toBeUndefined();
+    expect(r.ok && r.week).toMatchObject({ pct: 3, resetAt: NOW + 86_400_000 });
+  });
+
+  it('reports an unavailable snapshot when the server returns no quota windows', () => {
+    expect(parseCodexRateLimits({ rateLimits: {} }, NOW)).toEqual({ ok: false, at: NOW, reason: 'no-rate-limits' });
   });
 });
 
@@ -165,6 +223,79 @@ describe('probeClaudeUsage', () => {
       const r = await probeClaudeUsage({ configHome: home, now: NOW, run: async () => { throw new Error('boom'); } });
       expect(r.ok).toBe(false);
       expect(!r.ok && r.reason).toContain('probe-failed');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('probeCodexUsage', () => {
+  const mkHome = (withCred: boolean) => {
+    const home = path.join(os.tmpdir(), `karmax-codex-usage-test-${crypto.randomBytes(5).toString('hex')}`);
+    fs.mkdirSync(home, { recursive: true });
+    if (withCred) fs.writeFileSync(path.join(home, 'auth.json'), '{}');
+    return home;
+  };
+
+  it('reads rate limits through the injected app-server request without a model turn', async () => {
+    const home = mkHome(true);
+    try {
+      const r = await probeCodexUsage({ configHome: home, now: NOW, run: async () => CODEX_LIMITS });
+      expect(r.ok).toBe(true);
+      expect(r.ok && r.session?.pct).toBe(12);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('performs the initialize + account/rateLimits/read app-server handshake', async () => {
+    const home = mkHome(true);
+    const stub = path.join(home, 'codex-usage-stub.cjs');
+    const oldCmd = process.env.KARMAX_CODEX_USAGE_CMD;
+    const oldExpected = process.env.STUB_EXPECTED_CODEX_HOME;
+    fs.writeFileSync(stub, `#!/usr/bin/env node
+const readline = require('readline');
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+let initialized = false;
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    initialized = true;
+    send({ id: msg.id, result: {} });
+  } else if (msg.method === 'account/rateLimits/read') {
+    if (!initialized || process.env.CODEX_HOME !== process.env.STUB_EXPECTED_CODEX_HOME) {
+      send({ id: msg.id, error: { code: -1, message: 'bad probe environment' } });
+    } else {
+      send({ id: msg.id, result: ${JSON.stringify(CODEX_LIMITS)} });
+    }
+  }
+});
+`);
+    fs.chmodSync(stub, 0o755);
+    process.env.KARMAX_CODEX_USAGE_CMD = stub;
+    process.env.STUB_EXPECTED_CODEX_HOME = home;
+    try {
+      const r = await probeCodexUsage({ configHome: home, now: NOW, timeoutMs: 2_000 });
+      expect(r.ok && r.week?.pct).toBe(34);
+    } finally {
+      if (oldCmd === undefined) delete process.env.KARMAX_CODEX_USAGE_CMD;
+      else process.env.KARMAX_CODEX_USAGE_CMD = oldCmd;
+      if (oldExpected === undefined) delete process.env.STUB_EXPECTED_CODEX_HOME;
+      else process.env.STUB_EXPECTED_CODEX_HOME = oldExpected;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('requires a native auth.json and does not launch app-server without one', async () => {
+    const home = mkHome(false);
+    let ran = false;
+    try {
+      const r = await probeCodexUsage({ configHome: home, now: NOW, run: async () => { ran = true; return CODEX_LIMITS; } });
+      expect(r).toEqual({ ok: false, at: NOW, reason: 'setup-token' });
+      expect(ran).toBe(false);
+      expect(isUsagePollable({ provider: 'codex', kind: 'login', configHome: home })).toBe(false);
+      fs.writeFileSync(path.join(home, 'auth.json'), '{}');
+      expect(isUsagePollable({ provider: 'codex', kind: 'login', configHome: home })).toBe(true);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }

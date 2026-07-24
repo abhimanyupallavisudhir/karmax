@@ -1,6 +1,6 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
-import { worldRepos } from '../world/types.js';
+import { worldRepos, worldWorkingRelativePath } from '../world/types.js';
 
 /**
  * Deterministic mock agent for hermetic tests. It executes simple directives
@@ -102,7 +102,7 @@ export class MockAdapter implements AgentAdapter {
         case 'write': {
           const [p, content = ''] = splitOn(rest, '::');
           ctx.emitActivity({ id: `write-${p.trim()}`, kind: 'file', phase: 'started', title: `Write ${p.trim()}` });
-          await input.world.writeFile(p.trim(), content.replace(/\\n/g, '\n'));
+          await input.world.writeFile(worldWorkingRelativePath(input.world.handle, p.trim()), content.replace(/\\n/g, '\n'));
           ctx.emitActivity({ id: `write-${p.trim()}`, kind: 'file', phase: 'completed', title: `Wrote ${p.trim()}` });
           ctx.emit(`wrote ${p.trim()}`);
           outputs.push(`wrote ${p.trim()}`);

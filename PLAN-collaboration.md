@@ -1,27 +1,24 @@
 # Human and agent collaboration
 
+> Status: implemented and corrected for workflow-owned routing, 2026-07-15.
+
 ## Finding
 
-Authentication and authorization are necessary but not a collaboration model.
-Karmax now has real user identities and project/global grants, but tasks do not
-yet model people as owners, reviewers, subscribers, or notification recipients.
-Until the model below lands, the UI's notification bell is merely a project-wide
-projection of tasks at Review/escalation; it is not a per-user inbox.
+Karmax is not a conventional issue tracker. A task is an execution of a durable
+workflow, so generic issue metadata such as assignee, delegate, reviewer,
+approval, follower, or “My work” creates a second, competing orchestration model.
+It cannot say which decision needs attention, and it goes stale as the workflow
+moves between agents, automation, and human gates.
 
-The useful common shape across mature task systems is:
+The workflow is the authority. Each human wait declares its audience at that
+specific step; task events materialize a per-user inbox from that declaration.
+There is no task-level responsibility editor in the product UI.
 
-- one accountable assignee, rather than ambiguous shared ownership;
-- separate delegates/executors, collaborators/subscribers, and reviewers;
-- people and teams as explicit review targets;
-- automatic subscription for responsibility and participation, with user-level
-  delivery preferences;
-- assignment and responsibility as searchable fields.
+## Principals and tenancy
 
-Karmax should retain that clarity while admitting agents as first-class actors.
-
-## Principals and provenance
-
-A logical principal reference is one of:
+An Organization is the tenant and collaboration boundary. It owns users, teams,
+projects, repositories, execution policy, inboxes, identity policy, and audit.
+Stable principal references remain useful for provenance and routing:
 
 ```ts
 type PrincipalRef =
@@ -30,106 +27,90 @@ type PrincipalRef =
   | { kind: 'task-agent'; taskId: string; role: string };
 ```
 
-`task-agent` deliberately names a logical role (for example, “Task #120's Do
-agent”), not a provider process or retry attempt. Attempts, sessions, and forked
-conversations remain provenance records beneath that stable actor. A retry can
-therefore neither lose responsibility nor manufacture a new identity.
+`createdBy` is immutable provenance, not an assignee. Assignment never grants
+access. Organization/project membership and attenuated capabilities remain the
+authorization model.
 
-Every task then has distinct relationships:
+## Workflow-owned human routing
 
-- `createdBy` — immutable provenance; a user, task agent, or system service.
-- `assignee` — zero or one accountable user or agent. “Owner” is a UI synonym,
-  not a second field.
-- `delegate` — optional executing agent when a human remains accountable.
-- `subscribers` — users or teams who opted into ordinary updates.
-- `confirmationPolicy` — the principals allowed/required to make a particular
-  decision.
-
-Assignment never grants access. A user/team must already be a project member;
-an agent receives only its stored, attenuated task grant. This prevents an
-assignment edit from becoming a privilege-escalation path.
-
-## Teams and confirmation routing
-
-Use first-class teams, not free-form “categories of humans”. Teams may be global
-or project-local and have members plus optional semantic roles (project owner,
-triage, security review, billing approver). A confirmation target is a selector:
+A human Confirm layer carries an audience:
 
 ```ts
-type ConfirmationTarget =
-  | PrincipalRef
-  | { kind: 'project-role'; projectId: string; role: string };
+type ConfirmLayer =
+  | { kind: 'agent'; provider?: string; model?: string; prompt?: string }
+  | { kind: 'human'; audience: HumanAudience };
 
-type ConfirmationPolicy = {
-  targets: ConfirmationTarget[];
-  rule: 'any' | 'all' | { quorum: number };
-};
+type HumanAudience = string[]; // any matching person may satisfy this layer
 ```
 
-There is no durable naked `human` recipient. The task form resolves “Human” to a
-named user/team/project role and shows that resolution before queueing. Existing
-tasks with legacy `confirm.mode = human` use the project's configured default
-review team; if none exists, project administrators are the explicit fallback
-and the UI warns that the default needs configuration.
+Selectors are stable ids or explicit workflow vocabulary:
+
+- `@creator` — the initiating human. For an agent-created subtask, resolve back
+  through the parent-task chain to that human.
+- `@all` — every member of the organization.
+- `@owners` — organization owners.
+- `@project` — everyone with access to the project.
+- `@team:<slug>` — a team through a readable stable route such as
+  `@team:leaders`; `team:<id>` remains a compatibility spelling.
+- `user:<id>` — a specific person.
+
+The schema-driven Confirm editor provides searchable people/teams plus these
+special selectors. Multiple selectors in one layer mean “any”; multiple human
+layers express sequential decisions. Agent and human layers can be interleaved.
+Legacy naked human gates normalize to `@creator`.
+
+Membership is only the routing/scope fact. Human authority is selected once
+through Developer, Project maintainer, Automation operator, or Administrator.
+The store retains a hidden protected-owner marker solely to preserve one tenant
+recovery principal; it grants no independent permissions and is not selectable.
+Teams intentionally have no sub-roles.
+
+Team membership editors use account names and email addresses, never durable
+user IDs. Teams may be renamed; the previous slug remains a routing alias so an
+in-flight workflow cannot be stranded. An unused team may be deleted. Deletion
+is rejected while project access, saved defaults, or unfinished work still
+references the team, because silently turning a human gate into an empty
+audience is not an acceptable lifecycle behavior.
+
+When a workflow publishes `waitingFor: { kind: 'human', audience }`, only a
+matching human may send its Confirm signal. The confirming principal and declared
+audience are recorded in the event log. The compatibility API may still read old
+task-level confirmation policies, but new UI/workflows never create them.
 
 ## Inbox and delivery
 
-Events stay the source of truth. A recipient resolver consumes responsibility
-events (assigned, mentioned, review requested, escalated), expands team/role
-selectors at event time, and materializes one deduplicated inbox row per human:
+Events remain the source of truth:
 
 ```text
-event -> responsibility + subscriptions -> audience resolver -> user inbox
-                                                    \-> delivery preferences
+workflow wait/event -> audience resolver -> one actionable inbox row per human
+                                      \-> browser/email/Slack delivery adapters
 ```
 
-Creators and assignees are automatically subscribed; mentions subscribe the
-mentioned user to the relevant thread; users may unsubscribe from routine
-updates but not suppress a currently assigned review/escalation. Do not notify
-every project member. Email/browser/Slack are delivery adapters over the inbox,
-not independent sources of truth.
+The inbox contains only events routed to that user. It is not a saved task query,
+and it does not depend on following/subscription state. Agents do not need a
+simulated human inbox: agent-directed work uses durable task signals, child tasks,
+and workflow coordination.
+The UI exposes this as one page reached from the top-bar attention icon; there is
+no competing sidebar item or abbreviated popover.
 
-Agents do not need a simulated human notification bell. Agent-directed work is
-durable coordination: a task signal for an attached live workflow, or a new
-assigned task for asynchronous work. That preserves retries and auditability.
+## Authorization and execution
 
-## Search and organization
+Human routing does not widen authority. The selected user must already be an
+organization/project member with permission to view and signal the task. Agent
+roles remain bounded by the intersection of the workflow role ceiling, selected
+authorization profile, creator's grant, and task scope.
+People is the only UI for organization membership and project Access is the only
+UI for project membership. Agent permissions configure task-agent profiles only;
+they do not repeat human accounts or grants.
 
-Expose `assignee`, `delegate`, `creator`, `subscriber`, `reviewer`, and
-`participant` through the existing declared search-field registry. Add derived
-facets `is:mine`, `is:unassigned`, and `needs:my-review`; “My work” and “Inbox”
-are saved-query projections, not new task containers. Display names are for UI
-and fuzzy lookup only; persisted filters store immutable principal IDs.
+Authoring and protected-target merging remain separate trust domains. The Do
+agent edits an isolated world; Merge receives a concrete merge capability only
+while holding the durable queue lease after all Confirm layers have passed.
 
-## Worktree author versus merger
+## Compatibility boundary
 
-Yes: authoring and protected-target merging are different trust domains. Keep
-the separation already described by `SPEC.md` §8:
-
-- the Do role may edit its isolated world/branch;
-- the Merge role alone receives a concrete `merge-into:<repo>:<branch>` grant,
-  and only while holding the merge-queue lease after the review gate;
-- Resolve and Confirm receive their own smaller role ceilings;
-- retries/replacements inherit the same logical role and attenuated task grant.
-
-Do not make users hand-author a raw permission set for every workflow agent. The
-workflow manifest declares each role's maximum; the task's selected authorization
-profile declares the job envelope; the runtime grants their intersection. Offer
-per-role profile overrides as an advanced workflow setting. Worktree filesystem
-isolation belongs to the world provider (container/microVM for an enforcement
-boundary), while karmax capabilities enforce server/MCP operations. A cosmetic
-`worktree:write` server capability would not sandbox a host process and would
-therefore promise security it cannot provide.
-
-## Delivery order
-
-1. Add teams/project membership and immutable principal references.
-2. Persist task creator, assignee, delegate, and subscribers; expose them in task
-   create/edit, MCP, event history, and search.
-3. Replace naked human confirmation with explicit confirmation policies.
-4. Materialize the per-user inbox and delivery preferences from task events.
-5. Add “My work”, “Needs my review”, workload, and audit views as saved queries.
-
-These steps require a domain migration and workflow compatibility layer. They
-should land together by layer rather than adding UI-only owner fields that the
-workflow, search engine, and notification resolver cannot honor.
+The database retains creator, legacy responsibility, subscriber, and confirmation
+records so historical workflows replay and old API clients can migrate safely.
+They are not product concepts for new work. New task creation does not synthesize
+reviewer policies, and the task list/detail/settings UI exposes none of the old
+assignee/delegate/reviewer/approval/following controls or saved views.

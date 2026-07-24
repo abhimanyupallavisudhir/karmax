@@ -27,6 +27,13 @@ function envInt(name: string, dflt: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt;
 }
 
+function envNonNegativeInt(name: string, dflt: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt;
+}
+
 function envFloat(name: string, dflt: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return dflt;
@@ -34,9 +41,14 @@ function envFloat(name: string, dflt: number): number {
   return Number.isFinite(n) && n >= 0 ? n : dflt;
 }
 
-const CAPACITY = envInt('KARMAX_MAX_AGENT_SLOTS', 3);
-const MIN_FREE_MB = envInt('KARMAX_AGENT_MIN_FREE_MB', 512);
-const MAX_LOAD_FACTOR = envFloat('KARMAX_AGENT_MAX_LOAD_FACTOR', 1.0);
+// Read configuration at admission time. Besides making diagnostics reflect a
+// deliberate runtime env change, this prevents a utility import during startup
+// from permanently freezing legacy admission settings before configuration is
+// loaded. Stable turn IDs use the durable agent-queue coordinator; this file
+// remains the replay-compatible fallback for historical executions.
+const capacity = () => envInt('KARMAX_MAX_AGENT_SLOTS', 3);
+const minFreeMb = () => envNonNegativeInt('KARMAX_AGENT_MIN_FREE_MB', 512);
+const maxLoadFactor = () => envFloat('KARMAX_AGENT_MAX_LOAD_FACTOR', 1.0);
 const MEM_POLL_MS = 1000;
 const SLOT_POLL_MS = 100;
 const MEM_WAIT_MAX_MS = 5 * 60 * 1000;
@@ -172,13 +184,13 @@ export function admissionDecision(
 const pressure = () =>
   admissionDecision(
     { freeMemMb: freeMemMb(), loadavg1: os.loadavg()[0]!, cores: coreCount() },
-    { minFreeMb: MIN_FREE_MB, maxLoadFactor: MAX_LOAD_FACTOR },
+    { minFreeMb: minFreeMb(), maxLoadFactor: maxLoadFactor() },
   );
 const memoryTight = () => pressure().memoryTight;
 const loadHigh = () => pressure().loadHigh;
 
 export function hostMemoryTight(): boolean {
-  if (MIN_FREE_MB > 0) return memoryTight();
+  if (minFreeMb() > 0) return memoryTight();
   const total = os.totalmem() / (1024 * 1024);
   return freeMemMb() < total * 0.05;
 }
@@ -199,7 +211,7 @@ export function hostStats() {
 }
 
 export async function awaitAgentResources(onWait?: () => void, signal?: AbortSignal): Promise<void> {
-  if (MIN_FREE_MB <= 0 && MAX_LOAD_FACTOR <= 0) return;
+  if (minFreeMb() <= 0 && maxLoadFactor() <= 0) return;
   const deadline = Date.now() + MEM_WAIT_MAX_MS;
   while ((memoryTight() || loadHigh()) && Date.now() < deadline) {
     if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('agent slot wait cancelled');
@@ -212,7 +224,7 @@ export async function awaitAgentResources(onWait?: () => void, signal?: AbortSig
 function tryAcquire(rec: LeaseRecord): string | undefined {
   ensureLeaseDirs();
   liveRecords(slotsDir());
-  for (let i = 0; i < CAPACITY; i++) {
+  for (let i = 0; i < capacity(); i++) {
     const file = path.join(slotsDir(), `${i}.json`);
     if (writeExclusive(file, rec)) return file;
   }
@@ -259,11 +271,11 @@ export async function acquireAgentSlot(onWait?: () => void, signal?: AbortSignal
 export function agentSlotStats() {
   ensureLeaseDirs();
   return {
-    capacity: CAPACITY,
+    capacity: capacity(),
     inUse: liveRecords(slotsDir()).length,
     waiting: liveRecords(waitersDir()).length,
-    minFreeMb: MIN_FREE_MB,
-    maxLoadFactor: MAX_LOAD_FACTOR,
+    minFreeMb: minFreeMb(),
+    maxLoadFactor: maxLoadFactor(),
     memoryTight: memoryTight(),
     loadHigh: loadHigh(),
     host: hostStats(),

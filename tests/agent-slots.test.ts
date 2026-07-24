@@ -48,7 +48,9 @@ describe('host diagnostics', () => {
     expect(s.freeMemMb).toBeLessThanOrEqual(s.totalMemMb + 1);
     expect(s.usedMemPct).toBeGreaterThanOrEqual(0);
     expect(s.usedMemPct).toBeLessThanOrEqual(100);
-    expect(s.loadPerCore).toBeCloseTo(s.loadavg[0] / s.cores, 2); // reported rounded to 2dp
+    // Assert the documented two-decimal projection exactly. toBeCloseTo's
+    // half-step boundary is floating-point-sensitive (for example .425→.43).
+    expect(s.loadPerCore).toBe(Math.round((s.loadavg[0] / s.cores) * 100) / 100);
   });
 
   it('agentSlotStats surfaces capacity, gates, and the live host signal', () => {

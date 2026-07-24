@@ -144,11 +144,24 @@ describe('isTransportError', () => {
     expect(isTransportError('Anthropic API 503: upstream connect error')).toBe(true);
   });
 
+  it('recognizes provider reconnects, DNS/TLS failures, and temporary host pressure', () => {
+    // Exact terminal error from task #225 (the remaining text was provider logs).
+    expect(isTransportError('codex app-server turn failed: Reconnecting... 1/5 · failed to refresh available models: timeout waiting for child process to exit')).toBe(true);
+    expect(isTransportError('Temporary failure in name resolution')).toBe(true);
+    expect(isTransportError('TLS handshake timeout')).toBe(true);
+    expect(isTransportError('upstream service unavailable (HTTP 503)')).toBe(true);
+    expect(isTransportError('Claude provider server_error: temporarily unavailable')).toBe(true);
+    expect(isTransportError('spawn EAGAIN')).toBe(true);
+    expect(isTransportError('EMFILE: too many open files')).toBe(true);
+  });
+
   it('does NOT swallow agent/semantic errors into the retry path', () => {
     expect(isTransportError('boom goes the agent')).toBe(false);
     expect(isTransportError('mock failure')).toBe(false);
     expect(isTransportError('tests failed: 3 assertion errors in merge.test.ts')).toBe(false);
     expect(isTransportError('no agent adapter for provider "codex"')).toBe(false);
+    expect(isTransportError('ENOSPC: no space left on device')).toBe(false);
+    expect(isTransportError('EACCES: permission denied')).toBe(false);
   });
 
   it('leaves quota signals to the limit classifier (429 is not transport)', () => {

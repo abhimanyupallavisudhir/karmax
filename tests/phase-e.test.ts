@@ -31,6 +31,21 @@ describe('reconcileTasks (settle lost workflows on restart)', () => {
     expect(r.settled).toBe(1);
     expect(store.getTask(t.id)!.lastView!.status).toBe('failed');
   });
+
+  it('reconciles every attempt execution, including non-principal siblings', async () => {
+    const store = new Store(':memory:');
+    const p = store.createProject('P', {});
+    const first = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const second = store.createTask({ projectId: p.id, title: 'T', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'y' }, intentId: first.intentId });
+    for (const t of [first, second]) {
+      store.saveView(t.id, { taskId: t.id, title: 'T', workflow: 'software-dev', stage: 'do', status: 'active', messages: [], actions: [], state: {}, updatedAt: 0 });
+    }
+    const fakeClient: any = { workflow: { getHandle: () => ({ describe: async () => { throw new Error('not found'); } }) } };
+    const r = await reconcileTasks(store, fakeClient);
+    expect(r.settled).toBe(2);
+    expect(store.getTask(first.id)!.lastView!.status).toBe('failed');
+    expect(store.getTask(second.id)!.lastView!.status).toBe('failed');
+  });
 });
 
 describe('default branch + auto-review (real Temporal + git)', () => {

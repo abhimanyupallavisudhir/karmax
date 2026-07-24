@@ -55,6 +55,25 @@ describe('query-language parser', () => {
     expect(parseQuery('id:>=3').filters?.[0]).toEqual({ field: 'num', op: 'gte', values: ['3'] });
   });
 
+  it('keeps quoted multi-word clause values together (the form stringifyQuery emits)', () => {
+    expect(parseQuery('conversation:"merge conflict"').filters).toEqual([
+      { field: 'conversation', op: 'contains', values: ['merge conflict'] },
+    ]);
+    // commas outside quotes still split; quoted parts keep their spaces
+    expect(parseQuery('status:done,"in progress"').filters).toEqual([
+      { field: 'status', op: 'is', values: ['done', 'in progress'] },
+    ]);
+    // negation composes, and the quoted value is literal (no op sniffing inside)
+    expect(parseQuery('-says:">boom"').filters).toEqual([
+      { field: 'conversation', op: 'contains', values: ['>boom'], negate: true },
+    ]);
+  });
+
+  it('round-trips a spaced clause value through stringifyQuery', () => {
+    const q = parseQuery('conversation:"artifact cache" is:open');
+    expect(parseQuery(stringifyQuery(q))).toEqual(q);
+  });
+
   it('treats an unknown field key as free text (never drops it)', () => {
     const q = parseQuery('bogus:value plain');
     expect(q.filters).toBeUndefined();
@@ -101,6 +120,20 @@ describe('evaluateQuery — filtering', () => {
     expect(evaluateQuery(tasks, parseQuery('is:untagged'), ctx).tasks.map((t) => t.num)).toEqual([4]);
   });
 
+  it('searches responsibility and caller-relative work/review facets', () => {
+    const owned = task({ title: 'Owned', num: 20, assignee: { kind: 'user', userId: 'u1' },
+      createdBy: { kind: 'user', userId: 'u2' }, subscribers: [{ kind: 'team', teamId: 'design' }],
+      lastView: view('active') });
+    const review = task({ title: 'Review', num: 21, reviewers: ['u1'], lastView: view('waiting', 'review') });
+    const other = task({ title: 'Other', num: 22, assignee: { kind: 'user', userId: 'u2' }, lastView: view('active') });
+    const mine = { ...ctx, userId: 'u1' };
+    expect(evaluateQuery([owned, review, other], parseQuery('is:mine'), mine).tasks.map((t) => t.num)).toEqual([20]);
+    expect(evaluateQuery([owned, review, other], parseQuery('needs:my-review'), mine).tasks.map((t) => t.num)).toEqual([21]);
+    expect(evaluateQuery([owned, review, other], parseQuery('is:unassigned'), mine).tasks.map((t) => t.num)).toEqual([21]);
+    expect(evaluateQuery([owned, review, other], parseQuery('creator:user:u2'), mine).tasks.map((t) => t.num)).toEqual([20]);
+    expect(evaluateQuery([owned, review, other], parseQuery('participant:team:design'), mine).tasks.map((t) => t.num)).toEqual([20]);
+  });
+
   it('AND-s multiple clauses together', () => {
     const r = evaluateQuery(tasks, parseQuery('status:active priority:>=1'), ctx);
     expect(r.tasks.map((t) => t.num)).toEqual([1]);
@@ -112,11 +145,13 @@ describe('evaluateQuery — filtering', () => {
   });
 });
 
-describe('evaluateQuery — free text (token-AND over title/notes/#num)', () => {
+describe('evaluateQuery — free text (token-AND over title/notes/prompt/#num)', () => {
   const tasks: SearchTask[] = [
     task({ title: 'Fix login bug', num: 1, notes: 'affects the web client' }),
     task({ title: 'Add login rate limit', num: 2 }),
     task({ title: 'Refactor auth', num: 3 }),
+    // A boilerplate preamble becomes the title; the real subject lives only in the prompt.
+    task({ title: '[STANDING INSTRUCTION. My requests are APPROXIMATE…', num: 4, params: { prompt: '[STANDING INSTRUCTION…]\n\nkarmax needs a wiki system for agent skills' } }),
   ];
   const ctx = { now: NOW, tags: [] as Tag[] };
 
@@ -134,6 +169,58 @@ describe('evaluateQuery — free text (token-AND over title/notes/#num)', () => 
 
   it('matches the task number as a term', () => {
     expect(evaluateQuery(tasks, parseQuery('#3'), ctx).tasks.map((t) => t.num)).toEqual([3]);
+  });
+
+  it('matches words that appear only in the prompt (titles are just its first line)', () => {
+    expect(evaluateQuery(tasks, parseQuery('wiki'), ctx).tasks.map((t) => t.num)).toEqual([4]);
+    // terms may straddle title and prompt
+    expect(evaluateQuery(tasks, parseQuery('standing wiki'), ctx).tasks.map((t) => t.num)).toEqual([4]);
+  });
+
+  it('supports an explicit prompt: filter distinct from title', () => {
+    expect(evaluateQuery(tasks, parseQuery('prompt:wiki'), ctx).tasks.map((t) => t.num)).toEqual([4]);
+    expect(evaluateQuery(tasks, parseQuery('-prompt:wiki login'), ctx).tasks.map((t) => t.num).sort()).toEqual([1, 2]);
+  });
+});
+
+describe('evaluateQuery — conversation: filter (opt-in transcript search)', () => {
+  const tasks: SearchTask[] = [
+    task({
+      title: 'Fix flaky deploy', num: 1,
+      lastView: view('waiting', 'review', {
+        messages: [{ id: 'm0', role: 'user', text: 'the deploy is flaky', ts: 0 }],
+        transcripts: [
+          { role: 'do', label: 'Do agent', messages: [
+            { id: 'm0', role: 'user', text: 'the deploy is flaky', ts: 0 },
+            { id: 'a1', role: 'agent', text: 'Root cause: a stale artifact cache; purged it.', ts: 1 },
+          ] },
+          { role: 'merge', label: 'Merge agent', messages: [
+            { id: 'a2', role: 'agent', text: 'Resolved a rebase conflict in ci.yml', ts: 2 },
+          ] },
+        ],
+      }),
+    }),
+    // No transcripts — the legacy top-level `messages` (the Do transcript) is the fallback.
+    task({ title: 'Old-style task', num: 2, lastView: view('done', 'done', { messages: [{ id: 'm0', role: 'user', text: 'tune the artifact retention', ts: 0 }] }) }),
+    // Never started — no lastView at all; must simply not match.
+    task({ title: 'Untouched draft', num: 3 }),
+  ];
+  const ctx = { now: NOW, tags: [] as Tag[] };
+
+  it('matches text from any role transcript, with the says: alias and negation', () => {
+    expect(evaluateQuery(tasks, parseQuery('conversation:"artifact cache"'), ctx).tasks.map((t) => t.num)).toEqual([1]);
+    expect(evaluateQuery(tasks, parseQuery('says:conflict'), ctx).tasks.map((t) => t.num)).toEqual([1]);
+    expect(evaluateQuery(tasks, parseQuery('-conversation:artifact'), ctx).tasks.map((t) => t.num)).toEqual([3]);
+  });
+
+  it('falls back to the legacy messages transcript and skips tasks with no view', () => {
+    expect(evaluateQuery(tasks, parseQuery('conversation:retention'), ctx).tasks.map((t) => t.num)).toEqual([2]);
+    expect(evaluateQuery(tasks, parseQuery('conversation:anything'), ctx).tasks.map((t) => t.num)).toEqual([]);
+  });
+
+  it('keeps bare free-text away from transcripts (precision guarantee)', () => {
+    // "conflict" lives only in the merge transcript — bare text must NOT find it.
+    expect(evaluateQuery(tasks, parseQuery('conflict'), ctx).tasks.map((t) => t.num)).toEqual([]);
   });
 });
 

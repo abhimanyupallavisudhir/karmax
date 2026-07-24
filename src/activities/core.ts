@@ -5,12 +5,12 @@ import { classifyProviderTurnError, isTransportError, isResourceKill, type Limit
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
-import { WorldHandle, WorldKind } from '../world/types.js';
+import { World, WorldHandle, WorldKind, worldWorkingDirectory } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import { credentialAliases, credentialMatchesProfile, credentialProvider, isAgentProvider } from '../agent/provider-registry.js';
 import { AgentAdapter } from '../agent/types.js';
-import { runTurn } from '../agent/runtime.js';
+import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { acquireAgentSlot, awaitAgentResources } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
@@ -19,12 +19,18 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
-import { worldRepos } from '../world/types.js';
+import { worldRepos, worldRepoSource } from '../world/types.js';
+import { git as hostGit } from '../world/git.js';
+import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
+import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
+import { materializeRemoteSession } from '../agent/remote-process.js';
 import os from 'node:os';
 import fs from 'node:fs';
+import { paths } from '../config/paths.js';
+import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
@@ -168,12 +174,17 @@ export interface CoreActivityDeps {
   globalInstructions?: string;
   tokens?: TokenAuthority;
   broker?: CredentialBroker;
+  githubApp?: import('../integrations/github-app.js').GitHubAppService;
+  checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
+  runners?: import('../world/runners.js').RunnerPoolService;
   payments?: PaymentProvider;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
+  contentDir?: string;
 }
 
 export interface CreateWorldArgs {
   taskId: string;
+  projectId?: string;
   repo?: string;
   /** Source repos for a multi-repo world; takes precedence over `repo`. */
   repos?: string[];
@@ -284,6 +295,7 @@ export interface PrepareChildArgs {
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const gitProfiles = new GitProfiles(store, deps.broker);
+  const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
     const ev = { type, taskId, ts: Date.now(), payload };
@@ -306,32 +318,219 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
   }
 
+  function brokerAuthFor(handle: WorldHandle, taskId?: string): GitBrokerAuth {
+    const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : undefined;
+    const project = projectId ? store.getProject(projectId) : undefined;
+    const linked = projectId ? store.listProjectRepositories(projectId) : [];
+    const wiki = projectId ? store.projectWiki(projectId)?.repository : undefined;
+    if (project?.organizationId && (linked.length || wiki) && deps.githubApp) {
+      return async (worldRepo) => {
+        const source = worldRepoSource(worldRepo);
+        const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository
+          ?? (wiki?.sshUrl === source ? wiki : undefined);
+        if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${source}`);
+        return deps.githubApp!.brokerCredentials(repository);
+      };
+    }
+    return gitEnvFor(handle, taskId);
+  }
+
+  async function ensureRunnerLease(handleInput: WorldHandle, taskId: string): Promise<WorldHandle> {
+    const handle = (store.currentWorld(handleInput.id) ?? handleInput) as WorldHandle;
+    if (!isRemote(handle.kind) || !deps.runners) return handle;
+    const existing = typeof handle.meta?.worldLeaseId === 'string' ? store.worldLease(handle.meta.worldLeaseId) : undefined;
+    if (existing?.state === 'active') return handle;
+    const projectId = String(handle.meta?.projectId ?? store.getTask(taskId)?.projectId ?? '');
+    const project = store.getProject(projectId);
+    if (!project) throw new Error('cloud world has no owning project');
+    const ctx = activityContext.current();
+    const acquired = await deps.runners.acquire({ project, taskId, worldId: handle.id, provider: handle.kind,
+      priority: Number(store.getTask(taskId)?.params.priority ?? 0), signal: ctx.cancellationSignal,
+      heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) });
+    const next = store.updateWorldMeta(handle, { worldLeaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId });
+    store.setWorldState(next, 'ready');
+    record(taskId, 'world.lease-acquired', { leaseId: acquired.leaseId, runnerPoolId: acquired.runnerPoolId });
+    return next as WorldHandle;
+  }
+
+  async function openWorld(handle: WorldHandle, taskId = handle.id): Promise<World> {
+    return worlds.open(await ensureRunnerLease(handle, taskId));
+  }
+
+  /** Make the task's live project-wiki checkout host-readable for prompt
+   * assembly. Local providers already expose it directly; remote providers are
+   * copied into a short-lived snapshot through the provider-neutral file API. */
+  async function projectWikiPromptSnapshot(world: World): Promise<{ root: string; release(): void } | undefined> {
+    const repo = worldRepos(world.handle).find((candidate) => candidate.role === 'project-wiki');
+    if (!repo) return undefined;
+    if (fs.existsSync(repo.root)) return { root: repo.root, release: () => {} };
+
+    const worldRoot = world.handle.root.replace(/\\/g, '/').replace(/\/+$/, '');
+    const repoRoot = repo.root.replace(/\\/g, '/').replace(/\/+$/, '');
+    const prefix = path.posix.relative(worldRoot, repoRoot);
+    if (prefix.startsWith('..') || path.posix.isAbsolute(prefix))
+      throw new Error('project wiki is outside the task world');
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-prompt-'));
+    try {
+      for (const file of await world.listFiles()) {
+        if (prefix && file !== prefix && !file.startsWith(`${prefix}/`)) continue;
+        const rel = prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
+        if (!rel || rel === '.git' || rel.startsWith('.git/')) continue;
+        const target = path.resolve(root, rel);
+        if (target !== root && !target.startsWith(`${root}${path.sep}`))
+          throw new Error('invalid file path in project wiki checkout');
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, await world.readFileBuffer(file));
+      }
+      return { root, release: () => fs.rmSync(root, { recursive: true, force: true }) };
+    } catch (error) {
+      fs.rmSync(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
+      const remote = isRemote(args.kind);
+      if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote)
+        throw new Error(`hosted deployments cannot run task code in the control plane (${args.kind}); select a remote runner`);
+      record(args.taskId, 'world.provisioning', { provider: args.kind });
       // Resolve the git profile (project → global default → none) and materialize
       // its identity for worktree-scoped config (PLAN-git-config.md §4A). Identity
       // failure downgrades to a warning — the world is still usable locally.
       const profile = gitProfiles.resolve({ gitProfile: args.gitProfile });
       let gitIdentity;
+      let gitCredentials;
       try {
         gitIdentity = profile ? gitProfiles.identity(profile, { taskId: args.taskId }) : undefined;
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` });
       }
-      const world = await worlds.create(args.kind, {
-        taskId: args.taskId,
-        repo: args.repo,
-        repos: args.repos,
-        base: args.base,
-        target: args.target,
-        branch: args.branch,
-        copyGlobs: args.copyGlobs,
-        gitIdentity,
-      });
-      if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
-      record(args.taskId, 'world.created', { handle: world.handle });
-      for (const warning of world.handle.warnings ?? []) {
-        record(args.taskId, 'world.warning', { warning });
+      try {
+        gitCredentials = profile ? gitProfiles.worldCredentials(profile, { taskId: args.taskId }) : undefined;
+      } catch (e) {
+        record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` });
+      }
+      // The project wiki is a platform-owned companion repository. Add it at
+      // provisioning time (rather than to deterministic workflow input), so
+      // old workflow histories remain replay-compatible.
+      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
+      const project = projectId ? store.getProject(projectId) : undefined;
+      const wikiRoot = project
+        ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
+        : undefined;
+      if (project && !store.projectWiki(project.id)) store.setProjectWikiRepository(project.id);
+      const wikiRepository = project ? store.projectWiki(project.id)?.repository : undefined;
+      if (remote && project && !wikiRepository)
+        throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
+      const developmentSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
+      const requestedSources = [
+        ...developmentSources,
+        ...(wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
+      ];
+      const cloudSources = remote ? await Promise.all(requestedSources.map((source) => cloudGitSource(source))) : [];
+      const worldSources = remote ? cloudSources.map((resolved) => resolved.source) : requestedSources;
+      for (let i = 0; i < cloudSources.length; i++) {
+        if (cloudSources[i]!.localPath)
+          record(args.taskId, 'world.repository-resolved', {
+            localPath: cloudSources[i]!.localPath, remote: cloudSources[i]!.source,
+          });
+      }
+      // Older/local workflow histories do not pass projectId into createWorld;
+      // the durable task record is the compatibility source for repository
+      // enrollment, credentials, and world ownership.
+      const linkedRepositories = projectId ? store.listProjectRepositories(projectId) : [];
+      const repositoryBranches = Object.fromEntries(linkedRepositories.map((candidate) => {
+        const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
+        return [candidate.repository.sshUrl, { base, target: candidate.targetBranch ?? base }];
+      }));
+      if (wikiRoot && requestedSources.includes(wikiRoot))
+        repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
+        base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH,
+      };
+      if (linkedRepositories.length || wikiRepository) {
+        if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
+        const credentials: Record<string, string> = {};
+        for (const source of worldSources) {
+          const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
+          const repository = linked?.repository ?? (wikiRepository?.sshUrl === source ? wikiRepository : undefined);
+          if (!repository) {
+            if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
+            continue;
+          }
+          if (deps.githubApp) credentials[source] = deps.githubApp.repositorySshKey(repository.id, 'clone');
+        }
+        // Repository-scoped read-only keys take precedence for enrolled
+        // sources. Local managed clones use the same ephemeral provisioning
+        // credential without persisting it.
+        if (Object.keys(credentials).length) gitCredentials = { ...gitCredentials, repositories: credentials };
+      }
+      const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
+      let acquired: { leaseId: string; runnerPoolId: string } | undefined;
+      if (remote && project && deps.runners) {
+        const ctx = activityContext.current();
+        acquired = await deps.runners.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
+          priority: Number(store.getTask(args.taskId)?.params.priority ?? 0), signal: ctx.cancellationSignal,
+          heartbeat: () => ctx.heartbeat({ waitingFor: 'world-capacity' }) });
+      }
+      let world: World;
+      try {
+        world = await worlds.create(args.kind, {
+          taskId: args.taskId,
+          organizationId: project?.organizationId,
+          repo: worldSources.length === 1 ? worldSources[0] : undefined,
+          repos: worldSources.length > 1 ? worldSources : undefined,
+          scratch: developmentSources.length === 0,
+          base: args.base,
+          target: args.target,
+          branch: args.branch,
+          copyGlobs: args.copyGlobs,
+          ...(remote ? { copySources: cloudSources.map((source) => source.localPath) } : {}),
+          gitIdentity,
+          gitCredentials,
+          ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
+          network: executionConfig?.network,
+          environment: executionConfig?.environment,
+          resources: executionConfig?.resources,
+        });
+      } catch (error) {
+        if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        throw error;
+      }
+      try {
+        if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
+        if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
+          const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
+          const wiki = world.handle.repos.find((repo) => worldRepoSource(repo) === wikiSource || repo.repo === wikiSource);
+          if (wiki) wiki.role = 'project-wiki';
+        }
+        // A platform-owned companion must not unexpectedly move agents out of
+        // the project's only development repository. Keep `root` as the world
+        // boundary so the wiki remains accessible, and select that development
+        // checkout as the default cwd. Genuine multi-development-repo projects
+        // retain the encompassing root as their working directory.
+        const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
+        if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
+        if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
+          repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
+            ...(wikiRepository ? [wikiRepository.id] : [])] };
+        if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
+        if (projectId) {
+          world.handle = store.registerWorld(world.handle, projectId, {
+            runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${args.kind}` : 'local'),
+            environmentDigest: remote
+              ? String(world.handle.meta?.environmentArtifact ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`)
+              : 'karmax-local',
+          }) as WorldHandle;
+        }
+        record(args.taskId, 'world.created', { handle: world.handle });
+        record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 });
+        for (const warning of world.handle.warnings ?? []) record(args.taskId, 'world.warning', { warning });
+      } catch (error) {
+        await world.destroy().catch(() => undefined);
+        if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
+        throw error;
       }
       return world.handle;
     },
@@ -404,7 +603,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Apply the per-role agent override from the task form (SPEC §10.5).
       const spec = args.task.agents?.[args.role];
       const profile = applyAgentSpec(baseProfile, spec);
-      const world = await worlds.open(args.worldHandle);
+      const world = await openWorld(args.worldHandle, args.taskId);
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
       // materializing the source session needs this turn's config home + world path.
@@ -484,11 +683,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           profileId: profile.id,
           principal: args.task.parentTaskId ? `task:${args.task.parentTaskId}` : (args.task.grantPrincipal ?? 'system:legacy-task'),
           projectId: args.task.projectId,
+          organizationId: store.getProject(args.task.projectId)?.organizationId,
+          audience: 'karmax-platform',
+          executionId: args.agentTurnId ?? legacyAgentTurnId,
+          worldGeneration: args.worldHandle.generation,
           ceiling: profile.capabilities,
           grantorCaps: grant,
         });
         token = minted.token;
-        record(args.taskId, 'token.minted', { profile: profile.id, caps: effective });
+        record(args.taskId, 'token.minted', { tokenId: minted.record.id, profile: profile.id, caps: effective,
+          audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt });
       }
 
       // JIT-resolve credentials via the broker (never journaled). The account to
@@ -521,7 +725,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
       }
-
+      // API sessions are stateless. Cloud subscription sessions live in their
+      // sandbox; a requested cross-world session is materialized explicitly below.
+      const apiRail = !!resolvedAuth?.apiKey || (!resolvedAuth && (
+        (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY) ||
+        (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+      ));
+      const remoteSubscriptionRail = isRemote(args.worldHandle.kind) && !apiRail;
       // ── Fork a prior agent (SPEC §10.5) ──────────────────────────────────────
       // Branch a NEW session from the source's REAL conversation — NOT by stuffing its
       // transcript into the prompt. Make the source session visible to THIS turn's
@@ -552,9 +762,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // meaningless; pass the id straight through. Real providers (claude/codex) key
           // a session to a file; make it visible in this turn's (home × world) or fail.
           const materialized =
-            profile.provider === 'mock' || profile.provider === 'opencode' || profile.provider === 'kimi' || profile.provider === 'grok'
+            profile.provider === 'mock' || apiRail
+              || profile.provider === 'opencode' || profile.provider === 'kimi' || profile.provider === 'grok'
               ? true
-              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: world.handle.root });
+              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: worldWorkingDirectory(world.handle) });
           if (!materialized) {
             // The id resolves in NO config home for this provider. Fail loudly instead
             // of handing an unknown id to the adapter, which would silently start a
@@ -608,12 +819,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // OpenCode advertises ACP session/fork and resolves its own opaque
             // ids. Kimi and Grok currently do not; their native harnesses are not
             // admitted, and any historical profile uses the honest replay path.
-            forked =
-              profile.provider === 'opencode'
-                ? true
-                : profile.provider === 'kimi' || profile.provider === 'grok'
-                  ? false
-                  : materializeFork({ provider: profile.provider, session: srcSession, forkHome, worldPath: world.handle.root, srcHome });
+            if (profile.provider === 'opencode') {
+              forked = true;
+            } else if (profile.provider !== 'kimi' && profile.provider !== 'grok') {
+              if (remoteSubscriptionRail) {
+                const sourceHandle = store.currentWorld(spec.resumeFrom.taskId) as WorldHandle | undefined;
+                if (sourceHandle && isRemote(sourceHandle.kind)) {
+                  try {
+                    const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
+                    forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
+                  } catch { /* source world may have expired; try the durable local home below */ }
+                }
+              }
+              if (!forked) forked = materializeFork({ provider: profile.provider, session: srcSession,
+                forkHome, worldPath: worldWorkingDirectory(world.handle), srcHome });
+            }
             if (forked) {
               session = srcSession;
               fork = true; // adapter branches a NEW session id from it (native fork)
@@ -646,12 +866,55 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const { paths } = await import('../config/paths.js');
         bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
       }
+      // Goal mode: the do agent is told to keep driving across turns until the
+      // objective is verifiably complete. Appended to the built-in working
+      // instructions so it flows through the wiki context and fallback alike.
+      const goalSuffix = args.role === 'do' && (args.task as { goalMode?: boolean }).goalMode
+        ? `
+- Goal mode is active. Continue autonomously across turns until the entire objective is complete and verified. A normal response does not finish the task: call signal_completion only when no required work remains. If you genuinely need a human decision, raise it with the appropriate task tool instead.`
+        : '';
+      const builtinInstructions = goalSuffix ? `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}` : deps.globalInstructions;
+      // Wiki context (SPEC §5.4 "global + project instructions"): the built-in
+      // working instructions (a virtual unconditional wiki entry), then per
+      // scope its unconditional entries in full and the indexed TOC. Read here
+      // (an activity) and snapshotted into the journaled turn input — content
+      // is free to edit between turns, never mid-turn. If the wiki is ever
+      // unreadable, the agent still gets the built-in instructions.
+      let projectInstructions: string | undefined;
+      let globalInstructions: string | undefined;
+      let wikiSnapshot: { root: string; release(): void } | undefined;
+      try {
+        const { buildWikiPromptContext } = await import('../wiki/wiki.js');
+        // Wiki pages the task tags in its prompt/follow-ups (`@proj:…`/`@org:…`)
+        // are inlined in full, as are the tokens in the task's wiki-context field
+        // (`params.wikiContext`, read fresh here like the wiki content itself;
+        // absent ⇒ the default `tag:default` tokens apply).
+        const taggedText = [args.task.prompt, ...args.messages.filter((m) => m.role === 'user').map((m) => m.text)]
+          .filter(Boolean)
+          .join('\n');
+        const wikiContext = store.getTask(args.taskId)?.params?.wikiContext;
+        wikiSnapshot = await projectWikiPromptSnapshot(world);
+        projectInstructions = buildWikiPromptContext({
+          contentDir: deps.contentDir ?? paths().content,
+          organizationId: store.getProject(args.task.projectId)?.organizationId,
+          projectId: args.task.projectId,
+          projectRoot: wikiSnapshot?.root,
+          builtinInstructions,
+          taggedText,
+          contextTokens: Array.isArray(wikiContext) ? wikiContext.map(String) : undefined,
+        }) || undefined;
+      } catch {
+        globalInstructions = `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}`;
+      } finally {
+        wikiSnapshot?.release();
+      }
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: args.task,
         world: args.worldHandle,
-        globalInstructions: deps.globalInstructions ?? GLOBAL_INSTRUCTIONS,
+        globalInstructions,
+        projectInstructions,
         bindings,
       });
       // Snapshot the journaled turn input (SPEC §5.4).
@@ -749,32 +1012,37 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastEmit: string | undefined;
       let result;
       try {
-        publishLegacyAgentState('waiting-slot');
-        // Current workflows carry a stable turn id, so the activity enrolls that
-        // turn in the durable/reorderable coordinator before starting the model.
-        // Historical executions lack the id and retain the replay-safe file gate.
-        if (args.agentTurnId && deps.client && deps.taskQueue) {
-          releaseSlot = await acquireWorkflowAgentSlot({
-            client: deps.client,
-            taskQueue: deps.taskQueue,
-            store,
-            taskId: args.taskId,
-            turnId: args.agentTurnId,
-            role: args.role,
-            provider: profile.provider,
-            title: args.task.title,
-            projectId: args.task.projectId,
-            heartbeat,
-            signal,
-          });
-          try {
-            await awaitAgentResources(heartbeat, signal);
-          } catch (e) {
-            await releaseSlot();
-            releaseSlot = () => {};
-            throw e;
-          }
-        } else releaseSlot = await acquireAgentSlot(heartbeat, signal);
+        // Remote subscription CLIs consume provider-world CPU/RAM, not host
+        // capacity. API rails and local subprocesses retain the host admission
+        // queue; account-level concurrency is enforced separately for every rail.
+        if (!remoteSubscriptionRail) {
+          publishLegacyAgentState('waiting-slot');
+          // Current workflows carry a stable turn id, so the activity enrolls that
+          // turn in the durable/reorderable coordinator before starting the model.
+          // Historical executions lack the id and retain the replay-safe file gate.
+          if (args.agentTurnId && deps.client && deps.taskQueue) {
+            releaseSlot = await acquireWorkflowAgentSlot({
+              client: deps.client,
+              taskQueue: deps.taskQueue,
+              store,
+              taskId: args.taskId,
+              turnId: args.agentTurnId,
+              role: args.role,
+              provider: profile.provider,
+              title: args.task.title,
+              projectId: args.task.projectId,
+              heartbeat,
+              signal,
+            });
+            try {
+              await awaitAgentResources(heartbeat, signal);
+            } catch (e) {
+              await releaseSlot();
+              releaseSlot = () => {};
+              throw e;
+            }
+          } else releaseSlot = await acquireAgentSlot(heartbeat, signal);
+        }
         // The workflow publishes `waiting-slot` immediately after the account grant;
         // only admission itself can truthfully report that the model is now running.
         if (deps.client && args.agentTurnId) {
@@ -784,8 +1052,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             .catch(() => undefined);
         }
         publishLegacyAgentState('running');
-        result = await runTurn(
-        {
+        result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
           messages,
@@ -799,7 +1066,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Git-profile credentials for the agent subprocess (PLAN-git-config.md
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(() => {
-            const gitEnv = gitEnvFor(args.worldHandle, args.taskId);
+            const gitEnv = isRemote(args.worldHandle.kind) ? {} : gitEnvFor(args.worldHandle, args.taskId);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
@@ -808,7 +1075,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
-        },
+        } },
         {
           adapters: deps.adapters,
           signal,
@@ -843,7 +1110,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             store.kvSet(`session:${conversationTaskId}:${args.role}`, s);
             store.kvSet(
               `sessionmeta:${conversationTaskId}:${args.role}`,
-              JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
+              JSON.stringify({
+                home: resolvedAuth?.configHome ?? '',
+                provider: profile.provider,
+                ...(profile.model ? { model: profile.model } : {}),
+                ...(profile.effort ? { effort: profile.effort } : {}),
+              }),
             );
             record(args.taskId, 'session.started', { role: args.role });
           },
@@ -904,7 +1176,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         store.kvSet(`session:${conversationTaskId}:${args.role}`, result.session);
         store.kvSet(
           `sessionmeta:${conversationTaskId}:${args.role}`,
-          JSON.stringify({ home: resolvedAuth?.configHome ?? '', provider: profile.provider }),
+          JSON.stringify({
+            home: resolvedAuth?.configHome ?? '',
+            provider: profile.provider,
+            ...(profile.model ? { model: profile.model } : {}),
+            ...(profile.effort ? { effort: profile.effort } : {}),
+          }),
         );
       }
 
@@ -926,23 +1203,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      *  (§5.5). Diffs are intentionally NOT computed — they were removed from the
      *  review packet; reviewers use the changed-files list + the in-world terminal. */
     async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; changedFiles: string[] }> {
-      const world = await worlds.open(handle);
-      const root = handle.root;
-      const { git } = await import('../world/git.js');
-      const tracked = await git(root, ['diff', '--name-only', base]);
-      const untracked = await git(root, ['ls-files', '--others', '--exclude-standard']);
-      const changedFiles = [
-        ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean),
-        ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((f) => `${f} (new)`),
-      ];
-      void world;
+      const world = await openWorld(handle);
+      const repos = worldRepos(handle);
+      const roots = repos.length ? repos : [{ name: '', root: handle.root }];
+      const changedFiles: string[] = [];
+      for (const repo of roots) {
+        const tracked = await world.exec('git', ['diff', '--name-only', 'base' in repo ? repo.base : base], { cwd: repo.root });
+        const untracked = await world.exec('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo.root });
+        const prefix = repos.length > 1 ? `${repo.name}/` : '';
+        changedFiles.push(
+          ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file}`),
+          ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file} (new)`),
+        );
+      }
       const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.` : 'No file changes detected.';
       record(handle.id, 'review.built', { files: changedFiles.length });
       return { summary, changedFiles };
     },
 
     async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {
-      const world = await worlds.open(handle);
+      const world = await openWorld(handle);
       // Merge commits carry the world's profile identity too (PLAN-git-config.md
       // §4A) — they land on the target, where worktree-scoped config doesn't reach.
       let identity;
@@ -955,13 +1235,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           identity = undefined; // fall back to ensureIdentity inside finalizeMerge
         }
       }
-      const result = await finalizeMerge(world, target, identity);
+      const result = isRemote(handle.kind)
+        ? await brokerFinalizeMerge(world, target, identity, brokerAuthFor(handle, handle.id))
+        : await finalizeMerge(world, target, identity);
       record(handle.id, 'merge.result', { merged: result.merged, sha: result.sha, conflict: result.conflict, dirty: result.dirty });
       return result;
     },
 
     async runScript(args: { taskId: string; worldHandle: WorldHandle; command: string }): Promise<{ code: number; output: string }> {
-      const world = await worlds.open(args.worldHandle);
+      const world = await openWorld(args.worldHandle, args.taskId);
       record(args.taskId, 'script.start', { command: args.command });
       const r = await world.exec('bash', ['-lc', args.command], { timeoutMs: 30 * 60_000 });
       const output = `${r.stdout}${r.stderr}`;
@@ -970,7 +1252,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async runWorkflowChecks(args: { taskId: string; worldHandle: WorldHandle }): Promise<{ passed: boolean; detail?: string }> {
-      const world = await worlds.open(args.worldHandle);
+      const world = await openWorld(args.worldHandle, args.taskId);
       const hasPkg = (await world.exec('bash', ['-lc', 'test -f package.json && echo yes || echo no'])).stdout.includes('yes');
       if (!hasPkg) {
         record(args.taskId, 'checks.skip', { reason: 'no package.json' });
@@ -1027,20 +1309,53 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {
-      const world = await worlds.open(handle);
-      const r = await world.exec('bash', ['-lc', `git add -A && git commit -q -m ${JSON.stringify(message)} || true`]);
-      const sha = await world.exec('git', ['rev-parse', 'HEAD']);
-      record(handle.id, 'work.committed', { code: r.code });
-      return { committed: r.code === 0, sha: sha.stdout.trim() || undefined };
+      const world = await openWorld(handle);
+      const repos = worldRepos(world.handle);
+      const roots = repos.length ? repos.map((repo) => repo.root) : [world.handle.root];
+      let committed = true;
+      let sha: string | undefined;
+      for (const root of roots) {
+        const add = await world.exec('git', ['add', '-A'], { cwd: root });
+        const commit = add.code === 0 ? await world.exec('git', ['commit', '-q', '-m', message], { cwd: root }) : add;
+        const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: root });
+        const nothing = /nothing to commit|no changes added/i.test(`${commit.stdout}${commit.stderr}`);
+        committed &&= add.code === 0 && (commit.code === 0 || nothing) && head.code === 0;
+        sha = head.stdout.trim() || sha;
+      }
+      record(handle.id, 'work.committed', { committed, repos: roots.length });
+      return { committed, sha };
+    },
+
+    /** Persist a cloud task branch before releasing its sandbox. Unlike the
+     * best-effort post-merge push policy, this is the only durable copy of a
+     * just-do world's result, so any skipped repository is a hard failure. */
+    async publishTaskBranch(handle: WorldHandle): Promise<{ pushed: string[] }> {
+      if (!isRemote(handle.kind)) return { pushed: [] };
+      const world = await openWorld(handle);
+      const result = await brokerPublishBranch(world, brokerAuthFor(handle, handle.id));
+      if (!result.pushed.length || result.skipped.length) {
+        throw new Error(`cloud task branch was not persisted${result.skipped.length ? ` for: ${result.skipped.join(', ')}` : ' because it has no remote repository'}`);
+      }
+      record(handle.id, 'push.branch', { branch: handle.branch, repos: result.pushed });
+      return { pushed: result.pushed };
     },
 
     async destroyWorld(handle: WorldHandle): Promise<void> {
+      const current = (store.currentWorld(handle.id) ?? handle) as WorldHandle;
+      const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
       try {
         const world = await worlds.open(handle);
         await world.destroy();
+        store.setWorldState((store.currentWorld(handle.id) ?? current) as WorldHandle, 'released');
         record(handle.id, 'world.destroyed', {});
-      } catch {
-        /* best effort */
+      } catch (error) {
+        // The provider may be unavailable while its own timeout is evicting the
+        // sandbox. Do not retain admission capacity forever; keep the durable
+        // world degraded so operations can see/retry the incomplete teardown.
+        store.setWorldState((store.currentWorld(handle.id) ?? current) as WorldHandle, 'degraded');
+        record(handle.id, 'world.destroy_failed', { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        if (leaseId) deps.runners?.release(leaseId, current.kind);
       }
     },
 
@@ -1049,8 +1364,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // and authorized; otherwise the Review stage IS the conceptual PR. The git
       // profile's credentials (GH_TOKEN / GIT_SSH_COMMAND) select the account per
       // subprocess (PLAN-git-config.md §4B — never `gh auth switch`).
-      const world = await worlds.open(handle);
+      const world = await openWorld(handle);
       const env = gitEnvFor(handle, handle.id);
+      if (isRemote(handle.kind)) {
+        const remotePr = await brokerOpenGithubPr(world, target, brokerAuthFor(handle, handle.id));
+        record(handle.id, remotePr ? 'pr.opened' : 'pr.skipped', remotePr ?? { reason: 'cloud Git broker could not push/open PR' });
+        return remotePr;
+      }
       const which = await world.exec('bash', ['-lc', 'command -v gh && gh auth status >/dev/null 2>&1 && echo ok || echo no'], { env });
       if (!which.stdout.includes('ok')) {
         record(handle.id, 'pr.skipped', { reason: 'gh not available/authorized' });
@@ -1061,10 +1381,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         record(handle.id, 'pr.skipped', { reason: 'push failed', detail: push.stderr.slice(0, 300) });
         return null;
       }
-      const pr = await world.exec('bash', [
-        '-lc',
-        `gh pr create --base ${target} --head ${handle.branch} --fill --json url,number 2>/dev/null || gh pr view --json url,number`,
-      ], { env });
+      // `gh pr create` prints a URL; only `pr view` supports structured JSON.
+      // Query after the create attempt, which also makes this idempotently return
+      // an already-existing PR without interpolating branch names into a shell.
+      await world.exec('gh', ['pr', 'create', '--base', target, '--head', handle.branch, '--fill'], { env });
+      const pr = await world.exec('gh', ['pr', 'view', handle.branch, '--json', 'url,number'], { env });
       try {
         const parsed = JSON.parse(pr.stdout);
         record(handle.id, 'pr.opened', parsed);
@@ -1081,17 +1402,41 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      */
     async pushTarget(handle: WorldHandle, target: string): Promise<{ pushed: string[]; skipped: string[] }> {
       const env = { GIT_TERMINAL_PROMPT: '0', ...gitEnvFor(handle, handle.id) };
-      const world = await worlds.open(handle);
+      const world = await openWorld(handle);
       const pushed: string[] = [];
       const skipped: string[] = [];
+      if (isRemote(handle.kind)) {
+        for (const r of worldRepos(handle)) {
+          if (!r.localPath) {
+            // brokerFinalizeMerge already performed the authenticated target push;
+            // report the policy step as satisfied without re-exporting credentials.
+            pushed.push(r.name);
+            continue;
+          }
+          // Locally-authoritative repo: the broker landed the merge in the local
+          // checkout and pushed nothing, so the policy push runs from there —
+          // exactly like a worktree world's.
+          const repoTarget = r.target ?? target;
+          const push = await hostGit(r.localPath, ['push', 'origin', repoTarget], { env });
+          if (push.code === 0) {
+            pushed.push(r.name);
+            record(handle.id, 'push.done', { repo: r.name, target: repoTarget });
+          } else {
+            skipped.push(r.name);
+            record(handle.id, 'push.failed', { repo: r.name, target: repoTarget, detail: (push.stderr || push.stdout).slice(0, 300) });
+          }
+        }
+        return { pushed, skipped };
+      }
       for (const r of worldRepos(handle)) {
+        const repoTarget = r.target ?? target;
         const hasOrigin = await world.exec('git', ['remote', 'get-url', 'origin'], { cwd: r.repo, env });
         if (hasOrigin.code !== 0) {
           skipped.push(r.name);
           record(handle.id, 'push.skipped', { repo: r.name, reason: 'no origin remote' });
           continue;
         }
-        const push = await world.exec('git', ['push', 'origin', target], { cwd: r.repo, env });
+        const push = await world.exec('git', ['push', 'origin', repoTarget], { cwd: r.repo, env });
         if (push.code === 0) {
           pushed.push(r.name);
           record(handle.id, 'push.done', { repo: r.name, target });
@@ -1126,6 +1471,59 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         agentTurn: view.agentTurn?.state ?? null,
         agentRole: view.agentTurn?.role ?? null,
       });
+      // A waiting task owns durable state, not continuously-metered compute.
+      // Parking is an implementation detail inside this existing activity (no new
+      // workflow command, so old Temporal histories remain replay-compatible).
+      // Every later operation goes through worlds.open(), which transparently
+      // resumes a paused provider before a terminal, artifact, agent turn, or merge.
+      // software-dev also stores the handle in structured recovery state, while
+      // newer workflow views expose it directly. Accept both shapes. Crucially,
+      // skip providers that cannot really park: even a no-op lifecycle detour on
+      // every waiting publish creates avoidable activity contention precisely
+      // while parent/child cancellation signals need to settle promptly.
+      const waitingWorld = (view.world ?? view.state.recoveryWorld) as WorldHandle | undefined;
+      if (view.status === 'waiting' && waitingWorld && worlds.get(waitingWorld.kind).parkable) {
+        try {
+          const before = await worlds.status(waitingWorld);
+          if (before === 'ready') {
+            if (deps.checkpoints) {
+              try {
+                // The branch is the portable checkpoint's committed layer. Push
+                // it through the trusted broker before capturing the dirty delta.
+                if (isRemote(waitingWorld.kind) && worldRepos(waitingWorld).length) {
+                  const remoteWorld = await openWorld(waitingWorld, taskId);
+                  const projectId = String(waitingWorld.meta?.projectId ?? '');
+                  if (store.listProjectRepositories(projectId).length) {
+                    const pushed = await brokerPublishBranch(remoteWorld, brokerAuthFor(waitingWorld, taskId));
+                    if (pushed.skipped.length) throw new Error(`could not persist branch for ${pushed.skipped.join(', ')}`);
+                    record(taskId, 'push.branch', { branch: waitingWorld.branch, repos: pushed.pushed, reason: 'checkpoint' });
+                  }
+                }
+                const checkpoint = await deps.checkpoints.checkpoint(waitingWorld);
+                record(taskId, 'checkpoint.created', { checkpointId: checkpoint.id,
+                  generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 });
+              } catch (error) {
+                record(taskId, 'checkpoint.warning', { warning: error instanceof Error ? error.message : String(error) });
+              }
+            }
+            await worlds.park(waitingWorld);
+            if (await worlds.status(waitingWorld) === 'parked') {
+              const current = (store.currentWorld(waitingWorld.id) ?? waitingWorld) as WorldHandle;
+              const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
+              if (leaseId) {
+                deps.runners?.release(leaseId, current.kind);
+                store.updateWorldMeta(current, { worldLeaseId: null });
+              }
+              store.setWorldState((store.currentWorld(waitingWorld.id) ?? waitingWorld) as WorldHandle, 'parked');
+              record(taskId, 'world.parked', { provider: waitingWorld.kind, reason: view.waitingFor?.kind ?? view.stage });
+            }
+          }
+        } catch (error) {
+          // Auto-pause remains the cost backstop; a transient park failure must
+          // never roll back or retry the authoritative view update.
+          record(taskId, 'world.warning', { warning: `could not park waiting world: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      }
     },
 
     async recordEvent(taskId: string, type: string, payload: Record<string, unknown>): Promise<void> {
@@ -1142,6 +1540,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         workflowVersion: parent?.workflowVersion ?? '1.0.0',
         params: { prompt: args.prompt, base: args.base, target: args.target },
         parentTaskId: args.parentTaskId,
+        createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
+        assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
       });
       record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title });
       // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
@@ -1149,7 +1549,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // branch (which the parent owns and merges into). If no branch is known,
       // the child gets no merge capability — never a broad fallback.
       const delegation = attenuate(
-        ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
+        [
+          'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
+          'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
+          'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
+        ],
         args.parentGrant ?? DEFAULT_GRANT,
       );
       const mergeBack = args.parentBranch && allows(args.parentGrant ?? DEFAULT_GRANT, `merge-into:${args.parentBranch}`)

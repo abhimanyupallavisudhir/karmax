@@ -6,11 +6,35 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Small, code-native icons used by icon-only controls. Keeping them inline makes
+// the no-build-step console self-contained while still giving every button a
+// proper text alternative through its aria-label/title.
+const ICON = {
+  draft: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="m9 17 1.5-.3 5.2-5.2a1.4 1.4 0 0 0-2-2l-5.2 5.2L8 17z"/></svg>',
+  more: '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
+  send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+};
+
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  installPrompt = event;
+});
+window.addEventListener('appinstalled', () => { installPrompt = null; });
+
 const S = {
   token: null,
   meta: null,
   contributions: null,
   projects: [],
+  organizations: [],
+  organizationId: null,
+  organizationMembers: [],
+  teams: [],
+  users: [],
+  inbox: [],
+  deliveryPreferences: null,
   projectId: null,
   tasks: [],
   attemptGroup: null, // logical-task group for the open task page
@@ -45,78 +69,127 @@ const S = {
   queueOrders: {}, // merge domain -> { queue: taskId[], current? } authoritative order from the coordinator
   agentQueue: { capacity: 3, queue: [], current: [] }, // workflow-owned host admission queue
   modelCatalog: null, // provider-native model metadata loaded from the gateway
-  // The notification surface is an action inbox, not an event log. It is loaded
-  // across every visible project and contains only tasks currently waiting for a
-  // human decision (review) or direction (escalated).
-  attention: [],
-  attentionLoaded: false,
-  attentionLoading: false,
-  attentionError: null,
-  attentionFilter: 'all',
+  worldProviderConnections: [], // org's connected remote sandbox providers → Agent-environment options
+  inviteNotice: null,
 };
 
 // Non-principal attempts are intentionally absent from S.tasks because the list
 // has one row per logical task. Page lookups must also consult the loaded group.
 function taskRecord(id) {
   return (S.attemptGroup?.attempts || []).find((t) => t.id === id)
-    || (S.tasks || []).find((t) => t.id === id)
-    || (S.attention || []).find((t) => t.id === id);
+    || (S.tasks || []).find((t) => t.id === id);
 }
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
 // Every page is a host-owned route; the browser URL is the single source of truth
-// for {project, tab, open task}. Workflows/coordinators never own a URL — a page
-// like the merge queue is a first-party route that projects coordinator/task state.
-// Projects are addressed by a slug of their name; tasks are numbered per project.
+// for {organization, project, tab, open task}. Workflows/coordinators never own a
+// URL — a page like the merge queue is a first-party route that projects
+// coordinator/task state. Every page lives under its organization's slug; projects
+// are addressed by a slug of their name; tasks are numbered per project.
 // Scheme:
-//   /                                    → home (redirects to a project's tasks)
-//   /dashboard                           → global dashboard
-//   /notifications                       → global human-attention inbox
-//   /settings                            → global settings
-//   /projects/:name/tasks                → task list (also /queue, /activity, /settings)
-//   /projects/:name/tasks/:num           → the task's own page (permalink)
-//   /projects/:name/tasks/:num/:tab      → the task page pinned to one of its tabs
+//   /                                    → home (redirects into the current org)
+//   /<org>                               → org home (redirects to a project or dashboard)
+//   /<org>/dashboard                     → organization dashboard
+//   /<org>/settings                      → organization settings
+//   /<org>/inbox                         → inbox
+//   /<org>/wiki                          → organization wiki
+//   /<org>/<project>                     → task list (also /queue, /activity, /wiki, /settings)
+//   /<org>/<project>/tasks/:num          → the task's own page (permalink)
+//   /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
+// Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
+// parsed and then canonicalised to the org form.
 function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
 }
 function projectSlug(p) { return p ? slugify(p.name) : ''; }
 function projectById(pid) { return (S.projects || []).find((p) => p.id === pid); }
-// Resolve a URL slug back to a project. Matches the slugified name (the common,
-// human case), falling back to a raw project id for safety. On a slug collision
-// the first-created project wins (names are expected distinct).
-function projectBySlug(slug) {
+// Resolve a URL slug back to a project, optionally scoped to one organization
+// (project slugs need only be unique within their org). Matches the slugified name
+// (the common, human case), falling back to a raw project id for safety. On a slug
+// collision the first-created project wins (names are expected distinct).
+function projectBySlug(slug, organizationId) {
   const s = slugify(slug);
-  return (S.projects || []).find((p) => slugify(p.name) === s) || (S.projects || []).find((p) => p.id === slug);
+  const pool = (S.projects || []).filter((p) => !organizationId || p.organizationId === organizationId);
+  return pool.find((p) => slugify(p.name) === s) || pool.find((p) => p.id === slug)
+    || (S.projects || []).find((p) => p.id === slug);
 }
+
+// Organizations own the top path segment. They carry a persisted slug; fall back
+// to a slug of the name for older records that predate it.
+function orgSlug(o) { return o ? (o.slug || slugify(o.name)) : ''; }
+function organizationById(id) { return (S.organizations || []).find((o) => o.id === id); }
+function organizationBySlug(slug) {
+  const s = slugify(slug);
+  return (S.organizations || []).find((o) => orgSlug(o) === s) || (S.organizations || []).find((o) => o.id === slug);
+}
+// The organization whose slug prefixes every URL — the one selected in the
+// switcher, else the org owning the current project, else the first known org.
+function currentOrg() {
+  return organizationById(S.organizationId)
+    || organizationById(projectById(S.projectId)?.organizationId)
+    || (S.organizations || [])[0];
+}
+// `/<org>` prefix for the current (or a given) organization; '' when none is known.
+function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
+
+// Second-segment words that name an organization-level view rather than a project.
+const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki', profile: 'profile' };
 
 function parseRoute(pathname) {
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
-  if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard' };
-  if (seg[0] === 'settings') return { name: 'global', tab: 'global' };
-  if (seg[0] === 'notifications') return { name: 'global', tab: 'notifications' };
+  if (seg[0] === 'invite') return { name: 'invite' };
+  // Pre-organization URLs — resolved, then canonicalised to the org form.
+  if (seg[0] === 'dashboard') return { name: 'global', tab: 'dashboard', legacy: true };
+  if (seg[0] === 'settings' || seg[0] === 'organization') return { name: 'global', tab: 'organization', legacy: true };
+  if (seg[0] === 'inbox') return { name: 'global', tab: 'inbox', legacy: true };
   if (seg[0] === 'projects' && seg[1]) {
-    const tab = ['tasks', 'queue', 'activity', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+    const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-    return { name: 'project', slug: seg[1], tab, taskKey, taskTab };
+    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, legacy: true };
   }
-  return { name: 'home' };
+  // New scheme: /<org>/… — everything is namespaced under the organization slug.
+  const org = seg[0];
+  if (!seg[1]) return { name: 'global', org, tab: null };            // /<org> → org home
+  if (ORG_VIEWS[seg[1]]) return { name: 'global', org, tab: ORG_VIEWS[seg[1]] };
+  const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
+  const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
+  const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
+  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab };
 }
 
-// The list/tab route for a project (by id), addressed by name-slug.
+// The list/tab route for a project (by id): /<org>/<project> for the default
+// tasks tab, with the tab appended for the others.
 function projectRoute(pid, tab = 'tasks') {
   const p = projectById(pid);
-  return p ? `/projects/${projectSlug(p)}/${tab}` : '/dashboard';
+  if (!p) return globalRoute('dashboard');
+  const base = `${orgBase(organizationById(p.organizationId)) || orgBase()}/${projectSlug(p)}`;
+  return tab === 'tasks' ? base : `${base}/${tab}`;
+}
+
+// An organization-level route (dashboard / settings / inbox) under the current
+// (or a given) org's slug. Internal tab key 'organization' → URL segment 'settings'.
+function globalRoute(tab, org = currentOrg()) {
+  const seg = tab === 'organization' ? 'settings' : tab === 'orgwiki' ? 'wiki' : tab;
+  return `${orgBase(org)}/${seg}`;
 }
 
 // Navigate: update the URL then reconcile app state to it. `replace` swaps the
 // current history entry instead of pushing a new one.
 function go(path, opts = {}) {
+  closeTaskFormPage();
   if (path !== location.pathname) {
     history[opts.replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', path);
   }
   return applyRoute();
+}
+
+// The task form page floats over #main with the shell (topbar/rail) still live
+// behind it, so the user can navigate mid-edit. Any navigation closes it like
+// leaving any other page — via its close button, which flushes the draft.
+function closeTaskFormPage() {
+  if ($('#tf-page')) $('#tf-close')?.click();
 }
 
 // Resolve a per-project task URL key (a numeric #num, or a raw task id) → task id.
@@ -135,24 +208,56 @@ async function applyRoute() {
   const r = parseRoute(location.pathname);
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
-    return go(pid ? projectRoute(pid) : '/dashboard', { replace: true });
+    return go(pid ? projectRoute(pid) : globalRoute('dashboard'), { replace: true });
   }
   if (r.name === 'global') {
+    // Select the organization named in the URL (if any) before painting.
+    if (r.org) {
+      const org = organizationBySlug(r.org);
+      if (org && org.id !== S.organizationId) {
+        S.organizationId = org.id;
+        S.projectId = S.projects.find((p) => p.organizationId === org.id)?.id || null;
+        await loadCollaboration().catch(() => {});
+      }
+    }
+    // Bare /<org> → that org's default project (or its dashboard); pre-org URLs
+    // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
+    // redirect when the canonical path actually differs, so an unresolvable slug
+    // (or a workspace with no organizations yet) renders instead of looping.
+    if (!r.tab) {
+      const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id;
+      const dest = pid ? projectRoute(pid) : globalRoute('dashboard');
+      if (dest !== location.pathname) return go(dest, { replace: true });
+      r.tab = 'dashboard'; // fall through to a real page
+    }
+    if (r.legacy) {
+      const dest = globalRoute(r.tab);
+      if (dest !== location.pathname) return go(dest, { replace: true });
+    }
     closeTaskDom();
     S.tab = r.tab;
     renderRail();
     renderMain();
     if (r.tab === 'dashboard') renderDashboard();
-    // Re-evaluate on every inbox visit. Notifications are projections of current
-    // task state, so returning after acting on the task page must never revive the
-    // old review/blocker card even if its WebSocket transition was missed.
-    if (r.tab === 'notifications') loadAttention();
+    if (r.tab === 'organization') hydrateOrganizationView();
     return;
   }
-  // project / task routes → resolve the project (by name-slug) + optional open task
-  const proj = projectBySlug(r.slug);
+  // project / task routes → resolve the org + project (by name-slug) + optional open task
+  if (r.org) {
+    const org = organizationBySlug(r.org);
+    if (org) S.organizationId = org.id;
+  }
+  const proj = projectBySlug(r.slug, S.organizationId) || projectBySlug(r.slug);
   if (!proj) { toast('Project not found', true); return go('/', { replace: true }); }
+  // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
+  if (r.legacy) {
+    const dest = r.taskKey
+      ? `${projectRoute(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
+      : projectRoute(proj.id, r.tab);
+    return go(dest, { replace: true });
+  }
   const pid = proj.id;
+  S.organizationId = proj.organizationId || S.organizationId;
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
@@ -190,40 +295,74 @@ async function applyRoute() {
   if (tab === 'dashboard') renderDashboard();
 }
 
-// The permalink for a task (/projects/:name/tasks/:num) — used for in-place
+// The permalink for a task (/<org>/<project>/tasks/:num) — used for in-place
 // navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click).
 function taskUrl(id) {
   const rec = taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
-  return p ? `/projects/${projectSlug(p)}/tasks/${keyPart}` : location.pathname;
+  return p ? `${projectRoute(p.id)}/tasks/${keyPart}` : location.pathname;
 }
 
-// Push a task permalink and remember where to return on close — but only when
-// coming FROM a list/queue, so j/k-walking between task pages keeps the original
-// list (not the previous task) as the place Esc returns to.
-function goToTask(id) {
-  if (!parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
-  return go(taskUrl(id));
+// True when a click means "open in a new tab/window" by browser convention: any
+// modifier key, or a non-primary mouse button. Real <a> elements honour this
+// natively — we only consult it so JS handlers never hijack such a click.
+function isNewTabClick(ev) {
+  return ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey;
 }
 
-// Make an element open a task like a link: plain click navigates in place;
-// Ctrl/⌘-click and middle-click open the task's permalink in a new browser tab.
-// `getId(ev)` returns the task id, or null to ignore the click (e.g. it landed
-// on an inner button); `open` overrides the in-place action (default goToTask).
-function wireTaskNav(el, getId, open = goToTask) {
-  el.addEventListener('click', (ev) => {
-    const id = getId(ev);
-    if (!id) return;
-    if (ev.ctrlKey || ev.metaKey) return void window.open(taskUrl(id), '_blank', 'noopener');
-    open(id);
-  });
-  el.addEventListener('auxclick', (ev) => {
-    const id = ev.button === 1 ? getId(ev) : null;
-    if (!id) return;
+// Navigate to an in-app path, remembering the list to return to when opening a
+// task from a non-task page (so Esc / j-k walking returns to the list, not the
+// previous task). Generalises the old goToTask logic to any SPA link.
+function spaNavigate(href) {
+  const to = parseRoute(href);
+  if (to && to.taskKey && !parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
+  return go(href);
+}
+
+// Every in-app link is a real `<a data-spa href="/…">` anchor, so the browser
+// hands us every native "open in a new tab/window" affordance for free:
+// Ctrl/⌘-click, middle-click, Shift-click, right-click → "Open link in new tab",
+// drag-to-bookmark and the hover URL preview. This single delegated handler is
+// the *only* thing that keeps a plain left-click fast — it cancels the full-page
+// navigation and routes in place. Every modified or non-primary click falls
+// through untouched, so the browser opens it exactly as it would any web link.
+function installLinkRouter() {
+  document.addEventListener('click', (ev) => {
+    if (isNewTabClick(ev) || ev.defaultPrevented) return;
+    const a = ev.target.closest('a[data-spa]');
+    if (!a) return;
+    const href = a.getAttribute('href');
+    if (!href || href[0] !== '/') return; // only same-origin app routes route in place
     ev.preventDefault();
-    window.open(taskUrl(id), '_blank', 'noopener');
+    spaNavigate(href);
   });
+}
+
+// Push a task permalink (in place), remembering where to return on close.
+function goToTask(id) { return spaNavigate(taskUrl(id)); }
+
+// Make a whole row open its task like a real link. Rather than fake it in JS
+// (which can't offer the right-click "Open in new tab" menu, Shift-click, or a
+// hover preview), we lay a real `<a>` across the row: an absolutely-positioned
+// overlay that the browser treats as an ordinary link for every "new tab"
+// gesture, while installLinkRouter() catches its plain left-click and routes in
+// place — so normal clicking stays exactly as fast as before, with no reload.
+// Inner buttons/handles sit above the overlay (see the .has-row-link CSS) and
+// keep working; the overlay is non-draggable so it never shadows a row's own
+// drag-to-reorder. `getId()` returns the task id (falsy → leave the row inert).
+function wireTaskNav(el, getId) {
+  const id = getId();
+  if (!id) return;
+  el.classList.add('has-row-link');
+  const a = document.createElement('a');
+  a.className = 'row-link';
+  a.href = taskUrl(id);
+  a.dataset.spa = '';
+  a.draggable = false;
+  a.tabIndex = -1;
+  a.setAttribute('aria-hidden', 'true');
+  el.appendChild(a);
 }
 
 // A short human label for a task id: `#num` when known, else a short id.
@@ -232,12 +371,18 @@ function numLabel(taskId) {
   return t && t.num != null ? `#${t.num}` : String(taskId || '').slice(0, 8);
 }
 
+function principalLabel(principal) {
+  if (!principal) return 'Unassigned';
+  if (principal.kind === 'user') return S.users.find((u) => u.id === principal.userId)?.name || principal.userId;
+  if (principal.kind === 'team') return S.teams.find((t) => t.id === principal.teamId)?.name || principal.teamId;
+  return `Task agent · ${principal.role}`;
+}
+
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
   { id: 'goal', label: 'Goal (auto-run)' },
-  { id: 'just-do', label: 'Just do' },
-  { id: 'script-exec', label: 'Script' },
 ];
+const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
 
 const NODES = [
   { key: 'setup', label: 'Setup' },
@@ -301,8 +446,22 @@ function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
   el.outerHTML = effortSelectHtml(effortCls, provider, model, el.value || '');
 }
 
+// The "Agent environment" (worldProvider) choices depend on the deployment and
+// which remote sandbox providers the organization has connected — so the manifest
+// ships an empty option list and the client fills it in. An empty first option ⇒
+// inherit the project / organization default.
+function agentEnvOptions() {
+  const local = S.meta?.hosted ? [] : ['worktree', 'container'];
+  const connected = (S.worldProviderConnections || [])
+    .filter((c) => c.enabled && c.credentialConfigured)
+    .map((c) => c.provider);
+  return ['', ...new Set([...local, ...connected])];
+}
+
 function schemaFor(workflow) {
-  return (S.schema.find((s) => s.name === workflow)?.params) || [];
+  const params = S.schema.find((s) => s.name === workflow)?.params || [];
+  // Fill the Agent-environment select's options from the live provider catalog.
+  return params.map((f) => (f.name === 'worldProvider' ? { ...f, options: agentEnvOptions() } : f));
 }
 
 // ── generic field renderer (SPEC §10.4 / §10.5) ──────────────────────────────
@@ -315,9 +474,8 @@ const inhAttr = (val) => `data-inherit='${esc(JSON.stringify(val ?? null))}'`;
 
 // "Reset to default" button — cleared/hidden until the field holds an override,
 // then clicking it drops the override so the field inherits again (SPEC §10.5).
-// `kind` distinguishes the primary reset (→ data-inherit) from an alternate reset
-// (→ data-inherit-alt) — the quick-task project defaults have TWO parents (global
-// quick + project general) and so render two buttons per field (SPEC §10.4).
+// `kind` distinguishes the primary inherited value from an optional alternate
+// source used by fields that explicitly offer one.
 const resetBtn = (name, label = 'Reset to default', kind = 'primary') =>
   `<button type="button" class="field-reset" data-reset="${esc(name)}" data-reset-kind="${esc(kind)}" hidden title="Drop this override and inherit the default">↺ ${esc(label)}</button>`;
 // `alt` (optional): { primaryLabel, altLabel } — when present, render two reset
@@ -336,17 +494,29 @@ function renderField(f, own, inherited, withChips, alt) {
   if (f.type === 'agent') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderAgentField(f, own, inherited)}</div>`;
   if (f.type === 'confirmer') return `<div class="form-row" data-row="${esc(f.name)}">${label}${renderConfirmerField(f, own, inherited, alt)}</div>`;
   if (f.type === 'text') {
-    const ta = `<textarea ${attrs} rows="4" placeholder="${esc(f.placeholder || '')}">${esc(v)}</textarea>`;
+    // The prompt field (withChips) also carries the @-mention affordance, so its
+    // placeholder advertises both image paste and wiki tagging.
+    const placeholder = withChips ? 'Describe the task (paste an image to attach, type @ to add context from the wiki)' : (f.placeholder || '');
+    const ta = `<textarea ${attrs} rows="4" placeholder="${esc(placeholder)}">${esc(v)}</textarea>`;
     // For the prompt field, pasted images render inside the box (below the text),
     // growing it as needed — rather than in a separate "Images" section.
     if (withChips)
-      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div></div></div>`;
+      // The prompt box's clean bottom row: a borderless "wiki context" field,
+      // seeded elsewhere with the default @proj:tag:default / @org:tag:default so
+      // the user sees (and can backspace away) what's inlined by default.
+      return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips" id="tf-chips" style="display:none"></div>
+        <div class="prompt-context-row"><span class="pc-prefix" title="Wiki pages, labels (@…:tag:…), or folders (@…/*) inlined into this task's context. Type @ to add; backspace to remove.">context</span><textarea id="tf-context" class="prompt-context" rows="1" spellcheck="false" placeholder="type @ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
   if (f.type === 'boolean')
     return `<div class="form-row" data-row="${esc(f.name)}"><div class="switch"><input type="checkbox" ${attrs} ${v ? 'checked' : ''} /><label>${esc(f.label)}</label><span style="flex:1"></span>${f.required ? '' : resetBtns(f.name, alt)}</div></div>`;
-  if (f.type === 'select')
-    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${(f.options || []).map((o) => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>`;
+  if (f.type === 'select') {
+    // Keep the effective value selectable even if it isn't in the (possibly
+    // dynamic) option list — e.g. an inherited provider not connected locally.
+    const opts = [...(f.options || [])];
+    if (v !== '' && !opts.includes(v)) opts.push(v);
+    return `<div class="form-row" data-row="${esc(f.name)}">${label}<select ${attrs}>${opts.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${o === '' ? 'Inherit default' : esc(o)}</option>`).join('')}</select></div>`;
+  }
   if (f.type === 'list') {
     const text = Array.isArray(v) ? v.join('\n') : v;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}<textarea ${attrs} rows="2" placeholder="${esc(f.placeholder || 'one per line')}">${esc(text)}</textarea></div>`;
@@ -384,18 +554,24 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   const group = renderAgentGroup(fields, own, inherited, altFor);
   const grouped = new Set(group ? agentGroupFields(fields).map((f) => f.name) : []);
   let groupDrawn = false;
+  // Base, target, and the Agent environment share one row (rendered at the first
+  // of them present, in this order); the rest are skipped where they'd fall.
+  const inlineRow = ['base', 'target', 'worldProvider'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
+  const inlineNames = new Set(inlineRow.map((f) => f.name));
+  let inlineDrawn = false;
   const html = [];
   for (const f of fields) {
     if (grouped.has(f.name)) {
       if (!groupDrawn) { html.push(group); groupDrawn = true; }
       continue;
     }
-    if (f.name === 'base' && fields.some((x) => x.name === 'target')) {
-      const target = fields.find((x) => x.name === 'target');
-      html.push(`<div class="branch-pair">${renderField(f, own[f.name], inherited[f.name], false, altFor?.(f))}${renderField(target, own[target.name], inherited[target.name], false, altFor?.(target))}</div>`);
+    if (inlineNames.has(f.name) && inlineRow.length > 1) {
+      if (!inlineDrawn) {
+        inlineDrawn = true;
+        html.push(`<div class="branch-pair${inlineRow.length === 3 ? ' cols-3' : ''}">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`);
+      }
       continue;
     }
-    if (f.name === 'target' && fields.some((x) => x.name === 'base')) continue;
     html.push(renderField(f, own[f.name], inherited[f.name], withPromptChips && f.name === 'prompt', altFor?.(f)));
   }
   return html.join('');
@@ -406,8 +582,9 @@ function renderAgentField(f, spec, inherited) {
   const e = spec || inh; // prefill with the effective spec
   const provider = e.provider || 'claude';
   const role = f.role || f.name;
+  const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <div class="agent-controls">
       <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
         <input class="af-model" placeholder="model" value="${esc(e.model || '')}" autocomplete="off" />
@@ -417,11 +594,12 @@ function renderAgentField(f, spec, inherited) {
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
     <input class="af-model-provider" placeholder="credential provider (auto from model, e.g. kimi)" value="${esc(e.modelProvider || '')}" title="Optional. Separates the coding harness from the API-key/subscription pool; OpenCode normally derives this from the model prefix." style="width:100%;margin-top:6px;padding:7px 10px" />
-    <details class="af-resume" style="margin-top:6px"><summary style="font-size:12px;color:var(--ink-3);cursor:pointer">${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</summary>
-      <button type="button" class="btn sm af-resume-pick" style="margin-top:6px">⌕ Search tasks to fork from…</button>
+    <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> ${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</label>
+    <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
+      <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" style="width:100%;margin-top:6px;padding:7px 10px" />
-    </details>
+      <input class="af-resume-session" placeholder="…or paste a provider conversation/session id to continue" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+    </div>
   </div>`;
 }
 
@@ -436,6 +614,7 @@ function resumeChosenInner(rf, task) {
 // Read an agent box's fork/resume choice back out: the picker's {taskId, role}
 // from data-resume, with a pasted provider session id merged on top.
 function readResume(box) {
+  if (!box.querySelector('.af-resume-enabled')?.checked) return undefined;
   let resumeFrom;
   try { resumeFrom = JSON.parse(box.querySelector('.af-resume-chosen')?.dataset.resume || 'null') || undefined; } catch {}
   const sessionId = box.querySelector('.af-resume-session')?.value.trim();
@@ -456,11 +635,20 @@ function cfLayersOf(v) {
   const mode = v?.mode || 'human';
   if (mode === 'auto') return [];
   if (mode === 'agent') { const { mode: _m, layers: _l, agentDefault: _d, ...rest } = v || {}; return [{ kind: 'agent', ...rest }]; }
-  return [{ kind: 'human' }];
+  return [{ kind: 'human', audience: ['@creator'] }];
+}
+function humanAudienceOptions() {
+  return [
+    ['@creator', 'Task creator'], ['@all', 'Everyone in the organization'],
+    ['@owners', 'Organization owners'], ['@project', 'Everyone with project access'],
+    ...S.organizationMembers.map((m) => [`user:${m.userId}`, `Person · ${principalLabel({ kind: 'user', userId: m.userId })}`]),
+    ...S.teams.map((t) => [`@team:${t.slug}`, `Team · ${t.name}`]),
+  ];
 }
 function cfLayerHtml(f, layer, agentDefault) {
   const isAgent = layer.kind === 'agent';
   const promptVal = (isAgent ? layer.prompt ?? f.promptDefault : f.promptDefault) || '';
+  const audience = (layer.audience?.length ? layer.audience : ['@creator']).join(', ');
   return `<div class="cf-layer" data-kind="${esc(layer.kind)}">
     <div class="cf-layer-head" style="display:flex;gap:8px;align-items:center">
       <span class="cf-layer-num" style="font-size:11px;color:var(--ink-3);min-width:14px;text-align:right"></span>
@@ -469,6 +657,13 @@ function cfLayerHtml(f, layer, agentDefault) {
       <button type="button" class="btn sm cf-move" data-dir="-1" title="Move layer up">↑</button>
       <button type="button" class="btn sm cf-move" data-dir="1" title="Move layer down">↓</button>
       <button type="button" class="btn sm cf-del" title="Remove this layer">✕</button>
+    </div>
+    <div class="cf-human" style="margin:8px 0 0 22px;${isAgent ? 'display:none' : ''}">
+      <label class="form-row">Who confirms
+        <input class="cf-audience" list="human-audience-options" value="${esc(audience)}" placeholder="@creator, @team:leaders, or search for a person" />
+      </label>
+      <datalist id="human-audience-options">${humanAudienceOptions().map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join('')}</datalist>
+      <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
       <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type @ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
@@ -498,14 +693,17 @@ const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
       ? { kind: 'agent', provider: l.provider || '', modelProvider: l.modelProvider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
-      : { kind: 'human' },
+      : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
 // Read a confirmer box's layer list back out of the DOM (the stored value shape).
 function readConfirmerLayers(box) {
   const promptDefault = JSON.parse(box.getAttribute('data-prompt-default') || '""');
   return [...box.querySelectorAll('.cf-layer')].map((row) => {
-    if (row.querySelector('.cf-kind')?.value !== 'agent') return { kind: 'human' };
+    if (row.querySelector('.cf-kind')?.value !== 'agent') {
+      const audience = (row.querySelector('.cf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
+      return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
+    }
     const ab = row.querySelector('.agent-field');
     const spec = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
     const modelProvider = ab.querySelector('.af-model-provider')?.value.trim();
@@ -591,18 +789,46 @@ function wireCombo(combo, getOptions, onChange) {
   const caret = combo.querySelector('.combo-caret');
   if (!input || !menu || !caret) return;
   let open = false;
+  let active = -1; // index of the arrow-key-highlighted option (-1 = none)
+  const optEls = () => [...menu.querySelectorAll('.combo-opt')];
+  const paint = () => {
+    // Reflect the active index onto the DOM and keep it in view.
+    optEls().forEach((el, i) => {
+      const on = i === active;
+      el.classList.toggle('active', on);
+      if (on) el.scrollIntoView({ block: 'nearest' });
+    });
+  };
   const draw = () => {
     const q = input.value.trim().toLowerCase();
     const opts = (getOptions() || []).filter((o) => !q || o.toLowerCase().includes(q));
     menu.innerHTML = opts.length
       ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o)}">${esc(o)}</div>`).join('')
       : `<div class="combo-empty">No matching presets — free text is allowed</div>`;
+    active = -1; // filtering changes the list; start with nothing highlighted
   };
   const show = () => { draw(); menu.hidden = false; open = true; };
-  const hide = () => { menu.hidden = true; open = false; };
+  const hide = () => { menu.hidden = true; open = false; active = -1; };
+  const choose = (opt) => { input.value = opt.dataset.v; hide(); onChange && onChange(); };
   input.addEventListener('focus', show);
   input.addEventListener('input', () => { show(); onChange && onChange(); });
-  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') { hide(); input.blur(); } });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { hide(); input.blur(); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const els = optEls();
+      if (!els.length) { if (!open) show(); return; }
+      if (!open) show();
+      e.preventDefault();
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      // From no selection, ArrowDown lands on the first option and ArrowUp on the
+      // last; thereafter it wraps around the ends.
+      active = active === -1 ? (step === 1 ? 0 : els.length - 1) : (active + step + els.length) % els.length;
+      paint();
+    } else if (e.key === 'Enter') {
+      const els = optEls();
+      if (open && active >= 0 && els[active]) { e.preventDefault(); choose(els[active]); }
+    }
+  });
   input.addEventListener('blur', () => setTimeout(hide, 150)); // let a menu click land first
   // mousedown (not click) so it fires before the input's blur closes the menu
   caret.addEventListener('mousedown', (e) => {
@@ -610,17 +836,22 @@ function wireCombo(combo, getOptions, onChange) {
     if (open) hide();
     else { input.focus(); show(); }
   });
+  menu.addEventListener('mousemove', (e) => {
+    // Pointer takes over the highlight so it never fights the arrow-key cursor.
+    const opt = e.target.closest('.combo-opt');
+    if (!opt) return;
+    const i = optEls().indexOf(opt);
+    if (i !== active) { active = i; paint(); }
+  });
   menu.addEventListener('mousedown', (e) => {
     const opt = e.target.closest('.combo-opt');
     if (!opt) return;
     e.preventDefault();
-    input.value = opt.dataset.v;
-    hide();
-    onChange && onChange();
+    choose(opt);
   });
 }
 
-// Wire one agent box's controls: provider→model combobox + fork search (no toggle).
+// Wire one agent box's controls: provider→model combobox + opt-in fork search.
 function wireAgentBox(box) {
   const combo = box.querySelector('.af-model-combo');
   const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
@@ -632,22 +863,57 @@ function wireAgentBox(box) {
   // Fork-from search: the full task-picker overlay in agent mode (archived tasks
   // included — the completed ones are the ones you most often fork from).
   const chosen = box.querySelector('.af-resume-chosen');
-  const setResume = (rf, task) => {
+  const enabled = box.querySelector('.af-resume-enabled');
+  const panel = box.querySelector('.af-resume-panel');
+  const provider = box.querySelector('.af-provider');
+  const syncForkState = () => {
+    if (panel) panel.hidden = !enabled?.checked;
+    let taskFork;
+    try { taskFork = enabled?.checked && !!JSON.parse(chosen?.dataset.resume || 'null')?.taskId; } catch { taskFork = false; }
+    // Provider/session identity must match for a native fork. Model and effort are
+    // intentionally left editable: both adapters support retuning those knobs.
+    if (provider) provider.disabled = !!taskFork;
+    box.classList.toggle('af-has-task-fork', !!taskFork);
+  };
+  const applySourceAgent = (session) => {
+    if (!session) return;
+    if (session.provider && provider) provider.value = session.provider;
+    if (session.model !== undefined) box.querySelector('.af-model').value = session.model || '';
+    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
+    const effort = box.querySelector('.af-effort');
+    if (effort && session.effort && [...effort.options].some((o) => o.value === session.effort)) effort.value = session.effort;
+  };
+  const setResume = (rf, task, session) => {
     if (!chosen) return;
     chosen.dataset.resume = JSON.stringify(rf ?? null);
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
+    if (rf) applySourceAgent(session);
+    syncForkState();
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
   chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
+  enabled?.addEventListener('change', () => {
+    if (!enabled.checked) {
+      // Turning the feature off is also a real parameter change. Clear the
+      // dormant source so checking it again cannot silently re-lock a provider
+      // the user customized while the fork was off.
+      if (chosen) { chosen.dataset.resume = 'null'; chosen.innerHTML = ''; }
+      const session = box.querySelector('.af-resume-session');
+      if (session) session.value = '';
+    }
+    syncForkState();
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+  });
   box.querySelector('.af-resume-pick')?.addEventListener('click', () =>
     openTaskPicker({
       title: 'Fork a previous agent',
       hint: 'Archived tasks are included — click a task to list its agents, then pick the one to fork.',
       mode: 'agent',
       defaults: ['draft', 'series'],
-      onPick: ({ task, role }) => setResume({ taskId: task.id, role }, task),
+      onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
     }),
   );
+  syncForkState();
 }
 function wireAgentFields(root) {
   root.querySelectorAll('[data-agent-group]').forEach((group) => {
@@ -745,6 +1011,8 @@ function wireConfirmerField(box) {
     row.setAttribute('data-kind', e.target.value);
     const ab = row.querySelector('.cf-agent');
     if (ab) ab.style.display = e.target.value === 'agent' ? '' : 'none';
+    const hb = row.querySelector('.cf-human');
+    if (hb) hb.style.display = e.target.value === 'human' ? '' : 'none';
   });
   wireConfirmerWikiPrompts(box);
   cfSync(box);
@@ -756,10 +1024,8 @@ function wireConfirmerField(box) {
 function wireFieldResets(root, fields) {
   for (const f of fields) {
     if (f.required) continue; // a required field always stores a value; nothing to inherit
-    // A field can carry >1 reset button (quick-task project defaults have two
-    // parents — global-quick via `data-inherit`, project-general via
-    // `data-inherit-alt`). Each button resets to, and shows/hides against, its own
-    // source, so you can snap the field to either inherited value.
+    // Some inherited fields can expose more than one reset source. Each button
+    // compares and restores against the source named by its data attribute.
     const btns = [...root.querySelectorAll(`.field-reset[data-reset="${CSS.escape(f.name)}"]`)];
     if (!btns.length) continue;
     let box = null;
@@ -851,6 +1117,10 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   list.querySelectorAll('.agent-field').forEach(wireAgentBox);
   wireConfirmerWikiPrompts(list);
   cfSync(box);
+  // This composite control is rebuilt rather than assigned through an input.
+  // Emit the same event as a user edit so draft auto-save persists the reset;
+  // otherwise the UI can show @creator while the last partial value remains saved.
+  box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
@@ -958,6 +1228,318 @@ function renderMessageImages(images) {
     .join('')}</div>`;
 }
 
+// ── conversation rendering: markdown + math ──────────────────────────────────
+// Messages render as Markdown (with optional MathJax) by default; both can be
+// turned off on the Profile page → Appearance. The flags live in
+// localStorage (a per-browser display choice, like the theme toggle), and every
+// reader is defensive about a missing localStorage so the same functions run
+// under the plain-node conversation tests.
+function renderFlag(key, dflt) {
+  try { const v = localStorage.getItem(key); return v == null ? dflt : v === '1'; } catch { return dflt; }
+}
+const markdownEnabled = () => renderFlag('karmax-md-render', true);
+const mathjaxEnabled = () => renderFlag('karmax-mathjax', true);
+
+// A message body: Markdown when enabled, otherwise the previous plain-escaped
+// text (the .msg-text pre-wrap handles its newlines). The caller adds the `md`
+// class so the two whitespace models don't collide.
+function renderMessageBody(text) {
+  return markdownEnabled() ? renderMarkdown(text, { math: mathjaxEnabled() }) : esc(text);
+}
+
+// A little copy control for a message bubble — copies the raw source text (the
+// attribute round-trips it: the browser decodes the entities back on read).
+function messageCopyButton(text) {
+  if (!text) return '';
+  return `<button class="msg-copy" data-copy-msg="${esc(text)}" title="Copy message" aria-label="Copy message">${ICON.copy}</button>`;
+}
+
+function wireMessageCopies(root = document) {
+  root.querySelectorAll('.msg-copy').forEach((btn) => {
+    if (btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      copyToClipboard(btn.dataset.copyMsg || '').then(() => {
+        btn.classList.add('copied');
+        setTimeout(() => btn.classList.remove('copied'), 1200);
+      });
+    });
+  });
+}
+
+// A compact, dependency-free Markdown renderer. It escapes first (untrusted
+// agent/user text), then applies a small, common subset: fenced + inline code,
+// headings, lists, blockquotes, rules, bold/italic/strike, links, and — when
+// math is on — $…$ / $$…$$ spans left intact for MathJax to typeset. Code and
+// math are stashed up front so inline formatting can't corrupt their contents;
+// the single stash is restored once at the end (nested blocks recurse through
+// mdBlocks, never renderMarkdown, so indices never clash).
+function renderMarkdown(src, opts = {}) {
+  const withMath = !!opts.math;
+  const stash = [];
+  const keep = (html) => `\u0000${stash.push(html) - 1}\u0000`;
+  let s = String(src ?? '').replace(/\r\n?/g, '\n');
+  // Fenced code blocks first (a blank line around the placeholder keeps it its
+  // own block).
+  s = s.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, body) =>
+    `\n${keep(`<pre class="md-code"><code>${esc(body.replace(/\n$/, ''))}</code></pre>`)}\n`);
+  if (withMath) s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, body) => keep(`<span class="md-math">$$${esc(body)}$$</span>`));
+  s = s.replace(/`([^`\n]+)`/g, (_, body) => keep(`<code class="md-inline">${esc(body)}</code>`));
+  if (withMath) s = s.replace(/\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, body) => keep(`<span class="md-math">$${esc(body)}$</span>`));
+  let html = mdBlocks(s, stash);
+  return html.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)] ?? '');
+}
+
+function mdBlocks(s, stash) {
+  const lines = s.split('\n');
+  const out = [];
+  const bullet = /^\s*([-*+]|\d+[.)])\s+/;
+  const rule = /^\s*([-*_])(\s*\1){2,}\s*$/;
+  // A GFM pipe table: a header row followed by a |---|:--:| delimiter row.
+  const isTableStart = (idx) => idx + 1 < lines.length && lines[idx].includes('|')
+    && mdIsDelimiterRow(lines[idx + 1]) && mdSplitRow(lines[idx]).length > 1;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+    let m;
+    if ((m = /^(#{1,6})\s+(.*)$/.exec(line))) {
+      out.push(`<h${m[1].length} class="md-h">${mdInline(m[2].trim())}</h${m[1].length}>`);
+      i++; continue;
+    }
+    if (rule.test(line)) { out.push('<hr class="md-hr"/>'); i++; continue; }
+    if (/^\s*>\s?/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      out.push(`<blockquote class="md-quote">${mdBlocks(buf.join('\n'), stash)}</blockquote>`);
+      continue;
+    }
+    if (bullet.test(line)) {
+      const { html, next } = mdParseList(lines, i, stash);
+      out.push(html);
+      i = next;
+      continue;
+    }
+    if (isTableStart(i)) {
+      const headers = mdSplitRow(lines[i]);
+      const aligns = mdSplitRow(lines[i + 1]).map(mdCellAlign);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && !/^\s*$/.test(lines[i]) && lines[i].includes('|') && !mdIsDelimiterRow(lines[i])) {
+        rows.push(mdSplitRow(lines[i])); i++;
+      }
+      const al = (x) => (aligns[x] ? ` style="text-align:${aligns[x]}"` : '');
+      const head = `<thead><tr>${headers.map((h, x) => `<th${al(x)}>${mdInline(h)}</th>`).join('')}</tr></thead>`;
+      const body = rows.length
+        ? `<tbody>${rows.map((r) => `<tr>${headers.map((_, x) => `<td${al(x)}>${mdInline(r[x] || '')}</td>`).join('')}</tr>`).join('')}</tbody>`
+        : '';
+      out.push(`<table class="md-table">${head}${body}</table>`);
+      continue;
+    }
+    const buf = [line];
+    i++;
+    while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^(#{1,6})\s+/.test(lines[i])
+      && !bullet.test(lines[i]) && !/^\s*>\s?/.test(lines[i]) && !rule.test(lines[i]) && !isTableStart(i)) {
+      buf.push(lines[i]); i++;
+    }
+    const joined = buf.join('\n');
+    const sole = /^\u0000(\d+)\u0000$/.exec(joined.trim());
+    if (sole) { out.push(joined.trim()); continue; } // a lone code/display-math block: no wrapping <p>
+    out.push(`<p class="md-p">${mdInline(joined).replace(/\n/g, '<br>')}</p>`);
+  }
+  return out.join('\n');
+}
+
+// One list-item line: leading indent, the marker (bullet or `N.`/`N)`), the gap
+// after it, and the item's first-line content.
+const MD_ITEM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)(.*)$/;
+const mdListKind = (marker) => (/^\d/.test(marker) ? 'ol' : 'ul');
+// Leading-whitespace width of a line (a tab counts as 4 columns).
+function mdIndent(line) {
+  let w = 0;
+  for (const c of line) { if (c === ' ') w++; else if (c === '\t') w += 4; else break; }
+  return w;
+}
+
+// Parse a bullet/number list starting at lines[start]; returns { html, next }.
+// This is deliberately thorough because loose lists are where naive renderers
+// break: blank lines between items must NOT split one list into many one-item
+// lists (that is the classic bug where every ordered item shows "1."). It also
+// honours an arbitrary ordered start value (start=N), nested sublists by
+// indentation, and multi-line / multi-paragraph item bodies.
+function mdParseList(lines, start, stash) {
+  const first = MD_ITEM.exec(lines[start]);
+  const baseIndent = mdIndent(lines[start]);
+  const kind = mdListKind(first[2]);
+  const startNum = kind === 'ol' ? parseInt(first[2], 10) : 1;
+
+  // Extent of the whole list block: sibling markers at this indent, their more-
+  // indented continuation/nested lines, and interior blank lines (a blank counts
+  // as interior only when a later line resumes the list).
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (/^\s*$/.test(line)) {
+      let j = end;
+      while (j < lines.length && /^\s*$/.test(lines[j])) j++;
+      if (j >= lines.length) break;
+      const nm = MD_ITEM.exec(lines[j]);
+      const sameList = nm && mdIndent(lines[j]) === baseIndent && mdListKind(nm[2]) === kind;
+      const deeper = mdIndent(lines[j]) > baseIndent;
+      if (sameList || deeper) { end = j; continue; }
+      break;
+    }
+    const m = MD_ITEM.exec(line);
+    if (m && mdIndent(line) === baseIndent) {
+      if (mdListKind(m[2]) !== kind) break; // a switch of marker type starts a new list
+      end++; continue;
+    }
+    if (mdIndent(line) > baseIndent) { end++; continue; } // continuation / nested
+    break; // a dedented, non-item line ends the list
+  }
+
+  // A list is "loose" if any blank line falls inside its extent — CommonMark then
+  // wraps each item's text in a paragraph; we mirror that with extra spacing.
+  let loose = false;
+  for (let k = start; k < end - 1; k++) { if (/^\s*$/.test(lines[k])) { loose = true; break; } }
+
+  // Split the extent into items at each sibling marker; dedent each item's body
+  // by its own content indent so nested markup parses at the right level.
+  const items = [];
+  let k = start;
+  while (k < end) {
+    const m = MD_ITEM.exec(lines[k]);
+    if (!(m && mdIndent(lines[k]) === baseIndent && mdListKind(m[2]) === kind)) { k++; continue; }
+    const contentIndent = m[1].length + m[2].length + m[3].length;
+    const body = [m[4]];
+    k++;
+    while (k < end) {
+      const sib = MD_ITEM.exec(lines[k]);
+      if (sib && mdIndent(lines[k]) === baseIndent && mdListKind(sib[2]) === kind) break;
+      body.push(/^\s*$/.test(lines[k]) ? '' : lines[k].slice(contentIndent));
+      k++;
+    }
+    items.push(body.join('\n').replace(/\s+$/, ''));
+  }
+
+  // Render each item. A loose list wraps every item body in paragraphs (via
+  // mdBlocks). In a tight list, a plain item renders inline; one that carries a
+  // nested sublist keeps its lead text inline and parses only the sublist as a
+  // block, so tight lists don't sprout stray paragraph margins.
+  const li = items.map((text) => {
+    const rows = text.split('\n');
+    if (loose) return `<li>${mdBlocks(text, stash)}</li>`;
+    const cut = rows.findIndex((l, x) => x > 0 && MD_ITEM.test(l));
+    if (cut > 0) {
+      const lead = rows.slice(0, cut).join('\n').trim();
+      const rest = rows.slice(cut).join('\n');
+      const leadHtml = lead ? mdInline(lead).replace(/\n/g, '<br>') : '';
+      return `<li>${leadHtml}${leadHtml ? '\n' : ''}${mdBlocks(rest, stash)}</li>`;
+    }
+    return `<li>${mdInline(text).replace(/\n/g, '<br>')}</li>`;
+  }).join('');
+
+  const attr = kind === 'ol' && startNum !== 1 ? ` start="${startNum}"` : '';
+  return { html: `<${kind} class="md-list${loose ? ' md-loose' : ''}"${attr}>${li}</${kind}>`, next: end };
+}
+
+// Split one pipe-table row into trimmed cells, tolerating optional leading and
+// trailing pipes and backslash-escaped `\|` inside a cell.
+function mdSplitRow(line) {
+  const s = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\' && s[i + 1] === '|') { cur += '|'; i++; continue; }
+    if (s[i] === '|') { cells.push(cur.trim()); cur = ''; continue; }
+    cur += s[i];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+// The row under a table header: every cell is dashes with optional alignment
+// colons (`---`, `:--`, `--:`, `:-:`). The pipe requirement keeps a bare `---`
+// (a horizontal rule) from being mistaken for a one-column delimiter.
+function mdIsDelimiterRow(line) {
+  if (!line.includes('|') || !line.includes('-')) return false;
+  const cells = mdSplitRow(line);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+}
+
+function mdCellAlign(cell) {
+  const s = cell.trim();
+  const left = s.startsWith(':');
+  const right = s.endsWith(':');
+  return left && right ? 'center' : right ? 'right' : left ? 'left' : '';
+}
+
+// Inline formatting over already-block-split text. Escaping happens here so the
+// stash placeholders (bare digits) survive untouched.
+function mdInline(t) {
+  let x = esc(t);
+  // Backslash escapes: stash the escaped punctuation (as \u0001N\u0001) so the
+  // emphasis/link passes treat it as a literal, then restore it at the very end.
+  const lit = [];
+  x = x.replace(/\\([\\`*_{}[\]()#+\-.!~|>])/g, (_, ch) => `\u0001${lit.push(ch) - 1}\u0001`);
+  // Inline links [text](url "optional title") — safe schemes only; the title is
+  // dropped. Runs before autolinking so a bare URL inside a link is left alone.
+  x = x.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+[^)]*)?\)/g, (_, txt, href) => {
+    const safe = /^(https?:|mailto:|\/)/i.test(href) ? href : '#';
+    return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+  });
+  // Autolink bare http(s) URLs not already part of a link/attribute (only when
+  // preceded by start-of-string, whitespace or an opening paren). Trailing
+  // sentence punctuation is left outside the link.
+  x = x.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, pre, url) => {
+    const tail = (url.match(/[.,;:!?]+$/) || [''])[0];
+    const bare = url.slice(0, url.length - tail.length);
+    return `${pre}<a href="${bare}" target="_blank" rel="noopener noreferrer">${bare}</a>${tail}`;
+  });
+  x = x.replace(/\*\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*\*/g, '<strong><em>$1</em></strong>');
+  x = x.replace(/___([^\s](?:[\s\S]*?[^\s])?)___/g, '<strong><em>$1</em></strong>');
+  x = x.replace(/\*\*([^\s](?:[\s\S]*?[^\s])?)\*\*/g, '<strong>$1</strong>');
+  x = x.replace(/__([^\s](?:[\s\S]*?[^\s])?)__/g, '<strong>$1</strong>');
+  x = x.replace(/(^|[^*])\*([^\s*][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+  x = x.replace(/(^|[^_\w])_([^\s_][^_]*?)_(?![_\w])/g, '$1<em>$2</em>');
+  x = x.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  x = x.replace(/\u0001(\d+)\u0001/g, (_, n) => lit[Number(n)]);
+  return x;
+}
+
+// MathJax is loaded lazily from a CDN the first time a rendered message actually
+// contains math, and only while the flag is on. If it can't load (offline), the
+// raw $…$ simply stays visible — a graceful, non-fatal degradation.
+let mathjaxLoad = null;
+function ensureMathJax() {
+  if (mathjaxLoad) return mathjaxLoad;
+  mathjaxLoad = new Promise((resolve) => {
+    window.MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+      startup: { typeset: false, ready: () => { window.MathJax.startup.defaultReady(); resolve(true); } },
+    };
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js';
+    script.async = true;
+    script.onerror = () => resolve(false);
+    document.head.appendChild(script);
+  });
+  return mathjaxLoad;
+}
+function typesetMath(root) {
+  if (!mathjaxEnabled()) return;
+  const scope = root || document.getElementById('ck-thread');
+  if (!scope || !scope.querySelector('.md-math')) return;
+  ensureMathJax().then(() => {
+    if (!window.MathJax || !window.MathJax.typesetPromise) return;
+    try { window.MathJax.typesetClear?.([scope]); } catch {}
+    window.MathJax.typesetPromise([scope]).catch(() => {});
+  });
+}
+
 function toast(msg, err = false, action) {
   const t = document.createElement('div');
   t.className = 'toast' + (err ? ' err' : '');
@@ -980,11 +1562,28 @@ function toast(msg, err = false, action) {
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   const session = await (await fetch('/api/session')).json();
+  S.sso = session.sso || null;
   if (session.setupRequired) return renderSetup();
   if (session.authRequired && !session.authenticated && !session.token) return renderLogin();
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
+  const route = parseRoute(location.pathname);
+  if (route.name === 'invite') {
+    const invitationToken = new URLSearchParams(location.search).get('token');
+    if (invitationToken) {
+      try {
+        const membership = await api('/api/invitations/accept', { method: 'POST', body: JSON.stringify({ token: invitationToken }) });
+        S.organizationId = membership.organizationId;
+        S.inviteNotice = 'Invitation accepted. A project administrator can now add you to a project.';
+        history.replaceState({ kx: 1 }, '', '/organization');
+      } catch (error) {
+        S.inviteNotice = error.message;
+        history.replaceState({ kx: 1 }, '', '/organization');
+      }
+    }
+  }
   S.meta = await api('/api/meta');
+  await loadOrganizations().catch(() => {});
   try { await loadProjects(); }
   catch (e) {
     // A self-registered identity is real but intentionally starts with no
@@ -993,30 +1592,57 @@ async function boot() {
     if (e.status === 403) return renderAccessPending();
     throw e;
   }
+  if (!S.organizationId) S.organizationId = S.projects.find((p) => p.organizationId)?.organizationId || S.organizations[0]?.id || null;
+  await loadCollaboration().catch(() => {});
   const projectScope = S.projectId ? `?projectId=${encodeURIComponent(S.projectId)}` : '';
   try {
     S.contributions = await api(`/api/contributions${projectScope}`);
     S.schema = await api(`/api/schema${projectScope}`);
     S.modelCatalog = (await api(`/api/models${projectScope}`)).providers;
+    if (S.organizationId) S.worldProviderConnections = await api(`/api/organizations/${encodeURIComponent(S.organizationId)}/world-providers`).catch(() => []);
   } catch {}
   connectWs();
   renderShell();
   bindKeys();
-  window.addEventListener('popstate', () => applyRoute());
-  document.addEventListener('visibilitychange', () => {
-    // A background tab can miss a socket transition during reconnect. Refetching
-    // on focus makes stale attention self-heal without polling while idle.
-    if (document.visibilityState === 'visible' && S.attentionLoaded) scheduleAttentionRefresh();
-  });
+  installLinkRouter();
+  // A background repaint deferred to protect an open menu / text-selection gets
+  // flushed once that interaction releases (setTimeout lets focus + selection
+  // settle first). selectionchange fires constantly, so it only pokes the flush
+  // when something is actually waiting.
+  document.addEventListener('focusout', () => setTimeout(flushBgRender, 0));
+  document.addEventListener('mouseup', () => setTimeout(flushBgRender, 0));
+  document.addEventListener('selectionchange', () => { if (bgRenderQueued) setTimeout(flushBgRender, 0); });
+  window.addEventListener('popstate', () => { closeTaskFormPage(); applyRoute(); });
   await applyRoute(); // honor the initial URL (deep link / bookmark)
-  // Prime the global badge without delaying first paint. The notifications page
-  // itself shows an honest loading state if it is the initial route.
-  if (!S.attentionLoaded && !S.attentionLoading) loadAttention();
 }
 
 async function loadProjects() {
   S.projects = await api('/api/projects');
   if (!S.projectId && S.projects[0]) S.projectId = S.projects[0].id;
+  if (S.projectId) S.organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
+}
+
+async function loadOrganizations() {
+  S.organizations = await api('/api/organizations').catch(() => []);
+  if (!S.organizationId) S.organizationId = S.organizations[0]?.id || null;
+}
+
+async function loadCollaboration() {
+  if (!S.organizationId) return;
+  const q = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  const [members, teams, users, inbox, prefs] = await Promise.all([
+    api(`/api/organizations/${S.organizationId}/members`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/teams`).catch(() => []),
+    api('/api/users').catch(() => []),
+    api(`/api/inbox${q}`).catch(() => []),
+    api(`/api/inbox/preferences${q}`).catch(() => null),
+  ]);
+  S.organizationMembers = members || [];
+  S.teams = teams || [];
+  S.users = users || [];
+  S.inbox = inbox || [];
+  S.deliveryPreferences = prefs;
+  updateBell();
 }
 
 async function loadTasks() {
@@ -1030,55 +1656,6 @@ async function loadTasks() {
   // set can't grow without bound (task ids are never reused).
   for (const id of S.deleted) if (!fetched.some((t) => t.id === id)) S.deleted.delete(id);
   S.tasks = fetched.filter((t) => !S.deleted.has(t.id));
-}
-
-let attentionPromise = null;
-let attentionReloadQueued = false;
-async function loadAttention() {
-  // Coalesce bursts, but remember that state changed during the in-flight read.
-  // The follow-up pass closes the race where an older response could otherwise
-  // repaint a notification after its task had already advanced.
-  if (attentionPromise) {
-    attentionReloadQueued = true;
-    return attentionPromise;
-  }
-  S.attentionLoading = true;
-  S.attentionError = null;
-  if (S.tab === 'notifications') renderMain();
-  attentionPromise = (async () => {
-    const query = 'stage:review,escalated -status:done,failed,cancelled -is:archived -is:subtask sort:updated-desc';
-    const results = await Promise.allSettled(S.projects.map(async (project) => {
-      const result = await api(`/api/projects/${project.id}/search?q=${encodeURIComponent(query)}`);
-      return (result.tasks || []).map((task) => ({ ...task, projectName: project.name }));
-    }));
-    const loaded = results.filter((r) => r.status === 'fulfilled');
-    S.attention = loaded
-      .flatMap((r) => r.value)
-      .filter(isAttentionTask)
-      .sort((a, b) => {
-        const blocked = Number(b.lastView?.stage === 'escalated') - Number(a.lastView?.stage === 'escalated');
-        if (blocked) return blocked;
-        const priority = Number(b.params?.priority || 0) - Number(a.params?.priority || 0);
-        return priority || (b.lastView?.updatedAt || b.createdAt || 0) - (a.lastView?.updatedAt || a.createdAt || 0);
-      });
-    S.attentionLoaded = true;
-    if (loaded.length !== results.length) {
-      S.attentionError = loaded.length
-        ? `Could not check ${results.length - loaded.length} project${results.length - loaded.length === 1 ? '' : 's'}.`
-        : 'Could not load notifications.';
-    }
-  })().finally(() => {
-    S.attentionLoading = false;
-    attentionPromise = null;
-    updateBell();
-    renderRail();
-    if (S.tab === 'notifications' && !S.selected) renderMain();
-    if (attentionReloadQueued) {
-      attentionReloadQueued = false;
-      setTimeout(loadAttention, 0);
-    }
-  });
-  return attentionPromise;
 }
 
 // ── task organization: tags, saved views, query search ──────────────────────
@@ -1183,7 +1760,7 @@ function connectWs() {
     try { ev = JSON.parse(m.data); } catch { return; }
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
-    if (S.tab === 'activity') renderMain();
+    if (S.tab === 'activity') bgRenderMain();
     if (S.selected && ev.taskId === S.selected) {
       S.taskEvents.push(ev);
       if (ev.type === 'agent.output' && ev.payload?.text) {
@@ -1191,8 +1768,8 @@ function connectWs() {
         // Replacing avoids the old "H / He / Hello" cumulative transcript.
         S.liveOutput = ev.payload.text;
         updateLiveBubble();
-      } else if (ev.type === 'agent.activity') {
-        if (S.taskTab === 'checkin') renderTaskPage();
+      } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message') {
+        if (S.taskTab === 'checkin') scheduleTaskPageRender();
         else renderTaskEvents();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
@@ -1202,21 +1779,19 @@ function connectWs() {
         refreshTask(); // the session id was just published mid-turn → show the live fork command
       } else renderTaskEvents();
     }
-    if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
-      scheduleAttentionRefresh();
-    }
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => { if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks(); }, 350);
+    if (S.organizationId && ['view.updated', 'task.responsibility-changed', 'task.mentioned'].includes(ev.type))
+      setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
-  ws.onopen = () => { if (S.attentionLoaded) scheduleAttentionRefresh(); };
 }
 
 async function refreshTasks() {
   try {
     await loadTasks();
     if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-    if (S.tab === 'tasks' || S.tab === 'queue') renderMain();
+    if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
     renderRail();
     if (S.tab === 'queue' && !S.selected) seedQueue();
   } catch {}
@@ -1227,21 +1802,55 @@ function renderShell() {
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
+      <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
       <div class="brand"><span class="mark">◇</span> karmax</div>
+      <select class="org-switcher" id="org-switcher" title="Organization">
+        ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
+        <option value="__new">＋ New organization</option>
+      </select>
       <div class="spacer"></div>
-      <button class="icon-btn" id="topbar-palette" title="Search everything ( ${esc(fmtKeys('meta+k'))} )">⌕</button>
-      <button class="icon-btn has-badge" id="bell" title="Notifications" aria-label="Notifications"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg><span class="badge hidden" id="bell-badge">0</span></button>
-      <button class="icon-btn" id="theme" title="Toggle theme">◐</button>
+      <button class="global-search-trigger" id="topbar-search" title="Search tasks and projects across your workspace" aria-haspopup="dialog">
+        <span aria-hidden="true">⌕</span><span class="global-search-label">Search everything</span><span class="kbd">${esc(fmtKeys('meta+shift+F'))}</span>
+      </button>
+      <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
+      <button class="icon-btn" id="topbar-help" title="Keyboard shortcuts (?)" aria-haspopup="dialog">?</button>
+      <a class="topbar-user" id="topbar-user" data-spa href="${globalRoute('profile')}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     <div class="body">
       <div class="rail" id="rail"></div>
+      <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>`;
-  // Task search now lives at the top of the task list (see tasksView); the topbar
-  // glass icon opens the global command palette (commands, tasks, projects).
+  // Project-scoped query/filtering lives in the task list. The topbar finder is
+  // deliberately separate from the action-oriented command palette (Cmd/Ctrl+K).
+  $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#topbar-palette').addEventListener('click', openPalette);
-  $('#theme').addEventListener('click', toggleTheme);
-  $('#bell').addEventListener('click', openNotifications);
+  $('#topbar-help').addEventListener('click', openHelp);
+  const closeMobileNav = () => {
+    $('#rail')?.classList.remove('mobile-open');
+    $('#rail-scrim')?.classList.remove('visible');
+    $('#mobile-menu')?.setAttribute('aria-expanded', 'false');
+  };
+  $('#mobile-menu')?.addEventListener('click', () => {
+    const open = !$('#rail')?.classList.contains('mobile-open');
+    $('#rail')?.classList.toggle('mobile-open', open);
+    $('#rail-scrim')?.classList.toggle('visible', open);
+    $('#mobile-menu')?.setAttribute('aria-expanded', String(open));
+  });
+  $('#rail-scrim')?.addEventListener('click', closeMobileNav);
+  $('#rail')?.addEventListener('click', (event) => {
+    if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
+  });
+  // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
+  $('#org-switcher')?.addEventListener('change', async (e) => {
+    if (e.target.value === '__new') return createOrganization();
+    S.organizationId = e.target.value;
+    const project = S.projects.find((p) => p.organizationId === S.organizationId);
+    S.projectId = project?.id || null;
+    await loadCollaboration().catch(() => {});
+    return go(project ? projectRoute(project.id) : globalRoute('organization'));
+  });
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
 }
@@ -1249,41 +1858,42 @@ function renderShell() {
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
+  // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
+  // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
+  // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
+  // them. Snapshot the focused row's stable identity and re-focus the matching row.
+  const active = document.activeElement;
+  const focusedKey = active && rail.contains(active)
+    ? (active.dataset.id ? `[data-id="${active.dataset.id}"]` : active.id ? `#${active.id}` : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
+    : null;
   rail.innerHTML = `
     <div class="label">Projects</div>
-    ${S.projects
+    ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
       .map(
-        (p) => `<div class="proj ${p.id === S.projectId ? 'active' : ''}" data-id="${p.id}" tabindex="0">
+        (p) => `<a class="proj ${p.id === S.projectId ? 'active' : ''}" data-spa href="${projectRoute(p.id)}" data-id="${p.id}" tabindex="0">
           <span class="glyph">◇</span> <span>${esc(p.name)}</span>
-        </div>`,
+        </a>`,
       )
       .join('')}
     <div class="proj add" id="new-project" tabindex="0"><span>+</span> <span>New project</span></div>
     <div class="grow"></div>
-    <div class="label">Global</div>
-    <div class="nav-item ${S.tab === 'notifications' ? 'active' : ''}" data-tab="notifications" tabindex="0">♢ Notifications${needsAttention().length ? `<span class="count">${needsAttention().length}</span>` : ''}</div>
-    <div class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-tab="dashboard" tabindex="0">▦ Dashboard</div>
-    <div class="nav-item ${S.tab === 'global' ? 'active' : ''}" data-tab="global" tabindex="0">⚙ Global settings</div>
-    <div class="nav-item" id="rail-logout" tabindex="0" title="End this browser session">⇥ Sign out${S.user?.name ? ` · ${esc(S.user.name)}` : ''}</div>
-    <div class="nav-item" id="rail-palette" tabindex="0" title="Every command, task, and project — searchable">⌘ Command palette<span class="kbd" style="margin-left:auto">${esc(fmtKeys('meta+k'))}</span></div>`;
-  rail.querySelectorAll('.proj[data-id]').forEach((e) =>
-    e.addEventListener('click', () => go(projectRoute(e.dataset.id))),
-  );
+    <div class="label">Organization</div>
+    <a class="nav-item ${S.tab === 'dashboard' ? 'active' : ''}" data-spa href="${globalRoute('dashboard')}" data-tab="dashboard" tabindex="0">▦ Dashboard</a>
+    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="Organization-wide skills, memories, and the general agent prompt">🕮 Wiki</a>
+    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0">⚙ Settings</a>`;
+  // Your profile lives in the top bar (#topbar-user), not the rail. Project +
+  // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
+  // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
-  rail.querySelectorAll('.nav-item[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
-  $('#rail-logout')?.addEventListener('click', async () => {
-    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
-    location.reload();
-  });
-  $('#rail-palette')?.addEventListener('click', openPalette);
+  if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
 }
 
 function switchTab(tab) {
-  if (tab === 'notifications') return go('/notifications');
-  if (tab === 'dashboard') return go('/dashboard');
-  if (tab === 'global') return go('/settings');
+  if (tab === 'dashboard') return go(globalRoute('dashboard'));
+  if (tab === 'global' || tab === 'organization') return go(globalRoute('organization'));
+  if (tab === 'inbox') return go(globalRoute('inbox'));
   const pid = S.projectId || S.projects[0]?.id;
-  return go(pid ? projectRoute(pid, tab) : '/dashboard');
+  return go(pid ? projectRoute(pid, tab) : globalRoute('dashboard'));
 }
 
 // Preserve the focused field (value + caret) across a renderMain() innerHTML
@@ -1300,6 +1910,13 @@ function captureFocus(root) {
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
     st.selectionStart = el.selectionStart;
     st.selectionEnd = el.selectionEnd;
+    // A field scrolls its own content; a fresh element resets to the top-left, so
+    // snapshot the internal scroll and put it back with the caret. scrollLeft is
+    // the one that bites in a single-line <input>: setSelectionRange restores the
+    // caret but does NOT re-scroll the box to reveal it, so a long line otherwise
+    // snaps back to its start on every WS-driven repaint while the caret stays put.
+    st.scrollTop = el.scrollTop;
+    st.scrollLeft = el.scrollLeft;
   }
   return st;
 }
@@ -1308,14 +1925,64 @@ function restoreFocus(root, st) {
   if (!st) return;
   const el = root.querySelector(`#${window.CSS && CSS.escape ? CSS.escape(st.id) : st.id}`);
   if (!el || el.tagName !== st.tag) return;
-  if (st.tag === 'PRE') { el.focus(); return; } // terminal screen: just re-focus (no value to restore)
+  if (st.tag === 'PRE') { el.focus({ preventScroll: true }); return; } // terminal screen: just re-focus (no value to restore)
   // Only carry over the in-progress value for free-text fields; a fresh empty
   // composer input would otherwise be reset by the re-render.
   if (st.tag !== 'SELECT') el.value = st.value;
-  el.focus();
+  // preventScroll: re-focusing must not yank the page's scroll container to the
+  // field — the surrounding restore logic owns scroll position.
+  el.focus({ preventScroll: true });
   if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
+  if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
+  if (typeof st.scrollLeft === 'number') el.scrollLeft = st.scrollLeft;
+}
+
+// A background (WebSocket-driven) refresh repaints #main by swapping its
+// innerHTML, which tears down transient UI the user is mid-interaction with — an
+// open native <select> dropdown (e.g. the ＋ Filter… menu) or a live mouse
+// text-selection. A steady agent event stream would otherwise keep yanking the
+// menu shut / clearing the selection every few hundred ms. Detect an in-flight
+// interaction, defer the repaint, and flush it once the interaction releases
+// (blur / mouse-up / the next background event).
+let bgRenderQueued = false;
+function interactionInFlight(root) {
+  const el = document.activeElement;
+  if (el && el.tagName === 'SELECT' && root.contains(el)) return true; // dropdown may be open
+  const sel = window.getSelection && window.getSelection();
+  if (sel && !sel.isCollapsed && sel.rangeCount) {
+    const node = sel.anchorNode;
+    const host = node && (node.nodeType === 1 ? node : node.parentNode);
+    if (host && root.contains(host)) return true; // an active text selection
+  }
+  return false;
+}
+function bgRenderMain() {
+  const main = $('#main');
+  if (main && interactionInFlight(main)) { bgRenderQueued = true; return; }
+  bgRenderQueued = false;
+  renderMain();
+}
+function flushBgRender() {
+  if (!bgRenderQueued) return;
+  const main = $('#main');
+  if (main && interactionInFlight(main)) return; // still busy — wait for the next release
+  bgRenderQueued = false;
+  renderMain();
+}
+
+// A live agent emits a burst of conversation.message / agent.activity events (each
+// tool call is one), and every one used to fire a full renderTaskPage() rebuild
+// synchronously — so a single turn could repaint the whole page a dozen times in a
+// frame, which is what made scrolling the conversation feel janky. Coalesce the
+// WS-driven repaints into one per animation frame: the last state wins and the
+// browser paints once, at a frame boundary.
+let taskPageRenderQueued = false;
+function scheduleTaskPageRender() {
+  if (taskPageRenderQueued) return;
+  taskPageRenderQueued = true;
+  requestAnimationFrame(() => { taskPageRenderQueued = false; renderTaskPage(); });
 }
 
 // ── main content ───────────────────────────────────────────────────────────
@@ -1331,13 +1998,18 @@ function renderMain() {
     if (S.view) renderTaskPage();
     return;
   }
+  // An open wiki editor likewise manages its own renders: a background refresh
+  // must not clobber in-progress edits (only the focused field would survive
+  // the async rehydrate). Navigation still repaints — it changes S.tab or
+  // clears S.wikiEditing first.
+  if ((S.tab === 'wiki' || S.tab === 'orgwiki') && S.wikiEditing && $('#wiki-path')) return;
   const proj = S.projects.find((p) => p.id === S.projectId);
-  const tabs = ['tasks', 'queue', 'activity', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Queues', activity: 'Activity', settings: 'Project settings' };
-  const projectScoped = ['tasks', 'queue', 'activity', 'settings'].includes(S.tab);
+  const tabs = ['tasks', 'queue', 'activity', 'wiki', 'settings'];
+  const labels = { tasks: 'Tasks', queue: 'Queues', activity: 'Activity', wiki: 'Wiki', settings: 'Project settings' };
+  const projectScoped = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
-        .map((t) => `<div class="tab ${S.tab === t ? 'active' : ''}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</div>`)
+        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
         .join('')}</div>`
     : '';
 
@@ -1346,7 +2018,11 @@ function renderMain() {
   else if (S.tab === 'queue') content = queuesView();
   else if (S.tab === 'activity') content = activityView();
   else if (S.tab === 'dashboard') content = `<div id="dash">Loading…</div>`;
-  else if (S.tab === 'notifications') content = notificationsView();
+  else if (S.tab === 'inbox') content = inboxView();
+  else if (S.tab === 'organization') content = organizationView();
+  else if (S.tab === 'wiki') content = wikiView(proj);
+  else if (S.tab === 'orgwiki') content = wikiView(null);
+  else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
   else if (S.tab === 'global') content = globalSettingsView();
 
@@ -1356,13 +2032,17 @@ function renderMain() {
   const focusState = captureFocus(main);
 
   main.innerHTML = tabbar + content;
-  main.querySelectorAll('.tab[data-tab]').forEach((e) => e.addEventListener('click', () => switchTab(e.dataset.tab)));
+  // Project tabs are real <a> links; installLinkRouter() handles the plain click.
   if (S.tab === 'tasks') wireTasksView();
   if (S.tab === 'queue') wireQueueView();
+  if (S.tab === 'wiki') wireWikiView(proj);
+  if (S.tab === 'orgwiki') wireWikiView(null);
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
   if (S.tab === 'dashboard') renderDashboard();
-  if (S.tab === 'notifications') wireNotificationsView();
+  if (S.tab === 'inbox') wireInboxView();
+  if (S.tab === 'profile') wireProfileView();
+  if (S.tab === 'organization') { hydrateOrganizationView(); wireGlobalSettings(S.organizationId); }
 
   restoreFocus(main, focusState);
   updateBell();
@@ -1371,23 +2051,25 @@ function renderMain() {
 // ── tasks ────────────────────────────────────────────────────────────────────
 // Client-side twin of the authoritative `matchText` in src/domain/search.ts — the
 // pre-server fallback while the first evaluation is in flight. Keep the two in
-// sync: token-AND over title / notes / #num, so "login fix" matches "fix login".
+// sync: token-AND over title / notes / prompt / #num, so "login fix" matches "fix login".
 function taskMatches(t, q) {
   const s = (q || '').toLowerCase().trim();
   if (!s) return true;
-  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
+  const hay = `${(t.title || '').toLowerCase()} ${(t.notes || '').toLowerCase()} ${(t.params?.prompt || '').toLowerCase()} ${t.num != null ? '#' + t.num : ''}`;
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// The default list transparently hides two kinds of noise unless the query opts in:
-// archived tasks (`-is:archived`) and the auto-spawned *runs* of a repeatable series
-// (`-is:run`), so a cron series doesn't flood the list — its template still shows, and
-// you drill into runs with `is:run` (or the Repeatable/Archived views). Archived and runs
-// are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
-// evaluated query carries the defaults. If the query already mentions a facet, we leave it.
+// The default list transparently hides three kinds of noise unless the query opts in:
+// archived tasks (`-is:archived`), the auto-spawned *runs* of a repeatable series
+// (`-is:run`), and delegated *sub-tasks* (`-is:subtask`) — a sub-task lives under its
+// parent's detail page, not as a sibling at the top level, so a fan-out of children
+// doesn't flood the list. Its parent still shows, and you drill into children with
+// `is:subtask` (or the Sub-tasks/Repeatable/Archived views). These are therefore just
+// facets, not toggles. The clean `S.search` stays in the box; only the evaluated query
+// carries the defaults. If the query already mentions a facet, we leave it.
 // The task-picker overlay passes its own facet list (e.g. the fork search keeps archived).
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
-function effectiveQuery(q, facets = ['archived', 'run']) {
+function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
   let s = (q || '').trim();
   for (const facet of facets) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
   return s;
@@ -1400,6 +2082,7 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:subtasks', name: 'Sub-tasks', icon: '↳', query: 'is:subtask' },
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
@@ -1511,20 +2194,27 @@ function tasksView() {
   // hide runs from every list surface (flat + grouped) below.
   S._runsBySeries = {};
   for (const t of S.tasks) if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
-  const notRun = (t) => !t.params?.runOf;
+  // Runs nest under their series row and sub-tasks nest under their parent's detail page,
+  // so by default neither belongs in the flat top-level list. The server already drops both
+  // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
+  // and it opts back in when the query explicitly asks for that facet (the Sub-tasks view's
+  // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
+  const keepRun = queryMentionsFacet(S.search, 'run');
+  const keepSub = queryMentionsFacet(S.search, 'subtask');
+  const topLevel = (t) => (keepRun || !t.params?.runOf) && (keepSub || !t.parentTaskId);
   // The server already applied the query (incl. the default -is:archived from effectiveQuery).
   // Fallback (before the first result lands) filters client-side and drops archived to match.
   const flat = (r
     ? r.tasks
     : S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-  ).filter(notRun);
+  ).filter(topLevel);
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
   let body;
   if (groups) {
     body = groups
       .map((g) => {
-        const gt = g.tasks.filter(notRun);
+        const gt = g.tasks.filter(topLevel);
         return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
       })
       .join('');
@@ -1538,8 +2228,9 @@ function tasksView() {
     <div class="composer">
       <input class="title-in" id="new-task" placeholder="Describe a task and press ${esc(fmtKeys('meta+Enter').replace('↵', 'Enter'))}…  ( n )  ·  paste an image to attach" />
       <select id="new-wf">${WORKFLOWS.map((w) => `<option value="${w.id}">${w.label}</option>`).join('')}</select>
-      <button class="btn" id="expand-task" title="Full task form ( N or ↵ )">⋯ More</button>
-      <button class="btn primary" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )">Add</button>
+      <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.draft}</button>
+      <button class="btn icon-only" id="expand-task" title="More fields ( N or ↵ )" aria-label="More fields">${ICON.more}</button>
+      <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
     <div class="img-chips" id="new-task-chips" style="display:none"></div>
     <div class="organizer">
@@ -1830,14 +2521,18 @@ async function saveCurrentView() {
 function parseQueryClient(input) {
   const q = { filters: [], sort: [] };
   const text = [];
-  const re = /"([^"]*)"|(\S+)/g; let m;
+  // Mirrors the server tokenizer: a `key:` prefix binds to its value even when the
+  // value carries quotes, so `conversation:"merge conflict"` stays one clause.
+  const re = /([-!]{0,2}[A-Za-z_#][\w.#-]*):((?:"[^"]*"|[^\s"])*)|"([^"]*)"|(\S+)/g; let m;
   const OPS = [['>=', 'gte'], ['<=', 'lte'], ['>', 'gt'], ['<', 'lt'], ['=', 'is']];
+  const splitVals = (raw) => {
+    const vals = []; const vre = /"([^"]*)"|([^,]+)/g; let vm;
+    while ((vm = vre.exec(raw))) { const v = (vm[1] !== undefined ? vm[1] : vm[2]).trim(); if (v) vals.push(v); }
+    return vals;
+  };
   while ((m = re.exec(input))) {
-    const quoted = m[1] !== undefined;
-    const tok = quoted ? m[1] : m[2];
-    const colon = quoted ? -1 : tok.indexOf(':');
-    if (colon < 0) { if (tok) text.push(tok); continue; }
-    let key = tok.slice(0, colon); let rest = tok.slice(colon + 1); let negate = false;
+    if (m[1] === undefined) { const tok = m[3] !== undefined ? m[3] : m[4]; if (tok) text.push(tok); continue; }
+    let key = m[1]; let rest = m[2] || ''; let negate = false;
     if (key[0] === '-' || key[0] === '!') { negate = true; key = key.slice(1); }
     if (key === 'sort') { let dir = 'asc'; let k = rest; if (k[0] === '-') { dir = 'desc'; k = k.slice(1); } const dm = k.match(/^(.*)[-:](asc|desc)$/i); if (dm) { k = dm[1]; dir = dm[2].toLowerCase(); } q.sort.push({ field: k, dir }); continue; }
     if (key === 'group') { q.group = rest; continue; }
@@ -1845,10 +2540,10 @@ function parseQueryClient(input) {
     // `param.<key>` / `p.<key>` and `agent_<role>.<sub>` are synthetic (text) fields.
     const isParam = /^(param|p)\.[^.\s]+$/i.test(key) || /^agent_[a-z0-9]+\.(agent|model|effort)$/i.test(key);
     const fld = isParam ? { key, type: 'text' } : S.fields.find((f) => f.key === key || (f.aliases || []).includes(key));
-    if (!fld) { text.push(tok); continue; }
+    if (!fld) { text.push(m[0]); continue; }
     let op = fld.type === 'text' ? 'contains' : 'is';
-    for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
-    const values = rest.split(',').map((s) => s.trim()).filter(Boolean);
+    if (rest[0] !== '"') for (const [p, o] of OPS) if (rest.startsWith(p)) { op = o; rest = rest.slice(p.length); break; }
+    const values = splitVals(rest);
     if (values.length) q.filters.push(negate ? { field: fld.key, op, values, negate: true } : { field: fld.key, op, values });
   }
   if (!q.filters.length) delete q.filters;
@@ -2143,9 +2838,7 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-delseries]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (!confirm('Delete this repeatable task? Its past runs are kept.')) return; try { await api(`/api/tasks/${b.dataset.delseries}`, { method: 'DELETE' }); toast('Repeatable task deleted'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
   );
-  $('#main').querySelectorAll('[data-series]').forEach((e) =>
-    wireTaskNav(e, (ev) => (ev.target.closest('button') ? null : e.dataset.series)),
-  );
+  $('#main').querySelectorAll('[data-series]').forEach((e) => wireTaskNav(e, () => e.dataset.series));
   const setArchived = async (id, archived) => {
     const title = S.tasks.find((t) => t.id === id)?.title || 'task';
     try {
@@ -2163,41 +2856,37 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-unarchive]').forEach((b) =>
     b.addEventListener('click', (ev) => { ev.stopPropagation(); setArchived(b.dataset.unarchive, false); }),
   );
-  const add = async () => {
+  const add = async (draft = false) => {
     const input = $('#new-task');
     const title = input.value.trim();
     const images = S.newTaskImages || [];
     if (!title && !images.length) return;
     const workflow = $('#new-wf').value;
-    input.value = '';
     try {
       await api(`/api/projects/${S.projectId}/tasks`, {
         method: 'POST',
-        body: JSON.stringify({
-          title: firstLine(title || 'Image task'),
-          prompt: title,
-          command: workflow === 'script-exec' ? title : undefined,
-          workflow,
-          // Added from the quick box → apply the Quick task defaults overlay (SPEC §10.4).
-          quick: true,
-          ...(images.length ? { images } : {}),
-        }),
+        body: JSON.stringify(quickTaskPayload(title, workflow, images, draft)),
       });
+      input.value = '';
       S.newTaskImages = [];
       renderImageChips($('#new-task-chips'), S.newTaskImages);
-      toast('Task created');
+      toast(draft ? 'Draft saved' : 'Task created');
       await refreshTasks();
     } catch (e) {
       toast(e.message, true);
     }
   };
-  $('#add-task')?.addEventListener('click', add);
+  $('#draft-task')?.addEventListener('click', () => add(true));
+  $('#add-task')?.addEventListener('click', () => add(false));
   // Enter opens the FULL form (carrying the typed text into its prompt field) so
-  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly.
+  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly;
+  // Alt+Enter saves it as an editable draft.
   $('#new-task')?.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter') return;
+    const mode = quickTaskSubmitMode(e);
+    if (!mode) return;
     e.preventDefault();
-    if (e.metaKey || e.ctrlKey) add();
+    if (mode === 'draft') add(true);
+    else if (mode === 'add') add(false);
     else openTaskForm($('#new-wf').value, undefined, $('#new-task').value.trim());
   });
   // Paste / drag-drop an image into the quick-add box to attach it (SPEC — image prompts).
@@ -2212,6 +2901,29 @@ function wireTasksView() {
   $('#main').querySelectorAll('.task-row').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
 const firstLine = (s) => s.split('\n')[0].slice(0, 80);
+
+// Keyboard modes for the quick composer. Keep this separate from the event
+// listener so the shortcut behavior stays easy to verify without a browser.
+function quickTaskSubmitMode(e) {
+  if (e.key !== 'Enter') return null;
+  if (e.altKey) return 'draft';
+  if (e.metaKey || e.ctrlKey) return 'add';
+  return 'form';
+}
+
+// The quick composer has two submission modes (start now / save draft), but both
+// must use the exact same sparse quick-defaults payload.
+function quickTaskPayload(title, workflow, images, draft = false) {
+  return {
+    title: firstLine(title || 'Image task'),
+    prompt: title,
+    command: workflow === 'script-exec' ? title : undefined,
+    workflow,
+    quick: true,
+    ...(draft ? { draft: true } : {}),
+    ...(images.length ? { images } : {}),
+  };
+}
 
 // The task-scope field that consumes the quick-add "Describe a task" text: the
 // workflow's prompt field, else its primary required text/string input (e.g.
@@ -2368,6 +3080,11 @@ function wireDepPicker(values, selfId) {
 let activeFormToken = null;
 async function openTaskForm(workflow, draft, seedText) {
   const formToken = (activeFormToken = {});
+  // The shell (topbar/rail) stays live behind the page, so the user can navigate
+  // mid-edit. Pin the project NOW: every later write (auto-save flush, submit)
+  // must land in the project the form was opened in, not wherever S.projectId
+  // points by the time the async chain runs.
+  const projectId = S.projectId;
   const wf = workflow || draft?.workflow || 'software-dev';
   const fields = schemaFor(wf).filter((f) => f.scopes.includes('task'));
   // The prompt/consuming field (a textarea) hosts pasted-image chips inside its
@@ -2384,9 +3101,9 @@ async function openTaskForm(workflow, draft, seedText) {
     if (cf && !values[cf.name]) values[cf.name] = seedText;
   }
   let inherited = {};
-  try { inherited = (await api(`/api/defaults/${S.projectId}/${wf}`)).task.inherited; } catch {}
+  try { inherited = (await api(`/api/defaults/${projectId}/${wf}`)).task.inherited; } catch {}
   let authorization = { profiles: [], defaultProfile: 'developer' };
-  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(S.projectId)}`); } catch {}
+  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(projectId)}`); } catch {}
   const selectedAuthorization = draft?.params?._authorization?.profileId || authorization.defaultProfile;
   const authorizationOptions = (authorization.profiles || []).map((p) =>
     `<option value="${esc(p.id)}" ${p.id === selectedAuthorization ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
@@ -2398,49 +3115,67 @@ async function openTaskForm(workflow, draft, seedText) {
     try { formAttemptGroup = await api(`/api/tasks/${draft.id}/attempts`); } catch {}
   }
   const root = $('#overlay-root');
+  // Rendered as a full PAGE (GitHub-issue-creation style), not a dialog: the big
+  // prompt editor + workflow parameters fill the main column; organization
+  // metadata (priority/tags, authorization, attempts, notes) lives in a sidebar.
+  // Everything stays inside #tf-body so collect/auto-save wiring sees one form.
+  const proj = S.projects.find((p) => p.id === projectId);
+  const restFields = promptField ? fields.filter((f) => f.name !== promptField.name) : fields;
   root.innerHTML = `
-    <div class="palette-scrim" id="tf-scrim">
-      <div class="palette" style="width:min(640px,94vw);max-height:84vh;overflow:auto">
-        <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px">
-          <b>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</b>
-          <select id="tf-wf" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
-          <span style="flex:1"></span><button class="icon-btn" id="tf-close">✕</button>
-        </div>
-        <div style="padding:14px 16px" id="tf-body">${renderFields(fields, values, inherited, true)}
-          ${promptField ? '' : `<div class="form-row" data-row="__images">
-            <div class="label-row"><label>Images</label></div>
-            <div class="img-chips" id="tf-chips" style="display:none"></div>
-            <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
-          </div>`}
-          <div class="form-row" data-row="__notes">
-            <div class="label-row"><label>Notes</label></div>
-            <textarea id="tf-notes" rows="3" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
-            <span style="color:var(--ink-3);font-size:12px">Only you see this — never sent to the agent.</span>
-          </div>
-          <div class="form-row" data-row="__org">
-            <div class="label-row"><label>Priority &amp; tags</label></div>
-            ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
-            <span style="color:var(--ink-3);font-size:12px">For search / organization only — never sent to the agent. Use / for nested tags.</span>
-          </div>
-          ${authorizationOptions ? `<div class="form-row" data-row="__authorization">
-            <div class="label-row"><label>Agent authorization</label></div>
-            <select id="tf-authorization">${authorizationOptions}</select>
-            <span style="color:var(--ink-3);font-size:12px">Applies to every agent and retry in this workflow, capped by your own permissions.</span>
-          </div>` : ''}
-          <details class="advanced" style="margin-top:10px">
-            <summary>Credentials — precedence &amp; enable/disable for this task</summary>
-            <p class="task-sub" style="color:var(--ink-3);margin-top:0">Overrides the project/global order + enablement, just for this task. Drag to reorder; toggle On/Off.</p>
-            <div id="cred-editor-newtask">Loading…</div>
-          </details>
-          ${triggersSection(values, draft?.id)}
-          ${repeatableToggleHtml(values)}
-          ${!draft ? `<div class="form-row"><div class="label-row"><label>Attempts</label></div><input id="tf-attempt-count" type="number" min="1" max="8" value="1"><span style="color:var(--ink-3);font-size:12px">Attempts created here are queued together. Attempts added later start as editable drafts.</span></div>` : ''}
-        </div>
-        <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
-          <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
-          <button class="btn primary" id="tf-queue">${draft ? (editInPlace ? 'Save' : 'Queue') : 'Add task'}</button>
+    <div class="task-form-page" id="tf-page" tabindex="-1">
+      <div class="tf-head">
+        <div class="tf-head-inner">
+          <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+          <h2>${draft ? (editInPlace ? 'Edit task' : 'Edit draft') : 'New task'}</h2>
+          ${proj ? `<span class="tf-crumb">in ${esc(proj.name)}</span>` : ''}
+          <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
+          <select id="tf-wf" title="Workflow" ${draft ? 'disabled' : ''}>${WORKFLOWS.map((w) => `<option value="${w.id}" ${w.id === wf ? 'selected' : ''}>${w.label}</option>`).join('')}</select>
         </div>
       </div>
+      <div class="tf-scroll">
+        <div class="tf-columns parameter-fields" id="tf-body">
+          <div class="tf-main">
+            ${promptField ? renderField(promptField, values[promptField.name], inherited[promptField.name], true) : ''}
+            ${restFields.length ? `<div class="section-h">Parameters</div>${renderFields(restFields, values, inherited)}` : ''}
+            ${promptField ? '' : `<div class="form-row" data-row="__images">
+              <div class="label-row"><label>Images</label></div>
+              <div class="img-chips" id="tf-chips" style="display:none"></div>
+              <span style="color:var(--ink-3);font-size:12px">Paste (⌘/Ctrl-V) or drag an image into a text field above to attach it to the prompt.</span>
+            </div>`}
+            ${triggersSection(values, draft?.id)}
+            ${repeatableToggleHtml(values)}
+          </div>
+          <aside class="tf-side">
+            <div class="form-row" data-row="__org">
+              <div class="label-row"><label>Priority &amp; tags</label></div>
+              ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
+            </div>
+            ${authorizationOptions ? `<div class="form-row" data-row="__authorization">
+              <div class="label-row"><label title="Applies to every agent and retry in this workflow, capped by your own permissions.">Agent authorization</label></div>
+              <select id="tf-authorization">${authorizationOptions}</select>
+            </div>` : ''}
+            ${!draft ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
+              <label for="tf-attempt-count">Attempts</label>
+              <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
+            </div>` : ''}
+            <div class="form-row" data-row="__creds">
+              <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Credentials</label></div>
+              <div id="cred-editor-newtask">Loading…</div>
+            </div>
+            <div class="form-row" data-row="__notes">
+              <div class="label-row"><label>Notes</label></div>
+              <textarea id="tf-notes" rows="4" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
+            </div>
+          </aside>
+        </div>
+      </div>
+      <div class="tf-foot">
+        <div class="tf-foot-inner">
+          <span class="tf-hint">Closing keeps your work as a draft</span>
+          <button class="btn" id="tf-draft">${editInPlace ? 'Save as draft' : 'Save draft'}</button>
+          <button class="btn primary" id="tf-queue">${draft ? (editInPlace ? 'Save' : 'Queue') : 'Add task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
+        </div>
+      </footer>
     </div>`;
   // Reassigned below once auto-save is wired; flushes pending edits before closing.
   let closeForm = () => (root.innerHTML = '');
@@ -2458,7 +3193,6 @@ async function openTaskForm(workflow, draft, seedText) {
     if (localCred && draftId) { const id = draftId; draftId = null; try { await api(`/api/tasks/${id}`, { method: 'DELETE' }); } catch {} }
     openTaskForm($('#tf-wf').value, undefined, (carried || '').trim());
   });
-  $('#tf-scrim').addEventListener('click', (e) => { if (e.target.id === 'tf-scrim') closeForm(); });
   $('#tf-close').addEventListener('click', () => closeForm());
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
@@ -2482,6 +3216,20 @@ async function openTaskForm(workflow, draft, seedText) {
   $('#tf-body')
     .querySelectorAll('textarea, input[type="text"], input:not([type])')
     .forEach((el) => wireImagePaste(el, () => formImages, () => paintFormChips(true)));
+  // Typing "@" in the prompt tags wiki pages/labels/folders into the task's context.
+  const promptTa = $('#tf-body')?.querySelector('textarea[data-field="prompt"]');
+  if (promptTa) wireWikiMention(promptTa, projectId);
+  // The prompt's "wiki context" bottom row: seed with the task's tokens, or the
+  // defaults so the user can see (and backspace away) what's inlined by default.
+  const contextTa = $('#tf-context');
+  if (contextTa) {
+    const wc = draft?.params?.wikiContext;
+    contextTa.value = Array.isArray(wc) ? wc.join(' ') : '@proj:tag:default @org:tag:default';
+    const growContext = () => { contextTa.style.height = 'auto'; contextTa.style.height = `${contextTa.scrollHeight}px`; };
+    growContext();
+    contextTa.addEventListener('input', growContext);
+    wireWikiMention(contextTa, projectId);
+  }
   paintFormChips();
   // Focus the consuming field (prompt/command) with the caret at the end, so
   // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
@@ -2491,7 +3239,7 @@ async function openTaskForm(workflow, draft, seedText) {
     cfEl.focus();
     const end = cfEl.value?.length ?? 0;
     if (typeof cfEl.setSelectionRange === 'function') { try { cfEl.setSelectionRange(end, end); } catch {} }
-  }
+  } else $('#tf-page')?.focus(); // keep focus inside the page so Esc reaches its handler
   // Per-task credential overrides. NOTE: there are TWO task forms that must each carry
   // this control — this NEW-TASK / edit-draft form (#cred-editor-newtask) AND the task
   // page's Parameters tab (#cred-editor-task). Change one → check the other.
@@ -2499,8 +3247,8 @@ async function openTaskForm(workflow, draft, seedText) {
   // editor runs in `local` mode: changes are held here and applied on create (below).
   let taskCredPolicy = {};
   const localCred = !draft;
-  if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: S.projectId, taskId: draft.id });
-  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId: S.projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+  if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
+  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
 
@@ -2524,16 +3272,25 @@ async function openTaskForm(workflow, draft, seedText) {
     const triggers = collectTriggers(values.triggers);
     if (triggers.length) body.triggers = triggers;
     if ($('#trig-repeatable')?.checked) body.repeatable = true;
+    // The "wiki context" row (@proj:…/@org:… tokens). Always sent — even empty,
+    // which is a deliberate opt-out of the default `default`-labelled pages — so
+    // the replace:true auto-save preserves the user's choice.
+    const ctx = $('#tf-context');
+    if (ctx) body.wikiContext = String(ctx.value).split(/\s+/).map((t) => t.trim()).filter((t) => /^@(proj|org):\S/i.test(t));
     return { body, notes: $('#tf-notes')?.value ?? '', authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
   // guards against spawning empty drafts just from opening the form.
-  const hasContent = ({ body, notes }) =>
-    notes.trim() !== '' ||
-    hasPolicy() ||
-    formImages.length > 0 ||
-    Object.values(body).some((v) =>
-      Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
+  const hasContent = ({ body, notes }) => {
+    // Wiki context alone (default or edited) isn't "content" worth a draft — it
+    // rides along once there's a real prompt/command. Exclude it from the scan.
+    const { wikiContext: _wc, ...rest } = body;
+    return notes.trim() !== '' ||
+      hasPolicy() ||
+      formImages.length > 0 ||
+      Object.values(rest).some((v) =>
+        Array.isArray(v) ? v.length > 0 : typeof v === 'string' ? v.trim() !== '' : v != null && typeof v !== 'boolean');
+  };
 
   // Persist the current form as a draft without leaving the form. Silent by
   // design — auto-save shouldn't nag; the explicit buttons surface errors.
@@ -2563,7 +3320,7 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
@@ -2572,6 +3329,9 @@ async function openTaskForm(workflow, draft, seedText) {
         }
         if (localCred && hasPolicy()) await api(`/api/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
+        // Quiet auto-save indicator in the page head. Guard on the form token: this
+        // chain link can land after a NEWER form instance has mounted its own head.
+        if (activeFormToken === formToken) { const ss = $('#tf-savestate'); if (ss) ss.textContent = 'Draft saved'; }
         refreshTasks();
       } catch { /* keep the form open; a later save or explicit button will retry */ }
     });
@@ -2580,7 +3340,12 @@ async function openTaskForm(workflow, draft, seedText) {
 
   // Debounced auto-save while typing.
   let saveTimer = null;
-  function autoSaveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(() => { if (activeFormToken !== formToken) return; persistDraft(); }, 800); }
+  function autoSaveSoon() {
+    const ss = $('#tf-savestate');
+    if (ss) ss.textContent = ''; // edits in flight — clear "Draft saved" until it lands
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => { if (activeFormToken !== formToken) return; persistDraft(); }, 800);
+  }
   $('#tf-body').addEventListener('input', autoSaveSoon);
   $('#tf-body').addEventListener('change', autoSaveSoon);
 
@@ -2596,7 +3361,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -2647,13 +3412,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${S.projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -2679,14 +3444,14 @@ async function openTaskForm(workflow, draft, seedText) {
   // otherwise only blur the focused field on Escape). ⌘/Ctrl-Enter = Add task /
   // Queue; Escape closes — and closeForm() flushes the draft on the way out, so
   // dismissing with the keyboard saves just like clicking away does.
-  $('#tf-scrim').addEventListener('keydown', (e) => {
+  $('#tf-page').addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); submit(false); }
     else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeForm(); }
   });
 }
 
 // ── task page ─────────────────────────────────────────────────────────────────
-// A task opens as a PAGE of its own (route /projects/:name/tasks/:num), rendered
+// A task opens as a PAGE of its own (route /<org>/<project>/tasks/:num), rendered
 // into #main with four tabs — Overview (pipeline, review, widgets, sub-tasks,
 // notes), Check-in (agent conversations + the ephemeral terminal), Parameters
 // (priority/tags, workflow params, credentials) and Advanced (event log,
@@ -2886,14 +3651,23 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    // paramDefaults keys off the fetched view's workflow, so it follows the batch.
-    S.paramDefaults = await loadParamDefaults(taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
+  // Param defaults only feed the Parameters tab, and resolving them costs a git
+  // subprocess (defaultBranch) on the server — so they used to add that latency to
+  // the *front* of every task open (the paint waited on them). They key off the
+  // task's (project, workflow), which never change while it's open, so load them
+  // once, after the first paint, and repaint only if the user is still here and
+  // actually looking at the Parameters tab.
+  loadParamDefaults(taskId).then((d) => {
+    if (S.selected !== taskId) return; // navigated away before it landed
+    S.paramDefaults = d;
+    if (S.taskTab === 'parameters') renderTaskPage();
+  });
 }
 async function refreshTask() {
   if (!S.selected) return;
@@ -2918,7 +3692,10 @@ async function refreshTask() {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    S.paramDefaults = await loadParamDefaults(id);
+    // paramDefaults are NOT refetched here: they key off (project, workflow), which
+    // can't change under a live task, so the value from openTask still holds. This
+    // refresh runs on every `view.updated` WS push — re-resolving defaults would
+    // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
   } catch {}
   renderTaskPage();
 }
@@ -2927,7 +3704,7 @@ async function refreshTask() {
 // (the ← button, Esc and the palette all route through here).
 function closeTask() {
   const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
-  const back = S.returnRoute || (pid ? projectRoute(pid) : '/dashboard');
+  const back = S.returnRoute || (pid ? projectRoute(pid) : globalRoute('dashboard'));
   S.returnRoute = null;
   return go(back, { replace: true });
 }
@@ -3089,6 +3866,11 @@ function renderTaskPage() {
   const threadScroll = prevThread
     ? { top: prevThread.scrollTop, atBottom: prevThread.scrollHeight - prevThread.scrollTop - prevThread.clientHeight < 40 }
     : null;
+  // A background re-render (WS event while an agent streams) rebuilds the whole
+  // pane, which would drop any text the user has selected in the transcript.
+  // Snapshot the selection as character offsets and re-apply it after the swap —
+  // the same treatment scroll/focus already get.
+  const threadSel = prevThread ? captureThreadSelection(prevThread) : null;
   const focusState = captureFocus(main);
   // The per-agent follow-up textareas carry no id (captureFocus skips them), so
   // snapshot the active one by its agent role to re-focus the matching box after
@@ -3109,10 +3891,16 @@ function renderTaskPage() {
           <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
         </div>
         <div class="meta">
-          <span>${esc(v.workflow)}${rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
+          <span>${v.workflowOptions?.length > 1
+            ? `<select id="tp-workflow-mode" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
+                ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
+              </select>`
+            : esc(workflowLabel(v.workflow))}
+            ${rec?.workflowVersion ? `<span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
+          ${rec ? orgEditorHtml(rec) : ''}
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
@@ -3133,7 +3921,9 @@ function renderTaskPage() {
     }),
   );
   wireAttempts(v);
+  wireWorkflowMode(v);
   wireActions(v); // the footer action bar lives on every tab
+  wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
@@ -3143,7 +3933,6 @@ function renderTaskPage() {
     wireTerminal(v.taskId);
     wireWorldFileLinks(v);
   } else if (tab === 'parameters') {
-    wireTaskOrg(v);
     wireParams(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
   } else if (tab === 'advanced') {
@@ -3156,6 +3945,11 @@ function renderTaskPage() {
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
   const thread = document.getElementById('ck-thread');
   if (thread) thread.scrollTop = threadScroll && !threadScroll.atBottom ? threadScroll.top : thread.scrollHeight;
+  if (thread) {
+    restoreThreadSelection(thread, threadSel);
+    wireMessageCopies(thread);
+    typesetMath(thread);
+  }
   restoreFocus(main, focusState);
   restoreFollowupFocus(main, fuState);
   // The scrollable body is the page's own scroll container (the app shell is
@@ -3166,6 +3960,98 @@ function renderTaskPage() {
   const scroller = thread || newBody;
   const overlayOpen = $('#overlay-root')?.childElementCount > 0 || $('#modal-root')?.childElementCount > 0;
   if (scroller && shouldFocusTaskBody(main, document.activeElement, overlayOpen)) scroller.focus({ preventScroll: true });
+}
+
+// A text walker over the thread that ignores math (its raw `$…$` is replaced by
+// MathJax SVG + hidden MathML asynchronously, so counting it would make the
+// before/after offsets disagree). Skipping it keeps the character map stable
+// regardless of typeset state.
+function threadTextWalker(thread) {
+  return document.createTreeWalker(thread, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => (node.parentElement && node.parentElement.closest('.md-math, mjx-container'))
+      ? NodeFilter.FILTER_REJECT
+      : NodeFilter.FILTER_ACCEPT,
+  });
+}
+
+// The transcript's text selection, captured as absolute character offsets into
+// the thread's concatenated text so it can survive a full innerHTML rebuild
+// (the new nodes are different objects; offsets aren't). Returns null when there
+// is no live selection inside the thread.
+function captureThreadSelection(thread) {
+  const sel = window.getSelection && window.getSelection();
+  if (!thread || !sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!thread.contains(range.startContainer) || !thread.contains(range.endContainer)) return null;
+  const offsetOf = (node, off) => {
+    const walker = threadTextWalker(thread);
+    let total = 0, n;
+    while ((n = walker.nextNode())) {
+      if (n === node) return total + off;
+      total += n.nodeValue.length;
+    }
+    return total;
+  };
+  return { start: offsetOf(range.startContainer, range.startOffset), end: offsetOf(range.endContainer, range.endOffset) };
+}
+
+function restoreThreadSelection(thread, snap) {
+  if (!thread || !snap) return;
+  const locate = (target) => {
+    const walker = threadTextWalker(thread);
+    let total = 0, n;
+    while ((n = walker.nextNode())) {
+      const len = n.nodeValue.length;
+      if (total + len >= target) return { node: n, offset: target - total };
+      total += len;
+    }
+    return n ? { node: n, offset: n.nodeValue.length } : null;
+  };
+  const a = locate(snap.start);
+  const b = locate(snap.end);
+  if (!a || !b) return;
+  try {
+    const range = document.createRange();
+    range.setStart(a.node, a.offset);
+    range.setEnd(b.node, b.offset);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch {}
+}
+
+function wireWorkflowMode(v) {
+  const select = document.getElementById('tp-workflow-mode');
+  if (!select) return;
+  select.addEventListener('change', async () => {
+    const prior = v.workflow;
+    const workflow = select.value;
+    select.disabled = true;
+    try {
+      const changed = await api(`/api/tasks/${v.taskId}/workflow`, {
+        method: 'PATCH',
+        body: JSON.stringify({ workflow }),
+      });
+      v.workflow = changed.workflow;
+      const rec = taskRecord(v.taskId);
+      if (rec) rec.workflow = changed.workflow;
+      toast(changed.workflow === 'goal'
+        ? 'Goal mode enabled — the agent will continue autonomously'
+        : 'Software Dev mode enabled — the task will stop at Review');
+      await Promise.all([refreshTask(), refreshTasks()]);
+      // The workflow just changed, and param defaults key off it — reload them here
+      // (refreshTask deliberately doesn't, to avoid a git subprocess per WS refresh).
+      loadParamDefaults(v.taskId).then((d) => {
+        if (S.selected !== v.taskId) return;
+        S.paramDefaults = d;
+        if (S.taskTab === 'parameters') renderTaskPage();
+      });
+    } catch (e) {
+      select.value = prior;
+      select.disabled = !v.workflowSwitchable;
+      toast(e.message, true);
+    }
+  });
 }
 
 // Switch the open task page to another of its tabs, pinning the tab in the URL
@@ -3212,6 +4098,9 @@ function captureFollowupFocus(root) {
   if (!box) return null;
   const st = { role: box.dataset.role || '', value: el.value };
   if (typeof el.selectionStart === 'number') { st.selectionStart = el.selectionStart; st.selectionEnd = el.selectionEnd; }
+  // The compose box scrolls internally once the draft spills past its height; a
+  // fresh textarea starts at the top, so snapshot the scroll offset to restore.
+  st.scrollTop = el.scrollTop;
   return st;
 }
 
@@ -3223,10 +4112,15 @@ function restoreFollowupFocus(root, st) {
   // Only carry over the value if the box was cleared by the re-render (a sent
   // follow-up empties it); never clobber text the box already holds.
   if (st.value && !el.value) el.value = st.value;
-  el.focus();
+  // preventScroll: re-focusing the box must never scroll the conversation — that
+  // caused the box to jump to the top of the thread on every background refresh.
+  el.focus({ preventScroll: true });
   if (typeof st.selectionStart === 'number' && typeof el.setSelectionRange === 'function') {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
+  // Put the caret's line back into view inside the textarea (focus + selection
+  // alone don't restore a multi-line box's own scroll in every browser).
+  if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
 }
 
 function stripAnsi(s) {
@@ -3311,7 +4205,56 @@ function makeTermScreen(maxLines = 2000) {
       row = Math.max(0, row - drop);
     }
   }
-  return { write, render: () => lines.join('\n') };
+  // render() joins the authoritative buffer; an optional `pending` string is the
+  // predicted (locally-echoed, not-yet-confirmed) tail — overlaid at the cursor
+  // without mutating the buffer, so the next server byte reconciles cleanly.
+  return {
+    write,
+    cursor: () => ({ row, col }),
+    render: (pending = '') => {
+      if (!pending) return lines.join('\n');
+      const out = lines.slice();
+      let line = out[row] ?? '';
+      if (line.length < col) line += ' '.repeat(col - line.length);
+      out[row] = line.slice(0, col) + pending + line.slice(col + pending.length);
+      return out.join('\n');
+    },
+  };
+}
+
+// Predictive local echo (mosh-style, conservative). Typing into a cloud world's
+// PTY costs a full network round-trip before the remote shell echoes the char
+// back, so without prediction every keystroke feels laggy. We optimistically
+// render printable characters the instant they're typed (`term.pending`), then
+// reconcile against the authoritative server stream: each echoed printable byte
+// confirms and drops one predicted char; anything unexpected (an escape sequence,
+// a mismatch — completion, prompt redraw, program output) discards the whole
+// prediction and lets the server drive. Non-printable keys (Enter, arrows, Tab,
+// Ctrl-*) can't be predicted safely, so they clear pending and defer to the shell.
+function predictInput(bytes, ctrl) {
+  if (!term) return;
+  if (!ctrl && bytes.length === 1 && bytes >= ' ' && bytes !== '\x7f') {
+    term.pending += bytes;                       // printable → echo locally now
+  } else if (bytes === '\x7f' && term.pending) {
+    term.pending = term.pending.slice(0, -1);    // backspace an unconfirmed char
+  } else {
+    term.pending = '';                           // Enter/arrows/Tab/Ctrl-* → server drives
+  }
+}
+
+// Consume the server's echo of characters we already predicted, so they don't
+// render twice. Stops (and discards remaining predictions) on the first byte that
+// doesn't match — the server is authoritative from that point on.
+function reconcilePrediction(data) {
+  if (!term || !term.pending) return;
+  for (let i = 0; i < data.length && term.pending; i++) {
+    const ch = data[i];
+    const code = data.charCodeAt(i);
+    if (ch === '\x1b') { term.pending = ''; return; }   // escape/redraw → drop predictions
+    if (code < 32 || code === 127) continue;            // ignore CR/LF/other controls
+    if (ch === term.pending[0]) term.pending = term.pending.slice(1); // confirmed
+    else { term.pending = ''; return; }                 // mismatch → server wins
+  }
 }
 
 // Translate a browser keydown into the bytes a PTY expects. Returns null to let
@@ -3346,13 +4289,13 @@ function keyToPtyBytes(e) {
 function bindTermScreen(out) {
   if (!term || !out) return;
   out.classList.remove('hidden');
-  out.textContent = term.screen.render();
-  out.scrollTop = out.scrollHeight;
+  const repaint = () => { out.textContent = term.screen.render(term.pending); out.scrollTop = out.scrollHeight; };
+  repaint();
   const ws = term.ws;
   ws.onmessage = (m) => {
     try {
       const msg = JSON.parse(m.data);
-      if (msg.type === 'data') { term.screen.write(msg.data); out.textContent = term.screen.render(); out.scrollTop = out.scrollHeight; }
+      if (msg.type === 'data') { reconcilePrediction(msg.data); term.screen.write(msg.data); repaint(); }
     } catch {}
   };
   const send = (data) => { if (term && term.ws && term.ws.readyState === 1) term.ws.send(JSON.stringify({ type: 'input', data })); };
@@ -3365,12 +4308,16 @@ function bindTermScreen(out) {
     e.preventDefault();
     e.stopPropagation();                                                // consumed by the shell — never let it trigger an app shortcut
     send(bytes);
+    predictInput(bytes, e.ctrlKey);                                     // optimistic local echo — hides the round-trip on cloud worlds
+    repaint();
   };
   out.onpaste = (e) => {
     const text = (e.clipboardData || window.clipboardData)?.getData('text');
     if (!text) return;
     e.preventDefault();
     send(text);
+    term.pending = '';                                                  // multi-line paste: let the shell echo authoritatively
+    repaint();
   };
 }
 
@@ -3378,9 +4325,10 @@ function openTerminal(taskId) {
   if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
-  term = { taskId, ws, screen: makeTermScreen() };
+  term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
+    term.pending = '';
     term.screen.write('\r\n[terminal closed]\r\n');
     const out = document.getElementById('term-out');
     if (out) out.textContent = term.screen.render();
@@ -3649,6 +4597,36 @@ function checkinSelection(v) {
   return liveRoleFor(v);
 }
 
+// Return the adjacent sidebar key with wraparound. Kept pure so the keyboard
+// navigation behavior is easy to verify independently of rendering.
+function adjacentCheckinPane(panes, current, delta) {
+  if (!panes.length) return null;
+  const i = panes.indexOf(current);
+  const at = i < 0 ? (delta > 0 ? -1 : 0) : i;
+  return panes[(at + delta + panes.length) % panes.length];
+}
+
+function selectCheckinPane(v, key, openShell = false) {
+  if (!key) return;
+  const changed = key !== checkinSelection(v);
+  S.checkinSel = key;
+  if (changed) renderTaskPage();
+  // Selecting the sidebar's "Open terminal" action is deliberately enough to
+  // start the PTY; no second click inside the terminal pane is required.
+  if (openShell && key === 'terminal' && (v.worldAvailable || v.worldPath) && !termIsOpenFor(v.taskId)) {
+    document.getElementById('ck-term-hint')?.remove();
+    openTerminal(v.taskId);
+  }
+}
+
+function cycleCheckinPane(delta) {
+  const v = S.view;
+  if (!v || S.taskTab !== 'checkin') return;
+  const panes = [...taskTranscripts(v).map((t) => t.role), 'terminal'];
+  const key = adjacentCheckinPane(panes, checkinSelection(v), delta);
+  selectCheckinPane(v, key, key === 'terminal');
+}
+
 function checkinTab(v) {
   const transcripts = taskTranscripts(v);
   const sel = checkinSelection(v);
@@ -3660,14 +4638,18 @@ function checkinTab(v) {
         <span class="ck-count">${conversationEntries(t).length}</span>
       </div>`)
     .join('');
+  const hasWorld = !!(v.worldAvailable || v.worldPath);
   return `<div class="ck-layout">
     <div class="ck-side">
       <div class="ck-side-h">Agents</div>
       ${items}
       <div class="ck-side-h">Shell</div>
-      <div class="ck-item ${sel === 'terminal' ? 'sel' : ''}" data-checkin="terminal" id="ck-term-item">
-        <span class="ck-name">Terminal</span>
-        <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
+      <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
+        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? 'Open a terminal in this task world' : 'No world yet'}">
+          <span class="ck-name">${hasWorld ? 'Open terminal' : 'No world yet'}</span>
+          <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
+        </button>
+        ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
       </div>
     </div>
     <div class="ck-pane">${sel === 'terminal' ? terminalPane(v) : conversationPane(v, transcripts.find((t) => t.role === sel))}</div>
@@ -3689,9 +4671,12 @@ function conversationPane(v, t) {
   // id is published mid-turn (#3), so this appears WHILE the agent runs.
   const sess = S.sessions && S.sessions[t.role];
   const forkCmd = sess?.id && sess?.home && v.worldPath ? forkCommandFor(sess, v.worldPath) : '';
+  const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && !S.meta?.hosted;
   const copy = forkCmd
     ? `<button class="btn sm copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">⑂ fork cmd</button>`
-    : '';
+    : remoteFork
+      ? `<button class="btn sm fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">⑂ fork locally</button>`
+      : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
   // appears only when the workflow currently allows follow-ups.
@@ -3702,7 +4687,7 @@ function conversationPane(v, t) {
   const fu = followUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName}…  (paste an image to attach)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input" placeholder="Send a follow-up to ${agentName} (paste an image to attach, type @ to add context from the wiki)" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           <div class="img-chips followup-chips" style="display:none"></div>
         </div>
         <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
@@ -3752,7 +4737,20 @@ function conversationEntries(t) {
   const messages = (t.messages || [])
     .filter((message) => message.role !== 'agent' || !providerTexts.has(String(message.text || '').trim()))
     .map((message, index) => ({ type: 'message', message, ts: message.ts, order: index }));
-  const combined = [...messages, ...activities.values()];
+  // Follow-ups are journaled as soon as Temporal accepts their signal, while the
+  // workflow's cached transcript may not be republished until the turn ends.
+  // Merge those durable events into the presentation timeline, keyed by message
+  // id so the later transcript publish (and an optimistic + WS duplicate) cannot
+  // show the same user message twice.
+  const storedIds = new Set((t.messages || []).map((message) => message.id));
+  const posted = new Map();
+  for (const event of (S.taskEvents || [])) {
+    if (event.type !== 'conversation.message' || event.payload?.role !== t.role) continue;
+    const message = event.payload?.message;
+    if (!message?.id || storedIds.has(message.id)) continue;
+    posted.set(message.id, { type: 'message', message, ts: message.ts ?? event.ts, order: event.seq ?? event.ts });
+  }
+  const combined = [...messages, ...posted.values(), ...activities.values()];
   return combined.sort((a, b) => {
     const at = Number(a.ts) > 100000000000 ? Number(a.ts) : -1000000000000 + Number(a.order || 0);
     const bt = Number(b.ts) > 100000000000 ? Number(b.ts) : -1000000000000 + Number(b.order || 0);
@@ -3838,15 +4836,30 @@ function setFileLinksEnabled(enabled) {
   localStorage.setItem(`karmax-appearance:${user || 'local'}:world-file-links`, enabled ? 'on' : 'off');
 }
 
+// Markdown mode renders anchors itself; mark the in-world ones afterwards so
+// the same click interception (wireWorldFileLinks) applies in both modes.
+function annotateWorldFileLinks(html, v = S.view) {
+  return String(html).replace(/<a href="([^"]*)"/g, (anchor, href) =>
+    worldFileTarget(href, v?.worldPath) ? `${anchor} class="world-file-link" data-world-file="${href}"` : anchor);
+}
+
+// Agent message bodies: Markdown (with world-file annotation) when enabled,
+// else the plain path that renders only the file-citation link subset.
+function renderAgentMessageBody(text, v = S.view) {
+  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text), v) : renderConversationText(text, 'agent', v);
+}
+
 function renderConversationEntry(entry, v = S.view) {
+  const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}</div><div class="msg-text">${renderConversationText(m.text, m.role, v)}</div>${renderMessageImages(m.images)}</div>`;
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v) : renderMessageBody(m.text);
+    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}</div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}</div><div class="msg-text">${renderConversationText(a.title, 'agent', v)}</div></div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v)}</div></div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -3933,41 +4946,125 @@ function conversationPresence(v, t) {
 // (module state) and dies when you leave the task.
 function terminalPane(v) {
   const open = termIsOpenFor(v.taskId);
+  const hasWorld = !!(v.worldAvailable || v.worldPath);
   return `
     <div class="ck-pane-head">
       <b>Ephemeral terminal</b>
       <span class="pal-sub">a shell in the task's world — killed when you leave the task</span>
       <span style="flex:1"></span>
       ${v.worldPath ? `<button class="btn sm copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" title="Copy a shell command to open this world in your own terminal">⧉ Copy command</button>` : ''}
-      <button class="btn sm" id="term-open" ${v.worldPath ? '' : 'disabled'}>${v.worldPath ? 'Open terminal' : 'No world yet'}</button>
+      ${v.worldAvailable && !v.worldPath ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
+      ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
+      ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
+      <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No world yet'}</button>
     </div>
     <div class="ck-term">
       <pre class="raw ${open ? '' : 'hidden'} term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell"></pre>
-      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${v.worldPath ? '“Open terminal” starts one in the task\'s world.' : 'This task has no world yet.'}</div>`}
+      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? '“Open terminal” starts one in the task\'s world.' : 'This task has no world yet.'}</div>`}
     </div>`;
 }
 
 function wireCheckinSidebar(v) {
   $('#main').querySelectorAll('[data-checkin]').forEach((el) =>
     el.addEventListener('click', () => {
-      if (el.dataset.checkin === checkinSelection(v)) return;
-      S.checkinSel = el.dataset.checkin;
-      renderTaskPage();
+      selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
     }),
   );
+  $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
+  $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
+  $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
+  $('#desktop-open')?.addEventListener('click', async () => {
+    try { const session = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/desktop`); window.open(session.url, '_blank', 'noopener'); }
+    catch (error) { toast(error.message, true); }
+  });
+}
+
+async function openLocalCheckout(v) {
+  if (!S.meta?.hosted) return materializeLocalCheckout(v);
+  let plan;
+  try { plan = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/checkout`); }
+  catch (error) { return toast(error.message, true); }
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  const canRefresh = v.status === 'waiting' && !v.agentTurn && ['human', 'confirm'].includes(v.waitingFor?.kind);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Work locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <p class="task-sub">The task branch is the handoff boundary. Karmax never connects to your laptop and your GitHub credentials never enter the cloud sandbox.</p>
+    <div class="section-h">1. First checkout</div><pre class="raw">${esc(plan.cloneScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.cloneScript)}">Copy checkout commands</button>
+    <div class="section-h" style="margin-top:14px">Already checked out?</div><pre class="raw">${esc(plan.updateScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.updateScript)}">Copy update commands</button>
+    <div class="section-h" style="margin-top:14px">2. Test, commit, and push</div><pre class="raw">${esc(plan.pushScript)}</pre><button class="btn sm local-copy" data-value="${esc(plan.pushScript)}">Copy push commands</button>
+    <div class="section-h" style="margin-top:14px">3. Bring the pushed commits back</div>
+    <p class="task-sub">Karmax accepts only a clean fast-forward, then parks the world again so the handoff does not leave metered compute running.</p>
+    <div class="inline-form"><button class="btn sm primary" id="local-refresh" ${canRefresh ? '' : 'disabled'}>Refresh cloud world from GitHub</button><span class="task-sub" id="local-refresh-result">${canRefresh ? '' : 'Available while the task is waiting for human review.'}</span></div>
+  </div></div>`;
+  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
+  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
+  $('#local-refresh', host)?.addEventListener('click', async (event) => {
+    const button = event.currentTarget; const result = $('#local-refresh-result', host); button.disabled = true; result.textContent = 'Importing the pushed branch…';
+    try {
+      const refreshed = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/refresh-from-github`, { method: 'POST', body: '{}' });
+      result.textContent = `${refreshed.updated.length} repositor${refreshed.updated.length === 1 ? 'y' : 'ies'} refreshed${refreshed.parked ? ' and world parked' : ''}.${refreshed.warning ? ` ${refreshed.warning}` : ''}`;
+      await refreshTask();
+    } catch (error) { result.textContent = error.message; button.disabled = false; }
+  });
+}
+
+async function materializeLocalCheckout(v, session) {
+  let checkout;
+  try {
+    checkout = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/materialize-local`, { method: 'POST', body: '{}' });
+  } catch (error) { toast(error.message, true); return null; }
+  const fork = session ? forkCommandFor(session, checkout.cwd) : '';
+  const host = document.createElement('div'); $('#modal-root').appendChild(host);
+  host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
+    <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
+    <p class="task-sub">Karmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
+    <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
+    <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
+    ${fork ? `<div class="section-h" style="margin-top:14px">Fork this agent locally</div><pre class="raw">${esc(fork)}</pre><button class="btn sm local-copy" data-value="${esc(fork)}">Copy fork command</button>` : ''}
+    <div class="section-h" style="margin-top:14px">Repositories</div>
+    <pre class="raw">${esc(checkout.repositories.map((repo) => `${repo.name}  ${repo.branch}  ${repo.head}\n${repo.path}`).join('\n\n'))}</pre>
+  </div></div>`;
+  host.querySelector('.local-handoff-close').addEventListener('click', () => host.remove());
+  host.querySelector('.local-handoff-scrim').addEventListener('click', (event) => { if (event.target === event.currentTarget) host.remove(); });
+  host.querySelectorAll('.local-copy').forEach((button) => button.addEventListener('click', () => copyToClipboard(button.dataset.value || '').then(() => {
+    const label = button.textContent; button.textContent = '✓ copied'; setTimeout(() => { button.textContent = label; }, 1200);
+  })));
+  return checkout;
+}
+
+async function forkCloudSessionLocally(v, button) {
+  button.disabled = true;
+  button.textContent = 'Materializing…';
+  const session = { provider: button.dataset.provider, id: button.dataset.session, home: button.dataset.home };
+  const checkout = await materializeLocalCheckout(v, session);
+  if (checkout) await copyToClipboard(forkCommandFor(session, checkout.cwd)).then(() => toast('Fork command copied'));
+  button.disabled = false;
+  button.textContent = '⑂ fork locally';
+}
+
+async function copyNativeAttachCommand(v) {
+  try {
+    const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/terminal-ticket`, { method: 'POST', body: '{}' });
+    const command = [...(result.attachArgv || ['karmax']), 'attach', v.taskId, '--url', result.gatewayUrl, '--ticket', result.ticket]
+      .map((part) => JSON.stringify(String(part))).join(' ');
+    await copyToClipboard(command);
+    toast('One-time attach command copied');
+  } catch (error) { toast(error.message, true); }
 }
 
 // Parameters: everything the human configured on this task, in one place —
 // priority + tags (organization), the workflow's declared params (editable or
 // frozen per its lifecycle), and the per-task credential policy.
 function parametersTab(v) {
-  const rec = taskRecord(v.taskId);
+  // Priority + tags (organization metadata) now live in the page header, above the
+  // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
   return `
-    <div class="section-h">Organization</div>
-    ${rec ? orgEditorHtml(rec) : '<div class="task-sub" style="color:var(--ink-3)">Priority + tags load with the task list.</div>'}
     ${paramsSection(v)}
     <div class="section-h">Credentials</div>
-    <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the global/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
+    <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
     <div id="cred-editor-task">Loading…</div>`;
 }
 
@@ -3977,7 +5074,7 @@ function advancedTab(v) {
     <div class="section-h">Live events</div>
     <div class="events" id="tp-events"></div>
     <div class="section-h">Structured state (the view-model floor)</div>
-    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, worldPath: v.worldPath, pr: v.pr }, null, 2))}</pre>`;
+    <pre class="raw">${esc(JSON.stringify({ stage: v.stage, status: v.status, state: v.state, waitingFor: v.waitingFor, agentTurn: v.agentTurn, world: { available: v.worldAvailable, provider: v.worldProvider, localPath: v.worldPath }, pr: v.pr }, null, 2))}</pre>`;
 }
 
 function renderDiff(d) {
@@ -3995,7 +5092,7 @@ function waitingLabel(w) {
     // wait also covers plain lease contention (another task holds the login) and
     // grant latency, where asserting a quota cause sends the user to check a
     // dashboard that rightly shows nothing wrong.
-    case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to free up'}`;
+    case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to become available'}`;
     case 'agentSlot': return w.detail || 'a host agent slot';
     case 'mergeSlot': return 'a merge slot';
     case 'human': return w.detail ? `human input (${w.detail})` : 'human input';
@@ -4167,9 +5264,9 @@ function wireCopyButtons() {
       e.preventDefault();
       e.stopPropagation();
       copyToClipboard(btn.dataset.cmd || '').then(() => {
-        const prev = btn.textContent;
-        btn.textContent = '✓ copied';
-        setTimeout(() => { btn.textContent = prev; }, 1200);
+        const prev = btn.innerHTML;
+        btn.textContent = btn.dataset.copyIcon === '1' ? '✓' : '✓ copied';
+        setTimeout(() => { btn.innerHTML = prev; }, 1200);
       });
     });
   });
@@ -4314,7 +5411,7 @@ function paramsSection(v) {
   const footer = editable.size
     ? `<button class="btn sm primary" id="params-save">Save changes</button>`
     : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
-  return `<div class="section-h">Parameters</div><div id="tp-params">${rows}${footer}</div>`;
+  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
 }
 
 // Best-known current value of a param for a running task (the view carries a few;
@@ -4466,20 +5563,40 @@ function wireFollowups(v) {
     const chips = box.querySelector('.followup-chips');
     const paint = () => renderImageChips(chips, store);
     wireImagePaste(ta, () => store, paint);
+    // Typing "@" tags wiki pages/labels/folders into the follow-up, same as the
+    // task prompt — the backend scans follow-up messages for `@proj:…`/`@org:…`.
+    wireWikiMention(ta, taskRecord(v.taskId)?.projectId || S.projectId);
     paint();
     const send = async () => {
       const text = ta.value.trim();
       if (!text && !store.length) return;
       try {
-        await api(`/api/tasks/${v.taskId}/signal`, {
+        const result = await api(`/api/tasks/${v.taskId}/signal`, {
           method: 'POST',
           body: JSON.stringify({ signal: 'followUp', text, role, ...(store.length ? { images: [...store] } : {}) }),
         });
-        ta.value = '';
+        // Render immediately even if this browser's event WebSocket is reconnecting.
+        // The durable WS copy is de-duplicated by conversationEntries once it lands.
+        if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
+          S.taskEvents.push({ type: 'conversation.message', taskId: v.taskId, ts: result.message.ts, payload: { role: result.role || role, message: result.message } });
+        }
+        // Clear the persisted draft + image store FIRST, so neither the re-render
+        // below nor a background refresh can repopulate the box from them. The box
+        // content is sourced from S.followupDrafts on every render, so this — not
+        // touching the DOM — is what actually empties it.
         delete S.followupDrafts[key];
         store.length = 0;
+        // The captured `ta`/`chips` may be detached if a background WS refresh
+        // swapped the page during the await above, in which case clearing `ta`
+        // would leave the *live* box untouched. Clear the current DOM textarea by
+        // a fresh lookup so the box is cleared even in that race.
+        const sel = window.CSS && CSS.escape ? CSS.escape(role) : role;
+        const liveTa = $('#main').querySelector(`.followup-box[data-role="${sel}"] .followup-input`);
+        if (liveTa) liveTa.value = '';
+        else if (ta) ta.value = '';
         paint();
         toast('Follow-up sent');
+        renderTaskPage();
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
@@ -4493,9 +5610,13 @@ function wireFollowups(v) {
 function updateLiveBubble() {
   const b = document.getElementById('live-bubble');
   if (!b) return;
+  // Follow the stream only when the reader is already parked at the bottom; if
+  // they've scrolled up to read history, hold their view fixed as text streams in.
+  const thread = document.getElementById('ck-thread');
+  const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight < 40;
   b.classList.remove('hidden');
   b.innerHTML = `<div class="role">agent · live</div>${esc(S.liveOutput)}`;
-  b.scrollIntoView({ block: 'nearest' });
+  if (atBottom) b.scrollIntoView({ block: 'nearest' });
 }
 
 function renderTaskEvents() {
@@ -4632,7 +5753,7 @@ function localQueue(domain) {
 
 function wireQueueView() {
   $('#main').querySelectorAll('.queue-item').forEach((e) => {
-    if (taskRecord(e.dataset.id)) wireTaskNav(e, (ev) => (ev.target.closest('[data-move]') || ev.target.closest('.drag-handle') ? null : e.dataset.id));
+    if (taskRecord(e.dataset.id)) wireTaskNav(e, () => e.dataset.id);
   });
   $('#main').querySelectorAll('[data-move]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
@@ -4835,7 +5956,7 @@ function procPanelHtml(sample) {
     .map((g) => {
       const kindChip = `<span class="chip">${esc(PROC_KIND_LABEL[g.kind] || g.kind)}</span>`;
       const taskChip = g.taskId
-        ? `<button class="chip proc-task" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</button>`
+        ? `<a class="chip proc-task" data-spa href="${esc(taskUrl(g.taskId))}" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</a>`
         : '';
       // A group is killable at the root when it's a registered entity (agents,
       // terminals, logins, probes) — its registered killer escalates properly.
@@ -4874,7 +5995,7 @@ function procPanelHtml(sample) {
 }
 
 function wireProcPanel(el) {
-  el.querySelectorAll('.proc-task').forEach((b) => b.addEventListener('click', () => goToTask(b.dataset.task)));
+  // .proc-task chips are real <a> permalinks handled by installLinkRouter().
   el.querySelectorAll('.proc-kill').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       const pid = Number(b.dataset.kill);
@@ -5012,8 +6133,8 @@ async function renderDashboard() {
 }
 
 // Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,
-// an "unavailable" record, or undefined (never probed). Non-pollable logins (Codex /
-// API keys / setup-token) render nothing here — their reactive status is shown above.
+// an "unavailable" record, or undefined (never probed). Non-pollable logins (API
+// keys / setup-token) render nothing here — their reactive status is shown above.
 function usageBlock(id, snap, isPollable) {
   if (!snap) {
     return isPollable
@@ -5025,6 +6146,7 @@ function usageBlock(id, snap, isPollable) {
       ? 'Usage % needs a full login (this one uses a setup-token) — tracked reactively.'
       : snap.reason === 'logged-out' ? 'Not logged in.'
       : snap.reason === 'not-subscription' ? 'No subscription usage to report.'
+      : snap.reason === 'no-rate-limits' ? 'No subscription rate limits to report.'
       : `Usage unavailable (${esc(snap.reason || '')}).`;
     return `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">${esc(why)}</div>`;
   }
@@ -5046,7 +6168,7 @@ function usageRow(label, win) {
   const expired = win.resetAt && win.resetAt < Date.now();
   const hue = expired ? 'var(--ink-3)' : pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
   const reset = expired
-    ? `window reset ${esc(win.resetLabel || '')}${win.tz ? ` (${esc(win.tz)})` : ''} — % is from the previous window`
+    ? `window reset ${esc(usageResetLabel(win))}${win.tz ? ` (${esc(win.tz)})` : ''} — % is from the previous window`
     : `resets ${esc(fmtUsageReset(win))}`;
   return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px${expired ? ';opacity:.55' : ''}">
     <span style="width:64px;color:var(--ink-2)">${esc(label)}</span>
@@ -5058,9 +6180,16 @@ function usageRow(label, win) {
   </div>`;
 }
 
+function usageResetLabel(win) {
+  if (win.resetLabel) return win.resetLabel;
+  return win.resetAt
+    ? new Date(win.resetAt).toLocaleString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })
+    : '';
+}
+
 function fmtUsageReset(win) {
   const cd = win.resetAt ? ` · ${fmtCountdown(win.resetAt)}` : '';
-  return `${win.resetLabel || ''}${win.tz ? ` (${win.tz})` : ''}${cd}`;
+  return `${usageResetLabel(win)}${win.tz ? ` (${win.tz})` : ''}${cd}`;
 }
 
 function fmtCountdown(epoch) {
@@ -5093,38 +6222,79 @@ function fmtReset(epoch) {
 }
 
 // ── settings (schema-driven, SPEC §10.4) ─────────────────────────────────────
+// Confirmation happens where the eye already is: the pressed button itself says
+// Saved for a moment, instead of a toast in the far corner naming wire ids.
+function flashSaved(button) {
+  if (!button || button.dataset.flashing) return;
+  button.dataset.flashing = '1';
+  const label = button.textContent;
+  button.textContent = 'Saved ✓';
+  button.classList.add('saved');
+  setTimeout(() => { button.textContent = label; button.classList.remove('saved'); delete button.dataset.flashing; }, 1400);
+}
 // One renderer for both scopes; `scope` decides which fields show + where they save.
+const settingsFields = (workflow, scope) => schemaFor(workflow)
+  .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile'].includes(field.name));
+const COMMON_DEFAULT_NAMES = new Set(['base', 'target', 'worldProvider', 'copyGlobs', 'remote', 'agent:do', 'agent:merge', 'agent:resolve', 'confirm']);
+// `confirm` (the Review route) stays a shared/common value on the wire, but it is
+// edited in the Agents card beside the Do/Merge agents it gates — not here.
+const commonSettingsFields = (scope) => settingsFields('software-dev', scope).filter((field) => COMMON_DEFAULT_NAMES.has(field.name) && field.name !== 'confirm');
+// The stored `__common__` row is shared by several forms (task defaults here; the
+// Review route and Git profile elsewhere) and a settings PUT replaces the whole
+// row — so every save read-merge-writes: fetch the raw row, drop exactly the keys
+// this form owns, and lay the collected values on top.
+async function saveCommonSettings(scope, projectId, organizationId, ownNames, collected) {
+  const url = scope === 'project' ? `/api/settings/project/${encodeURIComponent(projectId)}/__common__`
+    : organizationId ? `/api/organizations/${encodeURIComponent(organizationId)}/settings/__common__`
+    : '/api/settings/global/__common__';
+  const values = await api(url).catch(() => ({}));
+  for (const name of ownNames) delete values[name];
+  Object.assign(values, collected);
+  await api(url, { method: 'PUT', body: JSON.stringify({ values }) });
+}
+// Agent defaults live in the profile editor, so manifests correctly declare
+// these controls as task-scoped. Quick tasks still need the same Do/Merge picker:
+// read those task fields directly rather than hiding them behind settings scopes.
+const quickAgentFields = () => schemaFor('software-dev').filter((field) => field.type === 'agent');
 function settingsForms(scope, projectId) {
   const wfs = S.schema
     .filter((s) => WORKFLOWS.some((w) => w.id === s.name) || (scope === 'global' && s.name === 'agent-queue'))
     .sort((a, b) => Number(b.name === 'agent-queue') - Number(a.name === 'agent-queue'));
-  return wfs
+  const common = `<div class="card" data-wf="__common__" data-schema-wf="software-dev">
+      <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
+      <button class="btn primary sm" data-save="__common__">Save task defaults</button>
+    </div>`;
+  const unique = wfs
     .map((s) => {
-      const fields = s.params.filter((f) => f.scopes.includes(scope));
+      const fields = settingsFields(s.name, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       if (!fields.length) return '';
       const label = s.name === 'agent-queue' ? 'Host capacity' : s.name;
-      const suffix = s.name === 'agent-queue' ? '— agent-turn admission' : '— defaults';
+      const suffix = s.name === 'agent-queue' ? '' : '— workflow-specific';
       return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' || s.name === 'agent-queue' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(label)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">${suffix}</span></summary>
-        <div class="wf-form" style="margin-top:10px">${renderFields(fields)}</div>
+        <div class="wf-form parameter-fields" style="margin-top:10px">${renderFields(fields)}</div>
         <button class="btn primary sm" data-save="${esc(s.name)}">${s.name === 'agent-queue' ? 'Save host capacity' : `Save ${esc(s.name)} defaults`}</button>
       </details>`;
     })
     .join('');
+  return common + unique;
 }
 
-async function hydrateSettingsForms(scope, projectId) {
+async function hydrateSettingsForms(scope, projectId, organizationId) {
   // load saved (own) values + inherited defaults per workflow and fill the inputs
   for (const sec of $('#main').querySelectorAll('[data-wf]')) {
     const wf = sec.dataset.wf;
+    const schemaWf = sec.dataset.schemaWf || wf;
     let own = {};
     let inherited = {};
     try {
-      const d = await api(`/api/defaults/${projectId || 'global'}/${wf}`);
+      const orgQuery = organizationId && wf !== 'agent-queue' ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+      const d = await api(`/api/defaults/${projectId || 'global'}/${schemaWf}${orgQuery}`);
       own = d[scope].own;
       inherited = d[scope].inherited;
     } catch {}
-    const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
+    const fields = wf === '__common__' ? commonSettingsFields(scope)
+      : settingsFields(wf, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
     sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
@@ -5132,101 +6302,676 @@ async function hydrateSettingsForms(scope, projectId) {
 }
 
 // ── Quick task defaults (SPEC §10.4) ─────────────────────────────────────────
-// A separate overlay applied ONLY to tasks added from the quick-task box (not the
-// full "⋯ More" form). Same per-workflow fields as the general defaults, saved to
-// a distinct `quick:`-scoped settings row. Global-quick inherits from the general
-// global defaults; project-quick inherits from EITHER global-quick or the project's
-// general defaults — so each project-quick field gets two "Reset to inherited"
-// buttons (↺ Global quick / ↺ Project default).
+// An agent-only overlay applied to tasks added from the quick-task box (not the
+// full "⋯ More" form). All non-agent task defaults continue to use the regular
+// organization/project chain.
 function quickSettingsForms(scope, projectId) {
-  const wfs = S.schema.filter((s) => WORKFLOWS.some((w) => w.id === s.name));
-  return wfs
-    .map((s) => {
-      const fields = s.params.filter((f) => f.scopes.includes(scope));
-      if (!fields.length) return '';
-      return `<details class="card" data-qwf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
-        <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— quick-task defaults</span></summary>
-        <div class="wf-form" style="margin-top:10px"></div>
-        <button class="btn primary sm" data-qsave="${esc(s.name)}">Save ${esc(s.name)} quick defaults</button>
-      </details>`;
-    })
-    .join('');
+  return `<div class="card" data-qwf="__common__" data-schema-wf="software-dev">
+    <label class="switch"><input type="checkbox" class="quick-defaults-enabled"> Different agents for Quick tasks?</label>
+    <div class="quick-defaults-body" hidden><div class="wf-form parameter-fields" style="margin-top:12px"></div>
+      <button class="btn primary sm" data-qsave="__common__">Save Quick agent defaults</button></div>
+  </div>`;
 }
 
-async function hydrateQuickSettingsForms(scope, projectId) {
+async function hydrateQuickSettingsForms(scope, projectId, organizationId) {
   const key = scope === 'global' ? 'globalQuick' : 'projectQuick';
   for (const sec of $('#main').querySelectorAll('[data-qwf]')) {
     const wf = sec.dataset.qwf;
+    const schemaWf = sec.dataset.schemaWf || wf;
     let d = null;
-    try { d = await api(`/api/defaults/${projectId || 'global'}/${wf}`); } catch {}
+    try { d = await api(`/api/defaults/${projectId || 'global'}/${schemaWf}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`); } catch {}
     const own = d?.[key]?.own || {};
     const inherited = d?.[key]?.inherited || {};
-    const inheritedAlt = d?.[key]?.inheritedAlt || {};
-    const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
-    const altFor = scope === 'project'
-      ? (f) => ({ primaryLabel: 'Global quick', altLabel: 'Project default', value: inheritedAlt[f.name] })
-      : undefined;
-    sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited, false, altFor);
+    const fields = quickAgentFields();
+    const enabled = own._enabled === true || (own._enabled !== false && fields.some((field) => own[field.name] !== undefined));
+    sec.querySelector('.quick-defaults-enabled').checked = enabled;
+    sec.querySelector('.quick-defaults-body').hidden = !enabled;
+    sec.querySelector('.quick-defaults-enabled').addEventListener('change', (event) => { sec.querySelector('.quick-defaults-body').hidden = !event.target.checked; });
+    sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
     wireAgentFields(sec);
     wireFieldResets(sec, fields);
   }
 }
 
 // Save handlers for the quick-defaults forms (shared by global + project scopes).
-function wireQuickSettingsSave(scope, projectId) {
+function wireQuickSettingsSave(scope, projectId, organizationId) {
   $('#main').querySelectorAll('[data-qsave]').forEach((b) =>
     b.addEventListener('click', async () => {
       const wf = b.dataset.qsave;
       const sec = b.closest('[data-qwf]');
-      const fields = schemaFor(wf).filter((f) => f.scopes.includes(scope));
-      const values = collectForm(sec.querySelector('.wf-form'), fields);
-      const url = scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
-      try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); toast(`${wf} quick defaults saved`); } catch (e) { toast(e.message, true); }
+      const fields = quickAgentFields();
+      const values = { ...collectForm(sec.querySelector('.wf-form'), fields), _enabled: sec.querySelector('.quick-defaults-enabled').checked };
+      const url = scope === 'global' && organizationId ? `/api/organizations/${organizationId}/quick-settings/${wf}`
+        : scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
+      try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); flashSaved(b); } catch (e) { toast(e.message, true); }
     }),
   );
 }
 
-const quickDefaultsHeader = (blurb) =>
-  `<div style="margin-top:26px;font-size:15px;font-weight:700">Quick task defaults</div>
-   <p style="color:var(--ink-2);margin:4px 0 8px;font-size:12px">${blurb}</p>`;
+const quickDefaultsHeader = () => '';
 
+// ── wiki (org/project skills, memories, and prompts — one content system) ─────
+// One view serves both scopes: /<org>/wiki (proj = null) and /<org>/<project>/wiki.
+// The left rail lists the wiki tree; the pane shows the Index (every `default`-
+// labelled entry rendered in full, plus the table of contents — exactly what
+// agents get with each prompt) or the selected entry. The open entry rides in
+// the URL hash so wiki pages deep-link like settings panes.
+function wikiScopeInfo(proj) {
+  if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
+    selector: S.wikiViews?.[proj.id] || '' };
+  const org = currentOrg();
+  if (!org) return null;
+  return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki` };
+}
+
+function wikiView(proj) {
+  const info = wikiScopeInfo(proj);
+  if (!info) return `<div class="empty">No organization yet.</div>`;
+  return `<div class="organization-settings wiki-page"><div class="settings-header"><div>
+      <h1 class="page-title">${esc(info.title)} — wiki</h1>
+    </div>${proj ? `<div class="wiki-view-picker"><label for="wiki-view-input">Viewing</label>
+      <input id="wiki-view-input" list="wiki-view-options" placeholder="Default branch" autocomplete="off">
+      <datalist id="wiki-view-options"></datalist></div>` : ''}</div>
+    <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
+    <div class="settings-content" id="wiki-pane"></div></div></div>`;
+}
+
+function wikiUrl(info, suffix = '', params = {}) {
+  const url = new URL(`${info.base}${suffix}`, location.origin);
+  if (info.selector?.startsWith('task:')) url.searchParams.set('taskId', info.selector.slice(5));
+  else if (info.selector?.startsWith('branch:')) url.searchParams.set('branch', info.selector.slice(7));
+  for (const [key, value] of Object.entries(params)) if (value != null && value !== '') url.searchParams.set(key, value);
+  return `${url.pathname}${url.search}`;
+}
+
+const wikiIsDefault = (e) => (e.labels || []).includes('default');
+const wikiGlyph = (e) => (wikiIsDefault(e) ? '✦' : e.kind === 'memory' ? '✎' : '⚡');
+
+function wikiTreeHtml(entries, sel, depth = 0) {
+  return (entries || []).map((e) => e.kind === 'section'
+    ? `<span class="wiki-sec" style="padding-left:${10 + depth * 12}px">${esc(e.name)}/</span>${wikiTreeHtml(e.children, sel, depth + 1)}`
+    : `<a href="#${encodeURIComponent(e.path)}" class="${sel === e.path ? 'active' : ''}" data-wiki-path="${esc(e.path)}"
+         style="padding-left:${10 + depth * 12}px" title="${esc(e.description || '')}">${wikiGlyph(e)} ${esc(e.name)}</a>`,
+  ).join('');
+}
+
+async function wireWikiView(proj) {
+  const info = wikiScopeInfo(proj);
+  const nav = $('#wiki-nav');
+  const pane = $('#wiki-pane');
+  if (!info || !nav || !pane) return;
+  if (proj) {
+    try {
+      const refs = await api(`${info.base}/refs`);
+      const input = $('#wiki-view-input');
+      const options = $('#wiki-view-options');
+      const entries = [
+        { value: '', label: `Default branch · ${refs.defaultBranch}` },
+        ...(refs.tasks || []).map((task) => ({ value: `task:${task.id}`, label: `#${task.num || '–'} ${task.title} · ${task.branch}` })),
+        ...(refs.branches || []).filter((branch) => branch !== refs.defaultBranch)
+          .map((branch) => ({ value: `branch:${branch}`, label: `Branch · ${branch}` })),
+      ];
+      const selected = entries.find((entry) => entry.value === info.selector) || entries[0];
+      input.value = selected.label;
+      options.innerHTML = entries.map((entry) => `<option value="${esc(entry.label)}"></option>`).join('');
+      input.onchange = () => {
+        const chosen = entries.find((entry) => entry.label === input.value.trim());
+        if (!chosen) return;
+        S.wikiViews ||= {};
+        S.wikiViews[proj.id] = chosen.value;
+        S.wikiEditing = null;
+        wireWikiView(proj);
+      };
+    } catch { /* the canonical wiki remains usable without the selector metadata */ }
+  }
+  const key = `${info.scope}:${info.id}`;
+  let data;
+  try { data = await api(wikiUrl(info)); }
+  catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
+  const sel = decodeURIComponent((location.hash || '').slice(1));
+
+  nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
+    <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
+    ${wikiTreeHtml(data.toc?.children, sel)}
+    ${data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
+  const open = (path) => {
+    S.wikiEditing = null;
+    history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
+    wireWikiView(proj);
+  };
+  nav.querySelector('[data-wiki-home]')?.addEventListener('click', (ev) => { ev.preventDefault(); open(''); });
+  nav.querySelectorAll('[data-wiki-path]').forEach((a) => a.addEventListener('click', (ev) => { ev.preventDefault(); open(a.dataset.wikiPath); }));
+  $('#wiki-new')?.addEventListener('click', () => renderWikiEditor(info, proj, pane, null));
+
+  // A page fetch goes through the base route so built-ins resolve (a virtual
+  // built-in has no on-disk page for /page to find).
+  const fetchPage = async (p) => {
+    const read = await api(wikiUrl(info, '', { path: p }));
+    return read.page ? { ...read.page, _wikiWritable: read.view?.writable !== false } : null;
+  };
+  // A background re-render (WS task event) must not blow away an in-progress
+  // editor: restore it for the same scope before painting the read view.
+  if (S.wikiEditing?.wikiKey === key) {
+    if (!S.wikiEditing.path) return renderWikiEditor(info, proj, pane, null);
+    try {
+      const editing = await fetchPage(S.wikiEditing.path);
+      if (editing) return renderWikiEditor(info, proj, pane, editing);
+    } catch { /* fall through */ }
+    S.wikiEditing = null;
+  }
+  if (!sel) return renderWikiHome(info, proj, pane, data);
+  let page;
+  try { page = await fetchPage(sel); } catch { page = null; }
+  if (!page) return renderWikiHome(info, proj, pane, data); // stale hash → fall back
+  renderWikiPage(info, proj, pane, page);
+}
+
+// Everything above the frontmatter fence is metadata; render only the body.
+function wikiBody(content) {
+  return String(content || '').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+}
+
+// ── frontmatter ⇄ form (the editor's two faces) ──────────────────────────────
+// Mirrors src/wiki/wiki.ts parseFrontmatter, plus strictness: toggling the raw
+// YAML view back to the form requires every line to be a valid known scalar.
+function parseWikiFm(text) {
+  const s = String(text ?? '');
+  if (!/^---\r?\n/.test(s)) return { ok: true, fields: {}, body: s };
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(s);
+  if (!m) return { ok: false, error: 'Unterminated frontmatter — missing the closing “---”.' };
+  const fields = {};
+  for (const line of m[1].split('\n')) {
+    if (!line.trim()) continue;
+    const kv = /^([A-Za-z][\w-]*):\s*(.*)$/.exec(line);
+    if (!kv) return { ok: false, error: `Invalid frontmatter line: “${line.trim()}”` };
+    fields[kv[1].toLowerCase()] = kv[2].trim().replace(/^["']|["']$/g, '');
+  }
+  // Back-compat: an older `delivery: unconditional` folds into the `default` label.
+  if (fields.delivery === 'unconditional')
+    fields.labels = [...new Set([...parseWikiLabels(fields.labels), 'default'])].join(', ');
+  delete fields.delivery;
+  if (fields.importance && !Number.isFinite(Number(fields.importance)))
+    return { ok: false, error: 'importance must be a number.' };
+  return { ok: true, fields, body: s.slice(m[0].length) };
+}
+
+// Split a comma-separated (optionally `[a, b]`) labels string into clean tokens.
+function parseWikiLabels(raw) {
+  return String(raw ?? '')
+    .replace(/^\[|\]$/g, '')
+    .split(',')
+    .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
+}
+
+function buildWikiContent(fields, body) {
+  const lines = [];
+  if (fields.name) lines.push(`name: ${fields.name}`);
+  if (fields.description) lines.push(`description: ${fields.description}`);
+  const labels = parseWikiLabels(fields.labels);
+  if (labels.length) lines.push(`labels: ${labels.join(', ')}`);
+  if (fields.importance && Number(fields.importance) !== 0) lines.push(`importance: ${fields.importance}`);
+  const text = String(body ?? '').replace(/^\n+/, '');
+  return lines.length ? `---\n${lines.join('\n')}\n---\n\n${text}` : text;
+}
+
+// ── @-mention: tag wiki context into a task prompt ───────────────────────────
+// Typing "@" in a prompt opens a dropdown that searches BOTH the project and
+// the organization wiki. Picking a result inserts a `@proj:…` / `@org:…` token
+// that inlines that page — or a whole label (`@proj:tag:…`) or folder
+// (`@proj:…/*`) — into the task's context at run time. Enter picks the top
+// (or highlighted) result; ↑/↓ navigate; Esc dismisses; a click picks directly.
+
+// Viewport-relative pixel position of a caret offset inside a textarea, via a
+// mirror div that copies the textarea's text metrics (the standard technique).
+function textareaCaretXY(ta, pos) {
+  const rect = ta.getBoundingClientRect();
+  const style = getComputedStyle(ta);
+  const mirror = document.createElement('div');
+  for (const p of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'textTransform',
+    'wordSpacing', 'lineHeight', 'textIndent', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+    'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth', 'boxSizing'])
+    mirror.style[p] = style[p];
+  Object.assign(mirror.style, {
+    position: 'absolute', visibility: 'hidden', whiteSpace: 'pre-wrap', wordWrap: 'break-word',
+    overflow: 'hidden', width: `${ta.clientWidth}px`, top: '0', left: '0',
+  });
+  mirror.textContent = ta.value.slice(0, pos);
+  const marker = document.createElement('span');
+  marker.textContent = ta.value.slice(pos) || '.';
+  mirror.appendChild(marker);
+  document.body.appendChild(mirror);
+  const lineH = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.4;
+  const xy = {
+    top: rect.top + marker.offsetTop - ta.scrollTop + lineH,
+    left: rect.left + marker.offsetLeft - ta.scrollLeft,
+  };
+  mirror.remove();
+  return xy;
+}
+
+function wireWikiMention(ta, projectId) {
+  if (!ta || !projectId || ta.dataset.wmWired) return;
+  ta.dataset.wmWired = '1';
+  const orgId = projectById(projectId)?.organizationId;
+  let menu = null, items = [], active = 0, token = null, seq = 0;
+
+  const close = () => { menu?.remove(); menu = null; items = []; token = null; };
+  // The @-token immediately before the caret — only at the start or right after
+  // whitespace (so `b@`, `\@`, `(@` don't trigger), and never inside an inline
+  // code span (odd count of backticks before the @). Mirrors parseWikiRefs.
+  const tokenAt = () => {
+    const pos = ta.selectionStart;
+    if (pos == null || pos !== ta.selectionEnd) return null;
+    const m = /(?:^|\s)@([^\s@]*)$/.exec(ta.value.slice(0, pos));
+    if (!m) return null;
+    const at = pos - m[1].length - 1;
+    if ((ta.value.slice(0, at).match(/`/g) || []).length % 2 === 1) return null;
+    return { start: at, end: pos, query: m[1] };
+  };
+  const parseQuery = (q) => /^proj:/i.test(q) ? { scopes: ['project'], q: q.slice(5) }
+    : /^org:/i.test(q) ? { scopes: ['organization'], q: q.slice(4) }
+    : { scopes: ['project', 'organization'], q };
+  const tokenFor = (s) => `@${s.scope === 'project' ? 'proj' : 'org'}:${s.ref}`;
+  const glyph = (s) => s.kind === 'label' ? '🏷' : s.kind === 'folder' ? '🗀' : s.scope === 'project' ? '⚡' : '✦';
+
+  const fetchSuggestions = async (q) => {
+    const { scopes, q: search } = parseQuery(q);
+    const per = await Promise.all(scopes.map((scope) => {
+      const id = scope === 'project' ? projectId : orgId;
+      if (!id) return Promise.resolve([]);
+      const base = scope === 'project' ? `/api/projects/${encodeURIComponent(id)}/wiki` : `/api/organizations/${encodeURIComponent(id)}/wiki`;
+      return api(`${base}/suggest?q=${encodeURIComponent(search)}`).then((r) => (r.suggestions || []).map((s) => ({ ...s, scope }))).catch(() => []);
+    }));
+    // Interleave the scopes so both surface near the top, then cap the list.
+    const merged = [], max = Math.max(0, ...per.map((r) => r.length));
+    for (let i = 0; i < max; i++) for (const r of per) if (r[i]) merged.push(r[i]);
+    return merged.slice(0, 8);
+  };
+
+  const highlight = () => menu?.querySelectorAll('.wm-opt').forEach((el, i) => el.classList.toggle('active', i === active));
+  const choose = (s) => {
+    if (!s || !token) return close();
+    const insert = `${tokenFor(s)} `;
+    ta.value = ta.value.slice(0, token.start) + insert + ta.value.slice(token.end);
+    const caret = token.start + insert.length;
+    close();
+    ta.setSelectionRange(caret, caret);
+    ta.focus();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  const render = () => {
+    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu'; document.body.appendChild(menu); }
+    menu.innerHTML = items.length ? items.map((s, i) => `
+      <div class="wm-opt ${i === active ? 'active' : ''}" data-i="${i}">
+        <span class="wm-glyph">${glyph(s)}</span>
+        <span class="wm-main"><span class="wm-ref">${esc(tokenFor(s))}</span>${
+          s.description ? `<span class="wm-desc">${esc(s.description)}</span>`
+          : s.count != null ? `<span class="wm-desc">${s.count} page${s.count === 1 ? '' : 's'}</span>` : ''
+        }</span>
+        <span class="wm-scope">${s.scope === 'project' ? 'project' : 'org'}</span>
+      </div>`).join('') : `<div class="wm-empty">No matching wiki pages</div>`;
+    menu.querySelectorAll('.wm-opt').forEach((el) => {
+      el.addEventListener('mousedown', (ev) => { ev.preventDefault(); choose(items[+el.dataset.i]); });
+      el.addEventListener('mouseenter', () => { active = +el.dataset.i; highlight(); });
+    });
+    const xy = textareaCaretXY(ta, token.start);
+    menu.style.left = `${Math.min(xy.left, window.innerWidth - 380)}px`;
+    menu.style.top = `${xy.top}px`;
+  };
+  const update = async () => {
+    token = tokenAt();
+    if (!token) return close();
+    const my = ++seq;
+    const found = await fetchSuggestions(token.query);
+    if (my !== seq) return;               // superseded by a newer keystroke
+    token = tokenAt();
+    if (!token) return close();           // caret moved off the token meanwhile
+    items = found; active = 0;
+    render();
+  };
+
+  ta.addEventListener('input', update);
+  ta.addEventListener('click', () => { if (!tokenAt()) close(); });
+  // Registered before the box's own send/submit keydown, so while the menu is
+  // open these keys drive it and stopImmediatePropagation keeps them from ALSO
+  // reaching the ⌘/Ctrl-Enter send/submit or Esc-close-form handlers.
+  ta.addEventListener('keydown', (ev) => {
+    if (!menu) return;
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopImmediatePropagation(); close(); }
+    else if (!items.length) return;
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active + 1) % items.length; highlight(); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active - 1 + items.length) % items.length; highlight(); }
+    else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
+  });
+  ta.addEventListener('blur', () => setTimeout(close, 150));
+  window.addEventListener('resize', close);
+}
+
+// ── the path-as-title control ────────────────────────────────────────────────
+// A single-line contenteditable where the stem (after the last slash) is the
+// large title and any parent sections shrink into a prefix.
+function caretOffsetIn(el) {
+  const s = window.getSelection();
+  if (!s?.rangeCount || !el.contains(s.anchorNode)) return null;
+  const pre = s.getRangeAt(0).cloneRange();
+  const end = s.getRangeAt(0);
+  pre.selectNodeContents(el);
+  pre.setEnd(end.endContainer, end.endOffset);
+  return pre.toString().length;
+}
+function setCaretIn(el, offset) {
+  if (offset == null) return;
+  const sel = window.getSelection();
+  const range = document.createRange();
+  let left = offset;
+  let placed = false;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (left <= node.textContent.length) { range.setStart(node, left); range.collapse(true); placed = true; break; }
+    left -= node.textContent.length;
+  }
+  if (!placed) { range.selectNodeContents(el); range.collapse(false); }
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+function wikiPathValue(el) {
+  return el.textContent.replace(/\s+/g, '').replace(/\/+/g, '/').replace(/^\/|\/$/g, '');
+}
+function wireWikiPathEditor(el, warnEl, kindOf) {
+  const restyle = () => {
+    const text = el.textContent.replace(/[\r\n]/g, '');
+    const caret = caretOffsetIn(el);
+    const cut = text.lastIndexOf('/') + 1;
+    el.innerHTML = (cut ? `<span class="wiki-path-prefix">${esc(text.slice(0, cut))}</span>` : '') +
+      `<span class="wiki-path-stem">${esc(text.slice(cut))}</span>`;
+    setCaretIn(el, caret);
+    const ext = /\.[A-Za-z0-9]{1,6}$/.test(wikiPathValue(el));
+    warnEl.hidden = !ext;
+    if (ext) warnEl.textContent = `That looks like a file extension — this is the entry's folder path; the file itself will be ${kindOf() === 'memory' ? 'MEMORY.md' : 'SKILL.md'}.`;
+  };
+  el.addEventListener('input', restyle);
+  el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') ev.preventDefault(); });
+  el.addEventListener('paste', (ev) => {
+    ev.preventDefault();
+    document.execCommand('insertText', false, (ev.clipboardData?.getData('text/plain') || '').replace(/\s+/g, ''));
+  });
+  restyle();
+}
+
+// ── panes ────────────────────────────────────────────────────────────────────
+// Index: exactly what agents receive each turn — every unconditional entry in
+// full, then the rendered table of contents (importance order, [more…] folds).
+function renderWikiHome(info, proj, pane, data) {
+  pane.innerHTML = (data.unconditional || []).map((u) => `
+    <div class="card wiki-uncond">
+      <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
+        ${data.view?.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}</div>
+      <div class="msg-text md wiki-md">${renderMessageBody(u.body || '')}</div>
+    </div>`).join('') + (data.tocText ? `
+    <div class="card wiki-uncond">
+      <div class="wiki-uncond-head"><b>Table of contents</b><span class="chip" title="Sent to agents as names and descriptions only; they open entries with read_wiki">titles only</span></div>
+      <div class="msg-text md wiki-md">${renderMessageBody(data.tocText)}</div>
+    </div>` : '');
+  typesetMath(pane);
+  pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
+    try {
+      const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
+      if (!read.page) return toast('Entry not found', true);
+      history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(read.page.path)}`);
+      renderWikiEditor(info, proj, pane, read.page);
+    } catch (e) { toast(e.message, true); }
+  }));
+}
+
+function renderWikiPage(info, proj, pane, page) {
+  // A built-in is always editable (the edit shadows the bundled default); its
+  // delete button appears only once customized, and restores that default.
+  const remove = page.builtin
+    ? (page.overridden ? '<button class="btn sm danger" id="wiki-page-delete">Restore default</button>' : '')
+    : '<button class="btn sm danger" id="wiki-page-delete">Delete</button>';
+  pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)}
+      <span class="chip">${page.kind}</span><span class="chip">${esc(page.path)}</span>
+      ${wikiIsDefault(page) ? '<span class="chip active" title="Labelled “default” — inlined into every task’s prompt">always in prompt</span>' : ''}
+      ${(page.labels || []).filter((l) => l !== 'default').map((l) => `<span class="chip">${esc(l)}</span>`).join('')}
+      ${page.builtin ? '<span class="chip">built-in</span>' : ''}
+      ${page.overridden ? '<span class="chip">customized</span>' : ''}
+      ${page.description ? `<small>${esc(page.description)}</small>` : ''}</div></div>
+    <div class="card">
+      <div class="msg-text md wiki-md">${renderMessageBody(wikiBody(page.content))}</div>
+      ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? '<span class="task-sub">Read-only branch view</span>' : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
+    </div>`;
+  typesetMath(pane);
+  $('#wiki-page-delete')?.addEventListener('click', async () => {
+    const q = page.builtin
+      ? `Restore the built-in default for “${page.name}”? Your customized text is discarded.`
+      : `Delete “${page.name}” (${page.path})? Its folder and attached files go with it.`;
+    if (!confirm(q)) return;
+    try {
+      await api(wikiUrl(info, '/page', { path: page.path }), { method: 'DELETE' });
+      if (!page.builtin) history.replaceState({ kx: 1 }, '', location.pathname);
+      wireWikiView(proj);
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#wiki-page-edit')?.addEventListener('click', () => renderWikiEditor(info, proj, pane, page));
+}
+
+// Create (page = null) and edit share one editor: the path-as-title control, the
+// frontmatter as a form (raw YAML behind a toggle), and a Write/Preview body.
+function renderWikiEditor(info, proj, pane, page) {
+  const isNew = !page;
+  S.wikiEditing = { wikiKey: `${info.scope}:${info.id}`, path: page?.path ?? null };
+  const fm = parseWikiFm(page?.content ?? '');
+  // A pristine built-in has no frontmatter of its own — seed the form from its
+  // resolved metadata so the first save writes an override that keeps its
+  // labels/importance instead of silently dropping them.
+  const fields = fm.ok
+    ? (page?.builtin
+      ? { name: page.name, description: page.description, labels: (page.labels || []).join(', '), importance: page.importance, ...Object.fromEntries(Object.entries(fm.fields).filter(([, v]) => v !== undefined && v !== '')) }
+      : fm.fields)
+    : {};
+  const body = fm.ok ? fm.body : (page?.content ?? '');
+  pane.innerHTML = `
+    <div class="wiki-title-row">
+      <div class="wiki-path-edit" id="wiki-path" contenteditable="${page?.builtin ? 'false' : 'true'}" spellcheck="false"></div>
+      ${isNew
+        ? `<select id="wiki-kind"><option value="skill">Skill</option><option value="memory">Memory</option></select>`
+        : `<span class="chip">${page.kind}</span>${page.builtin ? '<span class="chip">built-in</span>' : ''}`}
+    </div>
+    <div class="wiki-warn" id="wiki-path-warn" hidden></div>
+    <div class="card wiki-editor">
+      <div class="wiki-fields" id="wiki-form">
+        <label>Name<input id="wf-name" value="${esc(fields.name || '')}" placeholder="defaults to the folder name"></label>
+        <label>Description<input id="wf-desc" value="${esc(fields.description || '')}" placeholder="one line for the table of contents"></label>
+        <label title="Comma-separated. Every entry is always in the table of contents; a task inlines an entry in full by tagging its label with @proj:tag:… (or @org:tag:…). Add “default” to inline it into every task.">Labels<input id="wf-labels" value="${esc(fields.labels || '')}" placeholder="e.g. default, security"></label>
+        <label>Importance<input id="wf-importance" type="number" step="any" value="${esc(fields.importance ?? '')}" placeholder="0"></label>
+      </div>
+      <div class="wiki-body-bar">
+        <button class="wiki-body-tab active" id="wiki-tab-write" type="button">Write</button>
+        <button class="wiki-body-tab" id="wiki-tab-preview" type="button">Preview</button>
+        <span class="grow"></span>
+        <label class="switch"><input type="checkbox" id="wiki-yaml"><span>YAML</span></label>
+      </div>
+      <textarea id="wiki-body" rows="16">${esc(body)}</textarea>
+      <div id="wiki-preview" class="msg-text md wiki-md wiki-preview" hidden></div>
+      <textarea id="wiki-raw" rows="20" hidden></textarea>
+      <div class="inline-form" style="margin-top:10px"><button class="btn sm primary" id="wiki-save">${isNew ? 'Create' : 'Save'}</button><button class="btn sm" id="wiki-cancel">Cancel</button></div>
+    </div>`;
+  const pathEl = $('#wiki-path');
+  pathEl.textContent = page?.path ?? '';
+  const kindOf = () => (isNew ? $('#wiki-kind').value : page.kind);
+  wireWikiPathEditor(pathEl, $('#wiki-path-warn'), kindOf);
+  $('#wiki-kind')?.addEventListener('change', () => pathEl.dispatchEvent(new Event('input')));
+  if (isNew) pathEl.focus();
+
+  const formFields = () => ({
+    name: $('#wf-name').value.trim(),
+    description: $('#wf-desc').value.trim(),
+    labels: $('#wf-labels').value.trim(),
+    importance: $('#wf-importance').value.trim(),
+  });
+  const yamlToggle = $('#wiki-yaml');
+  const inYaml = () => yamlToggle.checked;
+  yamlToggle.addEventListener('change', () => {
+    if (yamlToggle.checked) {
+      $('#wiki-raw').value = buildWikiContent(formFields(), $('#wiki-body').value);
+      $('#wiki-form').hidden = true;
+      $('.wiki-body-bar', pane).hidden = true;
+      $('#wiki-body').hidden = true;
+      $('#wiki-preview').hidden = true;
+      $('#wiki-raw').hidden = false;
+      $('#wiki-raw').focus();
+    } else {
+      const parsed = parseWikiFm($('#wiki-raw').value);
+      if (!parsed.ok) { toast(parsed.error, true); yamlToggle.checked = true; return; }
+      $('#wf-name').value = parsed.fields.name || '';
+      $('#wf-desc').value = parsed.fields.description || '';
+      $('#wf-labels').value = parseWikiLabels(parsed.fields.labels).join(', ');
+      $('#wf-importance').value = parsed.fields.importance ?? '';
+      $('#wiki-body').value = parsed.body;
+      $('#wiki-form').hidden = false;
+      $('.wiki-body-bar', pane).hidden = false;
+      $('#wiki-raw').hidden = true;
+      showWrite();
+    }
+  });
+  const showWrite = () => {
+    $('#wiki-tab-write').classList.add('active');
+    $('#wiki-tab-preview').classList.remove('active');
+    $('#wiki-body').hidden = false;
+    $('#wiki-preview').hidden = true;
+  };
+  $('#wiki-tab-write').addEventListener('click', showWrite);
+  $('#wiki-tab-preview').addEventListener('click', () => {
+    $('#wiki-tab-preview').classList.add('active');
+    $('#wiki-tab-write').classList.remove('active');
+    const preview = $('#wiki-preview');
+    preview.innerHTML = renderMessageBody($('#wiki-body').value) || '<span class="task-sub">Nothing to preview.</span>';
+    $('#wiki-body').hidden = true;
+    preview.hidden = false;
+    typesetMath(preview);
+  });
+
+  $('#wiki-cancel').addEventListener('click', () => { S.wikiEditing = null; wireWikiView(proj); });
+  $('#wiki-save').addEventListener('click', async () => {
+    const path = wikiPathValue(pathEl);
+    if (!path) return toast('The entry needs a path', true);
+    const body = { path, kind: kindOf(), content: inYaml() ? $('#wiki-raw').value : buildWikiContent(formFields(), $('#wiki-body').value) };
+    if (isNew) body.create = true;
+    else if (path !== page.path) body.prevPath = page.path;
+    try {
+      await api(wikiUrl(info, '/page'), { method: 'PUT', body: JSON.stringify(body) });
+      S.wikiEditing = null;
+      history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(path)}`);
+      wireWikiView(proj);
+    } catch (e) { toast(e.message, true); }
+  });
+}
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
-  return `
-    <div class="page-title">Project settings — ${esc(proj.name)}</div>
-    <p style="color:var(--ink-2);margin-top:-8px">Per-workflow defaults for this project. They override your global defaults and are overridden per-task.</p>
+  return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
+    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
+    <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
+    <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
+    <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
+    <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
-    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box in this project (not the full “⋯ More” form). Each field inherits from your <b>global quick defaults</b> (↺ Global quick) or this project's <b>general defaults</b> above (↺ Project default) until you set it here.`)}
-    ${quickSettingsForms('project', proj.id)}
-    <div class="card">
-      <div class="section-h">Credentials &amp; precedence</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Override the global credential order/enablement for this project (e.g. enable an API key here that's off globally).</p>
-      <div id="cred-editor-project">Loading…</div>
-    </div>
     ${profilesCard('project')}
+    ${quickSettingsForms('project', proj.id)}
+    <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
+    <div class="settings-section-title" id="project-people"><div>People &amp; authorization<small>Who can work here, and what they may do</small></div></div>
+    <div class="card"><div id="project-access">Loading…</div></div>
     ${authorizationCard('project')}
-    ${paymentsCard('project')}
-    <div class="card" id="git-preflight-card">
-      <div class="section-h">Git setup</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Which git identity/credentials this project's worlds resolve to (its <b>Git profile</b> above, the global default, or the host's own setup), and whether pushes/PRs can reach the repos' remotes non-interactively. Profiles are managed in <b>Global settings → Git accounts</b>.</p>
-      <button class="btn sm" id="git-preflight-run">Check git setup</button>
-      <div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div>
-    </div>
+    <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Workflow versions</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Pin this project to a specific version of a workflow, or track the latest. A pin only affects <b>new</b> tasks — running ones keep the version they started on.</p>
-      <div id="wf-pins-list">Loading…</div>
-    </div>
-    <div class="card">
-      <div class="section-h">Workflow activation</div>
-      <p style="color:var(--ink-2);margin-top:0">Activating a workflow resolves its dependencies and may spawn an onActivate preparation task.</p>
-      <button class="btn" id="activate-sd">Activate software-dev (runs prep task)</button>
-    </div>
+      <div id="wf-pins-list">Loading…</div></div>
+    <div class="settings-section-title" id="project-advanced"><div>Advanced<small>Rarely needed — and hard to undo</small></div></div>
     <div class="card" style="border-color:var(--danger-weak)">
       <div class="section-h" style="color:var(--danger)">Danger zone</div>
-      <p style="color:var(--ink-2);margin-top:0">Deleting a project permanently removes it and all of its tasks. This cannot be undone.</p>
       <button class="btn danger" id="delete-project">Delete project</button>
-    </div>`;
+    </div></div></div></div>`;
+}
+function cloudEnvironmentCard(proj) {
+  return `<div class="card"><div class="section-h">Where tasks run</div>
+    <p class="task-sub">Agent environments (worktree / container / E2B / Daytona), remote-provider connections, runner pools, and the organization budget are set up in <a class="organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-compute">Organization → Compute</a>. This section only tightens them for this project.</p>
+    <div id="project-execution">Loading organization execution policy…</div>
+  </div>`;
+}
+async function hydrateProjectGitProfile(proj) {
+  const box = $('#project-git-profile'); if (!box) return;
+  try {
+    const [profiles, defaults] = await Promise.all([
+      api('/api/git-profiles'),
+      api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`).catch(() => ({})),
+    ]);
+    box.innerHTML = `<div class="inline-form"><label>Git profile <select id="project-git-profile-select"><option value="">Organization default${profiles.defaultProfile ? ` — ${esc(profiles.defaultProfile)}` : ''}</option>${profiles.profiles.map((profile) => `<option value="${esc(profile.name)}" ${defaults.gitProfile === profile.name ? 'selected' : ''}>${esc(profile.name)} · ${esc(profile.userName)}</option>`).join('')}</select></label><button class="btn sm" id="project-git-profile-save">Save</button></div>`;
+    $('#project-git-profile-save').addEventListener('click', async () => {
+      const current = await api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`).catch(() => ({}));
+      const selected = $('#project-git-profile-select').value;
+      if (selected) current.gitProfile = selected; else delete current.gitProfile;
+      await api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`, { method: 'PUT', body: JSON.stringify({ values: current }) });
+      toast('Git profile saved');
+    });
+  } catch (error) { box.textContent = error.message; }
+}
+async function hydrateProjectAccess(proj) {
+  const accessBox = $('#project-access');
+  const repositoryBox = $('#project-repositories');
+  if (!accessBox || !repositoryBox) return;
+  try {
+    const [repositories, members, gitConnections, githubApp] = await Promise.all([
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
+      api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch(() => []),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch(() => ({ configured: false })),
+    ]);
+    const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
+    const userName = (id) => userRecord(id)?.name || userRecord(id)?.email?.split('@')[0] || 'Unnamed member';
+    const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
+      : principal.kind === 'organization' ? '@all'
+      : `@team:${S.teams.find((team) => team.id === principal.teamId)?.slug || principal.teamId}`;
+    const candidates = [
+      { value: '@all', aliases: ['@all'], principal: { kind: 'organization', organizationId: proj.organizationId } },
+      ...S.teams.map((team) => ({ value: `@team:${team.slug}`, aliases: [`@team:${team.slug}`, team.name], principal: { kind: 'team', teamId: team.id } })),
+      ...S.organizationMembers.map((member) => { const record = userRecord(member.userId); const name = userName(member.userId); const value = record?.email ? `${name} — ${record.email}` : name; return { value, aliases: [value, name, record?.email, `user:${member.userId}`].filter(Boolean), principal: { kind: 'user', userId: member.userId } }; }),
+    ];
+    accessBox.innerHTML = `<div class="section-h">Project access</div>
+      ${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`; }).join('') || '<p class="task-sub">No project access overrides.</p>'}
+      <datalist id="project-principal-options">${candidates.map((candidate) => `<option value="${esc(candidate.value)}"></option>`).join('')}</datalist>
+      <div class="inline-form"><input id="project-member-principal" list="project-principal-options" placeholder="Type a person, @team:…, or @all"><select id="project-member-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="project-member-add">Add</button></div>`;
+    repositoryBox.innerHTML = `<div class="section-h">Repositories</div>
+      <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
+      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /local/path'}"><button class="btn sm project-repository-remove" aria-label="Remove repository">−</button></div>`).join('')}</div>
+      <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
+      ${!githubApp.configured ? '<div class="inline-form"><button class="btn sm primary" id="project-setup-github">Connect GitHub</button></div>'
+        : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
+        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="project-authorize-github">Authorize repository creation</button>' : ''}</div>
+          ${githubApp.userAuthorized ? `<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b></summary><div class="inline-form"><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="project-new-repo-name" placeholder="new-repository"><input id="project-new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="project-new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm primary" id="project-new-repo-create">Create and attach</button></div></details>` : ''}`}`;
+    $('#project-member-add')?.addEventListener('click', async () => {
+      const entered = $('#project-member-principal')?.value.trim().toLowerCase();
+      const candidate = candidates.find((item) => item.aliases.some((alias) => alias.toLowerCase() === entered));
+      if (!candidate) return toast('Choose a person, @team:…, or @all', true);
+      try { await api(`/api/projects/${proj.id}/members`, { method: 'POST', body: JSON.stringify({ principal: candidate.principal, profileId: $('#project-member-profile').value }) }); await hydrateProjectAccess(proj); }
+      catch (error) { toast(error.message, true); }
+    });
+    accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
+      try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
+      catch (error) { toast(error.message, true); }
+    }));
+    const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
+    wireRepositoryRemoves();
+    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><input list="project-repository-options" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /local/path'}"><button class="btn sm project-repository-remove" aria-label="Remove repository">−</button></div>`); wireRepositoryRemoves(); });
+    $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
+    $('#project-setup-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) }); const form = document.createElement('form'); form.method = 'POST'; form.action = result.action; const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest); form.appendChild(manifest); document.body.appendChild(form); form.submit(); } catch (error) { toast(error.message, true); } });
+    $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
+    $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
+    $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
+    $('#project-new-repo-create')?.addEventListener('click', async () => { const name = $('#project-new-repo-name')?.value.trim(); if (!name) return toast('Repository name is required', true); try { const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({ gitConnectionId: $('#project-new-repo-connection').value, name, description: $('#project-new-repo-description').value, private: $('#project-new-repo-private').checked }) }); await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) }); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
+  } catch (error) { accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
 }
 async function hydrateWorkflowPins(projectId) {
   const box = $('#wf-pins-list');
@@ -5253,20 +6998,34 @@ async function hydrateWorkflowPins(projectId) {
   }));
 }
 function wireSettingsView(proj) {
+  wireSettingsNavigation();
+  $('#main').querySelectorAll('.organization-settings-link').forEach((link) => link.addEventListener('click', (event) => {
+    event.preventDefault();
+    go(link.getAttribute('href'));
+  }));
+  hydrateProjectAccess(proj);
+  hydrateExecutionProviders(proj);
+  hydrateProjectGitProfile(proj);
   hydrateSettingsForms('project', proj.id);
   hydrateQuickSettingsForms('project', proj.id);
   wireQuickSettingsSave('project', proj.id);
   renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
+  hydrateReviewRoute('project', proj.id);
   hydrateAuthorization('project', proj.id);
   hydrateWorkflowPins(proj.id);
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
       const wf = b.dataset.save;
       const sec = b.closest('[data-wf]');
-      const fields = schemaFor(wf).filter((f) => f.scopes.includes('project'));
+      const fields = wf === '__common__' ? commonSettingsFields('project')
+        : settingsFields(wf, 'project').filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       const values = collectForm(sec.querySelector('.wf-form'), fields);
-      try { await api(`/api/settings/project/${proj.id}/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) }); await loadProjects(); toast(`${wf} defaults saved`); } catch (e) { toast(e.message, true); }
+      try {
+        if (wf === '__common__') await saveCommonSettings('project', proj.id, undefined, fields.map((f) => f.name), values);
+        else await api(`/api/settings/project/${proj.id}/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) });
+        await loadProjects(); flashSaved(b);
+      } catch (e) { toast(e.message, true); }
     }),
   );
   wirePaymentsCard('project', proj.id);
@@ -5284,13 +7043,6 @@ function wireSettingsView(proj) {
       out.style.color = 'var(--bad, crimson)';
     } finally { btn.disabled = false; }
   });
-  $('#activate-sd')?.addEventListener('click', async () => {
-    try {
-      const r = await api(`/api/projects/${proj.id}/activate-workflow`, { method: 'POST', body: JSON.stringify({ workflow: 'software-dev' }) });
-      toast(`Activated (deps: ${r.requires.join(', ') || 'none'}${r.spawnedTasks.length ? '; prep task spawned' : ''})`);
-      refreshTasks();
-    } catch (e) { toast(e.message, true); }
-  });
   $('#delete-project')?.addEventListener('click', async () => {
     if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
     try {
@@ -5307,28 +7059,77 @@ function wireSettingsView(proj) {
         const next = S.projects[0];
         if (next) return go(projectRoute(next.id));
         S.projectId = null;
-        return go('/dashboard');
+        return go(globalRoute('dashboard'));
       }
       renderRail();
       renderMain();
     } catch (e) { toast(e.message, true); }
   });
 }
+async function hydrateExecutionProviders(proj) {
+  const box = $('#project-execution'); if (!box) return;
+  try {
+    const [policy, connections, pools] = await Promise.all([
+      api(`/api/projects/${encodeURIComponent(proj.id)}/execution-policy`),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/world-providers`),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/runner-pools`),
+    ]);
+    S.worldProviderConnections = connections;
+    // The Agent environment (worktree / container / E2B / Daytona) now lives in
+    // Task defaults — and can be overridden per task. Compute keeps the runner
+    // pool, network policy, world flavor, and budget, so the pool list is filtered
+    // by the effective environment (shown read-only here).
+    const environment = policy.effective.worldProvider || 'worktree';
+    const networkOverride = policy.override.network;
+    const networkMode = networkOverride ? (networkOverride.unrestricted ? 'unrestricted' : 'restricted') : '';
+    box.innerHTML = `<div class="settings-grid">
+      <label class="form-row">Runner pool<select id="project-execution-pool"></select></label>
+      <label class="form-row">World experience<select id="project-execution-flavor"><option value="">Organization default — ${esc(policy.organization.environment?.flavor || 'headless')}</option><option value="headless" ${policy.override.environment?.flavor === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${policy.override.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
+      <label class="form-row">Outbound network<select id="project-execution-network"><option value="" ${networkMode === '' ? 'selected' : ''}>Organization default — ${policy.organization.network?.unrestricted !== false ? 'normal internet' : 'restricted'}</option><option value="unrestricted" ${networkMode === 'unrestricted' ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${networkMode === 'restricted' ? 'selected' : ''}>Restricted allowlist</option></select></label>
+      <label class="form-row">Optional tighter project budget (USD/month)<input id="project-execution-budget" type="number" min="0" step="0.01" value="${policy.override.monthlyBudgetMicros == null ? '' : esc(policy.override.monthlyBudgetMicros / 1e6)}" placeholder="Use organization budget" /></label>
+    </div>
+    <details id="project-network-restrictions" ${networkMode === 'restricted' ? 'open' : ''}><summary class="task-sub">Project restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="project-execution-domains" value="${esc((networkOverride?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="project-execution-cidrs" value="${esc((networkOverride?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
+    <div class="task-sub">Agent environment: <b>${esc(environment)}</b> — change it in <a href="#project-defaults">Task defaults</a> (or per task). Effective: ${esc(policy.effective.environment?.flavor || 'headless')} · ${policy.effective.resources?.cpu || 2} CPU · ${policy.effective.resources?.memoryMb || 2048} MiB · ${policy.effective.network?.unrestricted ? 'normal outbound internet' : 'restricted outbound'}</div>
+    <button class="btn sm primary" id="project-execution-save">Save compute override</button>`;
+    const matching = pools.filter((pool) => pool.provider === environment && pool.enabled);
+    $('#project-execution-pool').innerHTML = `<option value="">${environment === policy.organization.worldProvider ? 'Organization/default pool' : 'Provider-managed default'}</option>${matching.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (policy.override.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+    $('#project-execution-network')?.addEventListener('change', (event) => {
+      $('#project-network-restrictions').open = event.target.value === 'restricted';
+    });
+    $('#project-execution-save')?.addEventListener('click', async () => {
+      const pool = $('#project-execution-pool').value;
+      const budget = $('#project-execution-budget').value.trim();
+      const selectedNetwork = $('#project-execution-network').value;
+      const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+      try {
+        await api(`/api/projects/${proj.id}/execution-policy`, { method: 'PUT', body: JSON.stringify({ override: {
+          runnerPoolId: pool || null,
+          environment: $('#project-execution-flavor').value ? { flavor: $('#project-execution-flavor').value } : null,
+          network: selectedNetwork === '' ? null : selectedNetwork === 'unrestricted' ? { unrestricted: true }
+            : { unrestricted: false, allowDomains: split('#project-execution-domains'), allowCidrs: split('#project-execution-cidrs') },
+          monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
+        } }) });
+        await loadProjects(); toast('Project compute override saved'); await hydrateExecutionProviders(proj);
+      } catch (error) { toast(error.message, true); }
+    });
+  } catch (error) { toast(`Could not load compute providers: ${error.message}`, true); }
+}
 
-// ── global settings (user scope) ─────────────────────────────────────────────
-function globalSettingsView() {
+// ── organization defaults (legacy APIs still call this global scope) ─────────
+function globalSettingsView(embedded = false) {
   return `
-    <div class="page-title">Global settings</div>
-    <p style="color:var(--ink-2);margin-top:-8px">Your defaults across all projects. Projects can override these; tasks override both.</p>
+    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
-    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from your general global defaults above (↺ Reset to default) until you set it here.`)}
-    ${quickSettingsForms('global')}
     ${profilesCard('global')}
+    ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
+    ${quickSettingsForms('global')}
     ${authorizationCard('global')}
+    <div class="settings-section-title" id="settings-payments"><div>Payments<small>What tasks may spend, and the cards they spend from</small></div></div>
     ${paymentsCard('global')}
+    <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
     <div class="card" id="accounts-card">
-      <div class="section-h">Accounts &amp; precedence</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Every login and API key agents can use, in one list. <b>Drag</b> to set precedence (top = tried first); toggle <b>On/Off</b> to enable/disable. API keys are off by default when a subscription exists. Projects and each task override this order + enablement (a task in its own form).</p>
+      <div class="section-h">Agent accounts <span class="chip">installation resource</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The installation's logins and API keys, with organization defaults controlling how tasks use them. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
       <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
@@ -5368,8 +7169,8 @@ function globalSettingsView() {
       </div>
     </div>
     <div class="card" id="git-accounts-card">
-      <div class="section-h">Git accounts</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named git identities for the repos karmax works on: who commits are attributed to (and optionally signed by), and the SSH key / GitHub token used to push and open PRs. A project picks one in its settings (<b>Git profile</b>); without one, worlds fall back to the host's own git setup. Secrets go straight to the encrypted vault and are injected per subprocess — never written to any git config.</p>
+      <div class="section-h">Git accounts <span class="chip">installation resource</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named commit identities and SSH credentials for repository work. Secrets go straight to the encrypted vault and are injected only into the git subprocess that needs them.</p>
       <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Add / update a profile</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -5387,8 +7188,9 @@ function globalSettingsView() {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Re-saving a profile with a blank secret keeps the stored one. Interactive auth (password prompts at push) is never supported — configure a profile, or pre-authorize the host non-interactively.</div>
       </div>
     </div>
+    <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
-      <div class="section-h">Workflows</div>
+      <div class="section-h">Workflows <span class="chip">installation resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
       <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Install from a git repo</label>
@@ -5401,16 +7203,88 @@ function globalSettingsView() {
         <div style="font-size:11px;color:var(--ink-3);margin-top:4px">The repo is pinned to an exact commit and its manifest validated before it's loaded. Built-in workflows are edited through the review gate, not overwritten here.</div>
       </div>
     </div>
-    <div class="card">
-      <div class="section-h">Appearance</div>
-      <div class="switch"><button class="btn sm" id="gs-theme">Toggle theme ◐</button></div>
-      <div class="switch" style="margin-top:10px"><input type="checkbox" id="gs-world-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="gs-world-file-links">Open agent file links in their task world</label></div>
-      <div style="font-size:11px;color:var(--ink-3);margin:5px 0 0 24px">Keeps the agent’s original URL when copied; only clicks are resolved through karmax.</div>
-    </div>
-    <div class="card">
+    <div class="card" id="resilience-card">
       <div class="section-h">Resilience</div>
-      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Global safe mode (boot vanilla: all overlays off)</label></div>
+      <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
+    </div>
+    <div class="settings-section-title" id="settings-access"><div>Access<small>How you open Karmax from another device</small></div></div>
+    <div class="card phone-access-card" id="phone-access-card">
+      <div class="section-h">Phone access <span class="chip">private by default</span></div>
+      <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
     </div>`;
+}
+
+function phoneInstallHelp() {
+  if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) {
+    return '<span class="phone-installed">Installed on this device ✓</span>';
+  }
+  return `<button class="btn sm" id="install-karmax">Add Karmax to this phone</button>
+    <span class="task-sub" id="phone-install-note">No native Karmax app is needed.</span>`;
+}
+
+function renderPhoneAccess(status) {
+  const box = $('#phone-access-status');
+  if (!box) return;
+  const ready = status.state === 'ready';
+  const hosted = status.method === 'hosted';
+  const label = ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
+    : status.state === 'needs-login' ? 'Sign-in needed'
+      : status.state === 'conflict' ? 'Already in use' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
+  const link = status.url
+    ? `<a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a>`
+    : '';
+  const setup = hosted
+    ? '<li>Open this same HTTPS address on your phone.</li>'
+    : `<li>Install <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Tailscale</a> on your phone and sign in to the same tailnet.</li>
+       <li>Open the private Karmax address shown here. Keep Tailscale connected.</li>`;
+  box.innerHTML = `<div class="phone-access-head"><span class="remote-state ${ready ? 'ready' : ''}">${esc(label)}</span>${link}</div>
+    <p>${esc(status.detail)}</p>
+    ${ready ? `<ol class="phone-steps">${setup}<li>Use Karmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
+      <div class="phone-access-actions">${phoneInstallHelp()}${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}</div>`
+      : `<div class="phone-access-actions">
+          ${status.canEnable ? '<button class="btn sm primary" id="remote-enable">Turn on private access</button>' : ''}
+          ${status.method === 'none' ? '<a class="btn sm" href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Install Tailscale</a>' : ''}
+          <button class="btn sm" id="remote-refresh">Check again</button>
+        </div>`}
+    <p class="phone-security">${hosted ? 'Karmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. Karmax stays bound to localhost and is never made public.'}</p>`;
+
+  const act = async (action, button) => {
+    button.disabled = true;
+    button.textContent = action === 'enable' ? 'Turning on…' : 'Turning off…';
+    try {
+      renderPhoneAccess(await api('/api/remote-access', { method: 'POST', body: JSON.stringify({ action }) }));
+    } catch (error) {
+      toast(error.message, true);
+      hydratePhoneAccess();
+    }
+  };
+  $('#remote-enable')?.addEventListener('click', (event) => act('enable', event.currentTarget));
+  $('#remote-disable')?.addEventListener('click', (event) => act('disable', event.currentTarget));
+  $('#remote-refresh')?.addEventListener('click', hydratePhoneAccess);
+  $('#install-karmax')?.addEventListener('click', async () => {
+    const note = $('#phone-install-note');
+    if (installPrompt) {
+      await installPrompt.prompt();
+      await installPrompt.userChoice;
+      installPrompt = null;
+      if (note) note.textContent = 'Karmax can now open from your Home Screen.';
+      return;
+    }
+    const ios = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    if (note) note.textContent = ios
+      ? 'Tap Share, then “Add to Home Screen”.'
+      : 'Open your browser menu, then choose “Install app” or “Add to Home screen”.';
+  });
+}
+
+async function hydratePhoneAccess() {
+  const box = $('#phone-access-status');
+  if (!box) return;
+  try {
+    renderPhoneAccess(await api('/api/remote-access'));
+  } catch (error) {
+    box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`;
+  }
 }
 
 async function hydrateGitProfiles() {
@@ -5458,7 +7332,7 @@ function paymentsCard(scope) {
     <div class="section-h">Payments — budget & cards</div>
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
       <div style="font-weight:600;margin-bottom:4px">Funding source</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How karmax pays. Cards are shared project/global resources; agents spend against them within your budget policy. karmax never stores card numbers.</p>
+      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this installation pays. Projects can have narrower cards and policies; karmax never stores card numbers.</p>
       <div class="pay-providers-list">Loading…</div>
     </div>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
@@ -5564,8 +7438,8 @@ function profileRow(p, handles, logins, scope) {
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
     <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span> ${usedBy}
-      ${inherited ? '<span class="chip" title="Using the global default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      ${inherited ? '<span class="chip" title="Using the organization/installation default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
+    <div class="agent-profile-controls">
       <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <div class="combo pf-model-combo" style="flex:1;min-width:140px">
         <input class="pf-model" placeholder="model" value="${esc(p.model || '')}" autocomplete="off" />
@@ -5579,21 +7453,48 @@ function profileRow(p, handles, logins, scope) {
     <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
     <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins)}</div></div>
     <div style="display:flex;gap:8px">
-      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">Save profile</button>
-      ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to global</button>` : ''}
+      <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
+      ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
     </div>
   </div>`;
 }
 
-// Render + wire the agent-profiles editor for a scope (global or a project).
-async function hydrateProfiles(scope, projectId) {
+// Render + wire the agents editor for a scope (global or a project). One agent
+// runs both Do and Merge unless deliberately separated — the same unified shape
+// the task form and Quick defaults present — so the common case is one choice.
+// The standing Confirm-agent profile is not shown: review agents are configured
+// per layer in the Review route, right below the agents they gate.
+async function hydrateProfiles(scope, projectId, organizationId) {
   let handles = [], logins = [];
   try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
   let profiles = [];
   try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
+  profiles = profiles.filter((p) => p.role !== 'confirm');
   const list = $(`#profiles-list-${scope}`);
   if (!list) return;
-  list.innerHTML = profiles.length ? profiles.map((p) => profileRow(p, handles, logins, scope)).join('') : '<span style="color:var(--ink-3)">No profiles.</span>';
+  const doP = profiles.find((p) => p.role === 'do');
+  const mergeP = profiles.find((p) => p.role === 'merge');
+  const rest = profiles.filter((p) => p !== doP && p !== mergeP);
+  const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
+  // unset/empty allowedAccounts ⇒ all allowed — normalize before comparing roles
+  const normAllowed = (p) => (p.allowedAccounts?.length ? [...p.allowedAccounts].sort() : [...allRefs].sort());
+  const essence = (p) => JSON.stringify({ provider: p.provider, model: p.model || '', effort: p.effort || '', maxTurns: p.maxTurns ?? null, accounts: normAllowed(p) });
+  const separate = !!(doP && mergeP && essence(doP) !== essence(mergeP));
+  const unified = doP && mergeP
+    ? { ...doP, id: '__unified__', name: 'Agent', role: 'do + merge', scope: doP.scope === 'project' || mergeP.scope === 'project' ? 'project' : doP.scope }
+    : null;
+  list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
+    : unified
+      ? `<div class="profiles-group">
+          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, handles, logins, scope)}</div>
+          <label class="agent-separate-toggle"><input type="checkbox" class="profiles-separate" ${separate ? 'checked' : ''}> Separate Do and Merge agent configurations</label>
+          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, handles, logins, scope)).join('')}</div>
+        </div>${rest.map((p) => profileRow(p, handles, logins, scope)).join('')}`
+      : profiles.map((p) => profileRow(p, handles, logins, scope)).join('');
+  list.querySelector('.profiles-separate')?.addEventListener('change', (e) => {
+    list.querySelector('.profiles-unified').hidden = e.target.checked;
+    list.querySelector('.profiles-separated').hidden = !e.target.checked;
+  });
   list.querySelectorAll('[data-profile]').forEach((card) => {
     const combo = card.querySelector('.pf-model-combo');
     const providerOf = () => card.querySelector('.pf-provider')?.value || 'claude';
@@ -5603,28 +7504,70 @@ async function hydrateProfiles(scope, projectId) {
       refreshEffortSelect(card, 'pf-provider', 'pf-model', 'pf-effort');
     });
   });
-  const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
   list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
     const card = b.closest('[data-profile]');
-    const orig = profiles.find((p) => p.id === b.dataset.saveprofile) || {};
     const checked = [...card.querySelectorAll('.pf-acct:checked')].map((c) => c.value);
     // all checked ⇒ store nothing (means "all", stays correct as accounts are added)
     const allowedAccounts = allRefs.length && checked.length < allRefs.length ? checked : undefined;
-    const profile = {
-      role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined, projectId: scope === 'project' ? projectId : undefined,
+    const knobs = {
       provider: card.querySelector('.pf-provider').value,
       modelProvider: card.querySelector('.pf-model-provider').value.trim() || undefined,
       model: card.querySelector('.pf-model').value.trim() || undefined,
       effort: card.querySelector('.pf-effort').value || undefined,
       maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
-      capabilities: card.querySelector('.pf-caps').value.split(',').map((s) => s.trim()).filter(Boolean),
       allowedAccounts,
     };
-    try { await api('/api/profiles', { method: 'PUT', body: JSON.stringify(profile) }); toast('Profile saved'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
+    // The unified row IS the Do and Merge defaults: one Save writes both roles.
+    const targets = b.dataset.saveprofile === '__unified__' ? [doP, mergeP] : [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
+    try {
+      for (const orig of targets) {
+        await api('/api/profiles', { method: 'PUT', body: JSON.stringify({
+          role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined,
+          projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities, ...knobs,
+        }) });
+      }
+      await hydrateProfiles(scope, projectId, organizationId);
+      flashSaved($(`#profiles-list-${scope}`)?.querySelector(`[data-saveprofile="${b.dataset.saveprofile}"]`));
+    } catch (e) { toast(e.message, true); }
   }));
   list.querySelectorAll('[data-resetprofile]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api(`/api/profiles/${encodeURIComponent(b.dataset.resetprofile)}`, { method: 'DELETE' }); toast('Reset to global'); hydrateProfiles(scope, projectId); } catch (e) { toast(e.message, true); }
+    const ids = b.dataset.resetprofile === '__unified__' ? [doP.id, mergeP.id] : [b.dataset.resetprofile];
+    try {
+      for (const id of ids) await api(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      toast('Reset to inherited');
+      hydrateProfiles(scope, projectId, organizationId);
+    } catch (e) { toast(e.message, true); }
   }));
+}
+
+// The Review route — who checks the work at Review: human layers, agent layers,
+// or none (auto-confirm). Stored with the shared task defaults (__common__/
+// confirm) but edited here, beside the Do/Merge agents it gates.
+async function hydrateReviewRoute(scope, projectId, organizationId) {
+  const box = $(`#review-route-${scope}`);
+  if (!box) return;
+  const field = schemaFor('software-dev').find((f) => f.name === 'confirm');
+  if (!field) { box.innerHTML = ''; return; }
+  let own = {};
+  let inherited = {};
+  try {
+    const orgQuery = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+    const d = await api(`/api/defaults/${projectId || 'global'}/software-dev${orgQuery}`);
+    own = d[scope].own;
+    inherited = d[scope].inherited;
+  } catch {}
+  box.innerHTML = `<div class="wf-form parameter-fields">${renderFields([field], own, inherited)}</div>
+    <button class="btn primary sm" data-save-review-route>Save review route</button>`;
+  wireAgentFields(box);
+  wireFieldResets(box, [field]);
+  const saveButton = box.querySelector('[data-save-review-route]');
+  saveButton.addEventListener('click', async () => {
+    const values = collectForm(box.querySelector('.wf-form'), [field]);
+    try {
+      await saveCommonSettings(scope, projectId, organizationId, ['confirm'], values);
+      flashSaved(saveButton);
+    } catch (err) { toast(err.message, true); }
+  });
 }
 
 // The logins + API keys now live in the unified credential manager (#cred-editor-global:
@@ -5635,17 +7578,19 @@ async function hydrateAccounts() {
 }
 
 function profilesCard(scope) {
-  return `<div class="card" id="profiles-card-${scope}">
-    <div class="section-h">Agent profiles</div>
-    <p style="color:var(--ink-2);margin-top:0">Per-role defaults: provider, model, effort, capabilities, turn cap, and which accounts each agent may use.${scope === 'project' ? ' These override your global defaults for this project.' : ''}</p>
+  return `<div class="card agent-profile-settings" id="profiles-card-${scope}">
+    <div class="section-h">Agents</div>
+    <p style="color:var(--ink-2);margin-top:0">Who does the work: model, turn cap, and account pool.${scope === 'project' ? ' Overrides the organization defaults for this project.' : ''}</p>
     <div id="profiles-list-${scope}">Loading…</div>
+    <div class="settings-divider"></div>
+    <div id="review-route-${scope}">Loading…</div>
   </div>`;
 }
 
 function authorizationCard(scope) {
   return `<div class="card" id="authorization-card-${scope}">
-    <div class="section-h">Authorization</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Job-shaped permissions inherited by new task agents. A task can never receive more than its creator has.</p>
+    <div class="section-h">Authorization profiles</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">The same job-shaped profiles authorize people and task agents. Agents remain capped by their creator.</p>
     <div id="authorization-${scope}">Loading…</div>
   </div>`;
 }
@@ -5714,15 +7659,14 @@ async function hydrateAuthorization(scope, projectId) {
     const suffix = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
     const data = await api(`/api/authorization/profiles${suffix}`);
     const options = data.profiles.map((p) => `<option value="${esc(p.id)}" ${p.id === data.defaultProfile ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
-    box.innerHTML = `<div class="form-row"><label>Default for new tasks</label><select class="authz-default">${options}</select></div>
+    box.innerHTML = `<p class="task-sub">These profiles limit what task agents may do. Human membership and project access are managed in People and each project's Access section.</p>
+      <div class="form-row"><label>Default for new task agents</label><select class="authz-default">${options}</select></div>
       <div style="display:grid;gap:6px">${data.profiles.map((p) => `<details class="advanced authz-profile" data-profile-id="${esc(p.id)}">
         <summary><b>${esc(p.name)}</b> — ${esc(p.description)}</summary>
         <div class="form-row"><label>Description</label><input class="authz-description" value="${esc(p.description)}"></div>
         ${capabilityChecklist(p, data.capabilityGroups || [])}
         <button class="btn sm authz-save-profile">Save ${scope === 'project' ? 'project override' : 'profile'}</button>
-      </details>`).join('')}</div>
-      <div class="authz-accounts" style="margin-top:14px"><b>${scope === 'global' ? 'Human accounts' : 'Project access'}</b><div id="authz-users-${scope}" style="margin:6px 0">Loading…</div>
-        ${scope === 'global' ? `<div style="display:flex;gap:6px;flex-wrap:wrap"><input id="new-user-name" placeholder="Name"><input id="new-user-email" type="email" placeholder="Email"><input id="new-user-password" type="password" placeholder="Temporary password"><select id="new-user-profile">${options}</select><button class="btn sm" id="new-user-add">Add account</button></div>` : ''}</div>`;
+      </details>`).join('')}</div>`;
     box.querySelector('.authz-default')?.addEventListener('change', async (e) => {
       await api('/api/authorization/default', { method: 'PUT', body: JSON.stringify({ profileId: e.target.value, ...(projectId ? { projectId } : {}) }) });
       toast('Authorization default saved');
@@ -5748,45 +7692,17 @@ async function hydrateAuthorization(scope, projectId) {
         hydrateAuthorization(scope, projectId);
       } catch (e) { toast(e.message, true); }
     }));
-    try {
-      const users = await api('/api/users');
-      const scopeKey = projectId ? `project:${projectId}` : 'global';
-      const usersBox = $(`#authz-users-${scope}`);
-      usersBox.innerHTML = users.map((u) => {
-        const current = (u.grants || []).find((grant) => grant.scopeKey === scopeKey);
-        const grantOptions = data.profiles.map((profile) => `<option value="${esc(profile.id)}" ${profile.id === (current?.profileId || data.defaultProfile) ? 'selected' : ''}>${esc(profile.name)}</option>`).join('');
-        return `<div class="queue-item"><div style="flex:1;min-width:180px"><b>${esc(u.name)}</b><div class="task-sub">${esc(u.email)} · ${current ? esc(current.profileId) : 'no access in this scope'}</div></div>
-          <select class="authz-user-profile" data-user-id="${esc(u.id)}">${grantOptions}</select><button class="btn sm authz-user-grant" data-user-id="${esc(u.id)}">${current ? 'Update' : 'Grant'} access</button></div>`;
-      }).join('') || 'No accounts.';
-      usersBox.querySelectorAll('.authz-user-grant').forEach((button) => button.addEventListener('click', async () => {
-        const principalId = `user:${button.dataset.userId}`;
-        const profileId = button.closest('.queue-item').querySelector('.authz-user-profile').value;
-        try {
-          await api('/api/authorization/grants', { method: 'PUT', body: JSON.stringify({ principalId, profileId, ...(projectId ? { projectId } : {}) }) });
-          toast('Account access saved');
-          hydrateAuthorization(scope, projectId);
-        } catch (e) { toast(e.message, true); }
-      }));
-    } catch (e) {
-      $(`#authz-users-${scope}`).innerHTML = `<span class="task-sub">Account grants require user and authorization administration access.</span>`;
-    }
-    if (scope === 'global') {
-      $('#new-user-add')?.addEventListener('click', async () => {
-        try {
-          await api('/api/users', { method: 'POST', body: JSON.stringify({ name: $('#new-user-name').value, email: $('#new-user-email').value, password: $('#new-user-password').value, profileId: $('#new-user-profile').value }) });
-          toast('Account created'); hydrateAuthorization('global');
-        } catch (e) { toast(e.message, true); }
-      });
-    }
   } catch (e) { box.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; }
 }
 
-function wireGlobalSettings() {
-  hydrateSettingsForms('global');
-  hydrateQuickSettingsForms('global');
-  wireQuickSettingsSave('global');
+function wireGlobalSettings(organizationId) {
+  hydratePhoneAccess();
+  hydrateSettingsForms('global', undefined, organizationId);
+  hydrateQuickSettingsForms('global', undefined, organizationId);
+  wireQuickSettingsSave('global', undefined, organizationId);
   renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
-  hydrateProfiles('global');
+  hydrateProfiles('global', undefined, organizationId);
+  hydrateReviewRoute('global', undefined, organizationId);
   hydrateAuthorization('global');
   hydrateWorkflows();
   hydrateGitProfiles();
@@ -5871,7 +7787,7 @@ function wireGlobalSettings() {
       } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
       $('#login-name').value = '';
       hydrateAccounts();
-      hydrateProfiles('global');
+      hydrateProfiles('global', undefined, organizationId);
     } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
   });
   const syncLoginTarget = () => {
@@ -5885,126 +7801,428 @@ function wireGlobalSettings() {
     b.addEventListener('click', async () => {
       const wf = b.dataset.save;
       const sec = b.closest('[data-wf]');
-      const fields = schemaFor(wf).filter((f) => f.scopes.includes('global'));
+      const fields = wf === '__common__' ? commonSettingsFields('global')
+        : settingsFields(wf, 'global').filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       const values = collectForm(sec.querySelector('.wf-form'), fields);
       try {
-        await api(`/api/settings/global/${wf}`, { method: 'PUT', body: JSON.stringify({ values }) });
-        toast(wf === 'agent-queue' ? 'Host capacity saved' : `${wf} global defaults saved`);
+        if (wf === '__common__') {
+          await saveCommonSettings('global', undefined, organizationId, fields.map((f) => f.name), values);
+        } else {
+          const endpoint = organizationId && wf !== 'agent-queue'
+            ? `/api/organizations/${organizationId}/settings/${wf}` : `/api/settings/global/${wf}`;
+          await api(endpoint, { method: 'PUT', body: JSON.stringify({ values }) });
+        }
+        flashSaved(b);
       } catch (e) { toast(e.message, true); }
     }),
   );
-  $('#gs-theme')?.addEventListener('click', toggleTheme);
-  $('#gs-world-file-links')?.addEventListener('change', (e) => setFileLinksEnabled(e.target.checked));
   $('#safe-mode')?.addEventListener('change', async (e) => {
     try { const r = await api('/api/safe-mode', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }); S.meta.safeMode = r.safeMode; toast(`Safe mode ${r.safeMode ? 'on' : 'off'}`); } catch (err) { toast(err.message, true); }
   });
 }
 
-// ── notifications ────────────────────────────────────────────────────────────
-function isAttentionTask(t) {
-  return ['review', 'escalated'].includes(t.lastView?.stage)
-    && !['done', 'failed', 'cancelled'].includes(t.lastView?.status)
-    && !t.parentTaskId
-    && !t.params?.archived;
-}
-function needsAttention() {
-  return (S.attentionLoaded || S.attentionLoading ? S.attention : S.tasks).filter(isAttentionTask);
-}
+// ── inbox + collaboration ───────────────────────────────────────────────────
 function updateBell() {
   const badge = $('#bell-badge');
   if (!badge) return;
-  const n = needsAttention().length;
-  badge.textContent = n > 99 ? '99+' : n;
+  const n = S.inbox.filter((item) => item.unread).length;
+  badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
-  $('#bell')?.classList.toggle('active', S.tab === 'notifications');
+  $('#bell')?.classList.toggle('active', S.tab === 'inbox');
 }
-function openNotifications() { return go('/notifications'); }
-
-let attentionRefreshTimer = null;
-function scheduleAttentionRefresh() {
-  clearTimeout(attentionRefreshTimer);
-  attentionRefreshTimer = setTimeout(loadAttention, 400);
-}
-
-function attentionCopy(t) {
-  const v = t.lastView || {};
-  if (v.stage === 'escalated') {
-    return v.error || v.waitingFor?.detail || 'The agent is blocked and needs your direction to continue.';
-  }
-  return v.reviewInfo?.caption || v.reviewInfo?.summary || 'The work is ready for your review and decision.';
+function inboxView() {
+  const prefs = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
+  return `<h1 class="page-title">Inbox</h1>
+    <div class="inbox-toolbar"><span>${S.inbox.filter((x) => x.unread).length} unread</span><button class="btn sm" id="inbox-read-all">Mark all read</button></div>
+    <div class="inbox-list">${S.inbox.length ? S.inbox.map((item) => `<div class="inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${item.id}">
+      <span class="inbox-kind">${item.actionable ? '●' : '○'}</span><div><b>${esc(item.task?.title || item.kind)}</b>
+      <div class="task-sub">${item.task?.num != null ? `#${item.task.num} · ` : ''}${esc(item.kind.replaceAll('-', ' '))} · ${new Date(item.createdAt).toLocaleString()}</div></div>
+      <button class="btn sm" data-inbox-toggle="${item.id}">${item.unread ? 'Read' : 'Unread'}</button></div>`).join('') : '<div class="empty"><div class="big">Inbox zero</div>Only updates meant for you appear here.</div>'}</div>
+    <div class="card delivery-card"><div class="section-h">Delivery</div>
+      ${['browser', 'email', 'slack'].map((key) => `<label class="switch"><input type="checkbox" data-delivery="${key}" ${prefs[key] ? 'checked' : ''}/><span>${key[0].toUpperCase() + key.slice(1)}</span></label>`).join('')}
+      <button class="btn sm primary" id="save-delivery">Save preferences</button></div>`;
 }
 
-function attentionItem(t) {
-  const v = t.lastView || {};
-  const blocked = v.stage === 'escalated';
-  // "review" is already the task-page review panel's global CSS class; use a
-  // notification-specific name so the compact status label cannot inherit that
-  // panel's border/padding rules.
-  const kind = blocked ? 'blocked' : 'ready';
-  const label = blocked ? 'Needs direction' : 'Ready for review';
-  const project = t.projectName || projectById(t.projectId)?.name || 'Project';
-  const when = v.updatedAt || t.createdAt;
-  return `<article class="attention-item ${kind}" data-id="${esc(t.id)}" tabindex="0">
-    <div class="attention-mark" aria-hidden="true">${blocked ? '!' : '✓'}</div>
-    <div class="attention-body">
-      <div class="attention-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-      <div class="attention-copy">${esc(attentionCopy(t))}</div>
-      <div class="attention-meta"><span>${esc(project)}</span><span>${esc(t.workflow)}</span><time datetime="${new Date(when).toISOString()}" title="${new Date(when).toLocaleString()}">${esc(fmtAgo(when))}</time></div>
+function wireInboxView() {
+  $('#main').querySelectorAll('[data-inbox]').forEach((row) => row.addEventListener('click', (e) => {
+    if (e.target.closest('[data-inbox-toggle]')) return;
+    openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
+  }));
+  $('#main').querySelectorAll('[data-inbox-toggle]').forEach((button) => button.addEventListener('click', async () => {
+    const item = S.inbox.find((candidate) => candidate.id === button.dataset.inboxToggle); if (!item) return;
+    await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: !item.unread }) });
+    item.unread = !item.unread; renderMain(); renderRail();
+  }));
+  $('#inbox-read-all')?.addEventListener('click', async () => {
+    await Promise.all(S.inbox.filter((x) => x.unread).map((item) => api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })));
+    await loadCollaboration(); renderMain(); renderRail();
+  });
+  $('#save-delivery')?.addEventListener('click', async () => {
+    const values = Object.fromEntries([...$('#main').querySelectorAll('[data-delivery]')].map((el) => [el.dataset.delivery, el.checked]));
+    S.deliveryPreferences = await api(`/api/inbox/preferences?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PUT', body: JSON.stringify(values) });
+    toast('Delivery preferences saved');
+  });
+}
+
+async function openInboxItem(item) {
+  if (!item?.task) return;
+  if (item.unread) await api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(S.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) }).catch(() => {});
+  const project = projectById(item.task.projectId); if (!project) return;
+  S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
+  await loadTasks().catch(() => {});
+  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}`);
+}
+
+// The signed-in person's display name for the topbar/rail. The legacy single-user
+// session is the string 'me'; real identity sessions carry a Better Auth user.
+function userDisplayName() {
+  const u = S.user;
+  if (u && typeof u === 'object') return u.name || u.email || 'Account';
+  return 'Account';
+}
+
+// A clean profile page: identity, the browser display preference (theme), and the
+// one place to end the session. Sign out lives here rather than in the top bar.
+function profileView() {
+  const u = S.user && typeof S.user === 'object' ? S.user : null;
+  const name = userDisplayName();
+  const email = u?.email || '';
+  const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
+  const orgCount = (S.organizations || []).length;
+  const row = (label, value) => value
+    ? `<div class="profile-row"><span class="profile-row-label">${esc(label)}</span><span class="profile-row-value">${esc(value)}</span></div>`
+    : '';
+  return `<div class="profile-page">
+    <h1 class="page-title">Profile</h1>
+    <div class="card profile-card">
+      <div class="profile-identity">
+        <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
+        <div class="profile-meta">
+          <div class="profile-name">${esc(name)}</div>
+          ${email ? `<div class="profile-email">${esc(email)}</div>` : ''}
+        </div>
+      </div>
+      <div class="profile-rows">
+        ${row('Name', u?.name || '')}
+        ${row('Email', email)}
+        ${row('Account', u?.id || '')}
+        ${row('Organizations', orgCount ? String(orgCount) : '')}
+      </div>
     </div>
-    <div class="attention-end"><span class="attention-kind ${kind}">${label}</span><button class="btn sm ${blocked ? '' : 'primary'}" data-open-attention="${esc(t.id)}">${blocked ? 'Open task' : 'Review'}</button></div>
-  </article>`;
-}
-
-function notificationsView() {
-  const items = needsAttention();
-  const blocked = items.filter((t) => t.lastView?.stage === 'escalated');
-  const reviews = items.filter((t) => t.lastView?.stage === 'review');
-  const filter = S.attentionFilter || 'all';
-  const visible = filter === 'blocked' ? blocked : filter === 'review' ? reviews : items;
-  const filters = [
-    ['all', 'All', items.length],
-    ['blocked', 'Needs direction', blocked.length],
-    ['review', 'Ready for review', reviews.length],
-  ];
-  const loading = S.attentionLoading && !S.attentionLoaded;
-  const unavailable = S.attentionError === 'Could not load notifications.';
-  return `<div class="attention-page">
-    <div class="attention-head">
-      <div><h1>Notifications</h1><p>Tasks that need a decision from you, across all projects.</p></div>
-      <button class="btn sm" id="attention-refresh" ${S.attentionLoading ? 'disabled' : ''}><span class="refresh-glyph">↻</span> ${S.attentionLoading ? 'Refreshing…' : 'Refresh'}</button>
+    <div class="card">
+      <div class="section-h">Appearance</div>
+      <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
+      <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
+      <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
+      <div class="switch"><input type="checkbox" id="profile-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="profile-file-links">Open agent file links in their task world</label></div>
+      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
-    <div class="attention-filters" role="tablist" aria-label="Notification type">
-      ${filters.map(([key, label, count]) => `<button role="tab" class="attention-filter ${filter === key ? 'active' : ''}" data-attention-filter="${key}" aria-selected="${filter === key}"><span>${label}</span><b>${count}</b></button>`).join('')}
+    <div class="card">
+      <div class="section-h">Session</div>
+      <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
+      <button class="btn danger" id="profile-logout">Sign out</button>
     </div>
-    ${S.attentionError ? `<div class="attention-warning">${esc(S.attentionError)} <button id="attention-retry">Try again</button></div>` : ''}
-    ${loading
-      ? `<div class="attention-loading"><span></span><span></span><span></span></div>`
-      : unavailable
-        ? `<div class="attention-empty"><div class="attention-empty-mark unavailable">!</div><h2>Notifications are unavailable</h2><p>We couldn’t check your projects. Try refreshing in a moment.</p></div>`
-      : visible.length
-        ? `<div class="attention-list">${visible.map(attentionItem).join('')}</div>`
-        : `<div class="attention-empty"><div class="attention-empty-mark">✓</div><h2>${items.length ? 'Nothing in this view' : 'You’re all caught up'}</h2><p>${items.length ? 'Choose another filter to see the rest of your notifications.' : 'There are no reviews or blockers waiting on you.'}</p></div>`}
-    <div class="attention-footnote">Items leave this inbox automatically when the task advances.</div>
   </div>`;
 }
 
-function wireNotificationsView() {
-  $('#attention-refresh')?.addEventListener('click', loadAttention);
-  $('#attention-retry')?.addEventListener('click', loadAttention);
-  document.querySelectorAll('[data-attention-filter]').forEach((button) => button.addEventListener('click', () => {
-    S.attentionFilter = button.dataset.attentionFilter;
-    renderMain();
-  }));
-  document.querySelectorAll('.attention-item[data-id]').forEach((item) => {
-    wireTaskNav(item, (event) => event.target.closest('button') ? null : item.dataset.id);
-    item.addEventListener('keydown', (event) => {
-      if ((event.key === 'Enter' || event.key === ' ') && event.target === item) {
-        event.preventDefault();
-        goToTask(item.dataset.id);
-      }
-    });
+function wireProfileView() {
+  $('#profile-theme')?.addEventListener('click', toggleTheme);
+  $('#profile-md-render')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
+    if (S.taskTab === 'checkin') renderTaskPage();
+    toast(`Markdown rendering ${e.target.checked ? 'on' : 'off'}`);
   });
-  document.querySelectorAll('[data-open-attention]').forEach((button) => button.addEventListener('click', () => goToTask(button.dataset.openAttention)));
+  $('#profile-mathjax')?.addEventListener('change', (e) => {
+    try { localStorage.setItem('karmax-mathjax', e.target.checked ? '1' : '0'); } catch {}
+    if (S.taskTab === 'checkin') renderTaskPage();
+    toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
+  });
+  $('#profile-file-links')?.addEventListener('change', (e) => setFileLinksEnabled(e.target.checked));
+  $('#profile-logout')?.addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
+    location.reload();
+  });
+}
+
+// The settings rail is real navigation, not a scroll-spy: exactly one section is
+// visible at a time, so each pane reads as a page with a single purpose instead
+// of a position in one endless scroll. The URL hash names the open pane (via
+// replaceState, so browsing sections doesn't pollute history) — a deep link like
+// /organization#settings-agents lands on its pane, and background renderMain
+// refreshes restore the same pane because the URL, not DOM state, holds it.
+function wireSettingsNavigation() {
+  const layout = document.querySelector('.settings-layout');
+  if (!layout) return;
+  const content = layout.querySelector('.settings-content');
+  const links = [...layout.querySelectorAll('.settings-nav a[href^="#"]')];
+  if (!links.length || !content) return;
+  if (!content.querySelector('.settings-pane')) {
+    // Group each section title + the cards under it, then wrap the groups into
+    // panes in nav order (nav order is the canonical SPEC order; the templates
+    // may declare sections in any order).
+    const groups = new Map();
+    let current;
+    for (const child of [...content.children]) {
+      if (child.classList.contains('settings-section-title')) current = child.id;
+      if (!current) continue;
+      if (!groups.has(current)) groups.set(current, []);
+      groups.get(current).push(child);
+    }
+    for (const link of links) {
+      const id = link.getAttribute('href').slice(1);
+      const pane = document.createElement('section');
+      pane.className = 'settings-pane';
+      pane.dataset.pane = id;
+      for (const node of groups.get(id) || []) pane.append(node);
+      content.append(pane);
+    }
+  }
+  const panes = [...content.querySelectorAll('.settings-pane')];
+  const activate = (id) => {
+    const target = panes.some((pane) => pane.dataset.pane === id) ? id : links[0].getAttribute('href').slice(1);
+    panes.forEach((pane) => pane.classList.toggle('active', pane.dataset.pane === target));
+    links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${target}`));
+  };
+  links.forEach((link) => {
+    // onclick assignment (not addEventListener) keeps re-wiring idempotent —
+    // renderMain and hydrateOrganizationView can both land here on one paint.
+    link.onclick = (event) => {
+      event.preventDefault();
+      history.replaceState(history.state, '', location.pathname + link.getAttribute('href'));
+      activate(link.getAttribute('href').slice(1));
+      $('#main')?.scrollTo?.(0, 0);
+      window.scrollTo(0, 0);
+    };
+  });
+  activate(location.hash.slice(1));
+}
+
+// { / } walk the settings rail's panes, mirroring the Check-in page's pane
+// navigation. Clicking the nav link reuses wireSettingsNavigation's handler,
+// so the URL hash and active pane stay in sync.
+function cycleSettingsPane(delta) {
+  const layout = document.querySelector('.settings-layout');
+  if (!layout) return;
+  const links = [...layout.querySelectorAll('.settings-nav a[href^="#"]')];
+  if (!links.length) return;
+  const i = links.findIndex((l) => l.classList.contains('active'));
+  const at = i < 0 ? (delta > 0 ? -1 : 0) : i;
+  links[(at + delta + links.length) % links.length]?.click();
+}
+
+function organizationView() {
+  const org = S.organizations.find((o) => o.id === S.organizationId);
+  return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">Settings</h1>
+    <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
+    ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
+    <div class="settings-layout">
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <div class="settings-content">
+
+    <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
+    <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
+      <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
+      <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div><div id="org-authorization-slot"></div></div>
+
+    <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>The GitHub connection and commit identities your projects share</small></div></div>
+    <div class="card"><div class="section-h">GitHub connection</div><div id="org-github">Loading…</div><div id="org-git-accounts-slot"></div></div>
+
+    <div class="settings-section-title" id="settings-compute"><div>Compute<small>Where tasks run, how large each world is, and the monthly ceiling</small></div></div>
+    <div class="card"><div class="section-h">Task execution</div><p class="task-sub">Choose where tasks run, how large each world is, when idle worlds pause, and the monthly cost ceiling. Provider credentials and templates are configured directly below the policy that uses them.</p><div id="org-execution">Loading…</div><div class="section-h" style="margin-top:22px">Cloud providers</div><div id="org-providers">Loading…</div><div class="section-h" style="margin-top:22px">Capacity &amp; usage</div><div id="org-usage">Loading…</div><div id="org-runners"></div></div>
+
+    ${globalSettingsView(true)}
+
+    <div class="settings-section-title" id="settings-advanced"><div>Advanced<small>Rarely needed — appearance, identity, safe mode, export</small></div></div><div id="org-misc-slot"></div>
+    <details class="card settings-disclosure"><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
+    <details class="card settings-disclosure"><summary><b>Export or delete organization</b><span>Data portability and permanent removal</span></summary><p class="task-sub">Export this organization's durable metadata, or permanently delete the tenant and its worlds, objects, and repository keys.</p><div class="inline-form"><button class="btn sm" id="export-organization">Export</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div></details>
+    </div></div></div>`;
+}
+
+async function hydrateOrganizationView() {
+  if (!$('#org-members') || !S.organizationId) return;
+  const gitAccounts = $('#git-accounts-card');
+  if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
+  const authorization = $('#authorization-card-global');
+  if (authorization && $('#org-authorization-slot')) $('#org-authorization-slot').append(authorization);
+  for (const card of [$('#main [data-wf="agent-queue"]'), $('#resilience-card')])
+    if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
+  wireSettingsNavigation();
+  await loadCollaboration().catch(() => {});
+  const userRecord = (id, embedded) => embedded || S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
+  const userName = (id, embedded) => userRecord(id, embedded)?.name?.trim() || userRecord(id, embedded)?.email?.split('@')[0] || 'Unnamed member';
+  const personChoice = (member) => { const user = userRecord(member.userId, member.user); const name = userName(member.userId, member.user); return user?.email ? `${name} — ${user.email}` : name; };
+  const personMarkup = (id, embedded) => { const user = userRecord(id, embedded); return `<span class="person-name"><b>${esc(userName(id, embedded))}</b>${user?.email ? `<small>${esc(user.email)}</small>` : ''}</span>`; };
+  const memberRoles = [['developer', 'Developer'], ['maintainer', 'Project maintainer'], ['operator', 'Automation operator'], ['administrator', 'Administrator']];
+  $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
+    const current = m.profileId || 'developer';
+    return `<div class="member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; permissions still come from the selected profile">protected owner</span>' : ''}<select class="q-sel org-member-profile">${memberRoles.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('')}</select><button class="btn sm org-member-remove">Remove</button></div>`;
+  }).join('') : '<span class="task-sub">No members.</span>';
+  const [gitConnections, githubApp, runners, providerConnections, executionPolicy, usage, identityPolicy, invitations, teamMembers] = await Promise.all([
+    api(`/api/organizations/${S.organizationId}/git-connections`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/github/app`).catch(() => ({ configured: false })),
+    api(`/api/organizations/${S.organizationId}/runner-pools`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/world-providers`).catch(() => []),
+    api(`/api/organizations/${S.organizationId}/execution-policy`).catch(() => ({ worldProvider: S.meta?.hosted ? 'e2b' : 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true }, hibernateAfterMs: 604800000 })),
+    api(`/api/organizations/${S.organizationId}/usage`).catch(() => null),
+    api(`/api/organizations/${S.organizationId}/identity-policy`).catch(() => null),
+    api(`/api/organizations/${S.organizationId}/invitations`).catch(() => []),
+    Promise.all(S.teams.map((team) => api(`/api/organizations/${S.organizationId}/teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
+  ]);
+  if (invitations.some((invitation) => !invitation.acceptedAt)) $('#org-members').insertAdjacentHTML('beforeend', `<div class="section-h" style="margin-top:12px">Pending invitations</div>${invitations.filter((invitation) => !invitation.acceptedAt).map((invitation) => `<div class="member-row"><span>${esc(invitation.email)}</span><span class="chip">${esc(invitation.profileId || 'developer')}</span></div>`).join('')}`);
+  $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
+  $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
+  $('#org-github').innerHTML = githubApp.configured ? `
+    <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
+    ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
+    <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so Karmax refreshes repository access when you ask instead of using webhooks.'}</p>
+    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="authorize-github">Authorize repository creation</button>' : ''}</div>` : `
+    <p class="task-sub">This creates a private GitHub App for this Karmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
+    <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
+    <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
+  const connectionFor = (provider) => providerConnections.find((connection) => connection.provider === provider);
+  S.worldProviderConnections = providerConnections;
+  // The default Agent environment moved to Task defaults (below) and can be
+  // overridden per project/task. Compute keeps the runner pool + budget; the pool
+  // list is scoped to the effective environment, shown read-only here.
+  const orgEnvironment = executionPolicy.worldProvider || (S.meta?.hosted ? 'e2b' : 'worktree');
+  $('#org-execution').innerHTML = `<div class="settings-grid">
+    <label class="form-row">Agent environment<input value="${esc(orgEnvironment)}" disabled title="Set the default in Task defaults; override it per project or task" /></label>
+    <label class="form-row">Default runner pool<select id="org-execution-pool"></select></label>
+    <label class="form-row">World experience<select id="org-execution-flavor"><option value="headless" ${(executionPolicy.environment?.flavor || 'headless') === 'headless' ? 'selected' : ''}>Headless · coding + browser MCP</option><option value="desktop" ${executionPolicy.environment?.flavor === 'desktop' ? 'selected' : ''}>Desktop · adds GUI + noVNC</option></select></label>
+    <label class="form-row">CPU per world<input id="org-execution-cpu" type="number" min="1" value="${esc(executionPolicy.resources?.cpu || 2)}" /></label>
+    <label class="form-row">Memory per world (MiB)<input id="org-execution-memory" type="number" min="128" step="128" value="${esc(executionPolicy.resources?.memoryMb || 2048)}" /></label>
+    <label class="form-row">Cloud budget (USD/month)<input id="org-execution-budget" type="number" min="0" step="0.01" value="${executionPolicy.monthlyBudgetMicros == null ? '' : esc(executionPolicy.monthlyBudgetMicros / 1e6)}" placeholder="Unlimited" /></label>
+    <label class="form-row">Hibernate parked worlds after (days)<input id="org-execution-hibernate" type="number" min="1" value="${esc(Math.round((executionPolicy.hibernateAfterMs || 604800000) / 86400000))}" /></label>
+    <label class="form-row">Outbound network<select id="org-execution-network"><option value="unrestricted" ${executionPolicy.network?.unrestricted !== false ? 'selected' : ''}>Normal internet access (recommended)</option><option value="restricted" ${executionPolicy.network?.unrestricted === false ? 'selected' : ''}>Restricted allowlist</option></select></label>
+  </div>
+  <p class="task-sub">Coding agents normally need arbitrary package registries, documentation, web search, and APIs. Restricted mode is for organizations with a maintained egress policy.</p>
+  <details id="org-network-restrictions" ${executionPolicy.network?.unrestricted === false ? 'open' : ''}><summary class="task-sub">Restricted-network allowlist</summary><label class="form-row">Allowed domains<input id="org-execution-domains" value="${esc((executionPolicy.network?.allowDomains || []).join(', '))}" placeholder="registry.npmjs.org, pypi.org" /></label><label class="form-row">Allowed CIDRs<input id="org-execution-cidrs" value="${esc((executionPolicy.network?.allowCidrs || []).join(', '))}" placeholder="10.20.0.0/16" /></label></details>
+  <button class="btn sm primary" id="org-execution-save">Save execution policy</button>`;
+  const providerInfo = {
+    e2b: { name: 'E2B', site: 'https://e2b.dev', keys: 'https://e2b.dev/dashboard?tab=keys' },
+    daytona: { name: 'Daytona', site: 'https://www.daytona.io', keys: 'https://app.daytona.io' },
+  };
+  $('#org-providers').innerHTML = ['e2b', 'daytona'].map((provider) => {
+    const connection = connectionFor(provider); const config = connection?.config || {};
+    const state = connection ? `${connection.status}${connection.enabled ? '' : ' · disabled'}` : 'not connected';
+    const info = providerInfo[provider];
+    return `<div class="team-block provider-connection" data-provider="${provider}">
+      <div class="member-row"><b>${info.name}</b><span class="chip">${esc(state)}</span>${connection ? '<button class="btn sm provider-test">Test</button><button class="btn sm provider-disconnect">Disconnect</button>' : ''}</div>
+      <p class="task-sub">No account yet? Create one at <a href="${info.site}" target="_blank" rel="noopener noreferrer">${esc(info.site.replace(/^https?:\/\//, ''))}</a>, then paste an <a href="${info.keys}" target="_blank" rel="noopener noreferrer">API key</a> below.</p>
+      ${connection?.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(connection.lastError)}</p>` : ''}
+      <div class="settings-grid"><label class="form-row">API key<input class="provider-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Leave blank to keep current key' : 'Required'}" /></label>
+      ${provider === 'e2b' ? `<label class="form-row">Headless template<input class="provider-template" value="${esc(config.template || '')}" placeholder="karmax-browser-v1" /></label><label class="form-row">Desktop template<input class="provider-desktop-template" value="${esc(config.desktopTemplate || '')}" placeholder="desktop" /></label>`
+        : `<label class="form-row">Headless snapshot<input class="provider-snapshot" value="${esc(config.snapshot || '')}" placeholder="recommended" /></label><label class="form-row">Headless image<input class="provider-image" value="${esc(config.image || '')}" placeholder="used only when snapshot is blank" /></label><label class="form-row">Desktop snapshot<input class="provider-desktop-snapshot" value="${esc(config.desktopSnapshot || '')}" placeholder="Daytona default when blank" /></label><label class="form-row">Desktop image<input class="provider-desktop-image" value="${esc(config.desktopImage || '')}" placeholder="used only when desktop snapshot is blank" /></label><label class="form-row">API URL<input class="provider-api-url" value="${esc(config.apiUrl || '')}" placeholder="https://app.daytona.io/api" /></label><label class="form-row">Target<input class="provider-target" value="${esc(config.target || '')}" placeholder="provider default" /></label>`}
+      </div><button class="btn sm primary provider-save">${connection ? 'Save & verify' : 'Connect & verify'}</button></div>`;
+  }).join('');
+  $('#org-runners').innerHTML = `${runners.map((r) => `<div class="member-row" data-runner="${esc(r.id)}"><span>${esc(r.name)}</span><span class="chip">${esc(r.provider)} · ${r.capacity.activeWorlds} worlds</span>${r.id.includes(':managed-') ? '' : '<button class="btn sm runner-delete">Delete</button>'}</div>`).join('')}
+    <div class="inline-form"><input id="runner-name" placeholder="Dedicated pool"><select id="runner-provider"><option value="e2b">E2B</option><option value="daytona">Daytona</option></select><input id="runner-worlds" type="number" min="1" value="20" title="Concurrent worlds"><button class="btn sm" id="runner-create">Add pool</button></div>`;
+  $('#org-usage').innerHTML = usage ? `<div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">This query period · ${usage.events} metered events</div></div>` : 'Usage unavailable.';
+  if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
+    <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
+    <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
+    <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
+    <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
+  $('#invite-member')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email: $('#invite-email').value, profileId: $('#invite-profile').value }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
+  $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  $('#setup-github-app')?.addEventListener('click', async () => {
+    try {
+      const result = await api(`/api/organizations/${S.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) });
+      const form = document.createElement('form'); form.method = 'POST'; form.action = result.action;
+      const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest);
+      form.appendChild(manifest); document.body.appendChild(form); form.submit();
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#save-github-app')?.addEventListener('click', async () => {
+    try {
+      await api(`/api/organizations/${S.organizationId}/github/app`, { method: 'PUT', body: JSON.stringify({
+        appId: $('#github-app-id').value, appSlug: $('#github-app-slug').value, privateKey: $('#github-private-key').value,
+        webhookSecret: $('#github-webhook-secret').value, clientId: $('#github-client-id').value, clientSecret: $('#github-client-secret').value,
+      }) }); toast('GitHub App saved'); await hydrateOrganizationView();
+    } catch (e) { toast(e.message, true); }
+  });
+  $('#connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (e) { toast(e.message, true); } });
+  $('#authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (e) { toast(e.message, true); } });
+  $('#refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); } catch (e) { toast(e.message, true); } });
+  $('#org-providers').querySelectorAll('.provider-connection').forEach((row) => {
+    const provider = row.dataset.provider;
+    row.querySelector('.provider-save')?.addEventListener('click', async () => {
+      const body = { apiKey: row.querySelector('.provider-key').value || undefined, config: provider === 'e2b'
+        ? { template: row.querySelector('.provider-template').value, desktopTemplate: row.querySelector('.provider-desktop-template').value }
+        : { snapshot: row.querySelector('.provider-snapshot').value, image: row.querySelector('.provider-image').value,
+            desktopSnapshot: row.querySelector('.provider-desktop-snapshot').value, desktopImage: row.querySelector('.provider-desktop-image').value,
+            apiUrl: row.querySelector('.provider-api-url').value, target: row.querySelector('.provider-target').value } };
+      try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'PUT', body: JSON.stringify(body) }); await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${provider === 'e2b' ? 'E2B' : 'Daytona'} connected`); await hydrateOrganizationView(); }
+      catch (e) { toast(e.message, true); await hydrateOrganizationView(); }
+    });
+    row.querySelector('.provider-test')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}/test`, { method: 'POST', body: '{}' }); toast('Connection verified'); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); await hydrateOrganizationView(); } });
+    row.querySelector('.provider-disconnect')?.addEventListener('click', async () => { if (!confirm(`Disconnect ${provider}? Existing task worlds must be removed first.`)) return; try { await api(`/api/organizations/${S.organizationId}/world-providers/${provider}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  });
+  $('#runner-create')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/runner-pools`, { method: 'POST', body: JSON.stringify({ name: $('#runner-name').value, provider: $('#runner-provider').value, capacity: { activeWorlds: Number($('#runner-worlds').value) } }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  const matchingOrgPools = runners.filter((pool) => pool.provider === orgEnvironment && pool.enabled);
+  $('#org-execution-pool').innerHTML = `<option value="">Provider-managed default</option>${matchingOrgPools.map((pool) => `<option value="${esc(pool.id)}" ${pool.id === (executionPolicy.runnerPoolId || '') ? 'selected' : ''}>${esc(pool.name)}</option>`).join('')}`;
+  $('#org-execution-network')?.addEventListener('change', (event) => { $('#org-network-restrictions').open = event.target.value === 'restricted'; });
+  $('#org-execution-save')?.addEventListener('click', async () => {
+    const split = (selector) => $(selector).value.split(',').map((value) => value.trim()).filter(Boolean);
+    const restricted = $('#org-execution-network').value === 'restricted'; const budget = $('#org-execution-budget').value.trim();
+    try {
+      await api(`/api/organizations/${S.organizationId}/execution-policy`, { method: 'PUT', body: JSON.stringify({ policy: {
+        runnerPoolId: $('#org-execution-pool').value || undefined,
+        environment: { flavor: $('#org-execution-flavor').value },
+        resources: { cpu: Number($('#org-execution-cpu').value), memoryMb: Number($('#org-execution-memory').value) },
+        network: restricted ? { unrestricted: false, allowDomains: split('#org-execution-domains'), allowCidrs: split('#org-execution-cidrs') } : { unrestricted: true },
+        monthlyBudgetMicros: budget === '' ? null : Math.round(Number(budget) * 1e6),
+        hibernateAfterMs: Math.round(Number($('#org-execution-hibernate').value) * 86400000),
+      } }) }); toast('Organization execution policy saved'); await hydrateOrganizationView();
+    } catch (error) { toast(error.message, true); }
+  });
+  $('#org-runners').querySelectorAll('[data-runner]').forEach((row) => row.querySelector('.runner-delete')?.addEventListener('click', async () => { if (!confirm('Delete this runner pool?')) return; try { await api(`/api/organizations/${S.organizationId}/runner-pools/${encodeURIComponent(row.dataset.runner)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
+  $('#save-identity')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+  $('#rotate-scim')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
+  $('#create-organization')?.addEventListener('click', createOrganization);
+  $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
+    row.querySelector('.org-member-profile')?.addEventListener('change', async (event) => { try { await api(`/api/organizations/${S.organizationId}/members`, { method: 'POST', body: JSON.stringify({ userId: row.dataset.orgMember, profileId: event.target.value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+    row.querySelector('.org-member-remove')?.addEventListener('click', async () => { if (!confirm('Remove this member from the organization?')) return; try { await api(`/api/organizations/${S.organizationId}/members/${encodeURIComponent(row.dataset.orgMember)}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
+  });
+  $('#org-teams')?.querySelectorAll('[data-team]').forEach((block) => {
+    block.querySelector('.team-member-add')?.addEventListener('click', async () => {
+      const entered = block.querySelector('.team-user')?.value.trim();
+      const member = S.organizationMembers.find((candidate) => personChoice(candidate).toLowerCase() === entered?.toLowerCase()
+        || userName(candidate.userId, candidate.user).toLowerCase() === entered?.toLowerCase()
+        || userRecord(candidate.userId, candidate.user)?.email?.toLowerCase() === entered?.toLowerCase());
+      if (!member) return toast('Choose a person in this organization', true);
+      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members`, { method: 'POST', body: JSON.stringify({ userId: member.userId }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
+    });
+    block.querySelector('.team-rename')?.addEventListener('click', () => { const form = block.querySelector('.team-rename-form'); form.hidden = false; form.querySelector('.team-name-edit').focus(); form.querySelector('.team-name-edit').select(); });
+    block.querySelector('.team-rename-cancel')?.addEventListener('click', () => { block.querySelector('.team-rename-form').hidden = true; });
+    block.querySelector('.team-rename-save')?.addEventListener('click', async () => {
+      const name = block.querySelector('.team-name-edit')?.value.trim(); if (!name) return toast('Team name is required', true);
+      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
+    });
+    block.querySelector('.team-name-edit')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); block.querySelector('.team-rename-save').click(); } if (event.key === 'Escape') block.querySelector('.team-rename-cancel').click(); });
+    block.querySelector('.team-delete')?.addEventListener('click', async () => {
+      const team = S.teams.find((candidate) => candidate.id === block.dataset.team);
+      if (!confirm(`Delete “${team?.name || 'this team'}”? This is only allowed when no project or workflow still uses it.`)) return;
+      try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}`, { method: 'DELETE' }); await loadCollaboration(); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); }
+    });
+    block.querySelectorAll('.team-member-remove').forEach((button) => button.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams/${block.dataset.team}/members/${encodeURIComponent(button.dataset.user)}`, { method: 'DELETE' }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } }));
+  });
+  $('#export-organization')?.addEventListener('click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
+  $('#delete-organization')?.addEventListener('click', async () => { const org = S.organizations.find((o) => o.id === S.organizationId); const slug = prompt(`Type ${org?.slug} to permanently delete this organization`); if (!slug) return; try { await api(`/api/organizations/${S.organizationId}`, { method: 'DELETE', body: JSON.stringify({ confirmSlug: slug }) }); location.href = '/'; } catch (e) { toast(e.message, true); } });
+}
+
+async function createOrganization() {
+  const name = prompt('Organization name');
+  if (!name) { if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; return; }
+  try {
+    const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name }) });
+    await loadOrganizations();
+    S.organizationId = organization.id;
+    S.projectId = null;
+    await loadCollaboration().catch(() => {});
+    renderShell();
+    await go(globalRoute('organization'));
+  } catch (error) { toast(error.message, true); if ($('#org-switcher')) $('#org-switcher').value = S.organizationId; }
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────
@@ -6029,7 +8247,8 @@ async function newProject() {
     // from global settings. Hardcoding defaultBase/defaultTarget here would bake
     // a project-scope override that shadows the global default (e.g. "master"),
     // which is exactly the inheritance bug this avoids.
-    const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name, config: {} }) });
+    const endpoint = S.organizationId ? `/api/organizations/${encodeURIComponent(S.organizationId)}/projects` : '/api/projects';
+    const p = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {} }) });
     await loadProjects();
     // Route into the new project so its tasks, tags, saved views and search all
     // load fresh — setting S.projectId + re-rendering alone leaves the previous
@@ -6120,6 +8339,7 @@ function fuzzyScore(q, s) {
 // the server's command registry (S.contributions), so packages can rebind ids.
 const HOST_COMMANDS = [
   { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', run: () => openPalette() },
+  { id: 'nav.globalSearch', title: 'Search everything', key: 'meta+shift+F', run: () => openGlobalSearch() },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
   { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
   { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => { switchTab('tasks'); openTaskForm($('#new-wf')?.value, undefined, $('#new-task')?.value.trim()); } },
@@ -6127,11 +8347,14 @@ const HOST_COMMANDS = [
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
   { id: 'nav.activity', title: 'Go to activity', key: 'g a', run: () => switchTab('activity') },
-  { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g d', run: () => switchTab('dashboard') },
+  { id: 'nav.dashboard', title: 'Go to dashboard', key: 'g D', run: () => switchTab('dashboard') },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
-  { id: 'nav.global', title: 'Go to global settings', key: 'g g', run: () => switchTab('global') },
-  { id: 'nav.projects', title: 'Go to projects', key: 'g p', run: () => focusRail() },
-  { id: 'nav.notifications', title: 'Go to notifications', key: 'g N', run: () => openNotifications() },
+  { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', run: () => switchTab('wiki') },
+  { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', run: () => go(globalRoute('orgwiki')) },
+  { id: 'nav.global', title: 'Go to organization settings', key: 'g S', run: () => switchTab('global') },
+  { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
+  { id: 'nav.profile', title: 'Go to your profile', key: 'g A', run: () => go(globalRoute('profile')) },
+  { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', run: () => go(globalRoute('inbox')) },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -6170,6 +8393,12 @@ function allCommands() {
   add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
   add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
+  add({ id: 'task.checkin.prev', title: 'Previous Check-in pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
+  add({ id: 'task.checkin.next', title: 'Next Check-in pane', keybinding: '}', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(1) });
+  // { / } also walk the settings rail's panes (project or organization settings).
+  const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
+  add({ id: 'settings.pane.prev', title: 'Previous settings section', keybinding: '{', group: 'Navigation', help: false, available: onSettings, run: () => cycleSettingsPane(-1) });
+  add({ id: 'settings.pane.next', title: 'Next settings section', keybinding: '}', group: 'Navigation', help: false, available: onSettings, run: () => cycleSettingsPane(1) });
   // Workflow-contributed task commands: `task.<action>` binds to the selected
   // task's DECLARED action of that name — available only when the selected
   // task runs the contributing workflow and the action is currently enabled.
@@ -6280,7 +8509,10 @@ function moveCursor(delta) {
   rows[i].focus?.(); // rows carry tabindex=0, so the cursor and Tab order agree
 }
 function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId); }
-function openCursorRow() { cursorRow()?.click(); }
+// A data-id row navigates through its .row-link `<a>` overlay (the delegated
+// link router only fires for anchors), so click that; draft rows carry their
+// own click handler on the div, so fall back to the row itself.
+function openCursorRow() { const r = cursorRow(); if (r) (r.querySelector('a.row-link') || r).click(); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows.
 function taskOrder() {
@@ -6320,7 +8552,7 @@ function closeTopOverlay() {
   if ($('#modal-root').lastElementChild) return $('#modal-root').lastElementChild.remove();
   const overlay = $('#overlay-root').firstElementChild;
   if (overlay) {
-    if (overlay.id === 'tf-scrim') return overlay.click(); // task form: its scrim-close flushes the draft
+    if (overlay.id === 'tf-page') return overlay.querySelector('#tf-close')?.click(); // task form page: its close flushes the draft
     return ($('#overlay-root').innerHTML = '');
   }
   if (S.selected) return closeTask();
@@ -6329,7 +8561,14 @@ function closeTopOverlay() {
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
 function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
+// A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
+// it modifies. It must be transparent to the chord buffer — otherwise pressing
+// Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
+// would land here between the two steps, match nothing, and reset the pending
+// `g` before `P` ever arrives.
+function isBareModifier(key) { return key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta'; }
 function dispatchKey(e) {
+  if (isBareModifier(e.key)) return false;
   const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
   const cmds = allCommands().filter((c) => c.keys && c.available);
   const candidates = chordCandidates(cmds, CHORD.pending, snap);
@@ -6367,15 +8606,171 @@ function bindKeys() {
     }
     // Enter on a focused button/link is native activation, not the list cursor.
     if (e.key === 'Enter' && t && t.closest && t.closest('button, a, summary, [role="button"]')) return;
-    dispatchKey(e);
+    if (dispatchKey(e)) return;
+    // Fallback: Enter activates whatever custom control has keyboard focus. A div
+    // made Tab-focusable with tabindex="0" (view chips, nav items, task rows, …)
+    // carries a click handler but has no native Enter activation — so synthesize the
+    // click. Native controls returned above; list/rail cursors have their own Enter
+    // commands, which dispatchKey matched first.
+    if (e.key === 'Enter' && t && t.matches && t.matches('[tabindex="0"]')) { e.preventDefault(); t.click(); }
   });
 }
 
-// -- the ⌘K palette: fuzzy over the registry + jump-to-task/project -----------
+// -- global search: read-only discovery across every accessible project -------
+// Keep this separate from the command palette: search finds durable things;
+// the palette invokes actions. The per-project search endpoint gives this the
+// same free-text + field-filter semantics as the task list without loading every
+// project's task collection into browser state.
+function assembleGlobalSearchResults(query, projects, responses, limit = 40) {
+  const q = String(query || '').trim();
+  const hasFilterSyntax = /(?:^|\s)[!-]?[\w.-]+:/.test(q);
+  const textTerms = (q.match(/"[^"]+"|\S+/g) || [])
+    .filter((term) => !/^[!-]?[\w.-]+:/.test(term))
+    .map((term) => term.replace(/^"|"$/g, ''));
+  const projectHits = hasFilterSyntax ? [] : (projects || [])
+    .map((project) => ({ project, score: fuzzyScore(q, project.name) }))
+    .filter((hit) => hit.score >= 0)
+    .sort((a, b) => b.score - a.score || a.project.name.localeCompare(b.project.name))
+    .slice(0, 8);
+
+  const allTasks = (responses || []).flatMap(({ project, result }) =>
+    (result?.tasks || []).map((task) => ({
+      task,
+      project,
+      // Text hits in the title should lead notes-only matches. Structured
+      // queries have no text terms, so their cross-project order falls back to
+      // recency. Score terms independently because task free text is intentionally
+      // order-independent ("login fix" also matches "Fix login redirect").
+      score: textTerms.length
+        ? textTerms.reduce((total, term) => {
+          const termScore = fuzzyScore(term, task.title);
+          return total < 0 || termScore < 0 ? -1 : total + termScore;
+        }, 0)
+        : 0,
+    })),
+  );
+  allTasks.sort((a, b) => b.score - a.score || (b.task.createdAt || 0) - (a.task.createdAt || 0));
+  return { projectHits, taskHits: allTasks.slice(0, limit), totalTasks: allTasks.length };
+}
+
+function openGlobalSearch() {
+  const root = $('#overlay-root');
+  root.innerHTML = `<div class="palette-scrim" id="gs-scrim"><div class="palette global-search" role="dialog" aria-modal="true" aria-labelledby="gs-title">
+    <div class="global-search-head">
+      <span aria-hidden="true">⌕</span>
+      <input id="gs-in" aria-label="Search everything" aria-controls="gs-list" aria-autocomplete="list" placeholder="Search tasks and projects…" autocomplete="off" spellcheck="false" />
+      <button class="icon-btn" id="gs-close" title="Close" aria-label="Close search">✕</button>
+    </div>
+    <div class="global-search-context" id="gs-title">Every accessible project · title, notes, task number, status, tags, and more</div>
+    <div id="gs-list" role="listbox" aria-label="Search results" aria-live="polite"></div>
+    <div class="global-search-foot">Filter tasks with queries like <code>status:active</code>, <code>tag:frontend</code>, or <code>#42</code>.</div>
+  </div></div>`;
+  const input = $('#gs-in');
+  const list = $('#gs-list');
+  let items = [];
+  let active = 0;
+  let timer = 0;
+  let request = 0;
+  let state = 'prompt';
+  let summary = '';
+  const close = () => { clearTimeout(timer); request++; root.innerHTML = ''; };
+
+  const draw = () => {
+    if (state === 'prompt') {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = `<div class="global-search-empty"><b>Find work anywhere</b><span>Enter words, a task number, or a task filter. Results include archived work.</span></div>`;
+      return;
+    }
+    if (state === 'loading') {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = `<div class="global-search-empty"><span class="global-search-loading">Searching ${S.projects.length} project${S.projects.length === 1 ? '' : 's'}…</span></div>`;
+      return;
+    }
+    if (!items.length) {
+      input.removeAttribute('aria-activedescendant');
+      list.innerHTML = `<div class="global-search-empty"><b>No results</b><span>No accessible task or project matched this search.</span></div>`;
+      return;
+    }
+    let lastGroup = null;
+    list.innerHTML = items.map((item, i) => {
+      const head = item.group !== lastGroup ? `<div class="pal-group">${esc(item.group)}</div>` : '';
+      lastGroup = item.group;
+      // Each result is a real permalink, so it opens in a new tab with any native
+      // gesture (Ctrl/⌘-click, middle-click, right-click → Open in new tab); a plain
+      // click below still opens it in place and dismisses the palette.
+      return `${head}<a class="opt global-search-result ${i === active ? 'active' : ''}" id="gs-result-${i}" role="option" aria-selected="${i === active}" data-i="${i}"${item.href ? ` data-spa href="${esc(item.href)}"` : ''}>
+        <span class="global-search-kind" aria-hidden="true">${item.group === 'Projects' ? '◇' : '□'}</span>
+        <span class="global-search-copy"><b>${esc(item.title)}</b><span>${esc(item.sub || '')}</span></span>
+      </a>`;
+    }).join('');
+    input.setAttribute('aria-activedescendant', `gs-result-${active}`);
+    if (summary) list.insertAdjacentHTML('beforeend', `<div class="global-search-summary">${esc(summary)}</div>`);
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+
+  const search = async () => {
+    const q = input.value.trim();
+    const ownRequest = ++request;
+    if (!q) { state = 'prompt'; items = []; summary = ''; active = 0; return draw(); }
+    state = 'loading';
+    draw();
+    const responses = (await Promise.all(S.projects.map(async (project) => {
+      try {
+        const result = await api(`/api/projects/${encodeURIComponent(project.id)}/search?q=${encodeURIComponent(q)}`);
+        return { project, result };
+      } catch { return null; } // project discovery and task-read grants can differ
+    }))).filter(Boolean);
+    if (ownRequest !== request || !root.contains(input)) return;
+    const found = assembleGlobalSearchResults(q, S.projects, responses);
+    items = [
+      ...found.projectHits.map(({ project }) => {
+        const href = projectRoute(project.id);
+        return { group: 'Projects', title: project.name, sub: 'Open project', href, run: () => spaNavigate(href) };
+      }),
+      ...found.taskHits.map(({ project, task }) => {
+        const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
+        const number = task.num != null ? `#${task.num} · ` : '';
+        const href = `${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
+        return {
+          group: 'Tasks', title: task.title,
+          sub: `${number}${project.name} · ${stateLabel}`,
+          href, run: () => spaNavigate(href),
+        };
+      }),
+    ];
+    summary = found.totalTasks > found.taskHits.length ? `Showing ${found.taskHits.length} of ${found.totalTasks} matching tasks` : '';
+    active = 0;
+    state = 'done';
+    draw();
+  };
+  const schedule = () => { request++; clearTimeout(timer); timer = setTimeout(search, 160); };
+  const run = (i) => { const item = items[i]; if (!item) return; close(); item.run(); };
+
+  input.addEventListener('input', schedule);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(items.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); run(active); }
+  });
+  list.addEventListener('click', (e) => {
+    const row = e.target.closest('.opt'); if (!row) return;
+    if (isNewTabClick(e)) return; // real <a> result → let the browser open it in a new tab (palette stays open)
+    e.preventDefault();
+    run(Number(row.dataset.i));
+  });
+  list.addEventListener('mousemove', (e) => { const row = e.target.closest('.opt'); if (row && Number(row.dataset.i) !== active) { active = Number(row.dataset.i); draw(); } });
+  $('#gs-close').addEventListener('click', close);
+  $('#gs-scrim').addEventListener('click', (e) => { if (e.target.id === 'gs-scrim') close(); });
+  draw();
+  input.focus();
+}
+
+// -- the ⌘K palette: fuzzy command/action invocation --------------------------
 function openPalette() {
   const root = $('#overlay-root');
   root.innerHTML = `<div class="palette-scrim" id="pal-scrim"><div class="palette">
-    <input id="pal-in" placeholder="Type a command, task, or project…" autocomplete="off" />
+    <input id="pal-in" placeholder="Type a command…" autocomplete="off" />
     <div id="pal-list"></div>
   </div></div>`;
   const input = $('#pal-in');
@@ -6383,7 +8778,7 @@ function openPalette() {
   const close = () => (root.innerHTML = '');
   let items = [];
   let active = 0;
-  const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2, Tasks: 3, Projects: 4 };
+  const GROUP_ORDER = { Task: 0, Navigation: 1, List: 2 };
   const build = () => {
     const q = input.value.trim();
     items = [];
@@ -6392,17 +8787,6 @@ function openPalette() {
       const score = fuzzyScore(q, c.title);
       if (score < 0) continue;
       items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.workflow, danger: c.danger, score, run: c.run });
-    }
-    if (q) { // jump-to entries only once there's a query — the empty palette is the command list
-      for (const t of S.tasks) {
-        if (t.params?.archived) continue;
-        const score = fuzzyScore(q, t.title);
-        if (score >= 0) items.push({ group: 'Tasks', title: t.title, sub: `${t.workflow}${t.params?.draft ? ' · draft' : t.lastView?.stage ? ` · ${t.lastView.stage}` : ''}`, score, run: () => (t.params?.draft ? openTaskForm(undefined, t) : goToTask(t.id)) });
-      }
-      for (const p of S.projects) {
-        const score = fuzzyScore(q, p.name);
-        if (score >= 0) items.push({ group: 'Projects', title: p.name, score, run: () => go(projectRoute(p.id)) });
-      }
     }
     items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
     items = items.slice(0, 14);
@@ -6446,6 +8830,7 @@ function openHelp() {
       <div class="section-h">On a task page</div>
       ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
       ${row('[ / ]', 'Previous / next tab')}
+      ${row('{ / }', 'Previous / next Check-in pane')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
       ${row('Esc', 'Close the topmost panel / leave a text field')}
@@ -6464,6 +8849,7 @@ function renderLogin() {
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
+    ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
@@ -6474,6 +8860,14 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
+  $('#sso-btn')?.addEventListener('click', async () => {
+    try {
+      const response = await fetch('/api/sso/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callbackURL: location.href }) });
+      const result = await response.json();
+      if (!response.ok || !result.url) throw new Error(result.error || 'SSO unavailable');
+      location.href = result.url;
+    } catch (error) { $('#login-err').textContent = error.message; }
+  });
   $('#signup-open').addEventListener('click', renderSignup);
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -6504,12 +8898,23 @@ function renderSignup() {
 function renderAccessPending() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Account created</div>
+    ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
     <p>Your identity is active, but it does not have access to a project yet.</p>
     <p class="task-sub">Ask a karmax administrator to grant this account a global or project authorization profile. Signing in again will pick up the grant immediately.</p>
     <button class="btn primary" id="pending-retry" style="width:100%">Check again</button>
+    <button class="btn" id="pending-workspace" style="width:100%;margin-top:8px">Create my own organization</button>
     <button class="btn" id="pending-logout" style="width:100%;margin-top:8px">Sign out</button>
   </div></div>`;
   $('#pending-retry').addEventListener('click', () => boot());
+  $('#pending-workspace').addEventListener('click', async () => {
+    const organizationName = prompt('Organization name'); if (!organizationName) return;
+    const projectName = prompt('First project name', 'My project'); if (!projectName) return;
+    try {
+      const organization = await api('/api/organizations', { method: 'POST', body: JSON.stringify({ name: organizationName }) });
+      await api(`/api/organizations/${organization.id}/projects`, { method: 'POST', body: JSON.stringify({ name: projectName, config: {} }) });
+      location.href = '/';
+    } catch (error) { alert(error.message); }
+  });
   $('#pending-logout').addEventListener('click', async () => {
     await fetch('/api/logout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
     location.reload();
@@ -6519,7 +8924,7 @@ function renderAccessPending() {
 function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Set up karmax</div>
-    <p class="task-sub">Create the first administrator. Additional accounts are managed from Global settings.</p>
+    <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
     <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="setup-pw" autocomplete="new-password" /></div>

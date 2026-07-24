@@ -1,9 +1,11 @@
 import { ClaudeAdapter } from '../agent/claude.js';
 import { CodexAdapter } from '../agent/codex.js';
-import { apiKeyEnv, hasAcpAmbientLogin, MODEL_PROVIDERS } from '../agent/provider-registry.js';
+import { apiKeyEnv, hasAcpAmbientLogin, LOGIN_PROVIDERS, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { CredentialSources, CredPolicy } from './credentials.js';
+import os from 'node:os';
+import path from 'node:path';
 
 /**
  * Gather the live credential sources (config-home logins, ambient logins, env keys,
@@ -12,6 +14,8 @@ import type { CredentialSources, CredPolicy } from './credentials.js';
  * the core activity (resolution).
  */
 export function gatherCredentialSources(deps: { configHomes?: ConfigHomeManager; broker?: CredentialBroker }): CredentialSources {
+  const claudeHome = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+  const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
   return {
     logins: deps.configHomes?.list() ?? [],
     ambient: {
@@ -19,6 +23,7 @@ export function gatherCredentialSources(deps: { configHomes?: ConfigHomeManager;
       codex: CodexAdapter.hasAmbientSubscription(),
       opencode: hasAcpAmbientLogin('opencode'),
     },
+    ambientHomes: { claude: claudeHome, codex: codexHome },
     envKeys: {
       // Keep the historical harness namespaces for existing policies/profiles,
       // and expose model-provider namespaces for model-agnostic harnesses.
@@ -30,8 +35,19 @@ export function gatherCredentialSources(deps: { configHomes?: ConfigHomeManager;
           .map((provider) => [provider, !!process.env[apiKeyEnv(provider)]]),
       ),
     },
-    handles: deps.broker?.listHandles() ?? [],
+    handles: agentAccountHandles(deps.broker?.listHandles() ?? []),
   };
+}
+
+/** The vault also contains infrastructure secrets (checkpoint encryption,
+ * provider keys, GitHub App keys). Only model-provider account handles belong
+ * in agent account selection. */
+export function agentAccountHandles(handles: string[]): string[] {
+  const providers = new Set<string>([...LOGIN_PROVIDERS, ...MODEL_PROVIDERS, 'grok']);
+  return handles.filter((handle) => {
+    const [provider, account, extra] = handle.split(':');
+    return !!provider && !!account && !extra && providers.has(provider);
+  });
 }
 
 // ── credential-policy persistence (kv, overlay-resolved global→project→task) ──

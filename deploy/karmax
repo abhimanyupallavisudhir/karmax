@@ -1,0 +1,253 @@
+#!/bin/sh
+# Turnkey Karmax control-plane operator. Requires only Docker with Compose.
+set -eu
+
+DEPLOY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT_DIR=$(dirname "$DEPLOY_DIR")
+ENV_FILE="$DEPLOY_DIR/.turnkey.env"
+SECRETS_DIR="$DEPLOY_DIR/.secrets"
+COMPOSE_FILE="$DEPLOY_DIR/compose.turnkey.yml"
+
+die() { echo "karmax: $*" >&2; exit 1; }
+note() { echo "• $*"; }
+dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die 'Docker is required: https://docs.docker.com/engine/install/'
+  docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required (the `docker compose` command)'
+  docker info >/dev/null 2>&1 || die 'Docker is not running, or this user cannot access it'
+}
+
+valid_domain() {
+  case "$1" in
+    ''|*://*|*/*|*:*|.*|*..*|*.) return 1 ;;
+    *[!A-Za-z0-9.-]*) return 1 ;;
+  esac
+  printf '%s\n' "$1" | awk -F. '
+    length($0) > 253 || NF < 2 { exit 1 }
+    { for (i=1; i<=NF; i++) if (length($i) > 63 || $i !~ /^[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9]$/ && $i !~ /^[A-Za-z0-9]$/) exit 1 }
+  '
+}
+
+env_value() {
+  [ -f "$ENV_FILE" ] || return 0
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
+}
+
+random_hex() { od -An -N"${1:-48}" -tx1 /dev/urandom | tr -d ' \n'; }
+
+write_secret() {
+  file="$SECRETS_DIR/$1"
+  [ -s "$file" ] || random_hex 48 > "$file"
+  chmod 600 "$file"
+}
+
+configure() {
+  requested_domain=${1:-}
+  existing_domain=$(env_value KARMAX_DOMAIN)
+  domain=${requested_domain:-$existing_domain}
+  [ -n "$domain" ] || die 'usage: ./deploy/karmax up karmax.example.com [preview.example.com]'
+  domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+  valid_domain "$domain" || die "invalid domain: $domain"
+  if [ -n "${2:-}" ]; then preview=$2
+  elif [ -n "$requested_domain" ] && [ "$domain" != "$existing_domain" ]; then preview="preview.$domain"
+  else preview=$(env_value KARMAX_PREVIEW_DOMAIN)
+  fi
+  [ -n "$preview" ] || preview="preview.$domain"
+  preview=$(printf '%s' "$preview" | tr '[:upper:]' '[:lower:]')
+  valid_domain "$preview" || die "invalid preview domain: $preview"
+  [ "$domain" != "$preview" ] || die 'the preview domain must be different from the application domain'
+
+  old_password=$(env_value POSTGRES_PASSWORD)
+  password=${old_password:-$(random_hex 32)}
+  old_provider=$(env_value KARMAX_CLOUD_WORLD_PROVIDER)
+  provider=${old_provider:-e2b}
+  old_temporal=$(env_value TEMPORAL_VERSION)
+  temporal=${old_temporal:-1.31.0}
+  old_postgres=$(env_value POSTGRES_VERSION)
+  postgres=${old_postgres:-16}
+
+  umask 077
+  mkdir -p "$SECRETS_DIR"
+  chmod 700 "$SECRETS_DIR"
+  write_secret auth_secret
+  write_secret vault_key
+  write_secret world_ref_key
+  {
+    printf 'KARMAX_DOMAIN=%s\n' "$domain"
+    printf 'KARMAX_PREVIEW_DOMAIN=%s\n' "$preview"
+    printf 'KARMAX_CLOUD_WORLD_PROVIDER=%s\n' "$provider"
+    printf 'POSTGRES_PASSWORD=%s\n' "$password"
+    printf 'TEMPORAL_VERSION=%s\n' "$temporal"
+    printf 'POSTGRES_VERSION=%s\n' "$postgres"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+wait_ready() {
+  note 'Waiting for the Karmax control plane to become ready…'
+  attempt=0
+  until dc exec -T app node -e "fetch('http://127.0.0.1:4505/api/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 90 ]; then
+      dc ps
+      dc logs --tail=100 app temporal >&2 || true
+      die 'Karmax did not become ready; the diagnostic logs are above'
+    fi
+    sleep 2
+  done
+}
+
+print_finish() {
+  domain=$(env_value KARMAX_DOMAIN)
+  preview=$(env_value KARMAX_PREVIEW_DOMAIN)
+  cat <<EOF
+
+Karmax is ready: https://$domain
+
+DNS must point at this VPS:
+  A/AAAA  $domain
+  A/AAAA  *.$preview
+
+Caddy obtains and renews HTTPS certificates automatically. Open Karmax, create
+the first administrator, then connect GitHub and E2B or Daytona in Organization
+settings. No provider secrets or GitHub keys belong in this file.
+EOF
+}
+
+cmd_up() {
+  need_docker
+  configure "${1:-}" "${2:-}"
+  dc config --quiet
+  note 'Building and starting PostgreSQL, Temporal, Karmax, and Caddy…'
+  dc up -d --build --remove-orphans
+  wait_ready
+  print_finish
+}
+
+cmd_doctor() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured; run `./deploy/karmax up your-domain`'
+  dc config --quiet
+  note 'Compose configuration is valid.'
+  for secret in auth_secret vault_key world_ref_key; do
+    [ -s "$SECRETS_DIR/$secret" ] || die "missing secret: $secret"
+  done
+  note 'Durable secrets are present.'
+  dc ps
+  domain=$(env_value KARMAX_DOMAIN)
+  if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 "https://$domain/api/health/ready" >/dev/null 2>&1; then
+    note "Public HTTPS health check passed for $domain."
+  else
+    note "Public HTTPS is not reachable yet. Check DNS for $domain and ports 80/443."
+  fi
+}
+
+cmd_backup() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  destination=${1:-"$DEPLOY_DIR/backups/$stamp"}
+  case "$destination" in /*) ;; *) destination="$PWD/$destination" ;; esac
+  [ ! -e "$destination" ] || die "backup destination already exists: $destination"
+  mkdir -p "$destination"
+  chmod 700 "$destination"
+  temporary="/tmp/karmax-control-plane-$stamp"
+  note 'Taking an online Karmax snapshot…'
+  dc exec -T app npm run backup -- "$temporary"
+  dc cp "app:$temporary" "$destination/control-plane"
+  dc exec -T app rm -rf "$temporary"
+  note 'Dumping Temporal history…'
+  dc exec -T postgresql pg_dump -U temporal -Fc temporal > "$destination/temporal.dump"
+  dc exec -T postgresql pg_dump -U temporal -Fc temporal_visibility > "$destination/temporal-visibility.dump"
+  cp -R "$SECRETS_DIR" "$destination/deployment-secrets"
+  chmod -R go-rwx "$destination"
+  note "Backup complete: $destination"
+  note 'Treat it as highly sensitive: it contains the encrypted vault and its decryption key.'
+}
+
+cmd_restore() {
+  need_docker
+  source=${1:-}
+  [ -n "$source" ] || die 'usage: ./deploy/karmax restore /path/to/backup'
+  case "$source" in /*) ;; *) source="$PWD/$source" ;; esac
+  [ -f "$source/control-plane/manifest.json" ] || die 'backup is missing control-plane/manifest.json'
+  [ -f "$source/temporal.dump" ] || die 'backup is missing temporal.dump'
+  [ -f "$source/temporal-visibility.dump" ] || die 'backup is missing temporal-visibility.dump'
+  [ -d "$source/deployment-secrets" ] || die 'backup is missing deployment-secrets'
+  [ -f "$ENV_FILE" ] || die 'configure the destination first with `./deploy/karmax up your-domain`'
+  echo "This replaces Karmax and Temporal data on this instance with: $source"
+  printf 'Type RESTORE to continue: '
+  read answer
+  [ "$answer" = RESTORE ] || die 'restore cancelled'
+
+  dc down
+  rm -rf "$SECRETS_DIR"
+  cp -R "$source/deployment-secrets" "$SECRETS_DIR"
+  chmod -R go-rwx "$SECRETS_DIR"
+  dc up -d postgresql
+  attempt=0
+  until dc exec -T postgresql pg_isready -U temporal -d postgres >/dev/null 2>&1; do
+    attempt=$((attempt + 1)); [ "$attempt" -lt 60 ] || die 'PostgreSQL did not become ready'; sleep 2
+  done
+  for database in temporal temporal_visibility; do
+    dc exec -T postgresql dropdb --if-exists -U temporal --force "$database"
+    dc exec -T postgresql createdb -U temporal "$database"
+  done
+  dc exec -T postgresql pg_restore -U temporal -d temporal < "$source/temporal.dump"
+  dc exec -T postgresql pg_restore -U temporal -d temporal_visibility < "$source/temporal-visibility.dump"
+  dc build app
+  dc run --rm --no-deps -v "$source/control-plane:/restore:ro" app npm run restore -- /restore
+  dc up -d --remove-orphans
+  wait_ready
+  note 'Restore complete.'
+  print_finish
+}
+
+cmd_update() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  cmd_backup
+  if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]; then
+      note 'Fast-forwarding the Karmax source checkout…'
+      git -C "$ROOT_DIR" pull --ff-only
+    else
+      note 'Source has local changes; leaving it untouched and rebuilding the current revision.'
+    fi
+  fi
+  dc build --pull app
+  dc up -d --remove-orphans
+  wait_ready
+  note 'Update complete.'
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./deploy/karmax COMMAND
+
+  up DOMAIN [PREVIEW-DOMAIN]  Configure or start the complete HTTPS stack
+  doctor                       Validate configuration, containers, DNS, and HTTPS
+  status                       Show service health
+  logs [SERVICE]               Follow logs (app by default)
+  backup [DIRECTORY]           Snapshot Karmax, object data, Temporal, and keys
+  restore DIRECTORY            Verify and restore a complete snapshot
+  update                        Backup, fast-forward when clean, rebuild, and restart
+  down                          Stop everything without deleting durable data
+EOF
+}
+
+command=${1:-help}
+[ "$#" -eq 0 ] || shift
+case "$command" in
+  up) cmd_up "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  status) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc ps ;;
+  logs) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc logs -f --tail=200 "${1:-app}" ;;
+  backup) cmd_backup "$@" ;;
+  restore) cmd_restore "$@" ;;
+  update) cmd_update "$@" ;;
+  down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; die "unknown command: $command" ;;
+esac

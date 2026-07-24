@@ -39,6 +39,8 @@ export interface CredentialSources {
   logins: { provider: string; account: string; path: string; loggedIn: boolean }[];
   /** Ambient (~/.claude / ~/.codex) login present? */
   ambient: Record<string, boolean>;
+  /** Resolved ambient homes. Optional keeps pure callers/tests backwards compatible. */
+  ambientHomes?: Record<string, string | undefined>;
   /** ANTHROPIC_API_KEY / OPENAI_API_KEY present in the environment? */
   envKeys: Record<string, boolean>;
   /** Broker-registered API-key handles (e.g. "claude:work"). */
@@ -53,7 +55,8 @@ export function enumerateCredentials(s: CredentialSources): Credential[] {
     out.push({ key: `login:${l.provider}:${l.account}`, provider: l.provider, kind: 'login', label: `${l.provider}:${l.account}`, configHome: l.path, account: l.account });
   }
   for (const [provider, present] of Object.entries(s.ambient)) {
-    if (present) out.push({ key: `ambient:${provider}`, provider, kind: 'ambient', label: `${provider} (ambient login)` });
+    if (present) out.push({ key: `ambient:${provider}`, provider, kind: 'ambient',
+      label: `${provider} (ambient login)`, configHome: s.ambientHomes?.[provider] });
   }
   for (const [provider, present] of Object.entries(s.envKeys)) {
     if (present) out.push({ key: `key:${provider}`, provider, kind: 'key', label: `${provider} API key (environment)` });

@@ -18,6 +18,11 @@ function extractFn(name) {
 
 global.esc = (s) => String(s ?? '').replace(/</g, '&lt;');
 global.renderMessageImages = () => '';
+// Markdown/copy are exercised by markdown.test.cjs; here we pin the plain path so
+// these assertions stay about the timeline, not the message body renderer.
+global.markdownEnabled = () => false;
+global.renderMessageBody = (t) => global.esc(t);
+global.messageCopyButton = () => '';
 const preferences = new Map();
 global.localStorage = {
   getItem: (key) => preferences.has(key) ? preferences.get(key) : null,
@@ -34,7 +39,7 @@ global.S = {
   ],
 };
 
-for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileLinksEnabled', 'setFileLinksEnabled', 'renderConversationText', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileLinksEnabled', 'setFileLinksEnabled', 'renderConversationText', 'renderAgentMessageBody', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -56,6 +61,20 @@ ok(html.includes('You') && html.includes('Please run the tests'), 'user message 
 ok(html.includes('npm test') && html.includes('completed'), 'agent action and its state are visible');
 ok(html.includes('<time'), 'timestamps are rendered');
 ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown exactly once');
+
+// A follow-up accepted while the agent is still running is journaled before the
+// workflow republishes its transcript, so it must appear from the event alone.
+const followUp = { id: 'u-live', role: 'user', text: 'One more requirement', ts: 1710000005000 };
+S.taskEvents.push({ seq: 5, ts: followUp.ts, type: 'conversation.message', payload: { role: 'do', message: followUp } });
+let liveEntries = conversationEntries(transcript);
+ok(liveEntries.some((entry) => entry.message?.id === 'u-live'), 'mid-turn user messages render from the durable event');
+
+// Optimistic rendering and the WebSocket can both carry the event, then the
+// workflow snapshot eventually catches up. All three copies still render once.
+S.taskEvents.push({ seq: 6, ts: followUp.ts, type: 'conversation.message', payload: { role: 'do', message: followUp } });
+transcript.messages.push(followUp);
+liveEntries = conversationEntries(transcript);
+ok(liveEntries.filter((entry) => entry.message?.id === 'u-live').length === 1, 'event and stored transcript copies are de-duplicated');
 
 const linked = renderConversationText('See [app.js](/work/task-1/web/app.js:42) and [docs](https://example.com).', 'agent', S.view);
 ok(linked.includes('href="/work/task-1/web/app.js:42"'), 'the agent-provided file href is preserved for copy behavior');

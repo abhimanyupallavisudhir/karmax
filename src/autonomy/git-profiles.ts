@@ -130,6 +130,15 @@ export class GitProfiles {
     return id;
   }
 
+  /** Secret material used only while provisioning an isolated remote world.
+   * The caller passes it directly to the provider; it is never journaled or
+   * stored in the serializable world handle. */
+  worldCredentials(profile: GitProfile, ctx: { taskId?: string }): { sshKey?: string } {
+    return {
+      ...(profile.sshKey ? { sshKey: this.resolveSecret(profile.name, 'ssh', ctx) } : {}),
+    };
+  }
+
   /**
    * Environment for remote git/gh operations (§4B): GIT_SSH_COMMAND for SSH
    * remotes, GH_TOKEN for the gh CLI and https pushes. Resolved JIT via the

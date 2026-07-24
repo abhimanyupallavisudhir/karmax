@@ -3,18 +3,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, RUNAWAY_BACKSTOP } from './types.js';
-import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
+import { TOOL_SCHEMAS, PLATFORM_TOOL_SCHEMAS, SDK_CONTROL_TOOL_SCHEMAS, platformToolHandlers } from './tools.js';
 import { claudeMessagesEffort } from './effort.js';
 import { anthropicUserContent, collectAnthropicImageBlocks } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { createFollowUpInjector, toSdkUserMessage, followUpContent } from './sdk-stream.js';
 import { agentMcpToConfig } from '../contrib/manifests.js';
 import { newSubagentTracker, trackTaskMessage, pendingSubagentCount, pendingBackgroundShellCount } from './subagents.js';
-import { ProviderFailure, providerErrorFromMessage } from './limits.js';
+import {
+  ProviderFailure,
+  classifyLimitError,
+  isTransportError,
+  providerErrorFromMessage,
+  providerFailure,
+} from './limits.js';
 import { spawn } from 'node:child_process';
 import { registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity } from './activity.js';
+import { platformMcpSpec } from '../autonomy/config-homes.js';
+import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
+import { worldWorkingDirectory } from '../world/types.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -224,18 +233,37 @@ export class ClaudeAdapter implements AgentAdapter {
     const { query, createSdkMcpServer, tool } = sdk;
     const zod = (await import('zod')).z;
     const handlers = platformToolHandlers(input.world, ctx);
+    const remote = isRemoteAgentWorld(input.world);
+    const remoteHome = remote
+      ? await seedRemoteAgentHome(input.world, 'claude', input.resolvedAuth?.configHome ?? '', input.session)
+      : undefined;
 
-    // Expose EVERY platform tool as an in-process MCP server, derived from the shared
-    // PLATFORM_TOOL_SCHEMAS so this path can never again drift out of sync with the
-    // Messages-API path (the drift that left Claude-Code agents without
-    // respond_to_sub_task / raise_to_parent / wait_for_subtasks — a parent literally
-    // could not confirm a child that raised to it). Read/Write/Bash come from the SDK
-    // natively, so they are excluded upstream.
-    const platform = createSdkMcpServer({
-      name: 'karmax',
+    // Only turn-local controls live in-process. Historically this SDK server and
+    // the config-home stdio bridge were both registered as `karmax`; the SDK
+    // instance shadowed the durable bridge and could lose its transport during a
+    // continuation re-init, surfacing only "Stream closed". Separate names and
+    // disjoint tool sets remove that collision.
+    const controls = createSdkMcpServer({
+      name: 'karmax_control',
       version: '1.0.0',
-      tools: buildSdkTools(tool, zod, handlers),
+      // A remote CLI cannot launch the control plane's absolute stdio-MCP path.
+      // Keep every platform/control tool in the SDK host process instead; the
+      // Claude wire protocol already supports SDK MCP servers across custom spawn.
+      tools: buildSdkTools(tool, zod, handlers, remote ? PLATFORM_TOOL_SCHEMAS : SDK_CONTROL_TOOL_SCHEMAS),
     });
+    const configuredMcp = configHomeMcpServers(input.resolvedAuth?.configHome);
+    if (remoteHome?.browserMcp) {
+      delete configuredMcp['chrome-devtools'];
+      delete configuredMcp.playwright;
+      Object.assign(configuredMcp, remoteHome.browserMcp);
+    }
+    const { forwardEnv: _forwardEnv, ...platform } = platformMcpSpec(
+      process.env.KARMAX_GATEWAY_URL ?? 'http://127.0.0.1:4505',
+    );
+    platform.env = {
+      ...(platform.env ?? {}),
+      ...(input.extraEnv?.KARMAX_TOKEN ? { KARMAX_TOKEN: input.extraEnv.KARMAX_TOKEN } : {}),
+    };
 
     // Only the messages new since the resumed session last advanced (the whole
     // conversation on a fresh session) — the session already holds the rest, so
@@ -302,7 +330,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
     // Scrubbed, config-home-isolated env (SPEC §7.3).
     const { scrubbedEnv } = await import('../autonomy/config-homes.js');
-    const env = scrubbedEnv({
+    let env = scrubbedEnv({
       provider: 'claude',
       configHome: input.resolvedAuth?.configHome,
       // A captured setup-token login: re-supply it (scrubbedEnv strips it by default),
@@ -312,6 +340,11 @@ export class ClaudeAdapter implements AgentAdapter {
         ...(input.resolvedAuth?.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: input.resolvedAuth.oauthToken } : {}),
       },
     });
+    if (remoteHome) env = remoteAgentEnv('claude', remoteHome.absolute, {
+      ...env,
+      KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
+    });
+    if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Mid-turn cancel (SPEC §5.6): kill the agent subprocess when the workflow
     // cancels. The Agent SDK spawns a child harness process (the Claude Code
@@ -350,7 +383,7 @@ export class ClaudeAdapter implements AgentAdapter {
       prompt: promptArg,
       options: {
         abortController,
-        cwd: input.world.handle.root,
+        cwd: worldWorkingDirectory(input.world.handle),
         additionalDirectories: [input.world.handle.root],
         // The world is already an isolated git worktree (the sandbox boundary) and
         // the agent runs headless — there is no human to approve tool calls, so it
@@ -397,8 +430,16 @@ export class ClaudeAdapter implements AgentAdapter {
         // Resume the session, or (fork) branch a NEW session id from it, leaving the
         // source untouched — SPEC §10.5 (CLI: --resume <id> [--fork-session]).
         ...(session ? { resume: session, ...(input.fork ? { forkSession: true } : {}) } : {}),
-        // The platform MCP (in-process) + any MCP servers the workflow declares (§7.5).
-        mcpServers: { karmax: platform, ...agentMcpToConfig(input.agentMcp) },
+        // Strict mode prevents the same on-disk `karmax` entry from being loaded
+        // again. Re-declare the config home's other servers explicitly so its
+        // selected browser/user servers are preserved.
+        mcpServers: {
+          ...configuredMcp,
+          ...agentMcpToConfig(input.agentMcp),
+          ...(!remote ? { karmax: { ...platform, alwaysLoad: true } } : {}),
+          karmax_control: controls,
+        },
+        strictMcpConfig: true,
         env,
         // Spawn the agent harness ourselves (same call the SDK makes internally:
         // stdio ['pipe','pipe','ignore'], the SDK's forwarded abort signal) so the
@@ -410,6 +451,19 @@ export class ClaudeAdapter implements AgentAdapter {
         //  - the live task-manager registry (dashboard Processes panel), with the
         //    task attribution and an escalating kill.
         spawnClaudeCodeProcess: (o: { command: string; args: string[]; cwd?: string; env: Record<string, string | undefined>; signal: AbortSignal }) => {
+          if (remote && remoteHome) {
+            const remoteEnv = remoteAgentEnv('claude', remoteHome.absolute, o.env);
+            if (remoteHome.runtimeBin) remoteEnv.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+            return spawnRemoteAgentProcess({
+              world: input.world,
+              provider: 'claude',
+              command: o.command,
+              args: o.args,
+              cwd: worldWorkingDirectory(input.world.handle),
+              env: remoteEnv,
+              signal: o.signal,
+            }) as any;
+          }
           const child = spawn(o.command, o.args, {
             cwd: o.cwd,
             env: o.env,
@@ -457,6 +511,55 @@ export class ClaudeAdapter implements AgentAdapter {
             .filter((b: any) => b.type === 'text')
             .map((b: any) => b.text)
             .join('\n');
+          // Claude Code exposes provider failures on the assistant frame itself.
+          // In task #183 a session limit arrived as `error: rate_limit`, followed by
+          // a misleading SDK result (`subtype: success`, `is_error: true`,
+          // `errors: ['completed']`). Waiting for that result erased the only useful
+          // signal and routed the task to human escalation. Preserve the structured
+          // error here, before the generic terminal-result handling can flatten it.
+          const assistantError = (message as any).error ?? (message as any).message?.error;
+          if (assistantError === 'rate_limit') {
+            const cls = classifyLimitError(text, { providerOrigin: true });
+            throw providerFailure(text || 'Claude usage limit reached', {
+              kind: 'quota',
+              permanence: 'transient',
+              provider: 'claude',
+              source: 'structured',
+              window: cls.window ?? '5h',
+              ...(cls.resetHint ? { resetHint: cls.resetHint } : {}),
+              ...(cls.note ? { note: cls.note } : {}),
+            });
+          }
+          if (assistantError === 'authentication_failed' || assistantError === 'oauth_org_not_allowed') {
+            throw providerFailure(text || `Claude credential rejected (${assistantError})`, {
+              kind: 'credential', permanence: 'hard', provider: 'claude', source: 'structured',
+            });
+          }
+          if (assistantError === 'billing_error') {
+            throw providerFailure(text || 'Claude billing account is unavailable', {
+              kind: 'quota', permanence: 'hard', provider: 'claude', source: 'structured',
+            });
+          }
+          if (assistantError === 'overloaded' || assistantError === 'server_error') {
+            throw new Error(`Claude provider ${assistantError}: ${text || 'temporarily unavailable'}`);
+          }
+          if (assistantError === 'max_output_tokens') {
+            // The response was cut at a mechanical output boundary. Retrying the
+            // activity resumes the same provider session, so the agent continues
+            // rather than asking a human to diagnose a token counter.
+            throw new Error(`turn interrupted before completion: Claude reached max_output_tokens${text ? ` · ${text}` : ''}`);
+          }
+          // Claude Code sometimes carries the only real failure in a text block,
+          // then emits the same misleading `success` / `completed` result envelope
+          // seen with structured limits. Task #240 was exactly this shape:
+          // "API Error: Connection closed mid-response" followed by a nominally
+          // successful result. Preserve recognized transport failures before that
+          // terminal frame can erase them. Requiring both the provider's API-error
+          // prefix and our conservative transport classifier avoids treating an
+          // agent merely discussing a connection error as a failed turn.
+          if (/^\s*API Error:/i.test(text) && isTransportError(text)) {
+            throw new Error(`Claude provider transport interruption: ${text}`);
+          }
           if (text) {
             finalText = text;
             ctx.emit(text);
@@ -504,6 +607,30 @@ export class ClaudeAdapter implements AgentAdapter {
               phase: block.is_error ? 'failed' : 'completed',
               title: prior?.title ?? (block.is_error ? 'Tool failed' : 'Tool completed'),
               ...(detail ? { detail } : {}),
+            });
+          }
+        } else if (message.type === 'rate_limit_event') {
+          const info = (message as any).rate_limit_info;
+          // `overageStatus: rejected` only says that paid overage is unavailable;
+          // it is commonly paired with `status: allowed` while subscription quota
+          // remains. Treating that informational field as a turn rejection parked
+          // a login whose live /usage panel showed just 10% used (task #245).
+          // Conversely, a rejected base window is still usable when the SDK says
+          // overage is allowed/in use.
+          const overageUsable = info?.overageStatus === 'allowed' || info?.overageStatus === 'allowed_warning'
+            || info?.isUsingOverage === true || info?.overageInUse === true;
+          if (info?.status === 'rejected' && !overageUsable) {
+            const kind = String(info.rateLimitType ?? 'five_hour');
+            const window = kind === 'five_hour' || kind === 'overage'
+              ? '5h'
+              : /^seven_day_(?:opus|sonnet)$/.test(kind) ? 'model' : 'weekly';
+            const reset = Number(info.resetsAt);
+            const resetMs = Number.isFinite(reset) ? (reset < 1_000_000_000_000 ? reset * 1000 : reset) : 0;
+            const seconds = resetMs > Date.now() ? Math.ceil((resetMs - Date.now()) / 1000) : 0;
+            throw providerFailure('Claude usage limit reached', {
+              kind: 'quota', permanence: 'transient', provider: 'claude', source: 'structured', window,
+              ...(seconds ? { resetHint: `in ${seconds}s` } : {}),
+              ...(window === 'model' ? { note: kind.replace(/^seven_day_/, '') } : {}),
             });
           }
         } else if (message.type === 'tool_progress') {
@@ -596,6 +723,8 @@ export class ClaudeAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       injector.close(); // release the input stream so the SDK subprocess can't wedge open
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
+      if (remoteHome && input.resolvedAuth?.configHome)
+        await syncRemoteAgentHome(input.world, 'claude', remoteHome, input.resolvedAuth.configHome);
     }
     if (ctx.signal?.aborted) throw new Error('Claude Agent SDK turn cancelled');
     if (!successfulResult) {
@@ -645,6 +774,14 @@ function jsonPropToZod(zod: any, prop: any): any {
       default:
         base = zod.string();
     }
+  // JSON Schema measures maxLength in Unicode code points, while Zod's `.max()`
+  // currently uses JavaScript UTF-16 code units. Refine explicitly so the SDK
+  // path agrees with the provider schemas and the shared tool handler.
+  if (prop?.type === 'string' && Number.isInteger(prop?.maxLength)) {
+    base = base.refine((value: string) => [...value].length <= prop.maxLength, {
+      message: `Too big: expected string to have <=${prop.maxLength} characters`,
+    });
+  }
   if (typeof prop?.description === 'string') base = base.describe(prop.description);
   return base;
 }
@@ -661,15 +798,29 @@ export function jsonSchemaToZodShape(zod: any, schema: any): Record<string, any>
   return shape;
 }
 
-/** Build the Agent-SDK in-process MCP tool defs for EVERY platform tool, derived from
- *  PLATFORM_TOOL_SCHEMAS + the shared handlers. Exported so a unit test can assert the
- *  SDK path exposes the full platform toolset (no silent drift). */
+/** Read a config home's MCP servers so strict SDK isolation can preserve its
+ * browser/user servers while replacing the on-disk karmax entry for this turn. */
+export function configHomeMcpServers(home: string | undefined): Record<string, any> {
+  if (!home) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
+    if (!parsed?.mcpServers || typeof parsed.mcpServers !== 'object' || Array.isArray(parsed.mcpServers)) return {};
+    const { karmax: _karmax, karmax_control: _karmaxControl, ...others } = parsed.mcpServers;
+    return others;
+  } catch {
+    return {};
+  }
+}
+
+/** Build in-process defs only for turn-local controls. Durable platform tools are
+ * intentionally served by the stdio karmax MCP, never registered a second time. */
 export function buildSdkTools(
   tool: (name: string, description: string, shape: Record<string, any>, run: (a: any) => Promise<any>) => any,
   zod: any,
   handlers: Record<string, (args: any) => Promise<string>>,
+  schemas = SDK_CONTROL_TOOL_SCHEMAS,
 ): any[] {
-  return PLATFORM_TOOL_SCHEMAS.filter((schema) => typeof handlers[schema.name] === 'function').map((schema) =>
+  return schemas.filter((schema) => typeof handlers[schema.name] === 'function').map((schema) =>
     tool(schema.name, schema.description, jsonSchemaToZodShape(zod, schema.parameters), async (a: any) => ({
       content: [{ type: 'text', text: await handlers[schema.name]!(a) }],
     })),

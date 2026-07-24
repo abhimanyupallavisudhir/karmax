@@ -3,7 +3,7 @@ export const PLATFORM_API_CATALOG = {
   note: 'Every route is authenticated and capability checked. Colon-prefixed names are path parameters.',
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
-    'POST /api/projects/:projectId/activate-workflow', 'GET|POST /api/projects/:projectId/workflow-pins',
+    'GET|POST /api/projects/:projectId/workflow-pins',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
@@ -14,6 +14,9 @@ export const PLATFORM_API_CATALOG = {
     'PATCH /api/tasks/:taskId/params|notes|authorization',
     'PUT /api/tasks/:taskId/tags|priority', 'POST /api/tasks/:taskId/tag|archive|signal|target',
     'POST /api/tasks/:taskId/cancel-trigger|run-now|run-again', 'GET /api/tasks/:taskId/runs|widgets',
+    'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/materialize-local',
+    'POST /api/tasks/:taskId/terminal-ticket', 'POST /api/tasks/:taskId/refresh-from-github',
+    'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
@@ -23,7 +26,7 @@ export const PLATFORM_API_CATALOG = {
   review: [
     'POST /api/tasks/:taskId/review-action', 'GET /api/tasks/:taskId/review-action/:procId',
     'POST /api/tasks/:taskId/review-action/:procId/stop', 'GET /api/tasks/:taskId/artifact?path=',
-    'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
+    'GET /api/tasks/:taskId/desktop', 'WS /ws/review-action?procId=', 'WS /ws/terminal?taskId=',
   ],
   automation: [
     'GET /api/workflows', 'POST /api/workflows/install', 'POST /api/projects/:projectId/propose-workflow-edit',
@@ -40,11 +43,29 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/git-profiles', 'GET|PATCH|DELETE /api/git-profiles/:id',
     'GET /api/git-profiles/preflight?projectId=', 'POST /api/git-profiles/default',
   ],
+  wiki: [
+    'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',
+    'GET|PUT|DELETE /api/organizations/:organizationId/wiki/page?path= (PUT body {path, content, kind: skill|memory, create?, prevPath?})',
+    'GET /api/organizations/:organizationId/wiki/search?q=',
+    'GET /api/organizations/:organizationId/wiki/history?path= (append-only database version history)',
+    'GET /api/projects/:projectId/wiki?path=', 'GET|PUT|DELETE /api/projects/:projectId/wiki/page?path=',
+    'GET /api/projects/:projectId/wiki/search?q=',
+    'GET /api/projects/:projectId/wiki/refs (filterable branch/task views; pass taskId= or branch= to reads)',
+  ],
   payments: ['GET /api/payments/providers', 'POST /api/payments/connect', 'GET|POST /api/cards', 'POST /api/cards/:id/fund'],
   administration: [
     'GET|POST /api/users', 'DELETE /api/users/:id',
     'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',
+  ],
+  cloud: [
+    'GET|PUT /api/organizations/:organizationId/execution-policy',
+    'GET|PUT /api/projects/:projectId/execution-policy',
+    'GET /api/organizations/:organizationId/world-providers',
+    'PUT|DELETE /api/organizations/:organizationId/world-providers/:provider',
+    'POST /api/organizations/:organizationId/world-providers/:provider/test',
+    'GET|POST /api/organizations/:organizationId/runner-pools',
+    'PATCH|DELETE /api/organizations/:organizationId/runner-pools/:runnerPoolId',
   ],
   operations: [
     'GET /api/activity?projectId=&since=', 'GET /api/dashboard', 'GET /api/diagnostics',

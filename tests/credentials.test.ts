@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { enumerateCredentials, resolveCredentials, credentialsForProvider, defaultEnabled, isEnabled } from '../src/platform/credentials.js';
+import { agentAccountHandles } from '../src/platform/credential-sources.js';
 
 const sources = {
   logins: [
@@ -9,6 +10,7 @@ const sources = {
     { provider: 'claude', account: 'loggedout', path: '/h/lo', loggedIn: false }, // excluded
   ],
   ambient: { claude: true, codex: true },
+  ambientHomes: { claude: '/home/test/.claude', codex: '/home/test/.codex' },
   envKeys: { claude: false, codex: true }, // OPENAI_API_KEY present
   handles: ['claude:broker1'],
 };
@@ -16,6 +18,13 @@ const all = enumerateCredentials(sources);
 const keys = (cs: { key: string }[]) => cs.map((c) => c.key);
 
 describe('credential enumeration', () => {
+  it('hides infrastructure vault handles from agent account selection', () => {
+    expect(agentAccountHandles(['claude:work', 'codex:personal', 'kimi:design', 'xai:grok',
+      'checkpoint:encryption-key',
+      'github-app:private-key', 'world-provider:org:e2b:api-key']))
+      .toEqual(['claude:work', 'codex:personal', 'kimi:design', 'xai:grok']);
+  });
+
   it('lists logged-in logins, ambient logins, env keys, and broker handles', () => {
     const k = keys(all);
     expect(k).toEqual(
@@ -24,6 +33,8 @@ describe('credential enumeration', () => {
     expect(k).not.toContain('login:claude:loggedout'); // not logged in
     expect(k).not.toContain('key:claude'); // ANTHROPIC_API_KEY absent
     expect(all.find((c) => c.key === 'login:claude:manyu')?.configHome).toBe('/h/cm');
+    expect(all.find((c) => c.key === 'ambient:claude')?.configHome).toBe('/home/test/.claude');
+    expect(all.find((c) => c.key === 'ambient:codex')?.configHome).toBe('/home/test/.codex');
   });
 });
 

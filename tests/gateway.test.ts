@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import http from 'node:http';
 import fs from 'node:fs';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
@@ -26,6 +27,28 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(meta.version).toBeTruthy();
     expect(meta.agent.provider).toBeTruthy();
     expect(meta.resolveAgentEnabled).toBe(false);
+  });
+
+  it('keeps untrusted preview hosts outside the app/API origin', async () => {
+    const previous = process.env.KARMAX_PREVIEW_ORIGIN;
+    process.env.KARMAX_PREVIEW_ORIGIN = 'http://preview.invalid';
+    try {
+      const target = new URL(base);
+      const blocked = await new Promise<number>((resolve, reject) => {
+        const request = http.request({ hostname: target.hostname, port: target.port, path: '/api/meta',
+          headers: { host: 'p-deadbeef.preview.invalid' } }, (response) => {
+          response.resume(); resolve(response.statusCode ?? 0);
+        });
+        request.on('error', reject); request.end();
+      });
+      expect(blocked).toBe(404);
+      const redirected = await fetch(`${base}/preview/lease-1/`, { redirect: 'manual' });
+      expect(redirected.status).toBe(307);
+      expect(redirected.headers.get('location')).toMatch(/^http:\/\/p-[a-f0-9]{24}\.preview\.invalid\/preview\/lease-1\/$/);
+    } finally {
+      if (previous === undefined) delete process.env.KARMAX_PREVIEW_ORIGIN;
+      else process.env.KARMAX_PREVIEW_ORIGIN = previous;
+    }
   });
 
   it('exposes contributions (slots, commands, event schemas)', async () => {
@@ -83,6 +106,23 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   it('rejects unauthenticated API calls', async () => {
     const res = await fetch(`${base}/api/projects`);
     expect(res.status).toBe(401);
+  });
+
+  it('deletes provider worlds before committing project deletion', async () => {
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Disposable' }) })).json();
+    const task = h.store.createTask({ projectId: project.id, title: 'Draft', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'x', draft: true } });
+    const world = await h.worlds.create('memory', { taskId: task.id, base: 'main' });
+    await world.writeFile('private.txt', 'private');
+    h.store.registerWorld(world.handle, project.id);
+    expect(fs.existsSync(world.handle.root)).toBe(true);
+
+    const deleted = await fetch(`${base}/api/projects/${project.id}`, { method: 'DELETE', headers: auth() });
+    expect(deleted.status).toBe(200);
+    expect(fs.existsSync(world.handle.root)).toBe(false);
+    expect(h.store.getProject(project.id)).toBeUndefined();
+    expect(h.store.getTask(task.id)).toBeUndefined();
   });
 
   it('drives a full task lifecycle over HTTP and lands work', async () => {
@@ -311,10 +351,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     await fetch(`${base}/api/settings/project/${project.id}/software-dev`, {
       method: 'PUT',
       headers: auth(),
-      body: JSON.stringify({ values: { worldProvider: 'container', base: 'develop' } }),
+      body: JSON.stringify({ values: { base: 'develop' } }),
     });
     const defs: any = await (await fetch(`${base}/api/defaults/${project.id}/software-dev`, { headers: auth() })).json();
-    expect(defs.task.inherited.worldProvider).toBe('container');
     expect(defs.task.inherited.base).toBe('develop');
 
     // A project override, in turn, still inherits from a global default it does
@@ -326,7 +365,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
     const defs2: any = await (await fetch(`${base}/api/defaults/${project.id}/software-dev`, { headers: auth() })).json();
     expect(defs2.task.inherited.copyGlobs).toEqual(['.env']); // global reaches the task through the project
-    expect(defs2.task.inherited.worldProvider).toBe('container'); // project override still wins
+    expect(defs2.task.inherited.base).toBe('develop'); // project override still wins
   });
 
   it('stores cosmetic human notes on a task and never mixes them into params/prompt', async () => {
@@ -493,6 +532,22 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(login).toBeTruthy();
     expect(login.path).toBeUndefined(); // listing also hides the path
     expect(typeof login.loggedIn).toBe('boolean');
+  });
+
+  it('seeds a brand-new project with the karmax-ready prep task', async () => {
+    // A new project's tasks default to software-dev, so creation spawns that
+    // workflow's onActivate prep task automatically (SPEC §4.6) — no manual
+    // "activate workflow" step. Covers both create-project routes.
+    const post = (path: string, body: unknown) =>
+      fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
+    const prepTitle = 'Make this project karmax-ready';
+    for (const path of ['/api/organizations/org_personal/projects', '/api/projects']) {
+      const project: any = await post(path, { name: `Fresh via ${path}` });
+      const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
+      const prep = tasks.find((t: any) => t.title === prepTitle);
+      expect(prep, `new project via ${path} should get the prep task`).toBeTruthy();
+      expect(prep.workflow).toBe('just-do');
+    }
   });
 
   it('drives tags, saved views, and query search over HTTP (a view is a saved query)', async () => {

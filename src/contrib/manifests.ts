@@ -34,20 +34,19 @@ const agentField = (role: string, label: string, mutable?: FieldSpec['mutable'])
 // review-request prompt template (pre-filled with `promptDefault`, editable per
 // task/project/global). Chosen at task creation (queue-time), like the other agent
 // selections.
-const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Confirm layers', help: 'Played in order at Review — each layer is a human confirmation or a review agent; every layer must approve. No layers ⇒ auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human' }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
+const confirmerField = (): FieldSpec => ({ name: 'confirm', type: 'confirmer', label: 'Review route', help: 'The workflow decides who is pinged at Review. Add people, teams, or @all to human steps; agent steps can review first. Steps run in order, and no steps means auto-confirm.', scopes: ALL, bind: 'confirm', role: 'confirm', default: { layers: [{ kind: 'human', audience: ['@creator'] }] }, promptDefault: CONFIRM_PROMPT_DEFAULT });
 const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
-const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repository directories', help: 'One per line — absolute path, or starting with ~. Multiple repos are each checked out in their own subdirectory of the task world.', scopes: ['project'], bind: 'project' });
+const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repositories', help: 'One per line. Local worlds accept filesystem paths; E2B accepts SSH Git URLs (git@github.com:org/repo.git). Multiple repos are checked out in separate world subdirectories.', scopes: ['project'], bind: 'project' });
 const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
-const worldProviderField = (): FieldSpec => ({ name: 'worldProvider', type: 'select', label: 'World provider', options: ['worktree', 'container'], default: 'worktree', scopes: ['project', 'global'], bind: 'project' });
 const remoteField = (): FieldSpec => ({
   name: 'remote',
   type: 'select',
   label: 'Remote policy',
-  help: 'What leaves the machine: none — merges stay local; push — push the target branch after a merge lands; pr — open a GitHub PR at Review and push the target after merge (PLAN-git-config.md §5).',
+  help: 'What leaves a local machine: none — merges stay local; push — push the target after merge; pr — also open a GitHub PR at Review. In E2B, the SSH repository is necessarily the durable source of truth, so confirmed merges are broker-pushed even when this is none.',
   options: ['none', 'push', 'pr'],
   default: 'none',
   scopes: ['project', 'global'],
@@ -57,8 +56,27 @@ const gitProfileField = (): FieldSpec => ({
   name: 'gitProfile',
   type: 'string',
   label: 'Git profile',
-  help: 'Named git identity/credentials (Global settings → Git accounts) this project commits, signs and pushes as. Empty ⇒ the default profile, else the host’s own git setup.',
+  help: 'Named git identity/credentials (Organization settings → Git accounts) this project commits, signs and pushes as. Empty ⇒ the organization default, else the host’s own git setup.',
   scopes: ['project', 'global'],
+  bind: 'project',
+});
+// "Agent environment" (SPEC §11) — the world backend a task's agent runs in: a
+// local git worktree/container or a remote sandbox (E2B/Daytona). Canonical
+// storage remains the execution policy (ProjectConfig.worldProvider / the
+// organization policy); this field exposes it as an ordinary task default AND a
+// per-task override, so a single task can pick a different environment without a
+// project-wide change. `bind:'project'` lands the resolved value on
+// `input.project.worldProvider`, which every world-creating workflow already
+// reads. Options are filled in by the client from the organization's connected
+// providers; an empty value ⇒ inherit the project / organization default. It is
+// frozen once the task starts (default `queue`): the world is provisioned at
+// setup and can't be swapped mid-flight.
+const agentEnvironmentField = (): FieldSpec => ({
+  name: 'worldProvider',
+  type: 'select',
+  label: 'Agent environment',
+  options: [''],
+  scopes: ALL,
   bind: 'project',
 });
 
@@ -123,7 +141,11 @@ export interface WorkflowRole {
 const DO_ROLE: WorkflowRole = {
   name: 'do',
   label: 'Do agent',
-  capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill'],
+  capabilities: [
+    'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
+    'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
+    'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
+  ],
   promptTemplate: `{{toolsPreamble}}
 
 # Task
@@ -285,12 +307,15 @@ export interface WorkflowManifest {
   onActivate?: OnActivateDecl;
   /** Coordinators are long-lived singletons (SPEC §6), not task workflows. */
   kind?: 'task' | 'coordinator';
+  /** False for replay/backward-compatible workflows that remain runnable by
+   * existing tasks and API callers but are hidden from new-task UI surfaces. */
+  selectable?: boolean;
 }
 
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.2.0',
+    version: '1.3.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -330,9 +355,9 @@ export const MANIFESTS: WorkflowManifest[] = [
       agentField('do', 'Do agent', 'always'),
       baseField(),
       targetField(),
+      agentEnvironmentField(),
       reposField(),
       copyGlobsField(),
-      worldProviderField(),
       remoteField(),
       gitProfileField(),
       agentField('merge', 'Merge agent', 'always'),
@@ -341,7 +366,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     onActivate: {
       spawnTask: {
-        workflow: 'just-do',
+        workflow: 'goal',
         title: 'Make this project karmax-ready',
         prompt:
           'Ensure git is initialized in each repo. For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them. Report what you changed.',
@@ -351,7 +376,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'just-do',
     version: '1.1.0',
-    description: 'A single straightforward agent call, no merge machinery.',
+    description: 'Legacy single-agent workflow retained for existing tasks and API compatibility.',
+    selectable: false,
     requires: [],
     capabilities: ['create-review-info', 'signal-completion', 'save-skill'],
     events: [{ type: 'just-do.done', description: 'Single agent call finished.', fields: {} }],
@@ -365,12 +391,13 @@ export const MANIFESTS: WorkflowManifest[] = [
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), reposField(), worldProviderField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), agentEnvironmentField(), reposField(), confirmerField()],
   },
   {
     name: 'script-exec',
     version: '1.0.0',
-    description: 'Run a script/command as a task.',
+    description: 'Legacy command workflow retained for existing tasks and API compatibility.',
+    selectable: false,
     requires: [],
     capabilities: ['signal-completion'],
     events: [{ type: 'script-exec.done', description: 'Command finished.', fields: { code: 'number' } }],
@@ -385,13 +412,14 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     params: [
       { name: 'command', type: 'text', label: 'Command', required: true, scopes: ['task'], bind: 'top', placeholder: 'npm test' },
+      agentEnvironmentField(),
       reposField(),
     ],
   },
   {
     name: 'goal',
-    version: '1.2.0',
-    description: 'Like software-dev, but auto-confirms a verified successful provider turn.',
+    version: '1.3.0',
+    description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
@@ -400,7 +428,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Merge/Review machinery.
     roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), remoteField(), gitProfileField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), gitProfileField(), confirmerField()],
   },
   {
     name: 'merge-only',
@@ -422,6 +450,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     params: [
       { name: 'branch', type: 'branch', label: 'Branch to merge', required: true, scopes: ['task'], bind: 'top' },
       targetField(),
+      agentEnvironmentField(),
       reposField(),
       agentField('merge', 'Merge agent'),
       confirmerField(),
@@ -483,7 +512,7 @@ export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
   .filter((m) => m.name === 'software-dev' || m.name === 'just-do' || m.name === 'goal' || m.name === 'merge-only')
   .flatMap((m) => [
     { ...m, version: '1.0.0' },
-    ...((m.name === 'software-dev' || m.name === 'goal') ? [{ ...m, version: '1.1.0' }] : []),
+    ...((m.name === 'software-dev' || m.name === 'goal') ? [{ ...m, version: '1.1.0' }, { ...m, version: '1.2.0' }] : []),
   ]);
 
 export function manifest(name: string): WorkflowManifest | undefined {
@@ -502,7 +531,8 @@ export const PLATFORM_EVENTS: EventSchemaDecl[] = [
   { type: 'pr.opened', description: 'A pull request was opened for a task.', fields: { number: 'number', url: 'string' } },
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },
-  { type: 'world.created', description: "A task's world (worktree/container) was provisioned.", fields: {} },
+  { type: 'world.created', description: "A task's local or cloud world was provisioned.", fields: {} },
+  { type: 'world.parked', description: "A waiting task's metered world compute was paused while durable state was retained.", fields: {} },
   { type: 'world.destroyed', description: "A task's world was torn down.", fields: {} },
   { type: 'spend.requested', description: 'An agent requested spend above the auto-approve threshold.', fields: { status: 'string', reason: 'string' } },
 ];
