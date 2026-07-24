@@ -166,12 +166,22 @@ Two manifest mechanisms, kept deliberately minimal:
 ### 4.7 Standard workflows shipped in v1
 
 - **software-dev** — branch/world → do → review → PR (optional) → merge → end, with resolve and sub-tasks. Detailed in §5.
-- **just-do** — a single straightforward agent call, no merge machinery.
-- **script-exec** — run a script/command as a task.
-- **goal** — like software-dev, but auto-confirms after the provider reports a verified successful turn completion. `signal_completion` may attach a structured summary but is not required.
+- **goal** — software-dev in autonomous completion mode: keep the Do agent moving
+  until it explicitly reports verified completion, then auto-confirm. A merely
+  successful provider return is not enough in Goal mode; it causes another turn.
+  Software-dev and goal are compatible policies over the same pipeline,
+  so a task may switch between them during Setup, Do, or an unconfirmed Review.
+  Switching software-dev → goal at Review sends the work back through Do rather
+  than implicitly approving a possibly partial review. The execution's Temporal
+  type/version remains pinned throughout; only its policy changes.
 - **merge-only** — the review-and-merge half of software-dev (no Do stage). Starts at the review gate, then optional PR, then merge. Used to review agents' PRs, including edits to workflow repos.
 - **merge-queue** (coordinator) — leases the single merge slot per target branch (§6).
 - **token/account coordinator** — tracks per-account limits and leases agent-account capacity (§6, §7).
+
+`just-do` and `script-exec` remain registered only for replay and API
+backward-compatibility; they are not selectable for new tasks. The normal
+software-dev/goal pair covers user-facing work, and software-dev activation uses
+goal for its automated project-readiness task.
 
 ---
 

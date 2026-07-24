@@ -285,12 +285,15 @@ export interface WorkflowManifest {
   onActivate?: OnActivateDecl;
   /** Coordinators are long-lived singletons (SPEC §6), not task workflows. */
   kind?: 'task' | 'coordinator';
+  /** False for replay/backward-compatible workflows that remain runnable by
+   * existing tasks and API callers but are hidden from new-task UI surfaces. */
+  selectable?: boolean;
 }
 
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.2.0',
+    version: '1.3.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -341,7 +344,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     onActivate: {
       spawnTask: {
-        workflow: 'just-do',
+        workflow: 'goal',
         title: 'Make this project karmax-ready',
         prompt:
           'Ensure git is initialized in each repo. For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them. Report what you changed.',
@@ -351,7 +354,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'just-do',
     version: '1.1.0',
-    description: 'A single straightforward agent call, no merge machinery.',
+    description: 'Legacy single-agent workflow retained for existing tasks and API compatibility.',
+    selectable: false,
     requires: [],
     capabilities: ['create-review-info', 'signal-completion', 'save-skill'],
     events: [{ type: 'just-do.done', description: 'Single agent call finished.', fields: {} }],
@@ -370,7 +374,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'script-exec',
     version: '1.0.0',
-    description: 'Run a script/command as a task.',
+    description: 'Legacy command workflow retained for existing tasks and API compatibility.',
+    selectable: false,
     requires: [],
     capabilities: ['signal-completion'],
     events: [{ type: 'script-exec.done', description: 'Command finished.', fields: { code: 'number' } }],
@@ -390,8 +395,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.2.0',
-    description: 'Like software-dev, but auto-confirms a verified successful provider turn.',
+    version: '1.3.0',
+    description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
@@ -400,7 +405,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Merge/Review machinery.
     roles: [DO_ROLE, MERGE_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), remoteField(), gitProfileField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Do agent'), baseField(), targetField(), reposField(), copyGlobsField(), worldProviderField(), remoteField(), gitProfileField()],
   },
   {
     name: 'merge-only',
@@ -483,7 +488,7 @@ export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
   .filter((m) => m.name === 'software-dev' || m.name === 'just-do' || m.name === 'goal' || m.name === 'merge-only')
   .flatMap((m) => [
     { ...m, version: '1.0.0' },
-    ...((m.name === 'software-dev' || m.name === 'goal') ? [{ ...m, version: '1.1.0' }] : []),
+    ...((m.name === 'software-dev' || m.name === 'goal') ? [{ ...m, version: '1.1.0' }, { ...m, version: '1.2.0' }] : []),
   ]);
 
 export function manifest(name: string): WorkflowManifest | undefined {

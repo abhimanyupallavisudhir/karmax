@@ -558,12 +558,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const { paths } = await import('../config/paths.js');
         bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
       }
+      const baseInstructions = deps.globalInstructions ?? GLOBAL_INSTRUCTIONS;
+      const globalInstructions =
+        args.role === 'do' && (args.task as { goalMode?: boolean }).goalMode
+          ? `${baseInstructions}
+- Goal mode is active. Continue autonomously across turns until the entire objective is complete and verified. A normal response does not finish the task: call signal_completion only when no required work remains. If you genuinely need a human decision, raise it with the appropriate task tool instead.`
+          : baseInstructions;
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: args.task,
         world: args.worldHandle,
-        globalInstructions: deps.globalInstructions ?? GLOBAL_INSTRUCTIONS,
+        globalInstructions,
         bindings,
       });
       // Snapshot the journaled turn input (SPEC §5.4).

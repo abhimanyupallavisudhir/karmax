@@ -20,7 +20,7 @@ export function livePinnedRefs(tasks: TaskRecord[]): Set<string> {
     // Status lives on the (opportunistic) view snapshot; a task with no snapshot
     // yet is treated as live so its code is never pulled out from under it.
     const status = t.lastView?.status;
-    if (!status || !TERMINAL_STATUS.has(status)) refs.add(`${t.workflow}@${t.workflowVersion}`);
+    if (!status || !TERMINAL_STATUS.has(status)) refs.add(`${t.executionWorkflow ?? t.workflow}@${t.workflowVersion}`);
   }
   return refs;
 }

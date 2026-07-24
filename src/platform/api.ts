@@ -1173,6 +1173,7 @@ export class KarmaxApi {
       START_TIMEOUT_MS,
     );
     this.deps.store.setTaskWorkflowVersion(taskId, version);
+    this.deps.store.setTaskExecutionWorkflow(taskId, task.workflow);
     const started = this.resolveStart(task.workflow, version);
     if (started) this.saveAgentSnapshot(taskId, started.manifest, input);
     // Close the short acceptance→first-publish window so the UI cannot offer a
@@ -1284,6 +1285,33 @@ export class KarmaxApi {
     try {
       const result = (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
       this.updateAgentSnapshot(taskId, patch, result.applied);
+      return result;
+    } catch (e) {
+      throw new Error(unwrapCause(e));
+    }
+  }
+
+  /**
+   * Change the policy of a compatible running workflow without replacing its
+   * Temporal execution. The workflow update is authoritative and validates the
+   * lifecycle window; only after it accepts do we change the searchable record.
+   */
+  async changeWorkflow(
+    token: string,
+    taskId: string,
+    workflow: string,
+  ): Promise<{ workflow: 'software-dev' | 'goal' }> {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    if (!task) throw new Error(`no task ${taskId}`);
+    if (workflow !== 'software-dev' && workflow !== 'goal') {
+      throw new Error('only Software Dev and Goal are compatible in-flight');
+    }
+    try {
+      const result = (await this.deps.client.workflow
+        .getHandle(taskId)
+        .executeUpdate('changeWorkflow', { args: [workflow] })) as { workflow: 'software-dev' | 'goal' };
+      this.deps.store.setTaskWorkflow(taskId, result.workflow);
       return result;
     } catch (e) {
       throw new Error(unwrapCause(e));
@@ -1452,7 +1480,7 @@ export class KarmaxApi {
   workflowSchemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
     const taskSchemas = this.deps.workflows
       ? this.deps.workflows.schemas()
-      : MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
+      : MANIFESTS.filter((m) => m.kind !== 'coordinator' && m.selectable !== false).map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
     const settingsOnly = MANIFESTS
       .filter((m) => m.kind === 'coordinator' && m.params.length)
       .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));

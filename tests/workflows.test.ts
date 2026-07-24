@@ -101,6 +101,62 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('achieved');
   });
 
+  it('goal: a clean partial return triggers another turn until explicit completion', async () => {
+    const repo = await h.makeRepo('goal-persist');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('goal@1.3.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'persist', prompt: '@write persisted.txt :: first pass\n@incomplete' })],
+    });
+    expect((await handle.result()).stage).toBe('done');
+    const finalView = await view(handle);
+    expect(finalView.messages.map((m: any) => m.text).join('\n')).toMatch(/call signal_completion/i);
+    const onMain = await git(repo, ['show', 'main:persisted.txt']);
+    expect(onMain.stdout).toContain('first pass');
+  });
+
+  it('switches Software Dev at Review to Goal without approving the partial Review', async () => {
+    const repo = await h.makeRepo('switch-to-goal');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.3.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'finish autonomously', prompt: '@write switched.txt :: achieved\n@review first pass' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const changed = await handle.executeUpdate('changeWorkflow', { args: ['goal'] }) as any;
+    expect(changed.workflow).toBe('goal');
+    // The switch injects a continuation and goes back through Do; it does not
+    // treat the already-waiting Software Dev review as implicitly confirmed.
+    const res = await handle.result();
+    expect(res.stage).toBe('done');
+    const finalView = await view(handle);
+    expect(finalView.workflow).toBe('goal');
+    expect(finalView.messages.map((m: any) => m.text).join('\n')).toMatch(/entire task is complete/i);
+    const onMain = await git(repo, ['show', 'main:switched.txt']);
+    expect(onMain.stdout).toContain('achieved');
+  });
+
+  it('switches Goal back to Software Dev during Do and restores the Review gate', async () => {
+    const repo = await h.makeRepo('switch-to-dev');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('goal@1.3.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'restore review', prompt: '@sleep 1500\n@write reviewed.txt :: ready' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    const changed = await handle.executeUpdate('changeWorkflow', { args: ['software-dev'] }) as any;
+    expect(changed.workflow).toBe('software-dev');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const atReview = await view(handle);
+    expect(atReview.workflow).toBe('software-dev');
+    expect(atReview.status).toBe('waiting');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+  });
+
   it('merge-only: reviews and merges an existing branch (the dogfooded gate)', async () => {
     const repo = await h.makeRepo('mo');
     // build an existing feature branch with work
