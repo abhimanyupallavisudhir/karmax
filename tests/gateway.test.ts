@@ -54,6 +54,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   it('exposes contributions (slots, commands, event schemas)', async () => {
     const c: any = await (await fetch(`${base}/api/contributions`, { headers: auth() })).json();
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
+    expect(c.commands.find((x: any) => x.id === 'nav.notifications')?.keybinding).toBe('g N');
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);
     expect(c.slots.some((s: any) => s.workflow === 'agent-queue' && s.contribution.slot === 'queue-panel')).toBe(true);
@@ -286,11 +287,24 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(artifact.status).toBe(200);
     expect(await artifact.text()).toContain('hello-artifact');
 
-    // a bad index is rejected; artifact traversal is refused
+    // Agent-authored absolute paths are resolved back into this task's world by
+    // the conversation file endpoint; source files open inline as text.
+    const file = await fetch(`${base}/api/tasks/${task.id}/file?path=${encodeURIComponent(`${view.worldPath}/out.txt`)}`, { headers: auth() });
+    expect(file.status).toBe(200);
+    expect(file.headers.get('content-type')).toContain('text/plain');
+    expect(await file.text()).toContain('hello-artifact');
+
+    // A bad index is rejected; neither artifact nor conversation-file paths may
+    // traverse outside the task world.
     const bad = await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST', headers: auth(), body: JSON.stringify({ index: 99 }) });
     expect(bad.status).toBe(404);
     const escape = await fetch(`${base}/api/tasks/${task.id}/artifact?path=${encodeURIComponent('../../../etc/passwd')}`, { headers: auth() });
     expect(escape.status).toBe(400);
+    const fileEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=${encodeURIComponent('/etc/passwd')}`, { headers: auth() });
+    expect(fileEscape.status).toBe(400);
+    await fs.promises.symlink('/etc/passwd', `${view.worldPath}/escape-link`);
+    const symlinkEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=escape-link`, { headers: auth() });
+    expect(symlinkEscape.status).toBe(400);
   });
 
   it('inherits defaults live: drafts store only overrides and re-resolve when queued', async () => {
