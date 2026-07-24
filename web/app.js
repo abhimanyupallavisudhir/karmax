@@ -381,9 +381,8 @@ function principalLabel(principal) {
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
   { id: 'goal', label: 'Goal (auto-run)' },
-  { id: 'just-do', label: 'Just do' },
-  { id: 'script-exec', label: 'Script' },
 ];
+const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
 
 const NODES = [
   { key: 'setup', label: 'Setup' },
@@ -3831,7 +3830,12 @@ function renderTaskPage() {
           <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
         </div>
         <div class="meta">
-          <span>${esc(v.workflow)}${rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
+          <span>${v.workflowOptions?.length > 1
+            ? `<select id="tp-workflow-mode" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
+                ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
+              </select>`
+            : esc(workflowLabel(v.workflow))}
+            ${rec?.workflowVersion ? `<span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
@@ -3856,6 +3860,7 @@ function renderTaskPage() {
     }),
   );
   wireAttempts(v);
+  wireWorkflowMode(v);
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   if (tab === 'overview') {
@@ -3952,6 +3957,33 @@ function restoreThreadSelection(thread, snap) {
     sel.removeAllRanges();
     sel.addRange(range);
   } catch {}
+}
+
+function wireWorkflowMode(v) {
+  const select = document.getElementById('tp-workflow-mode');
+  if (!select) return;
+  select.addEventListener('change', async () => {
+    const prior = v.workflow;
+    const workflow = select.value;
+    select.disabled = true;
+    try {
+      const changed = await api(`/api/tasks/${v.taskId}/workflow`, {
+        method: 'PATCH',
+        body: JSON.stringify({ workflow }),
+      });
+      v.workflow = changed.workflow;
+      const rec = taskRecord(v.taskId);
+      if (rec) rec.workflow = changed.workflow;
+      toast(changed.workflow === 'goal'
+        ? 'Goal mode enabled — the agent will continue autonomously'
+        : 'Software Dev mode enabled — the task will stop at Review');
+      await Promise.all([refreshTask(), refreshTasks()]);
+    } catch (e) {
+      select.value = prior;
+      select.disabled = !v.workflowSwitchable;
+      toast(e.message, true);
+    }
+  });
 }
 
 // Switch the open task page to another of its tabs, pinning the tab in the URL

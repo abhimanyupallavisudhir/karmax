@@ -107,12 +107,13 @@ describe('Store', () => {
     const second = store.createTask({ projectId: p.id, listId: first.listId, title: first.title, workflow: first.workflow, workflowVersion: first.workflowVersion, params: { prompt: 'second', draft: true }, intentId: first.intentId });
     expect(second.attemptNumber).toBe(2);
     expect(second.num).toBeUndefined();
-    expect(store.listPrincipalTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(store.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(store.listTaskAttempts(p.id).map((t) => t.id)).toEqual([first.id, second.id]);
     const cancelled = { taskId: first.id, title: first.title, workflow: first.workflow, stage: 'cancelled' as const, status: 'cancelled' as const, messages: [], actions: [], state: {}, updatedAt: 1 };
     store.saveView(first.id, cancelled);
     expect(store.attemptGroup(first.id)!.principalAttemptId).toBe(second.id);
-    expect(store.listPrincipalTasks(p.id).map((t) => t.id)).toEqual([second.id]);
-    expect(store.listPrincipalTasks(p.id)[0]!.num).toBe(first.num); // logical # is stable
+    expect(store.listTasks(p.id).map((t) => t.id)).toEqual([second.id]);
+    expect(store.listTasks(p.id)[0]!.num).toBe(first.num); // logical # is stable
     expect(store.getTaskByNum(p.id, first.num!)!.id).toBe(second.id); // permalink follows principal
     expect(store.attemptGroup(second.id)!.confirmer).toEqual({ mode: 'agent' });
     expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'agent' })).not.toThrow();

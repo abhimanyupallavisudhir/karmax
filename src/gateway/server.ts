@@ -1777,6 +1777,15 @@ export class Gateway {
           return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
         }
       }
+      const workflowMatch = p.match(/^\/api\/tasks\/([^/]+)\/workflow$/);
+      if (workflowMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.changeWorkflow(token, workflowMatch[1]!, String(b.workflow ?? '')));
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);

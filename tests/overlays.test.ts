@@ -27,6 +27,6 @@ describe('overlay resolution + safe mode (SPEC §9)', () => {
 describe('manifest dependency resolution (SPEC §4.6)', () => {
   it('resolves the transitive closure of requires', () => {
     expect(resolveRequires(['software-dev']).sort()).toEqual(['merge-queue', 'software-dev'].sort());
-    expect(manifest('software-dev')?.onActivate?.spawnTask?.workflow).toBe('just-do');
+    expect(manifest('software-dev')?.onActivate?.spawnTask?.workflow).toBe('goal');
   });
 });

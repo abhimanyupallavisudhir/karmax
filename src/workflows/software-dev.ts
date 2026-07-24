@@ -86,6 +86,9 @@ export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
  * returns what it applied. `setTarget` above is the back-compat shim for `target`.
  */
 export const updateParamsUpdate = defineUpdate<{ applied: string[] }, [Record<string, unknown>]>('updateParams');
+/** Switch between the two compatible policies sharing this execution. This is a
+ * mode update, not a Temporal workflow-type hot swap; the execution stays pinned. */
+export const changeWorkflowUpdate = defineUpdate<{ workflow: 'software-dev' | 'goal' }, ['software-dev' | 'goal']>('changeWorkflow');
 export const viewQuery = defineQuery<TaskView>('view');
 /**
  * Live follow-up feed for in-flight injection (SPEC §5.6). A running agent turn
@@ -181,15 +184,21 @@ export async function softwareDevV1_2(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.2.0');
 }
 
+/** Compatible software-dev/goal mode switching. */
+export async function softwareDevV1_3(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.3.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0'): Promise<{ stage: Stage; sha?: string }> {
+async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0'): Promise<{ stage: Stage; sha?: string }> {
   const liveAgentStates = behaviorVersion !== '1.0.0';
-  const providerTerminalCompletion = behaviorVersion === '1.2.0';
+  const providerTerminalCompletion = behaviorVersion === '1.2.0' || behaviorVersion === '1.3.0';
+  const modeSwitching = behaviorVersion === '1.3.0';
   const taskId = input.taskId;
   const recovery = input.recovery;
   let stage: Stage = recovery ? 'do' : 'setup';
@@ -201,6 +210,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       : [];
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   const base = input.base ?? input.project.defaultBase ?? 'main';
+  let goalMode = !!input.goalMode;
   let confirmed = false;
   let cancelled = false;
   let retryRequested = false;
@@ -254,7 +264,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   // their layer equivalents. A child with a `parentTaskId` always routes Review to
   // its parent regardless (parent-as-confirmer, SPEC §5.3), so this only governs
   // top-level tasks.
-  const confirmLayers = confirmLayersOf(input.confirm, !!input.autoConfirm);
+  // Goal owns the zero-layer policy dynamically. Keeping the normal Software Dev
+  // layers separately means switching back restores the task's original gate.
+  const softwareDevConfirmLayers = confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   const accountGrants = new Map<string, { accountId: string; configHome?: string; apiKeyHandle?: string }>();
   let turnSeq = 0;
@@ -424,10 +436,19 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   }
 
   function buildView(): TaskView {
+    const workflowSwitchable =
+      modeSwitching &&
+      !confirmed &&
+      !cancelled &&
+      !pointOfNoReturnPassed &&
+      (stage === 'setup' || stage === 'do' || stage === 'review');
     return {
       taskId,
       title: input.title,
-      workflow: 'software-dev',
+      workflow: modeSwitching ? (goalMode ? 'goal' : 'software-dev') : 'software-dev',
+      ...(modeSwitching
+        ? { workflowOptions: ['software-dev', 'goal'], workflowSwitchable }
+        : {}),
       stage,
       status,
       messages: msgs,
@@ -546,6 +567,48 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     return true;
   });
   setHandler(updateParamsUpdate, (patch) => applyParamPatch(patch), { validator: validateParamPatch });
+  setHandler(
+    changeWorkflowUpdate,
+    async (workflow) => {
+      const nextGoalMode = workflow === 'goal';
+      if (nextGoalMode === goalMode) return { workflow };
+      goalMode = nextGoalMode;
+      liveInput.goalMode = goalMode;
+      liveInput.workflow = workflow;
+      if (goalMode) {
+        // This both redirects an in-flight Do turn (the adapter polls follow-ups)
+        // and wakes a Software Dev task already waiting at Review. In the latter
+        // case the workflow returns to Do instead of auto-approving potentially
+        // partial work that pre-dated the mode switch.
+        msgs.push({
+          id: `mode-${msgs.length}`,
+          role: 'user',
+          text: 'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.',
+          ts: msgs.length,
+        });
+      }
+      await publish();
+      return { workflow };
+    },
+    {
+      validator: (workflow) => {
+        if (workflow !== 'software-dev' && workflow !== 'goal')
+          throw ApplicationFailure.nonRetryable(`unsupported workflow mode "${workflow}"`, 'WorkflowModeInvalid');
+        if (workflow === (goalMode ? 'goal' : 'software-dev')) return;
+        if (
+          !modeSwitching ||
+          confirmed ||
+          cancelled ||
+          pointOfNoReturnPassed ||
+          (stage !== 'setup' && stage !== 'do' && stage !== 'review')
+        )
+          throw ApplicationFailure.nonRetryable(
+            'the workflow can only switch between Software Dev and Goal before confirmation begins',
+            'WorkflowModeLocked',
+          );
+      },
+    },
+  );
 
   // ── Resolve wrapper (SPEC §5.2) ──
   async function withResolve<T>(stageName: string, fn: () => Promise<T>): Promise<T> {
@@ -1141,7 +1204,15 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
 
     // v1.2 advances only after an adapter observed the provider's successful terminal
     // event. v1.0/v1.1 retain their immutable signal/idle semantics for replay.
-    const turnFinished = providerTerminalCompletion ? !!turn.providerCompleted : turn.completed;
+    // Software Dev treats a clean provider return as the turn boundary and asks
+    // its confirmer to judge the result. Goal has no reviewer, so v1.3 requires
+    // the agent's explicit completion marker; a merely clean-but-partial return
+    // is re-prompted instead of silently auto-merging.
+    const turnFinished = providerTerminalCompletion
+      ? modeSwitching && goalMode
+        ? !!turn.completed
+        : !!turn.providerCompleted
+      : turn.completed;
     const finishing = turnFinished || (!providerTerminalCompletion && turn.needsInput) || turn.raise;
 
     // While children are still running, the parent doesn't leave the Do loop:
@@ -1248,11 +1319,13 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     {
       // Legacy goal versions required signal_completion. v1.2 treats the provider's
       // verified successful terminal event as the authoritative turn boundary.
-      if (input.goalMode && !turnFinished && !turn.raise) {
+      if (goalMode && !turnFinished && !turn.raise) {
         msgs.push({
           id: `kg-${msgs.length}`,
           role: 'user',
-          text: providerTerminalCompletion
+          text: modeSwitching
+            ? 'Keep going until the goal is fully complete and verified, then call signal_completion. Do not call it for partial progress.'
+            : providerTerminalCompletion
             ? 'Keep going until the goal is fully complete, then finish with the result.'
             : 'Keep going until the goal is fully complete, then call signal_completion.',
           ts: msgs.length,
@@ -1328,6 +1401,9 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       // would push a zero-/partial-work diff straight through to merge unseen: a stall
       // degrades to a single human gate. (In goal mode the loop above already
       // guarantees completed|raise here, so the guard changes no reachable goal path.)
+      const confirmLayers: ConfirmLayer[] = modeSwitching
+        ? (goalMode ? (turn.raise ? [{ kind: 'human', audience: ['@creator'] }] : []) : softwareDevConfirmLayers)
+        : softwareDevConfirmLayers;
       const gates: ConfirmLayer[] = confirmLayers.length || turnFinished || turn.raise
         ? confirmLayers : [{ kind: 'human', audience: ['@creator'] }];
       let backToDo = false;

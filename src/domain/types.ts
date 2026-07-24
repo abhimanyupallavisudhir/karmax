@@ -450,6 +450,12 @@ export interface TaskRecord {
   listId: string;
   title: string;
   workflow: string; // workflow definition name
+  /**
+   * Workflow definition that started the current Temporal execution. Normally
+   * identical to `workflow`; it stays fixed while a compatible workflow mode
+   * (software-dev ↔ goal) changes in-flight, preserving the real replay pin.
+   */
+  executionWorkflow?: string;
   workflowVersion: string; // pinned at creation (SPEC §4.4)
   params: TaskParams;
   createdAt: number;
@@ -871,6 +877,11 @@ export interface TaskView {
   num?: number;
   title: string;
   workflow: string;
+  /** Compatible workflow modes this execution can adopt without replacing its
+   * pinned Temporal workflow. The UI renders these as the in-flight mode picker. */
+  workflowOptions?: string[];
+  /** False once confirmation / the point of no return has begun. */
+  workflowSwitchable?: boolean;
   stage: Stage;
   status: TaskStatus;
   /**
