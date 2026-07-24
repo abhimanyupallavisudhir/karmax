@@ -1757,7 +1757,7 @@ function connectWs() {
         S.liveOutput = ev.payload.text;
         updateLiveBubble();
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message') {
-        if (S.taskTab === 'checkin') renderTaskPage();
+        if (S.taskTab === 'checkin') scheduleTaskPageRender();
         else renderTaskEvents();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
@@ -1846,6 +1846,14 @@ function renderShell() {
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
+  // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
+  // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
+  // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
+  // them. Snapshot the focused row's stable identity and re-focus the matching row.
+  const active = document.activeElement;
+  const focusedKey = active && rail.contains(active)
+    ? (active.dataset.id ? `[data-id="${active.dataset.id}"]` : active.id ? `#${active.id}` : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
+    : null;
   rail.innerHTML = `
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
@@ -1865,6 +1873,7 @@ function renderRail() {
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
+  if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
 }
 
 function switchTab(tab) {
@@ -1889,9 +1898,13 @@ function captureFocus(root) {
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
     st.selectionStart = el.selectionStart;
     st.selectionEnd = el.selectionEnd;
-    // A multi-line field scrolls its own content; a fresh element resets to the
-    // top, so snapshot the internal scroll and put it back with the caret.
+    // A field scrolls its own content; a fresh element resets to the top-left, so
+    // snapshot the internal scroll and put it back with the caret. scrollLeft is
+    // the one that bites in a single-line <input>: setSelectionRange restores the
+    // caret but does NOT re-scroll the box to reveal it, so a long line otherwise
+    // snaps back to its start on every WS-driven repaint while the caret stays put.
     st.scrollTop = el.scrollTop;
+    st.scrollLeft = el.scrollLeft;
   }
   return st;
 }
@@ -1911,6 +1924,7 @@ function restoreFocus(root, st) {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
   if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
+  if (typeof st.scrollLeft === 'number') el.scrollLeft = st.scrollLeft;
 }
 
 // A background (WebSocket-driven) refresh repaints #main by swapping its
@@ -1944,6 +1958,19 @@ function flushBgRender() {
   if (main && interactionInFlight(main)) return; // still busy — wait for the next release
   bgRenderQueued = false;
   renderMain();
+}
+
+// A live agent emits a burst of conversation.message / agent.activity events (each
+// tool call is one), and every one used to fire a full renderTaskPage() rebuild
+// synchronously — so a single turn could repaint the whole page a dozen times in a
+// frame, which is what made scrolling the conversation feel janky. Coalesce the
+// WS-driven repaints into one per animation frame: the last state wins and the
+// browser paints once, at a frame boundary.
+let taskPageRenderQueued = false;
+function scheduleTaskPageRender() {
+  if (taskPageRenderQueued) return;
+  taskPageRenderQueued = true;
+  requestAnimationFrame(() => { taskPageRenderQueued = false; renderTaskPage(); });
 }
 
 // ── main content ───────────────────────────────────────────────────────────
@@ -2020,15 +2047,17 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// The default list transparently hides two kinds of noise unless the query opts in:
-// archived tasks (`-is:archived`) and the auto-spawned *runs* of a repeatable series
-// (`-is:run`), so a cron series doesn't flood the list — its template still shows, and
-// you drill into runs with `is:run` (or the Repeatable/Archived views). Archived and runs
-// are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
-// evaluated query carries the defaults. If the query already mentions a facet, we leave it.
+// The default list transparently hides three kinds of noise unless the query opts in:
+// archived tasks (`-is:archived`), the auto-spawned *runs* of a repeatable series
+// (`-is:run`), and delegated *sub-tasks* (`-is:subtask`) — a sub-task lives under its
+// parent's detail page, not as a sibling at the top level, so a fan-out of children
+// doesn't flood the list. Its parent still shows, and you drill into children with
+// `is:subtask` (or the Sub-tasks/Repeatable/Archived views). These are therefore just
+// facets, not toggles. The clean `S.search` stays in the box; only the evaluated query
+// carries the defaults. If the query already mentions a facet, we leave it.
 // The task-picker overlay passes its own facet list (e.g. the fork search keeps archived).
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
-function effectiveQuery(q, facets = ['archived', 'run']) {
+function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
   let s = (q || '').trim();
   for (const facet of facets) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
   return s;
@@ -2041,6 +2070,7 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:subtasks', name: 'Sub-tasks', icon: '↳', query: 'is:subtask' },
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
@@ -2152,20 +2182,27 @@ function tasksView() {
   // hide runs from every list surface (flat + grouped) below.
   S._runsBySeries = {};
   for (const t of S.tasks) if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
-  const notRun = (t) => !t.params?.runOf;
+  // Runs nest under their series row and sub-tasks nest under their parent's detail page,
+  // so by default neither belongs in the flat top-level list. The server already drops both
+  // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
+  // and it opts back in when the query explicitly asks for that facet (the Sub-tasks view's
+  // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
+  const keepRun = queryMentionsFacet(S.search, 'run');
+  const keepSub = queryMentionsFacet(S.search, 'subtask');
+  const topLevel = (t) => (keepRun || !t.params?.runOf) && (keepSub || !t.parentTaskId);
   // The server already applied the query (incl. the default -is:archived from effectiveQuery).
   // Fallback (before the first result lands) filters client-side and drops archived to match.
   const flat = (r
     ? r.tasks
     : S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-  ).filter(notRun);
+  ).filter(topLevel);
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
   let body;
   if (groups) {
     body = groups
       .map((g) => {
-        const gt = g.tasks.filter(notRun);
+        const gt = g.tasks.filter(topLevel);
         return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
       })
       .join('');
@@ -3602,14 +3639,23 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    // paramDefaults keys off the fetched view's workflow, so it follows the batch.
-    S.paramDefaults = await loadParamDefaults(taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
+  // Param defaults only feed the Parameters tab, and resolving them costs a git
+  // subprocess (defaultBranch) on the server — so they used to add that latency to
+  // the *front* of every task open (the paint waited on them). They key off the
+  // task's (project, workflow), which never change while it's open, so load them
+  // once, after the first paint, and repaint only if the user is still here and
+  // actually looking at the Parameters tab.
+  loadParamDefaults(taskId).then((d) => {
+    if (S.selected !== taskId) return; // navigated away before it landed
+    S.paramDefaults = d;
+    if (S.taskTab === 'parameters') renderTaskPage();
+  });
 }
 async function refreshTask() {
   if (!S.selected) return;
@@ -3634,7 +3680,10 @@ async function refreshTask() {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    S.paramDefaults = await loadParamDefaults(id);
+    // paramDefaults are NOT refetched here: they key off (project, workflow), which
+    // can't change under a live task, so the value from openTask still holds. This
+    // refresh runs on every `view.updated` WS push — re-resolving defaults would
+    // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
   } catch {}
   renderTaskPage();
 }
@@ -3978,6 +4027,13 @@ function wireWorkflowMode(v) {
         ? 'Goal mode enabled — the agent will continue autonomously'
         : 'Software Dev mode enabled — the task will stop at Review');
       await Promise.all([refreshTask(), refreshTasks()]);
+      // The workflow just changed, and param defaults key off it — reload them here
+      // (refreshTask deliberately doesn't, to avoid a git subprocess per WS refresh).
+      loadParamDefaults(v.taskId).then((d) => {
+        if (S.selected !== v.taskId) return;
+        S.paramDefaults = d;
+        if (S.taskTab === 'parameters') renderTaskPage();
+      });
     } catch (e) {
       select.value = prior;
       select.disabled = !v.workflowSwitchable;
@@ -6284,7 +6340,8 @@ const quickDefaultsHeader = () => '';
 // agents get with each prompt) or the selected entry. The open entry rides in
 // the URL hash so wiki pages deep-link like settings panes.
 function wikiScopeInfo(proj) {
-  if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki` };
+  if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
+    selector: S.wikiViews?.[proj.id] || '' };
   const org = currentOrg();
   if (!org) return null;
   return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki` };
@@ -6295,9 +6352,19 @@ function wikiView(proj) {
   if (!info) return `<div class="empty">No organization yet.</div>`;
   return `<div class="organization-settings wiki-page"><div class="settings-header"><div>
       <h1 class="page-title">${esc(info.title)} — wiki</h1>
-    </div></div>
+    </div>${proj ? `<div class="wiki-view-picker"><label for="wiki-view-input">Viewing</label>
+      <input id="wiki-view-input" list="wiki-view-options" placeholder="Default branch" autocomplete="off">
+      <datalist id="wiki-view-options"></datalist></div>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
+}
+
+function wikiUrl(info, suffix = '', params = {}) {
+  const url = new URL(`${info.base}${suffix}`, location.origin);
+  if (info.selector?.startsWith('task:')) url.searchParams.set('taskId', info.selector.slice(5));
+  else if (info.selector?.startsWith('branch:')) url.searchParams.set('branch', info.selector.slice(7));
+  for (const [key, value] of Object.entries(params)) if (value != null && value !== '') url.searchParams.set(key, value);
+  return `${url.pathname}${url.search}`;
 }
 
 const wikiIsDefault = (e) => (e.labels || []).includes('default');
@@ -6316,16 +6383,40 @@ async function wireWikiView(proj) {
   const nav = $('#wiki-nav');
   const pane = $('#wiki-pane');
   if (!info || !nav || !pane) return;
+  if (proj) {
+    try {
+      const refs = await api(`${info.base}/refs`);
+      const input = $('#wiki-view-input');
+      const options = $('#wiki-view-options');
+      const entries = [
+        { value: '', label: `Default branch · ${refs.defaultBranch}` },
+        ...(refs.tasks || []).map((task) => ({ value: `task:${task.id}`, label: `#${task.num || '–'} ${task.title} · ${task.branch}` })),
+        ...(refs.branches || []).filter((branch) => branch !== refs.defaultBranch)
+          .map((branch) => ({ value: `branch:${branch}`, label: `Branch · ${branch}` })),
+      ];
+      const selected = entries.find((entry) => entry.value === info.selector) || entries[0];
+      input.value = selected.label;
+      options.innerHTML = entries.map((entry) => `<option value="${esc(entry.label)}"></option>`).join('');
+      input.onchange = () => {
+        const chosen = entries.find((entry) => entry.label === input.value.trim());
+        if (!chosen) return;
+        S.wikiViews ||= {};
+        S.wikiViews[proj.id] = chosen.value;
+        S.wikiEditing = null;
+        wireWikiView(proj);
+      };
+    } catch { /* the canonical wiki remains usable without the selector metadata */ }
+  }
   const key = `${info.scope}:${info.id}`;
   let data;
-  try { data = await api(info.base); }
+  try { data = await api(wikiUrl(info)); }
   catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
   const sel = decodeURIComponent((location.hash || '').slice(1));
 
   nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
     <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
     ${wikiTreeHtml(data.toc?.children, sel)}
-    <button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>`;
+    ${data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
   const open = (path) => {
     S.wikiEditing = null;
     history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
@@ -6337,7 +6428,10 @@ async function wireWikiView(proj) {
 
   // A page fetch goes through the base route so built-ins resolve (a virtual
   // built-in has no on-disk page for /page to find).
-  const fetchPage = async (p) => (await api(`${info.base}?path=${encodeURIComponent(p)}`)).page;
+  const fetchPage = async (p) => {
+    const read = await api(wikiUrl(info, '', { path: p }));
+    return read.page ? { ...read.page, _wikiWritable: read.view?.writable !== false } : null;
+  };
   // A background re-render (WS task event) must not blow away an in-progress
   // editor: restore it for the same scope before painting the read view.
   if (S.wikiEditing?.wikiKey === key) {
@@ -6595,7 +6689,7 @@ function renderWikiHome(info, proj, pane, data) {
   pane.innerHTML = (data.unconditional || []).map((u) => `
     <div class="card wiki-uncond">
       <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
-        <button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button></div>
+        ${data.view?.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}</div>
       <div class="msg-text md wiki-md">${renderMessageBody(u.body || '')}</div>
     </div>`).join('') + (data.tocText ? `
     <div class="card wiki-uncond">
@@ -6605,7 +6699,7 @@ function renderWikiHome(info, proj, pane, data) {
   typesetMath(pane);
   pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
     try {
-      const read = await api(`${info.base}?path=${encodeURIComponent(b.dataset.path)}`);
+      const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
       if (!read.page) return toast('Entry not found', true);
       history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(read.page.path)}`);
       renderWikiEditor(info, proj, pane, read.page);
@@ -6629,7 +6723,7 @@ function renderWikiPage(info, proj, pane, page) {
     <div class="card">
       <div class="msg-text md wiki-md">${renderMessageBody(wikiBody(page.content))}</div>
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:10px"><button class="btn sm" id="wiki-page-edit">Edit</button>${remove}</div>
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? '<span class="task-sub">Read-only branch view</span>' : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
     </div>`;
   typesetMath(pane);
   $('#wiki-page-delete')?.addEventListener('click', async () => {
@@ -6638,7 +6732,7 @@ function renderWikiPage(info, proj, pane, page) {
       : `Delete “${page.name}” (${page.path})? Its folder and attached files go with it.`;
     if (!confirm(q)) return;
     try {
-      await api(`${info.base}/page?path=${encodeURIComponent(page.path)}`, { method: 'DELETE' });
+      await api(wikiUrl(info, '/page', { path: page.path }), { method: 'DELETE' });
       if (!page.builtin) history.replaceState({ kx: 1 }, '', location.pathname);
       wireWikiView(proj);
     } catch (e) { toast(e.message, true); }
@@ -6750,7 +6844,7 @@ function renderWikiEditor(info, proj, pane, page) {
     if (isNew) body.create = true;
     else if (path !== page.path) body.prevPath = page.path;
     try {
-      await api(`${info.base}/page`, { method: 'PUT', body: JSON.stringify(body) });
+      await api(wikiUrl(info, '/page'), { method: 'PUT', body: JSON.stringify(body) });
       S.wikiEditing = null;
       history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(path)}`);
       wireWikiView(proj);

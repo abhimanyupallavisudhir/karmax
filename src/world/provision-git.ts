@@ -56,7 +56,7 @@ export function credentialFile(home: string, index: number): string {
 }
 
 export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec, options: ProvisionRepoOptions):
-  Promise<{ root: string; repos: WorldRepo[]; warnings: string[] }> {
+  Promise<{ root: string; repos: WorldRepo[]; warnings: string[]; workdir?: string }> {
   const branch = spec.branch ?? `karmax/${spec.taskId}`;
   const sources = (spec.repos?.length ? spec.repos : spec.repo ? [spec.repo] : []).map((value) => value.trim()).filter(Boolean);
   const warnings: string[] = [];
@@ -65,11 +65,18 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
   if (!sources.length) {
     await runOrThrow(target, `mkdir -p ${quote(root)} && git -C ${quote(root)} init -q -b ${quote(spec.base || 'main')}`);
     await configureRepo(target, root, spec, branch, false);
-    return { root, repos: [], warnings };
+    return { root, repos: [], warnings, ...(spec.scratch ? { workdir: root } : {}) };
   }
-  const multi = sources.length > 1;
-  const names = uniqueNames(sources.map(remoteName));
+  const multi = sources.length > 1 || spec.scratch;
+  const allNames = uniqueNames([...(spec.scratch ? ['scratch'] : []), ...sources.map(remoteName)]);
+  const scratchName = spec.scratch ? allNames[0]! : undefined;
+  const names = spec.scratch ? allNames.slice(1) : allNames;
   if (multi) await runOrThrow(target, `mkdir -p ${quote(root)}`);
+  const workdir = spec.scratch ? path.posix.join(root, scratchName!) : undefined;
+  if (workdir) {
+    await runOrThrow(target, `mkdir -p ${quote(workdir)} && git -C ${quote(workdir)} init -q -b ${quote(spec.base || 'main')}`);
+    await configureRepo(target, workdir, spec, branch, false);
+  }
   const uniqueKeys = [...new Set([spec.gitCredentials?.sshKey, ...Object.values(spec.gitCredentials?.repositories ?? {})]
     .filter((value): value is string => Boolean(value)))];
   const repos: WorldRepo[] = [];
@@ -109,7 +116,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     }
     if (!copied) warnings.push(options.copyGlobsWarning);
   }
-  return { root, repos, warnings };
+  return { root, repos, warnings, ...(workdir ? { workdir } : {}) };
 }
 
 /** Rewrite the sandbox's remote-tracking refs with the host checkout's truth.

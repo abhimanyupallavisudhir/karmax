@@ -481,7 +481,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       base,
       targetBranch: target,
       world,
-      worldPath: world?.root,
+      worldPath: world?.workdir ?? world?.root,
       pr,
       mergeQueue: mergeQueuePos,
       subTasks: subTaskIds.length ? subTaskIds : undefined,

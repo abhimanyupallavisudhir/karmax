@@ -233,6 +233,16 @@ export class Store {
         targetBranch TEXT, ord INTEGER NOT NULL,
         PRIMARY KEY (projectId, repositoryId)
       );
+      CREATE TABLE IF NOT EXISTS project_wikis (
+        projectId TEXT PRIMARY KEY, repositoryId TEXT, createdAt INTEGER NOT NULL,
+        updatedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS organization_wiki_versions (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, path TEXT NOT NULL,
+        version INTEGER NOT NULL, operation TEXT NOT NULL, kind TEXT,
+        content TEXT, principal TEXT, previousPath TEXT, createdAt INTEGER NOT NULL,
+        UNIQUE (organizationId, path, version)
+      );
       CREATE TABLE IF NOT EXISTS repository_deploy_keys (
         repositoryId TEXT PRIMARY KEY, cloneKeyId TEXT NOT NULL, writeKeyId TEXT NOT NULL,
         cloneHandle TEXT NOT NULL, writeHandle TEXT NOT NULL, createdAt INTEGER NOT NULL
@@ -427,17 +437,27 @@ export class Store {
     if (!invitationCols.some((c) => c.name === 'profileId')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN profileId TEXT');
     const previewCols = this.db.prepare('PRAGMA table_info(preview_leases)').all() as any[];
     if (!previewCols.some((c) => c.name === 'hostname')) this.db.exec('ALTER TABLE preview_leases ADD COLUMN hostname TEXT');
+    const wikiVersionCols = this.db.prepare('PRAGMA table_info(organization_wiki_versions)').all() as any[];
+    if (!wikiVersionCols.some((c) => c.name === 'previousPath'))
+      this.db.exec('ALTER TABLE organization_wiki_versions ADD COLUMN previousPath TEXT');
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_hostname ON preview_leases(hostname) WHERE hostname IS NOT NULL');
     if (!projectCols.some((c) => c.name === 'organizationId')) this.db.exec('ALTER TABLE projects ADD COLUMN organizationId TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(organizationId)');
     if (!cols.some((c) => c.name === 'intentId')) this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT');
     if (!cols.some((c) => c.name === 'attemptNumber')) this.db.exec('ALTER TABLE tasks ADD COLUMN attemptNumber INTEGER');
-    // Existing rows become single-attempt intents. This is deliberately idempotent.
+    // Legacy rows become single-attempt intents. Alternate attempts already point
+    // at their root intent and must never acquire an intent row of their own:
+    // doing so makes the alternate look like a second top-level task after boot.
     this.db.exec(`
       UPDATE tasks SET intentId = id WHERE intentId IS NULL;
       UPDATE tasks SET attemptNumber = 1 WHERE attemptNumber IS NULL;
       INSERT OR IGNORE INTO task_intents (id, principalAttemptId, createdAt)
-        SELECT id, id, createdAt FROM tasks;
+        SELECT id, id, createdAt FROM tasks WHERE id = intentId;
+      DELETE FROM task_intents
+        WHERE EXISTS (
+          SELECT 1 FROM tasks
+          WHERE tasks.id = task_intents.id AND tasks.intentId <> task_intents.id
+        );
       CREATE INDEX IF NOT EXISTS idx_tasks_intent ON tasks(intentId, attemptNumber);
     `);
     if (!cols.some((c) => c.name === 'notes')) {
@@ -687,7 +707,7 @@ export class Store {
       this.db.prepare('DELETE FROM audit_log WHERE scopeKey=?').run(scopeKey);
       this.db.prepare('DELETE FROM attachment_scopes WHERE projectId=?').run(id);
       this.deleteProjectKv([id], taskIds);
-      for (const table of ['project_memberships', 'project_repositories', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
+      for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id);
       deleteRows(this.db, 'teams', 'id', teamIds);
       deleteRows(this.db, 'tasks', 'id', taskIds);
@@ -773,6 +793,8 @@ export class Store {
       git_connections: selectRows(this.db, 'git_connections', 'organizationId=?', [organizationId]),
       repositories: rowsFor(this.db, 'repositories', 'id', repositoryIds),
       project_repositories: rowsFor(this.db, 'project_repositories', 'projectId', projectIds),
+      project_wikis: rowsFor(this.db, 'project_wikis', 'projectId', projectIds),
+      organization_wiki_versions: selectRows(this.db, 'organization_wiki_versions', 'organizationId=?', [organizationId]),
       // Public key IDs make external cleanup auditable; credential-broker handles
       // and private material never belong in an export.
       repository_deploy_keys: rowsFor(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds)
@@ -888,7 +910,7 @@ export class Store {
       deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'attachment_scopes', 'projectId', projectIds);
       this.deleteProjectKv(projectIds, taskIds);
-      for (const table of ['project_memberships', 'project_repositories', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
+      for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         deleteRows(this.db, table, 'projectId', projectIds);
       this.db.prepare('DELETE FROM preview_leases WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId);
@@ -902,6 +924,7 @@ export class Store {
       this.db.prepare('DELETE FROM organization_identity_policy WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_invitations WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM organization_wiki_versions WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM git_connections WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM github_install_states WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
@@ -1318,6 +1341,7 @@ export class Store {
     const projects = (this.db.prepare('SELECT DISTINCT projectId FROM project_repositories WHERE repositoryId=?').all(id) as any[])
       .map((r) => String(r.projectId));
     this.db.prepare('DELETE FROM project_repositories WHERE repositoryId=?').run(id);
+    this.db.prepare('UPDATE project_wikis SET repositoryId=NULL, updatedAt=? WHERE repositoryId=?').run(Date.now(), id);
     this.db.prepare('DELETE FROM repository_deploy_keys WHERE repositoryId=?').run(id);
     this.db.prepare('DELETE FROM repositories WHERE id=?').run(id);
     for (const projectId of projects) this.syncProjectRepositoryConfig(projectId);
@@ -1401,6 +1425,85 @@ export class Store {
         targetBranch: r.prTargetBranch ?? undefined, order: r.prOrd, repository: rowToRepository(r) }));
   }
 
+  projectWiki(projectId: string): { projectId: string; repository?: Repository; createdAt: number; updatedAt: number } | undefined {
+    const row = this.db.prepare('SELECT * FROM project_wikis WHERE projectId=?').get(projectId) as any;
+    if (!row) return undefined;
+    return {
+      projectId,
+      repository: row.repositoryId ? this.getRepository(String(row.repositoryId)) : undefined,
+      createdAt: Number(row.createdAt),
+      updatedAt: Number(row.updatedAt),
+    };
+  }
+
+  repositoryIsProjectWiki(repositoryId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM project_wikis WHERE repositoryId=? LIMIT 1').get(repositoryId);
+  }
+
+  setProjectWikiRepository(projectId: string, repositoryId?: string): void {
+    if (!this.getProject(projectId)) throw new Error(`no project ${projectId}`);
+    if (repositoryId && !this.getRepository(repositoryId)) throw new Error(`no repository ${repositoryId}`);
+    const now = Date.now();
+    this.db.prepare(`INSERT INTO project_wikis (projectId, repositoryId, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?) ON CONFLICT(projectId) DO UPDATE SET
+      repositoryId=excluded.repositoryId, updatedAt=excluded.updatedAt`)
+      .run(projectId, repositoryId ?? null, now, now);
+  }
+
+  recordOrganizationWikiVersion(input: {
+    organizationId: string;
+    path: string;
+    operation: 'baseline' | 'write' | 'delete' | 'move';
+    kind?: 'skill' | 'memory';
+    content?: string;
+    principal?: string;
+    previousPath?: string;
+    /** Insert only when this path has no recorded history. Used to snapshot
+     * pre-versioning content immediately before its first mutation. */
+    ifEmpty?: boolean;
+  }): boolean {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (input.ifEmpty && this.db.prepare(`SELECT 1 FROM organization_wiki_versions
+          WHERE organizationId=? AND path=? LIMIT 1`).get(input.organizationId, input.path)) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const version = Number((this.db.prepare(`SELECT COALESCE(MAX(version), 0) + 1 n
+        FROM organization_wiki_versions WHERE organizationId=? AND path=?`)
+        .get(input.organizationId, input.path) as any).n);
+      this.db.prepare(`INSERT INTO organization_wiki_versions
+        (id, organizationId, path, version, operation, kind, content, principal, previousPath, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(newId('wikiver'), input.organizationId, input.path, version, input.operation,
+          input.kind ?? null, input.content ?? null, input.principal ?? null,
+          input.previousPath ?? null, Date.now());
+      this.db.exec('COMMIT');
+      return true;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  organizationWikiHistory(organizationId: string, wikiPath?: string): Array<{
+    id: string; organizationId: string; path: string; version: number; operation: string;
+    kind?: string; content?: string; principal?: string; previousPath?: string; createdAt: number;
+  }> {
+    const rows = wikiPath
+      ? this.db.prepare(`SELECT * FROM organization_wiki_versions
+          WHERE organizationId=? AND (path=? OR previousPath=?)
+          ORDER BY createdAt DESC, rowid DESC`).all(organizationId, wikiPath, wikiPath)
+      : this.db.prepare(`SELECT * FROM organization_wiki_versions WHERE organizationId=?
+          ORDER BY createdAt DESC, rowid DESC`).all(organizationId);
+    return (rows as any[]).map((row) => ({
+      id: row.id, organizationId: row.organizationId, path: row.path, version: Number(row.version),
+      operation: row.operation, kind: row.kind ?? undefined, content: row.content ?? undefined,
+      principal: row.principal ?? undefined, previousPath: row.previousPath ?? undefined,
+      createdAt: Number(row.createdAt),
+    }));
+  }
+
   detachProjectRepository(projectId: string, repositoryId: string): void {
     this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, repositoryId);
     this.syncProjectRepositoryConfig(projectId);
@@ -1416,7 +1519,9 @@ export class Store {
     if (!projectBefore) throw new Error(`no project ${projectId}`);
     // A catalog SSH URL carries its GitHub connection/deploy-key metadata. Keep
     // those attachments synchronized automatically; users edit one plain list.
-    const catalog = projectBefore.organizationId ? this.listRepositories(projectBefore.organizationId) : [];
+    const catalog = projectBefore.organizationId
+      ? this.listRepositories(projectBefore.organizationId).filter((repository) => !this.repositoryIsProjectWiki(repository.id))
+      : [];
     const wanted = new Map(catalog.filter((repository) => sources.includes(repository.sshUrl)).map((repository) => [repository.id, repository]));
     for (const attachment of this.listProjectRepositories(projectId))
       if (!wanted.has(attachment.repositoryId)) this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, attachment.repositoryId);
@@ -1590,7 +1695,8 @@ export class Store {
   /** One row per logical task: only the current principal appears in list/search. */
   listTasks(projectId: string): TaskRecord[] {
     const rows = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
-      JOIN task_intents i ON i.principalAttemptId=t.id JOIN tasks root ON root.id=i.id
+      JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+      JOIN tasks root ON root.id=i.id
       WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId) as any[];
     return this.attachTags(projectId, rows.map(rowToTask));
   }

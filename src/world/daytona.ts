@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse, WorldLifecycleState,
   WorldProcess, WorldProcessSpec, WorldProvider, WorldPty, WorldPtySpec, WorldSpec } from './types.js';
-import { worldRelativePath } from './types.js';
+import { worldRelativePath, worldWorkingDirectory } from './types.js';
 import { boundedResponseBody } from './http.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
@@ -113,6 +113,7 @@ export class DaytonaWorldProvider implements WorldProvider {
         branch: spec.branch ?? `karmax/${spec.taskId}`, base: provisioned.repos[0]?.base ?? spec.base,
         target: provisioned.repos[0]?.target ?? spec.target,
         repo: provisioned.repos[0]?.repo, repos: provisioned.repos,
+        ...(provisioned.workdir ? { workdir: provisioned.workdir } : {}),
         sealedProviderRef: this.seal({ sandboxId: sandbox.id, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) }),
         meta: { releaseOnCompletion: true, environmentFlavor: flavor,
           ...((selectedSnapshot ?? selectedImage) ? { environmentArtifact: selectedSnapshot ?? selectedImage } : {}) },
@@ -244,7 +245,8 @@ class DaytonaWorld implements World {
     await this.sandbox.fs.uploadFile(content, target);
   }
   async listFiles(): Promise<string[]> {
-    const result = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print | sed 's#^./##'"]);
+    const result = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print | sed 's#^./##'"],
+      { cwd: this.handle.root });
     if (result.code !== 0) throw new Error(result.stderr || 'failed to list remote files');
     return result.stdout.split('\n').map((value) => value.trim()).filter(Boolean);
   }
@@ -363,7 +365,7 @@ class DaytonaWorld implements World {
     return path.posix.join(this.handle.root, safe);
   }
   private cwd(value?: string): string {
-    if (!value) return this.handle.root;
+    if (!value) return worldWorkingDirectory(this.handle);
     if (value === this.handle.root || value.startsWith(`${this.handle.root}/`)) return value;
     const safe = worldRelativePath(value);
     return safe === '.' ? this.handle.root : path.posix.join(this.handle.root, safe);

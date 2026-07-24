@@ -39,7 +39,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   function view(): TaskView {
     return {
       taskId, title: input.title, workflow: 'script-exec', stage, status, messages: msgs, actions: actions(),
-      state: { code }, branch: world?.branch, base, world, worldPath: world?.root,
+      state: { code }, branch: world?.branch, base, world, worldPath: world?.workdir ?? world?.root,
       parentTaskId: input.parentTaskId, updatedAt: workflowInfo().historyLength,
     };
   }

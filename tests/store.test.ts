@@ -120,6 +120,32 @@ describe('Store', () => {
     expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'human' })).toThrow(/freezes/);
   });
 
+  it('does not turn persisted attempts into top-level tasks on restart', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-attempt-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const s1 = new Store(dbPath);
+    const p = s1.createProject('Acme');
+    const first = s1.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'first' } });
+    const second = s1.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'second' }, intentId: first.intentId });
+    s1.close();
+
+    // Re-running schema migrations must create an intent only for the root task.
+    const s2 = new Store(dbPath);
+    expect(s2.db.prepare('SELECT id FROM task_intents WHERE id=?').get(second.id)).toBeUndefined();
+    expect(s2.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+
+    // Repair databases already polluted by the old migration.
+    s2.db.prepare('INSERT INTO task_intents (id, principalAttemptId, createdAt) VALUES (?, ?, ?)')
+      .run(second.id, second.id, second.createdAt);
+    s2.close();
+    const s3 = new Store(dbPath);
+    expect(s3.db.prepare('SELECT id FROM task_intents WHERE id=?').get(second.id)).toBeUndefined();
+    expect(s3.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(s3.attemptsOf(first.id)).toHaveLength(2);
+    s3.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('grants exactly one Merge commitment and makes the winner principal', () => {
     const p = store.createProject('Acme');
     const first = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'first' } });

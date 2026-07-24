@@ -157,4 +157,64 @@ describe('hosted/local Git handoff', () => {
     expect(store.eventsSince(task.id, 0).some((event) => event.type === 'push.branch')).toBe(true);
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  it('materializes a cloud branch backed by a local repository without a project GitHub attachment', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-authority-materialize-'));
+    const remote = path.join(dir, 'remote.git');
+    const source = path.join(dir, 'source');
+    const cloud = path.join(dir, 'cloud');
+    const localRoot = path.join(dir, 'local');
+    const branch = 'karmax/task-local-source';
+    fs.mkdirSync(source);
+    await gitOrThrow(dir, ['init', '--bare', '-q', remote]);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), 'base\n');
+    await gitOrThrow(source, ['add', '.']); await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+    await gitOrThrow(source, ['remote', 'add', 'origin', remote]);
+    await gitOrThrow(source, ['push', '-q', '-u', 'origin', 'main']);
+    await gitOrThrow(dir, ['clone', '-q', remote, cloud]);
+    await ensureIdentity(cloud);
+    await gitOrThrow(cloud, ['switch', '-q', '-c', branch]);
+    fs.writeFileSync(path.join(cloud, 'cloud.txt'), 'from cloud\n');
+    await gitOrThrow(cloud, ['add', '.']); await gitOrThrow(cloud, ['commit', '-q', '-m', 'cloud work']);
+
+    const sshUrl = 'git@github.com:acme/app.git';
+    const handle: WorldHandle = { kind: 'e2b', id: 'task-local-source', root: cloud, branch, base: 'main', repo: sshUrl,
+      repos: [{ name: 'app', repo: sshUrl, localPath: source, root: cloud, branch, base: 'main' }] };
+    const world: World = {
+      handle,
+      async exec(command, args, options = {}) {
+        if (command === 'git') return git(options.cwd ?? cloud, args, { env: options.env, timeoutMs: options.timeoutMs });
+        return { stdout: '', stderr: `unsupported ${command}`, code: 1 };
+      },
+      async readFile(file) { return fs.readFileSync(path.join(cloud, file), 'utf8'); },
+      async readFileBuffer(file) { return fs.readFileSync(path.join(cloud, file)); },
+      async writeFile(file, content) { fs.writeFileSync(path.join(cloud, file), content); },
+      async writeFileBuffer(file, content) { fs.writeFileSync(path.join(cloud, file), content); },
+      async listFiles() { return []; }, async startProcess() { throw new Error('unused'); },
+      async openPty() { throw new Error('unused'); }, async destroy() {},
+    };
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const project = store.createProject('Platform', { worldProvider: 'e2b', repos: [source] }, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Cloud work', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any });
+    handle.id = task.id;
+    const view = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting',
+      actions: [], state: {}, messages: [], branch, base: 'main', waitingFor: { kind: 'human' }, updatedAt: 1 } as any;
+    store.saveView(task.id, view); store.registerWorld(handle, project.id);
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', capabilities: { remote: true }, create: async () => world,
+      open: async () => world, destroy: async () => {} } as any);
+    const github = { brokerCredentials: async () => { throw new Error('GitHub credentials should not be requested'); } } as any;
+
+    const result = await new WorldHandoffService(store, worlds, github, undefined, undefined, localRoot)
+      .materialize(task.id, view);
+
+    expect(result.cwd).toBe(path.join(localRoot, task.id, 'app'));
+    expect(fs.readFileSync(path.join(result.cwd, 'cloud.txt'), 'utf8')).toBe('from cloud\n');
+    expect((await git(source, ['rev-parse', branch])).stdout.trim()).toBe((await git(cloud, ['rev-parse', 'HEAD'])).stdout.trim());
+    store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  });
 });

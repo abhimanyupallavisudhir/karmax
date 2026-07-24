@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
+import type { TaskView } from '../domain/types.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -39,6 +40,9 @@ import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCook
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
+import { paths } from '../config/paths.js';
+import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
+import { worldWorkingRelativePath } from '../world/types.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -336,6 +340,9 @@ export class Gateway {
   private modelCatalog?: { at: number; value: ModelCatalog };
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
   private fanout: DurableEventFanout;
+  /** Remotes verified during this gateway process. Persisted links are retried
+   * once after every restart so interrupted first pushes self-heal. */
+  private wikiRemotesReady = new Set<string>();
 
   constructor(private deps: GatewayDeps) {
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess);
@@ -413,6 +420,11 @@ export class Gateway {
       void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
     });
 
+    // Deployment migration for projects that predate companion wiki repos.
+    // Complete this before binding the listener so scheduled/immediate task
+    // starts cannot race the backfill, and a local migration error cannot leave
+    // a half-started HTTP server behind.
+    for (const project of this.deps.store.listProjects()) await this.ensureProjectWiki(project);
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       server.once('error', onError);
@@ -698,6 +710,8 @@ export class Gateway {
       if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub authorization link is invalid, expired, or belongs to another user.');
       try {
         await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req));
+        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
+          await this.ensureProjectWiki(project, identity.user.id);
         res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
@@ -720,6 +734,8 @@ export class Gateway {
           res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl) });
           return void res.end();
         }
+        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
+          await this.ensureProjectWiki(project, identity.user.id);
         res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=connected&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
@@ -1067,7 +1083,10 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub App is not configured' });
-          return this.json(res, 200, await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? '')));
+          const connected = await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? ''));
+          for (const project of store.listProjects().filter((candidate) => candidate.organizationId === organizationId))
+            await this.ensureProjectWiki(project, session.userId);
+          return this.json(res, 200, connected);
         }
       }
       const githubAppSetup = p.match(/^\/api\/organizations\/([^/]+)\/github\/app$/);
@@ -1122,13 +1141,16 @@ export class Gateway {
           const repositories: import('../domain/types.js').Repository[] = [];
           for (const connection of store.listGitConnections(githubRefresh[1]!))
             repositories.push(...await this.deps.githubApp.reconcile(connection));
+          for (const project of store.listProjects().filter((candidate) => candidate.organizationId === githubRefresh[1]))
+            await this.ensureProjectWiki(project, session.userId);
           return this.json(res, 200, { repositories, count: repositories.length });
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationRepositories = p.match(/^\/api\/organizations\/([^/]+)\/repositories$/);
       if (organizationRepositories) {
         const organizationId = organizationRepositories[1]!;
-        if (method === 'GET') return this.json(res, 200, store.listRepositories(organizationId));
+        if (method === 'GET') return this.json(res, 200,
+          store.listRepositories(organizationId).filter((repository) => !store.repositoryIsProjectWiki(repository.id)));
         if (method === 'POST') {
           if (this.deps.hosted) return this.json(res, 400, { error: 'Hosted repositories must be imported through the GitHub App' });
           const b = await this.body(req);
@@ -1162,6 +1184,7 @@ export class Gateway {
             project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
+          await this.ensureProjectWiki(project, session.userId);
           await this.spawnProjectPrepTask(token, project.id);
           return this.json(res, 200, project);
         }
@@ -1397,6 +1420,7 @@ export class Gateway {
         try {
           project = store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        await this.ensureProjectWiki(project, session.userId);
         await this.spawnProjectPrepTask(token, project.id);
         return this.json(res, 200, project);
       }
@@ -1503,10 +1527,13 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listProjectRepositories(projectId));
         if (method === 'POST') {
           const b = await this.body(req);
-          return this.json(res, 200, store.attachProjectRepository({ projectId, repositoryId: String(b.repositoryId),
+          const attached = store.attachProjectRepository({ projectId, repositoryId: String(b.repositoryId),
             baseBranch: b.baseBranch ? String(b.baseBranch) : undefined,
             targetBranch: b.targetBranch ? String(b.targetBranch) : undefined,
-            order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined }));
+            order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined });
+          const project = store.getProject(projectId);
+          if (project) await this.ensureProjectWiki(project, session.userId);
+          return this.json(res, 200, attached);
         }
       }
       const projectRepositorySources = p.match(/^\/api\/projects\/([^/]+)\/repository-sources$/);
@@ -1523,7 +1550,9 @@ export class Gateway {
               const unknown = repos.filter((repo: string) => !known.has(repo));
               if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
             }
-            return this.json(res, 200, store.setProjectRepositorySources(project.id, repos)); }
+            const saved = store.setProjectRepositorySources(project.id, repos);
+            await this.ensureProjectWiki(saved, session.userId);
+            return this.json(res, 200, saved); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
@@ -1544,11 +1573,23 @@ export class Gateway {
           const limit = Number(url.searchParams.get('limit') ?? '0');
           const offset = Number(url.searchParams.get('offset') ?? '0');
           const page = limit > 0 ? filtered.slice(offset, offset + limit) : filtered;
+          // The list only needs each task's chip/queue fields (stage/status/state/
+          // waitingFor/mergeQueue/…), never its conversation. Dropping the heavy view
+          // fields — `messages`, `transcripts`, `reviewInfo` — shrinks this response by
+          // ~80% (they were the bulk of a multi-MB payload for a few hundred tasks).
+          // It matters because loadTasks() refetches the whole list on navigation AND
+          // on every WS-debounced refresh, so the fat body was paid over and over. The
+          // full view is still served per task by /api/tasks/:id when a task is opened.
+          const trimListView = (v: TaskView | undefined) => {
+            if (!v) return v;
+            const { messages: _m, transcripts: _t, reviewInfo: _r, ...rest } = v;
+            return rest;
+          };
           // enrich with the freshest live view where possible
           const enriched = await Promise.all(
             page.map(async (t) => {
               const view = await api.getTaskView(token, t.id).catch(() => t.lastView);
-              return { ...t, lastView: view ?? t.lastView };
+              return { ...t, lastView: trimListView(view ?? t.lastView) };
             }),
           );
           if (limit > 0) return this.json(res, 200, { tasks: enriched, total: filtered.length, offset });
@@ -1556,6 +1597,8 @@ export class Gateway {
         }
         if (method === 'POST') {
           const b = await this.body(req);
+          const project = store.getProject(projectId);
+          if (project) await this.ensureProjectWiki(project, session.userId);
           const task = await api.createTask(token, { projectId, ...b });
           return this.json(res, 200, task);
         }
@@ -1730,6 +1773,9 @@ export class Gateway {
       }
       const queueMatch = p.match(/^\/api\/tasks\/([^/]+)\/queue$/);
       if (queueMatch && method === 'POST') {
+        const queued = store.getTask(queueMatch[1]!);
+        const project = queued ? store.getProject(queued.projectId) : undefined;
+        if (project) await this.ensureProjectWiki(project, session.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
@@ -1995,7 +2041,7 @@ export class Gateway {
         const task = store.getTask(taskId);
         const project = task ? store.getProject(task.projectId) : undefined;
         const b = await this.body(req);
-        const relPath = String(b.path ?? '');
+          const relPath = String(b.path ?? '');
         if (!task || !project?.organizationId || !relPath) return this.json(res, 400, { error: 'task and artifact path are required' });
         const handle = worldHandleForView(task.lastView, taskId, store.effectiveProjectConfig(project));
         if (!handle) return this.json(res, 404, { error: 'no world for this task' });
@@ -2003,7 +2049,7 @@ export class Gateway {
         try {
           access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
           const world = access?.world ?? await this.deps.worlds.open(handle);
-          const data = await world.readFileBuffer(relPath);
+          const data = await world.readFileBuffer(worldWorkingRelativePath(handle, relPath));
           if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
           const id = newId('artifact');
           const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
@@ -2220,29 +2266,36 @@ export class Gateway {
       // family per scope; KarmaxApi enforces read/write capabilities and path
       // safety, so the wiki works identically for humans (UI) and agents
       // (read_wiki/search_wiki/platform_request, including from cloud worlds).
-      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search|suggest))?$/);
+      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search|suggest|refs|history))?$/);
       if (wikiMatch) {
         const scope = wikiMatch[1] === 'projects' ? ('project' as const) : ('organization' as const);
         const id = wikiMatch[2]!;
         const sub = wikiMatch[3];
+        const selector = {
+          ...(url.searchParams.get('taskId') ? { taskId: String(url.searchParams.get('taskId')) } : {}),
+          ...(url.searchParams.get('branch') ? { branch: String(url.searchParams.get('branch')) } : {}),
+        };
         try {
-          if (!sub && method === 'GET') return this.json(res, 200, api.readWiki(token, scope, id, url.searchParams.get('path') ?? ''));
+          if (!sub && method === 'GET') return this.json(res, 200, await api.readWikiResolved(token, scope, id, url.searchParams.get('path') ?? '', selector));
           if (sub === 'page') {
             if (method === 'GET') {
-              const read = api.readWiki(token, scope, id, String(url.searchParams.get('path') ?? ''));
+              const read = await api.readWikiResolved(token, scope, id, String(url.searchParams.get('path') ?? ''), selector);
               return 'page' in read ? this.json(res, 200, read.page) : this.json(res, 404, { error: 'wiki page not found' });
             }
             if (method === 'PUT') {
               const b = await this.body(req);
-              return this.json(res, 200, api.saveWikiPage(token, scope, id, {
+              return this.json(res, 200, await api.saveWikiPageResolved(token, scope, id, {
                 path: String(b.path ?? ''), content: String(b.content ?? ''), kind: b.kind === 'memory' ? 'memory' : 'skill',
                 create: b.create === true, prevPath: b.prevPath ? String(b.prevPath) : undefined,
-              }));
+              }, selector));
             }
-            if (method === 'DELETE') return this.json(res, 200, api.deleteWikiPage(token, scope, id, String(url.searchParams.get('path') ?? '')));
+            if (method === 'DELETE') return this.json(res, 200, await api.deleteWikiPageResolved(token, scope, id, String(url.searchParams.get('path') ?? ''), selector));
           }
-          if (sub === 'search' && method === 'GET') return this.json(res, 200, api.searchWiki(token, scope, id, String(url.searchParams.get('q') ?? '')));
-          if (sub === 'suggest' && method === 'GET') return this.json(res, 200, api.suggestWiki(token, scope, id, String(url.searchParams.get('q') ?? '')));
+          if (sub === 'search' && method === 'GET') return this.json(res, 200, await api.searchWikiResolved(token, scope, id, String(url.searchParams.get('q') ?? ''), selector));
+          if (sub === 'suggest' && method === 'GET') return this.json(res, 200, await api.suggestWikiResolved(token, scope, id, String(url.searchParams.get('q') ?? ''), selector));
+          if (sub === 'refs' && method === 'GET' && scope === 'project') return this.json(res, 200, api.wikiViews(token, id));
+          if (sub === 'history' && method === 'GET' && scope === 'organization')
+            return this.json(res, 200, api.organizationWikiHistory(token, id, url.searchParams.get('path') ?? undefined));
         } catch (error) {
           if (error instanceof CapabilityError) throw error;
           const conflict = /already exists/.test(String((error as Error)?.message));
@@ -2789,6 +2842,53 @@ export class Gateway {
     }
   }
 
+  /** Initialize the local canonical wiki immediately. When GitHub is fully
+   * connected and the creating human authorized, also create its private
+   * companion remote; otherwise the local repo remains ready and this is
+   * retried naturally when a project is next set up. */
+  private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
+    const root = ensureProjectWikiRepository(paths().content, project.id);
+    if (!this.deps.store.projectWiki(project.id)) this.deps.store.setProjectWikiRepository(project.id);
+    const current = this.deps.store.projectWiki(project.id)?.repository;
+    if (current && this.wikiRemotesReady.has(project.id)) return;
+    if (!this.deps.githubApp) return;
+    const organizationId = project.organizationId ?? 'org_personal';
+    const candidates = [...new Set([
+      ...(userId ? [userId] : []),
+      ...this.deps.store.listOrganizationMemberships(organizationId)
+        .sort((a, b) => Number(b.role === 'owner') - Number(a.role === 'owner'))
+        .map((membership) => membership.userId),
+    ])];
+    const actor = candidates.find((candidate) => this.deps.githubApp!.status(candidate).userAuthorized);
+    if (!actor) return;
+    const connections = this.deps.store.listGitConnections(organizationId);
+    const attachedConnectionIds = [...new Set(this.deps.store.listProjectRepositories(project.id)
+      .map((candidate) => candidate.repository.gitConnectionId).filter((id): id is string => Boolean(id)))];
+    const connection = current?.gitConnectionId
+      ? connections.find((candidate) => candidate.id === current.gitConnectionId)
+      : attachedConnectionIds.length === 1
+      ? connections.find((candidate) => candidate.id === attachedConnectionIds[0])
+      : connections.length === 1 ? connections[0] : undefined;
+    if (!connection) return;
+    try {
+      const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
+      const name = `${base}-wiki-${project.id.slice(-8)}`;
+      const repository = current ?? this.deps.store.listRepositories(organizationId)
+        .find((candidate) => candidate.gitConnectionId === connection.id && candidate.name === name)
+        ?? await this.deps.githubApp.createRepository(connection.id, actor, {
+          name, description: `Karmax project wiki for ${project.name}`,
+          private: true, defaultBranch: 'main', autoInit: false,
+        });
+      // Link before the push so even a transient network failure keeps this
+      // platform-owned repository out of the ordinary project repo picker.
+      this.deps.store.setProjectWikiRepository(project.id, repository.id);
+      setProjectWikiRemote(root, repository.sshUrl, this.deps.githubApp.repositorySshKey(repository.id, 'write'));
+      this.wikiRemotesReady.add(project.id);
+    } catch (error) {
+      console.warn(`[karmax] could not create wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
+    }
+  }
+
   private async availableModels(refresh = false): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
     if (!refresh && this.modelCatalog && Date.now() - this.modelCatalog.at < 5 * 60_000) {
       return { providers: this.modelCatalog.value, refreshedAt: this.modelCatalog.at };
@@ -2945,11 +3045,19 @@ export class Gateway {
     const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
-    // Agent citations may be absolute paths inside the world; strip the world
-    // root so the provider-confined relative read (and its traversal guard)
-    // covers those too. Absolute paths outside this task's world stay rejected.
-    const root = String(task?.lastView?.worldPath ?? handle.workspaceRoot ?? handle.root ?? '').replace(/\/+$/, '');
-    if (root && (relPath === root || relPath.startsWith(`${root}/`))) relPath = relPath.slice(root.length + 1) || '.';
+    // Relative artifact paths are authored from the agent's default cwd, while
+    // provider file APIs are rooted at the whole world boundary. Absolute
+    // citations may name any checkout inside that boundary.
+    const root = String(handle.root ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+    const normalized = relPath.replace(/\\/g, '/');
+    if (normalized.startsWith('/')) {
+      if (normalized !== root && !normalized.startsWith(`${root}/`))
+        return this.json(res, 400, { error: 'path escapes world' });
+      relPath = normalized.slice(root.length + 1) || '.';
+    } else {
+      try { relPath = worldWorkingRelativePath(handle, relPath); }
+      catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
     let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
     try {
       access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;

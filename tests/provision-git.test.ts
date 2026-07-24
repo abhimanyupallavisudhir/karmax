@@ -63,6 +63,22 @@ describe('shared cloud world git provisioning', () => {
       .rejects.toThrow('ssh only');
     expect(commands).toHaveLength(0);
   });
+
+  it('keeps a scratch workspace beside a companion repository', async () => {
+    const { target, commands } = fakeTarget((command) => {
+      if (command.includes('rev-parse')) return { stdout: `${'a'.repeat(40)}\n` };
+      return undefined;
+    });
+    const provisioned = await provisionGitRepos(target, {
+      taskId: 't1', base: 'main', repo: 'git@github.com:acme/project-wiki.git', scratch: true,
+    }, OPTIONS);
+    expect(provisioned.workdir).toBe('/w/scratch');
+    expect(provisioned.repos[0]).toMatchObject({
+      repo: 'git@github.com:acme/project-wiki.git',
+      root: '/w/project-wiki',
+    });
+    expect(commands.some((command) => command.includes("git -C '/w/scratch' init"))).toBe(true);
+  });
 });
 
 /** Drives provisioning against a plain host directory, standing in for a cloud

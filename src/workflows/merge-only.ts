@@ -116,7 +116,7 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
     return {
       taskId, title: input.title, workflow: 'merge-only', stage, status, messages: msgs, reviewInfo,
       actions: actions(), state: { checks, mergeGranted, targetLocked }, branch: world?.branch, base, targetBranch: target,
-      world, worldPath: world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
+      world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, pointOfNoReturnPassed,
       editableParams: editableParamsNow(), waitingFor, agentTurn, mergeQueue,
       updatedAt: workflowInfo().historyLength,
     };
