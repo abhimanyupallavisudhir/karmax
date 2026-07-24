@@ -250,7 +250,11 @@ function hostOf(value?: string): string {
 
 // ── the registry + sync service (state in the store kv) ───────────────────────
 
-const KV_CONFIG = (name: string) => `vault:connector:${name}`;
+// Connector config + unlock secret are ORGANIZATION-scoped: a tenant connects
+// its own Bitwarden/1Password, and its session key must never be reachable from
+// another org's world.
+const kvConfig = (org: string, name: string) => `vault:connector:${org}:${name}`;
+const connectorAuthHandle = (org: string, name: string) => `connector:${org}:${name}:auth`;
 
 export interface ConnectorConfig {
   /** Opt-in write-back of agent-created items. */
@@ -266,7 +270,13 @@ export interface ConnectorStore {
 
 export class Connectors {
   private map = new Map<string, CredentialConnector>();
-  constructor(private store: ConnectorStore, private items: VaultItems, private broker?: CredentialBroker) {}
+  constructor(
+    private store: ConnectorStore,
+    private items: VaultItems,
+    private broker?: CredentialBroker,
+    /** Owning organization; `items` must be constructed for the same org. */
+    private organizationId = 'org_personal',
+  ) {}
 
   register(connector: CredentialConnector): void {
     this.map.set(connector.name, connector);
@@ -280,24 +290,25 @@ export class Connectors {
 
   config(name: string): ConnectorConfig {
     try {
-      return JSON.parse(this.store.kvGet(KV_CONFIG(name)) ?? '{}');
+      return JSON.parse(this.store.kvGet(kvConfig(this.organizationId, name)) ?? '{}');
     } catch {
       return {};
     }
   }
   setConfig(name: string, patch: Partial<ConnectorConfig>): ConnectorConfig {
     const next = { ...this.config(name), ...patch };
-    this.store.kvSet(KV_CONFIG(name), JSON.stringify(next));
+    this.store.kvSet(kvConfig(this.organizationId, name), JSON.stringify(next));
     return next;
   }
 
   /** Store a connector's unlock secret (bw session key / op token) in the vault. */
   connect(name: string, secret: string): void {
-    this.broker?.registerHandle(`connector:${name}:auth`, secret);
+    this.broker?.registerHandle(connectorAuthHandle(this.organizationId, name), secret);
   }
   secretFor(name: string): string | undefined {
-    return this.broker?.hasHandle(`connector:${name}:auth`)
-      ? this.broker.resolve(`connector:${name}:auth`, { caps: ['use-credential:*'] })
+    const handle = connectorAuthHandle(this.organizationId, name);
+    return this.broker?.hasHandle(handle)
+      ? this.broker.resolve(handle, { caps: ['use-credential:*'] })
       : undefined;
   }
 

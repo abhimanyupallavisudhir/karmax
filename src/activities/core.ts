@@ -903,7 +903,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // Granted `auto` vault items materialize into the subprocess env
             // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
             // SSH keys as 0600 file paths. Local worlds only, like gitEnv.
-            const vaultEnv = isRemote(args.worldHandle.kind) ? {} : vaultItems.envFor(args.taskId, effective);
+            // Item resolution is per-organization (the tenant boundary), so bind
+            // to the task's org — not the module-level personal-org instance.
+            const taskOrg = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
+            const orgVault = new VaultItems(store, deps.broker, undefined, taskOrg);
+            const vaultEnv = isRemote(args.worldHandle.kind) ? {} : orgVault.envFor(args.taskId, effective);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
@@ -959,7 +963,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(deps.payments
             ? {
                 budget: new BudgetService(store, deps.payments),
-                spendCtx: { projectId: args.task.projectId, taskId: args.taskId },
+                spendCtx: { projectId: args.task.projectId, taskId: args.taskId, organizationId: store.getProject(args.task.projectId)?.organizationId },
                 onSpend: (req: any, outcome: any) => record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }),
               }
             : {}),

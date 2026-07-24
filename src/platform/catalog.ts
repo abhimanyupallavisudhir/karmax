@@ -56,6 +56,8 @@ export const PLATFORM_API_CATALOG = {
   ],
   agentMail: [
     'GET /api/organizations/:organizationId/agent-mail?since=&match=&limit= (per-organization agent inbox: address + messages, verification code/link extracted)',
+    'GET /api/agent-mail/providers (mailbox backends + active domain)',
+    'POST /api/agent-mail/connect (operator connects a mailbox provider once for the whole installation; body {provider, domain?|apiKey?})',
     'POST /api/agent-mail/ingest (inbound mail webhook; shared-secret authenticated, routed to the recipient organization)',
   ],
   wiki: [

@@ -128,6 +128,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent-mail inbound webhook authenticates with its own shared secret
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
+  // Connecting a mailbox provider is an installation-wide operator action
+  // (applies to every organization), so it lives behind global settings.
+  if (p === '/api/agent-mail/providers' || p === '/api/agent-mail/connect') return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return 'safe-mode:write';
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -679,7 +682,7 @@ export class Gateway {
       if (!b.to || !b.from) return this.json(res, 400, { error: 'to and from are required' });
       // Routed by recipient to the owning organization; unknown recipients are
       // dropped (never leaked into any tenant's inbox). Never echo the message.
-      const { delivered } = new AgentMail(this.deps.store).ingest({ to: String(b.to), from: String(b.from), subject: b.subject ? String(b.subject) : undefined, text: String(b.text ?? '') });
+      const { delivered } = new AgentMail(this.deps.store, this.mailboxDomain()).ingest({ to: String(b.to), from: String(b.from), subject: b.subject ? String(b.subject) : undefined, text: String(b.text ?? '') });
       return this.json(res, 200, { delivered });
     }
     const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
@@ -2305,7 +2308,11 @@ export class Gateway {
       // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
       if (p.startsWith('/api/vault')) {
         const { VaultItems, ITEM_FIELDS } = await import('../autonomy/vault-items.js');
-        const vault = new VaultItems(store, this.deps.broker);
+        // Bind to the caller's own organization (tenant boundary). The token org
+        // is authoritative and cannot be spoofed — auth() validated it against
+        // membership; the query-param org only ever narrows within it.
+        const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId);
         const caps = authRecord?.caps ?? [];
         // A human session's token is task-unscoped; per-task passes/extensions
         // only ever apply to real task-agent bearers.
@@ -2442,7 +2449,7 @@ export class Gateway {
         if (p.startsWith('/api/vault/connectors')) {
           if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
           const { Connectors, BitwardenConnector, OnePasswordConnector, PassConnector } = await import('../autonomy/connectors.js');
-          const connectors = new Connectors(store, vault, this.deps.broker);
+          const connectors = new Connectors(store, vault, this.deps.broker, organizationId);
           connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden')));
           connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password')));
           connectors.register(new PassConnector());
@@ -2511,6 +2518,30 @@ export class Gateway {
         }
       }
 
+      // ── mailbox provider: connected once per installation (operator), which
+      // gives every organization a working address automatically (§8). ──
+      if (p === '/api/agent-mail/providers' && method === 'GET') {
+        const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+        const registry = defaultMailboxRegistry();
+        const config = this.mailboxConfig();
+        return this.json(res, 200, { providers: registry.list(config), active: config.provider, domain: registry.activeDomain(config) });
+      }
+      if (p === '/api/agent-mail/connect' && method === 'POST') {
+        const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+        const registry = defaultMailboxRegistry();
+        const b = await this.body(req);
+        const provider = registry.get(String(b.provider ?? ''));
+        if (!provider) return this.json(res, 400, { error: `unknown mailbox provider "${b.provider}"` });
+        const result = provider.connect({ domain: b.domain ? String(b.domain) : undefined, apiKey: b.apiKey ? String(b.apiKey) : undefined });
+        if (result.status === 'connected' && result.config) {
+          // A hosted API key is a secret → vault handle, never echoed/stored raw.
+          let apiKeyHandle: string | undefined;
+          if (b.apiKey && this.deps.broker) { apiKeyHandle = 'mailbox:hosted:auth'; this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey)); }
+          this.setMailboxConfig({ ...this.mailboxConfig(), ...result.config, ...(apiKeyHandle ? { apiKeyHandle } : {}) });
+        }
+        return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
+      }
+
       // ── agent mailbox: per-organization address + inbox reads (§8; the
       // inbound webhook is an unauthenticated shared-secret route handled
       // before the session gate). The org in the path is what requestScope +
@@ -2519,23 +2550,29 @@ export class Gateway {
       const mailMatch = p.match(/^\/api\/organizations\/([^/]+)\/agent-mail$/);
       if (mailMatch && method === 'GET') {
         const { AgentMail } = await import('../autonomy/agent-mail.js');
-        const mail = new AgentMail(store);
+        const mail = new AgentMail(store, this.mailboxDomain());
         const organizationId = mailMatch[1]!;
         return this.json(res, 200, { organizationId, address: mail.address(organizationId), configured: mail.configured(),
           messages: mail.recent(organizationId, { since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
       }
 
-      // cards (payment resources; SPEC §7.6). Provision/list/fund.
+      // cards (payment resources; SPEC §7.6) — organization-scoped so a tenant
+      // never spends from another's card. A project card narrows within its org.
       if (p === '/api/cards' && method === 'GET') {
         const pid = url.searchParams.get('projectId') ?? undefined;
-        return this.json(res, 200, store.listCards(pid));
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId;
+        return this.json(res, 200, store.listCards(pid, cardOrg));
       }
       if (p === '/api/cards' && method === 'POST') {
         if (!this.deps.payments) return this.json(res, 400, { error: 'no payment provider configured' });
         const b = await this.body(req);
+        // A non-project card belongs to the caller's own organization (the old
+        // installation-wide "global" card is gone in the multi-tenant model).
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId
+          ?? (b.projectId ? store.getProject(String(b.projectId))?.organizationId : undefined) ?? 'org_personal';
         const card = await this.deps.payments.provisionCard({
-          scope: b.scope === 'global' ? 'global' : 'project',
-          scopeId: b.scope === 'global' ? undefined : b.projectId,
+          scope: b.scope === 'project' ? 'project' : 'organization',
+          scopeId: b.scope === 'project' ? b.projectId : cardOrg,
           label: b.label ?? 'Card',
           cap: Number(b.cap ?? 0),
           merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
@@ -3522,6 +3559,25 @@ export class Gateway {
     }
     return this.auth(req, projectId);
   }
+  /** Installation-wide mailbox provider config (agent-mail §8), set once by the
+   *  operator; every organization's address is minted on its resolved domain. */
+  private mailboxConfig(): import('../autonomy/mailbox.js').MailboxConfig {
+    try {
+      return JSON.parse(this.deps.store.kvGet('agent-mail:provider') ?? '{}');
+    } catch {
+      return {};
+    }
+  }
+  private setMailboxConfig(config: import('../autonomy/mailbox.js').MailboxConfig): void {
+    this.deps.store.kvSet('agent-mail:provider', JSON.stringify(config));
+  }
+  private mailboxDomain(): string | undefined {
+    // Resolve without importing the registry synchronously: self-managed keeps
+    // its domain in config; hosted keeps hostedDomain. Either is the mint domain.
+    const config = this.mailboxConfig();
+    return config.domain || config.hostedDomain || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
+  }
+
   private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {
     const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]

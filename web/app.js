@@ -3173,8 +3173,10 @@ async function openTaskForm(workflow, draft, seedText) {
   (async () => {
     const box = $('#tf-vault-grants');
     if (!box) return;
+    // Vault items are organization-scoped — read the project's org's vault.
+    const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
     let items = [];
-    try { items = await api('/api/vault/items'); } catch { box.closest('[data-row="__vault"]')?.remove(); return; }
+    try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); } catch { box.closest('[data-row="__vault"]')?.remove(); return; }
     if (!items.length) {
       box.closest('[data-row="__vault"]')?.remove();
       return;
@@ -6669,7 +6671,7 @@ function wireSettingsView(proj) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  wirePaymentsCard('project', proj.id);
+  wirePaymentsCard('project', proj.id, proj.organizationId);
   $('#git-preflight-run')?.addEventListener('click', async () => {
     const out = $('#git-preflight-result');
     const btn = $('#git-preflight-run');
@@ -6769,6 +6771,7 @@ function globalSettingsView(embedded = false) {
     ${vaultCard()}
     ${connectorsCard()}
     ${vaultRequestsCard()}
+    ${mailboxProviderCard()}
     ${agentMailCard()}
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
@@ -6929,9 +6932,12 @@ async function wirePaymentProviders(box) {
     } catch (e) { toast(e.message, true); }
   }));
 }
-async function wirePaymentsCard(scope, projectId) {
+async function wirePaymentsCard(scope, projectId, organizationId) {
   const box = $(`[data-payments="${scope}"]`);
   if (!box) return;
+  // Non-project cards belong to the organization (tenant boundary), not the
+  // whole installation. `scope==='global'` here is the org-settings surface.
+  const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
   if (scope === 'global') await wirePaymentProviders(box);
   const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
@@ -6948,8 +6954,11 @@ async function wirePaymentsCard(scope, projectId) {
   });
   const renderCards = async () => {
     let cards = [];
-    try { cards = await api(`/api/cards${projectId ? `?projectId=${projectId}` : ''}`); } catch {}
-    if (scope === 'global') cards = cards.filter((c) => c.scope === 'global');
+    const q = [projectId ? `projectId=${projectId}` : '', orgQ].filter(Boolean).join('&');
+    try { cards = await api(`/api/cards${q ? `?${q}` : ''}`); } catch {}
+    // The org-settings surface shows the org's own cards (+ legacy global);
+    // the project surface shows project cards (its org's cards appear too).
+    if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope}</span><div class="task-sub">available ${usd(c.available)} / cap ${usd(c.cap)}</div></div>
@@ -6966,7 +6975,7 @@ async function wirePaymentsCard(scope, projectId) {
     const label = box.querySelector('.card-label').value.trim() || 'Card';
     const cap = box.querySelector('.card-cap').value;
     try {
-      await api('/api/cards', { method: 'POST', body: JSON.stringify({ scope, projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
+      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ scope: scope === 'project' ? 'project' : 'organization', projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
       box.querySelector('.card-label').value = '';
       box.querySelector('.card-cap').value = '';
       toast('Card added');
@@ -7011,9 +7020,11 @@ function vaultRequestsCard() {
     <div class="vault-requests-list">Loading…</div>
   </div>`;
 }
-async function wireVaultCards() {
+async function wireVaultCards(organizationId) {
   const box = $('#vault-card');
   if (!box) return;
+  // Vault items + requests are organization-scoped; every call carries the org.
+  const oq = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
   const secretRows = () => {
     const type = box.querySelector('.vi-type').value;
     box.querySelector('.vi-envvar').style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
@@ -7026,7 +7037,7 @@ async function wireVaultCards() {
   box.querySelector('.vi-type').addEventListener('change', secretRows);
   const renderItems = async () => {
     let items = [];
-    try { items = await api('/api/vault/items'); } catch {}
+    try { items = await api(`/api/vault/items${oq}`); } catch {}
     const list = box.querySelector('.vault-items-list');
     list.innerHTML = items.length
       ? items.map((i) => `<div class="queue-item" data-vi="${esc(i.id)}">
@@ -7041,7 +7052,7 @@ async function wireVaultCards() {
       const item = items.find((x) => x.id === row.dataset.vi);
       const savePolicy = async () => {
         try {
-          await api('/api/vault/items', { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
+          await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
           toast('Policy saved');
         } catch (e) { toast(e.message, true); }
       };
@@ -7050,7 +7061,7 @@ async function wireVaultCards() {
     });
     list.querySelectorAll('[data-vi-del]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm('Delete this vault item (and its secrets)?')) return;
-      try { await api(`/api/vault/items/${b.dataset.viDel}`, { method: 'DELETE' }); renderItems(); } catch (e) { toast(e.message, true); }
+      try { await api(`/api/vault/items/${b.dataset.viDel}${oq}`, { method: 'DELETE' }); renderItems(); } catch (e) { toast(e.message, true); }
     }));
     return items;
   };
@@ -7058,7 +7069,7 @@ async function wireVaultCards() {
     const secrets = {};
     box.querySelectorAll('.vi-secret').forEach((el) => { if (el.value) secrets[el.dataset.field] = el.value; });
     try {
-      await api('/api/vault/items', { method: 'POST', body: JSON.stringify({
+      await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({
         type: box.querySelector('.vi-type').value,
         label: box.querySelector('.vi-label').value,
         domains: box.querySelector('.vi-domains').value,
@@ -7078,7 +7089,7 @@ async function wireVaultCards() {
     if (!rbox) return;
     let requests = [];
     let items = [];
-    try { [requests, items] = await Promise.all([api('/api/vault/requests'), api('/api/vault/items')]); } catch {}
+    try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
     const pending = requests.filter((r) => r.status === 'pending');
     const recent = requests.filter((r) => r.status !== 'pending').slice(-5).reverse();
     const itemLabel = (id) => items.find((i) => i.id === id)?.label || id;
@@ -7097,7 +7108,7 @@ async function wireVaultCards() {
     rbox.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((b) => b.addEventListener('click', async () => {
       const itemId = row.querySelector('.vreq-bind')?.value || undefined;
       try {
-        await api(`/api/vault/requests/${row.dataset.vreq}/resolve`, { method: 'POST', body: JSON.stringify({ action: b.dataset.vreqAct, itemId }) });
+        await api(`/api/vault/requests/${row.dataset.vreq}/resolve${oq}`, { method: 'POST', body: JSON.stringify({ action: b.dataset.vreqAct, itemId }) });
         toast(b.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted — tell the task to retry (or it will pick it up next turn)');
         renderRequests();
       } catch (e) { toast(e.message, true); }
@@ -7115,12 +7126,13 @@ function connectorsCard() {
     <div class="connectors-list">Loading…</div>
   </div>`;
 }
-async function wireConnectorsCard() {
+async function wireConnectorsCard(organizationId) {
   const box = $('#connectors-card');
   if (!box) return;
+  const oq = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
   const list = box.querySelector('.connectors-list');
   let conns = [];
-  try { conns = await api('/api/vault/connectors'); } catch { list.innerHTML = '<span style="color:var(--ink-3)">Connectors need a credential broker.</span>'; return; }
+  try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3)">Connectors need a credential broker.</span>'; return; }
   list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}" style="flex-wrap:wrap">
     <div style="flex:1;min-width:180px"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not ready</span>'}
       <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · last sync: ${c.config.lastSync.count} item(s)` : ''}</div></div>
@@ -7133,16 +7145,16 @@ async function wireConnectorsCard() {
     const name = row.dataset.conn;
     row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
       const secret = row.querySelector('.conn-secret').value;
-      try { await api(`/api/vault/connectors/${name}/connect`, { method: 'POST', body: JSON.stringify({ secret }) }); toast('Connected'); wireConnectorsCard(); } catch (e) { toast(e.message, true); }
+      try { await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret }) }); toast('Connected'); wireConnectorsCard(organizationId); } catch (e) { toast(e.message, true); }
     });
     row.querySelector('.conn-writeback')?.addEventListener('change', async (e) => {
-      try { await api(`/api/vault/connectors/${name}/config`, { method: 'POST', body: JSON.stringify({ writeBack: e.target.checked }) }); toast('Saved'); } catch (err) { toast(err.message, true); }
+      try { await api(`/api/vault/connectors/${name}/config${oq}`, { method: 'POST', body: JSON.stringify({ writeBack: e.target.checked }) }); toast('Saved'); } catch (err) { toast(err.message, true); }
     });
     row.querySelector('[data-conn-list]')?.addEventListener('click', async () => {
       const target = row.querySelector('.conn-items');
       target.innerHTML = 'Loading…';
       try {
-        const items = await api(`/api/vault/connectors/${name}/list`, { method: 'POST', body: '{}' });
+        const items = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' });
         target.innerHTML = items.length
           ? `<div style="max-height:200px;overflow:auto;border:1px solid var(--line,#333);border-radius:6px;padding:6px">${items.map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0"><input type="checkbox" class="conn-pick" value="${esc(i.externalId)}"/> ${esc(i.label)} <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div>
             <button class="btn sm primary" data-conn-sync style="margin-top:6px">Sync selected</button>`
@@ -7150,9 +7162,44 @@ async function wireConnectorsCard() {
         target.querySelector('[data-conn-sync]')?.addEventListener('click', async () => {
           const externalIds = [...target.querySelectorAll('.conn-pick:checked')].map((b) => b.value);
           if (!externalIds.length) { toast('Select items first', true); return; }
-          try { const r = await api(`/api/vault/connectors/${name}/sync`, { method: 'POST', body: JSON.stringify({ externalIds }) }); toast(`Mirrored ${r.count} item(s)`); wireVaultCards(); wireConnectorsCard(); } catch (e) { toast(e.message, true); }
+          try { const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({ externalIds }) }); toast(`Mirrored ${r.count} item(s)`); wireVaultCards(organizationId); wireConnectorsCard(organizationId); } catch (e) { toast(e.message, true); }
         });
       } catch (e) { target.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; }
+    });
+  });
+}
+
+// ── mailbox provider: connect an email backend once for the whole install ─────
+function mailboxProviderCard() {
+  return `<div class="card" id="mailbox-provider-card">
+    <div class="section-h">Agent email service <span class="chip">installation-wide</span></div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect an email backend <b>once</b> and every organization automatically gets a working agent address — no per-user setup. <b>Your own domain</b>: enter a domain you control and forward its mail to karmax. <b>Hosted mailbox</b>: connect a managed service with one key, zero DNS.</p>
+    <div class="mailbox-providers">Loading…</div>
+  </div>`;
+}
+async function wireMailboxProviderCard() {
+  const box = $('#mailbox-provider-card');
+  if (!box) return;
+  const list = box.querySelector('.mailbox-providers');
+  let data = { providers: [], active: null, domain: null };
+  try { data = await api('/api/agent-mail/providers'); } catch { box.remove(); return; } // no settings:write ⇒ hidden
+  list.innerHTML = data.providers.map((p) => `<div class="queue-item" data-mp="${esc(p.name)}" style="flex-wrap:wrap">
+    <div style="flex:1;min-width:180px"><b>${esc(p.label)}</b> ${p.name === data.active && p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">active</span>' : p.connected ? '<span class="chip">connected</span>' : ''}
+      <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
+    ${p.kind === 'domain'
+      ? `<input class="mp-input" placeholder="agents.yourcompany.com" style="min-width:180px" /><button class="btn sm" data-mp-connect>Use this domain</button>`
+      : `<input class="mp-input" type="password" placeholder="managed inbound-email API key" style="min-width:180px" /><button class="btn sm" data-mp-connect>Connect</button>`}
+    </div>`).join('') || '<span style="color:var(--ink-3)">No mailbox providers.</span>';
+  list.querySelectorAll('[data-mp]').forEach((row) => {
+    row.querySelector('[data-mp-connect]')?.addEventListener('click', async () => {
+      const name = row.dataset.mp;
+      const val = row.querySelector('.mp-input').value.trim();
+      const body = { provider: name, ...(name === 'self-managed' ? { domain: val } : { apiKey: val }) };
+      try {
+        const r = await api('/api/agent-mail/connect', { method: 'POST', body: JSON.stringify(body) });
+        if (r.status === 'connected') { toast(r.detail || 'Connected'); wireMailboxProviderCard(); }
+        else { toast(r.detail || 'Not available', true); }
+      } catch (e) { toast(e.message, true); }
     });
   });
 }
@@ -7161,7 +7208,7 @@ async function wireConnectorsCard() {
 function agentMailCard() {
   return `<div class="card" id="agent-mail-card">
     <div class="section-h">Agent mailbox</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">This organization's dedicated inbox for accounts its agents register — never your personal email, and never readable by other organizations. Point an inbound-mail webhook (own catch-all domain, or a hosted inbox) at <code>POST /api/agent-mail/ingest</code> (shared-secret authenticated) and set <code>KARMAX_AGENT_MAIL_DOMAIN</code>. Agents read codes/links with <code>check_agent_mail</code>.</p>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">This organization's dedicated inbox for accounts its agents register — never your personal email, and never readable by other organizations. The address is provisioned automatically from the connected email service above. Agents read codes and links with <code>check_agent_mail</code>.</p>
     <div class="agent-mail-body">Loading…</div>
   </div>`;
 }
@@ -7172,7 +7219,7 @@ async function wireAgentMailCard(organizationId) {
   let data = { address: '', configured: false, messages: [] };
   try { data = await api(`/api/organizations/${encodeURIComponent(organizationId || 'org_personal')}/agent-mail`); } catch {}
   body.innerHTML = `<div class="form-row"><label>Agent address</label><input value="${esc(data.address)}" readonly class="mono" style="width:100%" /></div>
-    ${data.configured ? '' : '<div class="task-sub" style="color:var(--warn,#e0b15a);margin-bottom:6px">No mail domain configured — set KARMAX_AGENT_MAIL_DOMAIN to receive real mail. The address above still accepts test ingestion.</div>'}
+    ${data.configured ? '' : '<div class="task-sub" style="color:var(--warn,#e0b15a);margin-bottom:6px">No email service connected yet — connect one in <b>Agent email service</b> above and this address activates automatically. Until then it accepts test ingestion only.</div>'}
     <div style="font-weight:600;margin:6px 0 4px">Recent messages</div>
     ${data.messages.length ? data.messages.map((m) => `<div class="queue-item"><div style="flex:1"><b>${esc(m.subject || '(no subject)')}</b> ${m.code ? `<span class="chip" style="color:var(--ok,#4ec9a3)">code ${esc(m.code)}</span>` : ''}<div class="task-sub" style="color:var(--ink-3)">from ${esc(m.from)}${m.link ? ` · <a href="${esc(m.link)}" target="_blank" rel="noopener">link</a>` : ''}</div></div></div>`).join('') : '<span style="color:var(--ink-3)">No messages yet.</span>'}`;
 }
@@ -7462,10 +7509,11 @@ function wireGlobalSettings(organizationId) {
   hydrateAuthorization('global');
   hydrateWorkflows();
   hydrateGitProfiles();
-  wireVaultCards();
-  wireConnectorsCard();
+  wireVaultCards(organizationId);
+  wireConnectorsCard(organizationId);
+  wireMailboxProviderCard();
   wireAgentMailCard(organizationId);
-  wirePaymentsCard('global');
+  wirePaymentsCard('global', undefined, organizationId);
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
     const userName = $('#gitp-username').value.trim();

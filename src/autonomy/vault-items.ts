@@ -90,8 +90,12 @@ export interface VaultItemStore {
   appendAudit(entry: { principalId: string; action: string; scopeKey?: string; detail?: Record<string, unknown> }): number;
 }
 
-const KV_ITEMS = 'vault:items';
-const KV_REQUESTS = 'vault:requests';
+// Items and access requests are ORGANIZATION resources (the tenant boundary):
+// one org's agents must never see another's credentials. Grants and one-shot
+// passes are keyed by taskId (a task belongs to exactly one org), so they need
+// no org qualifier.
+const kvItems = (org: string) => `vault:items:${org}`;
+const kvRequests = (org: string) => `vault:requests:${org}`;
 const kvGrant = (taskId: string) => `vault:grant:${taskId}`;
 const kvPasses = (taskId: string) => `vault:pass:${taskId}`;
 
@@ -167,11 +171,14 @@ export class VaultItems {
     private store: VaultItemStore,
     private broker?: CredentialBroker,
     private home = paths().state,
+    /** The owning organization (tenant boundary). Every item/request key is
+     *  scoped to it; the gateway binds it from the caller's token org. */
+    private organizationId = 'org_personal',
   ) {}
 
   // ── items ──
   list(): VaultItem[] {
-    const raw = this.store.kvGet(KV_ITEMS);
+    const raw = this.store.kvGet(kvItems(this.organizationId));
     if (!raw) return [];
     try {
       return JSON.parse(raw) as VaultItem[];
@@ -256,7 +263,7 @@ export class VaultItems {
       provenance: prior?.provenance ?? { source: args.provenance?.source ?? 'manual', ...(args.provenance?.taskId ? { taskId: args.provenance.taskId } : {}), ...(args.provenance?.externalId ? { externalId: args.provenance.externalId } : {}), at: Date.now() },
       updatedAt: Date.now(),
     };
-    this.store.kvSet(KV_ITEMS, JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
+    this.store.kvSet(kvItems(this.organizationId), JSON.stringify([...this.list().filter((i) => i.id !== id), item]));
     // Key material may have changed — drop any materialized copies.
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
     return item;
@@ -270,7 +277,7 @@ export class VaultItems {
     if (!item) throw new Error(`no vault item ${id}`);
     item.provenance = { ...item.provenance, externalId };
     item.updatedAt = Date.now();
-    this.store.kvSet(KV_ITEMS, JSON.stringify(all));
+    this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all));
     return item;
   }
 
@@ -280,13 +287,13 @@ export class VaultItems {
     if (!item) throw new Error(`no vault item ${id}`);
     item.policy = { ...item.policy, ...patch };
     item.updatedAt = Date.now();
-    this.store.kvSet(KV_ITEMS, JSON.stringify(all));
+    this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all));
     return item;
   }
 
   delete(id: string) {
     const item = this.get(id);
-    this.store.kvSet(KV_ITEMS, JSON.stringify(this.list().filter((i) => i.id !== id)));
+    this.store.kvSet(kvItems(this.organizationId), JSON.stringify(this.list().filter((i) => i.id !== id)));
     for (const field of item?.fields ?? []) this.broker?.deleteHandle(itemHandle(id, field));
     fs.rmSync(this.keyDir(id), { recursive: true, force: true });
   }
@@ -417,7 +424,7 @@ export class VaultItems {
   // ── access requests (§7 — the request_spend-shaped escalation) ──
 
   requests(filter: { taskId?: string; status?: CredentialAccessRequest['status'] } = {}): CredentialAccessRequest[] {
-    const raw = this.store.kvGet(KV_REQUESTS);
+    const raw = this.store.kvGet(kvRequests(this.organizationId));
     let all: CredentialAccessRequest[] = [];
     try {
       all = raw ? JSON.parse(raw) : [];
@@ -428,7 +435,7 @@ export class VaultItems {
   }
 
   private saveRequests(all: CredentialAccessRequest[]) {
-    this.store.kvSet(KV_REQUESTS, JSON.stringify(all));
+    this.store.kvSet(kvRequests(this.organizationId), JSON.stringify(all));
   }
 
   /**

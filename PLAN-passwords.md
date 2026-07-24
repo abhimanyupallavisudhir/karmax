@@ -207,9 +207,10 @@ generated passwords and captured TOTP seeds with
   codes. Connector imports bring seeds along (1Password/Bitwarden both store
   them). Covers the large majority of 2FA sites with zero human involvement.
 - **Email codes / magic links / verification mails** — give agents a mailbox,
-  not the user's inbox: a per-user **agent email address** (own domain
-  catch-all, or an AgentMail-style hosted inbox as a connector) used for
-  registrations; a `check_agent_mail` tool reads codes. Existing accounts on
+  not the user's inbox: a **per-organization** agent email address used for
+  registrations, provisioned automatically from an email backend the operator
+  connects once (§7 impl: self-managed domain or hosted inbox — never a per-user
+  env var chore); a `check_agent_mail` tool reads codes. Existing accounts on
   the user's personal email escalate to the human ("forward me the code" —
   which is just a `needs_approval`-style request card with a text reply).
 - **SMS** — escalate by default: request card + push notification, human types
@@ -253,7 +254,10 @@ One section, five cards (payments cards join from the existing settings):
 - **Vault** — items list (type icon, label, domains, tags, policy badges),
   add/edit/import, per-item audit peek ("last used by task #142, 2h ago").
 - **Connectors** — connect Bitwarden / 1Password / pass; what's mirrored;
-  write-back toggle; agent-email connector lives here too.
+  write-back toggle.
+- **Agent email service** (installation-wide, operator-only) — connect a
+  mailbox provider once so every org gets an address automatically; and a
+  per-org **Agent mailbox** card showing that org's address + recent messages.
 - **Access requests** — pending escalations (the §7 cards) + history; the
   same cards render at the task's Review gate and in notifications.
 - **Policies** — defaults (`use`/`reveal` for new items, whether
@@ -347,13 +351,38 @@ Implementation notes (phases 4–5):
   between `enroll_passkey` and `save_passkey`. `cdp.ts` is shared with §5B fill.
 - Connectors deliberately re-instantiate per request (cheap; CLIs are the state)
   and never cache secrets in memory beyond the call.
-- **Hosted-tenancy caveat (open):** the mailbox is organization-scoped, but the
-  vault items, connectors, and payment cards remain *installation* resources —
-  the same scope as Git accounts and agent logins (their cards say
-  "installation resource"). Correct for self-hosted; before hosted GA these
-  need organization-scoping the same way (items gain an `organizationId`,
-  routes move under `/api/organizations/:id/…`, Settings cards render per
-  org), tracked with the broader hosted work in PLAN-cloud.md.
+6. **Organization scoping (hosted multi-tenancy)** ✅ — vault items, access
+   requests, connectors (config + unlock secrets), the mailbox, and payment
+   **cards** are all keyed to the owning organization (the tenant boundary), so
+   one tenant's agents can never read or spend another's. `VaultItems` and
+   `Connectors` bind an `organizationId` at construction (keys `vault:items:<org>`,
+   `vault:connector:<org>:<name>`, handle `connector:<org>:<name>:auth`); cards
+   gain an `organization` scope (legacy `global` cards stay visible to the
+   personal org only). The gateway derives the org from the caller's **token**
+   (`authRecord.organizationId` — set and membership-validated by `auth()`, so
+   it cannot be spoofed by a query param), the activity from the task's project
+   org. Tested: two-org item/request isolation (unit) and card isolation +
+   cross-org inbox 403 (gateway). Grants/passes stay task-keyed (a task is in
+   one org). *Open follow-up:* the budget **policy** (allowance/threshold) is
+   still global/project in the settings store, not org — a ceiling number, not
+   a cross-tenant secret; org-scoping it rides the broader settings-scope work
+   in PLAN-cloud.md.
+
+7. **Mailbox provider (connect once, no env var)** ✅ — the agent-email backend
+   is a pluggable provider connected in Settings, mirroring the payment-provider
+   pattern (`src/autonomy/mailbox.ts`): **self-managed** (enter a domain you own
+   — the Settings field that replaces `KARMAX_AGENT_MAIL_DOMAIN` — and forward
+   its mail to the webhook) and **hosted** (paste one managed-inbox API key,
+   zero DNS; live vendor call deferred like the Stripe rail, connect surface +
+   address formation real). The provider is connected **once per installation**
+   by the operator (`settings:write`); every organization then gets a working
+   address **automatically** — an org that first read a placeholder
+   `@agent.local` address upgrades to the real domain in place (same local part,
+   reverse route preserved) the moment a provider is connected. On the public
+   hosted site the operator (site owner) connects once, ever; tenants configure
+   nothing. `GET/POST /api/agent-mail/providers|connect` + an "Agent email
+   service" card (installation-wide; hidden without `settings:write`) above the
+   per-org mailbox card.
 
 Implementation notes:
 - Existing installs keep their seeded role profiles (`seedProfiles` does not

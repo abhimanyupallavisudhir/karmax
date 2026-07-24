@@ -14,8 +14,8 @@ import { newId } from '../util/id.js';
 export interface Card {
   id: string;
   provider: string;
-  scope: 'project' | 'global';
-  scopeId?: string; // projectId for project-scope; undefined for global
+  scope: 'project' | 'organization' | 'global';
+  scopeId?: string; // projectId for project scope; organizationId for organization scope; undefined for legacy global
   label: string;
   cap: number; // hard ceiling enforced at authorization (cents)
   available: number; // funds available to spend (cents)
@@ -47,7 +47,7 @@ export interface ConnectResult {
 
 export interface PaymentProvider {
   readonly name: string;
-  provisionCard(spec: { scope: 'project' | 'global'; scopeId?: string; label: string; cap: number; merchantLock?: string[] }): Promise<Card>;
+  provisionCard(spec: { scope: 'project' | 'organization' | 'global'; scopeId?: string; label: string; cap: number; merchantLock?: string[] }): Promise<Card>;
   getCard(cardId: string): Promise<Card | undefined>;
   fund(cardId: string, amount: number): Promise<void>;
   /** Attempt a charge; the rail enforces the hard cap + merchant lock + funds. */
@@ -63,7 +63,7 @@ export class MockPaymentProvider implements PaymentProvider {
   readonly name = 'mock';
   constructor(private store: Store) {}
 
-  async provisionCard(spec: { scope: 'project' | 'global'; scopeId?: string; label: string; cap: number; merchantLock?: string[] }): Promise<Card> {
+  async provisionCard(spec: { scope: 'project' | 'organization' | 'global'; scopeId?: string; label: string; cap: number; merchantLock?: string[] }): Promise<Card> {
     const card: Card = {
       id: newId('card'),
       provider: this.name,
@@ -213,6 +213,9 @@ export function evaluateSpend(i: SpendInputs): SpendDecision {
 export interface SpendCtx {
   projectId: string;
   taskId: string;
+  /** Owning organization; cards are org-scoped so a task only spends from its
+   *  own tenant's cards. Falls back to the project's org when omitted. */
+  organizationId?: string;
 }
 export interface SpendArgs {
   amount: number;
@@ -244,7 +247,7 @@ export class BudgetService {
 
   /** Decide a spend; on `granted`, authorize the charge and record it. */
   async request(ctx: SpendCtx, args: SpendArgs): Promise<SpendResult> {
-    const card = args.cardId ? await this.provider.getCard(args.cardId) : this.store.listCards(ctx.projectId)[0];
+    const card = args.cardId ? await this.provider.getCard(args.cardId) : this.store.listCards(ctx.projectId, ctx.organizationId)[0];
     if (!card) {
       return { status: 'needs_funding', reason: 'no card is configured for this project — add and fund one', shortfall: args.amount };
     }
@@ -271,7 +274,7 @@ export class BudgetService {
 
   /** After a human approves/funds, charge the held request (used by the review gate). */
   async settleApproved(ctx: SpendCtx, args: SpendArgs): Promise<SpendResult> {
-    const card = args.cardId ? await this.provider.getCard(args.cardId) : this.store.listCards(ctx.projectId)[0];
+    const card = args.cardId ? await this.provider.getCard(args.cardId) : this.store.listCards(ctx.projectId, ctx.organizationId)[0];
     if (!card) return { status: 'denied', reason: 'no card' };
     const auth = await this.provider.authorize(card.id, args.amount, args.merchant);
     if (!auth.ok) return { status: 'needs_funding', reason: auth.reason, shortfall: args.amount, cardId: card.id };

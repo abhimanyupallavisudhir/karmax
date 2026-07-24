@@ -27,11 +27,11 @@ function memStore(): VaultItemStore & { audit: any[] } {
   };
 }
 
-function makeService() {
+function makeService(organizationId?: string) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-items-'));
   const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
   const store = memStore();
-  const items = new VaultItems(store, broker, path.join(dir, 'state'));
+  const items = new VaultItems(store, broker, path.join(dir, 'state'), organizationId);
   return { items, broker, store, dir };
 }
 
@@ -78,6 +78,26 @@ describe('vault items: CRUD + write-only secrets', () => {
     const { items } = makeService();
     const item = items.save({ type: 'login', label: 'x', secrets: { totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' } });
     expect(items.totp(item, {})).toMatch(/^\d{6}$/);
+  });
+});
+
+describe('organization isolation (tenant boundary)', () => {
+  it('items and requests are scoped per organization', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-org-'));
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const store = memStore(); // one shared store, two orgs
+    const a = new VaultItems(store, broker, path.join(dir, 'state'), 'org_a');
+    const b = new VaultItems(store, broker, path.join(dir, 'state'), 'org_b');
+    const itemA = a.save({ type: 'login', label: 'A secret', secrets: { password: 'pa' } });
+    b.save({ type: 'login', label: 'B secret', secrets: { password: 'pb' } });
+    // neither org sees the other's items
+    expect(a.list().map((i) => i.label)).toEqual(['A secret']);
+    expect(b.list().map((i) => i.label)).toEqual(['B secret']);
+    expect(b.get(itemA.id)).toBeUndefined();
+    // a parked request in org A is invisible to org B
+    a.request({ taskId: 't1', caps: [], domain: 'x.com', mode: 'use', why: 'x' });
+    expect(a.requests({ status: 'pending' })).toHaveLength(1);
+    expect(b.requests({ status: 'pending' })).toHaveLength(0);
   });
 });
 

@@ -700,4 +700,33 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       if (prev === undefined) delete process.env.KARMAX_AGENT_MAIL_SECRET; else process.env.KARMAX_AGENT_MAIL_SECRET = prev;
     }
   });
+
+  it('mailbox provider: connect a domain in Settings (no env var) and addresses adopt it', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const providers: any = await (await fetch(`${base}/api/agent-mail/providers`, { headers: auth() })).json();
+    expect(providers.providers.map((p: any) => p.name).sort()).toEqual(['hosted', 'self-managed']);
+    const connect = await fetch(`${base}/api/agent-mail/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'self-managed', domain: 'agents.test.co' }) });
+    expect(connect.status).toBe(200);
+    // a fresh org now mints its address on the connected domain
+    const addr: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
+    expect(addr.address.endsWith('@agents.test.co')).toBe(true);
+    expect(addr.configured).toBe(true);
+    // an invalid domain is rejected with a clear reason, not stored
+    const bad = await fetch(`${base}/api/agent-mail/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'self-managed', domain: 'nonsense' }) });
+    expect(bad.status).toBe(400);
+  });
+
+  it('cards are organization-scoped: one org never sees or spends another\'s card', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const made: any = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { method: 'POST', headers: auth(), body: JSON.stringify({ scope: 'organization', label: 'Org card', cap: 100000 }) })).json();
+    expect(made.scope).toBe('organization');
+    expect(made.scopeId).toBe(orgId);
+    const mine: any = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { headers: auth() })).json();
+    expect(mine.map((c: any) => c.id)).toContain(made.id);
+    // a different org's card listing does not include it
+    const others: any = await (await fetch(`${base}/api/cards?organizationId=org_elsewhere`, { headers: auth() })).json();
+    expect(others.map((c: any) => c.id)).not.toContain(made.id);
+  });
 });

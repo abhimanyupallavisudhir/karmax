@@ -68,15 +68,32 @@ export function extractLink(body: string): string | undefined {
 }
 
 export class AgentMail {
-  constructor(private store: AgentMailStore, private domain = process.env.KARMAX_AGENT_MAIL_DOMAIN) {}
+  /** `domain` is resolved from the connected mailbox provider (mailbox.ts) and
+   *  passed in by the gateway — no env var. Undefined ⇒ the `agent.local`
+   *  placeholder (usable for local/test ingestion, not real mail). */
+  constructor(private store: AgentMailStore, private domain?: string) {}
 
-  /** The organization's stable agent address; minted (with its reverse-route
-   *  entry) on first read. Random local part: unguessable across tenants. */
+  /**
+   * The organization's stable agent address; minted (with its reverse-route
+   * entry) on first read, with a random unguessable local part. If a real
+   * domain gets connected AFTER an org first read a placeholder `@agent.local`
+   * address, the address upgrades to the real domain automatically (same local
+   * part, so the reverse route is preserved) — connecting a provider "just
+   * works" for organizations that already existed.
+   */
   address(organizationId: string): string {
     const existing = this.store.kvGet(kvAddress(organizationId));
-    if (existing) return existing;
+    const domain = this.domain || 'agent.local';
+    if (existing) {
+      const [local, host] = existing.split('@');
+      if (host === domain || host !== 'agent.local' || !this.domain) return existing;
+      const upgraded = `${local}@${this.domain}`;
+      this.store.kvSet(kvAddress(organizationId), upgraded);
+      this.store.kvSet(kvOwner(local!), organizationId);
+      return upgraded;
+    }
     const local = `agent-${crypto.randomBytes(6).toString('hex')}`;
-    const address = `${local}@${this.domain || 'agent.local'}`;
+    const address = `${local}@${domain}`;
     this.store.kvSet(kvAddress(organizationId), address);
     this.store.kvSet(kvOwner(local), organizationId);
     return address;
