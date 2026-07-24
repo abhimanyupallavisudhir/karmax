@@ -69,6 +69,37 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(base.stdout).toContain('base');
   });
 
+  it('just-do: keeps working in parallel, then parks at the turn boundary until collaboration settles', async () => {
+    const repo = await h.makeRepo('jd-collaboration');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('justDo', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'parallel join',
+        prompt: '@sleep 1200\n@write own.txt :: requester work',
+      })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await handle.signal('collaborationRequested', 'collab-test');
+
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000 })
+      .toBe('collaboration');
+    expect((await view(handle)).stage).toBe('do');
+
+    await handle.signal('collaborationSettled', 'collab-test', {
+      id: 'collab-collab-test',
+      role: 'user',
+      text: '@write joined.txt :: publication arrived',
+      ts: Date.now(),
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', `karmax/${taskId}:own.txt`])).stdout).toContain('requester work');
+    expect((await git(repo, ['show', `karmax/${taskId}:joined.txt`])).stdout).toContain('publication arrived');
+  });
+
   it('script-exec: runs a command and captures its output', async () => {
     const repo = await h.makeRepo('se');
     const taskId = newId('task');
@@ -292,6 +323,52 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await wf.signal('setAgentCapacity', { capacity: 1 });
     await expect.poll(async () => (await q()).capacity, { timeout: 10_000 }).toBe(1);
     expect((await q()).current).toHaveLength(2); // shrinking never kills running turns
+    await wf.terminate('test done');
+  });
+
+  it('admits a burst through one blocking update per waiter', async () => {
+    const { agentQueueId } = await import('../src/coordinators/names.js');
+    const wf = await h.client.workflow.start('agentQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: `${agentQueueId()}:burst-test`,
+      args: [{ capacity: 2 }],
+    });
+    const items = Array.from({ length: 5 }, (_, i) => ({
+      taskId: `burst-${i}`,
+      turnId: `burst-${i}#0`,
+      role: 'do',
+    }));
+    for (const item of items) await wf.signal('leaseAgentSlot', item);
+    const waits = items.map((item) =>
+      wf.executeUpdate('waitAgentSlot', { args: [{ taskId: item.taskId, turnId: item.turnId }] }) as Promise<boolean>);
+
+    await expect.poll(async () => {
+      const view = await wf.query('agentQueue') as any;
+      return [view.current.map((x: any) => x.turnId), view.queue.map((x: any) => x.turnId)];
+    }, { timeout: 10_000 }).toEqual([
+      ['burst-0#0', 'burst-1#0'],
+      ['burst-2#0', 'burst-3#0', 'burst-4#0'],
+    ]);
+    await expect(Promise.all(waits.slice(0, 2))).resolves.toEqual([true, true]);
+
+    await wf.signal('releaseAgentSlot', { taskId: 'burst-0', turnId: 'burst-0#0' });
+    await wf.signal('releaseAgentSlot', { taskId: 'burst-1', turnId: 'burst-1#0' });
+    await expect(Promise.all(waits.slice(2, 4))).resolves.toEqual([true, true]);
+    await wf.signal('releaseAgentSlot', { taskId: 'burst-2', turnId: 'burst-2#0' });
+    await wf.signal('releaseAgentSlot', { taskId: 'burst-3', turnId: 'burst-3#0' });
+    await expect(waits[4]).resolves.toBe(true);
+
+    await wf.signal('setAgentCapacity', { capacity: 1 });
+    const cancelled = { taskId: 'burst-cancelled', turnId: 'burst-cancelled#0', role: 'do' };
+    await wf.signal('leaseAgentSlot', cancelled);
+    const cancelledWait = wf.executeUpdate('waitAgentSlot', {
+      args: [{ taskId: cancelled.taskId, turnId: cancelled.turnId }],
+    }) as Promise<boolean>;
+    await expect.poll(async () => (await wf.query('agentQueue') as any).queue.map((x: any) => x.turnId))
+      .toContain(cancelled.turnId);
+    await wf.signal('cancelAgentSlot', { taskId: cancelled.taskId, turnId: cancelled.turnId });
+    await expect(cancelledWait).resolves.toBe(false);
+
     await wf.terminate('test done');
   });
 });

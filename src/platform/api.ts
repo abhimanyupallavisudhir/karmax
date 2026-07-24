@@ -1,6 +1,6 @@
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
-import { Store } from '../store/db.js';
+import { Store, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
 import { TOOL_CAPABILITY } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
@@ -39,7 +39,7 @@ import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
 import { worldRepos } from '../world/types.js';
-import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, type GitBrokerAuth } from '../world/git-broker.js';
+import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import type { WorldAccessService } from '../world/access.js';
 
 export class CapabilityError extends Error {
@@ -161,7 +161,20 @@ export interface KarmaxApiDeps {
  */
 export class KarmaxApi {
   private armer?: TriggerArmer;
-  constructor(private deps: KarmaxApiDeps) {}
+  private collaborationNotificationRetries = new Map<string, number>();
+  constructor(private deps: KarmaxApiDeps) {
+    deps.bus?.onAny((event) => {
+      void this.routeCollaborationEvent(event).catch(() => {
+        // Settlement is durable and startup reconciliation retries notification.
+      });
+    });
+    queueMicrotask(() => {
+      void this.reconcileCollaborationRequests().catch(() => {
+        // Temporal may still be coming up. The next relevant event retries this,
+        // and unnotified settlements remain durable in SQLite.
+      });
+    });
+  }
 
   /** Attach the trigger dispatcher after construction (resolves the ctor cycle). */
   setTriggerArmer(armer: TriggerArmer) {
@@ -181,10 +194,10 @@ export class KarmaxApi {
   }
 
   private gitBrokerAuth(projectId: string): GitBrokerAuth {
-    if (!this.deps.githubApp) throw new Error('Git collaboration requires a connected GitHub App');
     const linked = this.deps.store.listProjectRepositories(projectId);
     const wiki = this.deps.store.projectWiki(projectId)?.repository;
     return async (repo) => {
+      if (!this.deps.githubApp) throw new Error('Git collaboration for a remote repository requires a connected GitHub App');
       const repository = linked.find((candidate) => candidate.repository.sshUrl === repo.repo)?.repository
         ?? (wiki?.sshUrl === repo.repo ? wiki : undefined);
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
@@ -198,6 +211,82 @@ export class KarmaxApi {
     return { world: await this.deps.worlds.open(handle), handle, release: async () => {} };
   }
 
+  private collaborationCaller(token: string) {
+    const caller = this.require(token, 'request_agent_action');
+    if (!caller.taskId || caller.taskId === '*')
+      throw new CapabilityError('request_agent_action requires a task-agent token');
+    const task = this.deps.store.getTask(caller.taskId);
+    if (!task) throw new Error('calling task not found');
+    return task;
+  }
+
+  /**
+   * Register work with another task without synchronously waiting for it. The
+   * requester workflow records the durable request before the target is nudged;
+   * at its turn boundary it can therefore park without racing a fast publish.
+   */
+  async requestAgentAction(token: string, input: {
+    taskId: string;
+    role?: string;
+    action: 'publish_branch';
+    message?: string;
+  }): Promise<CollaborationRequest> {
+    const requester = this.collaborationCaller(token);
+    const target = this.deps.store.getTask(input.taskId);
+    if (!target || target.projectId !== requester.projectId)
+      throw new Error('target task must belong to the same project');
+    if (target.id === requester.id) throw new Error('a task cannot request collaboration from itself');
+    if (input.action !== 'publish_branch') throw new Error(`unsupported agent action: ${input.action}`);
+    if (['done', 'cancelled', 'failed'].includes(target.lastView?.status ?? ''))
+      throw new Error(`target task is already ${target.lastView?.status}`);
+    if (target.lastView?.pointOfNoReturnPassed || ['pr', 'merge'].includes(target.lastView?.stage ?? ''))
+      throw new Error('target task has passed its agent-work stage and can no longer publish on request');
+
+    const request = this.deps.store.createCollaborationRequest({
+      requesterTaskId: requester.id,
+      targetTaskId: target.id,
+      targetRole: input.role ?? 'do',
+      action: input.action,
+    });
+
+    // New software-dev workers understand this signal and hold the requester in
+    // Do at its turn boundary. Other workflow types still receive the eventual
+    // follow-up notification, so an unknown signal is a safe compatibility case.
+    try {
+      await this.deps.client.workflow.getHandle(requester.id)
+        .signal(SIG.collaborationRequested, request.id);
+    } catch (error) {
+      this.deps.store.deleteCollaborationRequest(request.id);
+      throw new Error(`could not register collaboration with the requesting workflow: ${unwrapCause(error)}`);
+    }
+
+    const instruction = [
+      `[Collaboration request ${request.id}]`,
+      input.message?.trim() || `Task ${requester.num ? `#${requester.num}` : requester.id} needs your current branch.`,
+      'Continue your work as needed, then commit all intended changes and call publish_task_branch.',
+      'Karmax will notify the requester automatically when publication succeeds or this task terminates; do not message it back just to report status.',
+    ].join('\n\n');
+    try {
+      await this.deliverWorkflowMessage(target.id, instruction, input.role ?? 'do');
+    } catch (error) {
+      const failed = this.deps.store.settleCollaborationRequest(request.id, 'failed', {
+        requestId: request.id,
+        reason: `could not deliver the request: ${unwrapCause(error)}`,
+      });
+      if (failed) await this.notifyCollaborationRequest(failed);
+      return this.deps.store.getCollaborationRequest(request.id) ?? request;
+    }
+    return this.deps.store.getCollaborationRequest(request.id) ?? request;
+  }
+
+  private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
+    const now = Date.now();
+    const message: Message = { id: `u${now}`, role: 'user', text, ts: now };
+    await this.deps.client.workflow.getHandle(taskId).signal(SIG.followUp, message, role);
+    this.publishConversationMessage(taskId, role, message);
+    return message;
+  }
+
   async publishTaskBranch(token: string): Promise<{ branch: string; pushed: string[] }> {
     const { task, handle } = this.collaborationTask(token, 'publish_task_branch');
     const access = await this.openCollaborationWorld(task.id, handle);
@@ -209,11 +298,12 @@ export class KarmaxApi {
       }
       const result = await brokerPublishBranch(access.world, this.gitBrokerAuth(task.projectId));
       if (!result.pushed.length || result.skipped.length)
-        throw new Error(`could not publish ${result.skipped.length ? result.skipped.join(', ') : 'task branch'}`);
+        throw new Error(`could not publish ${result.skipped.length ? describePublishFailures(result) : 'task branch'}`);
       const event = { taskId: task.id, type: 'push.branch', ts: Date.now(), payload: {
         branch: access.handle.branch, repos: result.pushed, reason: 'agent-collaboration' } };
       const seq = this.deps.store.appendEvent(event);
       this.deps.bus?.emit({ ...event, seq });
+      await this.routeCollaborationEvent({ ...event, seq });
       return { branch: access.handle.branch, pushed: result.pushed };
     } finally { await access.release(); }
   }
@@ -1468,6 +1558,17 @@ export class KarmaxApi {
     );
     this.deps.store.setTaskWorkflowVersion(taskId, version);
     this.deps.store.setTaskExecutionWorkflow(taskId, task.workflow);
+    // A failed workflow recovery starts a new Temporal history, so replay cannot
+    // reconstruct collaborationRequested signals from the old execution. Restore
+    // the durable join set before the recovered Do turn can advance to Review.
+    for (const request of this.deps.store.listCollaborationRequests({
+      requesterTaskId: taskId,
+      status: 'pending',
+    })) {
+      await this.deps.client.workflow.getHandle(taskId)
+        .signal(SIG.collaborationRequested, request.id)
+        .catch(() => undefined);
+    }
     const started = this.resolveStart(task.workflow, version);
     if (started) this.saveAgentSnapshot(taskId, started.manifest, input);
     // Close the short acceptance→first-publish window so the UI cannot offer a
@@ -1592,6 +1693,113 @@ export class KarmaxApi {
     };
     const seq = this.deps.store.appendEvent(event);
     this.deps.bus?.emit({ ...event, seq });
+  }
+
+  private async routeCollaborationEvent(event: {
+    taskId: string;
+    type: string;
+    ts: number;
+    payload: unknown;
+    seq?: number;
+  }): Promise<void> {
+    let settled: CollaborationRequest[] = [];
+    if (event.type === 'push.branch') {
+      const payload = (event.payload ?? {}) as Record<string, unknown>;
+      settled = this.deps.store.settleCollaborationRequests(event.taskId, 'completed', {
+        branch: payload.branch,
+        repos: payload.repos,
+        eventSeq: event.seq,
+      }, event.seq);
+    } else if (event.type === 'view.updated') {
+      const status = String((event.payload as { status?: unknown } | undefined)?.status ?? '');
+      if (status === 'failed' || status === 'cancelled' || status === 'done') {
+        settled = this.deps.store.settleCollaborationRequests(event.taskId, 'failed', {
+          reason: status === 'done'
+            ? 'target task completed without publishing its branch'
+            : `target task became ${status}`,
+          eventSeq: event.seq,
+        }, event.seq);
+      }
+    }
+    for (const request of settled) await this.notifyCollaborationRequest(request);
+  }
+
+  private async notifyCollaborationRequest(request: CollaborationRequest, attempt = 0): Promise<void> {
+    if (request.status === 'pending' || request.notifiedAt) return;
+    const target = this.deps.store.getTask(request.targetTaskId);
+    const label = target?.num ? `#${target.num}` : request.targetTaskId;
+    const result = request.result ?? {};
+    const text = request.status === 'completed'
+      ? [
+          `[Collaboration request ${request.id} completed]`,
+          `Task ${label} published branch ${String(result.branch ?? '(unknown)')}.`,
+          `Call import_task_branch with source_task_id "${request.targetTaskId}" when you are ready to consume it.`,
+        ].join('\n\n')
+      : [
+          `[Collaboration request ${request.id} failed]`,
+          `Task ${label} did not publish its branch: ${String(result.reason ?? 'unknown failure')}.`,
+          'Continue with another approach or send a new request after the target task is recoverable.',
+        ].join('\n\n');
+    const now = Date.now();
+    const message: Message = { id: `collab-${request.id}`, role: 'user', text, ts: now };
+    const handle = this.deps.client.workflow.getHandle(request.requesterTaskId);
+    try {
+      await handle.signal(SIG.collaborationSettled, request.id, message);
+    } catch {
+      this.scheduleCollaborationNotification(request.id, attempt + 1);
+      return;
+    }
+    try {
+      // Temporal accepts unknown signal names and buffers them, so success from
+      // collaborationSettled alone does not prove an older workflow consumed it.
+      // Also send the ordinary message signal; collaboration-aware workflows
+      // deduplicate by message id, while older ones still receive the update.
+      await handle.signal(SIG.followUp, message, 'do');
+    } catch {
+      this.scheduleCollaborationNotification(request.id, attempt + 1);
+      return;
+    }
+    this.publishConversationMessage(request.requesterTaskId, 'do', message);
+    this.deps.store.markCollaborationRequestNotified(request.id);
+    this.collaborationNotificationRetries.delete(request.id);
+  }
+
+  private scheduleCollaborationNotification(requestId: string, attempt: number): void {
+    if (this.collaborationNotificationRetries.has(requestId)) return;
+    this.collaborationNotificationRetries.set(requestId, attempt);
+    const timer = setTimeout(() => {
+      this.collaborationNotificationRetries.delete(requestId);
+      const request = this.deps.store.getCollaborationRequest(requestId);
+      if (request && request.status !== 'pending' && !request.notifiedAt)
+        void this.notifyCollaborationRequest(request, attempt);
+    }, Math.min(30_000, 500 * 2 ** Math.min(attempt, 6)));
+    timer.unref?.();
+  }
+
+  private async reconcileCollaborationRequests(): Promise<void> {
+    for (const request of this.deps.store.listCollaborationRequests({ status: 'pending' })) {
+      const relevant = this.deps.store.eventsSince(request.targetTaskId, request.afterSeq)
+        .find((event) => event.type === 'push.branch'
+          || (event.type === 'view.updated'
+            && ['done', 'cancelled', 'failed'].includes(String((event.payload as any)?.status ?? ''))));
+      if (relevant) {
+        await this.routeCollaborationEvent(relevant);
+        continue;
+      }
+      const status = this.deps.store.getTask(request.targetTaskId)?.lastView?.status;
+      if (status && ['done', 'cancelled', 'failed'].includes(status)) {
+        const settled = this.deps.store.settleCollaborationRequests(request.targetTaskId, 'failed', {
+          reason: status === 'done'
+            ? 'target task completed without publishing its branch'
+            : `target task became ${status}`,
+        });
+        for (const item of settled) await this.notifyCollaborationRequest(item);
+      }
+    }
+    for (const status of ['completed', 'failed'] as const) {
+      for (const request of this.deps.store.listCollaborationRequests({ status, unnotified: true }))
+        await this.notifyCollaborationRequest(request);
+    }
   }
 
   async setTarget(token: string, taskId: string, branch: string): Promise<boolean> {

@@ -371,6 +371,12 @@ karmax mints **one config home per (account × profile)** under `~/.karmax`, and
 ### 7.4 Agent communication
 
 - **Point-to-point** (supervisor follow-up to a sub-task at the review gate; a hotfix to one task) = **a signal to that task's workflow**, appended to the agent's next turn. No new machinery; it falls out of signals + the per-turn loop.
+- **Requested cross-task work** (for example, “publish your branch”) = a durable
+  collaboration request plus point-to-point signals. Registration returns immediately,
+  so the requester keeps working during its current turn. If the turn ends first, its
+  workflow parks without an agent process; the target's publication or terminal failure
+  settles the request and injects a deduplicated follow-up that wakes the requester.
+  The event log/store is the durable join state — agents never poll another task.
 - **Fan-out** (a hotfix broadcast to all active tasks touching a file) = **a small workflow** that enumerates targets and signals each. Only orchestrated multi-target comms deserve to be a workflow.
 
 ### 7.5 Browser automation

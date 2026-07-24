@@ -27,6 +27,8 @@ const turns = proxyActivities<coreActivities>({
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
 export const followUpSignal = defineSignal<[Message]>('followUp');
+export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
+export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const viewQuery = defineQuery<TaskView>('view');
@@ -62,6 +64,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
   let waitingFor: TaskView['waitingFor'];
   let agentTurn: TaskView['agentTurn'];
   let seen = 0;
+  const pendingCollaborations = new Set<string>();
   const base = input.base ?? input.project.defaultBase ?? 'main';
   // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
   // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
@@ -134,7 +137,16 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
   setHandler(viewQuery, view);
   setHandler(pendingMessagesQuery, (_role, fromIndex) => msgs.slice(Math.max(0, fromIndex)));
   setHandler(followUpSignal, (m) => {
-    msgs.push({ ...m, ts: m.ts || msgs.length });
+    if (!msgs.some((candidate) => candidate.id === m.id))
+      msgs.push({ ...m, ts: m.ts || msgs.length });
+  });
+  setHandler(collaborationRequestedSignal, (requestId) => {
+    pendingCollaborations.add(requestId);
+  });
+  setHandler(collaborationSettledSignal, (requestId, message) => {
+    pendingCollaborations.delete(requestId);
+    if (!msgs.some((candidate) => candidate.id === message.id))
+      msgs.push({ ...message, ts: message.ts || msgs.length });
   });
   setHandler(confirmSignal, () => {
     confirmed = true;
@@ -181,6 +193,20 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     // turn's last poll stay after `seen` → delivered on the next turn.
     seen = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    if (pendingCollaborations.size > 0) {
+      status = 'waiting';
+      waitingFor = {
+        kind: 'collaboration',
+        detail: `Waiting for ${pendingCollaborations.size} background collaboration request(s)`,
+      };
+      await publish();
+      await condition(() => cancelled || pendingCollaborations.size === 0 || msgs.length > seen);
+      if (cancelled) break;
+      status = 'active';
+      waitingFor = undefined;
+      continue;
+    }
+    if (msgs.length > seen) continue;
     stage = 'review';
     status = 'waiting';
     // Play the confirm layers in order (SPEC §5.2): every layer must approve; a

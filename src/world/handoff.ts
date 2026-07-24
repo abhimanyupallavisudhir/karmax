@@ -8,7 +8,13 @@ import { worldRepos, worldRepoSource, worldWorkingDirectory } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import type { RunnerPoolService } from './runners.js';
 import type { GitHubAppService } from '../integrations/github-app.js';
-import { brokerPublishBranch, brokerRefreshBranch, type GitBrokerAuth, type GitBrokerCredential } from './git-broker.js';
+import {
+  brokerPublishBranch,
+  brokerRefreshBranch,
+  describePublishFailures,
+  type GitBrokerAuth,
+  type GitBrokerCredential,
+} from './git-broker.js';
 import type { WorldAccessService } from './access.js';
 import { git } from './git.js';
 import { paths } from '../config/paths.js';
@@ -69,7 +75,7 @@ export class WorldHandoffService {
     const world = access?.world ?? await this.worlds.open(handle);
     try {
       const published = await brokerPublishBranch(world, auth);
-      if (published.skipped.length) throw new Error(`could not publish committed cloud branch for: ${published.skipped.join(', ')}`);
+      if (published.skipped.length) throw new Error(`could not publish committed cloud branch for: ${describePublishFailures(published)}`);
       this.store.appendEvent({ taskId, type: 'push.branch', ts: Date.now(), payload: {
         branch: handle.branch, repos: published.pushed, reason: 'local-materialization',
       } });

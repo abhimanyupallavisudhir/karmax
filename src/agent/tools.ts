@@ -204,6 +204,18 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, message: { type: 'string' } }, required: ['task_id', 'message'] },
   },
   {
+    name: 'request_agent_action',
+    description: 'Ask another task agent to publish its branch in the background. Returns a durable request id immediately; Karmax injects completion or failure into this conversation. Continue other work and do not poll.',
+    parameters: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string' }, role: { type: 'string' },
+        action: { type: 'string', enum: ['publish_branch'] }, message: { type: 'string' },
+      },
+      required: ['task_id', 'action'],
+    },
+  },
+  {
     name: 'publish_task_branch',
     description: 'Publish this task’s clean, committed Git branch so another agent can import it. Commit first.',
     parameters: { type: 'object', properties: {} },
@@ -424,6 +436,14 @@ export function platformToolHandlers(
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
       await platformRequest('POST', `/api/tasks/${taskId}/signal`, { signal: 'followUp', role: args?.role ?? 'do', text: args?.message });
       return 'message delivered';
+    },
+    async request_agent_action(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/agent/collaboration/request', {
+        taskId: String(args?.task_id ?? ''),
+        role: args?.role ? String(args.role) : 'do',
+        action: String(args?.action ?? ''),
+        message: args?.message ? String(args.message) : undefined,
+      }));
     },
     async publish_task_branch() {
       return JSON.stringify(await platformRequest('POST', '/api/agent/git/publish', {}));

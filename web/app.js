@@ -5085,6 +5085,7 @@ function waitingLabel(w) {
     case 'mergeSlot': return 'a merge slot';
     case 'human': return w.detail ? `human input (${w.detail})` : 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
+    case 'collaboration': return w.detail || 'another task agent';
     case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'shell': return w.detail || 'a background job to finish';
     case 'parent': return 'the parent task to respond';

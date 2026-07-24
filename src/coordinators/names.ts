@@ -23,6 +23,7 @@ export const SIG_LEASE_AGENT = 'leaseAgentSlot';
 export const SIG_CANCEL_AGENT = 'cancelAgentSlot';
 export const SIG_RELEASE_AGENT = 'releaseAgentSlot';
 export const SIG_SET_AGENT_CAPACITY = 'setAgentCapacity';
+export const UPD_WAIT_AGENT = 'waitAgentSlot';
 export const QRY_AGENT_QUEUE = 'agentQueue';
 
 export const SIG_LEASE_ACCOUNT = 'leaseAccount';

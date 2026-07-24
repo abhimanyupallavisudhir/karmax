@@ -68,6 +68,8 @@ export function pinnedType(type: WorkflowName, version: string): string {
 
 export const SIG = {
   followUp: 'followUp',
+  collaborationRequested: 'collaborationRequested',
+  collaborationSettled: 'collaborationSettled',
   confirm: 'confirm',
   cancel: 'cancel',
   retry: 'retry',
