@@ -1,4 +1,4 @@
-import { WorkflowNotFoundError, type Client } from '@temporalio/client';
+import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
@@ -816,7 +816,11 @@ export class KarmaxApi {
     const task = this.deps.store.getTask(taskId)!;
     const errs = validateTriggers(normalizeTriggers(task.params));
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
-    this.deps.store.updateTaskParams(taskId, { ...task.params, draft: false, triggerState: 'armed' });
+    // Arming is the queue transition for triggered work, so this also assigns
+    // the logical task's human-facing number if it has never been queued before.
+    this.deps.store.clearDraft(taskId);
+    const queued = this.deps.store.getTask(taskId)!;
+    this.deps.store.updateTaskParams(taskId, { ...queued.params, triggerState: 'armed' });
     const armed = this.deps.store.getTask(taskId)!;
     this.armer?.arm(armed);
     return armed;
@@ -846,21 +850,35 @@ export class KarmaxApi {
     // Pin to the version stamped when the draft was created, not whatever is
     // current now — queueing a draft after an upgrade must not silently swap code.
     const { startType, input } = await this.buildStart(task);
+    const hadNumber = task.num != null;
     this.deps.store.clearDraft(taskId);
-    // Bounded + compensated: on a wedged engine, restore the draft flag so a
-    // failed queue attempt leaves the task saved (not stranded, non-draft, with
-    // no workflow) and report a real error rather than hanging.
+    // Bounded + compensated: on a wedged engine, restore the draft and release a
+    // number minted by this failed transition. Previously established permalinks
+    // remain stable when already-numbered work is queued again.
     try {
       await withTimeout(
-        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
+        this.deps.client.workflow.start(startType, {
+          taskQueue: this.deps.taskQueue,
+          workflowId: task.id,
+          // Queueing is idempotent. In particular, never create a second run if
+          // the first one finished before a lost start acknowledgement is retried.
+          workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,
+          args: [input],
+        }),
         START_TIMEOUT_MS,
       );
     } catch (e) {
-      this.deps.store.updateTaskParams(taskId, { ...task.params, draft: true });
-      throw new Error(
-        `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
-          `It's still saved as a draft — check that Temporal is healthy and try again.`,
-      );
+      // A start acknowledgement can be lost after Temporal durably accepted the
+      // workflow. The retry then reports "already started"; that is proof of
+      // acceptance for this task's unique workflow ID, not a queue failure.
+      // Keep the task queued and repair the stale draft metadata.
+      if (!(e instanceof WorkflowExecutionAlreadyStartedError)) {
+        this.deps.store.restoreDraft(taskId, !hadNumber);
+        throw new Error(
+          `Could not queue task: the durable engine didn't accept it (${e instanceof Error ? e.message : String(e)}). ` +
+            `It's still saved as a draft — check that Temporal is healthy and try again.`,
+        );
+      }
     }
     const started = this.resolveStart(task.workflow, task.workflowVersion);
     if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
@@ -1130,7 +1148,7 @@ export class KarmaxApi {
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks', { projectId });
-    return this.deps.store.listPrincipalTasks(projectId);
+    return this.deps.store.listTasks(projectId);
   }
 
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
@@ -1243,7 +1261,7 @@ export class KarmaxApi {
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
     const caller = this.require(token, 'search_tasks', { projectId });
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
-    const tasks = this.deps.store.listPrincipalTasks(projectId);
+    const tasks = this.deps.store.listTasks(projectId);
     const tags = this.deps.store.listTags(projectId);
     const principal = principalRefOf(caller.principal);
     return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });
@@ -1433,6 +1451,7 @@ export class KarmaxApi {
       START_TIMEOUT_MS,
     );
     this.deps.store.setTaskWorkflowVersion(taskId, version);
+    this.deps.store.setTaskExecutionWorkflow(taskId, task.workflow);
     const started = this.resolveStart(task.workflow, version);
     if (started) this.saveAgentSnapshot(taskId, started.manifest, input);
     // Close the short acceptance→first-publish window so the UI cannot offer a
@@ -1582,6 +1601,33 @@ export class KarmaxApi {
     try {
       const result = (await this.deps.client.workflow.getHandle(taskId).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
       this.updateAgentSnapshot(taskId, patch, result.applied);
+      return result;
+    } catch (e) {
+      throw new Error(unwrapCause(e));
+    }
+  }
+
+  /**
+   * Change the policy of a compatible running workflow without replacing its
+   * Temporal execution. The workflow update is authoritative and validates the
+   * lifecycle window; only after it accepts do we change the searchable record.
+   */
+  async changeWorkflow(
+    token: string,
+    taskId: string,
+    workflow: string,
+  ): Promise<{ workflow: 'software-dev' | 'goal' }> {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'edit_task', { projectId: task?.projectId, taskId });
+    if (!task) throw new Error(`no task ${taskId}`);
+    if (workflow !== 'software-dev' && workflow !== 'goal') {
+      throw new Error('only Software Dev and Goal are compatible in-flight');
+    }
+    try {
+      const result = (await this.deps.client.workflow
+        .getHandle(taskId)
+        .executeUpdate('changeWorkflow', { args: [workflow] })) as { workflow: 'software-dev' | 'goal' };
+      this.deps.store.setTaskWorkflow(taskId, result.workflow);
       return result;
     } catch (e) {
       throw new Error(unwrapCause(e));
@@ -1829,7 +1875,7 @@ export class KarmaxApi {
   workflowSchemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
     const taskSchemas = this.deps.workflows
       ? this.deps.workflows.schemas()
-      : MANIFESTS.filter((m) => m.kind !== 'coordinator').map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
+      : MANIFESTS.filter((m) => m.kind !== 'coordinator' && m.selectable !== false).map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
     const settingsOnly = MANIFESTS
       .filter((m) => m.kind === 'coordinator' && m.params.length)
       .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));

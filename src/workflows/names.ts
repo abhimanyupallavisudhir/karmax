@@ -42,12 +42,14 @@ export const BUNDLED_QUALIFIED = new Set<string>([
   qualifiedType(WF.softwareDev, '1.0.0'),
   qualifiedType(WF.softwareDev, '1.1.0'),
   qualifiedType(WF.softwareDev, '1.2.0'),
+  qualifiedType(WF.softwareDev, '1.3.0'),
   qualifiedType(WF.justDo, '1.0.0'),
   qualifiedType(WF.justDo, '1.1.0'),
   qualifiedType(WF.scriptExec, '1.0.0'),
   qualifiedType(WF.goal, '1.0.0'),
   qualifiedType(WF.goal, '1.1.0'),
   qualifiedType(WF.goal, '1.2.0'),
+  qualifiedType(WF.goal, '1.3.0'),
   qualifiedType(WF.mergeOnly, '1.0.0'),
   qualifiedType(WF.mergeOnly, '1.1.0'),
 ]);
@@ -75,4 +77,4 @@ export const SIG = {
 export const SIG_AGENT_TURN_STATE = 'agentTurnState';
 
 export const QRY = { view: 'view' } as const;
-export const UPD = { setTarget: 'setTarget', updateParams: 'updateParams' } as const;
+export const UPD = { setTarget: 'setTarget', updateParams: 'updateParams', changeWorkflow: 'changeWorkflow' } as const;

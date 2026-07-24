@@ -707,6 +707,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const { paths } = await import('../config/paths.js');
         bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
       }
+      // Goal mode: the do agent is told to keep driving across turns until the
+      // objective is verifiably complete. Appended to the built-in working
+      // instructions so it flows through the wiki context and fallback alike.
+      const goalSuffix = args.role === 'do' && (args.task as { goalMode?: boolean }).goalMode
+        ? `
+- Goal mode is active. Continue autonomously across turns until the entire objective is complete and verified. A normal response does not finish the task: call signal_completion only when no required work remains. If you genuinely need a human decision, raise it with the appropriate task tool instead.`
+        : '';
+      const builtinInstructions = goalSuffix ? `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}` : deps.globalInstructions;
       // Wiki context (SPEC §5.4 "global + project instructions"): the built-in
       // working instructions (a virtual unconditional wiki entry), then per
       // scope its unconditional entries in full and the indexed TOC. Read here
@@ -730,12 +738,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           contentDir: paths().content,
           organizationId: store.getProject(args.task.projectId)?.organizationId,
           projectId: args.task.projectId,
-          builtinInstructions: deps.globalInstructions,
+          builtinInstructions,
           taggedText,
           contextTokens: Array.isArray(wikiContext) ? wikiContext.map(String) : undefined,
         }) || undefined;
       } catch {
-        globalInstructions = deps.globalInstructions ?? GLOBAL_INSTRUCTIONS;
+        globalInstructions = `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}`;
       }
       const systemPrompt = assemblePrompt({
         profile,

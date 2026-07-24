@@ -81,12 +81,15 @@ const cmds = [
   { id: 'nav.tasks', keys: parseKeybinding('g t') },
   { id: 'nav.queue', keys: parseKeybinding('g q') },
   { id: 'nav.global', keys: parseKeybinding('g g') },
+  { id: 'nav.notifications', keys: parseKeybinding('g N') },
   { id: 'pal', keys: parseKeybinding('meta+k') },
 ];
 ok(chordCandidates(cmds, [], ev('n')).map((c) => c.id).join() === 'nav.newTask', 'exact single-key match');
-ok(chordCandidates(cmds, [], ev('g')).length === 3, "'g' opens a 3-way chord prefix");
+ok(chordCandidates(cmds, [], ev('g')).length === 4, "'g' opens a 4-way chord prefix");
 ok(chordCandidates(cmds, [ev('g')], ev('t')).map((c) => c.id).join() === 'nav.tasks', 'g then t resolves');
 ok(chordCandidates(cmds, [ev('g')], ev('g')).map((c) => c.id).join() === 'nav.global', 'g then g resolves (prefix reuse)');
+ok(chordCandidates(cmds, [ev('g')], ev('N', { shiftKey: true })).map((c) => c.id).join() === 'nav.notifications', 'g then uppercase N opens notifications');
+ok(!chordCandidates(cmds, [ev('g')], ev('n')).some((c) => c.id === 'nav.notifications'), 'lowercase g n does not open notifications');
 ok(chordCandidates(cmds, [ev('g')], ev('z')).length === 0, 'g then unknown → no candidates');
 ok(chordCandidates(cmds, [], ev('k', { ctrlKey: true })).map((c) => c.id).join() === 'pal', 'Ctrl+K finds meta+k');
 ok(chordCandidates(cmds, [], ev('t')).length === 0, "bare 't' is not a command (only after 'g')");

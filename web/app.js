@@ -76,7 +76,8 @@ const S = {
 // Non-principal attempts are intentionally absent from S.tasks because the list
 // has one row per logical task. Page lookups must also consult the loaded group.
 function taskRecord(id) {
-  return (S.attemptGroup?.attempts || []).find((t) => t.id === id) || (S.tasks || []).find((t) => t.id === id);
+  return (S.attemptGroup?.attempts || []).find((t) => t.id === id)
+    || (S.tasks || []).find((t) => t.id === id);
 }
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
@@ -380,9 +381,8 @@ function principalLabel(principal) {
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
   { id: 'goal', label: 'Goal (auto-run)' },
-  { id: 'just-do', label: 'Just do' },
-  { id: 'script-exec', label: 'Script' },
 ];
+const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
 
 const NODES = [
   { key: 'setup', label: 'Setup' },
@@ -663,7 +663,7 @@ function cfLayerHtml(f, layer, agentDefault) {
       <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type @ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
   </div>`;
@@ -946,6 +946,16 @@ function cfSync(box) {
   if (empty) empty.style.display = rows.length ? 'none' : '';
 }
 
+// Review-request prompts accept the same project/org wiki mentions as the task
+// prompt and follow-up composer. The resolver scans the rendered request when the
+// Confirm turn starts; wireWikiMention supplies the shared search/picker UI.
+function wireConfirmerWikiPrompts(root) {
+  // Kept guarded for hosts upgrading from a build before wiki mentions existed;
+  // current builds always provide the shared picker.
+  if (typeof wireWikiMention !== 'function') return;
+  root.querySelectorAll('.cf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
+}
+
 // Confirmer fields: an editable layer list. Row controls are delegated to the box
 // so a reset (which re-renders the rows) needs no re-wiring; only dynamically
 // added agent sub-forms are wired as they appear.
@@ -981,6 +991,7 @@ function wireConfirmerField(box) {
       if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
       else list.appendChild(row);
       row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      wireConfirmerWikiPrompts(row);
       cfSync(box); changed();
     }
   });
@@ -994,6 +1005,7 @@ function wireConfirmerField(box) {
     const hb = row.querySelector('.cf-human');
     if (hb) hb.style.display = e.target.value === 'human' ? '' : 'none';
   });
+  wireConfirmerWikiPrompts(box);
   cfSync(box);
 }
 
@@ -1091,6 +1103,7 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   // the box, so only the fresh agent sub-forms need wiring.
   list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
   list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  wireConfirmerWikiPrompts(list);
   cfSync(box);
   // This composite control is rebuilt rather than assigned through an input.
   // Emit the same event as a user edit so draft auto-save persists the reset;
@@ -3808,6 +3821,7 @@ function renderTaskPage() {
   main.innerHTML = `
     <div class="task-page">
       <div class="tp-head">
+        ${parentTaskContext(v)}
         <div class="row1">
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
@@ -3816,7 +3830,12 @@ function renderTaskPage() {
           <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
         </div>
         <div class="meta">
-          <span>${esc(v.workflow)}${rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
+          <span>${v.workflowOptions?.length > 1
+            ? `<select id="tp-workflow-mode" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
+                ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
+              </select>`
+            : esc(workflowLabel(v.workflow))}
+            ${rec?.workflowVersion ? `<span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
@@ -3841,6 +3860,7 @@ function renderTaskPage() {
     }),
   );
   wireAttempts(v);
+  wireWorkflowMode(v);
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   if (tab === 'overview') {
@@ -3850,6 +3870,7 @@ function renderTaskPage() {
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
+    wireWorldFileLinks(v);
   } else if (tab === 'parameters') {
     wireParams(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
@@ -3936,6 +3957,33 @@ function restoreThreadSelection(thread, snap) {
     sel.removeAllRanges();
     sel.addRange(range);
   } catch {}
+}
+
+function wireWorkflowMode(v) {
+  const select = document.getElementById('tp-workflow-mode');
+  if (!select) return;
+  select.addEventListener('change', async () => {
+    const prior = v.workflow;
+    const workflow = select.value;
+    select.disabled = true;
+    try {
+      const changed = await api(`/api/tasks/${v.taskId}/workflow`, {
+        method: 'PATCH',
+        body: JSON.stringify({ workflow }),
+      });
+      v.workflow = changed.workflow;
+      const rec = taskRecord(v.taskId);
+      if (rec) rec.workflow = changed.workflow;
+      toast(changed.workflow === 'goal'
+        ? 'Goal mode enabled — the agent will continue autonomously'
+        : 'Software Dev mode enabled — the task will stop at Review');
+      await Promise.all([refreshTask(), refreshTasks()]);
+    } catch (e) {
+      select.value = prior;
+      select.disabled = !v.workflowSwitchable;
+      toast(e.message, true);
+    }
+  });
 }
 
 // Switch the open task page to another of its tabs, pinning the tab in the URL
@@ -4338,6 +4386,79 @@ function setStopBtn(running, procId, taskId) {
   };
 }
 
+// A child should always feel like part of its parent task, never like an orphaned
+// page. Keep the relationship in the task-page masthead where it reads as
+// navigation; `taskRecord` normally supplies the human title/number from the
+// project task pool, with a compact id fallback for old or partially loaded data.
+function parentTaskContext(v) {
+  const child = taskRecord(v.taskId);
+  const parentId = v.parentTaskId || child?.parentTaskId;
+  if (!parentId) return '';
+  const parent = taskRecord(parentId);
+  const label = parent
+    ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
+    : numLabel(parentId);
+  return `<button type="button" class="tp-parent" data-open="${esc(parentId)}" aria-label="Open parent task ${esc(label)}">
+    <span class="tp-parent-kicker">Sub-task of</span>
+    <span class="tp-parent-title">${esc(label)}</span>
+    <span class="tp-parent-arrow" aria-hidden="true">›</span>
+  </button>`;
+}
+
+// Turn workflow vocabulary into the one short state phrase a person needs while
+// scanning delegated work. The pipeline still carries exact stage progression;
+// this copy carries meaning.
+function subTaskState(rec) {
+  const v = rec?.lastView || {};
+  const status = v.status || 'active';
+  const stage = v.stage || 'setup';
+  if (status === 'done' || stage === 'done') return { label: 'Complete', tone: 'done', complete: true };
+  if (status === 'failed') return { label: 'Failed', tone: 'failed', complete: false };
+  if (status === 'cancelled') return { label: 'Cancelled', tone: 'cancelled', complete: false };
+  if (stage === 'escalated' || status === 'blocked') return { label: 'Needs direction', tone: 'blocked', complete: false };
+  if (stage === 'review') return { label: 'Ready to return', tone: 'waiting', complete: false };
+  if (v.waitingFor?.kind === 'parent') return { label: 'Waiting on parent', tone: 'waiting', complete: false };
+  if (status === 'waiting') return { label: 'Waiting', tone: 'waiting', complete: false };
+  return { label: 'In progress', tone: 'active', complete: false };
+}
+
+function subTasksSection(v) {
+  if (!v.subTasks?.length) return '';
+  const children = v.subTasks.map((id) => {
+    const rec = taskRecord(id);
+    const state = subTaskState(rec);
+    return { id, rec, state };
+  });
+  const complete = children.filter((child) => child.state.complete).length;
+  const progress = Math.round((complete / children.length) * 100);
+  const rows = children.map(({ id, rec, state }) => {
+    const title = rec?.title || `Sub-task ${numLabel(id)}`;
+    const childView = { workflow: rec?.workflow || v.workflow, ...(rec?.lastView || {}) };
+    return `<button type="button" class="subtask-row" data-open="${esc(id)}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
+      <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
+      <span class="subtask-identity">
+        <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
+        <span class="subtask-copy">${esc(state.label)} <span aria-hidden="true">·</span> ${esc(stageLabel(childView))}</span>
+      </span>
+      <span class="subtask-pipeline" aria-hidden="true">${pipeline(childView)}</span>
+      <span class="subtask-arrow" aria-hidden="true">›</span>
+    </button>`;
+  }).join('');
+  return `<section class="subtasks" aria-labelledby="subtasks-title">
+    <div class="subtasks-head">
+      <div>
+        <div class="subtasks-kicker">Delegated work</div>
+        <h3 id="subtasks-title">Sub-tasks</h3>
+      </div>
+      <div class="subtasks-count"><strong>${complete}</strong> of ${children.length} complete</div>
+    </div>
+    <div class="subtasks-progress" role="progressbar" aria-label="Sub-task completion" aria-valuemin="0" aria-valuemax="${children.length}" aria-valuenow="${complete}">
+      <span style="--subtask-progress:${progress}%"></span>
+    </div>
+    <div class="subtask-list">${rows}</div>
+  </section>`;
+}
+
 // ── the four task-page tabs ───────────────────────────────────────────────────
 // Overview: what the task IS and where it stands — pipeline, review, widgets,
 // sub-tasks, notes. Everything shown comes off the workflow's declared view.
@@ -4372,18 +4493,16 @@ function overviewTab(v) {
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
     : '';
-  const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><a class="branch sub-open" data-spa href="${taskUrl(id)}" style="cursor:pointer">↳ ${esc(numLabel(id))}</a></div>`).join('')}`
-    : '';
+  const subtasks = subTasksSection(v);
   return `
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
     ${error}
     ${waiting}
     ${agentTurn}
+    ${subtasks}
     ${review}
     ${renderWidgetGroups(S.widgets)}
-    ${subtasks}
     ${notesSection(v)}`;
 }
 
@@ -4472,7 +4591,7 @@ function checkinTab(v) {
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
-  const msgs = entries.map(renderConversationEntry).join('') || '<div class="msg system">No messages yet</div>';
+  const msgs = entries.map((entry) => renderConversationEntry(entry, v)).join('') || '<div class="msg system">No messages yet</div>';
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -4588,16 +4707,91 @@ function conversationTimeHtml(ts) {
   return `<time datetime="${new Date(Number(ts)).toISOString()}" title="${esc(new Date(Number(ts)).toLocaleString())}">${esc(label)}</time>`;
 }
 
-function renderConversationEntry(entry) {
+// Render the small Markdown-link subset agents use for file citations without
+// changing the stored transcript. The anchor keeps the agent's exact href (so
+// Copy Link Address and every transcript/copy surface retain the original); a
+// click handler below may resolve it through the task's world instead.
+function renderConversationText(text, role, v = S.view) {
+  const source = String(text ?? '');
+  if (role !== 'agent') return esc(source);
+  const link = /\[([^\]\n]+)\]\(\s*(<[^>\n]+>|[^\s)]+)(?:\s+["'][^\n)]*["'])?\s*\)/g;
+  let html = '';
+  let at = 0;
+  for (const match of source.matchAll(link)) {
+    html += esc(source.slice(at, match.index));
+    const href = match[2].startsWith('<') ? match[2].slice(1, -1) : match[2];
+    const worldFile = worldFileTarget(href, v?.worldPath);
+    html += `<a href="${esc(href)}" target="_blank" rel="noopener"${worldFile ? ` class="world-file-link" data-world-file="${esc(href)}"` : ''}>${esc(match[1])}</a>`;
+    at = match.index + match[0].length;
+  }
+  return html + esc(source.slice(at));
+}
+
+// Agent links commonly carry editor-style locations (`file.ts:12:4` or
+// `file.ts#L12`). Separate that location from the path sent to the gateway.
+function worldFileTarget(raw, worldPath) {
+  if (!raw || !worldPath) return null;
+  let value = String(raw).trim();
+  if (/^file:\/\//i.test(value)) {
+    try { value = decodeURIComponent(new URL(value).pathname); } catch { return null; }
+  }
+  let line;
+  const fragment = value.match(/#L(\d+)(?:-L?\d+)?$/i);
+  if (fragment) {
+    line = Number(fragment[1]);
+    value = value.slice(0, fragment.index);
+  } else {
+    const suffix = value.match(/:(\d+)(?::\d+)?$/);
+    if (suffix) {
+      line = Number(suffix[1]);
+      value = value.slice(0, suffix.index);
+    }
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value) && !/^[a-z]:[\\/]/i.test(value)) return null;
+  if (!value || value.startsWith('#') || value.startsWith('?')) return null;
+  // Absolute paths must name this task's world. Relative paths are resolved by
+  // the server against the world root and confined there authoritatively.
+  if (value.startsWith('/')) {
+    const root = String(worldPath).replace(/\/+$/, '');
+    if (value !== root && !value.startsWith(`${root}/`)) return null;
+  }
+  return { path: value, line };
+}
+
+function fileLinksEnabled() {
+  const user = typeof S.user === 'object' ? S.user?.id : S.user;
+  return localStorage.getItem(`karmax-appearance:${user || 'local'}:world-file-links`) !== 'off';
+}
+
+function setFileLinksEnabled(enabled) {
+  const user = typeof S.user === 'object' ? S.user?.id : S.user;
+  localStorage.setItem(`karmax-appearance:${user || 'local'}:world-file-links`, enabled ? 'on' : 'off');
+}
+
+// Markdown mode renders anchors itself; mark the in-world ones afterwards so
+// the same click interception (wireWorldFileLinks) applies in both modes.
+function annotateWorldFileLinks(html, v = S.view) {
+  return String(html).replace(/<a href="([^"]*)"/g, (anchor, href) =>
+    worldFileTarget(href, v?.worldPath) ? `${anchor} class="world-file-link" data-world-file="${href}"` : anchor);
+}
+
+// Agent message bodies: Markdown (with world-file annotation) when enabled,
+// else the plain path that renders only the file-citation link subset.
+function renderAgentMessageBody(text, v = S.view) {
+  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text), v) : renderConversationText(text, 'agent', v);
+}
+
+function renderConversationEntry(entry, v = S.view) {
   const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${renderMessageBody(m.text)}</div>${renderMessageImages(m.images)}</div>`;
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v) : renderMessageBody(m.text);
+    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}</div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderMessageBody(a.title)}</div></div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v)}</div></div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -4607,6 +4801,62 @@ function renderConversationEntry(entry) {
     <span class="activity-icon" aria-hidden="true">${icons[a.kind] || '·'}</span>
     <div class="activity-body"><div class="activity-head"><span class="activity-title">${esc(a.title)}</span><span class="activity-state">${esc(a.phase)}</span>${conversationTimeHtml(entry.ts)}</div>${detail}</div>
   </div>`;
+}
+
+function fileViewerHtml(text, title, line) {
+  const rows = String(text).split('\n');
+  const code = rows.map((row, i) => `<div class="line${line === i + 1 ? ' selected' : ''}" id="L${i + 1}"><a href="#L${i + 1}">${i + 1}</a><span>${esc(row) || ' '}</span></div>`).join('');
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><style>
+    :root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#e6edf3;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+    header{position:sticky;top:0;z-index:1;padding:10px 16px;background:#161b22;border-bottom:1px solid #30363d;color:#b1bac4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    main{padding:8px 0 28px;min-width:max-content}.line{display:flex;min-height:20px}.line:target,.line.selected{background:#3b2e00}.line>a{width:64px;padding:0 14px;color:#6e7681;text-align:right;text-decoration:none;user-select:none}.line>span{white-space:pre;padding-right:24px}
+  </style></head><body><header>${esc(title)}</header><main>${code}</main></body></html>`;
+}
+
+async function openWorldFile(anchor, v) {
+  const target = worldFileTarget(anchor.dataset.worldFile, v?.worldPath);
+  if (!target) return;
+  const popup = window.open('', '_blank');
+  if (popup) {
+    popup.opener = null;
+    popup.document.title = 'Opening file…';
+    popup.document.body.textContent = 'Opening file…';
+  }
+  try {
+    const url = `/api/tasks/${encodeURIComponent(v.taskId)}/file?path=${encodeURIComponent(target.path)}`;
+    const res = await fetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
+    if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || 'could not open file');
+    const type = res.headers.get('content-type') || '';
+    if (!/^text\//i.test(type) && !/json|javascript|xml/i.test(type)) {
+      const objectUrl = URL.createObjectURL(await res.blob());
+      if (popup) popup.location.replace(objectUrl);
+      else window.open(objectUrl, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+      return;
+    }
+    const html = fileViewerHtml(await res.text(), anchor.dataset.worldFile, target.line);
+    if (popup) {
+      popup.document.open();
+      popup.document.write(html);
+      popup.document.close();
+      if (target.line) popup.location.hash = `L${target.line}`;
+    } else {
+      const objectUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+      window.open(objectUrl, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    }
+  } catch (e) {
+    if (popup) popup.close();
+    toast(e.message, true);
+  }
+}
+
+function wireWorldFileLinks(v) {
+  document.querySelectorAll('.world-file-link').forEach((anchor) => anchor.addEventListener('click', (event) => {
+    if (!fileLinksEnabled()) return;
+    event.preventDefault();
+    openWorldFile(anchor, v);
+  }));
 }
 
 function conversationPresence(v, t) {
@@ -5218,7 +5468,7 @@ function wireActions(v) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  // Sub-task references are real <a> permalinks; installLinkRouter() handles them.
+  $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
@@ -7441,6 +7691,7 @@ function updateBell() {
   const n = S.inbox.filter((item) => item.unread).length;
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
+  $('#bell')?.classList.toggle('active', S.tab === 'inbox');
 }
 function inboxView() {
   const prefs = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
@@ -7526,6 +7777,7 @@ function profileView() {
       <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
       <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
       <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
+      <div class="switch"><input type="checkbox" id="profile-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="profile-file-links">Open agent file links in their task world</label></div>
       <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
     <div class="card">
@@ -7548,6 +7800,7 @@ function wireProfileView() {
     if (S.taskTab === 'checkin') renderTaskPage();
     toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
   });
+  $('#profile-file-links')?.addEventListener('change', (e) => setFileLinksEnabled(e.target.checked));
   $('#profile-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();

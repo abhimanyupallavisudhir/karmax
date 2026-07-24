@@ -433,8 +433,15 @@ export class Store {
     this.db.exec("UPDATE organization_invitations SET role='member' WHERE role='billing'");
     this.db.exec("UPDATE team_memberships SET role='member' WHERE role='lead'");
     this.db.exec("UPDATE projects SET organizationId = 'org_personal' WHERE organizationId IS NULL");
+    // A software-dev@1.3 execution can switch its user-facing mode to Goal (and
+    // back) without replacing the Temporal workflow. Keep the actual execution
+    // definition separately so replay/version-retirement accounting stays true.
+    if (!cols.some((c) => c.name === 'executionWorkflow')) {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN executionWorkflow TEXT');
+      this.db.exec('UPDATE tasks SET executionWorkflow = workflow WHERE executionWorkflow IS NULL');
+    }
     // Simple human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
-    // project's tasks run #1, #2, … A separate integer alongside the opaque `id`
+    // project's queued tasks run #1, #2, … A separate integer alongside the opaque `id`
     // (which stays the Temporal workflowId and must never change). The per-project
     // unique index doubles as the migration marker: if it isn't present yet, we
     // (re)assign numbers per project in creation order — this both backfills fresh
@@ -448,9 +455,14 @@ export class Store {
       const projects = this.db.prepare('SELECT DISTINCT projectId FROM tasks').all() as any[];
       const upd = this.db.prepare('UPDATE tasks SET num = ? WHERE id = ?');
       for (const { projectId } of projects) {
-        // Creation order within the project (createdAt, rowid as a stable tiebreak).
+        // Queue time was not recorded by old schemas, so preserve creation order
+        // for work that had started and leave never-queued drafts unnumbered.
         const rows = this.db
-          .prepare('SELECT id FROM tasks WHERE projectId = ? ORDER BY createdAt, rowid')
+          .prepare(`SELECT root.id FROM tasks root
+            WHERE root.projectId = ? AND root.id = root.intentId
+              AND EXISTS (SELECT 1 FROM tasks attempt WHERE attempt.intentId = root.intentId
+                AND COALESCE(json_extract(attempt.params, '$.draft'), 0) = 0)
+            ORDER BY root.createdAt, root.rowid`)
           .all(projectId) as any[];
         let n = 0;
         for (const r of rows) upd.run(++n, r.id);
@@ -459,9 +471,7 @@ export class Store {
     }
   }
 
-  /** Next task number within a project: MAX(num)+1 scoped to that project. node:sqlite
-   *  is synchronous and single-threaded, so read-then-write within one createTask
-   *  call cannot race. */
+  /** Next task number within a project: MAX(num)+1 scoped to that project. */
   private nextTaskNum(projectId: string): number {
     return (
       (this.db.prepare('SELECT COALESCE(MAX(num), 0) AS m FROM tasks WHERE projectId = ?').get(projectId) as any)
@@ -1467,11 +1477,15 @@ export class Store {
       id,
       intentId,
       attemptNumber,
-      num: input.intentId ? undefined : this.nextTaskNum(input.projectId),
+      // Alternate attempts share the root's number. A new logical task receives
+      // its number now only when it is being created directly into the queue;
+      // drafts receive one in clearDraft(), at their queue transition.
+      num: input.intentId || input.params.draft ? undefined : this.nextTaskNum(input.projectId),
       projectId: input.projectId,
       listId,
       title: input.title,
       workflow: input.workflow,
+      executionWorkflow: input.workflow,
       workflowVersion: input.workflowVersion,
       params: input.params,
       createdAt: Date.now(),
@@ -1484,8 +1498,8 @@ export class Store {
     };
     this.db
       .prepare(
-        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber, createdBy, assignee, delegate, confirmationPolicy)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber, createdBy, assignee, delegate, confirmationPolicy)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
@@ -1494,6 +1508,7 @@ export class Store {
         t.listId,
         t.title,
         t.workflow,
+        t.executionWorkflow!,
         t.workflowVersion,
         JSON.stringify(t.params),
         t.createdAt,
@@ -1536,7 +1551,7 @@ export class Store {
   }
 
   /** One row per logical task: only the current principal appears in list/search. */
-  listPrincipalTasks(projectId: string): TaskRecord[] {
+  listTasks(projectId: string): TaskRecord[] {
     const rows = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       JOIN task_intents i ON i.principalAttemptId=t.id JOIN tasks root ON root.id=i.id
       WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId) as any[];
@@ -1605,7 +1620,8 @@ export class Store {
     return r ? this.getTask(r.id) : undefined;
   }
 
-  listTasks(projectId: string): TaskRecord[] {
+  /** Every attempt execution. Internal lifecycle work must opt into this explicitly. */
+  listTaskAttempts(projectId: string): TaskRecord[] {
     const tasks = (
       this.db
         .prepare('SELECT * FROM tasks WHERE projectId = ? ORDER BY ord, createdAt')
@@ -1699,6 +1715,17 @@ export class Store {
     this.db.prepare('UPDATE tasks SET workflowVersion = ? WHERE id = ?').run(workflowVersion, taskId);
   }
 
+  /** Change only the user-facing compatible workflow mode. The execution pin is
+   * intentionally untouched; the running deterministic workflow owns the switch. */
+  setTaskWorkflow(taskId: string, workflow: string) {
+    this.db.prepare('UPDATE tasks SET workflow = ? WHERE id = ?').run(workflow, taskId);
+  }
+
+  /** Record the workflow definition of a newly-started/recovered Temporal run. */
+  setTaskExecutionWorkflow(taskId: string, workflow: string) {
+    this.db.prepare('UPDATE tasks SET executionWorkflow = ? WHERE id = ?').run(workflow, taskId);
+  }
+
   /** Update a task's display title (e.g. to track an edited prompt). */
   setTaskTitle(taskId: string, title: string) {
     if (title) this.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run(title, taskId);
@@ -1722,11 +1749,32 @@ export class Store {
     this.updateTaskParams(taskId, { ...t.params, priority: p });
   }
 
-  /** Mark a draft task as queued (clear its draft flag). */
+  /**
+   * Mark a draft task as queued. The human-facing number belongs to the logical
+   * task (the intent root), and is minted exactly once at this transition.
+   * A previously queued task that was moved back to drafts keeps its permalink.
+   */
   clearDraft(taskId: string) {
     const t = this.getTask(taskId);
     if (!t) return;
+    // A single UPDATE makes MAX+1 allocation safe even if two Store instances
+    // queue tasks concurrently against the same SQLite database.
+    this.db.prepare(`UPDATE tasks SET num = (
+      SELECT COALESCE(MAX(num), 0) + 1 FROM tasks WHERE projectId = ?
+    ) WHERE id = ? AND num IS NULL`).run(t.projectId, t.intentId ?? t.id);
     this.updateTaskParams(taskId, { ...t.params, draft: false });
+  }
+
+  /** Compensate a queue failure. Numbers minted by that failed transition may be
+   * released, but numbers from an earlier successful queue are permanent. */
+  restoreDraft(taskId: string, releaseNumber = false) {
+    const t = this.getTask(taskId);
+    if (!t) return;
+    this.updateTaskParams(taskId, { ...t.params, draft: true });
+    if (!releaseNumber) return;
+    const intentId = t.intentId ?? t.id;
+    const stillQueued = this.attemptsOf(intentId).some((attempt) => !attempt.params.draft);
+    if (!stillQueued) this.db.prepare('UPDATE tasks SET num = NULL WHERE id = ?').run(intentId);
   }
 
   /** Hard-delete a task row + its events (used for drafts, which never ran). */
@@ -3196,6 +3244,7 @@ function rowToTask(r: any): TaskRecord {
     listId: r.listId,
     title: r.title,
     workflow: r.workflow,
+    executionWorkflow: r.executionWorkflow ?? r.workflow,
     workflowVersion: r.workflowVersion,
     params: JSON.parse(r.params),
     createdAt: r.createdAt,

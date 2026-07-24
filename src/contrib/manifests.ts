@@ -213,7 +213,8 @@ const CONFIRM_ROLE: WorkflowRole = {
   // The task recap + the Do agent's response arrive as a per-Review conversation
   // message (domain/confirm-prompt.ts, template user-editable via the confirmer
   // field), so repeated Reviews read as one transcript; this system prompt carries
-  // only the role and the current state of the world under review.
+  // the role, the current state of the world under review, and the same shared
+  // global/project instructions (including resolved wiki context) as the Do agent.
   promptTemplate: `{{toolsPreamble}}
 
 You are the CONFIRM (review) agent for task "{{title}}". The Do agent believes the work is finished and it has reached the Review gate. Your job is to decide whether to accept it — NOT to keep building it. Each time the task reaches Review you receive a message with the task and the agent's latest response; judge the CURRENT state of the work.
@@ -227,6 +228,8 @@ Changed files:
 
 Recent Do-agent transcript:
 {{transcript}}
+
+{{instructions}}
 
 ## How to review
 Inspect the diff and the worktree (read files, run the build/tests) to judge whether the work actually satisfies the task. Then finish by calling confirm_decision exactly once:
@@ -304,12 +307,15 @@ export interface WorkflowManifest {
   onActivate?: OnActivateDecl;
   /** Coordinators are long-lived singletons (SPEC §6), not task workflows. */
   kind?: 'task' | 'coordinator';
+  /** False for replay/backward-compatible workflows that remain runnable by
+   * existing tasks and API callers but are hidden from new-task UI surfaces. */
+  selectable?: boolean;
 }
 
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.2.0',
+    version: '1.3.0',
     description: 'Branch/world → do → review → PR → merge → end, with auto-resolution, escalation, and sub-tasks.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -360,7 +366,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     onActivate: {
       spawnTask: {
-        workflow: 'just-do',
+        workflow: 'goal',
         title: 'Make this project karmax-ready',
         prompt:
           'Ensure git is initialized in each repo. For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them. Report what you changed.',
@@ -370,7 +376,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'just-do',
     version: '1.1.0',
-    description: 'A single straightforward agent call, no merge machinery.',
+    description: 'Legacy single-agent workflow retained for existing tasks and API compatibility.',
+    selectable: false,
     requires: [],
     capabilities: ['create-review-info', 'signal-completion', 'save-skill'],
     events: [{ type: 'just-do.done', description: 'Single agent call finished.', fields: {} }],
@@ -389,7 +396,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'script-exec',
     version: '1.0.0',
-    description: 'Run a script/command as a task.',
+    description: 'Legacy command workflow retained for existing tasks and API compatibility.',
+    selectable: false,
     requires: [],
     capabilities: ['signal-completion'],
     events: [{ type: 'script-exec.done', description: 'Command finished.', fields: { code: 'number' } }],
@@ -410,8 +418,8 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.2.0',
-    description: 'Like software-dev, but auto-confirms a verified successful provider turn.',
+    version: '1.3.0',
+    description: 'Software Dev in autonomous completion mode; keeps taking turns until explicit completion and is switchable in-flight before confirmation.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [{ type: 'goal.completed', description: 'Goal reached.', fields: {} }],
@@ -504,7 +512,7 @@ export const LEGACY_BUNDLED_MANIFESTS: WorkflowManifest[] = MANIFESTS
   .filter((m) => m.name === 'software-dev' || m.name === 'just-do' || m.name === 'goal' || m.name === 'merge-only')
   .flatMap((m) => [
     { ...m, version: '1.0.0' },
-    ...((m.name === 'software-dev' || m.name === 'goal') ? [{ ...m, version: '1.1.0' }] : []),
+    ...((m.name === 'software-dev' || m.name === 'goal') ? [{ ...m, version: '1.1.0' }, { ...m, version: '1.2.0' }] : []),
   ]);
 
 export function manifest(name: string): WorkflowManifest | undefined {

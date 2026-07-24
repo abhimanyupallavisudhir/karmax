@@ -67,7 +67,7 @@ merged into your target branch.
 | Area | Status |
 |---|---|
 | Durable execution on **Temporal** (activity/workflow split, signals, queries, updates, child workflows, continue-as-new) | ✅ real dev server, dynamic ports |
-| Workflows: **software-dev, just-do, script-exec, goal, merge-only** | ✅ |
+| Workflows: **software-dev ↔ goal** (switchable in-flight), **merge-only**; legacy just-do/script-exec replay | ✅ |
 | Coordinators (lease pattern, crash-safe, continue-as-new): **merge-queue, token/account, budget** | ✅ |
 | Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK + Messages API), Codex (OpenAI), mock** | ✅ |
 | Worlds: **local git worktree**, **Docker**, **E2B**, and **Daytona**, with checkpoint/park/hibernate lifecycle | ✅ |

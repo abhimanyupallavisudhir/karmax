@@ -140,6 +140,7 @@ a { color: var(--accent); text-decoration: none; }
   display: grid; place-items: center; font-size: 16px;
 }
 .icon-btn:hover { background: var(--surface-2); border-color: var(--line); color: var(--ink); }
+.icon-btn.active { background: var(--accent-weak); color: var(--accent); }
 .icon-btn.has-badge { position: relative; }
 .icon-btn .badge {
   position: absolute; top: 2px; right: 2px; min-width: 16px; height: 16px;
@@ -387,6 +388,17 @@ a { color: var(--accent); text-decoration: none; }
 .tp-head .row1 { display: flex; align-items: center; gap: 10px; }
 .tp-head h2 { font-size: 17px; margin: 0; flex: 1; letter-spacing: -0.01em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tp-head .row1 .task-num { font-size: 13px; }
+.tp-parent {
+  width: 100%; display: flex; align-items: center; gap: 7px;
+  padding: 0 28px 8px 72px; border: 0; background: transparent;
+  color: var(--ink-3); text-align: left; cursor: pointer;
+}
+.tp-parent:hover .tp-parent-title { color: var(--accent); }
+.tp-parent:focus-visible { outline: none; }
+.tp-parent:focus-visible .tp-parent-title { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+.tp-parent-kicker { font-size: 11px; letter-spacing: .02em; white-space: nowrap; }
+.tp-parent-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: 12px; font-weight: 600; transition: color .12s; }
+.tp-parent-arrow { font-size: 16px; line-height: 1; color: var(--ink-3); }
 .tp-head .meta { display: flex; gap: 10px; align-items: center; margin-top: 6px; font-size: 12px; color: var(--ink-3); font-family: var(--font-mono); flex-wrap: wrap; }
 /* margin-top/bottom longhands keep the parent rule's auto side margins (and kill
    the base .tabs 18px bottom margin — the head's border sits right under the tabs);
@@ -502,6 +514,55 @@ a { color: var(--accent); text-decoration: none; }
 
 .section-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin: 18px 0 8px; }
 .section-h:first-child { margin-top: 0; }
+
+/* Delegated work is one composed object, not a loose list of ids. The panel gives
+   the parent an at-a-glance answer to three questions: what was delegated, where
+   is each piece, and how close is the group to returning. */
+.subtasks {
+  margin: 24px 0 4px; overflow: hidden;
+  border: 1px solid var(--line); border-radius: 14px;
+  background: var(--surface); box-shadow: 0 1px 2px rgba(20, 24, 34, .035);
+}
+.subtasks-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 18px 20px 13px; }
+.subtasks-kicker { margin-bottom: 2px; color: var(--ink-3); font-size: 10px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
+.subtasks h3 { margin: 0; font-size: 17px; line-height: 1.25; letter-spacing: -.015em; }
+.subtasks-count { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+.subtasks-count strong { color: var(--ink); font-size: 15px; font-weight: 650; }
+.subtasks-progress { height: 3px; margin: 0 20px 5px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.subtasks-progress > span { display: block; width: var(--subtask-progress); height: 100%; border-radius: inherit; background: var(--merged); transition: width .25s ease; }
+.subtask-list { padding: 0 8px 8px; }
+.subtask-row {
+  appearance: none; width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center; gap: 13px; min-height: 64px; padding: 10px 12px;
+  border: 0; border-top: 1px solid var(--line); border-radius: 8px;
+  background: transparent; color: var(--ink); text-align: left; cursor: pointer;
+  transition: background .12s, transform .04s;
+}
+.subtask-row:first-child { border-top-color: transparent; }
+.subtask-row:hover { background: var(--surface-2); }
+.subtask-row:active { transform: translateY(1px); }
+.subtask-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.subtask-state { width: 10px; height: 10px; border-radius: 50%; background: var(--ink-3); box-shadow: 0 0 0 4px var(--surface-2); }
+.subtask-state.active { background: var(--accent); box-shadow: 0 0 0 4px var(--accent-weak); animation: pulse 1.4s ease-in-out infinite; }
+.subtask-state.waiting { background: var(--working); box-shadow: 0 0 0 4px var(--working-weak); }
+.subtask-state.blocked, .subtask-state.failed { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-weak); }
+.subtask-state.done { background: var(--merged); box-shadow: 0 0 0 4px var(--merged-weak); }
+.subtask-identity { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.subtask-title { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.subtask-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.subtask-title .task-num { flex: none; font-size: 11px; }
+.subtask-copy { color: var(--ink-3); font-size: 11px; }
+.subtask-pipeline .pipeline .seg { width: 16px; height: 4px; }
+.subtask-pipeline .pipeline .ponr { width: 7px; height: 7px; }
+.subtask-arrow { color: var(--ink-3); font-size: 20px; line-height: 1; transition: transform .12s, color .12s; }
+.subtask-row:hover .subtask-arrow { color: var(--accent); transform: translateX(2px); }
+
+@media (max-width: 700px) {
+  .tp-parent { padding-left: 28px; }
+  .subtask-pipeline { display: none; }
+  .subtask-row { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .subtasks-head { align-items: center; }
+}
 
 /* thread */
 .thread { display: flex; flex-direction: column; gap: 10px; }
@@ -779,12 +840,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .authz-cap-item input, .authz-all input, .authz-cap-group summary input { margin-top: 2px; flex: none; }
 .authz-scoped { margin: 8px 0 12px; }
 
-/* popover */
-.popover { position: absolute; top: 50px; right: 12px; width: 320px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); z-index: 50; overflow: hidden; }
-.popover .ph { padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 600; }
-.popover .pi { padding: 11px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
-.popover .pi:hover { background: var(--surface-2); }
-.popover .pi:last-child { border-bottom: 0; }
+
 
 .hidden { display: none !important; }
 

@@ -143,6 +143,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
+  if (/\/file$/.test(p)) return 'task:conversation:read';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
@@ -278,6 +279,20 @@ const MIME: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.cjs': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.ts': 'text/plain; charset=utf-8',
+  '.tsx': 'text/plain; charset=utf-8',
+  '.jsx': 'text/javascript; charset=utf-8',
+  '.py': 'text/plain; charset=utf-8',
+  '.rs': 'text/plain; charset=utf-8',
+  '.go': 'text/plain; charset=utf-8',
+  '.java': 'text/plain; charset=utf-8',
+  '.rb': 'text/plain; charset=utf-8',
+  '.sh': 'text/plain; charset=utf-8',
+  '.yml': 'text/plain; charset=utf-8',
+  '.yaml': 'text/plain; charset=utf-8',
+  '.toml': 'text/plain; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.ico': 'image/x-icon',
@@ -1762,6 +1777,15 @@ export class Gateway {
           return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
         }
       }
+      const workflowMatch = p.match(/^\/api\/tasks\/([^/]+)\/workflow$/);
+      if (workflowMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.changeWorkflow(token, workflowMatch[1]!, String(b.workflow ?? '')));
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
@@ -2076,6 +2100,13 @@ export class Gateway {
         if (handle && this.deps.worldAccess) await this.deps.worldAccess.releaseLeaseAndParkIfIdle(handle, lease.runnerLeaseId);
         else if (lease.runnerLeaseId) this.deps.runners?.release(lease.runnerLeaseId, lease.provider);
         return this.json(res, 200, { ok: true });
+      }
+      // Conversation file links are readable wherever the conversation itself
+      // is readable. They use the same world confinement as review artifacts,
+      // but unknown extensions default to inline text for a useful source view.
+      const fileMatch = p.match(/^\/api\/tasks\/([^/]+)\/file$/);
+      if (fileMatch && method === 'GET') {
+        return this.serveArtifact(res, fileMatch[1]!, url.searchParams.get('path') ?? '', true);
       }
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
@@ -2892,20 +2923,42 @@ export class Gateway {
   }
 
   /** Serve an artifact through its world provider. The browser never receives a
-   * host/sandbox path and remote worlds need no public filesystem endpoint. */
-  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string) {
+   * host/sandbox path and remote worlds need no public filesystem endpoint.
+   * `sourceFile` (conversation file links) defaults unknown extensions to an
+   * inline text view instead of a download, for a useful source view. */
+  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
     const task = this.deps.store.getTask(taskId);
     const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
+    // Agent citations may be absolute paths inside the world; strip the world
+    // root so the provider-confined relative read (and its traversal guard)
+    // covers those too. Absolute paths outside this task's world stay rejected.
+    const root = String(task?.lastView?.worldPath ?? handle.workspaceRoot ?? handle.root ?? '').replace(/\/+$/, '');
+    if (root && (relPath === root || relPath.startsWith(`${root}/`))) relPath = relPath.slice(root.length + 1) || '.';
     let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
     try {
       access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
       const world = access?.world ?? await this.deps.worlds.open(handle);
+      // A symlink inside a host-visible world must not read outside it (the
+      // provider's lexical traversal guard cannot see link targets). Remote
+      // sandboxes confine reads at the provider boundary instead.
+      const hostBase = path.resolve(handle.root ?? '');
+      const hostPath = relPath === '.' ? hostBase : path.resolve(hostBase, relPath);
+      if (fs.existsSync(hostPath)) {
+        const real = await fs.promises.realpath(hostPath);
+        const realBase = await fs.promises.realpath(hostBase).catch(() => hostBase);
+        if (real !== realBase && !real.startsWith(realBase + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
+      }
       const data = await world.readFileBuffer(relPath);
+      const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
+      const looksTextual = !data.subarray(0, 8192).includes(0);
       res.writeHead(200, {
-        'content-type': ARTIFACT_MIME[path.extname(relPath).toLowerCase()] ?? 'application/octet-stream',
+        'content-type': inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
         'content-length': String(data.length),
+        'content-disposition': `inline; filename="${path.basename(relPath).replace(/["\\\r\n]/g, '_')}"`,
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
       });
       res.end(data);
     } catch (error) {

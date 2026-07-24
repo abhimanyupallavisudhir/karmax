@@ -169,12 +169,22 @@ Two manifest mechanisms, kept deliberately minimal:
 ### 4.7 Standard workflows shipped in v1
 
 - **software-dev** — branch/world → do → review → PR (optional) → merge → end, with resolve and sub-tasks. Detailed in §5.
-- **just-do** — a single straightforward agent call, no merge machinery.
-- **script-exec** — run a script/command as a task.
-- **goal** — like software-dev, but auto-confirms after the provider reports a verified successful turn completion. `signal_completion` may attach a structured summary but is not required.
+- **goal** — software-dev in autonomous completion mode: keep the Do agent moving
+  until it explicitly reports verified completion, then auto-confirm. A merely
+  successful provider return is not enough in Goal mode; it causes another turn.
+  Software-dev and goal are compatible policies over the same pipeline,
+  so a task may switch between them during Setup, Do, or an unconfirmed Review.
+  Switching software-dev → goal at Review sends the work back through Do rather
+  than implicitly approving a possibly partial review. The execution's Temporal
+  type/version remains pinned throughout; only its policy changes.
 - **merge-only** — the review-and-merge half of software-dev (no Do stage). Starts at the review gate, then optional PR, then merge. Used to review agents' PRs, including edits to workflow repos.
 - **merge-queue** (coordinator) — leases the single merge slot per target branch (§6).
 - **token/account coordinator** — tracks per-account limits and leases agent-account capacity (§6, §7).
+
+`just-do` and `script-exec` remain registered only for replay and API
+backward-compatibility; they are not selectable for new tasks. The normal
+software-dev/goal pair covers user-facing work, and software-dev activation uses
+goal for its automated project-readiness task.
 
 ---
 
@@ -542,7 +552,7 @@ Organizations carry a persisted `slug` (falling back to a slug of the name for r
 
 **Workflows do not own URLs.** This is the answer to "does a workflow own its page?": no. Every page is a first-party **core UI module** (§10.3) whose *route* is host-owned; a workflow only ever *augments* a host page through the declared contribution system (§10.1) — a slot, a widget, an action, a param field — never by claiming a path. The merge queue is the illustrative case: it looks "produced by a workflow," but it is a host route that *projects* the merge-queue **coordinator's** query state (`{queue, current}`, §6.1) joined with each task's `mergeQueue` position. The coordinator is queried; it does not render or route. The same holds for the dashboard (projects the account coordinator's query). Keeping routes host-owned means the URL space is finite, stable, and knowable without loading any workflow package.
 
-**Task numbers (`num`).** Each task carries a simple, human-facing sequential id — numbered **per project**, so every project runs its own `#1`, `#2`, … assigned at creation, alongside the opaque `id`. The **`id` never changes**: it is the Temporal `workflowId`, the event key, and the session key, so it must stay stable for replay and cross-task signalling. `num` is purely the human/URL handle: the UI shows `#num` everywhere a task is named (list rows, drawer header, merge queue, notifications, sub-task links), the permalink is `/<org>/<project>/tasks/:num`, and it is a search key — both the task search box and the "Fork a previous agent" picker match on `#num` as well as title. The store owns `num` (unique per `(projectId, num)`, backfilled per project in creation order for pre-existing installs); the gateway resolves `(:projectId, :num) → id` (so a permalink to an archived/not-yet-loaded task still opens) and mirrors `num` onto the task view (the workflow only knows the opaque `id`).
+**Task numbers (`num`).** Each queued task carries a simple, human-facing sequential id — numbered **per project**, so every project runs its own `#1`, `#2`, … assigned when the task is first queued, alongside the opaque `id`. A never-queued draft has no `num`; if queued work is later moved back to drafts, it retains its number and permalink. The **`id` never changes**: it is the Temporal `workflowId`, the event key, and the session key, so it must stay stable for replay and cross-task signalling. `num` is purely the human/URL handle: the UI shows `#num` everywhere a task is named (list rows, drawer header, merge queue, notifications, sub-task links), the permalink is `/<org>/<project>/tasks/:num`, and it is a search key — both the task search box and the "Fork a previous agent" picker match on `#num` as well as title. The store owns `num` (unique per `(projectId, num)`, with legacy queued work backfilled per project in creation order); the gateway resolves `(:projectId, :num) → id` (so a permalink to an archived/not-yet-loaded task still opens) and mirrors `num` onto the task view (the workflow only knows the opaque `id`).
 
 ---
 

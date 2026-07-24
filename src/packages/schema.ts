@@ -40,6 +40,7 @@ export const manifestSchema = z.object({
   params: z.array(field),
   onActivate: z.object({ spawnTask: z.object({ workflow: z.string(), title: z.string(), prompt: z.string() }).optional() }).passthrough().optional(),
   kind: z.enum(['task', 'coordinator']).optional(),
+  selectable: z.boolean().optional(),
 }).passthrough();
 
 /** Validate + type a manifest; throws on malformed. */

@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { WorkflowExecutionAlreadyStartedError } from '@temporalio/client';
+import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
@@ -21,15 +23,18 @@ describe('repo-required guard (empty-repo footgun)', () => {
   let token: string;
   let tokens: TokenAuthority;
   let started: unknown[][];
+  let startError: Error | undefined;
 
   beforeEach(() => {
     store = new Store(':memory:');
     store.claimPersonalOrganization('a');
     tokens = new TokenAuthority();
     started = [];
+    startError = undefined;
     const client = {
       workflow: {
         start: async (...a: unknown[]) => {
+          if (startError) throw startError;
           started.push(a);
           return {};
         },
@@ -128,6 +133,51 @@ describe('repo-required guard (empty-repo footgun)', () => {
     expect(started).toHaveLength(0); // a draft starts nothing
     await expect(api.queueTask(token, draft.id)).rejects.toThrow(/repository/i);
     expect(started).toHaveLength(0); // still not started after the refused queue
+  });
+
+  it('does not retain a number when the durable engine refuses the queue', async () => {
+    const p = store.createProject('QueueFailure', { repos: ['/some/repo'] });
+    const draft = await api.createTask(token, {
+      projectId: p.id,
+      workflow: 'software-dev',
+      prompt: 'x',
+      draft: true,
+    });
+    expect(draft.num).toBeUndefined();
+
+    startError = new Error('engine unavailable');
+    await expect(api.queueTask(token, draft.id)).rejects.toThrow(/still saved as a draft/i);
+    expect(store.getTask(draft.id)).toMatchObject({ num: undefined, params: { draft: true } });
+
+    startError = undefined;
+    const queued = await api.queueTask(token, draft.id);
+    expect(queued.num).toBe(1);
+    expect(queued.params.draft).toBe(false);
+    expect((started[0]![1] as any).workflowIdReusePolicy).toBe(WorkflowIdReusePolicy.REJECT_DUPLICATE);
+  });
+
+  it('repairs a stale draft when Temporal already accepted its workflow', async () => {
+    const p = store.createProject('LostAcknowledgement', { repos: ['/some/repo'] });
+    const draft = await api.createTask(token, {
+      projectId: p.id,
+      workflow: 'software-dev',
+      prompt: 'x',
+      draft: true,
+    });
+
+    // This is what a retry sees when the earlier start reached Temporal but its
+    // acknowledgement did not reach Karmax: durable execution exists, metadata
+    // still says draft.
+    startError = new WorkflowExecutionAlreadyStartedError(
+      'Workflow execution already started',
+      draft.id,
+      'softwareDev@1.0.0',
+    );
+    const queued = await api.queueTask(token, draft.id);
+
+    expect(queued.num).toBe(1);
+    expect(queued.params.draft).toBe(false);
+    expect(store.getTask(draft.id)).toMatchObject({ num: 1, params: { draft: false } });
   });
 
   // The scratch-sandbox incident: the guard and the world builder read different
