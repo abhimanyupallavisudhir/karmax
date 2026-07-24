@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import type { Store } from '../store/db.js';
 import type { TaskView } from '../domain/types.js';
 import type { WorldHandle } from './types.js';
-import { worldRepos, worldRepoSource } from './types.js';
+import { worldRepos, worldRepoSource, worldWorkingDirectory } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import type { RunnerPoolService } from './runners.js';
 import type { GitHubAppService } from '../integrations/github-app.js';
@@ -112,7 +112,7 @@ export class WorldHandoffService {
 
   private existingLocal(handle: WorldHandle): MaterializedLocalCheckout {
     const repositories = worldRepos(handle).map((repo) => ({ name: repo.name, path: repo.root, branch: repo.branch, head: '' }));
-    return { taskId: handle.id, root: handle.root, cwd: handle.root, branch: handle.branch, repositories };
+    return { taskId: handle.id, root: handle.root, cwd: worldWorkingDirectory(handle), branch: handle.branch, repositories };
   }
 
   checkout(taskId: string): LocalCheckoutPlan {

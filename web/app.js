@@ -6293,7 +6293,8 @@ const quickDefaultsHeader = () => '';
 // agents get with each prompt) or the selected entry. The open entry rides in
 // the URL hash so wiki pages deep-link like settings panes.
 function wikiScopeInfo(proj) {
-  if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki` };
+  if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
+    selector: S.wikiViews?.[proj.id] || '' };
   const org = currentOrg();
   if (!org) return null;
   return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki` };
@@ -6304,9 +6305,19 @@ function wikiView(proj) {
   if (!info) return `<div class="empty">No organization yet.</div>`;
   return `<div class="organization-settings wiki-page"><div class="settings-header"><div>
       <h1 class="page-title">${esc(info.title)} — wiki</h1>
-    </div></div>
+    </div>${proj ? `<div class="wiki-view-picker"><label for="wiki-view-input">Viewing</label>
+      <input id="wiki-view-input" list="wiki-view-options" placeholder="Default branch" autocomplete="off">
+      <datalist id="wiki-view-options"></datalist></div>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
+}
+
+function wikiUrl(info, suffix = '', params = {}) {
+  const url = new URL(`${info.base}${suffix}`, location.origin);
+  if (info.selector?.startsWith('task:')) url.searchParams.set('taskId', info.selector.slice(5));
+  else if (info.selector?.startsWith('branch:')) url.searchParams.set('branch', info.selector.slice(7));
+  for (const [key, value] of Object.entries(params)) if (value != null && value !== '') url.searchParams.set(key, value);
+  return `${url.pathname}${url.search}`;
 }
 
 const wikiIsDefault = (e) => (e.labels || []).includes('default');
@@ -6325,16 +6336,40 @@ async function wireWikiView(proj) {
   const nav = $('#wiki-nav');
   const pane = $('#wiki-pane');
   if (!info || !nav || !pane) return;
+  if (proj) {
+    try {
+      const refs = await api(`${info.base}/refs`);
+      const input = $('#wiki-view-input');
+      const options = $('#wiki-view-options');
+      const entries = [
+        { value: '', label: `Default branch · ${refs.defaultBranch}` },
+        ...(refs.tasks || []).map((task) => ({ value: `task:${task.id}`, label: `#${task.num || '–'} ${task.title} · ${task.branch}` })),
+        ...(refs.branches || []).filter((branch) => branch !== refs.defaultBranch)
+          .map((branch) => ({ value: `branch:${branch}`, label: `Branch · ${branch}` })),
+      ];
+      const selected = entries.find((entry) => entry.value === info.selector) || entries[0];
+      input.value = selected.label;
+      options.innerHTML = entries.map((entry) => `<option value="${esc(entry.label)}"></option>`).join('');
+      input.onchange = () => {
+        const chosen = entries.find((entry) => entry.label === input.value.trim());
+        if (!chosen) return;
+        S.wikiViews ||= {};
+        S.wikiViews[proj.id] = chosen.value;
+        S.wikiEditing = null;
+        wireWikiView(proj);
+      };
+    } catch { /* the canonical wiki remains usable without the selector metadata */ }
+  }
   const key = `${info.scope}:${info.id}`;
   let data;
-  try { data = await api(info.base); }
+  try { data = await api(wikiUrl(info)); }
   catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
   const sel = decodeURIComponent((location.hash || '').slice(1));
 
   nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
     <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
     ${wikiTreeHtml(data.toc?.children, sel)}
-    <button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>`;
+    ${data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
   const open = (path) => {
     S.wikiEditing = null;
     history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
@@ -6346,7 +6381,10 @@ async function wireWikiView(proj) {
 
   // A page fetch goes through the base route so built-ins resolve (a virtual
   // built-in has no on-disk page for /page to find).
-  const fetchPage = async (p) => (await api(`${info.base}?path=${encodeURIComponent(p)}`)).page;
+  const fetchPage = async (p) => {
+    const read = await api(wikiUrl(info, '', { path: p }));
+    return read.page ? { ...read.page, _wikiWritable: read.view?.writable !== false } : null;
+  };
   // A background re-render (WS task event) must not blow away an in-progress
   // editor: restore it for the same scope before painting the read view.
   if (S.wikiEditing?.wikiKey === key) {
@@ -6604,7 +6642,7 @@ function renderWikiHome(info, proj, pane, data) {
   pane.innerHTML = (data.unconditional || []).map((u) => `
     <div class="card wiki-uncond">
       <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
-        <button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button></div>
+        ${data.view?.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}</div>
       <div class="msg-text md wiki-md">${renderMessageBody(u.body || '')}</div>
     </div>`).join('') + (data.tocText ? `
     <div class="card wiki-uncond">
@@ -6614,7 +6652,7 @@ function renderWikiHome(info, proj, pane, data) {
   typesetMath(pane);
   pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
     try {
-      const read = await api(`${info.base}?path=${encodeURIComponent(b.dataset.path)}`);
+      const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
       if (!read.page) return toast('Entry not found', true);
       history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(read.page.path)}`);
       renderWikiEditor(info, proj, pane, read.page);
@@ -6638,7 +6676,7 @@ function renderWikiPage(info, proj, pane, page) {
     <div class="card">
       <div class="msg-text md wiki-md">${renderMessageBody(wikiBody(page.content))}</div>
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:10px"><button class="btn sm" id="wiki-page-edit">Edit</button>${remove}</div>
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? '<span class="task-sub">Read-only branch view</span>' : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
     </div>`;
   typesetMath(pane);
   $('#wiki-page-delete')?.addEventListener('click', async () => {
@@ -6647,7 +6685,7 @@ function renderWikiPage(info, proj, pane, page) {
       : `Delete “${page.name}” (${page.path})? Its folder and attached files go with it.`;
     if (!confirm(q)) return;
     try {
-      await api(`${info.base}/page?path=${encodeURIComponent(page.path)}`, { method: 'DELETE' });
+      await api(wikiUrl(info, '/page', { path: page.path }), { method: 'DELETE' });
       if (!page.builtin) history.replaceState({ kx: 1 }, '', location.pathname);
       wireWikiView(proj);
     } catch (e) { toast(e.message, true); }
@@ -6759,7 +6797,7 @@ function renderWikiEditor(info, proj, pane, page) {
     if (isNew) body.create = true;
     else if (path !== page.path) body.prevPath = page.path;
     try {
-      await api(`${info.base}/page`, { method: 'PUT', body: JSON.stringify(body) });
+      await api(wikiUrl(info, '/page'), { method: 'PUT', body: JSON.stringify(body) });
       S.wikiEditing = null;
       history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(path)}`);
       wireWikiView(proj);

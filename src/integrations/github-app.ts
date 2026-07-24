@@ -293,7 +293,7 @@ export class GitHubAppService {
   /** Create a GitHub repository, add it to a selected-repository App
    * installation, enroll isolated deploy keys, and return the durable record. */
   async createRepository(connectionId: string, userId: string, input: {
-    name: string; description?: string; private?: boolean; defaultBranch?: string;
+    name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
   }): Promise<Repository> {
     const connection = this.store.getGitConnection(connectionId);
     if (!connection) throw new Error('GitHub connection not found');
@@ -306,7 +306,7 @@ export class GitHubAppService {
       : '/user/repos';
     const created = await this.request<GitHubRepositoryPayload>(pathname, userToken, {
       method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
-        private: input.private !== false, auto_init: true }),
+        private: input.private !== false, auto_init: input.autoInit !== false }),
     });
     // Installation may have been limited to selected repositories. User
     // authorization lets Karmax enroll the new repository without sending the

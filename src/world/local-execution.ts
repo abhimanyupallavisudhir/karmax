@@ -52,6 +52,13 @@ export async function openSpawnedPty(command: string, args: string[], spec: Worl
 }
 
 function localCwd(root: string, rel?: string): string {
+  if (rel && path.isAbsolute(rel)) {
+    const resolvedRoot = path.resolve(root);
+    const resolved = path.resolve(rel);
+    if (resolved !== resolvedRoot && !resolved.startsWith(`${resolvedRoot}${path.sep}`))
+      throw new Error('working directory escapes world');
+    return resolved;
+  }
   const safe = worldRelativePath(rel ?? '.');
   return safe === '.' ? root : path.join(root, ...safe.split('/'));
 }

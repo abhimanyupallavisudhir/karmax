@@ -22,6 +22,9 @@ export type WorldKind = string;
  * a single task can span a fleet of repos (e.g. a frontend + backend).
  */
 export interface WorldRepo {
+  /** Platform-owned companion repository. It participates in branching and
+   * merge like every other repo, while callers can still identify its role. */
+  role?: 'project-wiki';
   /** Short, world-unique name (usually the source repo's basename). For a
    *  multi-repo world this is the subdirectory the repo is checked out into. */
   name: string;
@@ -56,6 +59,10 @@ export interface WorldHandle extends WorldHandleRef {
    *  single-repo world this IS the worktree; for a multi-repo world it is the
    *  parent directory holding one worktree subdirectory per repo. */
   root: string;
+  /** Default directory for agent turns and commands. The world boundary remains
+   *  `root`; this may point at the sole development repo when platform-owned
+   *  companion repos (such as the project wiki) make the world multi-repo. */
+  workdir?: string;
   /** The branch work happens on. */
   branch: string;
   /** Base branch this world forked from. */
@@ -94,6 +101,10 @@ export interface WorldSpec {
   repo?: string;
   /** Source repos for a multi-repo world. Takes precedence over `repo`. Empty ⇒ scratch. */
   repos?: string[];
+  /** Keep a scratch working directory in addition to configured companion
+   * repositories. Used by repository-less projects whose wiki still branches
+   * with the task, without turning the wiki checkout into the task workspace. */
+  scratch?: boolean;
   base: string;
   target?: string;
   /** Check out this existing branch instead of creating karmax/<taskId> (merge-only). */
@@ -276,4 +287,22 @@ export function worldRelativePath(relPath: string): string {
   const parts = normalized.split('/').filter((p) => p && p !== '.');
   if (parts.some((p) => p === '..')) throw new Error('path escapes world');
   return parts.join('/') || '.';
+}
+
+/** Default process/agent directory, tolerant of handles created before the
+ * distinction between a world's boundary and its working directory existed. */
+export function worldWorkingDirectory(handle: WorldHandle): string {
+  return handle.workdir ?? handle.root;
+}
+
+/** Translate an agent-relative path into the root-relative namespace used by
+ * the provider-neutral file API. */
+export function worldWorkingRelativePath(handle: WorldHandle, relPath: string): string {
+  const safe = worldRelativePath(relPath);
+  const root = handle.root.replace(/\\/g, '/').replace(/\/+$/, '');
+  const workdir = worldWorkingDirectory(handle).replace(/\\/g, '/').replace(/\/+$/, '');
+  if (workdir === root) return safe;
+  if (!workdir.startsWith(`${root}/`)) throw new Error('working directory escapes world');
+  const prefix = workdir.slice(root.length + 1);
+  return safe === '.' ? prefix : `${prefix}/${safe}`;
 }

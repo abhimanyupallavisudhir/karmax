@@ -23,6 +23,7 @@ import { trackProcess } from '../util/processes.js';
 import { activityDetail, claudeToolActivity } from './activity.js';
 import { platformMcpSpec } from '../autonomy/config-homes.js';
 import { isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome, spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
+import { worldWorkingDirectory } from '../world/types.js';
 
 /**
  * Claude provider adapter (SPEC §7.1, §9.1: the Claude Agent SDK / Messages API,
@@ -382,7 +383,7 @@ export class ClaudeAdapter implements AgentAdapter {
       prompt: promptArg,
       options: {
         abortController,
-        cwd: input.world.handle.root,
+        cwd: worldWorkingDirectory(input.world.handle),
         additionalDirectories: [input.world.handle.root],
         // The world is already an isolated git worktree (the sandbox boundary) and
         // the agent runs headless — there is no human to approve tool calls, so it
@@ -458,7 +459,7 @@ export class ClaudeAdapter implements AgentAdapter {
               provider: 'claude',
               command: o.command,
               args: o.args,
-              cwd: input.world.handle.root,
+              cwd: worldWorkingDirectory(input.world.handle),
               env: remoteEnv,
               signal: o.signal,
             }) as any;

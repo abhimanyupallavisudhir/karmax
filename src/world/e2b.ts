@@ -15,7 +15,7 @@ import type {
   WorldPtySpec,
   WorldSpec,
 } from './types.js';
-import { worldRelativePath } from './types.js';
+import { worldRelativePath, worldWorkingDirectory } from './types.js';
 import { boundedResponseBody } from './http.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
@@ -116,7 +116,7 @@ export class E2BWorldProvider implements WorldProvider {
     try {
       const provisioner = provisionTarget(sandbox);
       await provisionGitCredentials(provisioner, spec, HOME);
-      const { repos, root, warnings } = await provisionGitRepos(provisioner, spec, {
+      const { repos, root, warnings, workdir } = await provisionGitRepos(provisioner, spec, {
         root: ROOT, home: HOME,
         sshUrlError: 'E2B worlds require repositories as SSH Git URLs (for example git@github.com:org/repo.git), not local paths or HTTPS URLs',
         copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote E2B world',
@@ -143,6 +143,7 @@ export class E2BWorldProvider implements WorldProvider {
         target: repos[0]?.target ?? spec.target,
         repo: repos[0]?.repo,
         repos,
+        ...(workdir ? { workdir } : {}),
         sealedProviderRef: this.sealRef({ sandboxId: sandbox.sandboxId, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) }),
         meta: { releaseOnCompletion: true, environmentFlavor: flavor,
           ...(selectedTemplate ? { environmentArtifact: selectedTemplate } : {}) },
@@ -289,7 +290,8 @@ class E2BWorld implements World {
   }
 
   async listFiles(): Promise<string[]> {
-    const listed = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print | sed 's#^./##'"], { timeoutMs: 120_000 });
+    const listed = await this.exec('bash', ['-lc', "find . -type f -not -path '*/.git/*' -print | sed 's#^./##'"],
+      { cwd: this.handle.root, timeoutMs: 120_000 });
     if (listed.code !== 0) throw new Error(listed.stderr || 'failed to list remote world files');
     return listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
   }
@@ -446,7 +448,7 @@ class E2BWorld implements World {
   }
 
   private cwd(value?: string): string {
-    if (!value) return this.handle.root;
+    if (!value) return worldWorkingDirectory(this.handle);
     // Existing activity callers sometimes pass the handle's absolute repo roots.
     if (value === this.handle.root || value.startsWith(`${this.handle.root}/`)) return value;
     const safe = worldRelativePath(value);

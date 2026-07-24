@@ -5,7 +5,7 @@ import { classifyProviderTurnError, isTransportError, isResourceKill, type Limit
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
-import { World, WorldHandle, WorldKind } from '../world/types.js';
+import { World, WorldHandle, WorldKind, worldWorkingDirectory } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import { AgentAdapter } from '../agent/types.js';
@@ -28,6 +28,8 @@ import { materializeFork } from '../agent/fork.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
 import os from 'node:os';
 import fs from 'node:fs';
+import { paths } from '../config/paths.js';
+import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
@@ -174,6 +176,7 @@ export interface CoreActivityDeps {
   runners?: import('../world/runners.js').RunnerPoolService;
   payments?: PaymentProvider;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
+  contentDir?: string;
 }
 
 export interface CreateWorldArgs {
@@ -316,10 +319,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : undefined;
     const project = projectId ? store.getProject(projectId) : undefined;
     const linked = projectId ? store.listProjectRepositories(projectId) : [];
-    if (project?.organizationId && linked.length && deps.githubApp) {
+    const wiki = projectId ? store.projectWiki(projectId)?.repository : undefined;
+    if (project?.organizationId && (linked.length || wiki) && deps.githubApp) {
       return async (worldRepo) => {
         const source = worldRepoSource(worldRepo);
-        const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository;
+        const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository
+          ?? (wiki?.sshUrl === source ? wiki : undefined);
         if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${source}`);
         return deps.githubApp!.brokerCredentials(repository);
       };
@@ -349,6 +354,39 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return worlds.open(await ensureRunnerLease(handle, taskId));
   }
 
+  /** Make the task's live project-wiki checkout host-readable for prompt
+   * assembly. Local providers already expose it directly; remote providers are
+   * copied into a short-lived snapshot through the provider-neutral file API. */
+  async function projectWikiPromptSnapshot(world: World): Promise<{ root: string; release(): void } | undefined> {
+    const repo = worldRepos(world.handle).find((candidate) => candidate.role === 'project-wiki');
+    if (!repo) return undefined;
+    if (fs.existsSync(repo.root)) return { root: repo.root, release: () => {} };
+
+    const worldRoot = world.handle.root.replace(/\\/g, '/').replace(/\/+$/, '');
+    const repoRoot = repo.root.replace(/\\/g, '/').replace(/\/+$/, '');
+    const prefix = path.posix.relative(worldRoot, repoRoot);
+    if (prefix.startsWith('..') || path.posix.isAbsolute(prefix))
+      throw new Error('project wiki is outside the task world');
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-prompt-'));
+    try {
+      for (const file of await world.listFiles()) {
+        if (prefix && file !== prefix && !file.startsWith(`${prefix}/`)) continue;
+        const rel = prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
+        if (!rel || rel === '.git' || rel.startsWith('.git/')) continue;
+        const target = path.resolve(root, rel);
+        if (target !== root && !target.startsWith(`${root}${path.sep}`))
+          throw new Error('invalid file path in project wiki checkout');
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, await world.readFileBuffer(file));
+      }
+      return { root, release: () => fs.rmSync(root, { recursive: true, force: true }) };
+    } catch (error) {
+      fs.rmSync(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
       const remote = isRemote(args.kind);
@@ -371,7 +409,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` });
       }
-      const requestedSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
+      // The project wiki is a platform-owned companion repository. Add it at
+      // provisioning time (rather than to deterministic workflow input), so
+      // old workflow histories remain replay-compatible.
+      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
+      const project = projectId ? store.getProject(projectId) : undefined;
+      const wikiRoot = project
+        ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
+        : undefined;
+      if (project && !store.projectWiki(project.id)) store.setProjectWikiRepository(project.id);
+      const wikiRepository = project ? store.projectWiki(project.id)?.repository : undefined;
+      if (remote && project && !wikiRepository)
+        throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
+      const developmentSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
+      const requestedSources = [
+        ...developmentSources,
+        ...(wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
+      ];
       const cloudSources = remote ? await Promise.all(requestedSources.map((source) => cloudGitSource(source))) : [];
       const worldSources = remote ? cloudSources.map((resolved) => resolved.source) : requestedSources;
       for (let i = 0; i < cloudSources.length; i++) {
@@ -383,29 +437,32 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Older/local workflow histories do not pass projectId into createWorld;
       // the durable task record is the compatibility source for repository
       // enrollment, credentials, and world ownership.
-      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
       const linkedRepositories = projectId ? store.listProjectRepositories(projectId) : [];
       const repositoryBranches = Object.fromEntries(linkedRepositories.map((candidate) => {
         const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
         return [candidate.repository.sshUrl, { base, target: candidate.targetBranch ?? base }];
       }));
-      if (linkedRepositories.length) {
+      if (wikiRoot && requestedSources.includes(wikiRoot))
+        repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
+        base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH,
+      };
+      if (linkedRepositories.length || wikiRepository) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const credentials: Record<string, string> = {};
         for (const source of worldSources) {
           const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
-          if (!linked) {
+          const repository = linked?.repository ?? (wikiRepository?.sshUrl === source ? wikiRepository : undefined);
+          if (!repository) {
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
             continue;
           }
-          if (deps.githubApp) credentials[source] = deps.githubApp.repositorySshKey(linked.repository.id, 'clone');
+          if (deps.githubApp) credentials[source] = deps.githubApp.repositorySshKey(repository.id, 'clone');
         }
         // Repository-scoped read-only keys take precedence for enrolled
         // sources. Local managed clones use the same ephemeral provisioning
         // credential without persisting it.
         if (Object.keys(credentials).length) gitCredentials = { ...gitCredentials, repositories: credentials };
       }
-      const project = projectId ? store.getProject(projectId) : undefined;
       const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
@@ -419,8 +476,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         world = await worlds.create(args.kind, {
           taskId: args.taskId,
           organizationId: project?.organizationId,
-          repo: args.repos?.length ? undefined : worldSources[0],
-          repos: args.repos?.length ? worldSources : undefined,
+          repo: worldSources.length === 1 ? worldSources[0] : undefined,
+          repos: worldSources.length > 1 ? worldSources : undefined,
+          scratch: developmentSources.length === 0,
           base: args.base,
           target: args.target,
           branch: args.branch,
@@ -439,8 +497,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       try {
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
+        if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
+          const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
+          const wiki = world.handle.repos.find((repo) => worldRepoSource(repo) === wikiSource || repo.repo === wikiSource);
+          if (wiki) wiki.role = 'project-wiki';
+        }
+        // A platform-owned companion must not unexpectedly move agents out of
+        // the project's only development repository. Keep `root` as the world
+        // boundary so the wiki remains accessible, and select that development
+        // checkout as the default cwd. Genuine multi-development-repo projects
+        // retain the encompassing root as their working directory.
+        const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
+        if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
-          repositoryIds: linkedRepositories.map((candidate) => candidate.repository.id) };
+          repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
+            ...(wikiRepository ? [wikiRepository.id] : [])] };
         if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
         if (projectId) {
           world.handle = store.registerWorld(world.handle, projectId, {
@@ -640,7 +711,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const materialized =
             profile.provider === 'mock' || apiRail
               ? true
-              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: world.handle.root });
+              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: worldWorkingDirectory(world.handle) });
           if (!materialized) {
             // The id resolves in NO config home for this provider. Fail loudly instead
             // of handing an unknown id to the adapter, which would silently start a
@@ -674,7 +745,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               }
             }
             if (!forked) forked = materializeFork({ provider: profile.provider, session: srcSession,
-              forkHome, worldPath: world.handle.root, srcHome });
+              forkHome, worldPath: worldWorkingDirectory(world.handle), srcHome });
             if (forked) {
               session = srcSession;
               fork = true; // adapter branches a NEW session id from it (native fork)
@@ -723,9 +794,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // unreadable, the agent still gets the built-in instructions.
       let projectInstructions: string | undefined;
       let globalInstructions: string | undefined;
+      let wikiSnapshot: { root: string; release(): void } | undefined;
       try {
         const { buildWikiPromptContext } = await import('../wiki/wiki.js');
-        const { paths } = await import('../config/paths.js');
         // Wiki pages the task tags in its prompt/follow-ups (`@proj:…`/`@org:…`)
         // are inlined in full, as are the tokens in the task's wiki-context field
         // (`params.wikiContext`, read fresh here like the wiki content itself;
@@ -734,16 +805,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           .filter(Boolean)
           .join('\n');
         const wikiContext = store.getTask(args.taskId)?.params?.wikiContext;
+        wikiSnapshot = await projectWikiPromptSnapshot(world);
         projectInstructions = buildWikiPromptContext({
-          contentDir: paths().content,
+          contentDir: deps.contentDir ?? paths().content,
           organizationId: store.getProject(args.task.projectId)?.organizationId,
           projectId: args.task.projectId,
+          projectRoot: wikiSnapshot?.root,
           builtinInstructions,
           taggedText,
           contextTokens: Array.isArray(wikiContext) ? wikiContext.map(String) : undefined,
         }) || undefined;
       } catch {
         globalInstructions = `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}`;
+      } finally {
+        wikiSnapshot?.release();
       }
       const systemPrompt = assemblePrompt({
         profile,
