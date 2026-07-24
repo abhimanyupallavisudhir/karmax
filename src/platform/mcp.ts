@@ -22,6 +22,7 @@ export interface PlatformOps {
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
+  requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
   readWiki(scope: 'organization' | 'project', id: string, path?: string): Promise<unknown>;
@@ -110,6 +111,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     tagTask: (id, add, remove) => api.tagTask(getToken(), id, { add, remove }),
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role) => void (await api.signalTask(getToken(), id, sig as any, text, role)),
+    requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
     readWiki: async (scope, id, path) => api.readWiki(getToken(), scope, id, path ?? ''),
@@ -179,6 +181,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     tagTask: (id, add, remove) => req(`/api/tasks/${id}/tag`, { method: 'POST', body: JSON.stringify({ add, remove }) }) as Promise<{ tags: string[] }>,
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role }) })),
+    requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
     reorderQueue: async (domain, taskId) => void (await req(`/api/queue/prioritize`, { method: 'POST', body: JSON.stringify({ domain, taskId }) })),
     saveSkill: (a) => req(`/api/skills`, { method: 'POST', body: JSON.stringify(a) }),
     readWiki: (scope, id, path) => req(`/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/wiki?path=${encodeURIComponent(path ?? '')}`),
@@ -317,6 +320,17 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'message_agent',
     { description: 'Send a follow-up into an attached agent conversation. This works for original or forked tasks and is delivered live when that agent is running.', inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string() } },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, 'followUp', a.message, a.role); return 'message delivered'; }),
+  );
+  server.registerTool(
+    'request_agent_action',
+    {
+      description: 'Ask another task agent to publish its branch in the background. Returns immediately with a durable request id; Karmax injects completion or failure into this agent automatically. Continue other work and do not poll.',
+      inputSchema: {
+        taskId: z.string(), role: z.string().default('do'),
+        action: z.literal('publish_branch'), message: z.string().optional(),
+      },
+    },
+    async (a) => wrap(() => ops.requestAgentAction(a)),
   );
   server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(() => ops.listEvents(a.taskId, a.since)));
   server.registerTool('publish_task_branch', {

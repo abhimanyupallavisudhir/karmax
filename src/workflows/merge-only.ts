@@ -183,7 +183,8 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
     confirmed = true;
   });
   setHandler(followUpSignal, (m) => {
-    msgs.push({ ...m, ts: m.ts || msgs.length });
+    if (!msgs.some((candidate) => candidate.id === m.id))
+      msgs.push({ ...m, ts: m.ts || msgs.length });
   });
   setHandler(cancelSignal, () => {
     if (!pointOfNoReturnPassed) {

@@ -3,6 +3,7 @@ import {
   continueAsNew,
   defineQuery,
   defineSignal,
+  defineUpdate,
   proxyActivities,
   setHandler,
 } from '@temporalio/workflow';
@@ -13,6 +14,7 @@ import {
   SIG_RELEASE_AGENT,
   SIG_REORDER,
   SIG_SET_AGENT_CAPACITY,
+  UPD_WAIT_AGENT,
   agentQueueId as aqId,
 } from './names.js';
 
@@ -40,6 +42,7 @@ export const cancelAgentSignal = defineSignal<[{ taskId: string; turnId: string 
 export const releaseAgentSignal = defineSignal<[{ taskId: string; turnId: string }]>(SIG_RELEASE_AGENT);
 export const reorderAgentSignal = defineSignal<[{ turnId: string; beforeTurnId?: string }]>(SIG_REORDER);
 export const setAgentCapacitySignal = defineSignal<[{ capacity: number }]>(SIG_SET_AGENT_CAPACITY);
+export const waitAgentUpdate = defineUpdate<boolean, [AgentQueueItem]>(UPD_WAIT_AGENT);
 export const agentQueueQuery = defineQuery<AgentQueueView>(QRY_AGENT_QUEUE);
 
 export const agentQueueId = aqId;
@@ -49,8 +52,8 @@ const LEASE_TIMEOUT = '5 minutes';
 const act = proxyActivities<{ isTaskAlive(taskId: string): Promise<boolean> }>({ startToCloseTimeout: '20s' });
 
 /**
- * Durable, host-wide admission queue for model turns. The task workflow requests
- * a lease before it schedules the expensive activity, so queue order and active
+ * Durable, host-wide admission queue for model turns. The turn activity requests
+ * a lease before it starts the expensive model process, so queue order and active
  * leases are workflow state (queryable/reorderable) rather than process-local
  * semaphore bookkeeping. Memory/load pressure remains an activity-side safety
  * check because only the worker can inspect the live host.
@@ -80,6 +83,31 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
   });
   setHandler(setAgentCapacitySignal, ({ capacity: next }) => {
     capacity = positiveInt(next, capacity);
+  });
+  // A waiter durably enqueues and blocks in one Update. The separate
+  // signalWithStart remains the crash-safe way to create the singleton, while
+  // the Update's idempotent enqueue closes their cross-request ordering race.
+  // One accepted Update replaces the former 10Hz consistent-query loop in every
+  // waiting activity. Cancellation removes the item and resolves `false`.
+  setHandler(waitAgentUpdate, async (item) => {
+    const matches = (candidate: AgentQueueItem) =>
+      candidate.taskId === item.taskId && candidate.turnId === item.turnId;
+    // signalWithStart acceptance and a subsequent Update are separate client
+    // requests, so their server-side processing order is not guaranteed. Make
+    // the Update idempotently enqueue too; otherwise an early Update can observe
+    // "not queued" and falsely report cancellation.
+    if (!current.some(matches) && !queue.some(matches)) queue.push(item);
+    await condition(() =>
+      current.some(matches)
+      || !queue.some(matches)
+      || (current.length < capacity && !!queue[0] && matches(queue[0])),
+    );
+    if (!current.some(matches) && queue.some(matches) && current.length < capacity) {
+      queue = queue.filter((candidate) => !matches(candidate));
+      current.push(item);
+      processed++;
+    }
+    return current.some(matches);
   });
   setHandler(agentQueueQuery, () => ({ capacity, queue: queue.map((x) => ({ ...x })), current: current.map((x) => ({ ...x })) }));
 

@@ -20,7 +20,7 @@ import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { git as hostGit } from '../world/git.js';
-import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
+import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
@@ -37,11 +37,11 @@ import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import {
   AGENT_QUEUE_WORKFLOW,
-  QRY_AGENT_QUEUE,
   SIG_CANCEL_AGENT,
   SIG_LEASE_AGENT,
   SIG_RELEASE_AGENT,
   SIG_SET_AGENT_CAPACITY,
+  UPD_WAIT_AGENT,
   agentQueueId,
 } from '../coordinators/names.js';
 
@@ -88,6 +88,12 @@ async function acquireConfirmLock(key: string): Promise<() => void> {
 function classifyTurnError(err: unknown, provider?: Provider): Error {
   const msg = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error ? err : undefined;
+  // Admission happens before a provider process exists. Temporal coordinator
+  // backpressure/outages therefore cannot be an agent error and must retain
+  // their retryable infrastructure classification through this outer boundary.
+  if (err instanceof AgentAdmissionInfrastructureError) {
+    return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
+  }
   const { classification: cls, metadata } = classifyProviderTurnError(err, provider);
   if (cls.limited) {
     return ApplicationFailure.create({
@@ -107,6 +113,14 @@ function classifyTurnError(err: unknown, provider?: Provider): Error {
   if (isResourceKill(msg)) return ApplicationFailure.create({ message: signalKillMessage(msg), type: 'agent-infra', nonRetryable: false, cause });
   if (isTransportError(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   return ApplicationFailure.create({ message: msg, type: 'agent-error', nonRetryable: true, cause });
+}
+
+class AgentAdmissionInfrastructureError extends Error {
+  constructor(cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`agent-slot admission failed: ${detail}`, { cause: cause instanceof Error ? cause : undefined });
+    this.name = 'AgentAdmissionInfrastructureError';
+  }
 }
 
 /**
@@ -218,23 +232,47 @@ async function acquireWorkflowAgentSlot(args: {
     signalArgs: [{ taskId: args.taskId, turnId: args.turnId, role: args.role, provider: args.provider, title: args.title, projectId: args.projectId }],
   });
   await args.client.workflow.getHandle(id).signal(SIG_SET_AGENT_CAPACITY, { capacity });
-  let lastHeartbeat = 0;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   try {
-    for (;;) {
-      if (args.signal?.aborted) throw args.signal.reason instanceof Error ? args.signal.reason : new Error('agent queue wait cancelled');
-      const view = (await args.client.workflow.getHandle(id).query(QRY_AGENT_QUEUE)) as {
-        current: Array<{ turnId: string }>;
-      };
-      if (view.current.some((x) => x.turnId === args.turnId)) break;
-      if (Date.now() - lastHeartbeat >= 10_000) {
-        args.heartbeat?.();
-        lastHeartbeat = Date.now();
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
-    }
+    if (args.signal?.aborted)
+      throw args.signal.reason instanceof Error ? args.signal.reason : new Error('agent queue wait cancelled');
+    // Keep the long-running activity lease alive while one durable Workflow
+    // Update waits for promotion. This creates O(waiters), not O(waiters × time),
+    // Temporal requests and cannot fill the consistent-query buffer.
+    heartbeatTimer = setInterval(() => {
+      try { args.heartbeat?.(); } catch { /* activity cancellation is handled below */ }
+    }, 10_000);
+    heartbeatTimer.unref?.();
+    const admission = args.client.workflow.getHandle(id).executeUpdate(UPD_WAIT_AGENT, {
+      args: [{
+        taskId: args.taskId,
+        turnId: args.turnId,
+        role: args.role,
+        provider: args.provider,
+        title: args.title,
+        projectId: args.projectId,
+      }],
+    }) as Promise<boolean>;
+    let removeAbortListener = () => {};
+    const granted = await (args.signal
+      ? Promise.race([
+          Promise.resolve(admission),
+          new Promise<never>((_, reject) => {
+            const abort = () => reject(args.signal!.reason instanceof Error
+              ? args.signal!.reason
+              : new Error('agent queue wait cancelled'));
+            args.signal!.addEventListener('abort', abort, { once: true });
+            removeAbortListener = () => args.signal!.removeEventListener('abort', abort);
+          }),
+        ]).finally(() => removeAbortListener())
+      : Promise.resolve(admission));
+    if (!granted) throw new Error('agent queue lease was cancelled before admission');
   } catch (e) {
     await args.client.workflow.getHandle(id).signal(SIG_CANCEL_AGENT, { taskId: args.taskId, turnId: args.turnId }).catch(() => undefined);
-    throw e;
+    if (args.signal?.aborted) throw e;
+    throw new AgentAdmissionInfrastructureError(e);
+  } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
   }
   let released = false;
   return async () => {
@@ -1171,7 +1209,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(handle);
       const result = await brokerPublishBranch(world, brokerAuthFor(handle, handle.id));
       if (!result.pushed.length || result.skipped.length) {
-        throw new Error(`cloud task branch was not persisted${result.skipped.length ? ` for: ${result.skipped.join(', ')}` : ' because it has no remote repository'}`);
+        throw new Error(`cloud task branch was not persisted${result.skipped.length ? ` for: ${describePublishFailures(result)}` : ' because it has no remote repository'}`);
       }
       record(handle.id, 'push.branch', { branch: handle.branch, repos: result.pushed });
       return { pushed: result.pushed };
@@ -1332,7 +1370,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const projectId = String(waitingWorld.meta?.projectId ?? '');
                   if (store.listProjectRepositories(projectId).length) {
                     const pushed = await brokerPublishBranch(remoteWorld, brokerAuthFor(waitingWorld, taskId));
-                    if (pushed.skipped.length) throw new Error(`could not persist branch for ${pushed.skipped.join(', ')}`);
+                    if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                     record(taskId, 'push.branch', { branch: waitingWorld.branch, repos: pushed.pushed, reason: 'checkpoint' });
                   }
                 }

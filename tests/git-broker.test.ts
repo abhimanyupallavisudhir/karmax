@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream } from '../src/world/git-broker.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
@@ -66,6 +66,58 @@ describe('cloud Git broker', () => {
     expect(branch.code).toBe(0);
     const refreshed = await brokerRefreshUpstream(collaborator, env, 'main');
     expect(refreshed[0]).toMatchObject({ branch: 'main', ref: 'refs/remotes/origin/main', sha: result.sha });
+  });
+
+  it('publishes a live local worktree branch without SSH or a self-fetch', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-worktree-'));
+    cleanups.push(root);
+    const source = path.join(root, 'source');
+    const worlds = path.join(root, 'worlds');
+    fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+
+    const provider = new WorktreeProvider(worlds);
+    const world = await provider.create({ taskId: 'local-publish', repo: source, base: 'main' });
+    await world.writeFile('feature.txt', 'still checked out\n');
+    await gitOrThrow(world.handle.root, ['add', '-A']);
+    await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'feature']);
+    expect((await git(world.handle.root, ['branch', '--show-current'])).stdout.trim()).toBe('karmax/local-publish');
+
+    const auth = vi.fn(async () => {
+      throw new Error('local publication must not request remote credentials');
+    });
+    expect(await brokerPublishBranch(world, auth)).toEqual({ pushed: ['source'], skipped: [] });
+    expect(auth).not.toHaveBeenCalled();
+    expect((await git(source, ['rev-parse', 'refs/heads/karmax/local-publish'])).stdout.trim())
+      .toBe((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim());
+  });
+
+  it('preserves the underlying error for every skipped repository', async () => {
+    const world = {
+      handle: {
+        kind: 'e2b',
+        id: 'broken-publish',
+        root: '/workspace',
+        branch: 'karmax/broken-publish',
+        base: 'main',
+        repos: [{
+          name: 'app',
+          repo: '/not-an-ssh-remote',
+          root: '/workspace',
+          branch: 'karmax/broken-publish',
+          base: 'main',
+        }],
+      },
+    } as any;
+    expect(await brokerPublishBranch(world, {})).toEqual({
+      pushed: [],
+      skipped: ['app'],
+      errors: { app: 'Git broker requires an SSH remote' },
+    });
   });
 
   it('lands in the authoritative local checkout (not origin) when the world was provisioned from a local path', async () => {

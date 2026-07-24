@@ -17,6 +17,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/tasks/:taskId/checkout', 'POST /api/tasks/:taskId/materialize-local',
     'POST /api/tasks/:taskId/terminal-ticket', 'POST /api/tasks/:taskId/refresh-from-github',
     'POST /api/agent/git/publish', 'POST /api/agent/git/import', 'POST /api/agent/git/refresh-upstream',
+    'POST /api/agent/collaboration/request',
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',

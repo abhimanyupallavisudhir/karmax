@@ -536,8 +536,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
 
   it('seeds a brand-new project with the karmax-ready prep task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
-    // workflow's onActivate prep task automatically (SPEC §4.6) — no manual
-    // "activate workflow" step. Covers both create-project routes.
+    // workflow's current onActivate Goal prep task automatically (SPEC §4.6) —
+    // no manual "activate workflow" step. Covers both create-project routes.
     const post = (path: string, body: unknown) =>
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
     const prepTitle = 'Make this project karmax-ready';
@@ -546,7 +546,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
       const prep = tasks.find((t: any) => t.title === prepTitle);
       expect(prep, `new project via ${path} should get the prep task`).toBeTruthy();
-      expect(prep.workflow).toBe('just-do');
+      expect(prep.workflow).toBe('goal');
     }
   });
 

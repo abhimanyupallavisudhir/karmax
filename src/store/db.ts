@@ -48,6 +48,23 @@ import {
 } from '../domain/types.js';
 import { newId } from '../util/id.js';
 
+export type CollaborationRequestStatus = 'pending' | 'completed' | 'failed';
+
+export interface CollaborationRequest {
+  id: string;
+  requesterTaskId: string;
+  targetTaskId: string;
+  targetRole: string;
+  action: 'publish_branch';
+  status: CollaborationRequestStatus;
+  afterSeq: number;
+  createdAt: number;
+  updatedAt: number;
+  settledAt?: number;
+  result?: Record<string, unknown>;
+  notifiedAt?: number;
+}
+
 /**
  * Terminal statuses that auto-archive a task when it first reaches one (see
  * `Store.saveView`). Only fully-resolved outcomes — a failed task stays visible
@@ -320,6 +337,16 @@ export class Store {
         seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL,
         type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS collaboration_requests (
+        id TEXT PRIMARY KEY, requesterTaskId TEXT NOT NULL, targetTaskId TEXT NOT NULL,
+        targetRole TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL,
+        afterSeq INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        settledAt INTEGER, result TEXT, notifiedAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_collaboration_requests_target_status
+        ON collaboration_requests(targetTaskId, status);
+      CREATE INDEX IF NOT EXISTS idx_collaboration_requests_requester_status
+        ON collaboration_requests(requesterTaskId, status);
       CREATE TABLE IF NOT EXISTS kv (
         k TEXT PRIMARY KEY, v TEXT NOT NULL
       );
@@ -642,6 +669,8 @@ export class Store {
       deleteRows(this.db, 'task_confirmation', 'taskId', taskIds);
       deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds);
       deleteRows(this.db, 'task_tags', 'taskId', taskIds);
+      deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
+      deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
       deleteRows(this.db, 'events', 'taskId', taskIds);
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
@@ -731,6 +760,12 @@ export class Store {
       task_subscribers: rowsFor(this.db, 'task_subscribers', 'taskId', taskIds),
       task_confirmation: rowsFor(this.db, 'task_confirmation', 'taskId', taskIds),
       confirmation_votes: rowsFor(this.db, 'confirmation_votes', 'taskId', taskIds),
+      collaboration_requests: [
+        ...new Map([
+          ...rowsFor(this.db, 'collaboration_requests', 'requesterTaskId', taskIds),
+          ...rowsFor(this.db, 'collaboration_requests', 'targetTaskId', taskIds),
+        ].map((row) => [String(row.id), row])).values(),
+      ],
       events: rowsFor(this.db, 'events', 'taskId', taskIds),
       tags: rowsFor(this.db, 'tags', 'projectId', projectIds),
       task_tags: rowsFor(this.db, 'task_tags', 'taskId', taskIds),
@@ -841,6 +876,8 @@ export class Store {
       deleteRows(this.db, 'task_confirmation', 'taskId', taskIds);
       deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds);
       deleteRows(this.db, 'task_tags', 'taskId', taskIds);
+      deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
+      deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
       deleteRows(this.db, 'events', 'taskId', taskIds);
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
@@ -2411,6 +2448,124 @@ export class Store {
   }
 
   // ─── Event log (live stream) ─────────────────────────────────────────────────
+
+  createCollaborationRequest(input: {
+    requesterTaskId: string;
+    targetTaskId: string;
+    targetRole?: string;
+    action: CollaborationRequest['action'];
+  }): CollaborationRequest {
+    const now = Date.now();
+    const afterSeq = Number((this.db.prepare('SELECT COALESCE(MAX(seq), 0) seq FROM events').get() as any)?.seq ?? 0);
+    const request: CollaborationRequest = {
+      id: newId('collab'),
+      requesterTaskId: input.requesterTaskId,
+      targetTaskId: input.targetTaskId,
+      targetRole: input.targetRole ?? 'do',
+      action: input.action,
+      status: 'pending',
+      afterSeq,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.db.prepare(`INSERT INTO collaboration_requests
+      (id, requesterTaskId, targetTaskId, targetRole, action, status, afterSeq, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      request.id, request.requesterTaskId, request.targetTaskId, request.targetRole,
+      request.action, request.status, request.afterSeq, request.createdAt, request.updatedAt,
+    );
+    return request;
+  }
+
+  getCollaborationRequest(id: string): CollaborationRequest | undefined {
+    const row = this.db.prepare('SELECT * FROM collaboration_requests WHERE id=?').get(id) as any;
+    return row ? this.collaborationRequestFromRow(row) : undefined;
+  }
+
+  listCollaborationRequests(input: {
+    requesterTaskId?: string;
+    targetTaskId?: string;
+    status?: CollaborationRequestStatus;
+    unnotified?: boolean;
+  } = {}): CollaborationRequest[] {
+    const clauses: string[] = [];
+    const args: any[] = [];
+    if (input.requesterTaskId) { clauses.push('requesterTaskId=?'); args.push(input.requesterTaskId); }
+    if (input.targetTaskId) { clauses.push('targetTaskId=?'); args.push(input.targetTaskId); }
+    if (input.status) { clauses.push('status=?'); args.push(input.status); }
+    if (input.unnotified) clauses.push("status!='pending' AND notifiedAt IS NULL");
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+    return (this.db.prepare(`SELECT * FROM collaboration_requests${where} ORDER BY createdAt, id`).all(...args) as any[])
+      .map((row) => this.collaborationRequestFromRow(row));
+  }
+
+  settleCollaborationRequests(
+    targetTaskId: string,
+    status: Exclude<CollaborationRequestStatus, 'pending'>,
+    result: Record<string, unknown>,
+    eventSeq?: number,
+  ): CollaborationRequest[] {
+    const pending = this.listCollaborationRequests({ targetTaskId, status: 'pending' })
+      .filter((request) => eventSeq === undefined || eventSeq > request.afterSeq);
+    if (!pending.length) return [];
+    const now = Date.now();
+    const update = this.db.prepare(`UPDATE collaboration_requests
+      SET status=?, result=?, updatedAt=?, settledAt=?
+      WHERE id=? AND status='pending'`);
+    const settled: CollaborationRequest[] = [];
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const request of pending) {
+        const changed = update.run(status, JSON.stringify(result), now, now, request.id).changes;
+        if (changed) settled.push({ ...request, status, result, updatedAt: now, settledAt: now });
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return settled;
+  }
+
+  settleCollaborationRequest(
+    id: string,
+    status: Exclude<CollaborationRequestStatus, 'pending'>,
+    result: Record<string, unknown>,
+  ): CollaborationRequest | undefined {
+    const request = this.getCollaborationRequest(id);
+    if (!request || request.status !== 'pending') return undefined;
+    const now = Date.now();
+    const changed = this.db.prepare(`UPDATE collaboration_requests
+      SET status=?, result=?, updatedAt=?, settledAt=?
+      WHERE id=? AND status='pending'`).run(status, JSON.stringify(result), now, now, id).changes;
+    return changed ? { ...request, status, result, updatedAt: now, settledAt: now } : undefined;
+  }
+
+  markCollaborationRequestNotified(id: string): void {
+    this.db.prepare("UPDATE collaboration_requests SET notifiedAt=?, updatedAt=? WHERE id=? AND status!='pending'")
+      .run(Date.now(), Date.now(), id);
+  }
+
+  deleteCollaborationRequest(id: string): void {
+    this.db.prepare('DELETE FROM collaboration_requests WHERE id=?').run(id);
+  }
+
+  private collaborationRequestFromRow(row: any): CollaborationRequest {
+    return {
+      id: String(row.id),
+      requesterTaskId: String(row.requesterTaskId),
+      targetTaskId: String(row.targetTaskId),
+      targetRole: String(row.targetRole),
+      action: row.action as CollaborationRequest['action'],
+      status: row.status as CollaborationRequestStatus,
+      afterSeq: Number(row.afterSeq),
+      createdAt: Number(row.createdAt),
+      updatedAt: Number(row.updatedAt),
+      ...(row.settledAt == null ? {} : { settledAt: Number(row.settledAt) }),
+      ...(row.result == null ? {} : { result: JSON.parse(String(row.result)) as Record<string, unknown> }),
+      ...(row.notifiedAt == null ? {} : { notifiedAt: Number(row.notifiedAt) }),
+    };
+  }
 
   appendEvent(ev: KarmaxEvent): number {
     const info = this.db

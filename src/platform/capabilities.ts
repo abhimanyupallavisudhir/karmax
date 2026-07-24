@@ -220,6 +220,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   get_settings: 'settings:read', set_settings: 'settings:write',
   list_agents: 'task:conversation:read', get_conversation: 'task:conversation:read',
   fork_agent: 'task:conversation:fork', message_agent: 'task:conversation:message',
+  request_agent_action: 'task:conversation:message',
   publish_task_branch: 'task:git:publish', import_task_branch: 'task:git:import', refresh_upstream: 'task:git:import',
   list_events: 'task:event:read', diagnostics: 'diagnostic:read', list_processes: 'process:read', kill_process: 'process:kill',
   execute_review_action: 'task:review:execute', stop_review_action: 'task:review:execute',

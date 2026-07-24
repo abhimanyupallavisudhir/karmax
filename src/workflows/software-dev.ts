@@ -67,6 +67,8 @@ const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s
 // `resolve`); omitted / unknown routes to the Do agent, so old single-arg signals
 // (and the other single-agent workflows) keep working unchanged.
 export const followUpSignal = defineSignal<[Message, string?]>('followUp');
+export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
+export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
@@ -246,6 +248,10 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   const settled: { childTaskId: string; stage: string; detail?: string }[] = [];
   const outstanding = new Set<string>();
   const awaitingResponse = new Set<string>();
+  // Cross-task collaboration is a durable, event-driven join. The requesting
+  // agent keeps working for the rest of its current turn; if it finishes before
+  // the target publishes, the workflow parks here and wakes on settlement.
+  const pendingCollaborations = new Set<string>();
   let pointOfNoReturnPassed = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
@@ -521,7 +527,16 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     // next turn (each turn is fed its own accumulated transcript). A turn currently
     // running polls `pendingMessagesQuery` and injects it live (in-flight).
     const target = conversationFor(role);
-    target.push({ ...m, ts: m.ts || target.length });
+    if (!target.some((candidate) => candidate.id === m.id))
+      target.push({ ...m, ts: m.ts || target.length });
+  });
+  setHandler(collaborationRequestedSignal, (requestId) => {
+    pendingCollaborations.add(requestId);
+  });
+  setHandler(collaborationSettledSignal, (requestId, message) => {
+    pendingCollaborations.delete(requestId);
+    if (!msgs.some((candidate) => candidate.id === message.id))
+      msgs.push({ ...message, ts: message.ts || msgs.length });
   });
   setHandler(confirmSignal, () => {
     confirmed = true;
@@ -1247,6 +1262,25 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
 
     // No children outstanding.
     if (turn.waitForSubtasks) continue; // nothing to wait for → just take another turn
+
+    if (pendingCollaborations.size > 0 && finishing) {
+      status = 'waiting';
+      waitingFor = {
+        kind: 'collaboration',
+        detail: `Waiting for ${pendingCollaborations.size} background collaboration request(s)`,
+      };
+      await publish();
+      await condition(() => cancelled || pendingCollaborations.size === 0 || msgs.length > seen);
+      if (cancelled) return await abort();
+      stage = 'do';
+      status = 'active';
+      continue;
+    }
+
+    // A collaboration may settle after the provider's final live-message poll
+    // but before its activity returns. Always deliver that queued result in a
+    // fresh turn instead of advancing to Review with an unread notification.
+    if (msgs.length > seen) continue;
 
     // The agent's OWN in-harness sub-agents (Claude Agent SDK Task tool) may still be
     // running when its turn returned — Claude Code auto-backgrounds long sub-agents, so

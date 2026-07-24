@@ -143,6 +143,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
+  if (p === '/api/agent/collaboration/request') return 'task:conversation:message';
   if (/\/file$/.test(p)) return 'task:conversation:read';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
@@ -1885,6 +1886,19 @@ export class Gateway {
         const b = await this.body(req);
         try { return this.json(res, 200, await api.refreshUpstream(token, b.branch ? String(b.branch) : undefined)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      if (p === '/api/agent/collaboration/request' && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 202, await api.requestAgentAction(token, {
+            taskId: String(b.taskId ?? ''),
+            role: b.role ? String(b.role) : undefined,
+            action: String(b.action ?? '') as 'publish_branch',
+            message: b.message ? String(b.message) : undefined,
+          }));
+        } catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       const desktopMatch = p.match(/^\/api\/tasks\/([^/]+)\/desktop$/);
       if (desktopMatch && method === 'GET') {
