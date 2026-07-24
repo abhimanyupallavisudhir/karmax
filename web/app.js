@@ -2020,15 +2020,17 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// The default list transparently hides two kinds of noise unless the query opts in:
-// archived tasks (`-is:archived`) and the auto-spawned *runs* of a repeatable series
-// (`-is:run`), so a cron series doesn't flood the list — its template still shows, and
-// you drill into runs with `is:run` (or the Repeatable/Archived views). Archived and runs
-// are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
-// evaluated query carries the defaults. If the query already mentions a facet, we leave it.
+// The default list transparently hides three kinds of noise unless the query opts in:
+// archived tasks (`-is:archived`), the auto-spawned *runs* of a repeatable series
+// (`-is:run`), and delegated *sub-tasks* (`-is:subtask`) — a sub-task lives under its
+// parent's detail page, not as a sibling at the top level, so a fan-out of children
+// doesn't flood the list. Its parent still shows, and you drill into children with
+// `is:subtask` (or the Sub-tasks/Repeatable/Archived views). These are therefore just
+// facets, not toggles. The clean `S.search` stays in the box; only the evaluated query
+// carries the defaults. If the query already mentions a facet, we leave it.
 // The task-picker overlay passes its own facet list (e.g. the fork search keeps archived).
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
-function effectiveQuery(q, facets = ['archived', 'run']) {
+function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
   let s = (q || '').trim();
   for (const facet of facets) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
   return s;
@@ -2041,6 +2043,7 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:subtasks', name: 'Sub-tasks', icon: '↳', query: 'is:subtask' },
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
@@ -2152,20 +2155,27 @@ function tasksView() {
   // hide runs from every list surface (flat + grouped) below.
   S._runsBySeries = {};
   for (const t of S.tasks) if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
-  const notRun = (t) => !t.params?.runOf;
+  // Runs nest under their series row and sub-tasks nest under their parent's detail page,
+  // so by default neither belongs in the flat top-level list. The server already drops both
+  // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
+  // and it opts back in when the query explicitly asks for that facet (the Sub-tasks view's
+  // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
+  const keepRun = queryMentionsFacet(S.search, 'run');
+  const keepSub = queryMentionsFacet(S.search, 'subtask');
+  const topLevel = (t) => (keepRun || !t.params?.runOf) && (keepSub || !t.parentTaskId);
   // The server already applied the query (incl. the default -is:archived from effectiveQuery).
   // Fallback (before the first result lands) filters client-side and drops archived to match.
   const flat = (r
     ? r.tasks
     : S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-  ).filter(notRun);
+  ).filter(topLevel);
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
   let body;
   if (groups) {
     body = groups
       .map((g) => {
-        const gt = g.tasks.filter(notRun);
+        const gt = g.tasks.filter(topLevel);
         return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
       })
       .join('');
