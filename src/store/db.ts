@@ -162,6 +162,13 @@ export class Store {
     if (!cols.some((c) => c.name === 'notes')) {
       this.db.exec('ALTER TABLE tasks ADD COLUMN notes TEXT');
     }
+    // A software-dev@1.3 execution can switch its user-facing mode to Goal (and
+    // back) without replacing the Temporal workflow. Keep the actual execution
+    // definition separately so replay/version-retirement accounting stays true.
+    if (!cols.some((c) => c.name === 'executionWorkflow')) {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN executionWorkflow TEXT');
+      this.db.exec('UPDATE tasks SET executionWorkflow = workflow WHERE executionWorkflow IS NULL');
+    }
     // Simple human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
     // project's queued tasks run #1, #2, … A separate integer alongside the opaque `id`
     // (which stays the Temporal workflowId and must never change). The per-project
@@ -305,6 +312,7 @@ export class Store {
       listId,
       title: input.title,
       workflow: input.workflow,
+      executionWorkflow: input.workflow,
       workflowVersion: input.workflowVersion,
       params: input.params,
       createdAt: Date.now(),
@@ -313,8 +321,8 @@ export class Store {
     };
     this.db
       .prepare(
-        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
@@ -323,6 +331,7 @@ export class Store {
         t.listId,
         t.title,
         t.workflow,
+        t.executionWorkflow!,
         t.workflowVersion,
         JSON.stringify(t.params),
         t.createdAt,
@@ -505,6 +514,17 @@ export class Store {
    * compatible workflow implementation. Ordinary starts never rewrite pins. */
   setTaskWorkflowVersion(taskId: string, workflowVersion: string) {
     this.db.prepare('UPDATE tasks SET workflowVersion = ? WHERE id = ?').run(workflowVersion, taskId);
+  }
+
+  /** Change only the user-facing compatible workflow mode. The execution pin is
+   * intentionally untouched; the running deterministic workflow owns the switch. */
+  setTaskWorkflow(taskId: string, workflow: string) {
+    this.db.prepare('UPDATE tasks SET workflow = ? WHERE id = ?').run(workflow, taskId);
+  }
+
+  /** Record the workflow definition of a newly-started/recovered Temporal run. */
+  setTaskExecutionWorkflow(taskId: string, workflow: string) {
+    this.db.prepare('UPDATE tasks SET executionWorkflow = ? WHERE id = ?').run(workflow, taskId);
   }
 
   /** Update a task's display title (e.g. to track an edited prompt). */
@@ -1002,6 +1022,7 @@ function rowToTask(r: any): TaskRecord {
     listId: r.listId,
     title: r.title,
     workflow: r.workflow,
+    executionWorkflow: r.executionWorkflow ?? r.workflow,
     workflowVersion: r.workflowVersion,
     params: JSON.parse(r.params),
     createdAt: r.createdAt,
