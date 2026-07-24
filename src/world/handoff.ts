@@ -8,7 +8,7 @@ import { worldRepos, worldRepoSource } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import type { RunnerPoolService } from './runners.js';
 import type { GitHubAppService } from '../integrations/github-app.js';
-import { brokerPublishBranch, brokerRefreshBranch, type GitBrokerAuth } from './git-broker.js';
+import { brokerPublishBranch, brokerRefreshBranch, type GitBrokerAuth, type GitBrokerCredential } from './git-broker.js';
 import type { WorldAccessService } from './access.js';
 import { git } from './git.js';
 import { paths } from '../config/paths.js';
@@ -54,11 +54,13 @@ export class WorldHandoffService {
     if (!handle) throw new Error('task has no recoverable world');
     if (!this.worlds.get(handle.kind).capabilities?.remote)
       return this.existingLocal(handle);
+    const worldRepositories = worldRepos(handle);
+    if (!worldRepositories.length) throw new Error('task world has no Git repositories to materialize');
     const linked = this.store.listProjectRepositories(project.id);
-    if (!linked.length) throw new Error('project has no connected repositories');
     const byUrl = new Map(linked.map((entry) => [entry.repository.sshUrl, entry.repository]));
     const auth: GitBrokerAuth = async (repo) => {
-      const repository = byUrl.get(repo.repo);
+      if (repo.localPath) return {};
+      const repository = byUrl.get(worldRepoSource(repo));
       if (!repository) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
       return this.githubApp.brokerCredentials(repository);
     };
@@ -78,10 +80,11 @@ export class WorldHandoffService {
     const root = path.join(this.localRoot, safeName(taskId));
     fs.mkdirSync(root, { recursive: true });
     const repositories: MaterializedLocalCheckout['repositories'] = [];
-    for (const repo of worldRepos(handle)) {
-      const record = byUrl.get(repo.repo);
-      if (!record) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
-      const credential = await this.githubApp.brokerCredentials(record);
+    for (const repo of worldRepositories) {
+      const record = repo.localPath ? undefined : byUrl.get(worldRepoSource(repo));
+      if (!repo.localPath && !record) throw new Error(`repository is not enrolled in this project: ${repo.repo}`);
+      const source = repo.localPath ?? repo.repo;
+      const credential = record ? await this.githubApp.brokerCredentials(record) : {};
       const env = await gitEnvironment(root, credential);
       const destination = path.join(root, safeName(repo.name));
       try {
@@ -95,7 +98,7 @@ export class WorldHandoffService {
         } else {
           if (fs.existsSync(destination) && fs.readdirSync(destination).length)
             throw new Error(`local checkout path is occupied: ${destination}`);
-          await gitOk(root, ['clone', '--branch', repo.branch, '--single-branch', repo.repo, destination], env);
+          await gitOk(root, ['clone', '--branch', repo.branch, '--single-branch', source, destination], env);
         }
         const head = (await git(destination, ['rev-parse', 'HEAD'])).stdout.trim();
         repositories.push({ name: repo.name, path: destination, branch: repo.branch, head });
@@ -237,7 +240,7 @@ function sh(value: string): string { return `'${value.replace(/'/g, `'"'"'`)}'`;
 
 function safeName(value: string): string { return value.replace(/[^A-Za-z0-9._-]/g, '-'); }
 
-async function gitEnvironment(root: string, credential: Awaited<ReturnType<GitHubAppService['brokerCredentials']>>): Promise<Record<string, string> & { keyPath?: string }> {
+async function gitEnvironment(root: string, credential: GitBrokerCredential): Promise<Record<string, string> & { keyPath?: string }> {
   const env: Record<string, string> & { keyPath?: string } = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
   if (credential.sshKey) {
     const keyPath = path.join(root, `.karmax-clone-${crypto.randomBytes(12).toString('hex')}.key`);
