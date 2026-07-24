@@ -8,7 +8,13 @@
 import type { TaskTrigger, TriggerState } from './triggers.js';
 export type { TaskTrigger, TriggerState } from './triggers.js';
 
-export type Provider = 'claude' | 'codex' | 'mock';
+/**
+ * The coding harness that executes a turn. OpenCode is driven through stable
+ * ACP; Kimi/Grok remain in this replay-persistent union for historical workflow
+ * data but are not admitted by the current provider registry. Model vendors are
+ * separate profile properties because OpenCode can use many of them.
+ */
+export type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
 
 export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | (string & {});
 
@@ -427,6 +433,8 @@ export interface FieldSpec {
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
   provider: Provider;
+  /** Model/API vendor when `provider` is a model-agnostic harness. */
+  modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** Continue a prior agent session: a source task (+ which role's agent) or a
@@ -569,6 +577,12 @@ export interface AgentProfile {
   id: string;
   name: string;
   provider: Provider;
+  /**
+   * Model/API credential provider used by a model-agnostic harness (for example
+   * `kimi`, `google`, or `xai`). For OpenCode this is inferred from the
+   * `provider/model` model id when omitted.
+   */
+  modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   role: AgentRole;

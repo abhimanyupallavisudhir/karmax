@@ -1,5 +1,6 @@
 import { ClaudeAdapter } from '../agent/claude.js';
 import { CodexAdapter } from '../agent/codex.js';
+import { apiKeyEnv, hasAcpAmbientLogin, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import type { ConfigHomeManager } from '../autonomy/config-homes.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { CredentialSources, CredPolicy } from './credentials.js';
@@ -13,8 +14,22 @@ import type { CredentialSources, CredPolicy } from './credentials.js';
 export function gatherCredentialSources(deps: { configHomes?: ConfigHomeManager; broker?: CredentialBroker }): CredentialSources {
   return {
     logins: deps.configHomes?.list() ?? [],
-    ambient: { claude: ClaudeAdapter.hasAmbientLogin(), codex: CodexAdapter.hasAmbientSubscription() },
-    envKeys: { claude: !!process.env.ANTHROPIC_API_KEY, codex: !!process.env.OPENAI_API_KEY },
+    ambient: {
+      claude: ClaudeAdapter.hasAmbientLogin(),
+      codex: CodexAdapter.hasAmbientSubscription(),
+      opencode: hasAcpAmbientLogin('opencode'),
+    },
+    envKeys: {
+      // Keep the historical harness namespaces for existing policies/profiles,
+      // and expose model-provider namespaces for model-agnostic harnesses.
+      claude: !!process.env.ANTHROPIC_API_KEY,
+      codex: !!process.env.OPENAI_API_KEY,
+      ...Object.fromEntries(
+        MODEL_PROVIDERS
+          .filter((provider) => provider !== 'anthropic' && provider !== 'openai')
+          .map((provider) => [provider, !!process.env[apiKeyEnv(provider)]]),
+      ),
+    },
     handles: deps.broker?.listHandles() ?? [],
   };
 }

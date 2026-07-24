@@ -20,14 +20,27 @@ export interface LoginResult {
   account: string;
   configHome: string;
   loginUrl?: string;
+  verificationCode?: string;
   status: 'awaiting_oauth' | 'logged_in' | 'failed';
   detail?: string;
 }
 
-/** Injectable so tests don't depend on the real CLIs / OAuth. */
-export type LoginCommand = (provider: Provider, configHome: string) => { cmd: string; args: string[]; env: Record<string, string> } | undefined;
+export interface LoginOptions {
+  urlTimeoutMs?: number;
+  /** OpenCode model-provider id, e.g. `openai` or `xai`. */
+  modelProvider?: string;
+  /** Exact OpenCode auth-method label, passed through its documented CLI flag. */
+  authMethod?: string;
+}
 
-const DEFAULT_LOGIN: LoginCommand = (provider, home) => {
+/** Injectable so tests don't depend on the real CLIs / OAuth. */
+export type LoginCommand = (
+  provider: Provider,
+  configHome: string,
+  opts: LoginOptions,
+) => { cmd: string; args: string[]; env: Record<string, string> } | undefined;
+
+export const defaultLoginCommand: LoginCommand = (provider, home, opts) => {
   const env = scrubbedEnv({ provider, configHome: home });
   if (provider === 'claude') {
     // Full OAuth login (writes a native `.credentials.json`) — pollable for usage (#6)
@@ -38,23 +51,39 @@ const DEFAULT_LOGIN: LoginCommand = (provider, home) => {
   if (provider === 'codex') {
     return { cmd: process.env.KARMAX_CODEX_LOGIN_CMD ?? 'codex', args: (process.env.KARMAX_CODEX_LOGIN_ARGS ?? 'login').split(' ').filter(Boolean), env };
   }
+  if (provider === 'opencode') {
+    // OpenCode's auth command is otherwise interactive. Its official
+    // --provider/--method flags make the OAuth choice deterministic and leave
+    // only the browser/device-code step to the human.
+    if (!opts.modelProvider || !opts.authMethod) return undefined;
+    return {
+      cmd: process.env.KARMAX_OPENCODE_LOGIN_CMD ?? 'opencode',
+      args: ['auth', 'login', '--provider', opts.modelProvider, '--method', opts.authMethod],
+      env,
+    };
+  }
   return undefined;
 };
 
 export class LoginManager {
   constructor(
     private homes: ConfigHomeManager,
-    private loginCommand: LoginCommand = DEFAULT_LOGIN,
+    private loginCommand: LoginCommand = defaultLoginCommand,
   ) {}
 
   /** Start (or report) a login for an account. Returns the device URL to open. */
-  async connect(provider: Provider, account: string, opts: { urlTimeoutMs?: number } = {}): Promise<LoginResult> {
+  async connect(provider: Provider, account: string, opts: LoginOptions = {}): Promise<LoginResult> {
     const configHome = this.homes.ensure(provider, account);
     // Skip only if fully authed with a native credential. A setup-token-only home
     // re-runs login here to UPGRADE to a full, usage-pollable credential (#6).
     if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
-    const spec = this.loginCommand(provider, configHome);
-    if (!spec) return { provider, account, configHome, status: 'failed', detail: `no login command for ${provider}` };
+    const spec = this.loginCommand(provider, configHome, opts);
+    if (!spec) {
+      const detail = provider === 'opencode'
+        ? 'OpenCode login requires a model provider and auth method'
+        : `no login command for ${provider}`;
+      return { provider, account, configHome, status: 'failed', detail };
+    }
 
     let child: ChildProcess;
     try {
@@ -72,9 +101,18 @@ export class LoginManager {
       child.once('exit', trackProcess({ pid: child.pid, kind: 'login', label: `${provider} login (${account})`, startedAt: Date.now() }));
     }
     persistTokenWhenPrinted(child, configHome);
-    const url = await captureUrl(child, opts.urlTimeoutMs ?? 8000);
+    const prompt = await captureLoginPrompt(child, opts.urlTimeoutMs ?? 8000);
     child.unref(); // let it keep running while the user completes OAuth
-    if (url) return { provider, account, configHome, loginUrl: url, status: 'awaiting_oauth' };
+    if (prompt.url) {
+      return {
+        provider,
+        account,
+        configHome,
+        loginUrl: prompt.url,
+        ...(prompt.verificationCode ? { verificationCode: prompt.verificationCode } : {}),
+        status: 'awaiting_oauth',
+      };
+    }
     if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
     return { provider, account, configHome, status: 'failed', detail: 'no login URL captured (is the CLI installed?)' };
   }
@@ -109,25 +147,39 @@ function persistTokenWhenPrinted(child: ChildProcess, home: string): void {
   child.stderr?.on('data', onData);
 }
 
-/** Read child stdout/stderr until a URL appears or the timeout elapses. */
-function captureUrl(child: ChildProcess, timeoutMs: number): Promise<string | undefined> {
+/** Read child output until its browser URL and optional device code appear. */
+function captureLoginPrompt(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<{ url?: string; verificationCode?: string }> {
   return new Promise((resolve) => {
     let buf = '';
     let done = false;
-    const finish = (u?: string) => {
+    let settleTimer: NodeJS.Timeout | undefined;
+    const result = () => {
+      const url = buf.match(/https?:\/\/[^\s'"]+/)?.[0];
+      const verificationCode = buf.match(/(?:enter|user(?:_| )?)\s*code\s*[:=]\s*([A-Z0-9][A-Z0-9-]{3,})/i)?.[1];
+      return { ...(url ? { url } : {}), ...(verificationCode ? { verificationCode } : {}) };
+    };
+    const finish = () => {
       if (done) return;
       done = true;
-      resolve(u);
+      if (settleTimer) clearTimeout(settleTimer);
+      resolve(result());
     };
     const onData = (b: Buffer) => {
       buf += b.toString();
-      const m = buf.match(/https?:\/\/[^\s'"]+/);
-      if (m) finish(m[0]);
+      if (result().url && !settleTimer) {
+        // A device code may be printed immediately after the URL in another
+        // chunk. Briefly settle so the browser receives both.
+        settleTimer = setTimeout(finish, 150);
+        settleTimer.unref();
+      }
     };
     child.stdout?.on('data', onData);
     child.stderr?.on('data', onData);
-    child.once('error', () => finish(undefined));
-    child.once('exit', () => setTimeout(() => finish(undefined), 50));
-    setTimeout(() => finish(undefined), timeoutMs).unref();
+    child.once('error', finish);
+    child.once('exit', () => setTimeout(finish, 50));
+    setTimeout(finish, timeoutMs).unref();
   });
 }

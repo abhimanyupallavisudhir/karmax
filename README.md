@@ -26,7 +26,11 @@ nothing is hardcoded).
   server for you.
 - A coding-agent credential for real work (auto-detected, in order):
   `ANTHROPIC_API_KEY` → a Claude Code login (`~/.claude/.credentials.json`, via
-  the Claude Agent SDK) → `OPENAI_API_KEY` (Codex). With none, karmax runs a
+  the Claude Agent SDK) → `OPENAI_API_KEY` (Codex) → an OpenCode login or
+  `KIMI_API_KEY` (OpenCode with its default Kimi model). OpenCode is supported
+  over stable ACP; Kimi, Gemini, and Grok models are available through it, and
+  its isolated homes can connect supported SuperGrok subscriptions.
+  With none, karmax runs a
   **mock agent** and prints a loud warning — it will not do real work.
 - Docker (optional) for the container world provider.
 
@@ -41,7 +45,7 @@ merged into your target branch.
 | Durable execution on **Temporal** (activity/workflow split, signals, queries, updates, child workflows, continue-as-new) | ✅ real dev server, dynamic ports |
 | Workflows: **software-dev, just-do, script-exec, goal, merge-only** | ✅ |
 | Coordinators (lease pattern, crash-safe, continue-as-new): **merge-queue, token/account, budget** | ✅ |
-| Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK + Messages API), Codex (OpenAI), mock** | ✅ |
+| Per-turn agent loop with session resume; provider adapters: **Claude (Agent SDK), Codex (app-server), OpenCode (ACP), mock** | ✅ |
 | Worlds: **local git worktree** + **Docker container**, swappable provider interface | ✅ |
 | Capability model + attenuation + **workflow-minted scoped tokens**; **platform MCP server** (permission-checked) | ✅ |
 | **Credential broker** (vault-backed, AES-GCM at rest, JIT, scoped, audited; handles only) | ✅ |

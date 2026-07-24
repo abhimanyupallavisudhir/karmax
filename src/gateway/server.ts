@@ -24,12 +24,13 @@ import { withTimeout } from '../util/timeout.js';
 import { Provider, ProjectConfig } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
-import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
+import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -1110,6 +1111,9 @@ export class Gateway {
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
+        if (b.provider !== undefined && !isAgentProvider(b.provider)) {
+          return this.json(res, 400, { error: `unknown agent provider "${String(b.provider)}"` });
+        }
         const { roleDef } = await import('../contrib/manifests.js');
         if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
         const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
@@ -1176,7 +1180,11 @@ export class Gateway {
         const b = await this.body(req);
         if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
         if (!b.provider || !b.account || !b.apiKey) return this.json(res, 400, { error: 'provider, account, apiKey required' });
-        const handle = `${b.provider}:${b.account}`;
+        const provider = String(b.provider);
+        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(provider)) {
+          return this.json(res, 400, { error: 'model provider must be a simple id (letters, numbers, dot, underscore, hyphen)' });
+        }
+        const handle = `${provider}:${b.account}`;
         this.deps.broker.registerHandle(handle, String(b.apiKey));
         return this.json(res, 200, { handle }); // never echoes the secret
       }
@@ -1185,9 +1193,20 @@ export class Gateway {
       if (p === '/api/accounts/connect' && method === 'POST') {
         if (!this.deps.login) return this.json(res, 400, { error: 'no login manager configured' });
         const b = await this.body(req);
-        const provider = b.provider === 'codex' ? 'codex' : 'claude';
+        if (!isLoginProvider(b.provider)) return this.json(res, 400, { error: `unsupported login provider: ${String(b.provider ?? '')}` });
+        const provider = b.provider;
         if (!b.account) return this.json(res, 400, { error: 'account required' });
-        const result = await this.deps.login.connect(provider, String(b.account));
+        const modelProvider = b.modelProvider === undefined ? undefined : String(b.modelProvider);
+        const authMethod = b.authMethod === undefined ? undefined : String(b.authMethod);
+        if (provider === 'opencode') {
+          if (!modelProvider || !/^[a-z0-9][a-z0-9._-]*$/i.test(modelProvider)) {
+            return this.json(res, 400, { error: 'OpenCode login requires a simple model-provider id' });
+          }
+          if (!authMethod || authMethod.length > 160 || /[\r\n\0]/.test(authMethod)) {
+            return this.json(res, 400, { error: 'OpenCode login requires a valid auth-method label' });
+          }
+        }
+        const result = await this.deps.login.connect(provider, String(b.account), { modelProvider, authMethod });
         // Seed the config home's MCP baseline (SPEC §7.5/§3.4): the karmax platform
         // MCP (always) + an optional browser MCP. The scoped token is injected at
         // spawn; here we bake in the gateway URL only.
@@ -1208,7 +1227,9 @@ export class Gateway {
       const loginMatch = p.match(/^\/api\/accounts\/logins\/([^/]+)\/(.+)$/);
       if (loginMatch && (method === 'DELETE' || method === 'PATCH')) {
         if (!this.deps.configHomes) return this.json(res, 400, { error: 'no config homes configured' });
-        const provider = (loginMatch[1] === 'codex' ? 'codex' : 'claude') as Provider;
+        const rawProvider = loginMatch[1];
+        if (!isLoginProvider(rawProvider)) return this.json(res, 400, { error: `unsupported login provider: ${rawProvider}` });
+        const provider = rawProvider;
         const account = decodeURIComponent(loginMatch[2]!);
         if (method === 'DELETE') {
           this.deps.configHomes.remove(provider, account);
@@ -1549,18 +1570,25 @@ export class Gateway {
     const { gatherCredentialSources } = await import('../platform/credential-sources.js');
     const { enumerateCredentials } = await import('../platform/credentials.js');
     const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
-    const homes = (provider: 'claude' | 'codex') => {
+    type CatalogProvider = Exclude<Provider, 'mock'>;
+    const homes = (provider: CatalogProvider) => {
       const values = creds.filter((c) => c.provider === provider && c.kind !== 'key').map((c) => c.configHome);
       // No subscription login: let the provider process use the ambient API key.
-      if (!values.length && creds.some((c) => c.provider === provider && c.kind === 'key')) values.push(undefined);
+      if (!values.length && creds.some((c) => credentialAliases(provider).includes(c.provider) && c.kind === 'key')) values.push(undefined);
       return [...new Set(values)];
     };
-    const settled = async (provider: 'claude' | 'codex') => {
-      const fn = provider === 'claude' ? claudeModels : codexModels;
+    const settled = async (provider: CatalogProvider) => {
+      const fn =
+        provider === 'claude' ? claudeModels
+        : provider === 'codex' ? codexModels
+        : provider === 'opencode' ? opencodeModels
+        : (home?: string) => acpModels(provider, home);
       const results = await Promise.all(homes(provider).map((home) => fn(home).catch(() => [])));
       return mergeModels(results);
     };
-    const [claude, codex] = await Promise.all([settled('claude'), settled('codex')]);
+    const [claude, codex, opencode] = await Promise.all([
+      settled('claude'), settled('codex'), settled('opencode'),
+    ]);
     // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
@@ -1568,6 +1596,19 @@ export class Gateway {
         { id: 'claude-sonnet-5' }, { id: 'claude-opus-4-8' }, { id: 'claude-haiku-4-5' }, { id: 'claude-fable-5' },
       ],
       codex: codex.length ? codex : [{ id: 'gpt-5.5' }, { id: 'gpt-5.4-mini' }],
+      opencode: opencode.length ? opencode : [
+        { id: 'kimi/kimi-for-coding' },
+        { id: 'kimi/k3', effort: ['low', 'high', 'max'] },
+        { id: 'google/gemini-3.6-pro' },
+        { id: 'xai/grok-4.5' },
+      ],
+      // Retained only for stored-profile/backward-compatible typing. The native
+      // Kimi harness is disabled until its ACP server supports session/fork.
+      kimi: [],
+      // Retained only for stored-profile/backward-compatible typing. Grok's
+      // current ACP server does not advertise session/fork.
+      grok: [],
+      mock: [{ id: 'mock' }],
     };
     this.modelCatalog = { at: Date.now(), value };
     return { providers: value, refreshedAt: this.modelCatalog.at };

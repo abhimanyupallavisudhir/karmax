@@ -72,7 +72,7 @@ export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
-export const agentTurnStateSignal = defineSignal<[{ turnId: string; role: AgentRole; provider?: 'claude' | 'codex' | 'mock'; state: 'running' }]>(SIG_AGENT_TURN_STATE);
+export const agentTurnStateSignal = defineSignal<[{ turnId: string; role: AgentRole; provider?: 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock'; state: 'running' }]>(SIG_AGENT_TURN_STATE);
 /** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
@@ -723,7 +723,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
      * activity changes it to `running` only after it actually acquires a slot. */
     const admittedTurn = async (
       turnId: string,
-      provider: 'claude' | 'codex' | 'mock' | undefined,
+      provider: 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock' | undefined,
       resumeStatus: TaskView['status'],
       home?: string,
       key?: string,
@@ -754,22 +754,27 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       return await admittedTurn(`${taskId}#${turnSeq++}`, undefined, status);
     }
     const prov = await core.resolveProvider({ role, task: liveInput }).catch(() => undefined);
-    const provider = prov === 'claude' || prov === 'codex' || prov === 'mock' ? prov : undefined;
-    if (!provider) {
+    const credentialProvider = typeof prov === 'string' && prov ? prov : undefined;
+    if (!credentialProvider) {
       if (!liveAgentStates) return await runCancellable(() => fn(undefined, undefined));
       return await admittedTurn(`${taskId}#${turnSeq++}`, undefined, status);
     }
     // Credential-policy allow-list for real providers (precedence + enable/disable,
     // resolved global→project→task); mock uses the coordinator's provider fallback.
     const allowed =
-      provider === 'claude' || provider === 'codex'
-        ? await core.resolveCredentialOrder({ taskId, projectId: input.projectId, provider }).catch(() => undefined)
+      credentialProvider !== 'mock'
+        ? await core.resolveCredentialOrder({ taskId, projectId: input.projectId, provider: credentialProvider, role, task: liveInput }).catch(() => undefined)
+        : undefined;
+    const displayProvider =
+      credentialProvider === 'claude' || credentialProvider === 'codex' || credentialProvider === 'opencode'
+      || credentialProvider === 'kimi' || credentialProvider === 'grok' || credentialProvider === 'mock'
+        ? credentialProvider
         : undefined;
     const turnId = `${taskId}#${turnSeq++}`;
-    await coord.leaseAccount(taskId, turnId, provider, allowed);
+    await coord.leaseAccount(taskId, turnId, credentialProvider, allowed);
     const priorStatus = status;
     status = 'waiting';
-    waitingFor = { kind: 'account', provider };
+    waitingFor = { kind: 'account', provider: credentialProvider };
     await publish();
     if (liveAgentStates) {
       // The coordinator owns refresh timers and signals every grant. An arbitrary
@@ -799,7 +804,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     // (#5): escalate rather than run/park.
     if (grant?.accountId === '(denied)') {
       if (cancelled) throw new Cancelled();
-      throw new CredentialDenied(`No usable ${provider} credential — every allowed login/key needs attention (funding, re-auth, or re-enable it in credential settings).`);
+      throw new CredentialDenied(`No usable ${credentialProvider} credential — every allowed login/key needs attention (funding, re-auth, or re-enable it in credential settings).`);
     }
     const passthrough = !grant || grant.accountId === '(passthrough)';
     const leasedHome = passthrough ? undefined : grant?.configHome;
@@ -807,7 +812,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     try {
       // This publish happens immediately after the lease grant and replaces the
       // stale account-wait view with the distinct host-slot state.
-      return await admittedTurn(turnId, provider, priorStatus, leasedHome, leasedKey);
+      return await admittedTurn(turnId, displayProvider, priorStatus, leasedHome, leasedKey);
     } catch (err) {
       // Limit failure → update the coordinator so it re-leases the next allowed
       // credential: a transient window arms a refresh timer; a HARD billing/auth

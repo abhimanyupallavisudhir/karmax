@@ -7,7 +7,7 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
 import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, isFullyAuthed, capturedToken, tokenToInject } from '../src/autonomy/config-homes.js';
-import { LoginManager } from '../src/autonomy/login.js';
+import { LoginManager, defaultLoginCommand } from '../src/autonomy/login.js';
 import { remoteAccessPlan } from '../src/remote/access.js';
 
 describe('config homes + scrubbed env (SPEC §7.3)', () => {
@@ -97,6 +97,31 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     expect(r.status).toBe('awaiting_oauth');
     expect(r.loginUrl).toBe('https://example.com/device?code=ABC123');
     expect(fs.existsSync(r.configHome)).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('uses OpenCode auth selectors and preserves a device verification code', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-oc-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('opencode', 'grok');
+    const method = 'xAI Grok OAuth (Headless / Remote / VPS)';
+    const spec = defaultLoginCommand('opencode', home, { modelProvider: 'xai', authMethod: method });
+    expect(spec?.args).toEqual(['auth', 'login', '--provider', 'xai', '--method', method]);
+    expect(spec?.env.XDG_DATA_HOME).toBe(path.join(home, 'data'));
+
+    const login = new LoginManager(homes, () => ({
+      cmd: 'bash',
+      args: ['-c', 'echo "Open https://x.ai/device on any device and enter code: ABCD-1234"; sleep 0.05'],
+      env: {} as Record<string, string>,
+    }));
+    const result = await login.connect('opencode', 'fresh', {
+      modelProvider: 'xai',
+      authMethod: method,
+      urlTimeoutMs: 2000,
+    });
+    expect(result.status).toBe('awaiting_oauth');
+    expect(result.loginUrl).toBe('https://x.ai/device');
+    expect(result.verificationCode).toBe('ABCD-1234');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 

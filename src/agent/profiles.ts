@@ -25,6 +25,9 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
 export function defaultModel(provider: Provider): string | undefined {
   if (provider === 'codex') return process.env.KARMAX_OPENAI_MODEL ?? 'gpt-5.5';
   if (provider === 'claude') return process.env.KARMAX_CLAUDE_MODEL ?? 'claude-sonnet-5';
+  if (provider === 'opencode') return process.env.KARMAX_OPENCODE_MODEL ?? 'kimi/kimi-for-coding';
+  if (provider === 'kimi') return process.env.KARMAX_KIMI_MODEL ?? 'kimi-for-coding';
+  if (provider === 'grok') return process.env.KARMAX_GROK_MODEL ?? 'grok-build';
   return undefined;
 }
 
@@ -32,7 +35,7 @@ export function defaultModel(provider: Provider): string | undefined {
  *  forms so the field reads a real value, not a bare "effort" placeholder. It is
  *  display-only: leaving a profile's effort unset still lets the provider pick. */
 export function defaultEffort(provider: Provider): string | undefined {
-  if (provider === 'codex' || provider === 'claude') return 'medium';
+  if (provider === 'codex' || provider === 'claude' || provider === 'opencode' || provider === 'kimi' || provider === 'grok') return 'medium';
   return undefined;
 }
 
@@ -44,10 +47,12 @@ export function applyAgentSpec(base: AgentProfile, spec?: AgentSpec): AgentProfi
   if (!spec) return base;
   const provider = spec.provider ?? base.provider;
   const sameProvider = provider === base.provider;
+  const modelProvider = spec.modelProvider ?? (sameProvider ? base.modelProvider : undefined);
   const model = spec.model ?? (sameProvider ? base.model : defaultModel(provider));
   const effort = spec.effort ?? (sameProvider ? base.effort : undefined);
   const {
     model: _model,
+    modelProvider: _modelProvider,
     effort: _effort,
     auth: _auth,
     allowedAccounts: _allowedAccounts,
@@ -56,6 +61,7 @@ export function applyAgentSpec(base: AgentProfile, spec?: AgentSpec): AgentProfi
   return {
     ...common,
     provider,
+    ...(modelProvider ? { modelProvider } : {}),
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
     ...(sameProvider && base.auth ? { auth: base.auth } : {}),

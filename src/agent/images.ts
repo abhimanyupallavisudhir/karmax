@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { Message, ImageRef } from '../domain/types.js';
 import { AttachmentStore, ALLOWED_IMAGE_TYPES } from '../store/attachments.js';
+import type { ContentBlock } from '@agentclientprotocol/sdk';
 
 /**
  * Adapter-side re-hydration of image attachments (image prompts;
@@ -65,6 +66,19 @@ export function collectAnthropicImageBlocks(messages: Message[]): any[] {
     for (const ref of m.images) {
       const b = anthropicImageBlock(ref);
       if (b) blocks.push(b);
+    }
+  }
+  return blocks;
+}
+
+/** ACP v1 image content blocks for agents that advertise prompt image support. */
+export function collectAcpImageBlocks(messages: Message[]): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
+  for (const m of messages) {
+    if (m.role === 'system' || !m.images?.length) continue;
+    for (const ref of m.images) {
+      const got = attachments().readBase64(ref.id);
+      if (got) blocks.push({ type: 'image', data: got.base64, mimeType: got.mediaType });
     }
   }
   return blocks;
