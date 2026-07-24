@@ -84,12 +84,24 @@ describe('pass connector', () => {
     const tree = `Password Store\n├── github.com\n│   └── alice\n└── email.com`;
     expect(parsePassTree(tree)).toEqual(['github.com/alice', 'email.com']);
   });
-  it('pulls the password (line 1) and an otpauth line', async () => {
-    const exec = scriptedExec({ 'pass ls': 'Password Store\n└── github.com', 'pass show github.com': 'hunter2\notpauth://totp/x?secret=SEED' });
+  it('strips ANSI colour codes that `tree` wraps directory names in', () => {
+    // Real `pass ls` output colourises folders (the bug the user hit).
+    const tree = 'Password Store\n\x1b[01;34m├── \x1b[0m\x1b[01;34malts\x1b[0m\n\x1b[01;34m│   └── \x1b[0mstackexchange.com\n\x1b[01;34m│       └── \x1b[0malice@example.com';
+    expect(parsePassTree(tree)).toEqual(['alts/stackexchange.com/alice@example.com']);
+  });
+  it('treats ONLY the first line as the password; notes never become the credential (V)', async () => {
+    const exec = scriptedExec({ 'pass show github.com': 'hunter2\nusername: alice\nsome random note\notpauth://totp/x?secret=SEED\nmore notes' });
     const c = new PassConnector(exec);
     const [pulled] = await c.pull(['github.com']);
     expect(pulled!.secrets.password).toBe('hunter2');
     expect(pulled!.secrets.totp).toContain('otpauth://');
+    // the notes/username lines are NOT stored as any secret field
+    expect(JSON.stringify(pulled!.secrets)).not.toContain('random note');
+    expect(JSON.stringify(pulled!.secrets)).not.toContain('username');
+  });
+  it('surfaces a clear unlock hint when GPG is locked', async () => {
+    const exec: any = async () => { throw new Error('gpg: decryption failed: No secret key'); };
+    await expect(new PassConnector(exec).pull(['x'])).rejects.toThrow(/GPG key is locked/);
   });
 });
 

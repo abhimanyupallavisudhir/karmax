@@ -6994,7 +6994,7 @@ const VAULT_SECRET_LABELS = {
 };
 function vaultCard() {
   return `<div class="card" id="vault-card">
-    <div class="section-h">Credential vault <span class="chip">installation resource</span></div>
+    <div class="section-h">Credential vault <span class="chip">organization resource</span></div>
     <p style="color:var(--ink-2);margin-top:0;font-size:12px">Site logins, API keys, SSH keys, and .env bags agents may use on your behalf. Secrets are encrypted at rest and <b>write-only</b> here; agents use them through grants you attach per task (or approve when an agent asks). Policy <b>use</b> covers browser fill and env injection (the agent never sees the secret); <b>reveal</b> is plaintext to the agent.</p>
     <div class="vault-items-list" style="margin-bottom:12px">Loading…</div>
     <div style="font-weight:600;margin-bottom:4px">Add an item</div>
@@ -7121,7 +7121,7 @@ async function wireVaultCards(organizationId) {
 // ── connectors: mirror an external password store into the vault (§9) ─────────
 function connectorsCard() {
   return `<div class="card" id="connectors-card">
-    <div class="section-h">Password-store connectors</div>
+    <div class="section-h">Password-store connectors <span class="chip">organization resource</span></div>
     <p style="color:var(--ink-2);margin-top:0;font-size:12px">Mirror selected items from Bitwarden, 1Password, or unix <code>pass</code> into the vault above. This is a <b>selective mirror</b>, not a live proxy — agents always resolve credentials from the karmax vault, so a store being down never blocks them. Connect the store's CLI (installed on this host), pick items, and sync.</p>
     <div class="connectors-list">Loading…</div>
   </div>`;

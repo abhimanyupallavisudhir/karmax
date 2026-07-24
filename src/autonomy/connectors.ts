@@ -196,10 +196,18 @@ export class PassConnector implements CredentialConnector {
   async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
     const out: ExternalSecretItem[] = [];
     for (const id of externalIds) {
-      const body = await this.exec('pass', ['show', id]);
-      const lines = body.split('\n');
+      let body: string;
+      try {
+        body = await this.exec('pass', ['show', id]);
+      } catch (e) {
+        throw new Error(gpgHint(e));
+      }
+      const lines = body.replace(/\r/g, '').split('\n');
+      // `pass` convention: the FIRST line is the password; everything after is
+      // free-form notes/fields. Only line 1 is ever the credential for `use`
+      // (fill/inject); an `otpauth://` line anywhere becomes the TOTP seed.
       const password = lines[0] ?? '';
-      const otp = lines.find((l) => l.startsWith('otpauth://'));
+      const otp = lines.slice(1).find((l) => l.trim().startsWith('otpauth://'))?.trim();
       const secrets: Partial<Record<VaultFieldName, string>> = { password };
       if (otp) secrets.totp = otp;
       out.push({ externalId: id, type: 'login', label: id, domains: [hostOf(id)].filter(Boolean) as string[],
@@ -207,19 +215,48 @@ export class PassConnector implements CredentialConnector {
     }
     return out;
   }
+  /**
+   * Write-back creates a NEW entry (under `karmax/…`) for an agent-created
+   * credential — it never overwrites an entry that was mirrored IN, because a
+   * real `pass` file usually carries notes/fields karmax didn't capture, and
+   * blind-overwriting would destroy them. Updating a synced entry is a
+   * deliberate, separate action, not a side effect of write-back.
+   */
   async push(item: ExternalSecretItem): Promise<{ externalId: string }> {
-    const name = item.externalId || `karmax/${item.label}`.replace(/\s+/g, '-');
+    const name = `karmax/${item.label}`.replace(/[^A-Za-z0-9._@/-]+/g, '-').replace(/\/+/g, '/');
     const body = [item.secrets.password ?? '', ...(item.secrets.totp ? [item.secrets.totp] : [])].join('\n');
-    await this.exec('pass', ['insert', '-m', '-f', name], { input: body + '\n' });
+    try {
+      await this.exec('pass', ['insert', '-m', '-f', name], { input: body + '\n' });
+    } catch (e) {
+      throw new Error(gpgHint(e));
+    }
     return { externalId: name };
   }
+}
+
+/** ANSI SGR colour codes `tree` (behind `pass ls`) wraps directory names in. */
+const ANSI = /\x1b\[[0-9;]*m/g;
+
+/** Turn a raw GPG failure into an actionable message (§ the pass-unlock story:
+ *  karmax never stores your GPG passphrase; it relies on gpg-agent being
+ *  unlocked, which is the self-hosted reality). */
+function gpgHint(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (/no such file|not in the password store/i.test(msg)) return msg;
+  if (/decrypt|gpg|passphrase|no secret key|inappropriate ioctl|pinentry/i.test(msg)) {
+    return 'pass could not decrypt — your GPG key is locked. Unlock it once in a terminal (e.g. `pass show <any-entry>` and enter your passphrase), so gpg-agent caches it, then retry. karmax deliberately does not store your GPG master passphrase.';
+  }
+  return msg;
 }
 
 /** Turn `tree`-style `pass ls` output into flat store paths. `pass` does not
  *  mark folders, so a node is a leaf iff nothing nests under it (lookahead). */
 export function parsePassTree(raw: string): string[] {
   const nodes: { depth: number; name: string }[] = [];
-  for (const line of raw.split('\n')) {
+  // `pass ls` shells out to `tree`, which colours directory names with ANSI SGR
+  // codes. Strip them first, or they end up inside the entry path and the later
+  // `pass show <path>` fails with "not in the password store".
+  for (const line of raw.replace(ANSI, '').split('\n')) {
     if (!line.trim() || /password store/i.test(line)) continue;
     const connector = line.search(/[├└]── /);
     if (connector < 0) continue;
@@ -345,13 +382,20 @@ export class Connectors {
     return { count: itemIds.length, itemIds };
   }
 
-  /** Push an agent-created vault item back out to the store (opt-in, §9). */
+  /**
+   * Push an **agent-created** vault item back out to the store as a NEW entry
+   * (opt-in, §9). Write-back's purpose is that accounts an agent registers
+   * survive beyond karmax in your own password manager — it is not a two-way
+   * sync. Items that were mirrored IN from a connector are refused: pushing
+   * them back would risk clobbering notes/fields karmax never captured.
+   */
   async writeBack(name: string, itemId: string): Promise<{ externalId: string } | undefined> {
     const connector = this.get(name);
     if (!connector?.push) throw new Error(`connector "${name}" does not support write-back`);
     if (!this.config(name).writeBack) return undefined;
     const item = this.items.get(itemId);
     if (!item) throw new Error(`no vault item ${itemId}`);
+    if (item.provenance.source.startsWith('connector:')) throw new Error('this item was mirrored in from a store; write-back only pushes agent-created items back out (it never overwrites a synced entry)');
     const secrets: Partial<Record<VaultFieldName, string>> = {};
     for (const field of item.fields) {
       const value = this.items.readSecret(item, field);
