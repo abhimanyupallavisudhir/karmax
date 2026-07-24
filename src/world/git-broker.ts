@@ -5,8 +5,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
 import { worldRepos } from './types.js';
-import { ensureIdentity, git } from './git.js';
-import type { MergeResult } from './merge.js';
+import { ensureIdentity, git, isGitRepo } from './git.js';
+import { finalizeMergeRepo, type MergeResult } from './merge.js';
 
 const pexec = promisify(execFile);
 
@@ -22,22 +22,75 @@ export type GitBrokerAuth = Record<string, string> | ((repo: WorldRepo) => Promi
  * write credential: it emits a git bundle, the broker downloads that bundle,
  * performs the authenticated push/merge in a short-lived host checkout, then
  * removes the checkout. Credentials remain JIT host process environment only.
+ *
+ * Every repo has exactly ONE authoritative repository. A repo provisioned from
+ * a host-local checkout (`WorldRepo.localPath`) is authoritative to that
+ * checkout: branches and merges land THERE — the same place worktree worlds
+ * land — and origin is only the sandbox's clone transport. Repos configured by
+ * URL are authoritative to origin (the pre-existing broker behavior). Without
+ * this split, cloud merges land on origin while local merges land in the
+ * checkout, and the two histories silently diverge.
  */
 export async function brokerPublishBranch(world: World, auth: GitBrokerAuth): Promise<{ pushed: string[]; skipped: string[] }> {
   const pushed: string[] = [];
   const skipped: string[] = [];
   for (const repo of worldRepos(world.handle)) {
     try {
-      await withTransferredRepo(world, repo, auth, async (clone, env) => {
-        const result = await git(clone, ['push', 'origin', `refs/heads/${repo.branch}:refs/heads/${repo.branch}`], { env });
-        if (result.code !== 0) throw new Error(result.stderr || result.stdout || 'push failed');
-      });
+      const local = await localAuthority(repo);
+      if (local) await importBranchToLocal(world, repo, local);
+      else await pushBranchToOrigin(world, repo, auth);
       pushed.push(repo.name);
     } catch {
       skipped.push(repo.name);
     }
   }
   return { pushed, skipped };
+}
+
+/** The host-local repository this repo is authoritative to, if any. A recorded
+ * checkout that has since vanished is a loud error — silently falling back to
+ * origin would reintroduce the split-brain this field exists to prevent. */
+async function localAuthority(repo: WorldRepo): Promise<string | undefined> {
+  if (!repo.localPath) return undefined;
+  if (!(await isGitRepo(repo.localPath)))
+    throw new Error(`repo "${repo.name}" was provisioned from local checkout ${repo.localPath}, which is no longer a git repository`);
+  return repo.localPath;
+}
+
+async function pushBranchToOrigin(world: World, repo: WorldRepo, auth: GitBrokerAuth): Promise<void> {
+  await withTransferredRepo(world, repo, auth, async (clone, env) => {
+    const result = await git(clone, ['push', 'origin', `refs/heads/${repo.branch}:refs/heads/${repo.branch}`], { env });
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout || 'push failed');
+  });
+}
+
+/** Import the world's task branch into its authoritative local checkout. The
+ * bundle is fetched to a staging ref first so the base-ancestry guard runs
+ * before any branch ref moves; the final self-fetch keeps git's refusal to
+ * update a checked-out branch as the safety interlock. The world's copy of its
+ * own task branch always wins over the local mirror — the only local-side
+ * commits it can overwrite are this machinery's own earlier merge commits,
+ * which a retry recreates. Returns the imported tip sha. */
+async function importBranchToLocal(world: World, repo: WorldRepo, localRepo: string): Promise<string> {
+  const staging = `refs/karmax/incoming/${cryptoSafeName(repo.branch)}`;
+  const bundle = await readBranchBundle(world, repo);
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-land-'));
+  try {
+    const bundlePath = path.join(temp, 'world.bundle');
+    await fs.promises.writeFile(bundlePath, bundle, { mode: 0o600 });
+    const fetched = await git(localRepo, ['fetch', bundlePath, `+refs/heads/${repo.branch}:${staging}`]);
+    if (fetched.code !== 0) throw new Error(`local checkout could not import the world branch: ${fetched.stderr || fetched.stdout}`);
+    if (repo.baseSha) {
+      const ancestor = await git(localRepo, ['merge-base', '--is-ancestor', repo.baseSha, staging]);
+      if (ancestor.code !== 0) throw new Error('world branch is not descended from its recorded base commit');
+    }
+    const updated = await git(localRepo, ['fetch', '.', `+${staging}:refs/heads/${repo.branch}`]);
+    if (updated.code !== 0) throw new Error(`could not update local task branch "${repo.branch}": ${updated.stderr || updated.stdout}`);
+    return (await git(localRepo, ['rev-parse', staging])).stdout.trim();
+  } finally {
+    await git(localRepo, ['update-ref', '-d', staging]);
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
 }
 
 /** Pull a human's pushed task-branch commits into a cloud world without ever
@@ -50,7 +103,6 @@ export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Pr
   const repos = worldRepos(world.handle);
   const updated: Array<{ repo: string; branch: string; sha: string }> = [];
   for (const repo of repos) {
-    if (!/^(?:ssh:\/\/|git@)/.test(repo.repo)) throw new Error(`repo "${repo.name}" is not an SSH remote`);
     if (!safeBranch(repo.branch)) throw new Error(`repo "${repo.name}" has an invalid task branch`);
     const dirty = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
     if (dirty.code !== 0) throw new Error(`could not inspect repo "${repo.name}": ${dirty.stderr || dirty.stdout}`);
@@ -60,20 +112,9 @@ export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Pr
     const bundleName = `.karmax-incoming-${repo.name.replace(/[^a-zA-Z0-9_.-]/g, '-')}.bundle`;
     const bundleRelative = repos.length > 1 ? `${repo.name}/${bundleName}` : bundleName;
     try {
-      const credential = await resolveCredential(auth, repo);
-      const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
-      if (credential.sshKey) {
-        const keyPath = path.join(temp, 'repository.key');
-        fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
-        env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
-      }
-      const clone = path.join(temp, 'repo');
-      const cloned = await git(temp, ['clone', '-q', '--branch', repo.branch, '--single-branch', repo.repo, clone],
-        { env, timeoutMs: 10 * 60_000 });
-      if (cloned.code !== 0) throw new Error(`could not fetch pushed branch "${repo.branch}": ${cloned.stderr || cloned.stdout}`);
-      const bundlePath = path.join(temp, 'incoming.bundle');
-      const bundled = await git(clone, ['bundle', 'create', bundlePath, `refs/heads/${repo.branch}`]);
-      if (bundled.code !== 0) throw new Error(`could not package pushed branch: ${bundled.stderr || bundled.stdout}`);
+      const basis = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
+      const bundlePath = await authorityBundle(temp, repo, repo.branch, auth,
+        basis.code === 0 ? basis.stdout.trim() : undefined);
       const data = fs.readFileSync(bundlePath);
       const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
       if (data.length > maxBytes) throw new Error(`incoming branch bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
@@ -138,26 +179,14 @@ export async function brokerRefreshUpstream(world: World, auth: GitBrokerAuth,
 
 async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: string, destinationRef: string,
   auth: GitBrokerAuth): Promise<string> {
-  if (!/^(?:ssh:\/\/|git@)/.test(destinationRepo.repo)) throw new Error('Git broker requires an SSH remote');
   if (!safeBranch(branch)) throw new Error(`Git broker rejected invalid branch "${branch}"`);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-import-'));
   const bundleName = `.karmax-import-${cryptoSafeName(destinationRepo.name)}.bundle`;
   const bundleRelative = worldRepos(world.handle).length > 1 ? `${destinationRepo.name}/${bundleName}` : bundleName;
   try {
-    const credential = await resolveCredential(auth, destinationRepo);
-    const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
-    if (credential.sshKey) {
-      const keyPath = path.join(temp, 'repository.key');
-      fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
-      env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
-    }
-    const clone = path.join(temp, 'repo');
-    const cloned = await git(temp, ['clone', '-q', '--branch', branch, '--single-branch', destinationRepo.repo, clone],
-      { env, timeoutMs: 10 * 60_000 });
-    if (cloned.code !== 0) throw new Error(`could not fetch branch "${branch}": ${cloned.stderr || cloned.stdout}`);
-    const bundlePath = path.join(temp, 'incoming.bundle');
-    const bundled = await git(clone, ['bundle', 'create', bundlePath, `refs/heads/${branch}`]);
-    if (bundled.code !== 0) throw new Error(`could not package branch "${branch}": ${bundled.stderr || bundled.stdout}`);
+    const known = await world.exec('git', ['rev-parse', '--verify', '--quiet', destinationRef], { cwd: destinationRepo.root });
+    const bundlePath = await authorityBundle(temp, destinationRepo, branch, auth,
+      known.code === 0 ? known.stdout.trim() : undefined);
     const data = fs.readFileSync(bundlePath);
     const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
     if (data.length > maxBytes) throw new Error(`incoming branch bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
@@ -176,6 +205,42 @@ async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: 
 }
 
 function cryptoSafeName(value: string): string { return value.replace(/[^A-Za-z0-9._-]/g, '-'); }
+
+/** Bundle `branch` from the repo's authoritative source: the host-local
+ * checkout when the world was provisioned from one and it holds the ref
+ * (branches of tasks that predate local landing still live only on origin),
+ * otherwise an authenticated clone of the SSH remote. `basisSha`, when the
+ * receiver already holds it, thins the bundle to just the missing history. */
+async function authorityBundle(temp: string, repo: WorldRepo, branch: string, auth: GitBrokerAuth,
+  basisSha?: string): Promise<string> {
+  const bundlePath = path.join(temp, 'incoming.bundle');
+  const local = await localAuthority(repo);
+  if (local && (await git(local, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).code === 0) {
+    const basis = basisSha && (await git(local, ['cat-file', '-e', `${basisSha}^{commit}`])).code === 0
+      ? ['--not', basisSha] : [];
+    let bundled = await git(local, ['bundle', 'create', bundlePath, `refs/heads/${branch}`, ...basis]);
+    // A receiver already at (or past) the tip makes the thin bundle empty, which
+    // git refuses to create — fall back to a full bundle; the fetch then no-ops.
+    if (bundled.code !== 0 && basis.length) bundled = await git(local, ['bundle', 'create', bundlePath, `refs/heads/${branch}`]);
+    if (bundled.code !== 0) throw new Error(`could not package branch "${branch}": ${bundled.stderr || bundled.stdout}`);
+    return bundlePath;
+  }
+  if (!/^(?:ssh:\/\/|git@)/.test(repo.repo)) throw new Error('Git broker requires an SSH remote');
+  const credential = await resolveCredential(auth, repo);
+  const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0', ...(credential.env ?? {}) };
+  if (credential.sshKey) {
+    const keyPath = path.join(temp, 'repository.key');
+    fs.writeFileSync(keyPath, credential.sshKey.endsWith('\n') ? credential.sshKey : `${credential.sshKey}\n`, { mode: 0o600 });
+    env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+  }
+  const clone = path.join(temp, 'repo');
+  const cloned = await git(temp, ['clone', '-q', '--branch', branch, '--single-branch', repo.repo, clone],
+    { env, timeoutMs: 10 * 60_000 });
+  if (cloned.code !== 0) throw new Error(`could not fetch branch "${branch}": ${cloned.stderr || cloned.stdout}`);
+  const bundled = await git(clone, ['bundle', 'create', bundlePath, `refs/heads/${branch}`]);
+  if (bundled.code !== 0) throw new Error(`could not package branch "${branch}": ${bundled.stderr || bundled.stdout}`);
+  return bundlePath;
+}
 
 export async function brokerFinalizeMerge(
   world: World,
@@ -200,6 +265,19 @@ export async function brokerFinalizeMerge(
       };
     }
     try {
+      const local = await localAuthority(repo);
+      if (local) {
+        // Land in the authoritative local checkout through the exact machinery
+        // worktree worlds use — same conflict guards, same target worktree.
+        // Nothing is pushed here: origin only moves under the project's remote
+        // policy (the pushTarget activity), like every local merge.
+        await importBranchToLocal(world, repo, local);
+        const one = await landLocalBranch(local, repo, repoTarget, world.handle.id, identity);
+        landedFiles.push(...one.landedFiles.map((file) => repos.length > 1 ? `${repo.name}/${file}` : file));
+        if (!one.merged) return { ...one, landedFiles };
+        sha = one.sha;
+        continue;
+      }
       const one = await withTransferredRepo(world, repo, auth, async (clone, env) => {
         const fetched = await git(clone, ['fetch', 'origin', repoTarget], { env });
         if (fetched.code !== 0) throw new Error(`target "${repoTarget}" is unavailable: ${fetched.stderr || fetched.stdout}`);
@@ -247,8 +325,16 @@ export async function brokerOpenGithubPr(
   const primary = repos[0];
   if (!primary) return null;
   const primaryTarget = primary.target ?? target;
-  const published = await brokerPublishBranch(world, auth);
-  if (!published.pushed.includes(primary.name)) return null;
+  // Remote policy 'pr' explicitly sanctions the remote op, so the branch is
+  // pushed to origin even for repos whose merges land in a local checkout.
+  const published: string[] = [];
+  for (const repo of repos) {
+    try {
+      await pushBranchToOrigin(world, repo, auth);
+      published.push(repo.name);
+    } catch { /* a repo without push access simply has no PR */ }
+  }
+  if (!published.includes(primary.name)) return null;
   const slug = githubSlug(primary.repo);
   if (!slug) return null;
   const credential = await resolveCredential(auth, primary);
@@ -272,6 +358,48 @@ async function viewGithubPr(slug: string, branch: string, env: Record<string, st
   return JSON.parse(stdout);
 }
 
+/** Package the world's named task ref as a bundle and hand it to the host.
+ * The BRANCH ref, not HEAD, crosses the boundary: human review terminals and
+ * verification servers may legitimately sit on another revision while a
+ * committed snapshot is published. */
+async function readBranchBundle(world: World, repo: WorldRepo): Promise<Buffer> {
+  if (!safeBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
+  const transferName = `.karmax-transfer-${cryptoSafeName(repo.name)}.bundle`;
+  const transferRel = worldRepos(world.handle).length > 1 ? `${repo.name}/${transferName}` : transferName;
+  try {
+    const bundle = await world.exec('git', ['bundle', 'create', transferName, `refs/heads/${repo.branch}`],
+      { cwd: repo.root, timeoutMs: 10 * 60_000 });
+    if (bundle.code !== 0) throw new Error(`could not package cloud branch: ${bundle.stderr || bundle.stdout}`);
+    const transferred = await world.readFileBuffer(transferRel);
+    const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
+    if (transferred.length > maxBytes) throw new Error(`world bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
+    return transferred;
+  } finally {
+    await world.exec('rm', ['-f', transferName], { cwd: repo.root }).catch(() => undefined);
+  }
+}
+
+/** Land an imported task branch in its authoritative local checkout, through
+ * the same per-repo primitive local worktree worlds use. The branch is checked
+ * out in a throwaway worktree so `finalizeMergeRepo`'s guards (conflict
+ * markers, target-into-branch merge, target-worktree landing) run unchanged. */
+async function landLocalBranch(localRepo: string, repo: WorldRepo, target: string, worldId: string,
+  identity?: WorldGitIdentity): Promise<MergeResult> {
+  const tmp = path.join(localRepo, '..', `.karmax-land-${cryptoSafeName(worldId)}-${cryptoSafeName(repo.name)}`);
+  if (fs.existsSync(tmp)) {
+    await git(localRepo, ['worktree', 'remove', '--force', tmp]);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  const added = await git(localRepo, ['worktree', 'add', '--force', tmp, repo.branch]);
+  if (added.code !== 0) throw new Error(`could not check out the task branch for landing: ${added.stderr || added.stdout}`);
+  try {
+    return await finalizeMergeRepo({ ...repo, repo: localRepo, root: tmp }, target, worldId, identity);
+  } finally {
+    await git(localRepo, ['worktree', 'remove', '--force', tmp]);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 async function withTransferredRepo<T>(
   world: World,
   repo: WorldRepo,
@@ -279,17 +407,7 @@ async function withTransferredRepo<T>(
   use: (clone: string, env: Record<string, string>) => Promise<T>,
 ): Promise<T> {
   if (!/^(?:ssh:\/\/|git@)/.test(repo.repo)) throw new Error('Git broker requires an SSH remote');
-  if (!safeBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
-  const transferName = `.karmax-transfer-${repo.name.replace(/[^a-zA-Z0-9_.-]/g, '-')}.bundle`;
-  const transferRel = worldRepos(world.handle).length > 1 ? `${repo.name}/${transferName}` : transferName;
-  // Package the named task ref, not the worktree's current HEAD. Human review
-  // terminals and verification servers may legitimately stay open while a
-  // committed snapshot is published for local testing; an unrelated `git
-  // switch` in one of those sessions must not change which branch crosses the
-  // broker boundary.
-  const sourceRef = `refs/heads/${repo.branch}`;
-  const bundle = await world.exec('git', ['bundle', 'create', transferName, sourceRef], { cwd: repo.root, timeoutMs: 10 * 60_000 });
-  if (bundle.code !== 0) throw new Error(`could not package cloud branch: ${bundle.stderr || bundle.stdout}`);
+  const transferred = await readBranchBundle(world, repo);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-broker-'));
   try {
     const credential = await resolveCredential(auth, repo);
@@ -300,14 +418,11 @@ async function withTransferredRepo<T>(
       env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
     }
     const bundlePath = path.join(temp, 'world.bundle');
-    const transferred = await world.readFileBuffer(transferRel);
-    const maxBytes = Number(process.env.KARMAX_MAX_GIT_BUNDLE_MB ?? 256) * 1024 * 1024;
-    if (transferred.length > maxBytes) throw new Error(`world bundle exceeds ${Math.floor(maxBytes / 1024 / 1024)} MiB policy`);
     await fs.promises.writeFile(bundlePath, transferred, { mode: 0o600 });
     const clone = path.join(temp, 'repo');
     const cloned = await git(temp, ['clone', '-q', '--no-checkout', repo.repo, clone], { env, timeoutMs: 10 * 60_000 });
     if (cloned.code !== 0) throw new Error(`authenticated clone failed: ${cloned.stderr || cloned.stdout}`);
-    const fetched = await git(clone, ['fetch', bundlePath, `${sourceRef}:refs/heads/${repo.branch}`]);
+    const fetched = await git(clone, ['fetch', bundlePath, `refs/heads/${repo.branch}:refs/heads/${repo.branch}`]);
     if (fetched.code !== 0) throw new Error(`bundle import failed: ${fetched.stderr || fetched.stdout}`);
     if (repo.baseSha) {
       const ancestor = await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, repo.branch]);
@@ -315,7 +430,6 @@ async function withTransferredRepo<T>(
     }
     return await use(clone, env);
   } finally {
-    await world.exec('rm', ['-f', transferName], { cwd: repo.root }).catch(() => undefined);
     fs.rmSync(temp, { recursive: true, force: true });
   }
 }

@@ -149,8 +149,11 @@ const MAX_SHELL_NUDGES = 3;
  * scratch or single-repo world yields one domain, exactly as before.)
  */
 function mergeDomains(world: WorldHandleLike | undefined, target: string, projectId: string): string[] {
+  // Key on the AUTHORITATIVE repo: a cloud world provisioned from a local
+  // checkout (`localPath`) lands its merge in that checkout, so it must
+  // serialize with worktree worlds of the same repo — not under its SSH URL.
   const domains = world?.repos?.length
-    ? world.repos.map((repo) => `${repo.repo}:${repo.target ?? target}`)
+    ? world.repos.map((repo) => `${repo.localPath ?? repo.repo}:${repo.target ?? target}`)
     : [`${world?.repo ?? projectId}:${target}`];
   return [...new Set(domains)].sort();
 }

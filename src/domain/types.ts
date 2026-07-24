@@ -314,7 +314,7 @@ export interface WorldHandleRef {
   base: string;
   repo?: string;
   target?: string;
-  repos?: { name: string; repo: string; root: string; branch: string; base: string; target?: string; baseSha?: string }[];
+  repos?: { name: string; repo: string; root: string; branch: string; base: string; target?: string; baseSha?: string; localPath?: string }[];
   meta?: Record<string, unknown>;
   warnings?: string[];
 }

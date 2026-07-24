@@ -59,8 +59,11 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
     note: targets.length === 1 ? `merged ${repos.length} repos into ${targets[0]}` : `merged ${repos.length} repos into their configured targets` };
 }
 
-/** Merge one repo's attempt branch into `target` (the per-repo primitive). */
-async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: string, identity?: WorldGitIdentity): Promise<MergeResult> {
+/** Merge one repo's attempt branch into `target` (the per-repo primitive).
+ *  Exported for the Git broker: a cloud world whose repo is authoritative to a
+ *  host-local checkout lands through this exact machinery (same conflict/dirty
+ *  guards, same target-worktree landing) after importing its branch bundle. */
+export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, worldId: string, identity?: WorldGitIdentity): Promise<MergeResult> {
   const root = worldRepo.root;
   const repo = worldRepo.repo;
   const branch = worldRepo.branch;

@@ -30,6 +30,13 @@ export interface WorldRepo {
   /** Configured network source when `repo` is a managed local checkout. Remote
    *  providers keep the URL directly in `repo`, so this is normally absent. */
   source?: string;
+  /** Host checkout this repo was provisioned from (remote worlds whose project
+   *  repo is a local path). When present, that checkout is the AUTHORITATIVE
+   *  repository: broker merges land there and upstream refreshes read from it
+   *  — `repo` (the SSH remote) is only the sandbox's clone transport. Without
+   *  it, cloud and local merges would land in two different places (origin vs
+   *  the local repo) and the two histories would silently diverge. */
+  localPath?: string;
   /** Absolute worktree path (where this repo is checked out in the world). */
   root: string;
   /** The branch work happens on in this repo. */
