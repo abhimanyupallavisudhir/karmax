@@ -130,6 +130,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/objects(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/services(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/import-copyglobs$/.test(p)) return 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/environment(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/objects\/promote$/.test(p)) return 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
@@ -2554,6 +2555,73 @@ export class Gateway {
         }
       }
 
+      // Project environment (PLAN-cloud): the derivation recipe from tracked
+      // state to a runnable workspace, and the immutable per-provider builds
+      // realized from it. Proposals read what the repo already declares.
+      const projectEnvironmentMatch = p.match(/^\/api\/projects\/([^/]+)\/environment(?:\/(proposal|build))?$/);
+      if (projectEnvironmentMatch && ['GET', 'PUT', 'POST'].includes(method)) {
+        const project = store.getProject(projectEnvironmentMatch[1]!);
+        if (!project) return this.json(res, 404, { error: 'no project' });
+        const { ProjectEnvironment, proposeEnvironment } = await import('../store/project-environment.js');
+        const environment = new ProjectEnvironment(store);
+        const sub = projectEnvironmentMatch[2];
+        try {
+          if (method === 'GET' && !sub) {
+            const spec = environment.spec(project.id);
+            return this.json(res, 200, { spec: spec ?? null, digest: spec ? environment.digest(spec) : null,
+              builds: environment.builds(project.id) });
+          }
+          if (method === 'PUT' && !sub) {
+            const b = await this.body(req);
+            const list = (v: unknown) => Array.isArray(v) ? v.map(String) : typeof v === 'string' ? v.split('\n') : [];
+            const spec = environment.setSpec(project.id, { image: b.image ? String(b.image) : undefined,
+              setup: list(b.setup), boot: list(b.boot), includeDocker: !!b.includeDocker });
+            return this.json(res, 200, { spec, digest: environment.digest(spec) });
+          }
+          if (method === 'GET' && sub === 'proposal') {
+            const { managedRepoPath } = await import('../world/worktree.js');
+            const { expandPath } = await import('../util/expand.js');
+            const { ProjectServices } = await import('../store/project-services.js');
+            const fs = await import('node:fs');
+            const dirs = (project.config.repos ?? []).map((source) => {
+              const local = expandPath(source);
+              if (fs.existsSync(local)) return local;
+              const managed = managedRepoPath(source);
+              return fs.existsSync(managed) ? managed : undefined;
+            }).filter((dir): dir is string => Boolean(dir));
+            const hasPerWorldServices = new ProjectServices(store).list(project.id).some((s) => s.kind === 'per-world');
+            return this.json(res, 200, proposeEnvironment(dirs, { hasPerWorldServices }));
+          }
+          if (method === 'POST' && sub === 'build') {
+            const spec = environment.spec(project.id);
+            if (!spec) return this.json(res, 400, { error: 'configure the environment first (or accept the proposal)' });
+            const b = await this.body(req);
+            const provider = String(b.provider ?? store.effectiveProjectConfig(project).worldProvider ?? 'worktree');
+            const digest = environment.digest(spec);
+            let connection: { apiKey?: string; apiUrl?: string; target?: string } | undefined;
+            if (['e2b', 'daytona'].includes(provider)) {
+              try {
+                const resolved = this.deps.providerConnections?.resolve(project.organizationId, provider);
+                if (resolved) connection = { apiKey: resolved.apiKey,
+                  apiUrl: (resolved.config as any)?.apiUrl, target: (resolved.config as any)?.target };
+              } catch (e) {
+                return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+              }
+            }
+            environment.recordBuild(project.id, { provider, digest, status: 'building' });
+            const { buildEnvironment } = await import('../world/environment-build.js');
+            // Builds take minutes; run detached and let the record carry status.
+            void buildEnvironment({ provider, projectId: project.id, digest, spec, ...(connection ? { connection } : {}) })
+              .then((result) => environment.recordBuild(project.id, { provider, digest, ref: result.ref, status: 'ready' }))
+              .catch((error) => environment.recordBuild(project.id, { provider, digest, status: 'failed',
+                error: (error instanceof Error ? error.message : String(error)).slice(0, 800) }));
+            return this.json(res, 202, { building: { provider, digest } });
+          }
+        } catch (e) {
+          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
       // Project services (PLAN-state.md §3.3): external → a connection Secret;
       // per-world → a private container per task world. compose-import turns
       // the compose file the repo already has into proposals.
@@ -2570,11 +2638,20 @@ export class Gateway {
             const fs = await import('node:fs');
             const nodePath = await import('node:path');
             const proposals: import('../domain/types.js').ProjectService[] = [];
+            const { readDevcontainer } = await import('../store/project-environment.js');
             for (const source of project.config.repos ?? []) {
               const local = expandPath(source);
               const dir = fs.existsSync(local) ? local : fs.existsSync(managedRepoPath(source)) ? managedRepoPath(source) : undefined;
               if (!dir) continue;
-              for (const file of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+              // Root compose files, the devcontainer's referenced ones, and the
+              // .devcontainer directory's own — first match wins per repo.
+              const devcontainer = readDevcontainer(dir);
+              const candidates = [
+                'docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml',
+                ...(devcontainer?.composeFiles ?? []),
+                '.devcontainer/docker-compose.yml', '.devcontainer/docker-compose.yaml',
+              ];
+              for (const file of candidates) {
                 const composePath = nodePath.join(dir, file);
                 if (!fs.existsSync(composePath)) continue;
                 proposals.push(...composeServiceProposals(fs.readFileSync(composePath, 'utf8')));

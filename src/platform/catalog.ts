@@ -65,6 +65,9 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/authorization/grants', 'GET /api/audit?since=&limit=',
   ],
   cloud: [
+    'GET|PUT /api/projects/:projectId/environment (spec {image, setup[], boot[], includeDocker} + per-provider builds)',
+    'GET /api/projects/:projectId/environment/proposal (derived from devcontainer.json, lockfiles, declared services)',
+    'POST /api/projects/:projectId/environment/build (bake an immutable artifact for {provider?}; async, status on the build record)',
     'GET|PUT /api/organizations/:organizationId/execution-policy',
     'GET|PUT /api/projects/:projectId/execution-policy',
     'GET /api/organizations/:organizationId/world-providers',

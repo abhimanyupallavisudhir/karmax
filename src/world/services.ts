@@ -78,9 +78,16 @@ export async function launchWorldServices(world: World, taskId: string, services
     }
     result.containers.push(container);
     if (service.containerPort && service.urlEnv && service.urlTemplate) {
-      const port = await publishedPort(world, container, service.containerPort);
-      if (port) result.env[service.urlEnv] = service.urlTemplate.replace(/\{host\}/g, '127.0.0.1').replace(/\{port\}/g, String(port));
-      else result.warnings.push(`service ${service.name}: could not resolve its published port`);
+      // In-sandbox daemons: prefer the container's bridge IP — the daemon runs
+      // in the world's own network namespace, so it is always routable and
+      // avoids docker-proxy/NAT entirely. Host daemons (worktree worlds) keep
+      // the published 127.0.0.1 port: host→bridge routing is NOT reliable
+      // there (rootless Docker, Docker Desktop VMs, and DOCKER-USER firewall
+      // chains all break it — observed on a stock apparmor/nftables host).
+      const address = await containerAddress(world, container, service.containerPort);
+      if (address) result.env[service.urlEnv] = service.urlTemplate
+        .replace(/\{host\}/g, address.host).replace(/\{port\}/g, String(address.port));
+      else result.warnings.push(`service ${service.name}: could not resolve its address`);
     }
   }
   return result;
@@ -128,10 +135,16 @@ async function hostDocker(args: string[], timeoutMs: number): Promise<{ stdout: 
   }
 }
 
-async function publishedPort(world: World, container: string, containerPort: number): Promise<number | undefined> {
+async function containerAddress(world: World, container: string, containerPort: number): Promise<{ host: string; port: number } | undefined> {
+  const inWorldDaemon = world.handle.kind !== 'worktree'; // sandbox-local docker vs the host's
+  if (inWorldDaemon) {
+    const ip = await world.exec('docker', ['inspect', '-f', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', container], { timeoutMs: 10_000 });
+    const host = ip.stdout.trim();
+    if (ip.code === 0 && /^\d+\.\d+\.\d+\.\d+$/.test(host)) return { host, port: containerPort };
+  }
   const r = await world.exec('docker', ['port', container, String(containerPort)], { timeoutMs: 10_000 });
   const m = r.stdout.match(/:(\d+)\s*$/m);
-  return m ? Number(m[1]) : undefined;
+  return m ? { host: '127.0.0.1', port: Number(m[1]) } : undefined;
 }
 
 function containerName(taskId: string, service: string): string {

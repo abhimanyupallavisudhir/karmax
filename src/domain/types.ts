@@ -495,6 +495,38 @@ export interface ProjectService {
   seedContainerPath?: string;
 }
 
+/**
+ * A project's environment recipe (PLAN-cloud "prepare an environment once"):
+ * the derivation from tracked state to a runnable workspace. `image` + `setup`
+ * are BUILD-time (baked once into an immutable per-provider artifact — Docker
+ * image, E2B snapshot, Daytona snapshot — keyed by their digest); `boot` runs
+ * cheaply in every new world. Worktree worlds skip it: the host IS their
+ * environment.
+ */
+export interface ProjectEnvironmentSpec {
+  /** Base: a container image (container/Daytona) or E2B template/snapshot id. */
+  image?: string;
+  /** Build-time commands, baked by an environment build. */
+  setup?: string[];
+  /** Cheap per-world commands run at world creation. */
+  boot?: string[];
+  /** Bake + start Docker so per-world services are guaranteed, not template luck. */
+  includeDocker?: boolean;
+}
+
+/** One immutable environment artifact for one provider (status machine). */
+export interface EnvironmentBuildRecord {
+  provider: string;
+  /** Digest of the spec's build-relevant half (image + setup + includeDocker). */
+  digest: string;
+  /** What worlds consume: image tag (container), snapshot id (E2B/Daytona). */
+  ref?: string;
+  status: 'building' | 'ready' | 'failed';
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface TaskList {
   id: string;
   projectId: string;

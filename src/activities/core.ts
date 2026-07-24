@@ -25,6 +25,8 @@ import { materializeFileSecrets } from '../world/secrets.js';
 import { materializeObjectMounts } from '../world/mounts.js';
 import { destroyWorldServices, launchWorldServices } from '../world/services.js';
 import { worldRuntimeEnv } from '../world/runtime-env.js';
+import { ProjectEnvironment } from '../store/project-environment.js';
+import { bootCommands, setupCommands } from '../world/environment-build.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
@@ -423,6 +425,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const project = projectId ? store.getProject(projectId) : undefined;
       const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
+      // A ready environment build for this provider (PLAN-cloud): the world
+      // boots from the baked artifact — image for containers, snapshot for
+      // sandboxes — instead of re-running setup. Stale/missing builds fall
+      // through to the base environment plus a live-setup pass below.
+      const projectEnvironment = new ProjectEnvironment(store);
+      const environmentSpec = projectId ? projectEnvironment.spec(projectId) : undefined;
+      const environmentBuild = projectId && environmentSpec
+        ? projectEnvironment.readyBuild(projectId, args.kind, projectEnvironment.digest(environmentSpec))
+        : undefined;
+      const environmentOverride = environmentBuild && environmentBuild.ref !== 'host'
+        ? { ...executionConfig?.environment,
+            ...(args.kind === 'container' ? { image: environmentBuild.ref } : { snapshot: environmentBuild.ref }) }
+        : executionConfig?.environment;
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
         const ctx = activityContext.current();
@@ -446,7 +461,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           gitCredentials,
           ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
           network: executionConfig?.network,
-          environment: executionConfig?.environment,
+          environment: environmentOverride,
           resources: executionConfig?.resources,
         });
       } catch (error) {
@@ -489,6 +504,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             }
           } catch (e) {
             record(args.taskId, 'world.warning', { warning: `project objects: ${e instanceof Error ? e.message : e}` });
+          }
+        }
+        // Environment realization (PLAN-cloud). Host-side worlds skip it —
+        // the host IS their environment. With a ready build the world booted
+        // from the baked artifact and only cheap boot commands remain; without
+        // one, setup runs live (correct but slow) and says so. Boot runs
+        // before services so a baked Docker daemon is up for them.
+        if (environmentSpec && !['worktree', 'memory'].includes(args.kind)) {
+          try {
+            const live = environmentBuild ? [] : setupCommands(environmentSpec);
+            if (live.length) record(args.taskId, 'world.warning',
+              { warning: 'environment build not ready for this provider — running setup live (build it in Settings → Environment to make worlds boot fast)' });
+            for (const command of [...live, ...bootCommands(environmentSpec)]) {
+              const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 });
+              if (result.code !== 0) record(args.taskId, 'world.warning',
+                { warning: `environment command "${command}" failed: ${(result.stderr || result.stdout).slice(-300)}` });
+            }
+          } catch (e) {
+            record(args.taskId, 'world.warning', { warning: `environment: ${e instanceof Error ? e.message : e}` });
           }
         }
         // Launch per-world service instances (PLAN-state §3.3): a private

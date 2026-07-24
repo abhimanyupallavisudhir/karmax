@@ -6485,7 +6485,7 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-data">Data</a><a href="#project-services">Services</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-data">Data</a><a href="#project-services">Services</a><a href="#project-environment">Environment</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
     <div class="settings-section-title" id="project-secrets"><div>Secrets<small>Values this project's own code reads (DATABASE_URL, API keys) — vault-stored, injected into task worlds, never committed</small></div></div>
@@ -6494,6 +6494,8 @@ function settingsView(proj) {
     <div class="card"><div id="project-objects-box">Loading…</div></div>
     <div class="settings-section-title" id="project-services"><div>Services<small>What this project's code connects to — a shared instance via a Secret, or a private per-world container</small></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
+    <div class="settings-section-title" id="project-environment"><div>Environment<small>Built once, copied into every task world — so worlds boot in seconds with dependencies (and Docker) already in place</small></div></div>
+    <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
@@ -6658,6 +6660,49 @@ async function hydrateProjectServices(proj) {
     });
   } catch (error) { box.textContent = error.message; }
 }
+async function hydrateProjectEnvironment(proj) {
+  const box = $('#project-environment-box'); if (!box) return;
+  try {
+    const { spec, digest, builds } = await api(`/api/projects/${encodeURIComponent(proj.id)}/environment`);
+    const buildRow = (b) => `<div class="queue-item"><div style="flex:1"><b>${esc(b.provider)}</b> <span class="chip">${b.status === 'ready' ? '🟢 ready' : b.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip" title="${esc(b.digest)}">${esc(b.digest.slice(0, 8))}${digest && b.digest !== digest ? ' · stale' : ''}</span>${b.ref && b.ref !== 'host' ? ` <span class="chip">${esc(b.ref)}</span>` : ''}</div>${b.error ? `<span class="task-sub" style="color:var(--danger)">${esc(b.error.slice(0, 120))}</span>` : ''}</div>`;
+    box.innerHTML = `
+      <div class="inline-form"><input id="project-env-image" value="${esc(spec?.image || '')}" placeholder="base image (e.g. node:22-slim) or provider template" style="flex:1;min-width:200px"><label class="switch"><input id="project-env-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span>Bake Docker (for per-world services)</span></label></div>
+      <div class="inline-form"><textarea id="project-env-setup" rows="3" placeholder="setup commands, one per line — baked once into the build (npm ci, pip install …)" style="flex:1">${esc((spec?.setup || []).join('\n'))}</textarea></div>
+      <div class="inline-form"><textarea id="project-env-boot" rows="2" placeholder="boot commands, one per line — run cheaply in every new world" style="flex:1">${esc((spec?.boot || []).join('\n'))}</textarea></div>
+      <div class="inline-form"><button class="btn sm" id="project-env-propose">Propose from repo</button><button class="btn sm primary" id="project-env-save">Save</button><button class="btn sm primary" id="project-env-build">Build now</button></div>
+      <div id="project-env-evidence" style="font-size:11px;color:var(--ink-3)"></div>
+      ${builds.length ? `<div class="section-h" style="margin-top:10px">Builds</div>${builds.map(buildRow).join('')}` : '<p class="task-sub" style="margin-top:8px">No builds yet. Without one, cloud worlds run setup live on every task (slow); a build makes them boot from a snapshot.</p>'}`;
+    $('#project-env-propose')?.addEventListener('click', async () => {
+      try {
+        const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);
+        if (proposal.spec.image) $('#project-env-image').value = proposal.spec.image;
+        if (proposal.spec.setup?.length) $('#project-env-setup').value = proposal.spec.setup.join('\n');
+        if (proposal.spec.includeDocker) $('#project-env-docker').checked = true;
+        $('#project-env-evidence').innerHTML = proposal.evidence.length
+          ? `Proposed from the repo: ${proposal.evidence.map(esc).join(' · ')} — review and Save.`
+          : 'Nothing to propose — no devcontainer or lockfiles found in this repo.';
+      } catch (error) { toast(error.message, true); }
+    });
+    $('#project-env-save')?.addEventListener('click', async () => {
+      try {
+        await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
+          image: $('#project-env-image').value.trim() || undefined,
+          setup: $('#project-env-setup').value.split('\n').map((s) => s.trim()).filter(Boolean),
+          boot: $('#project-env-boot').value.split('\n').map((s) => s.trim()).filter(Boolean),
+          includeDocker: $('#project-env-docker').checked }) });
+        toast('Environment saved');
+        await hydrateProjectEnvironment(proj);
+      } catch (error) { toast(error.message, true); }
+    });
+    $('#project-env-build')?.addEventListener('click', async () => {
+      try {
+        const result = await api(`/api/projects/${proj.id}/environment/build`, { method: 'POST', body: '{}' });
+        toast(`Building for ${result.building.provider}… status appears below`);
+        setTimeout(() => hydrateProjectEnvironment(projectById(proj.id)), 1500);
+      } catch (error) { toast(error.message, true); }
+    });
+  } catch (error) { box.textContent = error.message; }
+}
 async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
@@ -6749,6 +6794,7 @@ function wireSettingsView(proj) {
   hydrateProjectSecrets(proj);
   hydrateProjectObjects(proj);
   hydrateProjectServices(proj);
+  hydrateProjectEnvironment(proj);
   hydrateSettingsForms('project', proj.id);
   hydrateQuickSettingsForms('project', proj.id);
   wireQuickSettingsSave('project', proj.id);

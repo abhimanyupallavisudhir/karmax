@@ -178,6 +178,35 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(after.services).toEqual([]);
   });
 
+  it('manages the environment spec, proposes from devcontainer, and builds for host worlds', async () => {
+    const os = await import('node:os');
+    const dir = fs.mkdtempSync(`${os.tmpdir()}/karmax-envgw-`);
+    fs.mkdirSync(`${dir}/.devcontainer`);
+    fs.writeFileSync(`${dir}/.devcontainer/devcontainer.json`,
+      '{ "image": "node:22", /* c */ "postCreateCommand": "npm ci", "dockerComposeFile": "compose.yaml", }');
+    fs.writeFileSync(`${dir}/.devcontainer/compose.yaml`, 'services:\n  cache:\n    image: redis:7\n');
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Enviro' }) })).json();
+    h.store.updateProjectConfig(project.id, { repos: [dir] } as any);
+
+    const proposal: any = await (await fetch(`${base}/api/projects/${project.id}/environment/proposal`, { headers: auth() })).json();
+    expect(proposal.spec).toMatchObject({ image: 'node:22', setup: ['npm ci'] });
+    // The devcontainer's compose file feeds the services importer too.
+    const services: any = await (await fetch(`${base}/api/projects/${project.id}/services/compose-import`, { headers: auth() })).json();
+    expect(services.proposals).toEqual([expect.objectContaining({ name: 'cache', image: 'redis:7' })]);
+
+    const saved: any = await (await fetch(`${base}/api/projects/${project.id}/environment`, { method: 'PUT', headers: auth(),
+      body: JSON.stringify(proposal.spec) })).json();
+    expect(saved.digest).toMatch(/^[a-f0-9]{16}$/);
+    const build = await fetch(`${base}/api/projects/${project.id}/environment/build`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ provider: 'worktree' }) });
+    expect(build.status).toBe(202);
+    await expect.poll(async () => {
+      const state: any = await (await fetch(`${base}/api/projects/${project.id}/environment`, { headers: auth() })).json();
+      return state.builds.find((b: any) => b.provider === 'worktree')?.status;
+    }, { timeout: 10_000 }).toBe('ready');
+  });
+
   it('imports copyGlobs into secrets/objects and clears the setting', async () => {
     const os = await import('node:os');
     const dir = fs.mkdtempSync(`${os.tmpdir()}/karmax-cgimp-`);

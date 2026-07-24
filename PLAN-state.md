@@ -270,7 +270,29 @@ the declaration.
    versions (`WorldCheckpoint.objectMounts`), so restore re-materializes
    exactly what the checkpoint saw regardless of later promotions. The shared
    `worldRuntimeEnv` resolver injects service+secret env into agent turns, the
-   interactive terminal, and review-action runs alike. Remaining follow-ups:
-   PLAN-cloud environment builds (bake Docker + images into cloud templates so
-   in-sandbox services are fast and guaranteed rather than
-   template-dependent), and devcontainer.json import.
+   interactive terminal, and review-action runs alike.
+
+5. **Environment builds + devcontainer import** (the PLAN-cloud follow-ups,
+   shipped). `ProjectEnvironmentSpec` {image, setup, boot, includeDocker} with
+   a build-relevant digest (`src/store/project-environment.ts`); builds
+   realize it once into an immutable per-provider artifact
+   (`src/world/environment-build.ts`): worktree/memory no-op (the host IS the
+   environment), container → local `docker build`, e2b → builder sandbox +
+   `createSnapshot` (worlds pass the snapshot id through the existing
+   `environment.snapshot` selector), daytona → declarative snapshot build
+   (feature-detected; SDK optional). `includeDocker` bakes Docker at build
+   time and starts dockerd per world at boot — per-world services on cloud
+   stop being template luck. createWorld consumes a ready build (image/
+   snapshot override) and otherwise runs setup LIVE with a warning pointing
+   at Settings → Environment; boot commands run before services so dockerd is
+   up. Proposals read what the repo declares: devcontainer.json (JSONC:
+   comments, trailing commas, argv and named postCreateCommand shapes; both
+   canonical locations), lockfile install commands (npm/pnpm/yarn/uv/pip/
+   cargo/go), and declared per-world services flip includeDocker; a
+   devcontainer's dockerComposeFile (and `.devcontainer/` compose files) feed
+   the services importer. `/api/projects/:id/environment` (+`/proposal`,
+   `/build` async with status records) and a Settings → Environment card with
+   propose/save/build and per-provider build status. Connection-env addressing
+   refined: in-sandbox daemons use the container's bridge IP (always routable
+   in the world's own namespace); host daemons keep the published 127.0.0.1
+   port (host→bridge routing breaks under rootless/Desktop/firewalls).
