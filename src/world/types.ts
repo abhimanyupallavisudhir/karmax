@@ -38,6 +38,10 @@ export interface WorldRepo {
   base: string;
   /** Protected branch this repo lands on. Defaults to the world's target. */
   target?: string;
+  /** Distinguishes a creation-time copy of the task target from an explicit
+   * per-repository branch policy. This lets an in-flight task target update
+   * take effect without overriding repositories intentionally pinned elsewhere. */
+  targetSource?: 'task' | 'repository';
   /** Immutable commit from which this attempt started. */
   baseSha?: string;
 }
@@ -129,6 +133,17 @@ export function worldRepos(handle: WorldHandle): WorldRepo[] {
       branch: handle.branch, base: handle.base, target: handle.target }];
   }
   return [];
+}
+
+/** Resolve the target used for one repository at the moment of an operation.
+ * Historical single-repo handles copied the task target into `repo.target`, so
+ * the current task target must win there. Historical multi-repo handles used
+ * `repo.target` for per-repository policies, which remains the compatibility
+ * default until their executions complete. */
+export function worldRepoTarget(repo: WorldRepo, taskTarget: string, repoCount: number): string {
+  if (repo.targetSource === 'repository') return repo.target ?? taskTarget;
+  if (repo.targetSource === 'task') return taskTarget;
+  return repoCount > 1 ? repo.target ?? taskTarget : taskTarget;
 }
 
 /** Stable configured identity for enrollment/checkpoint lookups. Local

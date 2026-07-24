@@ -314,7 +314,18 @@ export interface WorldHandleRef {
   base: string;
   repo?: string;
   target?: string;
-  repos?: { name: string; repo: string; root: string; branch: string; base: string; target?: string; baseSha?: string }[];
+  repos?: {
+    name: string;
+    repo: string;
+    root: string;
+    branch: string;
+    base: string;
+    target?: string;
+    /** Whether `target` follows the task or is a fixed per-repository policy.
+     * Absent on historical handles; consumers retain their old interpretation. */
+    targetSource?: 'task' | 'repository';
+    baseSha?: string;
+  }[];
   meta?: Record<string, unknown>;
   warnings?: string[];
 }
@@ -329,6 +340,90 @@ export interface Project {
   name: string;
   createdAt: number;
   config: ProjectConfig;
+}
+
+export type ProjectResourceKind = 'secret' | 'file' | 'external' | 'database';
+
+export interface ResourceInjection {
+  /** Inject into agent/setup/review/terminal process environments. */
+  env?: string;
+  /** Materialize relative to the selected repository (or the world root). */
+  path?: string;
+  /** Optional repository name in a multi-repository world. */
+  repository?: string;
+  /** POSIX permission bits applied after materialization. */
+  mode?: number;
+}
+
+export type ProjectResourceSpec =
+  | {
+      kind: 'secret';
+      description?: string;
+      inject: ResourceInjection;
+    }
+  | {
+      kind: 'file';
+      description?: string;
+      inject: ResourceInjection & { path: string };
+      /** Writable files participate in portable task checkpoints. */
+      mutable?: boolean;
+      readOnly?: boolean;
+    }
+  | {
+      kind: 'external';
+      description?: string;
+      uri: string;
+      sha256: string;
+      inject: ResourceInjection & { path: string };
+      /** Optional secret resource used as an HTTP bearer token. */
+      credentialResourceId?: string;
+      mutable?: boolean;
+      readOnly?: boolean;
+    }
+  | {
+      kind: 'database';
+      description?: string;
+      driver: 'sqlite' | 'external';
+      /** SQLite lives at this world-relative path. */
+      path?: string;
+      /** Optional repository name in a multi-repository world. */
+      repository?: string;
+      /** Connection URL is exposed under this variable (DATABASE_URL by default). */
+      env?: string;
+      /** SQLite is task state by default; external databases remain out of checkpoints. */
+      mutable?: boolean;
+    };
+
+export interface ProjectResource {
+  id: string;
+  projectId: string;
+  name: string;
+  kind: ProjectResourceKind;
+  spec: ProjectResourceSpec;
+  currentRevisionId?: string;
+  secretConfigured: boolean;
+  createdAt: number;
+  updatedAt: number;
+  deletedAt?: number;
+}
+
+export interface ProjectResourceRevision {
+  id: string;
+  resourceId: string;
+  objectKey: string;
+  sha256: string;
+  bytes: number;
+  mediaType?: string;
+  createdAt: number;
+}
+
+/** Immutable resource selection captured when a task first provisions a world. */
+export interface TaskResourcePin {
+  taskId: string;
+  resourceId: string;
+  revisionId?: string;
+  spec: ProjectResourceSpec;
+  createdAt: number;
 }
 
 export interface ProjectConfig {
@@ -370,6 +465,8 @@ export interface ProjectConfig {
   /** Immutable remote environment selector. Provider adapters resolve this to
    * their image/snapshot primitive and stamp the result on the world handle. */
   environment?: { flavor?: 'headless' | 'desktop'; template?: string; image?: string; snapshot?: string };
+  /** Idempotent commands run after project resources are materialized. */
+  setupCommands?: string[];
   /** Hard monthly provider-cost ceiling; provisioning queues once exhausted. */
   monthlyBudgetMicros?: number;
   /** Parked-world retention before portable hibernation (default seven days). */

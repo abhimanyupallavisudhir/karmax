@@ -196,7 +196,7 @@ Merge is the point of no return.
 
 ### 5.2 Stage details
 
-**Setup.** An activity creates the world (a git worktree off the base branch, or a container/remote world per project config; §11), copies the gitignored files the project config names, and allocates non-conflicting resources (ports). Records the world handle in workflow state.
+**Setup.** An activity creates the world (a git worktree off the base branch, or a container/remote world per project config; §11), materializes the task's pinned non-Git resources, runs the project's idempotent setup/migration commands, and allocates non-conflicting resources (ports). The world is recorded as ready only after every required resource and setup command succeeds.
 
 **Do.** Runs the assigned coding agent profile **one turn per activity** (`runAgentTurn`). Between turns only a session ID is stored; the agent process does not exist while the task waits (§7). During a turn the agent may, via the platform MCP: create review info, spawn sub-tasks, save skills, and **signal completion via a structured tool call** (not a parsed "promise" string — structured is unambiguous and unspoofable). On completion/idle/needs-input → Review.
 
@@ -617,7 +617,50 @@ world belongs to one attempt, but it does not keep one VM running: compute is
 leased only while an execution is active. See `PLAN-cloud.md` for provider
 selection, pricing, lifecycle, GitHub/SSH, runner, and multi-tenant design.
 
-### 11.3 Ties to the rest of the spec
+### 11.3 Project resources: durable state outside Git
+
+Git is the source plane, not a general-purpose persistence layer. Hosted Karmax
+therefore owns a project-scoped **resource registry** whose metadata is in the
+control database and whose values use a backend appropriate to their class:
+
+- **Secrets** are write-only credential-broker handles. They may be exposed as a
+  named environment variable or a mode-`0600` file. Values are resolved for the
+  specific process/PTY at spawn, never returned by the API, put in Temporal
+  history, copied into a checkpoint, or exposed to an agent prompt.
+- **Managed files** are immutable revisions in the object store, envelope
+  encrypted with a per-project key held by the credential broker and verified by
+  SHA-256 on every read. The current revision is a project setting; a task pins
+  the exact revision the first time it provisions, including an explicit empty
+  snapshot when the project had no resources.
+- **Large/external objects** remain in the customer's HTTP(S) object or model
+  store. The registry contains a URL, required SHA-256, target path, and
+  optionally a same-project secret used as a bearer credential. The world
+  downloads and verifies the object during setup. The managed-upload limit is
+  configurable (`KARMAX_MAX_RESOURCE_BYTES`, 512 MiB by default); large models
+  should use this external-reference path rather than transit the control plane.
+- **Databases** are either task-local SQLite or an external managed database.
+  SQLite is injected as a `DATABASE_URL`, is mutable task state by default, and
+  uses SQLite's online backup API when captured in a portable checkpoint (never
+  a naive live-file copy). An external database contributes only its write-only
+  connection URL; Karmax does not dump or clone its contents. Projects declare
+  idempotent setup commands for migrations and seeds, which run after resources
+  are present on every new or restored world.
+
+Immutable resources are reconstructed from their pinned source. Explicitly
+mutable file/external resources and task-local SQLite state are included in the
+encrypted portable world delta even when `.gitignore` hides them. Secret paths
+are always excluded. Durable outputs that should outlive the task become Git
+commits or promoted artifacts, not accidental world filesystem state.
+
+Every route is capability checked and project scoped; cross-project credential
+references are rejected. Object keys are not public API, stored bytes are
+encrypted independently of the storage provider, worlds receive only their
+pinned project resources, and project deletion tears down worlds/checkpoints
+before purging resource objects and key handles. Thus a hosted control plane can
+work on arbitrary tenants' projects without depending on persistent local
+checkout files.
+
+### 11.4 Ties to the rest of the spec
 
 - The provider **PTY** powers the "open a terminal in the world" check-in against remote worlds.
 - Provider **park/open** powers resume-while-parked: when a workflow waits on a

@@ -18,7 +18,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
-import { worldRepos, worldRepoSource } from '../world/types.js';
+import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
@@ -170,6 +170,7 @@ export interface CoreActivityDeps {
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
+  projectResources?: import('../world/resources.js').ProjectResourceService;
   runners?: import('../world/runners.js').RunnerPoolService;
   payments?: PaymentProvider;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
@@ -437,10 +438,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw error;
       }
       try {
+        let resourceCount: number | undefined;
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
           repositoryIds: linkedRepositories.map((candidate) => candidate.repository.id) };
         if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
+        if (project && deps.projectResources) {
+          const materialized = await deps.projectResources.materialize(args.taskId, project.id, world);
+          for (const warning of materialized.warnings) {
+            world.handle.warnings = [...(world.handle.warnings ?? []), warning];
+          }
+          await deps.projectResources.runSetup(args.taskId, project.id, world);
+          resourceCount = materialized.pins;
+        }
+        // Publish the generation only after all required inputs and setup
+        // commands succeed. A failed provision must not leave a "ready" world
+        // record pointing at a sandbox that the catch block destroys.
         if (projectId) {
           world.handle = store.registerWorld(world.handle, projectId, {
             runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${args.kind}` : 'local'),
@@ -449,6 +462,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               : 'karmax-local',
           }) as WorldHandle;
         }
+        if (resourceCount !== undefined)
+          record(args.taskId, 'world.resources-ready', { count: resourceCount });
         record(args.taskId, 'world.created', { handle: world.handle });
         record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 });
         for (const warning of world.handle.warnings ?? []) record(args.taskId, 'world.warning', { warning });
@@ -898,7 +913,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
-            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            const resourceEnv = deps.projectResources?.environment(args.taskId, world, args.task.projectId) ?? {};
+            const extraEnv = { ...resourceEnv, ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
             return Object.keys(extraEnv).length ? { extraEnv } : {};
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
@@ -1239,8 +1255,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         pushed.push(...worldRepos(handle).map((repo) => repo.name));
         return { pushed, skipped };
       }
-      for (const r of worldRepos(handle)) {
-        const repoTarget = r.target ?? target;
+      const repos = worldRepos(handle);
+      for (const r of repos) {
+        const repoTarget = worldRepoTarget(r, target, repos.length);
         const hasOrigin = await world.exec('git', ['remote', 'get-url', 'origin'], { cwd: r.repo, env });
         if (hasOrigin.code !== 0) {
           skipped.push(r.name);

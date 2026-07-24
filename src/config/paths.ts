@@ -23,7 +23,7 @@ export interface KarmaxPaths {
   temporal: string; // temporal dev-server db
   overlays: string; // user/project overlays (safe-mode resolution)
   attachments: string; // content-addressed user image attachments (image prompts)
-  objects: string; // encrypted checkpoints and promoted artifacts
+  objects: string; // encrypted checkpoints, project resources, and promoted artifacts
   backups: string; // operator-created, integrity-checked control-plane snapshots
 }
 

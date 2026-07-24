@@ -93,7 +93,8 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     const baseSha = resolved.stdout.trim();
     if (!/^[0-9a-f]{40,64}$/i.test(baseSha)) throw new Error(`repository "${source}" has no resolvable base commit`);
     await configureRepo(target, repoRoot, spec, branch, true, remoteRefExists, base);
-    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base, target: targetBranch, baseSha });
+    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base, target: targetBranch,
+      targetSource: branchPolicy ? 'repository' : 'task', baseSha });
   }
   if (spec.copyGlobs?.length) {
     let copied = 0;

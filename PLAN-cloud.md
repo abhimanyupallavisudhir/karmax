@@ -576,7 +576,9 @@ Required changes from the local process:
   active/passive volume failover are implemented. PostgreSQL is justified only
   if one cell must later accept concurrent application writers.
 - S3-compatible object storage holds promoted artifacts, portable checkpoints,
-  and provider session artifacts. Content-addressed prompt attachments remain on
+  encrypted project-file revisions, and provider session artifacts. Large
+  project inputs remain in customer object/model stores and are materialized by
+  digest-pinned reference. Content-addressed prompt attachments remain on
   the encrypted single-writer cell volume in the first release and are included
   in its verified backup/restore path.
 - Temporal Cloud or a production Temporal cluster replaces the embedded dev

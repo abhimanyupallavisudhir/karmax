@@ -21,7 +21,8 @@ interface PortableDelta { version: 1; files: DeltaFile[] }
  * fast path; this encrypted delta plus the broker-pushed branch is portable. */
 export class WorldCheckpointService {
   constructor(private store: Store, private worlds: WorldRegistry, private objects: ObjectStore,
-    private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService) {
+    private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
+    private resources?: import('./resources.js').ProjectResourceService) {
     if (!broker.hasHandle(CHECKPOINT_KEY_HANDLE))
       broker.registerHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
   }
@@ -34,18 +35,21 @@ export class WorldCheckpointService {
     if (!project?.organizationId) throw new Error('world checkpoint has no owning project');
     const world = await this.worlds.open(handle);
     const linked = this.store.listProjectRepositories(projectId);
-    const files: DeltaFile[] = [];
+    const fileMap = new Map<string, DeltaFile>();
     const repos: WorldCheckpoint['repos'] = [];
+    const secretPaths = new Set((this.resources?.secretPaths(handle.id, world) ?? [])
+      .map((entry) => `${entry.repo}:${entry.path}`));
     for (const repo of worldRepos(world.handle)) {
       const status = await world.exec('git', ['status', '--porcelain=v1', '-z'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
-        if (change.path === '.env' || change.path.startsWith('.karmax-injection/')) continue;
+        if (change.path === '.env' || change.path.startsWith('.karmax-injection/')
+          || secretPaths.has(`${repo.name}:${change.path}`)) continue;
         const relative = worldRepos(world.handle).length > 1 ? `${repo.name}/${change.path}` : change.path;
-        if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
+        if (change.deleted) fileMap.set(`${repo.name}:${change.path}`, { repo: repo.name, path: change.path, deleted: true });
         else {
           const data = await world.readFileBuffer(relative);
-          files.push({ repo: repo.name, path: change.path, data: data.toString('base64') });
+          fileMap.set(`${repo.name}:${change.path}`, { repo: repo.name, path: change.path, data: data.toString('base64') });
         }
       }
       const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
@@ -55,7 +59,19 @@ export class WorldCheckpointService {
         checkoutPath: worldRepos(world.handle).length > 1 ? repo.name : '.', baseSha: repo.baseSha ?? handle.base,
         branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined });
     }
-    const delta: PortableDelta = { version: 1, files };
+    // Git intentionally hides ignored files. Explicitly mutable project inputs
+    // (including task-local SQLite databases) are part of task state anyway.
+    for (const entry of this.resources?.mutablePaths(handle.id, world) ?? []) {
+      const data = await this.resources!.snapshotMutable(handle.id, world, entry);
+      if (data) {
+        fileMap.set(`${entry.repo}:${entry.path}`, {
+          repo: entry.repo, path: entry.path, data: data.toString('base64'),
+        });
+      } else {
+        fileMap.set(`${entry.repo}:${entry.path}`, { repo: entry.repo, path: entry.path, deleted: true });
+      }
+    }
+    const delta: PortableDelta = { version: 1, files: [...fileMap.values()] };
     const compressed = await gzip(Buffer.from(JSON.stringify(delta)));
     const encrypted = this.encrypt(compressed);
     const checkpointId = newId('checkpoint');
@@ -102,25 +118,26 @@ export class WorldCheckpointService {
       branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
       ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
       network: executionConfig.network, environment: executionConfig.environment, resources: executionConfig.resources });
-    for (const file of delta.files) {
-      const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
-      if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
-      else {
-        const content = Buffer.from(file.data ?? '', 'base64');
-        if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
-        else await world.writeFile(relative, content.toString('utf8'));
-      }
-    }
-    let registered: WorldHandle;
     try {
-      registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
+      if (this.resources) await this.resources.materialize(checkpoint.worldId, checkpoint.projectId, world);
+      for (const file of delta.files) {
+        const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
+        if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
+        else {
+          const content = Buffer.from(file.data ?? '', 'base64');
+          if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
+          else await world.writeFile(relative, content.toString('utf8'));
+        }
+      }
+      if (this.resources) await this.resources.runSetup(checkpoint.worldId, checkpoint.projectId, world);
+      const registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
         { runnerPoolId: checkpoint.runnerPoolId, environmentDigest: checkpoint.environmentDigest }) as WorldHandle;
+      world.handle = registered;
+      return registered;
     } catch (error) {
       await world.destroy().catch(() => undefined);
       throw error;
     }
-    world.handle = registered;
-    return registered;
   }
 
   private key(): Buffer {

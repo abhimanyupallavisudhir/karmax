@@ -60,12 +60,13 @@ export class WorktreeProvider implements WorldProvider {
     if (resolvedSources.length === 0) {
       // No repo configured — a scratch sandbox (the world itself is the deliverable).
       const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
-      repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings));
+      repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings, undefined, 'task'));
     } else if (resolvedSources.length === 1) {
       // Single repo: the worktree IS the world root (unchanged layout).
       const resolved = resolvedSources[0]!;
       repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
-        this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined));
+        this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined,
+        spec.repositoryBranches?.[resolved.source] ? 'repository' : 'task'));
     } else {
       // Multi-repo: the world root is a parent dir holding one worktree per repo,
       // each in a subdirectory named after the repo (deduped on collision).
@@ -76,7 +77,8 @@ export class WorktreeProvider implements WorldProvider {
         const name = names[i]!;
         const resolved = resolvedSources[i]!;
         repos.push(await this.addWorktree(resolved.repo, path.join(root, name), name, branch,
-          this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined));
+          this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined,
+          spec.repositoryBranches?.[resolved.source] ? 'repository' : 'task'));
       }
     }
 
@@ -99,7 +101,7 @@ export class WorktreeProvider implements WorldProvider {
    * (falling back to HEAD if that ref is absent). Returns the `WorldRepo` record.
    */
   private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec,
-    warnings?: string[], source?: string): Promise<WorldRepo> {
+    warnings?: string[], source?: string, targetSource: 'task' | 'repository' = 'task'): Promise<WorldRepo> {
     // Resolve a real base ref per repo; fall back to HEAD if the named base is absent.
     let baseRef = spec.base;
     const verify = await git(repo, ['rev-parse', '--verify', `${spec.base}`]);
@@ -136,7 +138,8 @@ export class WorktreeProvider implements WorldProvider {
     // Copy gitignored files the project names (e.g. .env) into this repo's worktree.
     if (spec.copyGlobs?.length) await this.copyGlobs(repo, wt, spec.copyGlobs);
 
-    return { name, repo, ...(source ? { source } : {}), root: wt, branch, base: spec.base, target: spec.target };
+    return { name, repo, ...(source ? { source } : {}), root: wt, branch, base: spec.base,
+      target: spec.target, targetSource };
   }
 
   /** Apply a first-class repository attachment's per-repo branch policy. */

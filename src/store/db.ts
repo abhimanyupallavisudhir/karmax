@@ -45,6 +45,11 @@ import {
   ExecutionFrame,
   PreviewLease,
   WorldHandleRef,
+  ProjectResource,
+  ProjectResourceKind,
+  ProjectResourceRevision,
+  ProjectResourceSpec,
+  TaskResourcePin,
 } from '../domain/types.js';
 import { newId } from '../util/id.js';
 
@@ -114,6 +119,25 @@ export class Store {
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY, organizationId TEXT, name TEXT NOT NULL, createdAt INTEGER NOT NULL, config TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS project_resources (
+        id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
+        spec TEXT NOT NULL, currentRevisionId TEXT, secretConfigured INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, deletedAt INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS project_resource_revisions (
+        id TEXT PRIMARY KEY, resourceId TEXT NOT NULL, objectKey TEXT NOT NULL,
+        sha256 TEXT NOT NULL, bytes INTEGER NOT NULL, mediaType TEXT, createdAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS task_resource_pins (
+        taskId TEXT NOT NULL, resourceId TEXT NOT NULL, revisionId TEXT,
+        spec TEXT NOT NULL, createdAt INTEGER NOT NULL,
+        PRIMARY KEY(taskId, resourceId)
+      );
+      CREATE TABLE IF NOT EXISTS task_resource_snapshots (
+        taskId TEXT PRIMARY KEY, projectId TEXT NOT NULL, createdAt INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_project_resources_active_name
+        ON project_resources(projectId, name) WHERE deletedAt IS NULL;
       CREATE TABLE IF NOT EXISTS task_lists (
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
         createdAt INTEGER NOT NULL, ord INTEGER NOT NULL
@@ -576,6 +600,148 @@ export class Store {
     return { ...existing, config: merged };
   }
 
+  // ─── Project resources ───────────────────────────────────────────────────
+
+  createProjectResource(projectId: string, name: string, spec: ProjectResourceSpec): ProjectResource {
+    if (!this.getProject(projectId)) throw new Error(`no project ${projectId}`);
+    const normalized = name.trim();
+    if (!normalized) throw new Error('resource name is required');
+    if (normalized.length > 200 || /[\0\r\n]/.test(normalized)) throw new Error('resource name is invalid');
+    const now = Date.now();
+    const resource: ProjectResource = {
+      id: newId('resource'), projectId, name: normalized, kind: spec.kind,
+      spec, secretConfigured: false, createdAt: now, updatedAt: now,
+    };
+    try {
+      this.db.prepare(`INSERT INTO project_resources
+        (id, projectId, name, kind, spec, secretConfigured, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?)`)
+        .run(resource.id, projectId, resource.name, resource.kind, JSON.stringify(spec), now, now);
+    } catch (error) {
+      if (/unique/i.test(String(error))) throw new Error(`resource "${normalized}" already exists`);
+      throw error;
+    }
+    return resource;
+  }
+
+  getProjectResource(id: string): ProjectResource | undefined {
+    const row = this.db.prepare('SELECT * FROM project_resources WHERE id=?').get(id) as any;
+    return row ? rowToProjectResource(row) : undefined;
+  }
+
+  listProjectResources(projectId: string, includeDeleted = false): ProjectResource[] {
+    const rows = includeDeleted
+      ? this.db.prepare('SELECT * FROM project_resources WHERE projectId=? ORDER BY createdAt, name').all(projectId)
+      : this.db.prepare('SELECT * FROM project_resources WHERE projectId=? AND deletedAt IS NULL ORDER BY createdAt, name').all(projectId);
+    return (rows as any[])
+      .map(rowToProjectResource);
+  }
+
+  updateProjectResource(id: string, patch: { name?: string; spec?: ProjectResourceSpec; secretConfigured?: boolean;
+    currentRevisionId?: string | null }): ProjectResource {
+    const current = this.getProjectResource(id);
+    if (!current) throw new Error('resource not found');
+    const name = patch.name === undefined ? current.name : patch.name.trim();
+    if (!name) throw new Error('resource name is required');
+    if (name.length > 200 || /[\0\r\n]/.test(name)) throw new Error('resource name is invalid');
+    const spec = patch.spec ?? current.spec;
+    if (spec.kind !== current.kind)
+      throw new Error('resource kind is immutable; create a replacement resource');
+    const revision = patch.currentRevisionId === undefined ? current.currentRevisionId : patch.currentRevisionId ?? undefined;
+    const secretConfigured = patch.secretConfigured ?? current.secretConfigured;
+    const updatedAt = Date.now();
+    try {
+      this.db.prepare(`UPDATE project_resources SET name=?, spec=?, currentRevisionId=?,
+        secretConfigured=?, updatedAt=? WHERE id=?`)
+        .run(name, JSON.stringify(spec), revision ?? null, secretConfigured ? 1 : 0, updatedAt, id);
+    } catch (error) {
+      if (/unique/i.test(String(error))) throw new Error(`resource "${name}" already exists`);
+      throw error;
+    }
+    return { ...current, name, spec, currentRevisionId: revision, secretConfigured, updatedAt };
+  }
+
+  addProjectResourceRevision(input: Omit<ProjectResourceRevision, 'id' | 'createdAt'>): ProjectResourceRevision {
+    const resource = this.getProjectResource(input.resourceId);
+    if (!resource) throw new Error('resource not found');
+    if (resource.kind !== 'file') throw new Error('only file resources have uploaded revisions');
+    const revision: ProjectResourceRevision = {
+      ...input, id: newId('revision'), createdAt: Date.now(),
+    };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`INSERT INTO project_resource_revisions
+        (id, resourceId, objectKey, sha256, bytes, mediaType, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(revision.id, revision.resourceId, revision.objectKey, revision.sha256,
+          revision.bytes, revision.mediaType ?? null, revision.createdAt);
+      this.db.prepare('UPDATE project_resources SET currentRevisionId=?, updatedAt=? WHERE id=?')
+        .run(revision.id, revision.createdAt, resource.id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return revision;
+  }
+
+  getProjectResourceRevision(id: string): ProjectResourceRevision | undefined {
+    const row = this.db.prepare('SELECT * FROM project_resource_revisions WHERE id=?').get(id) as any;
+    return row ? rowToProjectResourceRevision(row) : undefined;
+  }
+
+  listProjectResourceRevisions(resourceId: string): ProjectResourceRevision[] {
+    return (this.db.prepare('SELECT * FROM project_resource_revisions WHERE resourceId=? ORDER BY createdAt DESC').all(resourceId) as any[])
+      .map(rowToProjectResourceRevision);
+  }
+
+  /** Capture current project bindings once. Subsequent retries/restores reuse
+   * the same immutable resource revisions and specs even if project settings move. */
+  pinTaskResources(taskId: string, projectId: string): TaskResourcePin[] {
+    if (this.hasTaskResourceSnapshot(taskId))
+      return this.taskResourcePins(taskId);
+    const task = this.getTask(taskId);
+    if (!task || task.projectId !== projectId) throw new Error('resource snapshot task does not belong to project');
+    const resources = this.listProjectResources(projectId);
+    const now = Date.now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`INSERT OR IGNORE INTO task_resource_snapshots
+        (taskId, projectId, createdAt) VALUES (?, ?, ?)`).run(taskId, projectId, now);
+      for (const resource of resources)
+        this.db.prepare(`INSERT OR IGNORE INTO task_resource_pins
+          (taskId, resourceId, revisionId, spec, createdAt) VALUES (?, ?, ?, ?, ?)`)
+          .run(taskId, resource.id, resource.currentRevisionId ?? null, JSON.stringify(resource.spec), now);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return this.taskResourcePins(taskId);
+  }
+
+  hasTaskResourceSnapshot(taskId: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM task_resource_snapshots WHERE taskId=?').get(taskId));
+  }
+
+  taskResourcePins(taskId: string): TaskResourcePin[] {
+    return (this.db.prepare('SELECT * FROM task_resource_pins WHERE taskId=? ORDER BY createdAt, resourceId').all(taskId) as any[])
+      .map((row) => ({
+        taskId: String(row.taskId), resourceId: String(row.resourceId),
+        revisionId: row.revisionId == null ? undefined : String(row.revisionId),
+        spec: JSON.parse(String(row.spec)) as ProjectResourceSpec, createdAt: Number(row.createdAt),
+      }));
+  }
+
+  deleteProjectResource(id: string): { resource: ProjectResource; revisions: ProjectResourceRevision[] } {
+    const resource = this.getProjectResource(id);
+    if (!resource) throw new Error('resource not found');
+    const revisions = this.listProjectResourceRevisions(id);
+    this.db.prepare('UPDATE project_resources SET deletedAt=?, updatedAt=? WHERE id=?')
+      .run(Date.now(), Date.now(), id);
+    return { resource, revisions };
+  }
+
   /** Delete project metadata after its workflows, worlds, leases, and objects
    * have been removed by the service layer. Billing rows are retained but
    * detached from deleted resource identifiers. */
@@ -616,6 +782,11 @@ export class Store {
       this.db.prepare('DELETE FROM principal_grants WHERE scopeKey=?').run(scopeKey);
       this.db.prepare('DELETE FROM audit_log WHERE scopeKey=?').run(scopeKey);
       this.db.prepare('DELETE FROM attachment_scopes WHERE projectId=?').run(id);
+      this.db.prepare('DELETE FROM task_resource_pins WHERE taskId IN (SELECT id FROM tasks WHERE projectId=?)').run(id);
+      this.db.prepare('DELETE FROM task_resource_snapshots WHERE projectId=?').run(id);
+      this.db.prepare(`DELETE FROM project_resource_revisions WHERE resourceId IN
+        (SELECT id FROM project_resources WHERE projectId=?)`).run(id);
+      this.db.prepare('DELETE FROM project_resources WHERE projectId=?').run(id);
       this.deleteProjectKv([id], taskIds);
       for (const table of ['project_memberships', 'project_repositories', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id);
@@ -664,6 +835,7 @@ export class Store {
     if (!organization) throw new Error('organization not found');
     const projectIds = (this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const taskIds = rowsFor(this.db, 'tasks', 'projectId', projectIds).map((r) => String(r.id));
+    const resourceIds = rowsFor(this.db, 'project_resources', 'projectId', projectIds).map((r) => String(r.id));
     const teamIds = (this.db.prepare('SELECT id FROM teams WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const repositoryIds = (this.db.prepare('SELECT id FROM repositories WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const executionIds = (this.db.prepare('SELECT id FROM executions WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
@@ -683,6 +855,10 @@ export class Store {
       team_aliases: rowsFor(this.db, 'team_aliases', 'teamId', teamIds),
       projects: rowsFor(this.db, 'projects', 'id', projectIds),
       project_memberships: rowsFor(this.db, 'project_memberships', 'projectId', projectIds),
+      project_resources: rowsFor(this.db, 'project_resources', 'projectId', projectIds),
+      project_resource_revisions: rowsFor(this.db, 'project_resource_revisions', 'resourceId', resourceIds),
+      task_resource_pins: rowsFor(this.db, 'task_resource_pins', 'taskId', taskIds),
+      task_resource_snapshots: rowsFor(this.db, 'task_resource_snapshots', 'taskId', taskIds),
       task_lists: rowsFor(this.db, 'task_lists', 'projectId', projectIds),
       tasks: rowsFor(this.db, 'tasks', 'projectId', projectIds),
       task_intents: rowsFor(this.db, 'task_intents', 'id', intentIds),
@@ -776,6 +952,7 @@ export class Store {
     const projectIds = (this.db.prepare('SELECT id FROM projects WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const tasks = rowsFor(this.db, 'tasks', 'projectId', projectIds);
     const taskIds = tasks.map((r) => String(r.id));
+    const resourceIds = rowsFor(this.db, 'project_resources', 'projectId', projectIds).map((r) => String(r.id));
     const intentIds = tasks.map((r) => String(r.intentId)).filter(Boolean);
     const teamIds = (this.db.prepare('SELECT id FROM teams WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
     const repositoryIds = (this.db.prepare('SELECT id FROM repositories WHERE organizationId=?').all(organizationId) as any[]).map((r) => String(r.id));
@@ -808,6 +985,10 @@ export class Store {
       deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'attachment_scopes', 'projectId', projectIds);
+      deleteRows(this.db, 'task_resource_pins', 'taskId', taskIds);
+      deleteRows(this.db, 'task_resource_snapshots', 'taskId', taskIds);
+      deleteRows(this.db, 'project_resource_revisions', 'resourceId', resourceIds);
+      deleteRows(this.db, 'project_resources', 'id', resourceIds);
       this.deleteProjectKv(projectIds, taskIds);
       for (const table of ['project_memberships', 'project_repositories', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         deleteRows(this.db, table, 'projectId', projectIds);
@@ -1710,6 +1891,8 @@ export class Store {
     this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId);
     this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId);
     this.db.prepare('DELETE FROM task_subscribers WHERE taskId = ?').run(taskId);
+    this.db.prepare('DELETE FROM task_resource_pins WHERE taskId = ?').run(taskId);
+    this.db.prepare('DELETE FROM task_resource_snapshots WHERE taskId = ?').run(taskId);
     this.db.prepare('DELETE FROM inbox WHERE taskId = ?').run(taskId);
     this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
     if (prior?.intentId) {
@@ -2955,6 +3138,10 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
   positive(raw.resources?.memoryMb, 'memory', 128);
   positive(raw.resources?.gpu, 'GPU', 0);
   positive(raw.monthlyBudgetMicros, 'monthly budget', 0);
+  if (raw.setupCommands != null && (!Array.isArray(raw.setupCommands)
+    || raw.setupCommands.length > 20
+    || raw.setupCommands.some((command: unknown) => typeof command !== 'string' || command.length > 10_000)))
+    throw new Error('setupCommands must contain at most 20 shell command strings of at most 10,000 characters');
   if (raw.environment?.flavor != null && !['headless', 'desktop'].includes(raw.environment.flavor))
     throw new Error('environment flavor must be headless or desktop');
   // Zero is the explicit "hibernate on the next lifecycle sweep" value. It is
@@ -3099,6 +3286,24 @@ function providerDisplayName(provider: string): string {
 
 function rowToProject(r: any): Project {
   return { id: r.id, organizationId: r.organizationId ?? 'org_personal', name: r.name, createdAt: r.createdAt, config: JSON.parse(r.config) };
+}
+function rowToProjectResource(r: any): ProjectResource {
+  return {
+    id: String(r.id), projectId: String(r.projectId), name: String(r.name),
+    kind: String(r.kind) as ProjectResourceKind,
+    spec: JSON.parse(String(r.spec)) as ProjectResourceSpec,
+    currentRevisionId: r.currentRevisionId == null ? undefined : String(r.currentRevisionId),
+    secretConfigured: Boolean(r.secretConfigured),
+    createdAt: Number(r.createdAt), updatedAt: Number(r.updatedAt),
+    deletedAt: r.deletedAt == null ? undefined : Number(r.deletedAt),
+  };
+}
+function rowToProjectResourceRevision(r: any): ProjectResourceRevision {
+  return {
+    id: String(r.id), resourceId: String(r.resourceId), objectKey: String(r.objectKey),
+    sha256: String(r.sha256), bytes: Number(r.bytes),
+    mediaType: r.mediaType == null ? undefined : String(r.mediaType), createdAt: Number(r.createdAt),
+  };
 }
 function rowToTag(r: any): Tag {
   return {

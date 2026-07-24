@@ -38,6 +38,7 @@ import { E2BWorldProvider } from './world/e2b.js';
 import { DaytonaWorldProvider } from './world/daytona.js';
 import { WorldHandoffService } from './world/handoff.js';
 import { WorldAccessService } from './world/access.js';
+import { ProjectResourceService } from './world/resources.js';
 
 const VERSION = '1.0.0';
 
@@ -138,7 +139,8 @@ async function main() {
         secretAccessKey: requiredEnv('KARMAX_S3_SECRET_ACCESS_KEY'), sessionToken: process.env.KARMAX_S3_SESSION_TOKEN,
       })
     : new LocalObjectStore(p.objects);
-  const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp);
+  const projectResources = new ProjectResourceService(store, objectStore, broker);
+  const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, projectResources);
   const runners = new RunnerPoolService(store);
   const worldAccess = new WorldAccessService(store, worlds, runners);
   const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess);
@@ -188,6 +190,7 @@ async function main() {
     broker,
     githubApp,
     checkpoints,
+    projectResources,
     runners,
     payments,
     configHomes,
@@ -319,6 +322,7 @@ async function main() {
     runners,
     worldAccess,
     objects: objectStore,
+    projectResources,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
   });

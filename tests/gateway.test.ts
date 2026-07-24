@@ -124,6 +124,60 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(h.store.getTask(task.id)).toBeUndefined();
   });
 
+  it('manages write-only secrets and encrypted file revisions through project-scoped routes', async () => {
+    const project: any = await (await fetch(`${base}/api/projects`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ name: 'Resource API' }),
+    })).json();
+    const secretResponse = await fetch(`${base}/api/projects/${project.id}/resources`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        name: 'API token', spec: { kind: 'secret', inject: { env: 'API_TOKEN' } }, value: 'super-private',
+      }),
+    });
+    expect(secretResponse.status).toBe(201);
+    const secret: any = await secretResponse.json();
+    expect(secret.secretConfigured).toBe(true);
+    expect(JSON.stringify(secret)).not.toContain('super-private');
+
+    const file: any = await (await fetch(`${base}/api/projects/${project.id}/resources`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        name: 'Local config', spec: { kind: 'file', inject: { path: 'config/local.json' } },
+      }),
+    })).json();
+    const uploaded = await fetch(`${base}/api/projects/${project.id}/resources/${file.id}/revisions`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: Buffer.from('{"local":true}'),
+    });
+    expect(uploaded.status).toBe(201);
+    const revision: any = await uploaded.json();
+    expect(revision.objectKey).toBeUndefined();
+    expect(revision.sha256).toMatch(/^[a-f0-9]{64}$/);
+
+    const listed = await (await fetch(
+      `${base}/api/projects/${project.id}/resources`,
+      { headers: auth() },
+    )).json() as any[];
+    expect(JSON.stringify(listed)).not.toContain('objectKey');
+    expect(listed.find((resource) => resource.id === file.id).revisions[0].id).toBe(revision.id);
+    const downloaded = await fetch(
+      `${base}/api/projects/${project.id}/resources/${file.id}/revisions/${revision.id}`,
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(downloaded.status).toBe(200);
+    expect(await downloaded.text()).toBe('{"local":true}');
+
+    const setup = await fetch(`${base}/api/projects/${project.id}`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({ config: { setupCommands: ['npm run db:migrate'] } }),
+    });
+    expect(setup.status).toBe(200);
+    const updatedProject = await setup.json() as any;
+    expect(updatedProject.config.setupCommands).toEqual(['npm run db:migrate']);
+    const removed = await fetch(`${base}/api/projects/${project.id}`, { method: 'DELETE', headers: auth() });
+    expect(removed.status).toBe(200);
+    expect(h.store.getProjectResource(secret.id)).toBeUndefined();
+    expect(h.store.getProjectResource(file.id)).toBeUndefined();
+  });
+
   it('drives a full task lifecycle over HTTP and lands work', async () => {
     const repo = await h.makeRepo('gw');
     // create a project pointed at the repo

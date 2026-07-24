@@ -6431,10 +6431,18 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-compute">Compute</a><a href="#project-resources-section">Resources</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
     <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
+    <div class="settings-section-title" id="project-resources-section"><div>Resources<small>Secrets, non-Git files, large immutable inputs, and development databases</small></div></div>
+    <div class="card">
+      <div class="section-h">World setup</div>
+      <p class="task-sub">These idempotent commands run after resources are mounted in every new or restored task world. Put schema migrations, dependency setup, or generated-file steps here—one shell command per line.</p>
+      <textarea id="project-setup-commands" rows="4" placeholder="npm ci&#10;npm run db:migrate">${esc((proj.config.setupCommands || []).join('\n'))}</textarea>
+      <div class="inline-form"><button class="btn sm primary" id="project-setup-save">Save setup commands</button></div>
+    </div>
+    <div class="card"><div id="project-resources">Loading resources…</div></div>
     <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
     <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage organization agent logins</a><div class="settings-divider"></div><div class="section-h">Credential order for this project</div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
@@ -6557,6 +6565,152 @@ async function hydrateWorkflowPins(projectId) {
     } catch (e) { toast(e.message, true); }
   }));
 }
+function projectResourceTarget(resource) {
+  const spec = resource.spec;
+  if (spec.kind === 'secret') return [spec.inject.env, spec.inject.path].filter(Boolean).join(' · ');
+  if (spec.kind === 'file') return spec.inject.path;
+  if (spec.kind === 'external') return `${spec.inject.path} · ${spec.uri}`;
+  return spec.driver === 'sqlite' ? `${spec.env || 'DATABASE_URL'} · ${spec.path || '.karmax-data/development.sqlite'}`
+    : `${spec.env || 'DATABASE_URL'} · managed externally`;
+}
+async function downloadProjectResource(proj, resource, revision) {
+  const response = await fetch(`/api/projects/${encodeURIComponent(proj.id)}/resources/${encodeURIComponent(resource.id)}/revisions/${encodeURIComponent(revision.id)}`, {
+    headers: S.token ? { authorization: `Bearer ${S.token}` } : {},
+  });
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try { message = (await response.json()).error || message; } catch { /* binary/non-JSON error */ }
+    throw new Error(message);
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.href = url; link.download = resource.name; document.body.appendChild(link); link.click(); link.remove();
+  URL.revokeObjectURL(url);
+}
+async function hydrateProjectResources(proj) {
+  const box = $('#project-resources');
+  if (!box) return;
+  const setupSave = $('#project-setup-save');
+  if (setupSave) setupSave.onclick = async () => {
+    const setupCommands = $('#project-setup-commands').value.split('\n').map((command) => command.trim()).filter(Boolean);
+    try {
+      await api(`/api/projects/${proj.id}`, { method: 'PATCH', body: JSON.stringify({ config: { setupCommands } }) });
+      await loadProjects(); toast('Setup commands saved');
+    } catch (error) { toast(error.message, true); }
+  };
+  let resources;
+  try { resources = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`); }
+  catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; return; }
+  const secrets = resources.filter((resource) => resource.kind === 'secret');
+  box.innerHTML = `<div class="section-h">Project resources</div>
+    <p class="task-sub">Resource definitions are versioned control-plane metadata. Uploaded bytes are encrypted and pinned to a task; secret values are injected only when a process starts and are never returned here. Secret file targets must be covered by the repository's <code>.gitignore</code>. External objects stay in their source store and are verified by SHA-256.</p>
+    <div id="project-resource-list">${resources.map((resource) => {
+      const latest = resource.revisions?.[0];
+      const configured = resource.kind === 'secret' || (resource.kind === 'database' && resource.spec.driver === 'external')
+        ? (resource.secretConfigured ? 'configured' : 'missing value')
+        : resource.kind === 'file' ? (latest ? `${latest.bytes.toLocaleString()} bytes · ${latest.sha256.slice(0, 12)}` : 'missing upload')
+        : resource.kind === 'external' ? `SHA ${resource.spec.sha256.slice(0, 12)}` : 'task-local state';
+      const acceptsValue = resource.kind === 'secret' || (resource.kind === 'database' && resource.spec.driver === 'external');
+      return `<div class="queue-item" data-project-resource="${esc(resource.id)}">
+        <div style="flex:1;min-width:0"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.kind)}</span>
+          ${resource.spec.mutable ? '<span class="chip">checkpointed</span>' : ''}
+          <div class="task-sub">${esc(projectResourceTarget(resource) || 'No injection target')} · ${esc(configured)}</div>
+        </div>
+        ${acceptsValue ? '<input class="project-resource-value" type="password" autocomplete="new-password" placeholder="New value"><button class="btn sm project-resource-rotate">Replace</button>' : ''}
+        ${resource.kind === 'file' ? `<input class="project-resource-upload-input" type="file"><button class="btn sm project-resource-upload">Upload revision</button>${latest ? '<button class="btn sm project-resource-download">Download</button>' : ''}` : ''}
+        <button class="btn sm danger project-resource-delete">Delete</button>
+      </div>`;
+    }).join('') || '<p class="task-sub">No project resources yet.</p>'}</div>
+    <div class="settings-divider"></div>
+    <details class="settings-disclosure" open><summary><b>Add resource</b></summary>
+      <div class="inline-form">
+        <label>Name <input id="project-resource-name" placeholder="Development database"></label>
+        <label>Kind <select id="project-resource-kind"><option value="secret">Secret</option><option value="file">Uploaded file</option><option value="external">External object</option><option value="database">Database</option></select></label>
+      </div>
+      <label>Description <input id="project-resource-description" placeholder="Optional explanation for maintainers"></label>
+      <div class="project-resource-fields" data-resource-fields="secret">
+        <div class="inline-form"><label>Environment variable <input id="project-resource-env" placeholder="API_TOKEN"></label><label>World path (optional) <input id="project-resource-secret-path" placeholder=".env.local"></label></div>
+        <label>Secret value <input id="project-resource-secret-value" type="password" autocomplete="new-password" placeholder="Stored write-only"></label>
+      </div>
+      <div class="project-resource-fields" data-resource-fields="file" hidden>
+        <div class="inline-form"><label>World path <input id="project-resource-file-path" placeholder="config/local.json"></label><label>Repository (multi-repo only) <input id="project-resource-file-repo"></label></div>
+        <label>File <input id="project-resource-file" type="file"></label>
+        <div class="inline-form"><label class="switch"><input id="project-resource-file-mutable" type="checkbox"><span>Checkpoint changes</span></label><label class="switch"><input id="project-resource-file-readonly" type="checkbox"><span>Read-only</span></label></div>
+      </div>
+      <div class="project-resource-fields" data-resource-fields="external" hidden>
+        <div class="inline-form"><label>HTTP(S) URL (non-secret) <input id="project-resource-uri" placeholder="https://objects.example/model.bin"></label><label>SHA-256 <input id="project-resource-sha" placeholder="64 hexadecimal characters"></label></div>
+        <div class="inline-form"><label>World path <input id="project-resource-external-path" placeholder="models/model.bin"></label><label>Repository (multi-repo only) <input id="project-resource-external-repo"></label></div>
+        <label>Bearer-token secret <select id="project-resource-credential"><option value="">None</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select></label>
+        <div class="inline-form"><label class="switch"><input id="project-resource-external-mutable" type="checkbox"><span>Checkpoint changes</span></label><label class="switch"><input id="project-resource-external-readonly" type="checkbox" checked><span>Read-only</span></label></div>
+      </div>
+      <div class="project-resource-fields" data-resource-fields="database" hidden>
+        <div class="inline-form"><label>Driver <select id="project-resource-db-driver"><option value="sqlite">Task-local SQLite</option><option value="external">External connection URL</option></select></label><label>Environment variable <input id="project-resource-db-env" value="DATABASE_URL"></label></div>
+        <div data-db-fields="sqlite"><div class="inline-form"><label>World path <input id="project-resource-db-path" value=".karmax-data/development.sqlite"></label><label>Repository (multi-repo only) <input id="project-resource-db-repo"></label></div><label class="switch"><input id="project-resource-db-mutable" type="checkbox" checked><span>Checkpoint database state</span></label></div>
+        <label data-db-fields="external" hidden>Connection URL <input id="project-resource-db-value" type="password" autocomplete="new-password" placeholder="Stored write-only"></label>
+      </div>
+      <div class="inline-form"><button class="btn sm primary" id="project-resource-create">Add resource</button></div>
+    </details>`;
+  const showResourceFields = () => {
+    const kind = $('#project-resource-kind').value;
+    box.querySelectorAll('[data-resource-fields]').forEach((fields) => { fields.hidden = fields.dataset.resourceFields !== kind; });
+  };
+  const showDatabaseFields = () => {
+    const driver = $('#project-resource-db-driver').value;
+    box.querySelectorAll('[data-db-fields]').forEach((fields) => { fields.hidden = fields.dataset.dbFields !== driver; });
+  };
+  $('#project-resource-kind')?.addEventListener('change', showResourceFields);
+  $('#project-resource-db-driver')?.addEventListener('change', showDatabaseFields);
+  box.querySelectorAll('[data-project-resource]').forEach((row) => {
+    const resource = resources.find((candidate) => candidate.id === row.dataset.projectResource);
+    row.querySelector('.project-resource-delete')?.addEventListener('click', async () => {
+      if (!confirm(`Delete resource "${resource.name}"? Existing tasks keep their pinned version; new tasks will not receive it.`)) return;
+      try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectResources(proj); }
+      catch (error) { toast(error.message, true); }
+    });
+    row.querySelector('.project-resource-rotate')?.addEventListener('click', async () => {
+      const value = row.querySelector('.project-resource-value').value;
+      if (!value) return toast('Enter the replacement value', true);
+      try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ value }) }); toast('Resource value replaced'); await hydrateProjectResources(proj); }
+      catch (error) { toast(error.message, true); }
+    });
+    row.querySelector('.project-resource-upload')?.addEventListener('click', async () => {
+      const file = row.querySelector('.project-resource-upload-input').files[0];
+      if (!file) return toast('Choose a file first', true);
+      try { await api(`/api/projects/${proj.id}/resources/${resource.id}/revisions`, { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream' }, body: file }); toast('Resource revision uploaded'); await hydrateProjectResources(proj); }
+      catch (error) { toast(error.message, true); }
+    });
+    row.querySelector('.project-resource-download')?.addEventListener('click', async () => {
+      try { await downloadProjectResource(proj, resource, resource.revisions[0]); }
+      catch (error) { toast(error.message, true); }
+    });
+  });
+  $('#project-resource-create')?.addEventListener('click', async () => {
+    const kind = $('#project-resource-kind').value;
+    const description = $('#project-resource-description').value.trim() || undefined;
+    const repository = (id) => $(id).value.trim() || undefined;
+    let spec; let value; let upload;
+    if (kind === 'secret') {
+      spec = { kind, description, inject: { env: $('#project-resource-env').value.trim() || undefined, path: $('#project-resource-secret-path').value.trim() || undefined } };
+      value = $('#project-resource-secret-value').value;
+    } else if (kind === 'file') {
+      spec = { kind, description, inject: { path: $('#project-resource-file-path').value.trim(), repository: repository('#project-resource-file-repo') }, mutable: $('#project-resource-file-mutable').checked, readOnly: $('#project-resource-file-readonly').checked };
+      upload = $('#project-resource-file').files[0];
+    } else if (kind === 'external') {
+      spec = { kind, description, uri: $('#project-resource-uri').value.trim(), sha256: $('#project-resource-sha').value.trim(), inject: { path: $('#project-resource-external-path').value.trim(), repository: repository('#project-resource-external-repo') }, credentialResourceId: $('#project-resource-credential').value || undefined, mutable: $('#project-resource-external-mutable').checked, readOnly: $('#project-resource-external-readonly').checked };
+    } else {
+      const driver = $('#project-resource-db-driver').value;
+      spec = { kind, description, driver, env: $('#project-resource-db-env').value.trim() || 'DATABASE_URL',
+        ...(driver === 'sqlite' ? { path: $('#project-resource-db-path').value.trim(), repository: repository('#project-resource-db-repo'), mutable: $('#project-resource-db-mutable').checked } : {}) };
+      if (driver === 'external') value = $('#project-resource-db-value').value;
+    }
+    try {
+      const resource = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name: $('#project-resource-name').value.trim(), spec, value }) });
+      if (upload) await api(`/api/projects/${proj.id}/resources/${resource.id}/revisions`, { method: 'POST', headers: { 'content-type': upload.type || 'application/octet-stream' }, body: upload });
+      toast('Project resource added');
+      await hydrateProjectResources(proj);
+    } catch (error) { toast(error.message, true); }
+  });
+}
 function wireSettingsView(proj) {
   wireSettingsNavigation();
   $('#main').querySelectorAll('.organization-settings-link').forEach((link) => link.addEventListener('click', (event) => {
@@ -6565,6 +6719,7 @@ function wireSettingsView(proj) {
   }));
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
+  hydrateProjectResources(proj);
   hydrateProjectGitProfile(proj);
   hydrateSettingsForms('project', proj.id);
   hydrateQuickSettingsForms('project', proj.id);

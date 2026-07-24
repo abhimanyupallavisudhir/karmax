@@ -4,6 +4,10 @@ export const PLATFORM_API_CATALOG = {
   projects: [
     'GET|POST /api/projects', 'GET|PATCH|DELETE /api/projects/:projectId',
     'GET|POST /api/projects/:projectId/workflow-pins',
+    'GET|POST /api/projects/:projectId/resources',
+    'PATCH|DELETE /api/projects/:projectId/resources/:resourceId',
+    'POST /api/projects/:projectId/resources/:resourceId/revisions',
+    'GET /api/projects/:projectId/resources/:resourceId/revisions/:revisionId',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',

@@ -21,7 +21,8 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef } from '../domain/types.js';
+import { AgentSpec, Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef,
+  ProjectResource, ProjectResourceRevision } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -66,6 +67,7 @@ export interface GatewayDeps {
   runners?: import('../world/runners.js').RunnerPoolService;
   worldAccess?: import('../world/access.js').WorldAccessService;
   objects?: ObjectStore;
+  projectResources?: import('../world/resources.js').ProjectResourceService;
   cellId?: string;
   hosted?: boolean;
 }
@@ -127,6 +129,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/resources(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
@@ -265,6 +268,7 @@ export const DEFAULT_GATEWAY_PORT = 4505;
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 const MAX_PREVIEW_REQUEST_BYTES = 16 * 1024 * 1024;
+const MAX_PROJECT_RESOURCE_BYTES = positiveEnvInt('KARMAX_MAX_RESOURCE_BYTES', 512 * 1024 * 1024);
 const PREVIEW_REQUEST_HEADERS = new Set([
   'accept', 'accept-language', 'content-type', 'if-match', 'if-modified-since',
   'if-none-match', 'if-unmodified-since', 'range', 'user-agent',
@@ -317,7 +321,9 @@ export class Gateway {
   private fanout: DurableEventFanout;
 
   constructor(private deps: GatewayDeps) {
-    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess);
+    this.reviewActions = new ReviewActionRunner(
+      deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.projectResources,
+    );
     this.fanout = new DurableEventFanout(deps.store, deps.bus);
   }
 
@@ -469,7 +475,8 @@ export class Gateway {
         kind: 'terminal', label: 'Interactive terminal', command: '$SHELL', server: false,
         openUrls: [], runnerLeaseId: worldLeaseId });
       const world = await this.deps.worlds.open(handle);
-      term = await world.openPty({ cols: 80, rows: 24 });
+      const env = this.deps.projectResources?.environment(taskId, world, projectRecord.id) ?? {};
+      term = await world.openPty({ cols: 80, rows: 24, env });
       this.deps.store.setExecutionRunning(executionId);
       this.deps.store.appendExecutionFrame(executionId, 'Terminal opened.\n', 'system');
     } catch (error) {
@@ -1387,6 +1394,107 @@ export class Gateway {
           for (const attachmentId of resources.attachmentIds)
             if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
           return this.json(res, 200, { deleted: true, projectId: id });
+        }
+      }
+      const projectResources = p.match(/^\/api\/projects\/([^/]+)\/resources$/);
+      if (projectResources) {
+        const projectId = projectResources[1]!;
+        if (!store.getProject(projectId)) return this.json(res, 404, { error: 'project not found' });
+        if (!this.deps.projectResources) return this.json(res, 503, { error: 'project resource service is unavailable' });
+        try {
+          if (method === 'GET')
+            return this.json(res, 200, this.deps.projectResources.list(projectId).map(publicProjectResource));
+          if (method === 'POST') {
+            const b = await this.body(req);
+            const resource = this.deps.projectResources.create(projectId, {
+              name: String(b.name ?? ''), spec: b.spec, value: typeof b.value === 'string' ? b.value : undefined,
+            });
+            return this.json(res, 201, publicProjectResource({ ...resource, revisions: [] }));
+          }
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      const projectResourceRevision = p.match(
+        /^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/revisions\/([^/]+)$/,
+      );
+      if (projectResourceRevision) {
+        const [, projectId, resourceId, revisionId] = projectResourceRevision;
+        const resource = store.getProjectResource(resourceId!);
+        if (!resource || resource.projectId !== projectId || resource.deletedAt)
+          return this.json(res, 404, { error: 'resource not found' });
+        if (!this.deps.projectResources) return this.json(res, 503, { error: 'project resource service is unavailable' });
+        if (method === 'GET') {
+          try {
+            const revision = store.getProjectResourceRevision(revisionId!);
+            if (!revision || revision.resourceId !== resource.id)
+              return this.json(res, 404, { error: 'resource revision not found' });
+            const data = await this.deps.projectResources.readRevision(resource.id, revision.id);
+            const filename = resource.name.replace(/[^A-Za-z0-9_.-]/g, '_') || 'resource';
+            res.writeHead(200, {
+              'content-type': revision.mediaType ?? 'application/octet-stream',
+              'content-length': String(data.length),
+              'content-disposition': `attachment; filename="${filename}"`,
+              'x-content-type-options': 'nosniff',
+              'x-karmax-cell': this.deps.cellId ?? 'local',
+            });
+            res.end(data);
+            return;
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      }
+      const projectResourceRevisions = p.match(
+        /^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/revisions$/,
+      );
+      if (projectResourceRevisions) {
+        const [, projectId, resourceId] = projectResourceRevisions;
+        const resource = store.getProjectResource(resourceId!);
+        if (!resource || resource.projectId !== projectId || resource.deletedAt)
+          return this.json(res, 404, { error: 'resource not found' });
+        if (!this.deps.projectResources) return this.json(res, 503, { error: 'project resource service is unavailable' });
+        if (method === 'POST') {
+          try {
+            const data = await this.rawBody(req, MAX_PROJECT_RESOURCE_BYTES);
+            const revision = await this.deps.projectResources.upload(
+              resource.id, data, String(req.headers['content-type'] ?? 'application/octet-stream'),
+            );
+            return this.json(res, 201, publicProjectResourceRevision(revision));
+          } catch (error) {
+            const tooLarge = error instanceof AttachmentError && /too large/i.test(error.message);
+            return this.json(res, tooLarge ? 413 : 400, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+      const projectResource = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)$/);
+      if (projectResource) {
+        const [, projectId, resourceId] = projectResource;
+        const resource = store.getProjectResource(resourceId!);
+        if (!resource || resource.projectId !== projectId || resource.deletedAt)
+          return this.json(res, 404, { error: 'resource not found' });
+        if (!this.deps.projectResources) return this.json(res, 503, { error: 'project resource service is unavailable' });
+        try {
+          if (method === 'PATCH') {
+            const b = await this.body(req);
+            const updated = this.deps.projectResources.update(resource.id, {
+              name: typeof b.name === 'string' ? b.name : undefined,
+              spec: b.spec,
+              value: typeof b.value === 'string' ? b.value : undefined,
+            });
+            return this.json(res, 200, publicProjectResource({
+              ...updated, revisions: updated.kind === 'file'
+                ? store.listProjectResourceRevisions(updated.id) : [],
+            }));
+          }
+          if (method === 'DELETE') {
+            this.deps.projectResources.delete(resource.id);
+            return this.json(res, 200, { deleted: true, resourceId: resource.id });
+          }
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
       }
       const projectExecution = p.match(/^\/api\/projects\/([^/]+)\/execution-policy$/);
@@ -3174,6 +3282,7 @@ export class Gateway {
     if (resources.objectKeys.length && !this.deps.objects)
       throw new Error('object store is unavailable; project resources were not fully deleted');
     for (const key of resources.objectKeys) await this.deps.objects!.delete(key);
+    await this.deps.projectResources?.purgeProject(projectId);
     return resources;
   }
 
@@ -3426,6 +3535,23 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
 }
 
+function publicProjectResource(resource: ProjectResource & { revisions: ProjectResourceRevision[] }) {
+  return {
+    ...resource,
+    revisions: resource.revisions.map(publicProjectResourceRevision),
+  };
+}
+
+function publicProjectResourceRevision(revision: ProjectResourceRevision) {
+  const { objectKey: _privateObjectKey, ...publicRevision } = revision;
+  return publicRevision;
+}
+
+function positiveEnvInt(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
 /** Expand ~ / $HOME in repo paths so a configured repo resolves to a real dir. */
 function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = false): ProjectConfig {
   if (process.env.KARMAX_DEPLOYMENT === 'hosted') {
@@ -3436,9 +3562,15 @@ function normalizeConfig(config: ProjectConfig = {}, defaultHostedProvider = fal
       throw new Error('hosted projects require a remote world provider');
     if (worldProvider) config = { ...config, worldProvider };
   }
-  if (Array.isArray(config.repos)) {
-    return { ...config, repos: config.repos.filter(Boolean).map(expandPath) };
+  if (config.setupCommands !== undefined) {
+    if (!Array.isArray(config.setupCommands) || config.setupCommands.some((command) => typeof command !== 'string'))
+      throw new Error('setupCommands must be an array of shell command strings');
+    if (config.setupCommands.length > 20 || config.setupCommands.some((command) => command.length > 10_000))
+      throw new Error('setupCommands exceeds the project setup limit');
+    config = { ...config, setupCommands: config.setupCommands.map((command) => command.trim()).filter(Boolean) };
   }
+  if (Array.isArray(config.repos))
+    config = { ...config, repos: config.repos.filter(Boolean).map(expandPath) };
   return config;
 }
 
