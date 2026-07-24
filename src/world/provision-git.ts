@@ -1,6 +1,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import type { WorldRepo, WorldSpec } from './types.js';
+import { git, isGitRepo } from './git.js';
 
 /** Minimal command/file surface a cloud sandbox exposes during trusted
  * provisioning. Adapters normalize the provider SDK's result shape and convert
@@ -83,6 +85,8 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
       ? `GIT_SSH_COMMAND=${quote(`ssh -i ${credentialFile(options.home, keyIndex)} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`)} `
       : '';
     await cloneWithRetry(target, `${ssh}git clone -q --origin origin ${quote(source)} ${quote(repoRoot)}`, repoRoot);
+    const localPath = spec.copySources?.[index];
+    if (localPath) await seedFromLocalCheckout(target, repoRoot, localPath, [base, spec.branch], names[index]!, warnings);
     const requested = spec.branch ?? base;
     const remoteRef = `refs/remotes/origin/${requested}`;
     const refCheck = await target.run(`git -C ${quote(repoRoot)} show-ref --verify --quiet ${quote(remoteRef)}`, 120_000);
@@ -93,7 +97,8 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     const baseSha = resolved.stdout.trim();
     if (!/^[0-9a-f]{40,64}$/i.test(baseSha)) throw new Error(`repository "${source}" has no resolvable base commit`);
     await configureRepo(target, repoRoot, spec, branch, true, remoteRefExists, base);
-    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base, target: targetBranch, baseSha });
+    repos.push({ name: names[index]!, repo: source, root: repoRoot, branch, base, target: targetBranch, baseSha,
+      ...(localPath ? { localPath } : {}) });
   }
   if (spec.copyGlobs?.length) {
     let copied = 0;
@@ -105,6 +110,52 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     if (!copied) warnings.push(options.copyGlobsWarning);
   }
   return { root, repos, warnings };
+}
+
+/** Rewrite the sandbox's remote-tracking refs with the host checkout's truth.
+ * A world provisioned from a local-path repo must fork off the LOCAL branch
+ * state: the checkout is the authoritative repository (merges land there, see
+ * git-broker.ts) and origin is only clone transport, so origin may lag it
+ * indefinitely. Seeding runs right after the clone and overwrites
+ * `refs/remotes/origin/<ref>`, leaving the rest of provisioning (branch
+ * checkout, baseSha resolution) untouched. Best-effort: on failure the world
+ * falls back to origin's state, with a warning that says so. */
+async function seedFromLocalCheckout(target: ProvisionTarget, repoRoot: string, localRepo: string,
+  refs: Array<string | undefined>, name: string, warnings: string[]): Promise<void> {
+  const wanted = [...new Set(refs.filter((ref): ref is string => Boolean(ref)))];
+  try {
+    if (!(await isGitRepo(localRepo))) return;
+    const seeds: string[] = [];
+    const bases: string[] = [];
+    for (const ref of wanted) {
+      const local = await git(localRepo, ['rev-parse', '--verify', '--quiet', `refs/heads/${ref}`]);
+      if (local.code !== 0) continue; // ref lives only on origin (if anywhere) — the clone state stands
+      const localSha = local.stdout.trim();
+      const origin = await target.run(`git -C ${quote(repoRoot)} rev-parse --verify --quiet ${quote(`refs/remotes/origin/${ref}`)}`, 120_000);
+      const originSha = origin.code === 0 ? origin.stdout.trim() : undefined;
+      if (originSha === localSha) continue;
+      if (originSha && (await git(localRepo, ['cat-file', '-e', `${originSha}^{commit}`])).code === 0) bases.push(originSha);
+      else if (originSha) warnings.push(`repo "${name}": origin/${ref} has commits the local checkout lacks — the world forked off the local state`);
+      seeds.push(ref);
+    }
+    if (!seeds.length) return;
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-world-seed-'));
+    try {
+      const bundlePath = path.join(temp, 'seed.bundle');
+      const bundled = await git(localRepo, ['bundle', 'create', bundlePath,
+        ...seeds.map((ref) => `refs/heads/${ref}`), ...(bases.length ? ['--not', ...bases] : [])]);
+      if (bundled.code !== 0) throw new Error(bundled.stderr || bundled.stdout);
+      const bundleName = '.karmax-seed.bundle';
+      const bundleRemote = path.posix.join(repoRoot, bundleName);
+      await target.writeFile(bundleRemote, fs.readFileSync(bundlePath));
+      const refspecs = seeds.map((ref) => quote(`+refs/heads/${ref}:refs/remotes/origin/${ref}`)).join(' ');
+      await runOrThrow(target, `git -C ${quote(repoRoot)} fetch ${quote(bundleName)} ${refspecs} && rm -f ${quote(bundleRemote)}`);
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  } catch (error) {
+    warnings.push(`repo "${name}": could not seed from local checkout ${localRepo} — using its origin state (${error instanceof Error ? error.message : String(error)})`);
+  }
 }
 
 async function uploadCopyGlobs(target: ProvisionTarget, sourceRoot: string, remoteRoot: string, globs: string[]): Promise<number> {

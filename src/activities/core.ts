@@ -19,6 +19,7 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
+import { git as hostGit } from '../world/git.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
@@ -1242,9 +1243,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const pushed: string[] = [];
       const skipped: string[] = [];
       if (isRemote(handle.kind)) {
-        // brokerFinalizeMerge already performed the authenticated target push;
-        // report the policy step as satisfied without re-exporting credentials.
-        pushed.push(...worldRepos(handle).map((repo) => repo.name));
+        for (const r of worldRepos(handle)) {
+          if (!r.localPath) {
+            // brokerFinalizeMerge already performed the authenticated target push;
+            // report the policy step as satisfied without re-exporting credentials.
+            pushed.push(r.name);
+            continue;
+          }
+          // Locally-authoritative repo: the broker landed the merge in the local
+          // checkout and pushed nothing, so the policy push runs from there —
+          // exactly like a worktree world's.
+          const repoTarget = r.target ?? target;
+          const push = await hostGit(r.localPath, ['push', 'origin', repoTarget], { env });
+          if (push.code === 0) {
+            pushed.push(r.name);
+            record(handle.id, 'push.done', { repo: r.name, target: repoTarget });
+          } else {
+            skipped.push(r.name);
+            record(handle.id, 'push.failed', { repo: r.name, target: repoTarget, detail: (push.stderr || push.stdout).slice(0, 300) });
+          }
+        }
         return { pushed, skipped };
       }
       for (const r of worldRepos(handle)) {

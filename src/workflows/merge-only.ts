@@ -275,7 +275,9 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
   // Commit `target` to the merge-queue domain — no await between locking and
   // reading it, so a queued edit can't desync the domain (SPEC §5.5).
   targetLocked = true;
-  const domain = `${world!.repo ?? input.projectId}:${target}`;
+  // The authoritative repo keys the domain (see mergeDomains in software-dev):
+  // a cloud world from a local checkout serializes with worktree worlds of it.
+  const domain = `${world!.repos?.[0]?.localPath ?? world!.repo ?? input.projectId}:${target}`;
   await coord.enqueueMerge(domain, taskId);
   if (managedTurns) {
     status = 'waiting';
