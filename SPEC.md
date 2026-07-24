@@ -267,7 +267,7 @@ export async function softwareDev(task: TaskInput) {
     (stage === 'do' || stage === 'review') ? (target = b, true) : false);
 
   await withResolve(() => stage, async () => {        // try/catch -> auto-resolve -> Resolve agent
-    const world = await act.createWorld(task.base, project.copyGlobs);
+    const world = await act.createWorld(task.base, project.resourceAttachments);
     let session;
     for (stage = 'do' ;; ) {
       const turn = await act.runAgentTurn(profiles.do, world, msgs, session);
@@ -475,7 +475,7 @@ the per-user inbox is a materialized projection of those workflow events.
 
 Just as a workflow declares its events (§5), capabilities (§8), and UI slots (§10.1), it declares its **parameters**: a typed `params` schema in the manifest. This single declaration drives three surfaces, so there is exactly one source of truth and no per-surface guessing (the "declare, don't guess" rule, §0):
 
-1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, copy-globs, PR toggle, and workflow-owned Review route).
+1. **The task form** — the expanded "new task" composer. The quick one-line composer stays for fast capture; an *expand* affordance reveals the full form rendered from the schema (e.g. for software-dev: a multi-line prompt textarea, an **agent field** per role, base/target branch, resource overrides, PR toggle, and workflow-owned Review route).
 2. **The project-settings form** — shared task defaults plus workflow-unique fields at project scope. Repository sources render once as a repeatable datalist accepting connected GitHub SSH URLs or, when self-hosted, local paths.
 3. **The organization-settings form** — the matching shared-default model at organization scope (the schema retains the historical `global` spelling on the wire). Shared values live in `__common__`; historical workflow rows remain compatible overlays.
 
@@ -636,6 +636,68 @@ checkpoint portably, and return Git changes through the host-side broker without
 retaining write credentials after provisioning. Organization-scoped runner pools,
 capacity/budget leases, usage attribution, portable restore, and generation fencing
 complete the managed-runner baseline described in `PLAN-cloud.md`.
+
+### 11.4 Project resources: state beyond Git
+
+**Git is one source driver, not the definition of a project.** A world is
+assembled from an immutable environment, zero or more Git checkouts, versioned
+project resources, and ephemeral credential injections. This composition is the
+same for a local worktree, a container, and a hosted sandbox.
+
+A **resource attachment** is a control-plane record connecting a project to
+something tasks need: a secret, object tree, mutable volume, database, or external
+service. It names an open-registry driver, a world target (path, environment
+variable, or service), read/write access, `fork` or `shared` isolation, an optional
+immutable revision, non-secret driver configuration, and vault handles. A task
+receives a scoped **resource lease** bound to its task id and world generation;
+it never receives the attachment's durable credentials.
+
+The default is read-only or a task-private copy-on-write fork. **Writable shared
+state is exceptional:** it requires an explicit capability and is visibly audited.
+This preserves the one-world-per-attempt isolation guarantee. There is no generic
+non-Git merge because files, object collections, databases, and external services
+do not share consistency semantics. At Review, each driver instead describes its
+changes and may offer an explicit, optimistic-concurrency-checked **Publish**
+operation that creates/promotes a new resource revision. Git commits continue
+through the Git merge queue; external side effects are recorded as side effects,
+not retroactively called a merge.
+
+Only attachment ids, immutable revision ids, and non-secret lease ids may enter
+workflow history and world handles. Raw secret values, signed object URLs, live
+database URLs, and provider tokens are resolved just in time by activities and
+placed on a non-checkpointed injection surface. Checkpoint restore always mints
+new leases. Resource drivers own idempotent prepare/materialize/diff/publish/release
+hooks, quiescing requirements, retention, and provider-specific acceleration.
+
+The portable filesystem resource is an encrypted content-addressed snapshot.
+Karmax owns the resource-revision envelope, policy, identity, and lease semantics;
+a replaceable snapshot-engine adapter owns chunking, encryption, packing,
+verification, and garbage collection. Karmax must use a proven engine rather than
+inventing a backup format. Provider snapshots and local bind mounts are fast paths,
+never the only durable representation. Database drivers use native branching when
+available or restore a task-private snapshot; non-clonable production databases
+are accurately marked shared. This keeps snapshot engines, object storage,
+database vendors, and runner providers replaceable behind the same contract.
+
+Resource publication is serialized through a durable singleton coordinator per
+attachment, reusing the merge queue's lease/position/audit pattern. Optimistic
+revision checks still run at the front of that queue to detect an earlier publish.
+Multi-resource publication acquires attachment coordinators in stable id order.
+
+Project onboarding scans an existing working directory or connected repository
+for ignored files, likely secrets, large directories, embedded databases, and
+declared container volumes, then proposes attachments. It uploads nothing until
+the user accepts the classification, never silently uploads likely secrets, and
+never silently grants writable production access. A generated
+`.karmax/resources.yaml` is optional export, not required repository structure.
+Most tasks inherit project attachments without showing another form.
+
+`copyGlobs` is a deprecated, self-hosted compatibility/import adapter. Historical
+projects remain readable, but new hosted projects use vault injection and resource
+revisions. A copied ignored file is task-private and non-publishable; it is never
+the hosted transport or a checkpointed source of project state. See
+`PLAN-project-resources.md` for the driver contract, built-in drivers, onboarding,
+publication, migration, and delivery order.
 
 ---
 

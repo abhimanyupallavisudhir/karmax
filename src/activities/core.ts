@@ -183,6 +183,7 @@ export interface CoreActivityDeps {
   runners?: import('../world/runners.js').RunnerPoolService;
   payments?: PaymentProvider;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
+  resources?: import('../world/resources.js').ProjectResourceService;
 }
 
 export interface CreateWorldArgs {
@@ -364,7 +365,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   async function openWorld(handle: WorldHandle, taskId = handle.id): Promise<World> {
-    return worlds.open(await ensureRunnerLease(handle, taskId));
+    const world = await worlds.open(await ensureRunnerLease(handle, taskId));
+    return deps.resources ? await deps.resources.prepare(world) : world;
   }
 
   return {
@@ -469,6 +471,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw error;
       }
       try {
+        if (projectId && deps.resources) {
+          const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
+          world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation);
+        }
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
           repositoryIds: linkedRepositories.map((candidate) => candidate.repository.id) };
@@ -1293,6 +1299,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const current = (store.currentWorld(handle.id) ?? handle) as WorldHandle;
       const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
       try {
+        await deps.resources?.release(current);
         const world = await worlds.open(handle);
         await world.destroy();
         store.setWorldState((store.currentWorld(handle.id) ?? current) as WorldHandle, 'released');
@@ -1363,7 +1370,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return { pushed, skipped };
       }
       for (const r of worldRepos(handle)) {
-        const repoTarget = r.target ?? target;
+        const repoTarget = r.targetPinned === false ? target : (r.target ?? target);
         const hasOrigin = await world.exec('git', ['remote', 'get-url', 'origin'], { cwd: r.repo, env });
         if (hasOrigin.code !== 0) {
           skipped.push(r.name);

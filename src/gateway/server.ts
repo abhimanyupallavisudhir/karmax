@@ -21,7 +21,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef } from '../domain/types.js';
+import { AgentSpec, Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -38,6 +38,8 @@ import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
+import { scanProjectResources } from '../world/resource-scan.js';
+import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -66,6 +68,7 @@ export interface GatewayDeps {
   runners?: import('../world/runners.js').RunnerPoolService;
   worldAccess?: import('../world/access.js').WorldAccessService;
   objects?: ObjectStore;
+  resources?: import('../world/resources.js').ProjectResourceService;
   cellId?: string;
   hosted?: boolean;
 }
@@ -79,6 +82,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   const read = method === 'GET';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   if (p === '/api/platform') return 'workflow:read';
+  if (p === '/api/resource-drivers') return 'workflow:read';
+  if (p.startsWith('/api/resource-uploads/')) return 'project:settings:write';
   if (p === '/api/logout') return 'none';
   if (p === '/api/dashboard') return 'diagnostic:read';
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
@@ -135,6 +140,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
+  if (/^\/api\/projects\/[^/]+\/resources/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
@@ -323,7 +330,7 @@ export class Gateway {
   private fanout: DurableEventFanout;
 
   constructor(private deps: GatewayDeps) {
-    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.broker);
+    this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.broker, deps.resources);
     this.fanout = new DurableEventFanout(deps.store, deps.bus);
   }
 
@@ -474,8 +481,10 @@ export class Gateway {
         projectId: projectRecord.id, taskId, worldId: handle.id, generation: handle.generation ?? 1,
         kind: 'terminal', label: 'Interactive terminal', command: '$SHELL', server: false,
         openUrls: [], runnerLeaseId: worldLeaseId });
-      const world = await this.deps.worlds.open(handle);
-      // The terminal sees the same project runtime env agent turns get.
+      // Resource preparation plus the same project runtime env agent turns
+      // get — the terminal must see the world the agent saw.
+      const opened = await this.deps.worlds.open(handle);
+      const world = this.deps.resources ? await this.deps.resources.prepare(opened) : opened;
       const { worldRuntimeEnv } = await import('../world/runtime-env.js');
       const runtimeEnv = worldRuntimeEnv(this.deps.store, this.deps.broker, world.handle, taskId);
       term = await world.openPty({ cols: 80, rows: 24, ...(Object.keys(runtimeEnv).length ? { env: runtimeEnv } : {}) });
@@ -858,6 +867,7 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
+      if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
 
       // Organization is the hosted tenant boundary. Collection discovery is
       // filtered by membership; every nested request was minted an
@@ -931,6 +941,7 @@ export class Gateway {
         await this.deps.githubApp?.disconnectOrganization(organizationId);
         for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
           this.deps.providerConnections?.delete(organizationId, connection.provider);
+        this.deps.resources?.deleteOrganizationKey(organizationId);
         store.deleteOrganization(organizationId);
         for (const attachmentId of resources.attachmentIds)
           if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
@@ -1425,6 +1436,199 @@ export class Gateway {
             return this.json(res, 200, { override: pickExecutionConfig(saved.config), organization: store.getOrganizationExecutionPolicy(project.organizationId!), effective: pickExecutionConfig(effective) });
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
+      }
+      const projectResources = p.match(/^\/api\/projects\/([^/]+)\/resources$/);
+      if (projectResources) {
+        const project = store.getProject(projectResources[1]!);
+        if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        if (method === 'GET') return this.json(res, 200, store.listResourceAttachments(project.id, true).map((resource) => ({
+          ...redactResource(resource),
+          revision: resource.currentRevisionId ? redactResourceRevision(store.getResourceRevision(resource.currentRevisionId)) : undefined,
+        })));
+        if (method === 'POST') {
+          const b = await this.body(req, 600 * 1024 * 1024);
+          const id = newId('resource');
+          const driver = String(b.driver ?? 'volume@1');
+          const secret = typeof b.secret === 'string' ? b.secret : undefined;
+          const credentialHandles: string[] = [];
+          if (credentialResource(driver)) {
+            if (!secret) return this.json(res, 400, { error: 'secret value is required for this resource driver' });
+            if (!this.deps.broker) return this.json(res, 503, { error: 'credential broker is unavailable' });
+            const handle = `resource:${id}:credential`;
+            this.deps.broker.registerHandle(handle, secret);
+            credentialHandles.push(handle);
+          }
+          try {
+            const resource = store.createResourceAttachment({ id, organizationId: project.organizationId,
+              projectId: project.id, name: String(b.name ?? 'Resource'), driver,
+              target: normalizeResourceTarget(b.target, driver, String(b.name ?? 'resource')),
+              access: b.access === 'write' ? 'write' : 'read', isolation: b.isolation === 'shared' ? 'shared' : 'fork',
+              source: b.source && typeof b.source === 'object' ? b.source : {}, credentialHandles,
+              publish: b.publish === 'review' ? 'review' : 'discard' });
+            let revision;
+            if (isSnapshotResourceDriver(driver)) {
+              if (typeof b.sourcePath === 'string') {
+                if (this.deps.hosted) throw new Error('hosted resource imports must upload bytes; a browser-local path is not available to the control plane');
+                revision = await this.deps.resources.importDirectory(resource.id, expandPath(b.sourcePath));
+              } else if (Array.isArray(b.files)) {
+                revision = await this.deps.resources.importFiles(resource.id, decodeResourceFiles(b.files));
+              }
+            }
+            store.appendAudit({ principalId: session.userId ? `user:${session.userId}` : 'system:legacy-user',
+              action: 'resource:create', scopeKey: `project:${project.id}`, detail: { resourceId: resource.id, driver } });
+            return this.json(res, 200, { ...redactResource(store.getResourceAttachment(resource.id)!),
+              revision: redactResourceRevision(revision) });
+          } catch (error) {
+            for (const handle of credentialHandles) this.deps.broker?.deleteHandle(handle);
+            store.deleteResourceAttachment(id);
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      }
+      const projectResource = p.match(/^\/api\/projects\/([^/]+)\/resources\/(?!scan$)([^/]+)$/);
+      if (projectResource) {
+        const resource = store.getResourceAttachment(projectResource[2]!);
+        if (!resource || resource.projectId !== projectResource[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (method === 'GET') return this.json(res, 200, { ...redactResource(resource),
+          revisions: store.listResourceRevisions(resource.id).map(redactResourceRevision) });
+        if (method === 'PATCH') {
+          const b = await this.body(req);
+          try {
+            let secretUpdate: { handle: string; value: string } | undefined;
+            if (typeof b.secret === 'string') {
+              if (!this.deps.broker) throw new Error('credential broker is unavailable');
+              const handle = resource.credentialHandles[0] ?? `resource:${resource.id}:credential`;
+              b.credentialHandles = [handle];
+              secretUpdate = { handle, value: b.secret };
+            }
+            const next = store.updateResourceAttachment(resource.id, {
+              ...(b.name !== undefined ? { name: String(b.name) } : {}),
+              ...(b.target !== undefined ? { target: normalizeResourceTarget(b.target, resource.driver, resource.name) } : {}),
+              ...(b.access !== undefined ? { access: b.access } : {}), ...(b.isolation !== undefined ? { isolation: b.isolation } : {}),
+              ...(b.publish !== undefined ? { publish: b.publish } : {}), ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
+              ...(b.source && typeof b.source === 'object' ? { source: b.source } : {}),
+              ...(b.credentialHandles ? { credentialHandles: b.credentialHandles } : {}),
+            });
+            if (secretUpdate) this.deps.broker!.registerHandle(secretUpdate.handle, secretUpdate.value);
+            return this.json(res, 200, redactResource(next));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+        if (method === 'DELETE') {
+          await this.deps.resources?.deleteAttachment(resource.id);
+          if (!this.deps.resources) {
+            for (const handle of resource.credentialHandles) this.deps.broker?.deleteHandle(handle);
+            store.deleteResourceAttachment(resource.id);
+          }
+          return this.json(res, 200, { deleted: true, resourceId: resource.id });
+        }
+      }
+      const projectResourceScan = p.match(/^\/api\/projects\/([^/]+)\/resources\/scan$/);
+      if (projectResourceScan && method === 'GET') {
+        const project = store.getProject(projectResourceScan[1]!);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        if (this.deps.hosted) return this.json(res, 200, { proposals: [], unavailable: project.config.repos ?? [],
+          note: 'Hosted repository clones do not expose the user workstation’s ignored files. Choose files or use the uploader.' });
+        return this.json(res, 200, await scanProjectResources(project));
+      }
+      const resourceUploadCreate = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/uploads$/);
+      if (resourceUploadCreate && method === 'POST') {
+        const resource = store.getResourceAttachment(resourceUploadCreate[2]!);
+        if (!resource || resource.projectId !== resourceUploadCreate[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (!isSnapshotResourceDriver(resource.driver) || !this.deps.objects) return this.json(res, 400, { error: 'resumable uploads require a snapshot resource and object store' });
+        const id = newId('resource-upload');
+        const upload: ResourceUploadSession = { id, organizationId: resource.organizationId, projectId: resource.projectId,
+          attachmentId: resource.id, files: {}, bytes: 0, createdAt: Date.now(), expiresAt: Date.now() + 24 * 60 * 60_000 };
+        store.kvSet(resourceUploadKey(id), JSON.stringify(upload));
+        return this.json(res, 200, { id, partBytes: RESOURCE_UPLOAD_PART_BYTES, expiresAt: upload.expiresAt });
+      }
+      const resourceUpload = p.match(/^\/api\/resource-uploads\/([^/]+)$/);
+      if (resourceUpload) {
+        const upload = resourceUploadSession(store, resourceUpload[1]!);
+        if (!upload || upload.projectId !== url.searchParams.get('projectId')) return this.json(res, 404, { error: 'resource upload not found' });
+        if (!this.deps.objects || !this.deps.resources) return this.json(res, 503, { error: 'resource upload services unavailable' });
+        if (upload.expiresAt < Date.now()) return this.json(res, 410, { error: 'resource upload expired' });
+        if (method === 'PUT') {
+          const relative = String(url.searchParams.get('path') ?? '');
+          const part = Number(url.searchParams.get('part'));
+          if (!safeUploadPath(relative) || !Number.isInteger(part) || part < 0) return this.json(res, 400, { error: 'invalid upload path or part' });
+          const data = await this.rawBody(req, RESOURCE_UPLOAD_PART_BYTES);
+          if (!data.length) return this.json(res, 400, { error: 'empty upload part' });
+          const record = upload.files[relative] ?? { parts: [], bytes: 0 };
+          if (part !== record.parts.length) return this.json(res, 409, { error: `expected part ${record.parts.length}` });
+          const objectKey = resourceUploadObjectKey(upload, relative, part);
+          await this.deps.objects.put(objectKey, data);
+          record.parts.push({ objectKey, bytes: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') });
+          record.bytes += data.length; upload.bytes += data.length; upload.files[relative] = record;
+          store.kvSet(resourceUploadKey(upload.id), JSON.stringify(upload));
+          return this.json(res, 200, { path: relative, part, bytes: data.length, totalBytes: upload.bytes });
+        }
+        if (method === 'POST') {
+          try {
+            if (!Object.keys(upload.files).length) throw new Error('upload has no files');
+            const revision = await this.deps.resources.importFiles(upload.attachmentId,
+              Object.entries(upload.files).map(([relative, record]) => ({ path: relative, bytes: record.bytes,
+                data: uploadedFileChunks(this.deps.objects!, record.parts) })));
+            await Promise.allSettled(Object.values(upload.files).flatMap((record) => record.parts)
+              .map((part) => this.deps.objects!.delete(part.objectKey)));
+            store.kvDelete(resourceUploadKey(upload.id));
+            return this.json(res, 200, redactResourceRevision(revision));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        }
+        if (method === 'DELETE') {
+          for (const record of Object.values(upload.files)) for (const part of record.parts) await this.deps.objects.delete(part.objectKey);
+          store.kvDelete(resourceUploadKey(upload.id));
+          return this.json(res, 200, { deleted: true });
+        }
+      }
+      const resourceImport = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/import$/);
+      if (resourceImport && method === 'POST') {
+        const resource = store.getResourceAttachment(resourceImport[2]!);
+        if (!resource || resource.projectId !== resourceImport[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const b = await this.body(req, 600 * 1024 * 1024);
+        try {
+          const revision = typeof b.sourcePath === 'string'
+            ? this.deps.hosted ? (() => { throw new Error('hosted imports require uploaded files'); })()
+              : await this.deps.resources.importDirectory(resource.id, expandPath(b.sourcePath))
+            : await this.deps.resources.importFiles(resource.id, decodeResourceFiles(b.files));
+          return this.json(res, 200, redactResourceRevision(revision));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const taskResources = p.match(/^\/api\/tasks\/([^/]+)\/resources$/);
+      if (taskResources && method === 'GET') {
+        const task = store.getTask(taskResources[1]!);
+        if (!task || !this.deps.resources) return this.json(res, task ? 503 : 404, { error: task ? 'project resources are unavailable' : 'task not found' });
+        const summaries = [];
+        for (const resource of store.listResourceAttachments(task.projectId)) {
+          if (resource.access !== 'write' || resource.target.kind !== 'path') continue;
+          try { summaries.push({ resource: redactResource(resource), summary: await this.deps.resources.summarize(task.id, resource.id) }); }
+          catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            summaries.push(message.includes('no active lease')
+              ? { resource: redactResource(resource), discarded: true }
+              : { resource: redactResource(resource), error: message });
+          }
+        }
+        return this.json(res, 200, summaries);
+      }
+      const taskResourcePromote = p.match(/^\/api\/tasks\/([^/]+)\/resources\/([^/]+)\/promote$/);
+      if (taskResourcePromote && method === 'POST') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        try {
+          const promoted = await this.deps.resources.promote(taskResourcePromote[1]!, taskResourcePromote[2]!);
+          return this.json(res, 200, { ...promoted, attachment: redactResource(promoted.attachment),
+            revision: redactResourceRevision(promoted.revision) });
+        }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const taskResourceDiscard = p.match(/^\/api\/tasks\/([^/]+)\/resources\/([^/]+)\/discard$/);
+      if (taskResourceDiscard && method === 'POST') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        try {
+          await this.deps.resources.discard(taskResourceDiscard[1]!, taskResourceDiscard[2]!);
+          return this.json(res, 200, { discarded: true });
+        } catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const projectMembers = p.match(/^\/api\/projects\/([^/]+)\/members$/);
       if (projectMembers) {
@@ -3461,6 +3665,7 @@ export class Gateway {
         await world.destroy();
       } catch (error) { if (!isWorldGone(error)) throw error; }
     }
+    await this.deps.resources?.deleteProject(projectId);
     if (resources.objectKeys.length && !this.deps.objects)
       throw new Error('object store is unavailable; project resources were not fully deleted');
     for (const key of resources.objectKeys) await this.deps.objects!.delete(key);
@@ -3594,8 +3799,8 @@ export class Gateway {
       'x-karmax-cell': this.deps.cellId ?? 'local' });
     res.end(body);
   }
-  private async body(req: http.IncomingMessage): Promise<any> {
-    const value = await this.rawBody(req, 2 * 1024 * 1024);
+  private async body(req: http.IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<any> {
+    const value = await this.rawBody(req, maxBytes);
     if (!value.length) return {};
     try {
       return JSON.parse(value.toString('utf8'));
@@ -3746,4 +3951,72 @@ function applyExecutionOverride(config: ProjectConfig, override: Record<string, 
     else next[key] = override[key];
   }
   return next as ProjectConfig;
+}
+
+function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
+  const { credentialHandles, ...safe } = resource;
+  return { ...safe, credentialConfigured: credentialHandles.length > 0 };
+}
+
+function redactResourceRevision(revision: ResourceRevision | undefined): Omit<ResourceRevision, 'sealedRef'> | undefined {
+  if (!revision) return undefined;
+  const { sealedRef: _sealedRef, ...safe } = revision;
+  return safe;
+}
+
+function normalizeResourceTarget(value: unknown, driver: string, name: string): ResourceTarget {
+  if (value && typeof value === 'object') {
+    const target = value as Record<string, unknown>;
+    if (target.kind === 'path') return { kind: 'path', path: String(target.path ?? '') };
+    if (target.kind === 'environment' || target.kind === 'service') return { kind: target.kind, name: String(target.name ?? '') };
+  }
+  const variable = name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^([^A-Z_])/, '_$1') || 'RESOURCE';
+  return ['secret@1', 'service@1', 'database@1'].includes(driver)
+    ? { kind: driver === 'service@1' || driver === 'database@1' ? 'service' : 'environment', name: variable }
+    : { kind: 'path', path: `resources/${name.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-') || 'data'}` };
+}
+
+function isSnapshotResourceDriver(driver: string): boolean { return snapshotResource(driver); }
+
+function decodeResourceFiles(value: unknown): Array<{ path: string; data: Buffer }> {
+  if (!Array.isArray(value)) throw new Error('files must be an array');
+  let bytes = 0;
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== 'object') throw new Error(`file ${index + 1} is invalid`);
+    const file = entry as Record<string, unknown>;
+    const relative = String(file.path ?? '');
+    if (!relative) throw new Error(`file ${index + 1} has no path`);
+    const data = Buffer.from(String(file.data ?? ''), file.encoding === 'utf8' ? 'utf8' : 'base64');
+    bytes += data.length;
+    if (bytes > 512 * 1024 * 1024) throw new Error('resource import exceeds 512 MiB JSON upload limit; use a local directory import or runner uploader');
+    return { path: relative, data };
+  });
+}
+
+const RESOURCE_UPLOAD_PART_BYTES = 8 * 1024 * 1024;
+interface ResourceUploadPart { objectKey: string; bytes: number; sha256: string }
+interface ResourceUploadSession {
+  id: string; organizationId: string; projectId: string; attachmentId: string;
+  files: Record<string, { parts: ResourceUploadPart[]; bytes: number }>;
+  bytes: number; createdAt: number; expiresAt: number;
+}
+function resourceUploadKey(id: string): string { return `resource-upload:${id}`; }
+function resourceUploadSession(store: Store, id: string): ResourceUploadSession | undefined {
+  try { return JSON.parse(store.kvGet(resourceUploadKey(id)) ?? '') as ResourceUploadSession; } catch { return undefined; }
+}
+function safeUploadPath(value: string): boolean {
+  return Boolean(value && value.length <= 1024 && !value.startsWith('/') && !value.includes('\\')
+    && !value.split('/').includes('..') && !value.includes('\0'));
+}
+function resourceUploadObjectKey(upload: ResourceUploadSession, relative: string, part: number): string {
+  const file = crypto.createHash('sha256').update(relative).digest('hex');
+  return `resource-uploads/${upload.organizationId}/${upload.id}/${file}/${part}.bin`;
+}
+async function* uploadedFileChunks(objects: ObjectStore, parts: ResourceUploadPart[]): AsyncGenerator<Buffer> {
+  for (const part of parts) {
+    const data = await objects.get(part.objectKey);
+    if (data.length !== part.bytes || crypto.createHash('sha256').update(data).digest('hex') !== part.sha256)
+      throw new Error('resource upload part failed integrity verification');
+    yield data;
+  }
 }

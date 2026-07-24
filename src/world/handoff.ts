@@ -38,7 +38,8 @@ export interface MaterializedLocalCheckout {
 export class WorldHandoffService {
   constructor(private store: Store, private worlds: WorldRegistry, private githubApp: GitHubAppService,
     private runners?: RunnerPoolService, private worldAccess?: WorldAccessService,
-    private localRoot = paths().localCheckouts) {}
+    private localRoot = paths().localCheckouts,
+    private resources?: import('./resources.js').ProjectResourceService) {}
 
   /** Publish the exact committed cloud branch through the trusted broker, then
    * clone/update a durable checkout on the Karmax host. This is intentionally a
@@ -202,6 +203,7 @@ export class WorldHandoffService {
     // silently leaving metered compute running.
     if (world) {
       try {
+        await this.resources?.scrubSecrets(world.handle);
         const parkedHandle = await this.worlds.park(world.handle);
         parked = await this.worlds.status(parkedHandle) === 'parked';
         if (!parked) warning = 'the provider did not confirm that the world was parked';

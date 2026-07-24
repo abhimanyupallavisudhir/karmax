@@ -116,7 +116,7 @@ export class E2BWorldProvider implements WorldProvider {
     try {
       const provisioner = provisionTarget(sandbox);
       await provisionGitCredentials(provisioner, spec, HOME);
-      const { repos, root, warnings } = await provisionGitRepos(provisioner, spec, {
+      const { repos, root, warnings, ephemeralPaths } = await provisionGitRepos(provisioner, spec, {
         root: ROOT, home: HOME,
         sshUrlError: 'E2B worlds require repositories as SSH Git URLs (for example git@github.com:org/repo.git), not local paths or HTTPS URLs',
         copyGlobsWarning: 'copyGlobs are host-local and were not copied into the remote E2B world — import them as project Secrets (Settings → Secrets), which inject into every backend',
@@ -145,6 +145,7 @@ export class E2BWorldProvider implements WorldProvider {
         repos,
         sealedProviderRef: this.sealRef({ sandboxId: sandbox.sandboxId, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) }),
         meta: { releaseOnCompletion: true, environmentFlavor: flavor,
+          ...(ephemeralPaths.length ? { ephemeralPaths } : {}),
           ...(selectedTemplate ? { environmentArtifact: selectedTemplate } : {}) },
         ...(warnings.length ? { warnings } : {}),
       };

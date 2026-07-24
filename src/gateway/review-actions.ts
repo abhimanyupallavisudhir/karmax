@@ -62,7 +62,8 @@ export class ReviewActionRunner {
 
   constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService,
     private access?: import('../world/access.js').WorldAccessService,
-    private broker?: import('../autonomy/broker.js').CredentialBroker) {
+    private broker?: import('../autonomy/broker.js').CredentialBroker,
+    private resources?: import('../world/resources.js').ProjectResourceService) {
     this.commandPoll = setInterval(() => {
       for (const rec of this.procs.values()) {
         this.store.heartbeatExecution(rec.procId);
@@ -108,9 +109,11 @@ export class ReviewActionRunner {
     }
     let process: WorldProcess;
     try {
-      const world = await this.worlds.open(opts.world);
-      // The same project runtime env agent turns get (PLAN-state): a human's
+      // Resource preparation (file secrets, projections) plus the same project
+      // runtime env agent turns get (services + legacy secrets): a human's
       // "run tests" must see the DATABASE_URL the agent's run saw.
+      const opened = await this.worlds.open(opts.world);
+      const world = this.resources ? await this.resources.prepare(opened) : opened;
       const { worldRuntimeEnv } = await import('../world/runtime-env.js');
       const env = worldRuntimeEnv(this.store, this.broker, world.handle, opts.taskId);
       process = await world.startProcess({ command: opts.command, ...(Object.keys(env).length ? { env } : {}) });

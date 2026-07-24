@@ -21,7 +21,8 @@ export class WorldAccessService {
    * in-flight artifact, preview, or WebSocket request. */
   private borrowed = new Map<string, number>();
 
-  constructor(private store: Store, private worlds: WorldRegistry, private runners?: RunnerPoolService) {}
+  constructor(private store: Store, private worlds: WorldRegistry, private runners?: RunnerPoolService,
+    private resources?: import('./resources.js').ProjectResourceService) {}
 
   async open(taskId: string, input: WorldHandle, options: { dedicated?: boolean } = {}): Promise<MeteredWorldAccess> {
     const handle = (this.store.currentWorld(input.id) ?? input) as WorldHandle;
@@ -37,7 +38,8 @@ export class WorldAccessService {
         priority: Number(this.store.getTask(taskId)?.params.priority ?? 0) })).leaseId;
     }
     try {
-      const world = await this.worlds.open(handle);
+      const opened = await this.worlds.open(handle);
+      const world = this.resources ? await this.resources.prepare(opened) : opened;
       const openedHandle = world.handle;
       this.store.setWorldState((this.store.currentWorld(openedHandle.id) ?? openedHandle) as WorldHandle, 'ready');
       let released = false;
@@ -51,6 +53,7 @@ export class WorldAccessService {
           if (parkIfIdle && remote && this.store.activeWorldLeaseCount(openedHandle.id) === 0
             && (this.borrowed.get(openedHandle.id) ?? 0) === 0) {
             if (this.store.worldState(openedHandle.id) === 'parked') return;
+            await this.resources?.scrubSecrets(openedHandle).catch(() => undefined);
             await this.worlds.park(openedHandle).catch(() => undefined);
             if (await this.worlds.status(openedHandle).catch(() => 'ready') === 'parked')
               this.store.setWorldState((this.store.currentWorld(openedHandle.id) ?? openedHandle) as WorldHandle, 'parked');
@@ -69,6 +72,7 @@ export class WorldAccessService {
     if (this.worlds.get(handle.kind).capabilities?.remote !== true || this.store.activeWorldLeaseCount(handle.id) > 0
       || (this.borrowed.get(handle.id) ?? 0) > 0) return;
     if (this.store.worldState(handle.id) === 'parked') return;
+    await this.resources?.scrubSecrets(handle).catch(() => undefined);
     await this.worlds.park(handle).catch(() => undefined);
     if (await this.worlds.status(handle).catch(() => 'ready') === 'parked')
       this.store.setWorldState((this.store.currentWorld(handle.id) ?? handle) as WorldHandle, 'parked');

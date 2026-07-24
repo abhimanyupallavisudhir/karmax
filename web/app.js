@@ -3822,6 +3822,7 @@ function renderTaskPage() {
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
+    wireResourceReview(v);
   } else if (tab === 'checkin') {
     wireCheckinSidebar(v);
     wireFollowups(v);
@@ -4297,6 +4298,68 @@ function wireReviewActions(v) {
     });
   });
 }
+
+const resourceReviewCache = new Map();
+async function wireResourceReview(v, force = false) {
+  const wrap = document.getElementById('review-resources');
+  if (!wrap || !v.reviewInfo) return;
+  try {
+    const cached = resourceReviewCache.get(v.taskId);
+    let items;
+    if (!force && cached && Date.now() - cached.at < 15_000) items = cached.items;
+    else {
+      items = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources`);
+      resourceReviewCache.set(v.taskId, { at: Date.now(), items });
+    }
+    if (!document.body.contains(wrap) || !items.length) return;
+    wrap.classList.remove('hidden');
+    wrap.innerHTML = `<div class="section-h" style="margin-top:16px">Resource changes</div>${items.map((item) => {
+      const resource = item.resource;
+      if (item.discarded) return `<div class="card"><b>${esc(resource.name)}</b><div class="task-sub">Task fork discarded; project baseline unchanged.</div></div>`;
+      if (item.error) return `<div class="card"><b>${esc(resource.name)}</b><div class="task-sub" style="color:var(--warn)">${esc(item.error)}</div></div>`;
+      const summary = item.summary;
+      const changed = summary.added + summary.modified + summary.deleted;
+      const detail = changed
+        ? `${summary.added} added · ${summary.modified} modified · ${summary.deleted} deleted · ${formatBytes(summary.bytes)}`
+        : 'No changes from the task’s pinned baseline';
+      const paths = summary.changedPaths?.length
+        ? `<div class="task-sub mono" style="margin-top:5px">${summary.changedPaths.slice(0, 8).map(esc).join(' · ')}${summary.changedPaths.length > 8 ? ' …' : ''}</div>` : '';
+      const action = resource.publish === 'review' && changed
+        ? `<div class="inline-form"><button class="btn sm primary resource-promote" data-resource-id="${esc(resource.id)}">Promote as new baseline</button><button class="btn sm resource-discard" data-resource-id="${esc(resource.id)}">Discard fork</button></div>`
+        : `<span class="chip">${resource.publish === 'discard' ? 'Task fork will be discarded' : 'Unchanged'}</span>`;
+      return `<div class="card" style="display:flex;gap:12px;align-items:center"><div style="flex:1"><b>${esc(resource.name)}</b>
+        <div class="task-sub">${esc(detail)} · baseline <span class="mono">${esc(summary.baseRevisionId || 'empty')}</span></div>${paths}</div>${action}</div>`;
+    }).join('')}`;
+    wrap.querySelectorAll('.resource-promote').forEach((button) => {
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        button.textContent = 'Capturing and promoting…';
+        try {
+          const result = await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/${encodeURIComponent(button.dataset.resourceId)}/promote`, { method: 'POST' });
+          toast(`Promoted ${result.attachment.name} atomically`);
+          resourceReviewCache.delete(v.taskId);
+          await wireResourceReview(v, true);
+        } catch (error) {
+          toast(error.message, true);
+          button.disabled = false;
+          button.textContent = 'Promote as new baseline';
+        }
+      });
+    });
+    wrap.querySelectorAll('.resource-discard').forEach((button) => button.addEventListener('click', async () => {
+      if (!confirm('Discard this task’s resource fork? Its Git changes are unaffected, but this resource can no longer be promoted from the task.')) return;
+      button.disabled = true;
+      try {
+        await api(`/api/tasks/${encodeURIComponent(v.taskId)}/resources/${encodeURIComponent(button.dataset.resourceId)}/discard`, { method: 'POST' });
+        toast('Resource fork discarded'); resourceReviewCache.delete(v.taskId); await wireResourceReview(v, true);
+      } catch (error) { toast(error.message, true); button.disabled = false; }
+    }));
+  } catch (error) {
+    if (!document.body.contains(wrap)) return;
+    wrap.classList.remove('hidden');
+    wrap.innerHTML = `<div class="task-sub" style="color:var(--warn)">Could not inspect task resources: ${esc(error.message)}</div>`;
+  }
+}
 function setStopBtn(running, procId, taskId) {
   const wrap = document.getElementById('review-actions');
   if (!wrap) return;
@@ -4339,6 +4402,7 @@ function overviewTab(v) {
          <pre class="raw hidden" id="review-action-out" style="height:180px"></pre>` : ''}
          ${v.reviewInfo.links?.length ? `<div class="links">${v.reviewInfo.links.map((l) => `<a class="btn sm" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)} ↗</a>`).join('')}</div>` : ''}
          ${v.reviewInfo.html ? `<iframe sandbox="allow-scripts" srcdoc="${esc(v.reviewInfo.html)}"></iframe>` : ''}
+         <div id="review-resources" class="hidden"></div>
        </div>`
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
@@ -6485,13 +6549,11 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-data">Data</a><a href="#project-services">Services</a><a href="#project-environment">Environment</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-resources-section">Resources</a><a href="#project-services">Services</a><a href="#project-environment">Environment</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
-    <div class="settings-section-title" id="project-secrets"><div>Secrets<small>Values this project's own code reads (DATABASE_URL, API keys) — vault-stored, injected into task worlds, never committed</small></div></div>
-    <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="settings-section-title" id="project-data"><div>Data<small>Versioned data objects — fixtures, dev-db seeds, model weights — materialized into every task world</small></div></div>
-    <div class="card"><div id="project-objects-box">Loading…</div></div>
+    <div class="settings-section-title" id="project-resources-section"><div>Resources<small>Secrets and versioned data attached to every task world</small></div></div>
+    <div class="card"><div id="project-resources">Loading…</div></div>
     <div class="settings-section-title" id="project-services"><div>Services<small>What this project's code connects to — a shared instance via a Secret, or a private per-world container</small></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="settings-section-title" id="project-environment"><div>Environment<small>Built once, copied into every task world — so worlds boot in seconds with dependencies (and Docker) already in place</small></div></div>
@@ -6702,6 +6764,126 @@ async function hydrateProjectEnvironment(proj) {
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { box.textContent = error.message; }
+async function hydrateProjectResources(proj) {
+  const box = $('#project-resources'); if (!box) return;
+  try {
+    const resources = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
+    const targetLabel = (resource) => resource.target.kind === 'path' ? resource.target.path : resource.target.name;
+    box.innerHTML = `<div class="section-h">Attached resources</div>
+      <p class="task-sub">Each task gets a pinned, private view. Secrets are injected just in time; writable volumes can publish a new immutable baseline from Review.</p>
+      ${S.meta?.hosted ? '' : '<div class="inline-form" style="margin-bottom:10px"><button class="btn sm" id="resource-scan">Scan ignored project files</button><span class="task-sub">Nothing is uploaded until you confirm.</span></div><div id="resource-scan-results"></div>'}
+      <div id="project-resource-list">${resources.map((resource) => `<div class="queue-item" data-resource="${esc(resource.id)}">
+        <div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${esc(resource.driver.replace('@1', ''))}</span>
+          <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
+        <button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button>
+      </div>`).join('') || '<p class="task-sub">No resources yet. Tasks currently receive only their repositories and environment.</p>'}</div>
+      <div class="settings-divider"></div><div class="section-h">Attach a resource</div>
+      <div class="settings-grid">
+        <label class="form-row">Name<input id="resource-name" placeholder="Training data"></label>
+        <label class="form-row">Kind<select id="resource-driver"><option value="volume@1">Versioned files / model / SQLite</option><option value="secret@1">Secret</option><option value="database@1">Shared database URL</option><option value="service@1">External service credential</option></select></label>
+        <label class="form-row">World path or variable<input id="resource-target" placeholder="resources/training-data"></label>
+        <label class="form-row">Access<select id="resource-access"><option value="read">Read-only</option><option value="write">Writable private fork</option></select></label>
+        <label class="form-row">On completion<select id="resource-publish"><option value="discard">Discard task changes</option><option value="review">Offer Promote at Review</option></select></label>
+        <label class="form-row">Secret / connection URL<input id="resource-secret" type="password" autocomplete="new-password" placeholder="Only for secret, database, or service"></label>
+        ${S.meta?.hosted ? '' : '<label class="form-row">Import local directory<input id="resource-source-path" placeholder="/absolute/path (optional)"></label>'}
+        <label class="form-row">Or choose files<input id="resource-files" type="file" multiple webkitdirectory></label>
+      </div><button class="btn sm primary" id="resource-add">Attach resource</button>`;
+    const driverInput = $('#resource-driver');
+    const syncDefaults = () => {
+      const name = $('#resource-name').value.trim() || 'resource';
+      const fileKind = driverInput.value === 'volume@1';
+      $('#resource-target').placeholder = fileKind ? `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : name.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+      $('#resource-secret').disabled = fileKind;
+      $('#resource-files').disabled = !fileKind;
+      if ($('#resource-source-path')) $('#resource-source-path').disabled = !fileKind;
+    };
+    driverInput.addEventListener('change', syncDefaults); $('#resource-name').addEventListener('input', syncDefaults); syncDefaults();
+    $('#resource-scan')?.addEventListener('click', async () => {
+      const button = $('#resource-scan'); const results = $('#resource-scan-results');
+      button.disabled = true; button.textContent = 'Scanning…';
+      try {
+        const scan = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources/scan`);
+        results.innerHTML = scan.proposals.length ? `<div class="section-h">Suggested classifications</div>${scan.proposals.map((proposal, index) =>
+          `<div class="queue-item" data-proposal="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span>
+          <div class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</div></div><button class="btn sm resource-use-proposal">Use suggestion</button></div>`).join('')}`
+          : '<p class="task-sub">No likely resources found. You can still attach one below.</p>';
+        results.querySelectorAll('[data-proposal]').forEach((row) => row.querySelector('.resource-use-proposal').addEventListener('click', () => {
+          const proposal = scan.proposals[Number(row.dataset.proposal)];
+          $('#resource-name').value = proposal.path.split('/').pop().replace(/\.[^.]+$/, '') || proposal.kind;
+          $('#resource-driver').value = proposal.suggested.driver;
+          $('#resource-target').value = proposal.suggested.target.path || proposal.suggested.target.name;
+          $('#resource-access').value = proposal.suggested.access;
+          $('#resource-publish').value = proposal.suggested.publish;
+          if ($('#resource-source-path') && proposal.suggested.driver === 'volume@1')
+            $('#resource-source-path').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
+          $('#resource-driver').dispatchEvent(new Event('change'));
+          if (proposal.suggested.driver === 'secret@1') $('#resource-secret').focus();
+          else $('#resource-add').focus();
+        }));
+      } catch (error) { results.textContent = error.message; }
+      finally { button.disabled = false; button.textContent = 'Scan ignored project files'; }
+    });
+    $('#resource-add').addEventListener('click', async () => {
+      const button = $('#resource-add'); const name = $('#resource-name').value.trim();
+      if (!name) return toast('Resource name is required', true);
+      const driver = driverInput.value; const isFiles = driver === 'volume@1';
+      const enteredTarget = $('#resource-target').value.trim();
+      const target = isFiles ? { kind: 'path', path: enteredTarget || `resources/${name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')}` }
+        : { kind: driver === 'secret@1' ? 'environment' : 'service', name: enteredTarget || name.toUpperCase().replace(/[^A-Z0-9]+/g, '_') };
+      button.disabled = true; button.textContent = 'Attaching…';
+      try {
+        const selectedFiles = isFiles ? [...$('#resource-files').files] : [];
+        const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({ name, driver, target,
+          access: $('#resource-access').value, isolation: driver === 'database@1' || driver === 'service@1' ? 'shared' : 'fork',
+          publish: $('#resource-publish').value, secret: $('#resource-secret').value,
+          sourcePath: $('#resource-source-path')?.value.trim() || undefined }) });
+        if (selectedFiles.length) {
+          button.textContent = 'Uploading…';
+          await uploadResourceFiles(proj.id, created.id, selectedFiles, (sent, total) => {
+            button.textContent = `Uploading ${Math.round(sent / Math.max(total, 1) * 100)}%…`;
+          });
+        }
+        toast('Resource attached'); await hydrateProjectResources(proj);
+      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Attach resource'; }
+    });
+    box.querySelectorAll('[data-resource]').forEach((row) => {
+      const resource = resources.find((candidate) => candidate.id === row.dataset.resource);
+      row.querySelector('.resource-toggle').addEventListener('click', async () => {
+        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) }); await hydrateProjectResources(proj); }
+        catch (error) { toast(error.message, true); }
+      });
+      row.querySelector('.resource-delete').addEventListener('click', async () => {
+        if (!confirm(`Remove resource “${resource.name}”? Existing task snapshots and audit history may be retained, but new tasks will no longer receive it.`)) return;
+        try { await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectResources(proj); }
+        catch (error) { toast(error.message, true); }
+      });
+    });
+  } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
+}
+
+async function uploadResourceFiles(projectId, resourceId, files, progress) {
+  const upload = await api(`/api/projects/${encodeURIComponent(projectId)}/resources/${encodeURIComponent(resourceId)}/uploads`, { method: 'POST' });
+  const total = files.reduce((sum, file) => sum + file.size, 0); let sent = 0;
+  try {
+    for (const file of files) {
+      const relative = file.webkitRelativePath ? file.webkitRelativePath.split('/').slice(1).join('/') || file.name : file.name;
+      for (let part = 0, offset = 0; offset < file.size; part++, offset += upload.partBytes) {
+        const chunk = file.slice(offset, Math.min(file.size, offset + upload.partBytes));
+        await api(`/api/resource-uploads/${encodeURIComponent(upload.id)}?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(relative)}&part=${part}`,
+          { method: 'PUT', body: chunk, headers: { 'content-type': 'application/octet-stream' } });
+        sent += chunk.size; progress?.(sent, total);
+      }
+    }
+    return await api(`/api/resource-uploads/${encodeURIComponent(upload.id)}?projectId=${encodeURIComponent(projectId)}`, { method: 'POST' });
+  } catch (error) {
+    await api(`/api/resource-uploads/${encodeURIComponent(upload.id)}?projectId=${encodeURIComponent(projectId)}`, { method: 'DELETE' }).catch(() => {});
+    throw error;
+  }
+}
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer); let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return btoa(binary);
 }
 async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
@@ -6791,8 +6973,7 @@ function wireSettingsView(proj) {
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
   hydrateProjectGitProfile(proj);
-  hydrateProjectSecrets(proj);
-  hydrateProjectObjects(proj);
+  hydrateProjectResources(proj);
   hydrateProjectServices(proj);
   hydrateProjectEnvironment(proj);
   hydrateSettingsForms('project', proj.id);

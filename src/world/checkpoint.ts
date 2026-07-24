@@ -25,7 +25,8 @@ interface PortableDelta { version: 1; files: DeltaFile[] }
  * fast path; this encrypted delta plus the broker-pushed branch is portable. */
 export class WorldCheckpointService {
   constructor(private store: Store, private worlds: WorldRegistry, private objects: ObjectStore,
-    private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService) {
+    private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
+    private resources?: import('./resources.js').ProjectResourceService) {
     if (!broker.hasHandle(CHECKPOINT_KEY_HANDLE))
       broker.registerHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
   }
@@ -40,21 +41,28 @@ export class WorldCheckpointService {
     const linked = this.store.listProjectRepositories(projectId);
     const files: DeltaFile[] = [];
     const repos: WorldCheckpoint['repos'] = [];
-    // Secret-materialized files are git-excluded at injection so status rarely
-    // sees them; the handle's manifest is the backstop for backends where the
-    // exclude write failed. The literal `.env`/`.karmax-injection/` names cover
-    // pre-manifest worlds (copyGlobs-era .env copies).
+    // Inputs are never portable project data. Secret-materialized files are
+    // git-excluded at injection (the handle manifest is the backstop), readonly
+    // mounts are immutable by contract, and resource projections/ephemeral
+    // copies are pinned by revision refs instead of bytes.
     const secretFiles = secretFileManifest(handle.meta);
-    // Readonly mounts are immutable by contract — capturing them would only
-    // bloat the delta and collide with their 444 copies at restore.
     const readonlyMounts = new Set(objectMountManifest(handle.meta).filter((m) => m.mode === 'readonly').map((m) => m.path));
+    const resourceRefs = await this.resources?.checkpoint(handle) ?? [];
+    const resourcePaths = Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
+      .map((projection) => projection.target).filter((value): value is string => Boolean(value));
+    const ephemeralPaths = new Set(Array.isArray(handle.meta?.ephemeralPaths)
+      ? handle.meta.ephemeralPaths.filter((value): value is string => typeof value === 'string')
+      : []);
     for (const repo of worldRepos(world.handle)) {
       const status = await world.exec('git', ['status', '--porcelain=v1', '-z'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
-        if (change.path === '.env' || change.path.startsWith('.karmax-injection/') || change.path.startsWith('.karmax-services/')) continue;
         const relative = worldRepos(world.handle).length > 1 ? `${repo.name}/${change.path}` : change.path;
-        if (secretFiles.has(relative) || readonlyMounts.has(relative)) continue;
+        // Inputs, never project data — do not make them portable merely
+        // because they are untracked.
+        if (change.path === '.env' || change.path.startsWith('.karmax-injection/') || change.path.startsWith('.karmax-services/')
+          || secretFiles.has(relative) || readonlyMounts.has(relative) || ephemeralPaths.has(relative)
+          || resourcePaths.some((target) => relative === target || relative.startsWith(`${target}/`))) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
         else {
           const data = await world.readFileBuffer(relative);
@@ -96,7 +104,8 @@ export class WorldCheckpointService {
       id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
       ...(mountManifest.length ? { objectMounts: mountManifest } : {}),
-      repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length }, createdAt: Date.now(),
+      repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length },
+      ...(resourceRefs.length ? { resources: resourceRefs } : {}), createdAt: Date.now(),
     };
     this.store.saveWorldCheckpoint(checkpoint);
     this.store.attachWorldCheckpoint(handle, checkpoint.id);
@@ -104,6 +113,7 @@ export class WorldCheckpointService {
       provider: handle.kind, kind: 'checkpoint.storage', quantity: encrypted.length, unit: 'byte-second', costMicros: 0,
       startedAt: checkpoint.createdAt, endedAt: checkpoint.createdAt,
       metadata: { checkpointId, generation: checkpoint.generation } });
+    await this.resources?.scrubSecrets(handle);
     return checkpoint;
   }
 
@@ -134,57 +144,59 @@ export class WorldCheckpointService {
       branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
       ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
       network: executionConfig.network, environment: executionConfig.environment, resources: executionConfig.resources });
-    // Object mounts materialize first, then the delta applies on top — the
-    // task's own modified copies win. Pinned checkpoint-time versions are
-    // preferred (blobs are content-addressed and kept, so a promotion since
-    // the checkpoint cannot change what this world sees); checkpoints from
-    // before pinning fall back to the registry's current versions.
-    let mountManifest: Array<{ path: string; object: string; mode: 'seed' | 'readonly' | 'writeback' }> = [];
     try {
-      const projectObjects = new ProjectObjects(this.store, this.objects);
-      const mounts = checkpoint.objectMounts?.length
-        ? await Promise.all(checkpoint.objectMounts.map(async (m) => ({
-            path: m.path, mode: m.mode, object: m.object, data: await projectObjects.data(checkpoint.projectId, m.object) })))
-        : await projectObjects.resolved(checkpoint.projectId);
-      mountManifest = await materializeObjectMounts(world, mounts);
-    } catch { /* world remains usable without them */ }
-    for (const file of delta.files) {
-      const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
-      if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
-      else {
-        const content = Buffer.from(file.data ?? '', 'base64');
-        const write = () => world.writeFileBuffer ? world.writeFileBuffer(relative, content) : world.writeFile(relative, content.toString('utf8'));
-        try {
-          await write();
-        } catch {
-          // A read-only target (e.g. a mount materialized moments ago): make it
-          // writable and retry — the delta is the task's authoritative state.
-          await world.exec('chmod', ['u+w', relative]).catch(() => undefined);
-          await write();
+      // Inputs first, then the delta on top — the task's own copies win.
+      // Resource revisions are pinned at checkpoint time (as are legacy object
+      // mounts): a promotion since the checkpoint cannot change what a
+      // restored world sees.
+      if (this.resources) {
+        const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
+        world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
+          checkpoint.generation + 1, revisions);
+      }
+      let mountManifest: Array<{ path: string; object: string; mode: 'seed' | 'readonly' | 'writeback' }> = [];
+      try {
+        const projectObjects = new ProjectObjects(this.store, this.objects);
+        const mounts = checkpoint.objectMounts?.length
+          ? await Promise.all(checkpoint.objectMounts.map(async (m) => ({
+              path: m.path, mode: m.mode, object: m.object, data: await projectObjects.data(checkpoint.projectId, m.object) })))
+          : await projectObjects.resolved(checkpoint.projectId);
+        mountManifest = await materializeObjectMounts(world, mounts);
+      } catch { /* world remains usable without them */ }
+      for (const file of delta.files) {
+        const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
+        if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
+        else {
+          const content = Buffer.from(file.data ?? '', 'base64');
+          const write = () => world.writeFileBuffer ? world.writeFileBuffer(relative, content) : world.writeFile(relative, content.toString('utf8'));
+          try {
+            await write();
+          } catch {
+            // A read-only target (e.g. a mount materialized moments ago): make
+            // it writable and retry — the delta is the task's authoritative state.
+            await world.exec('chmod', ['u+w', relative]).catch(() => undefined);
+            await write();
+          }
         }
       }
-    }
-    // Re-materialize file-shaped project secrets: they are excluded from the
-    // portable delta by design, so a restored world injects them fresh (the
-    // same duty createWorld performs). Env-shaped secrets resolve JIT per
-    // subprocess and need nothing here. Best-effort — a missing value surfaces
-    // where it is first used, not as a failed restore.
-    try {
-      const manifest = await materializeFileSecrets(world,
-        new ProjectSecrets(this.store, this.broker).files(checkpoint.projectId, { taskId: checkpoint.worldId }));
-      if (manifest.length) world.handle.meta = { ...world.handle.meta, secretFiles: manifest };
-    } catch { /* world remains usable without them */ }
-    if (mountManifest.length) world.handle.meta = { ...world.handle.meta, objectMounts: mountManifest };
-    let registered: WorldHandle;
-    try {
-      registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
+      // Re-materialize legacy file-shaped project secrets (excluded from the
+      // portable delta by design). Best-effort — a missing value surfaces
+      // where it is first used, not as a failed restore.
+      try {
+        const manifest = await materializeFileSecrets(world,
+          new ProjectSecrets(this.store, this.broker).files(checkpoint.projectId, { taskId: checkpoint.worldId }));
+        if (manifest.length) world.handle.meta = { ...world.handle.meta, secretFiles: manifest };
+      } catch { /* world remains usable without them */ }
+      if (mountManifest.length) world.handle.meta = { ...world.handle.meta, objectMounts: mountManifest };
+      const registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
         { runnerPoolId: checkpoint.runnerPoolId, environmentDigest: checkpoint.environmentDigest }) as WorldHandle;
+      world.handle = registered;
+      return registered;
     } catch (error) {
+      await this.resources?.release(world.handle).catch(() => undefined);
       await world.destroy().catch(() => undefined);
       throw error;
     }
-    world.handle = registered;
-    return registered;
   }
 
   private key(): Buffer {

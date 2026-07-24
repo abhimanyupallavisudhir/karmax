@@ -150,7 +150,7 @@ const MAX_SHELL_NUDGES = 3;
  */
 function mergeDomains(world: WorldHandleLike | undefined, target: string, projectId: string): string[] {
   const domains = world?.repos?.length
-    ? world.repos.map((repo) => `${repo.repo}:${repo.target ?? target}`)
+    ? world.repos.map((repo) => `${repo.repo}:${repo.targetPinned === false ? target : (repo.target ?? target)}`)
     : [`${world?.repo ?? projectId}:${target}`];
   return [...new Set(domains)].sort();
 }

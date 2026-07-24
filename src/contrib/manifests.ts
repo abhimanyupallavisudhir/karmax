@@ -41,7 +41,19 @@ const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repositories', help: 'One per line. Local worlds accept filesystem paths; E2B accepts SSH Git URLs (git@github.com:org/repo.git). Multiple repos are checked out in separate world subdirectories.', scopes: ['project'], bind: 'project' });
-const copyGlobsField = (): FieldSpec => ({ name: 'copyGlobs', type: 'list', label: 'Gitignored files to copy into each world (deprecated — prefer project Secrets)', placeholder: '.env', scopes: ['project', 'global'], bind: 'project' });
+// Deprecated compatibility path (SPEC §11.4). Keep the wire field so historical
+// projects remain editable while resource attachments replace host-file copying.
+// The warning is deliberately visible: a host path is not a hosted transport and
+// `.env` belongs in the credential broker, not a durable workspace snapshot.
+const copyGlobsField = (): FieldSpec => ({
+  name: 'copyGlobs',
+  type: 'list',
+  label: 'Legacy local file copies',
+  help: 'Self-hosted compatibility only. These host-local ignored files are copied into task worlds; they are not available to hosted projects. Put secrets in the credential broker and durable data in project resources.',
+  placeholder: '.env',
+  scopes: ['project', 'global'],
+  bind: 'project',
+});
 const remoteField = (): FieldSpec => ({
   name: 'remote',
   type: 'select',

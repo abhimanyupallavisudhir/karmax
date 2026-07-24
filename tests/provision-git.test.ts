@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { provisionGitRepos, type ProvisionTarget } from '../src/world/provision-git.js';
 
 function fakeTarget(handler: (command: string) => { stdout?: string; stderr?: string; code?: number } | undefined) {
@@ -54,5 +57,25 @@ describe('shared cloud world git provisioning', () => {
     await expect(provisionGitRepos(target, { taskId: 't1', base: 'main', repo: 'https://github.com/acme/app.git' }, OPTIONS))
       .rejects.toThrow('ssh only');
     expect(commands).toHaveLength(0);
+  });
+
+  it('reports copied compatibility files as ephemeral world paths', async () => {
+    const source = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-copy-globs-'));
+    fs.writeFileSync(path.join(source, '.env.local'), 'SECRET=1\n');
+    const writes: string[] = [];
+    const { target } = fakeTarget((command) => command.includes('rev-parse')
+      ? { stdout: `${'a'.repeat(40)}\n` }
+      : undefined);
+    target.writeFile = async (file) => { writes.push(file); };
+    try {
+      const provisioned = await provisionGitRepos(target, {
+        taskId: 't1', base: 'main', repo: 'git@github.com:acme/app.git',
+        copyGlobs: ['.env*'], copySources: [source],
+      }, OPTIONS);
+      expect(provisioned.ephemeralPaths).toEqual(['.env.local']);
+      expect(writes).toContain('/w/.env.local');
+    } finally {
+      fs.rmSync(source, { recursive: true, force: true });
+    }
   });
 });

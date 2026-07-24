@@ -8,6 +8,7 @@ export const MERGE_QUEUE_WORKFLOW = 'mergeQueue';
 export const AGENT_QUEUE_WORKFLOW = 'agentQueue';
 export const ACCOUNT_COORDINATOR_WORKFLOW = 'accountCoordinator';
 export const BUDGET_COORDINATOR_WORKFLOW = 'budgetCoordinator';
+export const RESOURCE_PUBLISH_COORDINATOR_WORKFLOW = 'resourcePublishCoordinator';
 
 export const SIG_ENQUEUE = 'enqueue';
 export const SIG_RELEASE = 'release';
@@ -24,6 +25,11 @@ export const SIG_CANCEL_AGENT = 'cancelAgentSlot';
 export const SIG_RELEASE_AGENT = 'releaseAgentSlot';
 export const SIG_SET_AGENT_CAPACITY = 'setAgentCapacity';
 export const QRY_AGENT_QUEUE = 'agentQueue';
+
+export const SIG_ENQUEUE_RESOURCE_PUBLISH = 'enqueueResourcePublish';
+export const SIG_RELEASE_RESOURCE_PUBLISH = 'releaseResourcePublish';
+export const SIG_CANCEL_RESOURCE_PUBLISH = 'cancelResourcePublish';
+export const QRY_RESOURCE_PUBLISH = 'resourcePublishQueue';
 
 export const SIG_LEASE_ACCOUNT = 'leaseAccount';
 export const SIG_CANCEL_ACCOUNT = 'cancelAccountLease';
@@ -57,6 +63,10 @@ export function accountCoordinatorId(): string {
 
 export function agentQueueId(): string {
   return 'agent-queue';
+}
+
+export function resourcePublishCoordinatorId(attachmentId: string): string {
+  return `resource-publish:${attachmentId}`;
 }
 
 /** A login's `maxConcurrent` when the user chooses "unlimited" (empty field in the UI).
