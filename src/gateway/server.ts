@@ -674,15 +674,35 @@ export class Gateway {
     // configured shared secret, not a karmax session — so it sits with the other
     // unauthenticated endpoints, before the session gate.
     if (p === '/api/agent-mail/ingest' && method === 'POST') {
-      const secret = process.env.KARMAX_AGENT_MAIL_SECRET;
-      const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined;
-      if (!secret || bearer !== secret) return this.json(res, 401, { error: 'agent-mail ingest requires the configured shared secret' });
-      const { AgentMail } = await import('../autonomy/agent-mail.js');
-      const b = await this.body(req);
-      if (!b.to || !b.from) return this.json(res, 400, { error: 'to and from are required' });
+      const mailMod = await import('../autonomy/agent-mail.js');
+      // Auth: the minted secret (in the copy-pasted webhook URL or a Bearer
+      // header) — forwarding services can rarely set custom headers, so the
+      // query form is the primary one. Legacy env secret stays accepted.
+      const minted = mailMod.ingestSecret(this.deps.store);
+      const presented = url.searchParams.get('secret')
+        ?? (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
+      const legacy = process.env.KARMAX_AGENT_MAIL_SECRET;
+      if (!presented || (presented !== minted && (!legacy || presented !== legacy)))
+        return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL karmax shows the operator)' });
+      // Providers POST different shapes/encodings; parse by content-type and
+      // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw
+      // MIME from the Cloudflare Email Worker).
+      const rawBody = await this.rawBody(req, 8 * 1024 * 1024);
+      const contentType = String(req.headers['content-type'] ?? '');
+      let fields: Record<string, any> = {};
+      try {
+        if (contentType.includes('multipart/form-data')) fields = mailMod.parseMultipart(rawBody.toString('utf8'), contentType);
+        else if (contentType.includes('application/x-www-form-urlencoded')) fields = mailMod.parseUrlEncoded(rawBody.toString('utf8'));
+        else fields = JSON.parse(rawBody.toString('utf8'));
+      } catch {
+        return this.json(res, 400, { error: 'unparseable body (expected JSON, form-urlencoded, or multipart/form-data)' });
+      }
+      const msg = mailMod.normalizeInbound(fields);
+      if (!msg.to || !msg.from) return this.json(res, 400, { error: 'could not find a recipient/sender in the payload' });
       // Routed by recipient to the owning organization; unknown recipients are
       // dropped (never leaked into any tenant's inbox). Never echo the message.
-      const { delivered } = new AgentMail(this.deps.store, this.mailboxDomain()).ingest({ to: String(b.to), from: String(b.from), subject: b.subject ? String(b.subject) : undefined, text: String(b.text ?? '') });
+      const { delivered } = new mailMod.AgentMail(this.deps.store, this.mailboxDomain(), this.mailboxFixedLocal())
+        .ingest({ to: mailMod.cleanAddress(msg.to), from: mailMod.cleanAddress(msg.from), subject: msg.subject ? String(msg.subject) : undefined, text: String(msg.text ?? '') });
       return this.json(res, 200, { delivered });
     }
     const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
@@ -2562,9 +2582,15 @@ export class Gateway {
       // gives every organization a working address automatically (§8). ──
       if (p === '/api/agent-mail/providers' && method === 'GET') {
         const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+        const { ingestSecret, cloudflareWorkerScript } = await import('../autonomy/agent-mail.js');
         const registry = defaultMailboxRegistry();
         const config = this.mailboxConfig();
-        return this.json(res, 200, { providers: registry.list(config), active: config.provider, domain: registry.activeDomain(config) });
+        // Everything the operator pastes elsewhere, ready-made: the complete
+        // webhook URL (secret included) and the Cloudflare Email Worker.
+        const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
+        const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store)}`;
+        return this.json(res, 200, { providers: registry.list(config), active: config.provider, domain: registry.activeDomain(config),
+          webhookUrl, cloudflareWorker: cloudflareWorkerScript(webhookUrl) });
       }
       if (p === '/api/agent-mail/connect' && method === 'POST') {
         const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
@@ -2590,7 +2616,7 @@ export class Gateway {
       const mailMatch = p.match(/^\/api\/organizations\/([^/]+)\/agent-mail$/);
       if (mailMatch && method === 'GET') {
         const { AgentMail } = await import('../autonomy/agent-mail.js');
-        const mail = new AgentMail(store, this.mailboxDomain());
+        const mail = new AgentMail(store, this.mailboxDomain(), this.mailboxFixedLocal());
         const organizationId = mailMatch[1]!;
         return this.json(res, 200, { organizationId, address: mail.address(organizationId), configured: mail.configured(),
           messages: mail.recent(organizationId, { since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
@@ -3616,6 +3642,11 @@ export class Gateway {
     // its domain in config; hosted keeps hostedDomain. Either is the mint domain.
     const config = this.mailboxConfig();
     return config.domain || config.hostedDomain || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
+  }
+  /** The single-inbox base local part when the hosted provider issued one
+   *  fixed address (orgs then ride +tags on it); undefined otherwise. */
+  private mailboxFixedLocal(): string | undefined {
+    return this.mailboxConfig().fixedAddress?.split('@')[0] || undefined;
   }
 
   private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {

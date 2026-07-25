@@ -707,27 +707,32 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(orgId).toBeTruthy();
     const addr: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
     expect(addr.address).toMatch(/@/);
-    // ingest requires the configured shared secret
-    const prev = process.env.KARMAX_AGENT_MAIL_SECRET;
-    process.env.KARMAX_AGENT_MAIL_SECRET = 'shh';
-    try {
-      const rejected = await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: addr.address, from: 'x@y.com', text: 'code 314159' }) });
-      expect(rejected.status).toBe(401);
-      const ok: any = await (await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer shh' }, body: JSON.stringify({ to: addr.address, from: 'noreply@github.com', subject: 'Verify', text: 'Your code is 314159' }) })).json();
-      expect(ok.delivered).toBe(true);
-      // mail to an address no organization owns is dropped
-      const dropped: any = await (await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer shh' }, body: JSON.stringify({ to: 'stranger@agent.local', from: 'x@y.com', text: 'code 999999' }) })).json();
-      expect(dropped.delivered).toBe(false);
-      const inbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail?match=github`, { headers: auth() })).json();
-      expect(inbox.messages[0].code).toBe('314159');
-      // an agent token scoped to ANOTHER organization cannot read this inbox
-      const foreign = h.tokens.mint({ taskId: 'task_mail', profileId: 'do', principal: 'user:test',
-        organizationId: 'org_other', ceiling: ['credential:read'], grantorCaps: ['credential:read'] });
-      const denied = await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: { authorization: `Bearer ${foreign.token}` } });
-      expect(denied.status).toBe(403);
-    } finally {
-      if (prev === undefined) delete process.env.KARMAX_AGENT_MAIL_SECRET; else process.env.KARMAX_AGENT_MAIL_SECRET = prev;
-    }
+    // the webhook secret is MINTED by karmax and rides in the copy-pasted URL
+    const providers: any = await (await fetch(`${base}/api/agent-mail/providers`, { headers: auth() })).json();
+    expect(providers.webhookUrl).toContain('/api/agent-mail/ingest?secret=');
+    expect(providers.cloudflareWorker).toContain('async email(message');
+    const hook = new URL(providers.webhookUrl);
+    const ingest = `${base}${hook.pathname}${hook.search}`;
+    const rejected = await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: addr.address, from: 'x@y.com', text: 'code 314159' }) });
+    expect(rejected.status).toBe(401);
+    const ok: any = await (await fetch(ingest, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: addr.address, from: 'noreply@github.com', subject: 'Verify', text: 'Your code is 314159' }) })).json();
+    expect(ok.delivered).toBe(true);
+    // provider-shaped payloads normalize too (Mailgun urlencoded)
+    const mg: any = await (await fetch(ingest, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ recipient: addr.address, sender: 'no-reply@stripe.com', subject: 'Code', 'body-plain': 'Your code is 271828' }).toString() })).json();
+    expect(mg.delivered).toBe(true);
+    // mail to an address no organization owns is dropped
+    const dropped: any = await (await fetch(ingest, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: 'stranger@agent.local', from: 'x@y.com', text: 'code 999999' }) })).json();
+    expect(dropped.delivered).toBe(false);
+    const inbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail?match=github`, { headers: auth() })).json();
+    expect(inbox.messages[0].code).toBe('314159');
+    const inbox2: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail?match=stripe`, { headers: auth() })).json();
+    expect(inbox2.messages[0].code).toBe('271828');
+    // an agent token scoped to ANOTHER organization cannot read this inbox
+    const foreign = h.tokens.mint({ taskId: 'task_mail', profileId: 'do', principal: 'user:test',
+      organizationId: 'org_other', ceiling: ['credential:read'], grantorCaps: ['credential:read'] });
+    const denied = await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: { authorization: `Bearer ${foreign.token}` } });
+    expect(denied.status).toBe(403);
   });
 
   it('mailbox provider: connect a domain in Settings (no env var) and addresses adopt it', async () => {

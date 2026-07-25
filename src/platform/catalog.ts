@@ -58,7 +58,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/organizations/:organizationId/agent-mail?since=&match=&limit= (per-organization agent inbox: address + messages, verification code/link extracted)',
     'GET /api/agent-mail/providers (mailbox backends + active domain)',
     'POST /api/agent-mail/connect (operator connects a mailbox provider once for the whole installation; body {provider, domain?|apiKey?})',
-    'POST /api/agent-mail/ingest (inbound mail webhook; shared-secret authenticated, routed to the recipient organization)',
+    'POST /api/agent-mail/ingest?secret= (inbound mail webhook; minted-secret URL shown to the operator; accepts karmax/Postmark/CloudMailin/Mailgun/SendGrid payloads and raw MIME, routed to the recipient organization)',
   ],
   wiki: [
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',

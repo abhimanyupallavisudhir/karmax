@@ -1,5 +1,18 @@
 import { describe, it, expect } from 'vitest';
-import { AgentMail, extractCode, extractLink, type AgentMailStore } from '../src/autonomy/agent-mail.js';
+import {
+  AgentMail,
+  extractCode,
+  extractLink,
+  cleanAddress,
+  normalizeInbound,
+  extractMimeText,
+  decodeQuotedPrintable,
+  parseMultipart,
+  parseUrlEncoded,
+  ingestSecret,
+  cloudflareWorkerScript,
+  type AgentMailStore,
+} from '../src/autonomy/agent-mail.js';
 
 function memStore(): AgentMailStore {
   const kv = new Map<string, string>();
@@ -55,6 +68,30 @@ describe('AgentMail inbox (per-organization tenancy)', () => {
     expect(JSON.stringify(inboxB)).not.toContain('112233');
   });
 
+  it('domain-free hosted path: orgs ride +tags on one fixed provider address', () => {
+    const store = memStore();
+    const mail = new AgentMail(store, 'inbound.postmarkapp.com', 'ab12cd');
+    const a = mail.address('org_a');
+    expect(a).toMatch(/^ab12cd\+agent-[0-9a-f]{12}@inbound\.postmarkapp\.com$/);
+    // routes on the exact local, and on the tag alone (provider may rewrite base)
+    expect(mail.ownerOf(a)).toBe('org_a');
+    expect(mail.ownerOf(a.replace('ab12cd+', 'whatever+'))).toBe('org_a');
+    expect(mail.ingest({ from: 'x@y.com', to: a, text: 'code 123456' }).delivered).toBe(true);
+  });
+
+  it('provider switch migrates the address, preserving the org token', () => {
+    const store = memStore();
+    const before = new AgentMail(store, undefined).address('org_a');
+    const token = before.match(/agent-[0-9a-f]+/)![0];
+    const after = new AgentMail(store, 'agents.myco.com').address('org_a');
+    expect(after).toBe(`${token}@agents.myco.com`);
+    const fixed = new AgentMail(store, 'inbound.svc.com', 'base1').address('org_a');
+    expect(fixed).toBe(`base1+${token}@inbound.svc.com`);
+    // mail addressed to ANY historical form still routes to the org
+    expect(new AgentMail(store).ownerOf(before)).toBe('org_a');
+    expect(new AgentMail(store).ownerOf(fixed)).toBe('org_a');
+  });
+
   it('filters by match and since', () => {
     const mail = new AgentMail(memStore());
     const a = mail.address('org_a');
@@ -62,5 +99,73 @@ describe('AgentMail inbox (per-organization tenancy)', () => {
     mail.ingest({ from: 'noreply@vercel.com', to: a, text: 'two', receivedAt: 2000 });
     expect(mail.recent('org_a', { match: 'github' })).toHaveLength(1);
     expect(mail.recent('org_a', { since: 1500 }).map((m) => m.from)).toEqual(['noreply@vercel.com']);
+  });
+});
+
+describe('inbound payload normalization (meet providers where they are)', () => {
+  it('recognizes Postmark, CloudMailin, Mailgun, SendGrid, and our own JSON', () => {
+    expect(normalizeInbound({ To: 'a@b.c', FromFull: { Email: 'x@y.z' }, Subject: 'Hi', TextBody: 'code 111222' }))
+      .toEqual({ to: 'a@b.c', from: 'x@y.z', subject: 'Hi', text: 'code 111222' });
+    expect(normalizeInbound({ envelope: { to: 'a@b.c', from: 'x@y.z' }, headers: { subject: 'Hi' }, plain: 'hello' }).text).toBe('hello');
+    expect(normalizeInbound({ recipient: 'a@b.c', sender: 'x@y.z', subject: 'Hi', 'body-plain': 'hey' }).to).toBe('a@b.c');
+    expect(normalizeInbound({ to: 'a@b.c', from: 'x@y.z', subject: 'Hi', text: 'plain' }).text).toBe('plain');
+  });
+  it('falls back to stripped HTML when no plain body exists', () => {
+    expect(normalizeInbound({ To: 'a@b.c', From: 'x@y.z', HtmlBody: '<p>Your code is <b>987654</b></p>' }).text).toContain('987654');
+  });
+  it('cleanAddress extracts the address from display forms', () => {
+    expect(cleanAddress('GitHub <noreply@github.com>')).toBe('noreply@github.com');
+    expect(cleanAddress('plain@addr.com')).toBe('plain@addr.com');
+  });
+});
+
+describe('raw MIME extraction (the Cloudflare Email Worker path)', () => {
+  it('decodes quoted-printable and picks the text/plain part of a multipart message', () => {
+    const raw = [
+      'From: noreply@github.com', 'To: agent-ab@x.co', 'Subject: Verify', 'MIME-Version: 1.0',
+      'Content-Type: multipart/alternative; boundary="BB"', '',
+      '--BB', 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: quoted-printable', '',
+      'Your code is 445566 =E2=80=94 enter it now.', '',
+      '--BB', 'Content-Type: text/html', '', '<p>ignored html</p>', '--BB--', '',
+    ].join('\r\n');
+    const msg = normalizeInbound({ to: 'agent-ab@x.co', from: 'noreply@github.com', subject: 'Verify', text: raw });
+    expect(msg.text).toContain('445566');
+    expect(msg.text).not.toContain('ignored html');
+  });
+  it('decodes base64 bodies', () => {
+    const body = Buffer.from('secret code 778899').toString('base64');
+    const raw = `Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n${body}`;
+    expect(extractMimeText(raw)).toContain('778899');
+  });
+  it('quoted-printable soft breaks and =XX escapes', () => {
+    expect(decodeQuotedPrintable('one=\r\ntwo =3D three')).toBe('onetwo = three');
+  });
+});
+
+describe('webhook body parsers + secret + worker script', () => {
+  it('parses urlencoded and multipart form posts into fields', () => {
+    expect(parseUrlEncoded('recipient=a%40b.c&sender=x%40y.z&subject=Hi&body-plain=code+123')['body-plain']).toBe('code 123');
+    const mp = [
+      '--XX', 'Content-Disposition: form-data; name="to"', '', 'a@b.c',
+      '--XX', 'Content-Disposition: form-data; name="text"', '', 'code 456789',
+      '--XX', 'Content-Disposition: form-data; name="file"; filename="x.eml"', '', 'IGNORED',
+      '--XX--', '',
+    ].join('\r\n');
+    const fields = parseMultipart(mp, 'multipart/form-data; boundary=XX');
+    expect(fields.to).toBe('a@b.c');
+    expect(fields.text).toBe('code 456789');
+    expect(fields.file).toBeUndefined();
+  });
+  it('mints a stable ingest secret in the store (no env var)', () => {
+    const store = memStore();
+    const s = ingestSecret(store);
+    expect(s.length).toBeGreaterThan(15);
+    expect(ingestSecret(store)).toBe(s);
+  });
+  it('the Cloudflare worker script embeds the full webhook URL and relays raw MIME', () => {
+    const script = cloudflareWorkerScript('https://kx.example/api/agent-mail/ingest?secret=abc');
+    expect(script).toContain('secret=abc');
+    expect(script).toContain('message.raw');
+    expect(script).toContain('async email(message');
   });
 });

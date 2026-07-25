@@ -21,13 +21,16 @@ describe('mailbox providers (§8: connect once, not an env var)', () => {
     expect(p.describe({ domain: 'agents.myco.com' }).connected).toBe(true);
   });
 
-  it('hosted: operator enters both the domain and the API key (no env var)', () => {
+  it('hosted: a domain OR a single fixed address connects; API key is optional', () => {
     const p = new HostedMailboxProvider();
-    expect(p.connect({ apiKey: 'k' }).status).toBe('unavailable'); // needs a domain
-    expect(p.connect({ domain: 'mail.karmax.app' }).status).toBe('unavailable'); // needs the key
-    const ok = p.connect({ domain: 'Mail.Karmax.App', apiKey: 'secret-key' });
-    expect(ok.status).toBe('connected');
-    expect(ok.config).toEqual({ provider: 'hosted', hostedDomain: 'mail.karmax.app' });
+    expect(p.connect({ apiKey: 'k' }).status).toBe('unavailable'); // needs the address/domain
+    const dom = p.connect({ domain: 'Mail.Karmax.App' });
+    expect(dom.status).toBe('connected');
+    expect(dom.config).toEqual({ provider: 'hosted', hostedDomain: 'mail.karmax.app', fixedAddress: undefined });
+    // the domain-free path: the ONE inbound address the service issued
+    const fixed = p.connect({ domain: 'AB12cd@inbound.postmarkapp.com' });
+    expect(fixed.status).toBe('connected');
+    expect(fixed.config).toEqual({ provider: 'hosted', hostedDomain: 'inbound.postmarkapp.com', fixedAddress: 'ab12cd@inbound.postmarkapp.com' });
     expect(p.domainFor({ provider: 'hosted', hostedDomain: 'mail.karmax.app' })).toBe('mail.karmax.app');
   });
 

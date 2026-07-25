@@ -31,6 +31,9 @@ export interface MailboxConfig {
   apiKeyHandle?: string;
   /** hosted: the domain the managed provider assigns. */
   hostedDomain?: string;
+  /** hosted, domain-free path: the ONE inbound address the service issued
+   *  (e.g. ab12cd@inbound.postmarkapp.com); orgs ride +tags on it. */
+  fixedAddress?: string;
 }
 
 export interface MailboxProviderInfo {
@@ -45,6 +48,8 @@ export interface MailboxProviderInfo {
 }
 
 export interface ConnectInput {
+  /** A domain (self-managed / hosted-with-domain) or, for the hosted
+   *  domain-free path, the full inbound address the service issued. */
   domain?: string;
   apiKey?: string;
 }
@@ -100,20 +105,25 @@ export class HostedMailboxProvider implements MailboxProvider {
   readonly name = 'hosted';
   describe(config: MailboxConfig): MailboxProviderInfo {
     const domain = this.domainFor(config);
-    const connected = !!config.apiKeyHandle && !!domain;
+    const connected = !!domain;
     return {
-      name: this.name, label: 'Hosted mailbox', kind: 'apiKey', connected, domain,
+      name: this.name, label: 'Hosted inbox', kind: 'apiKey', connected, domain,
       help: connected
-        ? `Connected. Agents get addresses on ${domain} — no DNS to manage.`
-        : 'Enter the domain your inbound-email service handles and its API key. One-time; then every organization gets an address automatically.',
+        ? (config.fixedAddress ? `Connected via ${config.fixedAddress} — organizations get +tagged addresses on it.` : `Connected. Agents get addresses on ${domain}.`)
+        : 'No domain needed: an inbound-email service gives you an address or domain on THEIR domain and POSTs incoming mail to a URL. Paste what they gave you, and paste karmax’s webhook URL (shown below) into their settings.',
     };
   }
   connect(input: ConnectInput): ConnectResult {
-    const domain = input.domain?.trim().replace(/^@/, '').toLowerCase();
-    if (!domain || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain)) return { status: 'unavailable', detail: 'enter the domain your inbound-email service handles, e.g. mail.yoursite.com' };
-    if (!input.apiKey?.trim()) return { status: 'unavailable', detail: 'paste your inbound-email API key' };
-    // The key is stored in the vault by the caller; we record the mint domain.
-    return { status: 'connected', detail: 'Connected. Every organization now gets a working agent address automatically.', config: { provider: this.name, hostedDomain: domain } };
+    const value = input.domain?.trim().replace(/^@/, '').toLowerCase();
+    if (!value) return { status: 'unavailable', detail: 'enter the inbound address (e.g. ab12cd@inbound.example.com) or domain the service gave you' };
+    // A full address ⇒ the domain-free single-inbox path (orgs ride +tags).
+    if (value.includes('@')) {
+      const [local, host] = value.split('@');
+      if (!local || !host || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(host)) return { status: 'unavailable', detail: 'that does not look like a valid address' };
+      return { status: 'connected', detail: 'Connected. Every organization now gets its own +tagged address on that inbox.', config: { provider: this.name, hostedDomain: host, fixedAddress: value } };
+    }
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(value)) return { status: 'unavailable', detail: 'that does not look like a valid domain' };
+    return { status: 'connected', detail: 'Connected. Every organization now gets a working agent address automatically.', config: { provider: this.name, hostedDomain: value, fixedAddress: undefined } };
   }
   domainFor(config: MailboxConfig): string | undefined {
     return config.hostedDomain || undefined;
