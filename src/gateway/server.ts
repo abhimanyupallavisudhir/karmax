@@ -44,6 +44,8 @@ import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
 import { worldWorkingRelativePath } from '../world/types.js';
+import { enumerateCredentials } from '../platform/credentials.js';
+import { gatherCredentialSources } from '../platform/credential-sources.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -68,6 +70,7 @@ export interface GatewayDeps {
   worlds: WorldRegistry;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  workflows?: import('../packages/manager.js').WorkflowManager;
   handoffs?: import('../world/handoff.js').WorldHandoffService;
   runners?: import('../world/runners.js').RunnerPoolService;
   worldAccess?: import('../world/access.js').WorldAccessService;
@@ -105,6 +108,10 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
+  if (/^\/api\/organizations\/[^/]+\/(?:accounts|git-profiles|credentials)(?:\/|$)/.test(p))
+    return read ? 'credential:read' : 'credential:write';
+  if (/^\/api\/organizations\/[^/]+\/workflows(?:\/|$)/.test(p))
+    return read ? 'workflow:read' : (p.includes('/install') ? 'workflow:install' : 'workflow:edit');
   // The wiki is the skills store: reads need the scope's read capability, edits
   // reuse skill:write (agents and developers can both grow it).
   if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
@@ -338,7 +345,7 @@ export class Gateway {
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions: ReviewActionRunner;
   private attachments = new AttachmentStore();
-  private modelCatalog?: { at: number; value: ModelCatalog };
+  private modelCatalog = new Map<string, { at: number; value: ModelCatalog }>();
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
   private fanout: DurableEventFanout;
   /** Remotes verified during this gateway process. Persisted links are retried
@@ -853,6 +860,11 @@ export class Gateway {
     }
     const token = session.apiToken;
     const { api, store } = this.deps;
+    const organizationResource = p.match(/^\/api\/organizations\/([^/]+)\/(accounts|git-profiles|credentials|workflows)(\/.*)?$/);
+    const resourceOrganizationId = organizationResource?.[1] ?? requestedScope.organizationId ?? 'org_personal';
+    const resourcePath = organizationResource
+      ? `/api/${organizationResource[2]}${organizationResource[3] ?? ''}`
+      : p;
 
     const required = capabilityForRequest(method, p, url);
     let authRecord = this.deps.tokens.verify(token);
@@ -974,6 +986,14 @@ export class Gateway {
         await this.deps.githubApp?.disconnectOrganization(organizationId);
         for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
           this.deps.providerConnections?.delete(organizationId, connection.provider);
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, organizationId);
+        for (const profile of gitProfiles.list()) gitProfiles.delete(profile.name);
+        const { agentAccountHandles } = await import('../platform/credential-sources.js');
+        for (const handle of agentAccountHandles(this.deps.broker?.listHandles() ?? [], organizationId))
+          this.deps.broker?.deleteHandle(handle);
+        this.deps.configHomes?.removeOrganization(organizationId);
+        await this.deps.workflows?.removeOrganization(organizationId);
         store.deleteOrganization(organizationId);
         for (const attachmentId of resources.attachmentIds)
           if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
@@ -2316,12 +2336,17 @@ export class Gateway {
       }
 
       // Installed + built-in workflows, and installing a new one from a git repo (§21d).
-      if (p === '/api/workflows' && method === 'GET') return this.json(res, 200, api.listWorkflows(token));
-      if (p === '/api/workflows/install' && method === 'POST') {
+      if (resourcePath === '/api/workflows' && method === 'GET')
+        return this.json(res, 200, api.listWorkflows(token, resourceOrganizationId));
+      if (resourcePath === '/api/workflows/install' && method === 'POST') {
         const b = await this.body(req);
         if (!b.url) return this.json(res, 400, { error: 'url required' });
         try {
-          return this.json(res, 200, await api.installWorkflow(token, { url: String(b.url), ref: b.ref ? String(b.ref) : undefined, name: b.name ? String(b.name) : undefined }));
+          return this.json(res, 200, await api.installWorkflow(token, {
+            url: String(b.url),
+            ref: b.ref ? String(b.ref) : undefined,
+            name: b.name ? String(b.name) : undefined,
+          }, resourceOrganizationId));
         } catch (e) {
           if (e instanceof CapabilityError) throw e;
           // fetch/validation/collision failures are user-facing input errors
@@ -2359,7 +2384,10 @@ export class Gateway {
       // Codex app-server expose this metadata; cache it because each refresh boots a
       // short-lived provider subprocess for every distinct connected login.
       if (p === '/api/models' && method === 'GET') {
-        return this.json(res, 200, await this.availableModels(url.searchParams.get('refresh') === '1'));
+        return this.json(res, 200, await this.availableModels(
+          url.searchParams.get('refresh') === '1',
+          requestedScope.organizationId ?? 'org_personal',
+        ));
       }
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
@@ -2422,15 +2450,22 @@ export class Gateway {
 
       // accounts: API-key handles (broker; secrets write-only) + config-home
       // logins (SPEC §7.3 — switchable per-account subscriptions).
-      if (p === '/api/accounts' && method === 'GET') {
+      if (resourcePath === '/api/accounts' && method === 'GET') {
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
         return this.json(res, 200, {
-          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? []),
+          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? [], resourceOrganizationId),
           // never expose the home's absolute path to the browser
-          logins: (this.deps.configHomes?.list() ?? []).map((a) => ({ provider: a.provider, account: a.account, loggedIn: a.loggedIn })),
+          logins: (this.deps.configHomes?.list(resourceOrganizationId) ?? []).map((a) => ({
+            provider: a.provider,
+            account: a.account,
+            loggedIn: a.loggedIn,
+            key: resourceOrganizationId === 'org_personal'
+              ? `login:${a.provider}:${a.account}`
+              : `login:${resourceOrganizationId}:${a.provider}:${a.account}`,
+          })),
         });
       }
-      if (p === '/api/accounts' && method === 'POST') {
+      if (resourcePath === '/api/accounts' && method === 'POST') {
         const b = await this.body(req);
         if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
         if (!b.provider || !b.account || !b.apiKey) return this.json(res, 400, { error: 'provider, account, apiKey required' });
@@ -2438,13 +2473,20 @@ export class Gateway {
         if (!/^[a-z0-9][a-z0-9._-]*$/i.test(provider)) {
           return this.json(res, 400, { error: 'model provider must be a simple id (letters, numbers, dot, underscore, hyphen)' });
         }
-        const handle = `${provider}:${b.account}`;
+        const account = String(b.account);
+        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(account)) {
+          return this.json(res, 400, { error: 'account must be a simple id (letters, numbers, dot, underscore, hyphen)' });
+        }
+        const handle = resourceOrganizationId === 'org_personal'
+          ? `${provider}:${account}`
+          : `${provider}:${resourceOrganizationId}:${account}`;
         this.deps.broker.registerHandle(handle, String(b.apiKey));
+        await this.refreshLoginPool();
         return this.json(res, 200, { handle }); // never echoes the secret
       }
       // connect an account login: mint a config home + launch the provider's own
       // OAuth, return the device URL for the user to complete (we never type creds).
-      if (p === '/api/accounts/connect' && method === 'POST') {
+      if (resourcePath === '/api/accounts/connect' && method === 'POST') {
         if (!this.deps.login) return this.json(res, 400, { error: 'no login manager configured' });
         const b = await this.body(req);
         if (!isLoginProvider(b.provider)) return this.json(res, 400, { error: `unsupported login provider: ${String(b.provider ?? '')}` });
@@ -2460,7 +2502,7 @@ export class Gateway {
             return this.json(res, 400, { error: 'OpenCode login requires a valid auth-method label' });
           }
         }
-        const result = await this.deps.login.connect(provider, String(b.account), { modelProvider, authMethod });
+        const result = await this.deps.login.connect(provider, String(b.account), { modelProvider, authMethod }, resourceOrganizationId);
         // Seed the config home's MCP baseline (SPEC §7.5/§3.4): the karmax platform
         // MCP (always) + an optional browser MCP. The scoped token is injected at
         // spawn; here we bake in the gateway URL only.
@@ -2478,7 +2520,7 @@ export class Gateway {
         return this.json(res, 200, safe);
       }
       // edit (rename) / delete a connected login
-      const loginMatch = p.match(/^\/api\/accounts\/logins\/([^/]+)\/(.+)$/);
+      const loginMatch = resourcePath.match(/^\/api\/accounts\/logins\/([^/]+)\/(.+)$/);
       if (loginMatch && (method === 'DELETE' || method === 'PATCH')) {
         if (!this.deps.configHomes) return this.json(res, 400, { error: 'no config homes configured' });
         const rawProvider = loginMatch[1];
@@ -2486,11 +2528,11 @@ export class Gateway {
         const provider = rawProvider;
         const account = decodeURIComponent(loginMatch[2]!);
         if (method === 'DELETE') {
-          this.deps.configHomes.remove(provider, account);
+          this.deps.configHomes.remove(provider, account, resourceOrganizationId);
         } else {
           const b = await this.body(req);
           if (!b.account) return this.json(res, 400, { error: 'new account name required' });
-          this.deps.configHomes.rename(provider, account, String(b.account));
+          this.deps.configHomes.rename(provider, account, String(b.account), resourceOrganizationId);
         }
         await this.refreshLoginPool();
         return this.json(res, 200, { ok: true });
@@ -2499,17 +2541,17 @@ export class Gateway {
       // Git profiles (PLAN-git-config.md §3): named git identity + credentials for
       // the repos karmax works on. The registry is public; secrets are write-only
       // into the vault (never echoed) and resolved JIT by the broker at use time.
-      if (p === '/api/git-profiles' && method === 'GET') {
+      if (resourcePath === '/api/git-profiles' && method === 'GET') {
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        const gp = new GitProfiles(store, this.deps.broker);
+        const gp = new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId);
         return this.json(res, 200, { profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null });
       }
-      if (p === '/api/git-profiles' && method === 'POST') {
+      if (resourcePath === '/api/git-profiles' && method === 'POST') {
         const b = await this.body(req);
         if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
         if (!b.name || !b.userName || !b.userEmail) return this.json(res, 400, { error: 'name, userName, userEmail required' });
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        const gp = new GitProfiles(store, this.deps.broker);
+        const gp = new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId);
         try {
           const rec = gp.save({
             name: String(b.name),
@@ -2525,35 +2567,42 @@ export class Gateway {
           return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
         }
       }
-      const gitProfileMatch = p.match(/^\/api\/git-profiles\/([^/]+)$/);
+      const gitProfileMatch = resourcePath.match(/^\/api\/git-profiles\/([^/]+)$/);
       if (gitProfileMatch && method === 'DELETE') {
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        new GitProfiles(store, this.deps.broker).delete(decodeURIComponent(gitProfileMatch[1]!));
+        new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId)
+          .delete(decodeURIComponent(gitProfileMatch[1]!));
         return this.json(res, 200, { ok: true });
       }
       // The doctor check (PLAN-git-config.md §7): which tier a project's remote
       // ops resolve to (profile / host fallback) and whether it can reach the
       // repos' remotes non-interactively. Read-only.
-      if (p === '/api/git-profiles/preflight' && method === 'GET') {
+      if (resourcePath === '/api/git-profiles/preflight' && method === 'GET') {
         const projectId = url.searchParams.get('projectId') ?? undefined;
         const project = projectId ? store.getProject(projectId) : undefined;
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        return this.json(res, 200, await new GitProfiles(store, this.deps.broker).preflight(project?.config));
+        const organizationId = project?.organizationId ?? resourceOrganizationId;
+        if (project && organizationId !== resourceOrganizationId)
+          return this.json(res, 400, { error: 'project does not belong to this organization' });
+        return this.json(res, 200, await new GitProfiles(store, this.deps.broker, undefined, organizationId).preflight(project?.config));
       }
-      if (p === '/api/git-profiles/default' && method === 'POST') {
+      if (resourcePath === '/api/git-profiles/default' && method === 'POST') {
         const b = await this.body(req);
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        new GitProfiles(store, this.deps.broker).setDefault(b.name ? String(b.name) : undefined);
+        new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId)
+          .setDefault(b.name ? String(b.name) : undefined);
         return this.json(res, 200, { ok: true });
       }
 
       // Manual availability override for an agent login (SPEC §6.2): force a login
       // on/off or edit its reset time (e.g. after upgrading a plan) without waiting
       // for the old refresh. Signals the account coordinator directly.
-      if (p === '/api/accounts/availability' && method === 'POST') {
+      if (resourcePath === '/api/accounts/availability' && method === 'POST') {
         if (!this.deps.client) return this.json(res, 400, { error: 'no temporal client' });
         const b = await this.body(req);
         if (!b.accountId || !b.status) return this.json(res, 400, { error: 'accountId and status required' });
+        if (!this.organizationCredentialKeys(resourceOrganizationId).includes(String(b.accountId)))
+          return this.json(res, 404, { error: 'credential not found in this organization' });
         const status = ['available', 'manual-off', 'needs-attention', 'exhausted'].includes(b.status) ? b.status : 'exhausted';
         const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
         await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).setAccountAvailability({
@@ -2567,9 +2616,11 @@ export class Gateway {
       // Per-login concurrency cap — how many agent turns may run on this login at once.
       // `max` = a positive integer, or null/empty for unlimited. Persisted + re-applied
       // to the coordinator immediately (concurrency doesn't cost extra quota).
-      if (p === '/api/accounts/concurrency' && method === 'POST') {
+      if (resourcePath === '/api/accounts/concurrency' && method === 'POST') {
         const b = await this.body(req);
         if (!b.accountId) return this.json(res, 400, { error: 'accountId required' });
+        if (!this.organizationCredentialKeys(resourceOrganizationId).includes(String(b.accountId)))
+          return this.json(res, 404, { error: 'credential not found in this organization' });
         const { concurrencyKey } = await import('../platform/credential-sources.js');
         const { UNLIMITED_CONCURRENCY } = await import('../coordinators/names.js');
         const n = b.max == null || b.max === '' ? UNLIMITED_CONCURRENCY : Math.floor(Number(b.max));
@@ -2582,11 +2633,15 @@ export class Gateway {
       // Proactive quota (#6): real usage % + reset for each pollable subscription.
       // GET returns the cached snapshots; recheck re-probes on demand (the button).
       // API-key/setup-token creds aren't pollable → they show reactive status.
-      if (p === '/api/accounts/usage' && method === 'GET') {
+      if (resourcePath === '/api/accounts/usage' && method === 'GET') {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
         const { isUsagePollable, isUsageStale } = await import('../agent/usage.js');
-        const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+        const creds = enumerateCredentials(gatherCredentialSources({
+          configHomes: this.deps.configHomes,
+          broker: this.deps.broker,
+          organizationId: resourceOrganizationId,
+        }));
         const usage: Record<string, unknown> = {};
         const pollable: string[] = [];
         for (const c of creds) {
@@ -2607,23 +2662,34 @@ export class Gateway {
         }
         return this.json(res, 200, { usage, pollable });
       }
-      if (p === '/api/accounts/usage/recheck' && method === 'POST') {
+      if (resourcePath === '/api/accounts/usage/recheck' && method === 'POST') {
         const b = await this.body(req);
         const only = b.accountId ? String(b.accountId) : undefined;
-        const usage = await this.refreshUsage(only);
+        const usage = await this.refreshUsage(only, resourceOrganizationId);
         return this.json(res, 200, { usage });
       }
 
       // Credential policy (SPEC §7/§9): list every credential + its effective
       // enablement per scope (global→project→task), and set a scope's ordering /
       // enable-disable overrides.
-      if (p === '/api/credentials' && method === 'GET') {
+      if (resourcePath === '/api/credentials' && method === 'GET') {
         const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources, parsePolicy, credPolicyKey } = await import('../platform/credential-sources.js');
-        const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
         const projectId = url.searchParams.get('projectId') ?? undefined;
         const taskId = url.searchParams.get('taskId') ?? undefined;
-        const g = parsePolicy(store.kvGet(credPolicyKey.global()));
+        const scopedProjectId = projectId ?? (taskId ? store.getTask(taskId)?.projectId : undefined);
+        const scopedOrganizationId = scopedProjectId
+          ? store.getProject(scopedProjectId)?.organizationId ?? resourceOrganizationId
+          : resourceOrganizationId;
+        if (scopedOrganizationId !== resourceOrganizationId)
+          return this.json(res, 400, { error: 'credential scope does not belong to this organization' });
+        const creds = enumerateCredentials(gatherCredentialSources({
+          configHomes: this.deps.configHomes,
+          broker: this.deps.broker,
+          organizationId: scopedOrganizationId,
+        }));
+        const g = parsePolicy(store.kvGet(credPolicyKey.organization(scopedOrganizationId)))
+          ?? (scopedOrganizationId === 'org_personal' ? parsePolicy(store.kvGet(credPolicyKey.global())) : undefined);
         const pr = projectId ? parsePolicy(store.kvGet(credPolicyKey.project(projectId))) : undefined;
         const tk = taskId ? parsePolicy(store.kvGet(credPolicyKey.task(taskId))) : undefined;
         const enabledKeys = (layers: { global?: unknown; project?: unknown; task?: unknown }) =>
@@ -2635,13 +2701,26 @@ export class Gateway {
           ...(taskId ? { task: { own: tk ?? {}, enabled: enabledKeys({ global: g, project: pr, task: tk }) } } : {}),
         });
       }
-      if (p === '/api/credentials/policy' && method === 'POST') {
+      if (resourcePath === '/api/credentials/policy' && method === 'POST') {
         const b = await this.body(req);
         const { credPolicyKey } = await import('../platform/credential-sources.js');
-        const key =
-          b.scope === 'task' && b.taskId ? credPolicyKey.task(String(b.taskId))
-          : b.scope === 'project' && b.projectId ? credPolicyKey.project(String(b.projectId))
-          : credPolicyKey.global();
+        let key: string;
+        if (b.scope === 'task') {
+          const task = b.taskId ? store.getTask(String(b.taskId)) : undefined;
+          const project = task ? store.getProject(task.projectId) : undefined;
+          if (!task || project?.organizationId !== resourceOrganizationId)
+            return this.json(res, 400, { error: 'credential scope does not belong to this organization' });
+          key = credPolicyKey.task(task.id);
+        } else if (b.scope === 'project') {
+          const project = b.projectId ? store.getProject(String(b.projectId)) : undefined;
+          if (!project || project.organizationId !== resourceOrganizationId)
+            return this.json(res, 400, { error: 'credential scope does not belong to this organization' });
+          key = credPolicyKey.project(project.id);
+        } else if (b.scope === 'global' || b.scope === 'organization') {
+          key = credPolicyKey.organization(resourceOrganizationId);
+        } else {
+          return this.json(res, 400, { error: 'scope must be organization, global, project, or task' });
+        }
         store.kvSet(key, JSON.stringify(b.policy ?? {}));
         return this.json(res, 200, { ok: true });
       }
@@ -2649,7 +2728,7 @@ export class Gateway {
       // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms
       if (p === '/api/schema' && method === 'GET') {
         // Built-in + installed workflows, so the New Task form offers both (§21d).
-        return this.json(res, 200, api.workflowSchemas());
+        return this.json(res, 200, api.workflowSchemas(requestedScope.organizationId ?? 'org_personal'));
       }
       if (p === '/api/events/catalog' && method === 'GET') {
         // Workflow + platform events for the event-trigger picker (SPEC §5).
@@ -2910,13 +2989,18 @@ export class Gateway {
     }
   }
 
-  private async availableModels(refresh = false): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
-    if (!refresh && this.modelCatalog && Date.now() - this.modelCatalog.at < 5 * 60_000) {
-      return { providers: this.modelCatalog.value, refreshedAt: this.modelCatalog.at };
+  private async availableModels(refresh = false, organizationId = 'org_personal'): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
+    const cached = this.modelCatalog.get(organizationId);
+    if (!refresh && cached && Date.now() - cached.at < 5 * 60_000) {
+      return { providers: cached.value, refreshedAt: cached.at };
     }
     const { gatherCredentialSources } = await import('../platform/credential-sources.js');
     const { enumerateCredentials } = await import('../platform/credentials.js');
-    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+    const creds = enumerateCredentials(gatherCredentialSources({
+      configHomes: this.deps.configHomes,
+      broker: this.deps.broker,
+      organizationId,
+    }));
     type CatalogProvider = Exclude<Provider, 'mock'>;
     const homes = (provider: CatalogProvider) => {
       const values = creds.filter((c) => c.provider === provider && c.kind !== 'key').map((c) => c.configHome);
@@ -2957,8 +3041,9 @@ export class Gateway {
       grok: [],
       mock: [{ id: 'mock' }],
     };
-    this.modelCatalog = { at: Date.now(), value };
-    return { providers: value, refreshedAt: this.modelCatalog.at };
+    const next = { at: Date.now(), value };
+    this.modelCatalog.set(organizationId, next);
+    return { providers: value, refreshedAt: next.at };
   }
 
   /** For each agent field, resolve the concrete provider/model the server would
@@ -2968,9 +3053,14 @@ export class Gateway {
    *  rotation reflects the current set (called after connect/rename/delete). */
   private async refreshLoginPool(): Promise<void> {
     if (!this.deps.configHomes || !this.deps.client) return;
-    const { gatherCredentialSources, concurrencyFor } = await import('../platform/credential-sources.js');
-    const { enumerateCredentials } = await import('../platform/credentials.js');
-    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+    const { concurrencyFor } = await import('../platform/credential-sources.js');
+    const creds = this.deps.store.listOrganizations().flatMap((organization) =>
+      enumerateCredentials(gatherCredentialSources({
+        configHomes: this.deps.configHomes,
+        broker: this.deps.broker,
+        organizationId: organization.id,
+      })),
+    );
     const pool = creds.map((c) => {
       const maxConcurrent = concurrencyFor((k) => this.deps.store.kvGet(k), c.key);
       return { id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}), ...(maxConcurrent != null ? { maxConcurrent } : {}) };
@@ -2986,12 +3076,14 @@ export class Gateway {
    *  Overlapping rechecks (auto-refresh + button, multiple tabs) share one in-flight
    *  probe per login rather than spawning duplicate CLIs. */
   private usageProbes = new Map<string, Promise<unknown>>();
-  private async refreshUsage(only?: string): Promise<Record<string, unknown>> {
+  private async refreshUsage(only?: string, organizationId = 'org_personal'): Promise<Record<string, unknown>> {
     const { store } = this.deps;
-    const { enumerateCredentials } = await import('../platform/credentials.js');
-    const { gatherCredentialSources } = await import('../platform/credential-sources.js');
     const { probeClaudeUsage, probeCodexUsage, isUsagePollable } = await import('../agent/usage.js');
-    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }))
+    const creds = enumerateCredentials(gatherCredentialSources({
+      configHomes: this.deps.configHomes,
+      broker: this.deps.broker,
+      organizationId,
+    }))
       .filter((c) => isUsagePollable(c) && (!only || c.key === only));
     const out: Record<string, unknown> = {};
     await Promise.all(creds.map(async (c) => {
@@ -3007,6 +3099,14 @@ export class Gateway {
       out[c.key] = await probe;
     }));
     return out;
+  }
+
+  private organizationCredentialKeys(organizationId: string): string[] {
+    return enumerateCredentials(gatherCredentialSources({
+      configHomes: this.deps.configHomes,
+      broker: this.deps.broker,
+      organizationId,
+    })).map((credential) => credential.key);
   }
 
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {

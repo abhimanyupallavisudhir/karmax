@@ -220,6 +220,7 @@ async function applyRoute() {
         await loadCollaboration().catch(() => {});
       }
     }
+    await loadOrganizationRuntimeCatalog();
     // Bare /<org> → that org's default project (or its dashboard); pre-org URLs
     // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
     // redirect when the canonical path actually differs, so an unresolvable slug
@@ -258,6 +259,7 @@ async function applyRoute() {
   }
   const pid = proj.id;
   S.organizationId = proj.organizationId || S.organizationId;
+  await loadOrganizationRuntimeCatalog();
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
@@ -1594,7 +1596,9 @@ async function boot() {
   }
   if (!S.organizationId) S.organizationId = S.projects.find((p) => p.organizationId)?.organizationId || S.organizations[0]?.id || null;
   await loadCollaboration().catch(() => {});
-  const projectScope = S.projectId ? `?projectId=${encodeURIComponent(S.projectId)}` : '';
+  const projectScope = S.projectId
+    ? `?projectId=${encodeURIComponent(S.projectId)}`
+    : S.organizationId ? `?organizationId=${encodeURIComponent(S.organizationId)}` : '';
   try {
     S.contributions = await api(`/api/contributions${projectScope}`);
     S.schema = await api(`/api/schema${projectScope}`);
@@ -1620,6 +1624,22 @@ async function loadProjects() {
   S.projects = await api('/api/projects');
   if (!S.projectId && S.projects[0]) S.projectId = S.projects[0].id;
   if (S.projectId) S.organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
+}
+
+async function loadOrganizationRuntimeCatalog() {
+  if (!S.organizationId || S.catalogOrganizationId === S.organizationId) return;
+  const query = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  try {
+    const [schema, models] = await Promise.all([
+      api(`/api/schema${query}`),
+      api(`/api/models${query}`),
+    ]);
+    S.schema = schema;
+    S.modelCatalog = models.providers;
+    S.catalogOrganizationId = S.organizationId;
+  } catch {
+    // Keep the last usable built-in catalog; task creation remains server-validated.
+  }
 }
 
 async function loadOrganizations() {
@@ -3327,7 +3347,7 @@ async function openTaskForm(workflow, draft, seedText) {
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
           await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
         }
-        if (localCred && hasPolicy()) await api(`/api/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
         // Quiet auto-save indicator in the page head. Guard on the form token: this
         // chain link can land after a NEWER form instance has mounted its own head.
@@ -3403,7 +3423,7 @@ async function openTaskForm(workflow, draft, seedText) {
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
         await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
-        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
         // requested siblings have been materialised.
@@ -3415,7 +3435,7 @@ async function openTaskForm(workflow, draft, seedText) {
         const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
-        await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
+        await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
         const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
@@ -5122,14 +5142,16 @@ function forkCommandFor(sess, worldPath) {
 // higher ones; API keys are off by default when a subscription exists.
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
+  const organizationId = opts.organizationId || projectById(opts.projectId)?.organizationId || S.organizationId || 'org_personal';
+  const organizationBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
   const q = new URLSearchParams();
   if (opts.projectId) q.set('projectId', opts.projectId);
   if (opts.taskId) q.set('taskId', opts.taskId);
   let data, accounts = { logins: [] };
   try {
     [data, accounts] = await Promise.all([
-      api(`/api/credentials?${q.toString()}`),
-      api('/api/accounts').catch(() => ({ logins: [] })),
+      api(`${organizationBase}/credentials?${q.toString()}`),
+      api(`${organizationBase}/accounts`).catch(() => ({ logins: [] })),
     ]);
   } catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
   // Effective policy for this scope. Normally the server computes it (global→project→
@@ -5158,7 +5180,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   const ordered = [...(sd.enabled || []).filter((k) => byKey[k]), ...(data.credentials || []).map((c) => c.key).filter((k) => !enabled.has(k))];
   if (!ordered.length) { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">No credentials yet — connect a login or add an API key below.</div>'; return; }
   const loginByKey = {};
-  for (const l of accounts.logins || []) loginByKey[`login:${l.provider}:${l.account}`] = l;
+  for (const l of accounts.logins || []) loginByKey[l.key || `login:${l.provider}:${l.account}`] = l;
   const canManage = scope === 'global'; // rename/delete a login only at the global scope
   el.innerHTML = `<div class="cred-list">${ordered
     .map((key) => {
@@ -5185,7 +5207,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     // persist immediately, keyed by taskId/projectId scope.
     if (opts.local) { opts.onChange?.(policy); renderCredentialEditor(el, scope, { ...opts, policy }); return; }
     const authScope = opts.taskId ? `?taskId=${encodeURIComponent(opts.taskId)}` : opts.projectId ? `?projectId=${encodeURIComponent(opts.projectId)}` : '';
-    try { await api(`/api/credentials/policy${authScope}`, { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
+    try { await api(`${organizationBase}/credentials/policy${authScope}`, { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
     catch (e) { toast(e.message, true); }
     renderCredentialEditor(el, scope, opts);
   };
@@ -5200,12 +5222,12 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
       const to = prompt(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;
-      try { await api(`/api/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
+      try { await api(`${organizationBase}/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
       catch (e) { toast(e.message, true); }
     });
     row.querySelector('.cred-del')?.addEventListener('click', async () => {
       if (!confirm(`Delete login ${login.provider}:${login.account}? Its stored credentials are removed.`)) return;
-      try { await api(`/api/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'DELETE' }); toast('Login deleted'); renderCredentialEditor(el, scope, opts); }
+      try { await api(`${organizationBase}/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'DELETE' }); toast('Login deleted'); renderCredentialEditor(el, scope, opts); }
       catch (e) { toast(e.message, true); }
     });
   });
@@ -6032,12 +6054,16 @@ async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
   try {
-    const [d, u, diag] = await Promise.all([
+    const organizationId = S.organizationId || 'org_personal';
+    const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
+    const [d, u, credentialData, diag] = await Promise.all([
       api('/api/dashboard'),
-      api('/api/accounts/usage').catch(() => ({ usage: {}, pollable: [] })),
+      api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
+      api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
       api('/api/diagnostics').catch(() => null),
     ]);
-    const accounts = d.accounts?.accounts || [];
+    const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
+    const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
     const usage = u.usage || {};
     const pollable = new Set(u.pollable || []);
     box.innerHTML = `
@@ -6081,11 +6107,11 @@ async function renderDashboard() {
                 <label style="display:inline-flex;align-items:center;gap:4px;color:var(--ink-3);font-size:12px">max concurrent <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" title="How many agent turns may run on this login at once; leave empty = unlimited" style="width:52px;padding:2px 6px" /></label>
               </div>
             </div>`;
-          }).join('') + (d.accounts.waiting ? `<div class="task-sub" style="color:var(--ink-3);margin-top:6px">${d.accounts.waiting} turn(s) waiting for a login</div>` : '')
+          }).join('')
         : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`;
     const recheck = async (btn, body) => {
       const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
-      try { await api('/api/accounts/usage/recheck', { method: 'POST', body: JSON.stringify(body) }); }
+      try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
       catch (e) { toast(e.message, true); }
       btn.textContent = label; renderDashboard();
     };
@@ -6095,7 +6121,7 @@ async function renderDashboard() {
     // one attempt a minute so a failing probe can't loop the dashboard.
     if ([...pollable].some((id) => !usage[id] || usage[id].stale) && Date.now() - (S.usageAutoAt || 0) > 60_000) {
       S.usageAutoAt = Date.now();
-      api('/api/accounts/usage/recheck', { method: 'POST', body: JSON.stringify({}) }).then(() => {
+      api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify({}) }).then(() => {
         // Skip the re-render if the user is mid-edit in the panel (e.g. concurrency).
         const el = document.activeElement;
         if (S.tab === 'dashboard' && !(box.contains(el) && /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName || ''))) renderDashboard();
@@ -6104,14 +6130,14 @@ async function renderDashboard() {
     box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
     box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
     box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
-      await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
+      await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
       renderDashboard();
     }));
     box.querySelectorAll('.acct-conc').forEach((inp) => {
       inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } });
       inp.addEventListener('change', async () => {
         const v = inp.value.trim(); // empty = unlimited
-        await api('/api/accounts/concurrency', { method: 'POST', body: JSON.stringify({ accountId: inp.dataset.id, max: v === '' ? null : Number(v) }) })
+        await api(`${accountBase}/accounts/concurrency`, { method: 'POST', body: JSON.stringify({ accountId: inp.dataset.id, max: v === '' ? null : Number(v) }) })
           .then(() => toast('Concurrency updated')).catch((e) => toast(e.message, true));
         renderDashboard();
       });
@@ -6122,7 +6148,7 @@ async function renderDashboard() {
       const mins = Number(ans);
       const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
       if (!resetAt || isNaN(resetAt)) { toast('Could not parse a time', true); return; }
-      await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
+      await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
       renderDashboard();
     }));
     // Keep the host panel live without re-rendering (and disrupting focus on) the
@@ -6906,7 +6932,7 @@ async function hydrateProjectGitProfile(proj) {
   const box = $('#project-git-profile'); if (!box) return;
   try {
     const [profiles, defaults] = await Promise.all([
-      api('/api/git-profiles'),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-profiles`),
       api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`).catch(() => ({})),
     ]);
     box.innerHTML = `<div class="inline-form"><label>Git profile <select id="project-git-profile-select"><option value="">Organization default${profiles.defaultProfile ? ` — ${esc(profiles.defaultProfile)}` : ''}</option>${profiles.profiles.map((profile) => `<option value="${esc(profile.name)}" ${defaults.gitProfile === profile.name ? 'selected' : ''}>${esc(profile.name)} · ${esc(profile.userName)}</option>`).join('')}</select></label><button class="btn sm" id="project-git-profile-save">Save</button></div>`;
@@ -6979,7 +7005,11 @@ async function hydrateWorkflowPins(projectId) {
   if (!box) return;
   let list = [];
   let pins = {};
-  try { [list, pins] = await Promise.all([api('/api/workflows'), api(`/api/projects/${projectId}/workflow-pins`)]); }
+  const organizationId = projectById(projectId)?.organizationId || S.organizationId || 'org_personal';
+  try { [list, pins] = await Promise.all([
+    api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`),
+    api(`/api/projects/${projectId}/workflow-pins`),
+  ]); }
   catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>'; return; }
   box.innerHTML = list.map((w) => {
     const pinned = pins[w.name] ?? 'latest';
@@ -7036,8 +7066,8 @@ function wireSettingsView(proj) {
     btn.disabled = true;
     out.innerHTML = 'Checking identity, credentials and remote reachability…';
     try {
-      const r = await api(`/api/git-profiles/preflight?projectId=${encodeURIComponent(proj.id)}`);
-      out.innerHTML = `<div style="margin-bottom:4px">Tier: <b>${r.tier === 'profile' ? `git profile “${esc(r.profile)}”` : 'host fallback (no profile configured)'}</b></div>` +
+      const r = await api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-profiles/preflight?projectId=${encodeURIComponent(proj.id)}`);
+      out.innerHTML = `<div style="margin-bottom:4px">Tier: <b>${r.tier === 'profile' ? `git profile “${esc(r.profile)}”` : r.tier === 'host' ? 'host fallback (personal organization)' : 'not configured — isolated from host Git accounts'}</b></div>` +
         r.checks.map((c) => `<div>${c.ok ? '🟢' : '🔴'} <b>${esc(c.label)}</b> — ${esc(c.detail || (c.ok ? 'ok' : 'failed'))}</div>`).join('');
     } catch (e) {
       out.textContent = e.message;
@@ -7129,8 +7159,8 @@ function globalSettingsView(embedded = false) {
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
     <div class="card" id="accounts-card">
-      <div class="section-h">Agent accounts <span class="chip">installation resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The installation's logins and API keys, with organization defaults controlling how tasks use them. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
+      <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">This organization's logins and API keys. They are never offered to another organization. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
       <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
@@ -7170,7 +7200,7 @@ function globalSettingsView(embedded = false) {
       </div>
     </div>
     <div class="card" id="git-accounts-card">
-      <div class="section-h">Git accounts <span class="chip">installation resource</span></div>
+      <div class="section-h">Git accounts <span class="chip">organization resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named commit identities and SSH credentials for repository work. Secrets go straight to the encrypted vault and are injected only into the git subprocess that needs them.</p>
       <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Add / update a profile</label>
@@ -7191,8 +7221,8 @@ function globalSettingsView(embedded = false) {
     </div>
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
-      <div class="section-h">Workflows <span class="chip">installation resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
+      <div class="section-h">Workflows <span class="chip">organization resource</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with karmax; workflows installed here are available only to this organization. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
       <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Install from a git repo</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -7288,12 +7318,20 @@ async function hydratePhoneAccess() {
   }
 }
 
-async function hydrateGitProfiles() {
+async function hydrateGitProfiles(organizationId = S.organizationId) {
   const box = $('#git-profiles-list');
   if (!box) return;
   let data = { profiles: [], defaultProfile: null };
-  try { data = await api('/api/git-profiles'); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
-  if (!data.profiles.length) { box.innerHTML = '<span style="color:var(--ink-3)">No git profiles yet — worlds use the host’s own git setup.</span>'; return; }
+  const base = `/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`;
+  try { data = await api(base); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
+  if (!data.profiles.length) {
+    box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
+      organizationId === 'org_personal'
+        ? 'personal projects use the host’s own Git setup.'
+        : 'projects remain isolated from the host’s Git identity and credentials.'
+    }</span>`;
+    return;
+  }
   box.innerHTML = data.profiles.map((p) => `<div class="queue-item" data-gitp="${esc(p.name)}">
       <div style="flex:1"><b>${esc(p.name)}</b>
         ${data.defaultProfile === p.name ? '<span class="chip">default</span>' : `<button class="btn sm" data-gitp-default="${esc(p.name)}">make default</button>`}
@@ -7304,20 +7342,20 @@ async function hydrateGitProfiles() {
     </div>`).join('');
   box.querySelectorAll('[data-gitp-del]').forEach((b) => b.addEventListener('click', async () => {
     if (!confirm(`Delete git profile "${b.dataset.gitpDel}" (and its stored secrets)?`)) return;
-    try { await api(`/api/git-profiles/${encodeURIComponent(b.dataset.gitpDel)}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
-    hydrateGitProfiles();
+    try { await api(`${base}/${encodeURIComponent(b.dataset.gitpDel)}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
+    hydrateGitProfiles(organizationId);
   }));
   box.querySelectorAll('[data-gitp-default]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api('/api/git-profiles/default', { method: 'POST', body: JSON.stringify({ name: b.dataset.gitpDefault }) }); } catch (e) { toast(e.message, true); }
-    hydrateGitProfiles();
+    try { await api(`${base}/default`, { method: 'POST', body: JSON.stringify({ name: b.dataset.gitpDefault }) }); } catch (e) { toast(e.message, true); }
+    hydrateGitProfiles(organizationId);
   }));
 }
 
-async function hydrateWorkflows() {
+async function hydrateWorkflows(organizationId = S.organizationId) {
   const box = $('#workflows-list');
   if (!box) return;
   let list = [];
-  try { list = await api('/api/workflows'); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>'; return; }
+  try { list = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>'; return; }
   if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
   box.innerHTML = list.map((w) => `<div class="queue-item">
       <div style="flex:1"><b>${esc(w.name)}</b>
@@ -7420,7 +7458,10 @@ async function wirePaymentsCard(scope, projectId) {
 
 // Which accounts an agent may use (SPEC §7.3/§6.2) — a checkbox pool, all checked
 // by default. The checked set becomes the agent's credential + lease-rotation pool.
-function accountChecks(p, handles, logins) {
+function accountChecks(p, handles, logins, organizationId) {
+  if (organizationId !== 'org_personal') {
+    return '<span style="color:var(--ink-3);font-size:12px">Use the organization credential manager above to control this pool and its precedence.</span>';
+  }
   const refs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
   if (!refs.length) return `<span style="color:var(--ink-3);font-size:12px">No accounts connected — the agent uses the ambient login.</span>`;
   const all = !p.allowedAccounts || !p.allowedAccounts.length; // unset ⇒ all allowed
@@ -7434,7 +7475,7 @@ function accountChecks(p, handles, logins) {
   );
 }
 
-function profileRow(p, handles, logins, scope) {
+function profileRow(p, handles, logins, scope, organizationId) {
   const inherited = scope === 'project' && p.scope === 'inherited';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
@@ -7452,7 +7493,7 @@ function profileRow(p, handles, logins, scope) {
     </div>
     <div class="form-row" style="margin-top:8px"><label>Credential provider (optional)</label><input class="pf-model-provider" placeholder="auto from harness/model; e.g. kimi, google, xai" value="${esc(p.modelProvider || '')}" /></div>
     <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
-    <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins)}</div></div>
+    <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins, organizationId)}</div></div>
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
       ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
@@ -7467,7 +7508,11 @@ function profileRow(p, handles, logins, scope) {
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
   let handles = [], logins = [];
-  try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
+  const accountOrganizationId = organizationId || projectById(projectId)?.organizationId || S.organizationId || 'org_personal';
+  try {
+    const a = await api(`/api/organizations/${encodeURIComponent(accountOrganizationId)}/accounts`);
+    handles = a.handles || []; logins = a.logins || [];
+  } catch {}
   let profiles = [];
   try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
   profiles = profiles.filter((p) => p.role !== 'confirm');
@@ -7476,7 +7521,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   const doP = profiles.find((p) => p.role === 'do');
   const mergeP = profiles.find((p) => p.role === 'merge');
   const rest = profiles.filter((p) => p !== doP && p !== mergeP);
-  const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
+  const allRefs = [...logins.map((l) => l.key || `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
   // unset/empty allowedAccounts ⇒ all allowed — normalize before comparing roles
   const normAllowed = (p) => (p.allowedAccounts?.length ? [...p.allowedAccounts].sort() : [...allRefs].sort());
   const essence = (p) => JSON.stringify({ provider: p.provider, model: p.model || '', effort: p.effort || '', maxTurns: p.maxTurns ?? null, accounts: normAllowed(p) });
@@ -7487,11 +7532,11 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
     : unified
       ? `<div class="profiles-group">
-          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, handles, logins, scope)}</div>
+          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, handles, logins, scope, accountOrganizationId)}</div>
           <label class="agent-separate-toggle"><input type="checkbox" class="profiles-separate" ${separate ? 'checked' : ''}> Separate Do and Merge agent configurations</label>
-          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, handles, logins, scope)).join('')}</div>
-        </div>${rest.map((p) => profileRow(p, handles, logins, scope)).join('')}`
-      : profiles.map((p) => profileRow(p, handles, logins, scope)).join('');
+          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, handles, logins, scope, accountOrganizationId)).join('')}</div>
+        </div>${rest.map((p) => profileRow(p, handles, logins, scope, accountOrganizationId)).join('')}`
+      : profiles.map((p) => profileRow(p, handles, logins, scope, accountOrganizationId)).join('');
   list.querySelector('.profiles-separate')?.addEventListener('change', (e) => {
     list.querySelector('.profiles-unified').hidden = e.target.checked;
     list.querySelector('.profiles-separated').hidden = !e.target.checked;
@@ -7509,7 +7554,9 @@ async function hydrateProfiles(scope, projectId, organizationId) {
     const card = b.closest('[data-profile]');
     const checked = [...card.querySelectorAll('.pf-acct:checked')].map((c) => c.value);
     // all checked ⇒ store nothing (means "all", stays correct as accounts are added)
-    const allowedAccounts = allRefs.length && checked.length < allRefs.length ? checked : undefined;
+    const allowedAccounts = accountOrganizationId === 'org_personal'
+      ? allRefs.length && checked.length < allRefs.length ? checked : undefined
+      : undefined;
     const knobs = {
       provider: card.querySelector('.pf-provider').value,
       modelProvider: card.querySelector('.pf-model-provider').value.trim() || undefined,
@@ -7524,7 +7571,9 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       for (const orig of targets) {
         await api('/api/profiles', { method: 'PUT', body: JSON.stringify({
           role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined,
-          projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities, ...knobs,
+          projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities,
+          ...knobs,
+          ...(accountOrganizationId !== 'org_personal' && orig.allowedAccounts ? { allowedAccounts: orig.allowedAccounts } : {}),
         }) });
       }
       await hydrateProfiles(scope, projectId, organizationId);
@@ -7574,8 +7623,8 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
 // The logins + API keys now live in the unified credential manager (#cred-editor-global:
 // drag to reorder, On/Off to enable/disable, ✎/✕ to rename/delete a login). This just
 // refreshes it after a connect/register/delete.
-async function hydrateAccounts() {
-  await renderCredentialEditor($('#cred-editor-global'), 'global');
+async function hydrateAccounts(organizationId = S.organizationId) {
+  await renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId });
 }
 
 function profilesCard(scope) {
@@ -7701,12 +7750,12 @@ function wireGlobalSettings(organizationId) {
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
-  renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
+  renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }); // the organization's accounts + precedence list
   hydrateProfiles('global', undefined, organizationId);
   hydrateReviewRoute('global', undefined, organizationId);
   hydrateAuthorization('global');
-  hydrateWorkflows();
-  hydrateGitProfiles();
+  hydrateWorkflows(organizationId);
+  hydrateGitProfiles(organizationId);
   wirePaymentsCard('global');
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
@@ -7716,7 +7765,7 @@ function wireGlobalSettings(organizationId) {
     if (!name || !userName || !userEmail) return toast('profile name, user.name and user.email required', true);
     const btn = $('#gitp-save'); btn.disabled = true;
     try {
-      await api('/api/git-profiles', { method: 'POST', body: JSON.stringify({
+      await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`, { method: 'POST', body: JSON.stringify({
         name, userName, userEmail,
         githubToken: $('#gitp-token').value.trim() || undefined,
         sshKey: $('#gitp-ssh').value.trim() || undefined,
@@ -7725,7 +7774,7 @@ function wireGlobalSettings(organizationId) {
       out.innerHTML = `🟢 Saved <b>${esc(name)}</b>. Secrets went to the vault and are never shown again.`;
       out.style.color = 'var(--ok, green)';
       for (const id of ['#gitp-token', '#gitp-ssh', '#gitp-signing']) $(id).value = '';
-      hydrateGitProfiles();
+      hydrateGitProfiles(organizationId);
     } catch (e) {
       out.textContent = e.message;
       out.style.color = 'var(--bad, crimson)';
@@ -7740,11 +7789,11 @@ function wireGlobalSettings(organizationId) {
     out.textContent = 'Fetching, validating, and loading the workflow…';
     out.style.color = 'var(--ink-2)';
     try {
-      const r = await api('/api/workflows/install', { method: 'POST', body: JSON.stringify({ url, ref: ref || undefined }) });
+      const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows/install`, { method: 'POST', body: JSON.stringify({ url, ref: ref || undefined }) });
       out.innerHTML = `🟢 Installed <b>${esc(r.name)}</b> v${esc(r.version)} — the worker was rolled to serve it, no restart needed.`;
       out.style.color = 'var(--ok, green)';
       $('#wf-url').value = ''; $('#wf-ref').value = '';
-      hydrateWorkflows();
+      hydrateWorkflows(organizationId);
     } catch (e) {
       out.textContent = e.message;
       out.style.color = 'var(--bad, crimson)';
@@ -7756,11 +7805,11 @@ function wireGlobalSettings(organizationId) {
     const apiKey = $('#acct-key').value.trim();
     if (!account || !apiKey) return toast('account name + key required', true);
     try {
-      await api('/api/accounts', { method: 'POST', body: JSON.stringify({ provider, account, apiKey }) });
+      await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts`, { method: 'POST', body: JSON.stringify({ provider, account, apiKey }) });
       $('#acct-key').value = '';
       $('#acct-name').value = '';
       toast('Key registered');
-      hydrateAccounts();
+      hydrateAccounts(organizationId);
     } catch (e) { toast(e.message, true); }
   });
   $('#login-connect')?.addEventListener('click', async () => {
@@ -7776,7 +7825,7 @@ function wireGlobalSettings(organizationId) {
     out.style.color = 'var(--ink-2)';
     try {
       const btn = $('#login-connect'); btn.disabled = true;
-      const r = await api('/api/accounts/connect', {
+      const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect`, {
         method: 'POST',
         body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod }),
       });
@@ -7787,7 +7836,7 @@ function wireGlobalSettings(organizationId) {
         out.style.color = 'var(--ink-1)';
       } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
       $('#login-name').value = '';
-      hydrateAccounts();
+      hydrateAccounts(organizationId);
       hydrateProfiles('global', undefined, organizationId);
     } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
   });

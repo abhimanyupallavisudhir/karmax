@@ -114,13 +114,15 @@ export interface WorldSpec {
   /** Host checkouts corresponding to `repos`, used only by the trusted
    * provisioner to upload requested gitignored files into a remote clone. */
   copySources?: Array<string | undefined>;
-  /** Worktree-scoped identity/signing for every commit made in this world
-   *  (PLAN-git-config.md §4A). Absent ⇒ host identity, else karmax@localhost. */
+  /** Worktree-scoped identity/signing for every commit made in this world.
+   * Absent is retained only for the personal organization's host fallback. */
   gitIdentity?: WorldGitIdentity;
   /** Ephemeral clone credentials resolved inside the create-world activity.
    * Providers may install them into the isolated world, but must never persist
    * their values in WorldHandle or logs. */
   gitCredentials?: {
+    /** Disable host gh/SSH/helper fallback when no explicit key matches. */
+    isolated?: boolean;
     /** Compatibility key for one repository/local profiles. */
     sshKey?: string;
     /** SSH URL -> distinct read-only clone key for hosted repository records. */

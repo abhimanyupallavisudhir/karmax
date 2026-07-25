@@ -35,7 +35,9 @@ A fourth principle governs all three: **declare, don't guess.** Events, actions,
 - **Secrets: a credential broker** backed by a vault (HashiCorp Vault, a cloud secret manager, or 1Password Unified Access). See §8.
 - **Worlds: a provider interface** with local and pluggable remote/sandboxed backends (§11).
 - **Remote access: Tailscale (default) or Cloudflare Tunnel + Access** (§12).
-- **Data home:** `~/.karmax/` holds workflow repos, agent config homes, prompt/skill content, and local state.
+- **Data home:** `~/.karmax/` holds organization-scoped workflow caches and agent
+  config homes, prompt/skill content, and local state. Host-wide storage does not
+  imply host-wide resource ownership.
 
 ---
 
@@ -107,7 +109,9 @@ Keeping these separate resolves most apparent contradictions about editing "a wo
 
 ### 4.2 Repo layout
 
-Each workflow lives in its own git repo under `~/.karmax/workflows/<name>/`:
+Built-ins ship with the host. Each installed workflow is owned by one
+organization and cached under
+`~/.karmax/workflows/organizations/<organization-id>/<name>/`:
 
 ```
 ~/.karmax/workflows/software-dev/
@@ -380,7 +384,9 @@ Between turns — where all waits live — the agent is only a stored session ID
 
 ### 7.3 Config homes under `~/.karmax`
 
-karmax mints **one config home per (account × profile)** under `~/.karmax`, and
+karmax mints **one config home per (organization × account × profile)** under
+`~/.karmax`. Existing flat homes migrate exclusively to the personal
+organization; no other organization can enumerate or lease them. Karmax then
 injects the harness's documented home variables at process spawn:
 `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or OpenCode's XDG homes. This isolates auth,
 settings, sessions, MCP servers, and skills. Because these variables are read at
@@ -393,6 +399,12 @@ PTY, and ACP uses its standard session contract. Consequently a cloud world neve
 needs an inbound route to a locally hosted Karmax merely to use platform tools.
 Historical Kimi/Grok home handling is retained only for workflow replay while
 those native harnesses are not admitted.
+
+API-key handles, Git identities/keys, credential precedence, and installed
+workflow availability follow the same organization boundary. Built-in workflow
+code remains platform-wide, but an external package's Temporal type is
+tenant-qualified; two organizations may safely install different commits under
+the same human-facing workflow name and version.
 
 **Gotcha — scrub the environment for *login* isolation, not as a sandbox.**
 Spawn each agent with a **clean environment per spawn**: unset inherited model

@@ -53,8 +53,8 @@ const PROJECT_GRANT_CEILING: Capability[] = [
 const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:settings:*',
-  'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
-  'credential:read', 'skill:write', 'payment:read',
+  'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'workflow:install', 'profile:*',
+  'credential:*', 'skill:write', 'payment:read',
 ];
 
 /**

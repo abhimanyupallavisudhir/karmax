@@ -359,9 +359,10 @@ export interface ProjectConfig {
    * happens only when a task explicitly asks its agent to push.
    */
   remote?: RemotePolicy;
-  /** Named git identity/credentials (a GitProfile, Global settings → Git accounts)
-   *  this project's worlds commit and push as. Absent ⇒ the global default
-   *  profile, else the host's own git setup (PLAN-git-config.md §3). */
+  /** Named git identity/credentials (an organization-owned GitProfile)
+   *  this project's worlds commit and push as. Absent ⇒ the organization default
+   *  profile. Only the migrated personal organization may fall back to the
+   *  host's own git setup; other organizations fail closed. */
   gitProfile?: string;
   /** role -> agent profile id. */
   defaultProfiles?: Record<string, string>;

@@ -39,8 +39,11 @@ export class WorkflowRepoLoader {
   constructor(private cacheHome: string) {}
 
   /** Where a given package name keeps its working clone and version snapshots. */
-  private nameDir(name: string): string {
-    return path.join(this.cacheHome, name.replace(/[^a-z0-9_.-]/gi, '-'));
+  private nameDir(name: string, namespace?: string): string {
+    const safeName = name.replace(/[^a-z0-9_.-]/gi, '-');
+    return namespace
+      ? path.join(this.cacheHome, 'organizations', namespace.replace(/[^a-z0-9_.-]/gi, '-'), safeName)
+      : path.join(this.cacheHome, safeName);
   }
 
   /**
@@ -48,17 +51,23 @@ export class WorkflowRepoLoader {
    * and (optionally) register it in `store`. Idempotent: a SHA already snapshotted
    * is reused rather than re-fetched.
    */
-  async load(spec: { url: string; ref?: string; name?: string }, store?: PackageStore): Promise<LoadedPackage> {
+  async load(
+    spec: { url: string; ref?: string; name?: string },
+    store?: PackageStore,
+    namespace?: string,
+    env?: Record<string, string>,
+  ): Promise<LoadedPackage> {
     const name = spec.name ?? deriveName(spec.url);
     const ref = spec.ref ?? 'HEAD';
-    const work = path.join(this.nameDir(name), '.work');
+    const nameDir = this.nameDir(name, namespace);
+    const work = path.join(nameDir, '.work');
 
     // Clone once, then fetch on subsequent loads. Local paths and URLs both work.
     if (!fs.existsSync(path.join(work, '.git'))) {
       fs.mkdirSync(path.dirname(work), { recursive: true });
-      await gitOrThrow(path.dirname(work), ['clone', '--quiet', spec.url, work]);
+      await gitOrThrow(path.dirname(work), ['clone', '--quiet', spec.url, work], { env });
     } else {
-      await git(work, ['fetch', '--quiet', '--tags', '--prune', 'origin']);
+      await git(work, ['fetch', '--quiet', '--tags', '--prune', 'origin'], { env });
     }
 
     // Resolve the ref to a concrete commit — the pin. `origin/<ref>` first so a
@@ -66,14 +75,14 @@ export class WorkflowRepoLoader {
     const sha = (await firstOk(work, [
       ['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`],
       ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
-    ])) ?? (await gitOrThrow(work, ['rev-parse', 'HEAD']));
+    ], env)) ?? (await gitOrThrow(work, ['rev-parse', 'HEAD'], { env }));
 
     // Snapshot the exact commit into an immutable, .git-free version dir.
-    const dir = path.join(this.nameDir(name), sha);
+    const dir = path.join(nameDir, sha);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
-      const tarball = path.join(this.nameDir(name), `.${sha}.tar`);
-      await gitOrThrow(work, ['archive', '--format=tar', '-o', tarball, sha]);
+      const tarball = path.join(nameDir, `.${sha}.tar`);
+      await gitOrThrow(work, ['archive', '--format=tar', '-o', tarball, sha], { env });
       await extractTar(tarball, dir);
       fs.rmSync(tarball, { force: true });
     }
@@ -108,9 +117,9 @@ function deriveName(url: string): string {
 }
 
 /** Return the trimmed stdout of the first git command that succeeds, else undefined. */
-async function firstOk(cwd: string, cmds: string[][]): Promise<string | undefined> {
+async function firstOk(cwd: string, cmds: string[][], env?: Record<string, string>): Promise<string | undefined> {
   for (const args of cmds) {
-    const r = await git(cwd, args);
+    const r = await git(cwd, args, { env });
     if (r.code === 0 && r.stdout.trim()) return r.stdout.trim();
   }
   return undefined;

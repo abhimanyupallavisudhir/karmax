@@ -6,7 +6,8 @@ import { Provider } from '../domain/types.js';
 import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 
 /**
- * Config homes (SPEC §7.3). karmax mints one config home per (account × profile)
+ * Config homes (SPEC §7.3). karmax mints one config home per
+ * (organization × account × profile)
  * and injects the right CODEX_HOME / CLAUDE_CONFIG_DIR at process spawn — the
  * official isolation mechanism for each admitted tool (auth, settings,
  * sessions, MCP).
@@ -17,35 +18,54 @@ import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS 
 export class ConfigHomeManager {
   constructor(private root = paths().configHomes) {}
 
-  /** Ensure (and return) the config home dir for an account × provider. */
-  ensure(provider: Provider, account: string): string {
-    const dir = path.join(this.root, `${provider}-${sanitize(account)}`);
+  /** Ensure (and return) the config home dir for an organization × account × provider.
+   * Historical flat homes belong only to the personal organization. */
+  ensure(provider: Provider, account: string, organizationId = 'org_personal'): string {
+    const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
     fs.mkdirSync(dir, { recursive: true });
     return dir;
   }
 
   /** Delete a login's config home (removes its credentials + settings). */
-  remove(provider: Provider, account: string): void {
-    const dir = path.join(this.root, `${provider}-${sanitize(account)}`);
+  remove(provider: Provider, account: string, organizationId = 'org_personal'): void {
+    const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
   /** Rename a login (move its config home so credentials carry over). */
-  rename(provider: Provider, from: string, to: string): string {
-    const src = path.join(this.root, `${provider}-${sanitize(from)}`);
-    const dst = path.join(this.root, `${provider}-${sanitize(to)}`);
+  rename(provider: Provider, from: string, to: string, organizationId = 'org_personal'): string {
+    const root = this.organizationRoot(organizationId);
+    const src = path.join(root, `${provider}-${sanitize(from)}`);
+    const dst = path.join(root, `${provider}-${sanitize(to)}`);
     if (fs.existsSync(src) && !fs.existsSync(dst)) fs.renameSync(src, dst);
     else fs.mkdirSync(dst, { recursive: true });
     return dst;
   }
 
-  list(): { provider: string; account: string; path: string; loggedIn: boolean }[] {
-    if (!fs.existsSync(this.root)) return [];
-    return fs.readdirSync(this.root).map((name) => {
+  list(organizationId = 'org_personal'): { provider: string; account: string; path: string; loggedIn: boolean }[] {
+    const root = this.organizationRoot(organizationId);
+    if (!fs.existsSync(root)) return [];
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !(organizationId === 'org_personal' && entry.name === 'organizations'))
+      .map(({ name }) => {
       const [provider, ...rest] = name.split('-');
-      const dir = path.join(this.root, name);
+      const dir = path.join(root, name);
       return { provider: provider ?? '', account: rest.join('-'), path: dir, loggedIn: isLoggedIn(provider ?? '', dir) };
-    });
+      });
+  }
+
+  /** Every managed login, for the host-wide lease coordinator. Ambient homes and
+   * environment keys are intentionally not included here: those legacy host
+   * credentials belong only to org_personal. */
+  listAll(organizationIds: string[]): Array<{ organizationId: string; provider: string; account: string; path: string; loggedIn: boolean }> {
+    return organizationIds.flatMap((organizationId) =>
+      this.list(organizationId).map((login) => ({ organizationId, ...login })),
+    );
+  }
+
+  removeOrganization(organizationId: string): void {
+    if (organizationId === 'org_personal') throw new Error('cannot remove the personal organization config-home namespace');
+    fs.rmSync(this.organizationRoot(organizationId), { recursive: true, force: true });
   }
 
   /**
@@ -93,7 +113,7 @@ export class ConfigHomeManager {
    */
   refreshPlatformMcp(gatewayUrl: string): void {
     const platform = platformMcpSpec(gatewayUrl);
-    for (const { provider, path: home } of this.list()) {
+    for (const { provider, path: home } of this.allHomes()) {
       if (provider === 'claude') {
         const file = path.join(home, '.claude.json');
         const cur = readJson(file);
@@ -106,6 +126,26 @@ export class ConfigHomeManager {
         fs.writeFileSync(file, preserved.trimEnd() + codexMcpServer('karmax', platform));
       }
     }
+  }
+
+  private organizationRoot(organizationId: string): string {
+    // Existing installations stored personal homes directly under config-homes.
+    // Keeping that path is the migration: no credentials move, and no other
+    // organization ever enumerates the directory.
+    return organizationId === 'org_personal'
+      ? this.root
+      : path.join(this.root, 'organizations', sanitize(organizationId));
+  }
+
+  private allHomes(): Array<{ provider: string; path: string }> {
+    if (!fs.existsSync(this.root)) return [];
+    const homes = this.list().map(({ provider, path: home }) => ({ provider, path: home }));
+    const organizations = path.join(this.root, 'organizations');
+    if (!fs.existsSync(organizations)) return homes;
+    for (const org of fs.readdirSync(organizations, { withFileTypes: true }).filter((entry) => entry.isDirectory())) {
+      for (const { provider, path: home } of this.list(org.name)) homes.push({ provider, path: home });
+    }
+    return homes;
   }
 }
 
