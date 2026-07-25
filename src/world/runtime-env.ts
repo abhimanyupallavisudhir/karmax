@@ -1,33 +1,38 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
-import { ProjectSecrets } from '../autonomy/project-secrets.js';
-import { serviceEnvManifest } from './services.js';
+import type { ResourceAttachment } from '../domain/types.js';
 import type { WorldHandle } from './types.js';
 
 /**
- * The project runtime env every process in a world should see (PLAN-state):
- * per-world service connections from the handle, then vault-resolved env
- * secrets — secrets win a name clash. One resolver shared by agent turns, the
- * interactive terminal, and review-action runs, so a human clicking "run
- * tests" sees exactly the world the agent saw. Resolution is JIT per call;
- * failures degrade to the non-secret half rather than blocking the process.
+ * The project runtime env every SPAWNED process in a world should see: the
+ * per-world service connections (broker handles registered on the handle by
+ * `registerServiceEnvironment`) plus env-shaped secret resources. This is the
+ * agent-subprocess counterpart of `resources.withEnvironment`, which can only
+ * wrap `world.exec` — agent turns, terminal PTYs, and review-action runs spawn
+ * their own processes and come through here instead. Resolution is JIT per
+ * call; failures degrade to fewer variables rather than a blocked process, and
+ * no value ever lands in a handle, event, or checkpoint.
  */
 export function worldRuntimeEnv(
-  store: { kvGet(k: string): string | undefined; kvSet(k: string, v: string): void;
-    listResourceAttachments?(projectId: string): import('../domain/types.js').ResourceAttachment[] },
+  store: { listResourceAttachments?(projectId: string): ResourceAttachment[] },
   broker: CredentialBroker | undefined,
   handle: WorldHandle,
   taskId?: string,
 ): Record<string, string> {
-  const env = serviceEnvManifest(handle.meta);
+  const env: Record<string, string> = {};
+  if (!broker) return env;
+  // Per-world service connections: opaque handles on the world handle.
+  const serviceHandles = handle.meta?.serviceEnvironmentHandles;
+  if (serviceHandles && typeof serviceHandles === 'object') {
+    for (const [name, credential] of Object.entries(serviceHandles as Record<string, unknown>)) {
+      if (typeof credential !== 'string') continue;
+      try {
+        env[name] = broker.resolve(credential, { taskId, caps: [`use-credential:${credential}`] });
+      } catch { /* released or rotated — surfaces at first use */ }
+    }
+  }
+  // Env-shaped secret attachments (the canonical secret model).
   const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : undefined;
-  if (!projectId || !broker) return env;
-  try {
-    Object.assign(env, new ProjectSecrets(store, broker).env(projectId, { taskId }));
-  } catch { /* legacy layer is best-effort */ }
-  // env-shaped secret resources (the canonical model) win name clashes: this is
-  // the agent-subprocess counterpart of resources.withEnvironment, which can
-  // only wrap world.exec — spawned agent/terminal/run processes come through
-  // here instead.
+  if (!projectId) return env;
   try {
     for (const attachment of store.listResourceAttachments?.(projectId) ?? []) {
       if (attachment.driver !== 'secret@1' || attachment.target.kind !== 'environment') continue;
@@ -37,6 +42,6 @@ export function worldRuntimeEnv(
         env[attachment.target.name] = broker.resolve(credential, { taskId, caps: [`use-credential:${credential}`] });
       } catch { /* missing value surfaces at first use */ }
     }
-  } catch { /* stores without resource tables (older kv-only) */ }
+  } catch { /* stores without resource tables */ }
   return env;
 }

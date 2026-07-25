@@ -21,7 +21,7 @@ import { accountCoordinatorId } from '../coordinators/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentSpec, Provider, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
+import { AgentSpec, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
@@ -40,6 +40,7 @@ import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCook
 import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
+import { managedRepoPath } from '../world/worktree.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -131,16 +132,15 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
-  if (/^\/api\/projects\/[^/]+\/secrets(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
-  if (/^\/api\/projects\/[^/]+\/objects(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/services(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/import-copyglobs$/.test(p)) return 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/environment(?:\/|$)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
-  if (/^\/api\/tasks\/[^/]+\/objects\/promote$/.test(p)) return 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/resources/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/(?:secrets|services|environment)(?:\/|$)/.test(p))
+    return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
@@ -1437,6 +1437,178 @@ export class Gateway {
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
+      // Product-facing secret view over typed resource attachments. Values are
+      // write-only; .env example files provide lazy suggestions.
+      const projectSecrets = p.match(/^\/api\/projects\/([^/]+)\/secrets(?:\/([^/]+))?$/);
+      if (projectSecrets && ['GET', 'POST', 'DELETE'].includes(method)) {
+        const project = store.getProject(projectSecrets[1]!);
+        if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
+        if (!this.deps.broker || !this.deps.resources)
+          return this.json(res, 503, { error: 'project resources are unavailable' });
+        const resources = store.listResourceAttachments(project.id, true)
+          .filter((resource) => resource.driver === 'secret@1');
+        const encodedName = projectSecrets[2] ? decodeURIComponent(projectSecrets[2]) : undefined;
+        if (method === 'GET' && !encodedName) {
+          const names = await discoverEnvironmentNames(project, store, this.deps.githubApp);
+          const existing = new Set(resources.map((resource) => resource.target.kind === 'environment'
+            ? resource.target.name : resource.name));
+          return this.json(res, 200, { secrets: resources.map((resource) => ({
+            ...redactResource(resource),
+            file: resource.target.kind === 'path' ? resource.target.path : undefined,
+            variable: resource.target.kind === 'environment' ? resource.target.name : undefined,
+          })), suggestions: [...names].filter((name) => !existing.has(name)).sort() });
+        }
+        if (method === 'POST' && !encodedName) {
+          const body = await this.body(req);
+          const entries: Array<{ name: string; value: string; file?: string }> =
+            typeof body.env === 'string' ? parseEnvironmentValues(body.env)
+            : body.name ? [{ name: String(body.name), value: body.value == null ? '' : String(body.value),
+              file: body.file ? String(body.file) : undefined }] : [];
+          if (!entries.length) return this.json(res, 400, { error: 'name/value or pasted env required' });
+          const saved: ResourceAttachment[] = [];
+          try {
+            for (const entry of entries) {
+              const existing = resources.find((resource) =>
+                resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
+              if (existing) {
+                const handle = existing.credentialHandles[0] ?? `resource:${existing.id}:credential`;
+                if (entry.value) this.deps.broker.registerHandle(handle, entry.value);
+                saved.push(store.updateResourceAttachment(existing.id, {
+                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
+                  credentialHandles: [handle], enabled: true,
+                }));
+              } else {
+                if (!entry.value) continue;
+                const id = newId('resource'), handle = `resource:${id}:credential`;
+                this.deps.broker.registerHandle(handle, entry.value);
+                saved.push(store.createResourceAttachment({ id, organizationId: project.organizationId,
+                  projectId: project.id, name: entry.name, driver: 'secret@1',
+                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
+                  access: 'read', isolation: 'fork', source: { discovered: typeof body.env === 'string' },
+                  credentialHandles: [handle], publish: 'discard' }));
+              }
+            }
+            return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource) });
+          } catch (error) {
+            return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        if (method === 'DELETE' && encodedName) {
+          const resource = resources.find((candidate) => candidate.id === encodedName || candidate.name === encodedName
+            || (candidate.target.kind === 'environment' && candidate.target.name === encodedName));
+          if (!resource) return this.json(res, 404, { error: 'secret not found' });
+          await this.deps.resources.deleteAttachment(resource.id);
+          return this.json(res, 200, { deleted: true });
+        }
+      }
+
+      // Environment recipe, repo-derived proposal, and immutable provider build.
+      const projectEnvironment = p.match(/^\/api\/projects\/([^/]+)\/environment(?:\/(proposal|build))?$/);
+      if (projectEnvironment && ['GET', 'PUT', 'POST'].includes(method)) {
+        const project = store.getProject(projectEnvironment[1]!);
+        if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
+        const { ProjectEnvironment, proposeEnvironment } = await import('../store/project-environment.js');
+        const environments = new ProjectEnvironment(store);
+        const sub = projectEnvironment[2];
+        try {
+          if (method === 'GET' && !sub) {
+            const spec = environments.spec(project.id);
+            return this.json(res, 200, { spec: spec ?? null,
+              digest: spec ? environments.digest(spec) : null, builds: environments.builds(project.id) });
+          }
+          if (method === 'PUT' && !sub) {
+            const body = await this.body(req);
+            const list = (value: unknown) => Array.isArray(value) ? value.map(String)
+              : typeof value === 'string' ? value.split('\n') : [];
+            const spec = environments.setSpec(project.id, { image: body.image ? String(body.image) : undefined,
+              setup: list(body.setup), boot: list(body.boot), includeDocker: Boolean(body.includeDocker) });
+            return this.json(res, 200, { spec, digest: environments.digest(spec) });
+          }
+          if (method === 'GET' && sub === 'proposal') {
+            const dirs = projectRepositoryDirectories(project);
+            const { ProjectServices } = await import('../store/project-services.js');
+            return this.json(res, 200, proposeEnvironment(dirs, {
+              hasPerWorldServices: new ProjectServices(store).list(project.id)
+                .some((service) => service.kind === 'per-world'),
+            }));
+          }
+          if (method === 'POST' && sub === 'build') {
+            const spec = environments.spec(project.id);
+            if (!spec) return this.json(res, 400, { error: 'accept or configure an environment proposal first' });
+            const body = await this.body(req);
+            const provider = String(body.provider ?? store.effectiveProjectConfig(project).worldProvider ?? 'worktree');
+            const digest = environments.digest(spec);
+            const connection = ['e2b', 'daytona'].includes(provider)
+              ? this.deps.providerConnections?.resolve(project.organizationId, provider) : undefined;
+            environments.recordBuild(project.id, { provider, digest, status: 'building' });
+            const { buildEnvironment } = await import('../world/environment-build.js');
+            void buildEnvironment({ provider, projectId: project.id, digest, spec,
+              ...(connection ? { connection: { apiKey: connection.apiKey,
+                apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target } } : {}) })
+              .then((result) => environments.recordBuild(project.id,
+                { provider, digest, ref: result.ref, status: 'ready' }))
+              .catch((error) => environments.recordBuild(project.id,
+                { provider, digest, status: 'failed', error: String(error instanceof Error ? error.message : error).slice(0, 800) }));
+            return this.json(res, 202, { building: { provider, digest } });
+          }
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      // Service recipes. Per-world services consume Task 253 resources as
+      // optional read-only seeds; they never introduce a parallel object store.
+      const projectServices = p.match(/^\/api\/projects\/([^/]+)\/services(?:\/(compose-import))?$/);
+      if (projectServices && ['GET', 'POST', 'DELETE'].includes(method)) {
+        const project = store.getProject(projectServices[1]!);
+        if (!project) return this.json(res, 404, { error: 'project not found' });
+        const { ProjectServices, composeServiceProposals } = await import('../store/project-services.js');
+        const services = new ProjectServices(store);
+        try {
+          if (method === 'GET' && projectServices[2] === 'compose-import') {
+            const { readDevcontainer } = await import('../store/project-environment.js');
+            const proposals = [];
+            for (const dir of projectRepositoryDirectories(project)) {
+              const devcontainer = readDevcontainer(dir);
+              const candidates = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml',
+                ...(devcontainer?.composeFiles ?? []),
+                '.devcontainer/docker-compose.yml', '.devcontainer/docker-compose.yaml'];
+              for (const candidate of candidates) {
+                const filename = path.join(dir, candidate);
+                if (!fs.existsSync(filename)) continue;
+                proposals.push(...composeServiceProposals(fs.readFileSync(filename, 'utf8')));
+                break;
+              }
+            }
+            const existing = new Set(services.list(project.id).map((service) => service.name));
+            return this.json(res, 200, { proposals: proposals.filter((service) => !existing.has(service.name)) });
+          }
+          if (method === 'GET') return this.json(res, 200, { services: services.list(project.id) });
+          if (method === 'POST' && !projectServices[2]) {
+            const body = await this.body(req);
+            if (body.seedResourceId) {
+              const resource = store.getResourceAttachment(String(body.seedResourceId));
+              if (!resource || resource.projectId !== project.id || resource.target.kind !== 'path')
+                return this.json(res, 400, { error: 'seed resource must be a path resource in this project' });
+            }
+            if (body.connectionResourceId) {
+              const resource = store.getResourceAttachment(String(body.connectionResourceId));
+              if (!resource || resource.projectId !== project.id || !credentialResource(resource))
+                return this.json(res, 400, { error: 'connection resource must be a secret/service attachment in this project' });
+            }
+            return this.json(res, 200, { service: services.save(project.id, body as any) });
+          }
+          if (method === 'DELETE') {
+            const name = url.searchParams.get('name');
+            if (!name) return this.json(res, 400, { error: 'name required' });
+            services.delete(project.id, name);
+            return this.json(res, 200, { deleted: true });
+          }
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
       const projectResources = p.match(/^\/api\/projects\/([^/]+)\/resources$/);
       if (projectResources) {
         const project = store.getProject(projectResources[1]!);
@@ -2167,38 +2339,6 @@ export class Gateway {
           return this.json(res, 200, artifact);
         } finally { await access?.release(); }
       }
-      // Promote a task world's modified copy of a declared object mount to the
-      // project's new current version (PLAN-state §3.2) — the data analogue of
-      // merging a branch, gated at Review like code.
-      const objectPromote = p.match(/^\/api\/tasks\/([^/]+)\/objects\/promote$/);
-      if (objectPromote && method === 'POST') {
-        if (!this.deps.objects) return this.json(res, 503, { error: 'object storage is not configured' });
-        const taskId = objectPromote[1]!;
-        const task = store.getTask(taskId);
-        const project = task ? store.getProject(task.projectId) : undefined;
-        const b = await this.body(req);
-        const relPath = String(b.path ?? '');
-        if (!task || !project || !relPath) return this.json(res, 400, { error: 'task and object path are required' });
-        const handle = (store.currentWorld(taskId)
-          ?? worldHandleForView(task.lastView, taskId, store.effectiveProjectConfig(project))) as import('../world/types.js').WorldHandle | undefined;
-        if (!handle) return this.json(res, 404, { error: 'no world for this task' });
-        let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
-        try {
-          access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
-          const world = access?.world ?? await this.deps.worlds.open(handle);
-          const data = await world.readFileBuffer(relPath);
-          if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'object exceeds 100 MiB' });
-          const { ProjectObjects } = await import('../store/project-objects.js');
-          const mount = await new ProjectObjects(store, this.deps.objects).promote(project.id, relPath, data);
-          const ev = { type: 'object.promoted', taskId, ts: Date.now(),
-            payload: { path: mount.path, object: mount.object, bytes: mount.bytes } };
-          const seq = store.appendEvent(ev);
-          this.deps.bus?.emit({ ...ev, seq });
-          return this.json(res, 200, { object: mount });
-        } catch (e) {
-          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-        } finally { await access?.release(); }
-      }
       const promotedArtifact = p.match(/^\/api\/artifacts\/([^/]+)$/);
       if (promotedArtifact) {
         const artifact = store.getPromotedArtifact(promotedArtifact[1]!);
@@ -2632,102 +2772,6 @@ export class Gateway {
         new GitProfiles(store, this.deps.broker).delete(decodeURIComponent(gitProfileMatch[1]!));
         return this.json(res, 200, { ok: true });
       }
-      // Project runtime secrets (PLAN-state.md §3.1): the DATABASE_URL-shaped
-      // values the project's own code reads. Values are write-only — the list
-      // returns names/shape only; injection happens at world boot / per spawn.
-      const projectSecretsMatch = p.match(/^\/api\/projects\/([^/]+)\/secrets(?:\/([^/]+))?$/);
-      if (projectSecretsMatch && ['GET', 'POST', 'DELETE'].includes(method)) {
-        const project = store.getProject(projectSecretsMatch[1]!);
-        if (!project) return this.json(res, 404, { error: 'no project' });
-        if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
-        const { ProjectSecrets } = await import('../autonomy/project-secrets.js');
-        const secrets = new ProjectSecrets(store, this.deps.broker);
-        const name = projectSecretsMatch[2] ? decodeURIComponent(projectSecretsMatch[2]) : undefined;
-        try {
-          // The lazy-onboarding sugar over secret@1 RESOURCE attachments (the
-          // canonical store): the shapes below stay stable, but writes land as
-          // attachments, so they appear in Resources and lease like any other.
-          const secretAttachments = () => store.listResourceAttachments(project.id)
-            .filter((a) => a.driver === 'secret@1')
-            .map((a) => ({ id: a.id, name: a.target.kind === 'environment' ? a.target.name : a.name,
-              ...(a.target.kind === 'path' ? { file: a.target.path } : {}) }));
-          const upsertSecretAttachment = (secretName: string, value: string | undefined, file?: string) => {
-            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(secretName)) throw new Error('secret name must be env-var-shaped (letters, digits, _)');
-            const prior = secretAttachments().find((s) => s.name === secretName);
-            const credential = `secret:${project.id}:${secretName}`;
-            if (value?.length) this.deps.broker!.registerHandle(credential, value);
-            else if (!prior && !this.deps.broker!.hasHandle(credential)) throw new Error(`secret ${secretName} has no stored value — provide one`);
-            const target = file ? { kind: 'path' as const, path: file } : { kind: 'environment' as const, name: secretName };
-            if (prior) {
-              store.updateResourceAttachment(prior.id, { target });
-              return secretAttachments().find((s) => s.name === secretName)!;
-            }
-            store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
-              name: secretName, driver: 'secret@1', target, access: 'read', isolation: 'fork',
-              source: {}, credentialHandles: [credential], publish: 'discard' });
-            return secretAttachments().find((s) => s.name === secretName)!;
-          };
-          if (method === 'GET' && !name) {
-            // Suggestions: the names the repo's own .env example files declare.
-            // Local checkouts and managed clones read from disk; enrolled
-            // GitHub repositories — the only shape hosted has — read through
-            // the App's contents API, so hosted suggests too.
-            const { envExampleNames, envExampleNamesFromText } = await import('../autonomy/project-secrets.js');
-            const { managedRepoPath } = await import('../world/worktree.js');
-            const { expandPath } = await import('../util/expand.js');
-            const fs = await import('node:fs');
-            const dirs = (project.config.repos ?? []).map((source) => {
-              const local = expandPath(source);
-              if (fs.existsSync(local)) return local;
-              const managed = managedRepoPath(source);
-              return fs.existsSync(managed) ? managed : undefined;
-            }).filter((dir): dir is string => Boolean(dir));
-            const names2 = new Set(envExampleNames(dirs));
-            if (this.deps.githubApp) {
-              for (const linked of store.listProjectRepositories(project.id)) {
-                for (const file of ['.env.example', '.env.sample', '.env.template']) {
-                  const text = await this.deps.githubApp.fileContents(linked.repository, file);
-                  if (text) for (const n of envExampleNamesFromText(text)) names2.add(n);
-                }
-              }
-            }
-            // Legacy kv-layer records still list; new writes are attachments.
-            const legacy = secrets.list(project.id);
-            const attached = secretAttachments();
-            const merged = [...attached.map(({ id: _id, ...s }) => s),
-              ...legacy.filter((s) => !attached.some((a) => a.name === s.name))];
-            const existing = new Set(merged.map((s) => s.name));
-            const suggestions = [...names2].filter((n) => !existing.has(n)).sort();
-            return this.json(res, 200, { secrets: merged, suggestions });
-          }
-          if (method === 'POST' && !name) {
-            const b = await this.body(req);
-            if (typeof b.env === 'string') {
-              const { parseEnv } = await import('../autonomy/project-secrets.js');
-              const entries = parseEnv(b.env);
-              if (!entries.length) return this.json(res, 400, { error: 'no KEY=value lines found' });
-              return this.json(res, 200, { imported: entries.map((e) => upsertSecretAttachment(e.name, e.value).name) });
-            }
-            if (!b.name) return this.json(res, 400, { error: 'name required (or env: "<pasted .env>" to bulk-import)' });
-            const rec = upsertSecretAttachment(String(b.name),
-              b.value != null && b.value !== '' ? String(b.value) : undefined,
-              b.file ? String(b.file) : undefined);
-            const { id: _id, ...shape } = rec;
-            return this.json(res, 200, { secret: shape }); // never echoes the value
-          }
-          if (method === 'DELETE' && name) {
-            const attached = secretAttachments().find((s) => s.name === name);
-            if (attached) {
-              await this.deps.resources?.deleteAttachment(attached.id).catch(() => store.deleteResourceAttachment(attached.id));
-              this.deps.broker.deleteHandle(`secret:${project.id}:${name}`);
-            } else secrets.delete(project.id, name);
-            return this.json(res, 200, { ok: true });
-          }
-        } catch (e) {
-          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-        }
-      }
-
       // The copyGlobs exit ramp (PLAN-state §5): classify the matched
       // gitignored files into secrets/objects, then clear copyGlobs — the
       // project stops depending on the host checkout.
@@ -2738,181 +2782,11 @@ export class Gateway {
         if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
         try {
           const { importCopyGlobs } = await import('../store/state-import.js');
-          const { ProjectSecrets } = await import('../autonomy/project-secrets.js');
-          const { ProjectObjects } = await import('../store/project-objects.js');
-          const result = await importCopyGlobs({ project,
-            secrets: new ProjectSecrets(store, this.deps.broker),
-            ...(this.deps.objects ? { objects: new ProjectObjects(store, this.deps.objects) } : {}) });
+          const result = await importCopyGlobs({ project, store, broker: this.deps.broker,
+            ...(this.deps.resources ? { resources: this.deps.resources } : {}) });
           const imported = result.envSecrets.length + result.fileSecrets.length + result.objects.length;
           if (imported) store.updateProjectConfig(project.id, { copyGlobs: [] } as any);
           return this.json(res, 200, { ...result, cleared: imported > 0 });
-        } catch (e) {
-          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-        }
-      }
-
-      // Project data objects (PLAN-state.md §3.2): content-addressed values —
-      // fixtures, dev-db seeds, weights — with declared mounts materialized
-      // into every world. Values are versioned (history chain), not merged.
-      const projectObjectsMatch = p.match(/^\/api\/projects\/([^/]+)\/objects(?:\/(data))?$/);
-      if (projectObjectsMatch && ['GET', 'POST', 'DELETE'].includes(method)) {
-        const project = store.getProject(projectObjectsMatch[1]!);
-        if (!project) return this.json(res, 404, { error: 'no project' });
-        if (!this.deps.objects) return this.json(res, 503, { error: 'object storage is not configured' });
-        const { ProjectObjects } = await import('../store/project-objects.js');
-        const objects = new ProjectObjects(store, this.deps.objects);
-        try {
-          if (method === 'GET' && projectObjectsMatch[2] === 'data') {
-            const mountPath = url.searchParams.get('path') ?? '';
-            const mount = objects.get(project.id, mountPath);
-            if (!mount) return this.json(res, 404, { error: 'no object mount at that path' });
-            const data = await objects.data(project.id, mount.object);
-            res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(data.length),
-              'content-disposition': `attachment; filename="${path.basename(mount.path).replace(/["\\\r\n]/g, '_')}"`,
-              'cache-control': 'private, no-store' });
-            return void res.end(data);
-          }
-          if (method === 'GET' && !projectObjectsMatch[2]) return this.json(res, 200, { objects: objects.list(project.id) });
-          if (method === 'POST' && !projectObjectsMatch[2]) {
-            const b = await this.body(req);
-            if (!b.path) return this.json(res, 400, { error: 'path required' });
-            const data = b.dataBase64 != null ? Buffer.from(String(b.dataBase64), 'base64')
-              : b.text != null ? Buffer.from(String(b.text), 'utf8') : undefined;
-            if (!data) return this.json(res, 400, { error: 'dataBase64 or text required' });
-            if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'object exceeds 100 MiB' });
-            const mode = b.mode != null ? String(b.mode) : undefined;
-            if (mode && !['seed', 'readonly', 'writeback'].includes(mode)) return this.json(res, 400, { error: 'mode must be seed, readonly, or writeback' });
-            return this.json(res, 200, { object: await objects.put(project.id, { path: String(b.path),
-              ...(mode ? { mode: mode as 'seed' | 'readonly' | 'writeback' } : {}), data }) });
-          }
-          if (method === 'DELETE' && !projectObjectsMatch[2]) {
-            const mountPath = url.searchParams.get('path') ?? '';
-            if (!mountPath) return this.json(res, 400, { error: 'path required' });
-            objects.remove(project.id, mountPath);
-            return this.json(res, 200, { ok: true });
-          }
-        } catch (e) {
-          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-        }
-      }
-
-      // Project environment (PLAN-cloud): the derivation recipe from tracked
-      // state to a runnable workspace, and the immutable per-provider builds
-      // realized from it. Proposals read what the repo already declares.
-      const projectEnvironmentMatch = p.match(/^\/api\/projects\/([^/]+)\/environment(?:\/(proposal|build))?$/);
-      if (projectEnvironmentMatch && ['GET', 'PUT', 'POST'].includes(method)) {
-        const project = store.getProject(projectEnvironmentMatch[1]!);
-        if (!project) return this.json(res, 404, { error: 'no project' });
-        const { ProjectEnvironment, proposeEnvironment } = await import('../store/project-environment.js');
-        const environment = new ProjectEnvironment(store);
-        const sub = projectEnvironmentMatch[2];
-        try {
-          if (method === 'GET' && !sub) {
-            const spec = environment.spec(project.id);
-            return this.json(res, 200, { spec: spec ?? null, digest: spec ? environment.digest(spec) : null,
-              builds: environment.builds(project.id) });
-          }
-          if (method === 'PUT' && !sub) {
-            const b = await this.body(req);
-            const list = (v: unknown) => Array.isArray(v) ? v.map(String) : typeof v === 'string' ? v.split('\n') : [];
-            const spec = environment.setSpec(project.id, { image: b.image ? String(b.image) : undefined,
-              setup: list(b.setup), boot: list(b.boot), includeDocker: !!b.includeDocker });
-            return this.json(res, 200, { spec, digest: environment.digest(spec) });
-          }
-          if (method === 'GET' && sub === 'proposal') {
-            const { managedRepoPath } = await import('../world/worktree.js');
-            const { expandPath } = await import('../util/expand.js');
-            const { ProjectServices } = await import('../store/project-services.js');
-            const fs = await import('node:fs');
-            const dirs = (project.config.repos ?? []).map((source) => {
-              const local = expandPath(source);
-              if (fs.existsSync(local)) return local;
-              const managed = managedRepoPath(source);
-              return fs.existsSync(managed) ? managed : undefined;
-            }).filter((dir): dir is string => Boolean(dir));
-            const hasPerWorldServices = new ProjectServices(store).list(project.id).some((s) => s.kind === 'per-world');
-            return this.json(res, 200, proposeEnvironment(dirs, { hasPerWorldServices }));
-          }
-          if (method === 'POST' && sub === 'build') {
-            const spec = environment.spec(project.id);
-            if (!spec) return this.json(res, 400, { error: 'configure the environment first (or accept the proposal)' });
-            const b = await this.body(req);
-            const provider = String(b.provider ?? store.effectiveProjectConfig(project).worldProvider ?? 'worktree');
-            const digest = environment.digest(spec);
-            let connection: { apiKey?: string; apiUrl?: string; target?: string } | undefined;
-            if (['e2b', 'daytona'].includes(provider)) {
-              try {
-                const resolved = this.deps.providerConnections?.resolve(project.organizationId, provider);
-                if (resolved) connection = { apiKey: resolved.apiKey,
-                  apiUrl: (resolved.config as any)?.apiUrl, target: (resolved.config as any)?.target };
-              } catch (e) {
-                return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-              }
-            }
-            environment.recordBuild(project.id, { provider, digest, status: 'building' });
-            const { buildEnvironment } = await import('../world/environment-build.js');
-            // Builds take minutes; run detached and let the record carry status.
-            void buildEnvironment({ provider, projectId: project.id, digest, spec, ...(connection ? { connection } : {}) })
-              .then((result) => environment.recordBuild(project.id, { provider, digest, ref: result.ref, status: 'ready' }))
-              .catch((error) => environment.recordBuild(project.id, { provider, digest, status: 'failed',
-                error: (error instanceof Error ? error.message : String(error)).slice(0, 800) }));
-            return this.json(res, 202, { building: { provider, digest } });
-          }
-        } catch (e) {
-          return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-        }
-      }
-
-      // Project services (PLAN-state.md §3.3): external → a connection Secret;
-      // per-world → a private container per task world. compose-import turns
-      // the compose file the repo already has into proposals.
-      const projectServicesMatch = p.match(/^\/api\/projects\/([^/]+)\/services(?:\/(compose-import))?$/);
-      if (projectServicesMatch && ['GET', 'POST', 'DELETE'].includes(method)) {
-        const project = store.getProject(projectServicesMatch[1]!);
-        if (!project) return this.json(res, 404, { error: 'no project' });
-        const { ProjectServices, composeServiceProposals } = await import('../store/project-services.js');
-        const services = new ProjectServices(store);
-        try {
-          if (method === 'GET' && projectServicesMatch[2] === 'compose-import') {
-            const { managedRepoPath } = await import('../world/worktree.js');
-            const { expandPath } = await import('../util/expand.js');
-            const fs = await import('node:fs');
-            const nodePath = await import('node:path');
-            const proposals: import('../domain/types.js').ProjectService[] = [];
-            const { readDevcontainer } = await import('../store/project-environment.js');
-            for (const source of project.config.repos ?? []) {
-              const local = expandPath(source);
-              const dir = fs.existsSync(local) ? local : fs.existsSync(managedRepoPath(source)) ? managedRepoPath(source) : undefined;
-              if (!dir) continue;
-              // Root compose files, the devcontainer's referenced ones, and the
-              // .devcontainer directory's own — first match wins per repo.
-              const devcontainer = readDevcontainer(dir);
-              const candidates = [
-                'docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml',
-                ...(devcontainer?.composeFiles ?? []),
-                '.devcontainer/docker-compose.yml', '.devcontainer/docker-compose.yaml',
-              ];
-              for (const file of candidates) {
-                const composePath = nodePath.join(dir, file);
-                if (!fs.existsSync(composePath)) continue;
-                proposals.push(...composeServiceProposals(fs.readFileSync(composePath, 'utf8')));
-                break;
-              }
-            }
-            const existing = new Set(services.list(project.id).map((s) => s.name));
-            return this.json(res, 200, { proposals: proposals.filter((s) => !existing.has(s.name)) });
-          }
-          if (method === 'GET') return this.json(res, 200, { services: services.list(project.id) });
-          if (method === 'POST' && !projectServicesMatch[2]) {
-            const b = await this.body(req);
-            return this.json(res, 200, { service: services.save(project.id, b as import('../domain/types.js').ProjectService) });
-          }
-          if (method === 'DELETE' && !projectServicesMatch[2]) {
-            const name = url.searchParams.get('name') ?? '';
-            if (!name) return this.json(res, 400, { error: 'name required' });
-            services.delete(project.id, name);
-            return this.json(res, 200, { ok: true });
-          }
         } catch (e) {
           return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
         }
@@ -3988,6 +3862,52 @@ function applyExecutionOverride(config: ProjectConfig, override: Record<string, 
     else next[key] = override[key];
   }
   return next as ProjectConfig;
+}
+
+function projectRepositoryDirectories(project: Project): string[] {
+  return (project.config.repos ?? []).map((source) => {
+    const local = expandPath(source);
+    if (fs.existsSync(local)) return local;
+    const managed = managedRepoPath(source);
+    return fs.existsSync(managed) ? managed : undefined;
+  }).filter((value): value is string => Boolean(value));
+}
+
+async function discoverEnvironmentNames(project: Project, store: Store,
+  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<Set<string>> {
+  const names = new Set<string>();
+  const add = (text: string) => {
+    for (const line of text.split('\n')) {
+      const match = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+      if (match) names.add(match[1]!);
+    }
+  };
+  for (const dir of projectRepositoryDirectories(project)) for (const file of
+    ['.env.example', '.env.sample', '.env.template']) {
+    try { add(fs.readFileSync(path.join(dir, file), 'utf8')); } catch {}
+  }
+  if (githubApp) for (const linked of store.listProjectRepositories(project.id)) for (const file of
+    ['.env.example', '.env.sample', '.env.template']) {
+    const text = await githubApp.fileContents(linked.repository, file);
+    if (text) add(text);
+  }
+  return names;
+}
+
+function parseEnvironmentValues(text: string): Array<{ name: string; value: string }> {
+  const values: Array<{ name: string; value: string }> = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    let value = match[2]!.trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+      value = value.slice(1, -1);
+    else value = value.replace(/\s+#.*$/, '');
+    if (value) values.push({ name: match[1]!, value });
+  }
+  return values;
 }
 
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {

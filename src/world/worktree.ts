@@ -375,18 +375,19 @@ class WorktreeWorld implements World {
   }
 }
 
-/** The repo's basename (its worktree subdirectory name in a multi-repo world). */
-function repoName(repo: string): string {
-  return (repo.split(/[/:]/).filter(Boolean).pop() ?? 'repo').replace(/\.git$/i, '');
-}
-
-/** Where a configured network source's managed clone lives (whether or not it
- * exists yet) — the stable host-side checkout host features may inspect. */
+/** Stable host-side checkout location for network repositories. Onboarding can
+ * inspect it without imposing any repository layout on the user. */
 export function managedRepoPath(source: string, home = paths().worlds): string {
   const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
   const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
   return path.join(home, '.repositories', `${name}-${hash}`);
 }
+
+/** The repo's basename (its worktree subdirectory name in a multi-repo world). */
+function repoName(repo: string): string {
+  return (repo.split(/[/:]/).filter(Boolean).pop() ?? 'repo').replace(/\.git$/i, '');
+}
+
 
 /** Git's common network transports, including file:// for self-hosted remotes. */
 function isNetworkGitSource(source: string): boolean {

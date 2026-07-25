@@ -18,15 +18,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
-import { ProjectSecrets } from '../autonomy/project-secrets.js';
-import { ProjectObjects } from '../store/project-objects.js';
-import { ProjectServices } from '../store/project-services.js';
-import { materializeFileSecrets } from '../world/secrets.js';
-import { materializeObjectMounts } from '../world/mounts.js';
-import { destroyWorldServices, launchWorldServices } from '../world/services.js';
 import { worldRuntimeEnv } from '../world/runtime-env.js';
-import { ProjectEnvironment } from '../store/project-environment.js';
-import { bootCommands, setupCommands } from '../world/environment-build.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
@@ -43,6 +35,10 @@ import { allows, attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
+import { ProjectEnvironment } from '../store/project-environment.js';
+import { bootCommands, setupCommands } from '../world/environment-build.js';
+import { ProjectServices } from '../store/project-services.js';
+import { destroyWorldServices, launchWorldServices } from '../world/services.js';
 import {
   AGENT_QUEUE_WORKFLOW,
   QRY_AGENT_QUEUE,
@@ -299,7 +295,6 @@ export interface PrepareChildArgs {
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
   const gitProfiles = new GitProfiles(store, deps.broker);
-  const projectSecrets = new ProjectSecrets(store, deps.broker);
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
@@ -436,6 +431,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const environmentBuild = projectId && environmentSpec
         ? projectEnvironment.readyBuild(projectId, args.kind, projectEnvironment.digest(environmentSpec))
         : undefined;
+      const environmentDigest = environmentSpec ? projectEnvironment.digest(environmentSpec) : undefined;
       const environmentOverride = environmentBuild && environmentBuild.ref !== 'host'
         ? { ...executionConfig?.environment,
             ...(args.kind === 'container' ? { image: environmentBuild.ref } : { snapshot: environmentBuild.ref }) }
@@ -475,100 +471,43 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
           world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation);
         }
+        if (environmentSpec && !['worktree', 'memory'].includes(args.kind)) {
+          const liveSetup = environmentBuild ? [] : setupCommands(environmentSpec);
+          if (liveSetup.length) record(args.taskId, 'world.warning', {
+            warning: 'environment build is not ready; running setup live (build it in Project Settings → Environment for faster worlds)',
+          });
+          for (const command of [...liveSetup, ...bootCommands(environmentSpec)]) {
+            const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 });
+            if (result.code !== 0) record(args.taskId, 'world.warning', {
+              warning: `environment command "${command}" failed: ${(result.stderr || result.stdout).slice(-300)}`,
+            });
+          }
+        }
+        if (projectId) {
+          const services = new ProjectServices(store).list(projectId);
+          const perWorld = services.filter((service) => service.kind === 'per-world');
+          if (perWorld.length) {
+            const resources = new Map(store.listResourceAttachments(projectId)
+              .map((resource) => [resource.id, resource]));
+            const launched = await launchWorldServices(world, args.taskId, perWorld, resources);
+            for (const warning of launched.warnings) record(args.taskId, 'world.warning', { warning });
+            if (Object.keys(launched.env).length && deps.resources)
+              world.handle = deps.resources.registerServiceEnvironment(world.handle, launched.env);
+            if (launched.containers.length) world.handle.meta = {
+              ...world.handle.meta, serviceContainers: launched.containers,
+            };
+          }
+        }
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
           repositoryIds: linkedRepositories.map((candidate) => candidate.repository.id) };
-        // Inject project secrets (PLAN-state §3.1): file-shaped ones are written
-        // 0600 + git-excluded now — uniformly across backends, remote included
-        // (writeFile/exec are provider duties); env-shaped ones resolve JIT per
-        // subprocess. The handle records only the materialization manifest —
-        // paths and names, never values. Failure degrades to a warning: the
-        // world is still usable, and the missing secret surfaces at first use.
-        if (projectId) {
-          try {
-            const secrets = projectSecrets.list(projectId);
-            if (secrets.length) {
-              const manifest = await materializeFileSecrets(world, projectSecrets.files(projectId, { taskId: args.taskId }));
-              const envNames = projectSecrets.envNames(projectId);
-              world.handle.meta = { ...world.handle.meta,
-                ...(manifest.length ? { secretFiles: manifest } : {}),
-                ...(envNames.length ? { secretEnv: envNames } : {}) };
-            }
-          } catch (e) {
-            record(args.taskId, 'world.warning', { warning: `project secrets: ${e instanceof Error ? e.message : e}` });
-          }
-        }
-        // Materialize declared data-object mounts (PLAN-state §3.2). The handle
-        // records path/version/mode so the checkpoint can capture task-local
-        // drift even for gitignored paths. Same failure posture as secrets.
-        if (projectId && deps.objects) {
-          try {
-            const mounts = await new ProjectObjects(store, deps.objects).resolved(projectId);
-            if (mounts.length) {
-              const manifest = await materializeObjectMounts(world, mounts);
-              world.handle.meta = { ...world.handle.meta, objectMounts: manifest };
-            }
-          } catch (e) {
-            record(args.taskId, 'world.warning', { warning: `project objects: ${e instanceof Error ? e.message : e}` });
-          }
-        }
-        // Environment realization (PLAN-cloud). Host-side worlds skip it —
-        // the host IS their environment. With a ready build the world booted
-        // from the baked artifact and only cheap boot commands remain; without
-        // one, setup runs live (correct but slow) and says so. Boot runs
-        // before services so a baked Docker daemon is up for them.
-        if (environmentSpec && !['worktree', 'memory'].includes(args.kind)) {
-          try {
-            const live = environmentBuild ? [] : setupCommands(environmentSpec);
-            if (live.length) record(args.taskId, 'world.warning',
-              { warning: 'environment build not ready for this provider — running setup live (build it in Settings → Environment to make worlds boot fast)' });
-            for (const command of [...live, ...bootCommands(environmentSpec)]) {
-              const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 });
-              if (result.code !== 0) record(args.taskId, 'world.warning',
-                { warning: `environment command "${command}" failed: ${(result.stderr || result.stdout).slice(-300)}` });
-            }
-          } catch (e) {
-            record(args.taskId, 'world.warning', { warning: `environment: ${e instanceof Error ? e.message : e}` });
-          }
-        }
-        // Launch per-world service instances (PLAN-state §3.3): a private
-        // container per declared service, seeded from the object store, its
-        // connection env recorded on the handle (per-world throwaway values,
-        // not secrets). Launch goes THROUGH the world's own exec, so a cloud
-        // sandbox with Docker runs its services next to the code; a world
-        // without Docker degrades to a warning pointing at external-via-Secret.
-        if (projectId) {
-          try {
-            const perWorld = new ProjectServices(store).list(projectId).filter((s) => s.kind === 'per-world');
-            if (perWorld.length) {
-              const seeds = new Map<string, Buffer>();
-              if (deps.objects) {
-                const projectObjects = new ProjectObjects(store, deps.objects);
-                for (const service of perWorld) {
-                  if (!service.seedObject) continue;
-                  const mount = projectObjects.get(projectId, service.seedObject);
-                  if (mount) seeds.set(service.seedObject, await projectObjects.data(projectId, mount.object));
-                }
-              }
-              const launched = await launchWorldServices(world, args.taskId, perWorld, seeds);
-              for (const warning of launched.warnings) record(args.taskId, 'world.warning', { warning });
-              if (launched.containers.length) {
-                world.handle.meta = { ...world.handle.meta,
-                  serviceContainers: launched.containers,
-                  ...(Object.keys(launched.env).length ? { serviceEnv: launched.env } : {}) };
-              }
-            }
-          } catch (e) {
-            record(args.taskId, 'world.warning', { warning: `project services: ${e instanceof Error ? e.message : e}` });
-          }
-        }
         if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
         if (projectId) {
           world.handle = store.registerWorld(world.handle, projectId, {
             runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${args.kind}` : 'local'),
-            environmentDigest: remote
-              ? String(world.handle.meta?.environmentArtifact ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`)
-              : 'karmax-local',
+            environmentDigest: environmentDigest
+              ?? (remote ? String(world.handle.meta?.environmentArtifact
+                ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`) : 'karmax-local'),
           }) as WorldHandle;
         }
         record(args.taskId, 'world.created', { handle: world.handle });

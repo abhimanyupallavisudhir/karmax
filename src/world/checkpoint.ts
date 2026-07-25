@@ -7,10 +7,7 @@ import type { ObjectStore } from '../store/objects.js';
 import type { Store } from '../store/db.js';
 import type { World, WorldHandle, WorldKind, WorldRepo } from './types.js';
 import { worldRepos, worldRepoSource } from './types.js';
-import { materializeFileSecrets, secretFileManifest } from './secrets.js';
-import { ProjectSecrets } from '../autonomy/project-secrets.js';
-import { ProjectObjects } from '../store/project-objects.js';
-import { enclosingRepo, materializeObjectMounts, objectMountManifest } from './mounts.js';
+import { secretFileManifest } from './secrets.js';
 import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
 
@@ -46,7 +43,6 @@ export class WorldCheckpointService {
     // mounts are immutable by contract, and resource projections/ephemeral
     // copies are pinned by revision refs instead of bytes.
     const secretFiles = secretFileManifest(handle.meta);
-    const readonlyMounts = new Set(objectMountManifest(handle.meta).filter((m) => m.mode === 'readonly').map((m) => m.path));
     const resourceRefs = await this.resources?.checkpoint(handle) ?? [];
     const resourcePaths = Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
       .map((projection) => projection.target).filter((value): value is string => Boolean(value));
@@ -61,7 +57,7 @@ export class WorldCheckpointService {
         // Inputs, never project data — do not make them portable merely
         // because they are untracked.
         if (change.path === '.env' || change.path.startsWith('.karmax-injection/') || change.path.startsWith('.karmax-services/')
-          || secretFiles.has(relative) || readonlyMounts.has(relative) || ephemeralPaths.has(relative)
+          || secretFiles.has(relative) || ephemeralPaths.has(relative)
           || resourcePaths.some((target) => relative === target || relative.startsWith(`${target}/`))) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
         else {
@@ -76,34 +72,15 @@ export class WorldCheckpointService {
         checkoutPath: worldRepos(world.handle).length > 1 ? repo.name : '.', baseSha: repo.baseSha ?? handle.base,
         branch: repo.branch, headSha: head.code === 0 ? head.stdout.trim() : undefined });
     }
-    // Data-object mounts (PLAN-state §3.2): task-local drift rides the delta
-    // even when the path is gitignored (git status cannot see it). `readonly`
-    // mounts never drift by contract; a sha match costs one hash.
-    for (const mount of objectMountManifest(handle.meta)) {
-      if (mount.mode === 'readonly') continue;
-      const enclosing = enclosingRepo(world.handle, mount.path);
-      if (!enclosing) continue;
-      const already = files.some((f) => f.repo === enclosing.repo.name && f.path === enclosing.inRepo);
-      if (already) continue;
-      try {
-        const data = await world.readFileBuffer(mount.path);
-        if (sha256(data) === mount.object) continue;
-        files.push({ repo: enclosing.repo.name, path: enclosing.inRepo, data: data.toString('base64') });
-      } catch {
-        files.push({ repo: enclosing.repo.name, path: enclosing.inRepo, deleted: true });
-      }
-    }
     const delta: PortableDelta = { version: 1, files };
     const compressed = await gzip(Buffer.from(JSON.stringify(delta)));
     const encrypted = this.encrypt(compressed);
     const checkpointId = newId('checkpoint');
     const objectKey = `checkpoints/${project.organizationId}/${projectId}/${handle.id}/${checkpointId}.bin`;
     await this.objects.put(objectKey, encrypted);
-    const mountManifest = objectMountManifest(handle.meta);
     const checkpoint: WorldCheckpoint = {
       id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
-      ...(mountManifest.length ? { objectMounts: mountManifest } : {}),
       repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length },
       ...(resourceRefs.length ? { resources: resourceRefs } : {}), createdAt: Date.now(),
     };
@@ -154,15 +131,6 @@ export class WorldCheckpointService {
         world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
           checkpoint.generation + 1, revisions);
       }
-      let mountManifest: Array<{ path: string; object: string; mode: 'seed' | 'readonly' | 'writeback' }> = [];
-      try {
-        const projectObjects = new ProjectObjects(this.store, this.objects);
-        const mounts = checkpoint.objectMounts?.length
-          ? await Promise.all(checkpoint.objectMounts.map(async (m) => ({
-              path: m.path, mode: m.mode, object: m.object, data: await projectObjects.data(checkpoint.projectId, m.object) })))
-          : await projectObjects.resolved(checkpoint.projectId);
-        mountManifest = await materializeObjectMounts(world, mounts);
-      } catch { /* world remains usable without them */ }
       for (const file of delta.files) {
         const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
         if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
@@ -179,15 +147,34 @@ export class WorldCheckpointService {
           }
         }
       }
-      // Re-materialize legacy file-shaped project secrets (excluded from the
-      // portable delta by design). Best-effort — a missing value surfaces
-      // where it is first used, not as a failed restore.
+      // A restored world must return with its declared runtime, not just its
+      // files: run the environment's cheap boot commands (setup only when no
+      // baked build exists for this provider) and relaunch per-world services,
+      // exactly as createWorld does. Best-effort — a failed service surfaces
+      // as a warning-shaped state at first use, not a failed restore.
       try {
-        const manifest = await materializeFileSecrets(world,
-          new ProjectSecrets(this.store, this.broker).files(checkpoint.projectId, { taskId: checkpoint.worldId }));
-        if (manifest.length) world.handle.meta = { ...world.handle.meta, secretFiles: manifest };
-      } catch { /* world remains usable without them */ }
-      if (mountManifest.length) world.handle.meta = { ...world.handle.meta, objectMounts: mountManifest };
+        const { ProjectEnvironment } = await import('../store/project-environment.js');
+        const { setupCommands, bootCommands } = await import('./environment-build.js');
+        const environment = new ProjectEnvironment(this.store);
+        const spec = environment.spec(checkpoint.projectId);
+        if (spec && !['worktree', 'memory'].includes(selected)) {
+          const ready = environment.readyBuild(checkpoint.projectId, selected, environment.digest(spec));
+          for (const command of [...(ready ? [] : setupCommands(spec)), ...bootCommands(spec)])
+            await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 });
+        }
+        const { ProjectServices } = await import('../store/project-services.js');
+        const { launchWorldServices } = await import('./services.js');
+        const perWorld = new ProjectServices(this.store).list(checkpoint.projectId).filter((s) => s.kind === 'per-world');
+        if (perWorld.length) {
+          const attachments = new Map(this.store.listResourceAttachments(checkpoint.projectId)
+            .map((resource) => [resource.id, resource]));
+          const launched = await launchWorldServices(world, checkpoint.worldId, perWorld, attachments);
+          if (Object.keys(launched.env).length && this.resources)
+            world.handle = this.resources.registerServiceEnvironment(world.handle, launched.env);
+          if (launched.containers.length) world.handle.meta = {
+            ...world.handle.meta, serviceContainers: launched.containers };
+        }
+      } catch { /* the world's files are intact; runtime gaps surface at use */ }
       const registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
         { runnerPoolId: checkpoint.runnerPoolId, environmentDigest: checkpoint.environmentDigest }) as WorldHandle;
       world.handle = registered;

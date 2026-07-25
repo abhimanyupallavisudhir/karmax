@@ -10,13 +10,13 @@ import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
   WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
 import { worldRelativePath } from './types.js';
-import { ensureWorldExcluded } from './secrets.js';
 import type { WorldRegistry } from './registry.js';
 import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL_RESOURCE_PUBLISH,
   SIG_ENQUEUE_RESOURCE_PUBLISH, SIG_RELEASE_RESOURCE_PUBLISH,
   resourcePublishCoordinatorId } from '../coordinators/names.js';
 import type { ResourcePublishView } from '../coordinators/resource-publish.js';
 import { credentialResource, snapshotResource } from '../domain/resource-drivers.js';
+import { ensureWorldExcluded } from './secret-exclude.js';
 
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const WORLD_READ_BYTES = 16 * 1024 * 1024;
@@ -184,6 +184,7 @@ export class ProjectResourceService {
         } else if (isSnapshotDriver(attachment.driver)) {
           const target = attachment.target.kind === 'path' ? safePath(attachment.target.path) : undefined;
           if (!target) throw new Error(`resource "${attachment.name}" requires a path target`);
+          if (target !== '.') await ensureWorldExcluded(world, target);
           if (revisionId) {
             const revision = this.store.getResourceRevision(revisionId);
             if (!revision) throw new Error(`resource "${attachment.name}" revision is missing`);
@@ -226,6 +227,16 @@ export class ProjectResourceService {
    * values live only in this wrapper and disappear with the activity. */
   withEnvironment(world: World): World {
     const env: Record<string, string> = {};
+    const serviceHandles = world.handle.meta?.serviceEnvironmentHandles;
+    if (serviceHandles && typeof serviceHandles === 'object') {
+      for (const [name, handle] of Object.entries(serviceHandles as Record<string, unknown>)) {
+        if (typeof handle !== 'string') continue;
+        env[name] = this.broker.resolve(handle, {
+          taskId: world.handle.id,
+          caps: [`use-credential:${handle}`],
+        });
+      }
+    }
     for (const lease of this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1)) {
       if (lease.state !== 'active') continue;
       const attachment = this.store.getResourceAttachment(lease.attachmentId);
@@ -234,6 +245,19 @@ export class ProjectResourceService {
         env[attachment.target.name] = this.resolveSecret(attachment, lease.taskId);
     }
     return Object.keys(env).length ? new EnvironmentWorld(world, env) : world;
+  }
+
+  /** Store generated per-world service endpoints behind opaque vault handles.
+   * World metadata may be durable; connection strings and tokens may not be. */
+  registerServiceEnvironment(handle: WorldHandle, values: Record<string, string>): WorldHandle {
+    const refs: Record<string, string> = {};
+    for (const [name, value] of Object.entries(values)) {
+      const ref = `world-service:${handle.id}:${handle.generation ?? 1}:${name}`;
+      this.broker.registerHandle(ref, value);
+      refs[name] = ref;
+    }
+    return { ...handle, meta: { ...handle.meta,
+      ...(Object.keys(refs).length ? { serviceEnvironmentHandles: refs } : {}) } };
   }
 
   /** Rehydrate path credentials after a park/resume and wrap environment
@@ -265,6 +289,10 @@ export class ProjectResourceService {
 
   async release(handle: WorldHandle): Promise<void> {
     await this.scrubSecrets(handle);
+    const serviceHandles = handle.meta?.serviceEnvironmentHandles;
+    if (serviceHandles && typeof serviceHandles === 'object')
+      for (const value of Object.values(serviceHandles as Record<string, unknown>))
+        if (typeof value === 'string') this.broker.deleteHandle(value);
     for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
       const attachment = this.store.getResourceAttachment(lease.attachmentId);
       this.store.updateResourceLease(lease.id, 'released');
@@ -308,6 +336,9 @@ export class ProjectResourceService {
 
   async deleteProject(projectId: string): Promise<void> {
     for (const attachment of this.store.listResourceAttachments(projectId, true)) await this.deleteAttachment(attachment.id);
+    this.store.kvDelete(`project-environment:${projectId}`);
+    this.store.kvDelete(`project-environment-builds:${projectId}`);
+    this.store.kvDelete(`project-services:${projectId}`);
   }
 
   deleteOrganizationKey(organizationId: string): void {

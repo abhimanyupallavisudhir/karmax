@@ -10,8 +10,11 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/projects/:projectId/resources/scan',
     'POST /api/projects/:projectId/resources/:resourceId/uploads',
     'PUT|POST|DELETE /api/resource-uploads/:uploadId?projectId=',
-    'GET|POST|DELETE /api/projects/:projectId/services (external → {name, kind: external, connectionSecret}; per-world → {name, kind: per-world, image, containerPort, urlEnv, urlTemplate, seedObject?}; DELETE ?name=)',
+    'GET|POST /api/projects/:projectId/secrets (sugar creating secret@1 attachments; {env: "<pasted .env>"} bulk-imports)', 'DELETE /api/projects/:projectId/secrets/:name',
+    'GET|POST|DELETE /api/projects/:projectId/services (external → connectionResourceId; per-world → {image, containerPort, urlEnv, urlTemplate, seedResourceId?}; DELETE ?name=)',
     'GET /api/projects/:projectId/services/compose-import (proposals parsed from the repo\'s docker-compose file)',
+    'GET|PUT /api/projects/:projectId/environment', 'GET /api/projects/:projectId/environment/proposal',
+    'POST /api/projects/:projectId/environment/build',
   ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',

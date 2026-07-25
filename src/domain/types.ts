@@ -459,6 +459,45 @@ export interface ResourceChangeSummary {
   changedPaths: string[];
 }
 
+// ─── Project environments and per-world services ───────────────────────────
+
+/** A user-approved derivation recipe. Setup is baked into immutable provider
+ * artifacts; boot commands run for each world. The proposal UI derives this
+ * from lockfiles/devcontainers instead of requiring hand-authored config. */
+export interface ProjectEnvironmentSpec {
+  image?: string;
+  setup?: string[];
+  boot?: string[];
+  includeDocker?: boolean;
+}
+
+export interface EnvironmentBuildRecord {
+  provider: string;
+  digest: string;
+  status: 'building' | 'ready' | 'failed';
+  ref?: string;
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Services are recipes/access declarations, not a second data store. A
+ * per-world seed references a typed resource attachment already materialized
+ * in the world; external services name a secret attachment. */
+export interface ProjectService {
+  name: string;
+  kind: 'external' | 'per-world';
+  connectionResourceId?: string;
+  image?: string;
+  command?: string[];
+  env?: Record<string, string>;
+  containerPort?: number;
+  urlEnv?: string;
+  urlTemplate?: string;
+  seedResourceId?: string;
+  seedContainerPath?: string;
+}
+
 /** Organization-owned defaults for task execution. Projects may select another
  * connected provider/pool or set a tighter budget, but sandbox shape, lifecycle,
  * and network posture have one obvious home. */

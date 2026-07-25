@@ -3796,7 +3796,6 @@ function renderTaskPage() {
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
-          ${rec ? orgEditorHtml(rec) : ''}
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
@@ -3818,7 +3817,6 @@ function renderTaskPage() {
   );
   wireAttempts(v);
   wireActions(v); // the footer action bar lives on every tab
-  wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
@@ -3828,6 +3826,7 @@ function renderTaskPage() {
     wireFollowups(v);
     wireTerminal(v.taskId);
   } else if (tab === 'parameters') {
+    wireTaskOrg(v);
     wireParams(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
   } else if (tab === 'advanced') {
@@ -4066,56 +4065,7 @@ function makeTermScreen(maxLines = 2000) {
       row = Math.max(0, row - drop);
     }
   }
-  // render() joins the authoritative buffer; an optional `pending` string is the
-  // predicted (locally-echoed, not-yet-confirmed) tail — overlaid at the cursor
-  // without mutating the buffer, so the next server byte reconciles cleanly.
-  return {
-    write,
-    cursor: () => ({ row, col }),
-    render: (pending = '') => {
-      if (!pending) return lines.join('\n');
-      const out = lines.slice();
-      let line = out[row] ?? '';
-      if (line.length < col) line += ' '.repeat(col - line.length);
-      out[row] = line.slice(0, col) + pending + line.slice(col + pending.length);
-      return out.join('\n');
-    },
-  };
-}
-
-// Predictive local echo (mosh-style, conservative). Typing into a cloud world's
-// PTY costs a full network round-trip before the remote shell echoes the char
-// back, so without prediction every keystroke feels laggy. We optimistically
-// render printable characters the instant they're typed (`term.pending`), then
-// reconcile against the authoritative server stream: each echoed printable byte
-// confirms and drops one predicted char; anything unexpected (an escape sequence,
-// a mismatch — completion, prompt redraw, program output) discards the whole
-// prediction and lets the server drive. Non-printable keys (Enter, arrows, Tab,
-// Ctrl-*) can't be predicted safely, so they clear pending and defer to the shell.
-function predictInput(bytes, ctrl) {
-  if (!term) return;
-  if (!ctrl && bytes.length === 1 && bytes >= ' ' && bytes !== '\x7f') {
-    term.pending += bytes;                       // printable → echo locally now
-  } else if (bytes === '\x7f' && term.pending) {
-    term.pending = term.pending.slice(0, -1);    // backspace an unconfirmed char
-  } else {
-    term.pending = '';                           // Enter/arrows/Tab/Ctrl-* → server drives
-  }
-}
-
-// Consume the server's echo of characters we already predicted, so they don't
-// render twice. Stops (and discards remaining predictions) on the first byte that
-// doesn't match — the server is authoritative from that point on.
-function reconcilePrediction(data) {
-  if (!term || !term.pending) return;
-  for (let i = 0; i < data.length && term.pending; i++) {
-    const ch = data[i];
-    const code = data.charCodeAt(i);
-    if (ch === '\x1b') { term.pending = ''; return; }   // escape/redraw → drop predictions
-    if (code < 32 || code === 127) continue;            // ignore CR/LF/other controls
-    if (ch === term.pending[0]) term.pending = term.pending.slice(1); // confirmed
-    else { term.pending = ''; return; }                 // mismatch → server wins
-  }
+  return { write, render: () => lines.join('\n') };
 }
 
 // Translate a browser keydown into the bytes a PTY expects. Returns null to let
@@ -4150,13 +4100,13 @@ function keyToPtyBytes(e) {
 function bindTermScreen(out) {
   if (!term || !out) return;
   out.classList.remove('hidden');
-  const repaint = () => { out.textContent = term.screen.render(term.pending); out.scrollTop = out.scrollHeight; };
-  repaint();
+  out.textContent = term.screen.render();
+  out.scrollTop = out.scrollHeight;
   const ws = term.ws;
   ws.onmessage = (m) => {
     try {
       const msg = JSON.parse(m.data);
-      if (msg.type === 'data') { reconcilePrediction(msg.data); term.screen.write(msg.data); repaint(); }
+      if (msg.type === 'data') { term.screen.write(msg.data); out.textContent = term.screen.render(); out.scrollTop = out.scrollHeight; }
     } catch {}
   };
   const send = (data) => { if (term && term.ws && term.ws.readyState === 1) term.ws.send(JSON.stringify({ type: 'input', data })); };
@@ -4169,16 +4119,12 @@ function bindTermScreen(out) {
     e.preventDefault();
     e.stopPropagation();                                                // consumed by the shell — never let it trigger an app shortcut
     send(bytes);
-    predictInput(bytes, e.ctrlKey);                                     // optimistic local echo — hides the round-trip on cloud worlds
-    repaint();
   };
   out.onpaste = (e) => {
     const text = (e.clipboardData || window.clipboardData)?.getData('text');
     if (!text) return;
     e.preventDefault();
     send(text);
-    term.pending = '';                                                  // multi-line paste: let the shell echo authoritatively
-    repaint();
   };
 }
 
@@ -4186,10 +4132,9 @@ function openTerminal(taskId) {
   if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
-  term = { taskId, ws, screen: makeTermScreen(), pending: '' };
+  term = { taskId, ws, screen: makeTermScreen() };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
-    term.pending = '';
     term.screen.write('\r\n[terminal closed]\r\n');
     const out = document.getElementById('term-out');
     if (out) out.textContent = term.screen.render();
@@ -4742,7 +4687,7 @@ async function materializeLocalCheckout(v, session) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">Karmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
+    <p class="task-sub">Karmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world was parked again.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
     ${fork ? `<div class="section-h" style="margin-top:14px">Fork this agent locally</div><pre class="raw">${esc(fork)}</pre><button class="btn sm local-copy" data-value="${esc(fork)}">Copy fork command</button>` : ''}
@@ -4781,9 +4726,10 @@ async function copyNativeAttachCommand(v) {
 // priority + tags (organization), the workflow's declared params (editable or
 // frozen per its lifecycle), and the per-task credential policy.
 function parametersTab(v) {
-  // Priority + tags (organization metadata) now live in the page header, above the
-  // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
+  const rec = taskRecord(v.taskId);
   return `
+    <div class="section-h">Organization</div>
+    ${rec ? orgEditorHtml(rec) : '<div class="task-sub" style="color:var(--ink-3)">Priority + tags load with the task list.</div>'}
     ${paramsSection(v)}
     <div class="section-h">Credentials</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
@@ -5129,7 +5075,7 @@ function paramsSection(v) {
   const footer = editable.size
     ? `<button class="btn sm primary" id="params-save">Save changes</button>`
     : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
-  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
+  return `<div class="section-h">Parameters</div><div id="tp-params">${rows}${footer}</div>`;
 }
 
 // Best-known current value of a param for a running task (the view carries a few;
@@ -6549,14 +6495,16 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-resources-section">Resources</a><a href="#project-services">Services</a><a href="#project-environment">Environment</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-data">Data</a><a href="#project-services">Services</a><a href="#project-environment">Environment</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
-    <div class="settings-section-title" id="project-resources-section"><div>Resources<small>Secrets and versioned data attached to every task world</small></div></div>
-    <div class="card"><div id="project-resources">Loading…</div></div>
-    <div class="settings-section-title" id="project-services"><div>Services<small>What this project's code connects to — a shared instance via a Secret, or a private per-world container</small></div></div>
+    <div class="settings-section-title" id="project-secrets"><div>Secrets<small>Paste values only when needed; the repository supplies the names</small></div></div>
+    <div class="card"><div id="project-secrets-box">Loading…</div></div>
+    <div class="settings-section-title" id="project-data"><div>Data<small>Versioned datasets, model weights, fixtures, and development databases</small></div></div>
+    <div class="card"><div id="project-data-box">Loading…</div></div>
+    <div class="settings-section-title" id="project-services"><div>Services<small>Shared connections or a private container for every task world</small></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
-    <div class="settings-section-title" id="project-environment"><div>Environment<small>Built once, copied into every task world — so worlds boot in seconds with dependencies (and Docker) already in place</small></div></div>
+    <div class="settings-section-title" id="project-environment"><div>Environment<small>Proposed from the repo, built once, and copied into each world</small></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
@@ -6602,138 +6550,187 @@ async function hydrateProjectGitProfile(proj) {
     });
   } catch (error) { box.textContent = error.message; }
 }
-// The lazy-onboarding strip inside the Resources card: quick-add a secret,
-// one-click .env.example suggestions, paste-.env import, copyGlobs exit ramp.
-// Writes land as secret@1 resource attachments; the list above shows them.
 async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box) return;
   try {
-    const { suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
-    const refresh = () => hydrateProjectResources(projectById(proj.id));
-    box.innerHTML = `
-      ${suggestions.length ? `<div style="margin-top:6px;font-size:12px;color:var(--ink-3)">Named by this repo's .env example: ${suggestions.map((n) => `<button class="btn sm project-secret-suggest" data-name="${esc(n)}">＋ ${esc(n)}</button>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:8px"><input id="project-secret-name" placeholder="DATABASE_URL" style="max-width:190px"><input id="project-secret-value" type="password" placeholder="value (write-only)" style="flex:1;min-width:140px"><input id="project-secret-file" placeholder="as file at path (optional)" style="max-width:190px"><button class="btn sm primary" id="project-secret-save">Add secret</button></div>
-      <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Values go to the vault and are never shown again. Re-saving a name with a blank value keeps the stored one.</div>
-      <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# comments, blank lines, and empty values are skipped" style="width:100%"></textarea><div class="inline-form"><button class="btn sm primary" id="project-secret-import">Import</button></div></details>
-      ${(proj.config.copyGlobs || []).length ? `<div class="inline-form" style="margin-top:6px"><button class="btn sm primary" id="project-copyglobs-import">Import copyGlobs (${esc((proj.config.copyGlobs || []).join(', '))}) into Resources</button></div><div style="font-size:11px;color:var(--ink-3)">.env files become secrets, other small text files become file secrets, large/binary files become data — then copyGlobs is cleared and cloud worlds get them too.</div>` : ''}`;
+    const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    box.innerHTML = `${secrets.map((secret) => `<div class="queue-item"><div style="flex:1"><b>${esc(secret.name)}</b> <span class="chip">${secret.file ? `file · ${esc(secret.file)}` : `env · ${esc(secret.variable || secret.name)}`}</span> <span class="chip">vault configured</span></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')
+      || '<p class="task-sub">No values are required up front. Karmax asks when code first needs one.</p>'}
+      ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
+      <div class="inline-form" style="margin-top:8px"><input id="project-secret-name" placeholder="DATABASE_URL" style="max-width:190px"><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="value (write-only)" style="flex:1;min-width:160px"><input id="project-secret-file" placeholder="file path (optional)" style="max-width:190px"><button class="btn sm primary" id="project-secret-save">Save</button></div>
+      <p class="task-sub">Values are never shown again. File secrets are 0600, checkpoint-excluded, and privately Git-excluded in each task worktree.</p>
+      <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
-      $('#project-secret-name').value = button.dataset.name;
-      $('#project-secret-value').focus();
+      $('#project-secret-name').value = button.dataset.name; $('#project-secret-value').focus();
+    }));
+    box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
+      if (!confirm('Remove this secret and its vault value?')) return;
+      try { await api(`/api/projects/${proj.id}/secrets/${encodeURIComponent(button.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectSecrets(proj); }
+      catch (error) { toast(error.message, true); }
     }));
     $('#project-secret-save')?.addEventListener('click', async () => {
-      const name = $('#project-secret-name').value.trim();
-      if (!name) return toast('Secret name is required', true);
+      const name = $('#project-secret-name').value.trim(), value = $('#project-secret-value').value;
+      if (!name || !value) return toast('Name and value are required', true);
       try {
-        await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ name,
-          value: $('#project-secret-value').value || undefined, file: $('#project-secret-file').value.trim() || undefined }) });
-        toast(`🟢 Saved ${name}. The value went to the vault and is never shown again.`);
-        await refresh();
+        await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ name, value,
+          file: $('#project-secret-file').value.trim() || undefined }) });
+        toast(`Saved ${name}`); await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
     $('#project-secret-import')?.addEventListener('click', async () => {
       try {
-        const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST', body: JSON.stringify({ env: $('#project-secret-env').value }) });
-        toast(`Imported ${result.imported.length} ${result.imported.length === 1 ? 'secret' : 'secrets'}`);
-        await refresh();
-      } catch (error) { toast(error.message, true); }
-    });
-    $('#project-copyglobs-import')?.addEventListener('click', async () => {
-      try {
-        const result = await api(`/api/projects/${proj.id}/import-copyglobs`, { method: 'POST', body: '{}' });
-        const total = result.envSecrets.length + result.fileSecrets.length + result.objects.length;
-        toast(total ? `Imported ${total} item(s); copyGlobs cleared` : 'No matching files found to import', !total);
-        await loadProjects();
-        await refresh();
+        const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST',
+          body: JSON.stringify({ env: $('#project-secret-env').value }) });
+        toast(`Imported ${result.imported.length} secret${result.imported.length === 1 ? '' : 's'}`);
+        await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { box.textContent = error.message; }
 }
-async function hydrateProjectServices(proj) {
-  const box = $('#project-services-box'); if (!box) return;
+
+async function hydrateProjectData(proj) {
+  const box = $('#project-data-box'); if (!box) return;
   try {
-    const { services } = await api(`/api/projects/${encodeURIComponent(proj.id)}/services`);
-    box.innerHTML = `
-      ${services.map((s) => `<div class="queue-item"><div style="flex:1"><b>${esc(s.name)}</b> <span class="chip">${esc(s.kind)}</span> ${s.kind === 'external' ? `<span class="chip">secret · ${esc(s.connectionSecret || '')}</span>` : `<span class="chip">${esc(s.image || '')}</span>${s.urlEnv ? ` <span class="chip">${esc(s.urlEnv)}</span>` : ''}${s.seedObject ? ` <span class="chip">seed · ${esc(s.seedObject)}</span>` : ''}`}</div><button class="btn sm project-service-delete" data-name="${esc(s.name)}">Remove</button></div>`).join('')
-        || '<p class="task-sub">No services yet. A shared database is just a connection-string Secret; a per-world service gives every task world its own fresh container, seeded from a Data object.</p>'}
-      <div class="inline-form" style="margin-top:8px"><button class="btn sm" id="project-service-import">Import from docker-compose</button></div>
-      <div id="project-service-proposals"></div>
-      <details class="settings-disclosure compact"><summary><b>Add a service by hand</b></summary>
-        <div class="inline-form"><input id="project-service-name" placeholder="name (e.g. postgres)" style="max-width:150px"><select id="project-service-kind"><option value="per-world">per-world container</option><option value="external">external (via Secret)</option></select><input id="project-service-image" placeholder="image (per-world)" style="max-width:160px"><input id="project-service-port" placeholder="port" style="max-width:70px"><input id="project-service-urlenv" placeholder="urlEnv (e.g. DATABASE_URL)" style="max-width:180px"><input id="project-service-template" placeholder="url template with {host}:{port}" style="flex:1;min-width:170px"><input id="project-service-secret" placeholder="connection Secret name (external)" style="max-width:210px"><button class="btn sm primary" id="project-service-save">Save service</button></div>
+    const all = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
+    const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
+    box.innerHTML = `${resources.map((resource) => `<div class="queue-item" data-data-resource="${esc(resource.id)}"><div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${resource.access === 'write' ? 'private writable fork' : 'read-only'}</span> <span class="chip">${resource.publish === 'review' ? 'promotable at Review' : 'discard changes'}</span><div class="task-sub"><span class="mono">${esc(resource.target.path)}</span>${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · immutable ${esc(resource.revision.id)}` : ' · awaiting initial upload'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')
+      || '<p class="task-sub">No data resources yet. Datasets, model weights, fixtures, and SQLite files become immutable revisions; task changes are explicitly promoted or discarded.</p>'}
+      ${S.meta?.hosted ? '' : '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button><span class="task-sub">Karmax proposes; nothing uploads until you approve.</span></div><div id="data-proposals"></div>'}
+      <details class="settings-disclosure compact"><summary><b>Add data</b><span>Large uploads are resumable and streamed</span></summary>
+        <div class="inline-form"><input id="data-name" placeholder="Training data"><input id="data-path" placeholder="resources/training-data"><select id="data-access"><option value="read">read-only</option><option value="write">writable private fork</option></select><select id="data-publish"><option value="discard">discard task changes</option><option value="review">offer Promote at Review</option></select></div>
+        <div class="inline-form">${S.meta?.hosted ? '' : '<input id="data-source" placeholder="/local/path (optional)" style="flex:1">'}<input id="data-files" type="file" multiple webkitdirectory><button class="btn sm primary" id="data-add">Add</button></div>
       </details>`;
-    box.querySelectorAll('.project-service-delete').forEach((button) => button.addEventListener('click', async () => {
-      if (!confirm(`Remove service ${button.dataset.name}?`)) return;
-      try { await api(`/api/projects/${proj.id}/services?name=${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' }); await hydrateProjectServices(proj); }
-      catch (error) { toast(error.message, true); }
-    }));
-    $('#project-service-import')?.addEventListener('click', async () => {
+    box.querySelectorAll('[data-data-resource]').forEach((row) => {
+      const resource = resources.find((item) => item.id === row.dataset.dataResource);
+      row.querySelector('.resource-toggle').addEventListener('click', async () => {
+        await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) });
+        await hydrateProjectData(proj);
+      });
+      row.querySelector('.resource-delete').addEventListener('click', async () => {
+        if (!confirm(`Remove ${resource.name}?`)) return;
+        await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectData(proj);
+      });
+    });
+    $('#data-discover')?.addEventListener('click', async () => {
       try {
-        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`);
-        const target = $('#project-service-proposals');
-        if (!proposals.length) { target.innerHTML = '<p class="task-sub">No importable services found in this repo’s docker-compose file.</p>'; return; }
-        target.innerHTML = proposals.map((s, i) => `<div class="queue-item"><div style="flex:1"><b>${esc(s.name)}</b> <span class="chip">${esc(s.image)}</span>${s.urlEnv ? ` <span class="chip">${esc(s.urlEnv)}</span>` : ''}</div><button class="btn sm primary project-service-accept" data-index="${i}">Add</button></div>`).join('');
-        target.querySelectorAll('.project-service-accept').forEach((button) => button.addEventListener('click', async () => {
-          try { await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify(proposals[Number(button.dataset.index)]) }); toast('Service added'); await hydrateProjectServices(proj); }
-          catch (error) { toast(error.message, true); }
+        const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = $('#data-proposals');
+        const proposals = scan.proposals.filter((proposal) => proposal.suggested.driver === 'volume@1');
+        target.innerHTML = proposals.map((proposal, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span><p class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</p></div><button class="btn sm primary accept-data-proposal">Use proposal</button></div>`).join('')
+          || '<p class="task-sub">No likely data resources found.</p>';
+        target.querySelectorAll('.accept-data-proposal').forEach((button) => button.addEventListener('click', () => {
+          const proposal = proposals[Number(button.closest('[data-index]').dataset.index)];
+          $('#data-name').value = proposal.path.split('/').pop() || 'Data';
+          $('#data-path').value = proposal.suggested.target.path;
+          $('#data-access').value = proposal.suggested.access;
+          $('#data-publish').value = proposal.suggested.publish;
+          if ($('#data-source')) $('#data-source').value = `${proposal.repository.replace(/\/$/, '')}/${proposal.path}`;
+          $('#data-name').scrollIntoView({ behavior: 'smooth', block: 'center' });
         }));
       } catch (error) { toast(error.message, true); }
     });
-    $('#project-service-save')?.addEventListener('click', async () => {
-      const kind = $('#project-service-kind').value;
-      const body = { name: $('#project-service-name').value.trim(), kind,
-        ...(kind === 'external' ? { connectionSecret: $('#project-service-secret').value.trim() } : {
-          image: $('#project-service-image').value.trim(),
-          containerPort: Number($('#project-service-port').value) || undefined,
-          urlEnv: $('#project-service-urlenv').value.trim() || undefined,
-          urlTemplate: $('#project-service-template').value.trim() || undefined,
-        }) };
-      try { await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify(body) }); toast(`Saved ${body.name}`); await hydrateProjectServices(proj); }
-      catch (error) { toast(error.message, true); }
+    $('#data-add')?.addEventListener('click', async () => {
+      const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
+      const button = $('#data-add'); button.disabled = true;
+      try {
+        const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
+          name, driver: 'volume@1', target: { kind: 'path', path: $('#data-path').value.trim() || `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
+          access: $('#data-access').value, isolation: 'fork', publish: $('#data-publish').value,
+          sourcePath: $('#data-source')?.value.trim() || undefined,
+        }) });
+        const files = [...$('#data-files').files];
+        if (files.length) await uploadResourceFiles(proj.id, created.id, files,
+          (done, total) => { button.textContent = `Uploading ${Math.round(done / total * 100)}%`; });
+        toast('Data resource added'); await hydrateProjectData(proj);
+      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Add'; }
     });
   } catch (error) { box.textContent = error.message; }
 }
+
+async function hydrateProjectServices(proj) {
+  const box = $('#project-services-box'); if (!box) return;
+  try {
+    const [{ services }, resources] = await Promise.all([
+      api(`/api/projects/${proj.id}/services`), api(`/api/projects/${proj.id}/resources`),
+    ]);
+    const secrets = resources.filter((resource) => ['secret@1', 'database@1', 'service@1'].includes(resource.driver));
+    const data = resources.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver) && resource.target.kind === 'path');
+    box.innerHTML = `${services.map((service) => `<div class="queue-item"><div style="flex:1"><b>${esc(service.name)}</b> <span class="chip">${esc(service.kind)}</span>${service.image ? ` <span class="chip">${esc(service.image)}</span>` : ''}${service.urlEnv ? ` <span class="chip">${esc(service.urlEnv)}</span>` : ''}</div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')
+      || '<p class="task-sub">No services yet. Shared production services use a credential resource; per-world services give every task an isolated container.</p>'}
+      <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button></div><div id="service-proposals"></div>
+      <details class="settings-disclosure compact"><summary><b>Add a service manually</b></summary><div class="inline-form"><input id="service-name" placeholder="postgres"><select id="service-kind"><option value="per-world">per-world container</option><option value="external">external connection</option></select><input id="service-image" placeholder="postgres:16"><input id="service-port" placeholder="5432" style="max-width:80px"><input id="service-url-env" placeholder="DATABASE_URL"><input id="service-url-template" placeholder="postgres://…@{host}:{port}/db" style="flex:1"></div><div class="inline-form"><label>Connection secret <select id="service-connection"><option value="">—</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select></label><label>Seed data <select id="service-seed"><option value="">—</option>${data.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)} · ${esc(resource.target.path)}</option>`).join('')}</select></label><input id="service-seed-path" placeholder="/docker-entrypoint-initdb.d/seed.sql"><button class="btn sm primary" id="service-save">Save</button></div></details>`;
+    box.querySelectorAll('.service-delete').forEach((button) => button.addEventListener('click', async () => {
+      await api(`/api/projects/${proj.id}/services?name=${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' });
+      await hydrateProjectServices(proj);
+    }));
+    $('#service-discover')?.addEventListener('click', async () => {
+      try {
+        const { proposals } = await api(`/api/projects/${proj.id}/services/compose-import`), target = $('#service-proposals');
+        target.innerHTML = proposals.map((service, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(service.name)}</b> <span class="chip">${esc(service.image)}</span>${service.urlEnv ? ` <span class="chip">${esc(service.urlEnv)}</span>` : ''}</div><button class="btn sm primary service-accept">Add</button></div>`).join('')
+          || '<p class="task-sub">No importable Compose services found.</p>';
+        target.querySelectorAll('.service-accept').forEach((button) => button.addEventListener('click', async () => {
+          await api(`/api/projects/${proj.id}/services`, { method: 'POST',
+            body: JSON.stringify(proposals[Number(button.closest('[data-index]').dataset.index)]) });
+          toast('Service added'); await hydrateProjectServices(proj);
+        }));
+      } catch (error) { toast(error.message, true); }
+    });
+    $('#service-save')?.addEventListener('click', async () => {
+      const kind = $('#service-kind').value;
+      try {
+        await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify({
+          name: $('#service-name').value.trim(), kind,
+          ...(kind === 'external' ? { connectionResourceId: $('#service-connection').value } : {
+            image: $('#service-image').value.trim(), containerPort: Number($('#service-port').value) || undefined,
+            urlEnv: $('#service-url-env').value.trim() || undefined,
+            urlTemplate: $('#service-url-template').value.trim() || undefined,
+            seedResourceId: $('#service-seed').value || undefined,
+            seedContainerPath: $('#service-seed-path').value.trim() || undefined,
+          }),
+        }) }); toast('Service saved'); await hydrateProjectServices(proj);
+      } catch (error) { toast(error.message, true); }
+    });
+  } catch (error) { box.textContent = error.message; }
+}
+
 async function hydrateProjectEnvironment(proj) {
   const box = $('#project-environment-box'); if (!box) return;
   try {
-    const { spec, digest, builds } = await api(`/api/projects/${encodeURIComponent(proj.id)}/environment`);
-    const buildRow = (b) => `<div class="queue-item"><div style="flex:1"><b>${esc(b.provider)}</b> <span class="chip">${b.status === 'ready' ? '🟢 ready' : b.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip" title="${esc(b.digest)}">${esc(b.digest.slice(0, 8))}${digest && b.digest !== digest ? ' · stale' : ''}</span>${b.ref && b.ref !== 'host' ? ` <span class="chip">${esc(b.ref)}</span>` : ''}</div>${b.error ? `<span class="task-sub" style="color:var(--danger)">${esc(b.error.slice(0, 120))}</span>` : ''}</div>`;
-    box.innerHTML = `
-      <div class="inline-form"><input id="project-env-image" value="${esc(spec?.image || '')}" placeholder="base image (e.g. node:22-slim) or provider template" style="flex:1;min-width:200px"><label class="switch"><input id="project-env-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span>Bake Docker (for per-world services)</span></label></div>
-      <div class="inline-form"><textarea id="project-env-setup" rows="3" placeholder="setup commands, one per line — baked once into the build (npm ci, pip install …)" style="flex:1">${esc((spec?.setup || []).join('\n'))}</textarea></div>
-      <div class="inline-form"><textarea id="project-env-boot" rows="2" placeholder="boot commands, one per line — run cheaply in every new world" style="flex:1">${esc((spec?.boot || []).join('\n'))}</textarea></div>
-      <div class="inline-form"><button class="btn sm" id="project-env-propose">Propose from repo</button><button class="btn sm primary" id="project-env-save">Save</button><button class="btn sm primary" id="project-env-build">Build now</button></div>
-      <div id="project-env-evidence" style="font-size:11px;color:var(--ink-3)"></div>
-      ${builds.length ? `<div class="section-h" style="margin-top:10px">Builds</div>${builds.map(buildRow).join('')}` : '<p class="task-sub" style="margin-top:8px">No builds yet. Without one, cloud worlds run setup live on every task (slow); a build makes them boot from a snapshot.</p>'}`;
-    $('#project-env-propose')?.addEventListener('click', async () => {
+    const { spec, digest, builds } = await api(`/api/projects/${proj.id}/environment`);
+    const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div></div>`;
+    box.innerHTML = `<div class="proposal-card"><b>Repository-derived setup</b><p class="task-sub">Karmax reads devcontainer.json and lockfiles, then proposes a recipe. Review it before saving; existing CI and production are untouched.</p><button class="btn sm primary" id="environment-propose">Discover and propose</button><div id="environment-evidence"></div></div>
+      <div class="inline-form"><input id="environment-image" value="${esc(spec?.image || '')}" placeholder="base image or provider template" style="flex:1"><label class="switch"><input id="environment-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span>Include Docker for per-world services</span></label></div>
+      <textarea id="environment-setup" rows="3" style="width:100%" placeholder="setup commands — baked once">${esc((spec?.setup || []).join('\n'))}</textarea>
+      <textarea id="environment-boot" rows="2" style="width:100%" placeholder="boot commands — run in each world">${esc((spec?.boot || []).join('\n'))}</textarea>
+      <div class="inline-form"><button class="btn sm" id="environment-save">Save proposal</button><button class="btn sm primary" id="environment-build">Build now</button></div>
+      ${builds.length ? `<div class="section-h">Builds</div>${builds.map(build).join('')}` : '<p class="task-sub">No build yet. Cloud worlds run setup live until the recipe is built.</p>'}`;
+    $('#environment-propose')?.addEventListener('click', async () => {
       try {
         const proposal = await api(`/api/projects/${proj.id}/environment/proposal`);
-        if (proposal.spec.image) $('#project-env-image').value = proposal.spec.image;
-        if (proposal.spec.setup?.length) $('#project-env-setup').value = proposal.spec.setup.join('\n');
-        if (proposal.spec.includeDocker) $('#project-env-docker').checked = true;
-        $('#project-env-evidence').innerHTML = proposal.evidence.length
-          ? `Proposed from the repo: ${proposal.evidence.map(esc).join(' · ')} — review and Save.`
-          : 'Nothing to propose — no devcontainer or lockfiles found in this repo.';
+        if (proposal.spec.image) $('#environment-image').value = proposal.spec.image;
+        if (proposal.spec.setup?.length) $('#environment-setup').value = proposal.spec.setup.join('\n');
+        if (proposal.spec.includeDocker) $('#environment-docker').checked = true;
+        $('#environment-evidence').innerHTML = proposal.evidence.length
+          ? `<p class="task-sub">Evidence: ${proposal.evidence.map(esc).join(' · ')}</p>`
+          : '<p class="task-sub">No devcontainer or recognized lockfile found.</p>';
       } catch (error) { toast(error.message, true); }
     });
-    $('#project-env-save')?.addEventListener('click', async () => {
-      try {
-        await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
-          image: $('#project-env-image').value.trim() || undefined,
-          setup: $('#project-env-setup').value.split('\n').map((s) => s.trim()).filter(Boolean),
-          boot: $('#project-env-boot').value.split('\n').map((s) => s.trim()).filter(Boolean),
-          includeDocker: $('#project-env-docker').checked }) });
-        toast('Environment saved');
-        await hydrateProjectEnvironment(proj);
-      } catch (error) { toast(error.message, true); }
+    $('#environment-save')?.addEventListener('click', async () => {
+      await api(`/api/projects/${proj.id}/environment`, { method: 'PUT', body: JSON.stringify({
+        image: $('#environment-image').value.trim() || undefined,
+        setup: $('#environment-setup').value.split('\n').map((value) => value.trim()).filter(Boolean),
+        boot: $('#environment-boot').value.split('\n').map((value) => value.trim()).filter(Boolean),
+        includeDocker: $('#environment-docker').checked,
+      }) }); toast('Environment recipe saved'); await hydrateProjectEnvironment(proj);
     });
-    $('#project-env-build')?.addEventListener('click', async () => {
+    $('#environment-build')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/environment/build`, { method: 'POST', body: '{}' });
-        toast(`Building for ${result.building.provider}… status appears below`);
-        setTimeout(() => hydrateProjectEnvironment(projectById(proj.id)), 1500);
+        toast(`Building for ${result.building.provider}…`); setTimeout(() => hydrateProjectEnvironment(proj), 1500);
       } catch (error) { toast(error.message, true); }
     });
   } catch (error) { box.textContent = error.message; }
 }
+
 async function hydrateProjectResources(proj) {
   const box = $('#project-resources'); if (!box) return;
   try {
@@ -6747,7 +6744,6 @@ async function hydrateProjectResources(proj) {
           <div class="task-sub"><span class="mono">${esc(targetLabel(resource))}</span> · ${esc(resource.access)} · ${esc(resource.isolation)}${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · ${esc(resource.revision.id)}` : ''}${resource.credentialConfigured ? ' · credential configured' : ''}</div></div>
         <button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button>
       </div>`).join('') || '<p class="task-sub">No resources yet. Tasks currently receive only their repositories and environment.</p>'}</div>
-      <div class="settings-divider"></div><div id="project-secrets-box"></div>
       <div class="settings-divider"></div><div class="section-h">Attach a resource</div>
       <div class="settings-grid">
         <label class="form-row">Name<input id="resource-name" placeholder="Training data"></label>
@@ -6829,7 +6825,6 @@ async function hydrateProjectResources(proj) {
         catch (error) { toast(error.message, true); }
       });
     });
-    hydrateProjectSecrets(proj);
   } catch (error) { box.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`; }
 }
 
@@ -6945,7 +6940,8 @@ function wireSettingsView(proj) {
   hydrateProjectAccess(proj);
   hydrateExecutionProviders(proj);
   hydrateProjectGitProfile(proj);
-  hydrateProjectResources(proj);
+  hydrateProjectSecrets(proj);
+  hydrateProjectData(proj);
   hydrateProjectServices(proj);
   hydrateProjectEnvironment(proj);
   hydrateSettingsForms('project', proj.id);
@@ -8393,14 +8389,7 @@ function closeTopOverlay() {
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
 function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
-// A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
-// it modifies. It must be transparent to the chord buffer — otherwise pressing
-// Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
-// would land here between the two steps, match nothing, and reset the pending
-// `g` before `P` ever arrives.
-function isBareModifier(key) { return key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta'; }
 function dispatchKey(e) {
-  if (isBareModifier(e.key)) return false;
   const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
   const cmds = allCommands().filter((c) => c.keys && c.available);
   const candidates = chordCandidates(cmds, CHORD.pending, snap);

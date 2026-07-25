@@ -116,41 +116,20 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(await saved.json())).not.toContain('postgres://dev'); // never echoed
     const imported: any = await (await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
       body: JSON.stringify({ env: 'STRIPE_KEY="sk_1"\n# note\nEMPTY=' }) })).json();
-    expect(imported.imported).toEqual(['STRIPE_KEY']);
+    expect(imported.imported.map((s: any) => s.name)).toEqual(['STRIPE_KEY']);
     const listed: any = await (await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })).json();
     expect(listed.secrets.map((s: any) => s.name).sort()).toEqual(['DATABASE_URL', 'STRIPE_KEY']);
     expect(JSON.stringify(listed)).not.toContain('sk_1'); // names/shape only
+    // Secrets are typed attachments now — visible to the resource surface too.
+    const asResources: any = await (await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() })).json();
+    expect(asResources.filter((r: any) => r.driver === 'secret@1').length).toBe(2);
     const rejected = await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
-      body: JSON.stringify({ name: 'lower-case', value: 'x' }) });
+      body: JSON.stringify({}) });
     expect(rejected.status).toBe(400);
     const removed = await fetch(`${base}/api/projects/${project.id}/secrets/DATABASE_URL`, { method: 'DELETE', headers: auth() });
     expect(removed.status).toBe(200);
     const after: any = await (await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })).json();
     expect(after.secrets.map((s: any) => s.name)).toEqual(['STRIPE_KEY']);
-  });
-
-  it('manages project data objects and promotes a task copy to a new version', async () => {
-    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
-      body: JSON.stringify({ name: 'Datary' }) })).json();
-    const created: any = await (await fetch(`${base}/api/projects/${project.id}/objects`, { method: 'POST', headers: auth(),
-      body: JSON.stringify({ path: 'fixtures/dev.sql', mode: 'writeback', text: 'seed-v1' }) })).json();
-    expect(created.object.object).toMatch(/^[a-f0-9]{64}$/);
-    const listed: any = await (await fetch(`${base}/api/projects/${project.id}/objects`, { headers: auth() })).json();
-    expect(listed.objects).toEqual([expect.objectContaining({ path: 'fixtures/dev.sql', mode: 'writeback', bytes: 7 })]);
-    const downloaded = await fetch(`${base}/api/projects/${project.id}/objects/data?path=${encodeURIComponent('fixtures/dev.sql')}`, { headers: auth() });
-    expect(await downloaded.text()).toBe('seed-v1');
-
-    // A task world modifies its copy; promotion makes that the current version.
-    const task = h.store.createTask({ projectId: project.id, title: 'Data task', workflow: 'just-do',
-      workflowVersion: '1.0.0', params: { prompt: 'x', draft: true } });
-    const world = await h.worlds.create('memory', { taskId: task.id, base: 'main' });
-    await world.writeFile('fixtures/dev.sql', 'task-improved');
-    h.store.registerWorld(world.handle, project.id);
-    const promoted: any = await (await fetch(`${base}/api/tasks/${task.id}/objects/promote`, { method: 'POST', headers: auth(),
-      body: JSON.stringify({ path: 'fixtures/dev.sql' }) })).json();
-    expect(promoted.object.history.length).toBe(1);
-    const afterText = await (await fetch(`${base}/api/projects/${project.id}/objects/data?path=${encodeURIComponent('fixtures/dev.sql')}`, { headers: auth() })).text();
-    expect(afterText).toBe('task-improved');
   });
 
   it('manages project services and imports proposals from docker-compose', async () => {
@@ -681,6 +660,65 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const listed = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() }).then((response) => response.json()) as any[];
     expect(listed.find((resource) => resource.id === volume.id).revision.bytes).toBe(bytes.length);
     expect(JSON.stringify(listed)).not.toContain('sealedRef');
+  });
+
+  it('offers proposal-driven secrets, environment, and per-world services over typed resources', async () => {
+    const repo = await h.makeRepo('project-onboarding');
+    fs.mkdirSync(`${repo}/.devcontainer`);
+    fs.writeFileSync(`${repo}/.env.example`, 'DATABASE_URL=\nMODEL_TOKEN=\n');
+    fs.writeFileSync(`${repo}/package-lock.json`, '{}');
+    fs.writeFileSync(`${repo}/.devcontainer/devcontainer.json`, JSON.stringify({
+      image: 'node:22-slim',
+      postCreateCommand: 'npm run setup',
+      dockerComposeFile: '../compose.yaml',
+    }));
+    fs.writeFileSync(`${repo}/compose.yaml`, `services:
+  database:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: local
+      POSTGRES_DB: app
+`);
+    await git(repo, ['add', '.']);
+    await git(repo, ['commit', '-m', 'add project declarations']);
+
+    const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Onboarding API', config: { repos: [repo], worldProvider: 'container' } }) })
+      .then((response) => response.json());
+
+    const suggested: any = await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })
+      .then((response) => response.json());
+    expect(suggested.suggestions).toEqual(['DATABASE_URL', 'MODEL_TOKEN']);
+    const imported = await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ env: 'MODEL_TOKEN=private-value\nDATABASE_URL=postgres://external' }) });
+    expect(imported.status).toBe(200);
+    expect(JSON.stringify(await imported.json())).not.toContain('private-value');
+
+    const proposal: any = await fetch(`${base}/api/projects/${project.id}/environment/proposal`, { headers: auth() })
+      .then((response) => response.json());
+    expect(proposal.spec).toMatchObject({ image: 'node:22-slim', setup: ['npm run setup', 'npm ci'] });
+    const savedEnvironment = await fetch(`${base}/api/projects/${project.id}/environment`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify(proposal.spec),
+    });
+    expect(savedEnvironment.status).toBe(200);
+
+    const compose: any = await fetch(`${base}/api/projects/${project.id}/services/compose-import`, { headers: auth() })
+      .then((response) => response.json());
+    expect(compose.proposals[0]).toMatchObject({
+      name: 'database', kind: 'per-world', image: 'postgres:16', containerPort: 5432,
+      urlEnv: 'DATABASE_URL',
+    });
+    const service = await fetch(`${base}/api/projects/${project.id}/services`, {
+      method: 'POST', headers: auth(), body: JSON.stringify(compose.proposals[0]),
+    });
+    expect(service.status).toBe(200);
+
+    const secrets: any = await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })
+      .then((response) => response.json());
+    expect(secrets.suggestions).toEqual([]);
+    expect(secrets.secrets.every((secret: any) => secret.credentialConfigured)).toBe(true);
+    expect(JSON.stringify(secrets)).not.toContain('postgres://external');
   });
 
   it('seeds a brand-new project with the karmax-ready prep task', async () => {

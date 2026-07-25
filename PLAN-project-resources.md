@@ -215,6 +215,17 @@ The machinery should remove setup from the common path:
 5. Each new task automatically receives the project's default attachments. A
    task form only shows an override when the user expands **Resources**.
 
+The proposal-oriented Settings UI groups the same attachments into Secrets and
+Data, while Services and Environment describe how those attachments are
+materialized. `.env.example`, `.env.sample`, and `.env.template` contribute names
+only; users provide values once and values are never returned. Compose and
+devcontainer declarations propose per-world service recipes, whose optional seed
+and connection fields reference existing typed attachment ids. Devcontainer
+images/setup commands and package-manager lockfiles propose an immutable
+environment recipe; accepting or correcting the proposal is the only setup
+required. Provider snapshots/images derived from that recipe remain disposable
+accelerators rather than a second durable state model.
+
 Heuristics can reduce questions but must never silently upload likely secrets or
 grant a shared writable production resource. A `.karmax/resources.yaml` file may
 export the setup for teams that want infrastructure-as-code, but it is generated
@@ -257,6 +268,9 @@ promotion may commit; otherwise a partial publish is explicit and retryable.
 - `shared + write` requires a dedicated capability and an explicit task grant.
 - Secret projections live outside checkpointed paths and are erased/revoked on
   park, checkpoint, cancellation, generation change, and release.
+- File-shaped secret projections are also added to the private exclude file for
+  that Git worktree, so an agent cannot accidentally stage one; the exclusion
+  must not affect sibling worlds or the user's checkout.
 - Resource objects and snapshots are tenant-scoped, encrypted, checksummed,
   retention-bound, malware-scanned where applicable, and never addressed by a
   user-supplied object-store key.

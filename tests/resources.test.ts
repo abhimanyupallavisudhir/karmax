@@ -12,17 +12,39 @@ import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resou
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
+import { ensureWorldExcluded } from '../src/world/secret-exclude.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
 describe('project resources', () => {
+  it('Git-excludes file secrets only in the task worktree that owns them', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-secret-exclude-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'README.md'), 'base\n');
+    await git(repo, ['add', '-A']); await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
+    const provider = new WorktreeProvider(path.join(dir, 'worlds'));
+    const first = await provider.create({ taskId: 'secret-a', repo, base: 'main', target: 'main' });
+    await first.writeFile('.env.local', 'TOKEN=secret');
+    await ensureWorldExcluded(first, '.env.local');
+    expect((await first.exec('git', ['status', '--porcelain'])).stdout).not.toContain('.env.local');
+    await first.exec('git', ['add', '-A']);
+    expect((await first.exec('git', ['diff', '--cached', '--name-only'])).stdout.trim()).toBe('');
+
+    const second = await provider.create({ taskId: 'secret-b', repo, base: 'main', target: 'main' });
+    await second.writeFile('.env.local', 'ordinary task file');
+    expect((await second.exec('git', ['status', '--porcelain'])).stdout).toContain('.env.local');
+    await first.destroy(); await second.destroy();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('forks encrypted volume revisions, injects secrets, and promotes with a CAS fence', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resources-'));
     const repo = path.join(dir, 'repo');
     fs.mkdirSync(repo);
     await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
     await ensureIdentity(repo);
-    fs.writeFileSync(path.join(repo, '.gitignore'), 'resources/\n');
+    fs.writeFileSync(path.join(repo, '.gitignore'), '# project-local ignores\n');
     fs.writeFileSync(path.join(repo, 'app.txt'), 'app\n');
     await git(repo, ['add', '-A']);
     await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
@@ -49,11 +71,19 @@ describe('project resources', () => {
 
     const world = await worlds.create('worktree', { taskId: task.id, repo, base: 'main' });
     world.handle = await resources.materialize(project.id, task.id, world, 1);
+    world.handle = resources.registerServiceEnvironment(world.handle,
+      { DATABASE_URL: 'postgres://private-per-world-endpoint' });
     world.handle = store.registerWorld(world.handle, project.id) as typeof world.handle;
     expect(await world.readFile('resources/model/model.bin')).toBe('base-model');
+    expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
     const wrapped = resources.withEnvironment(world);
     expect((await wrapped.exec('bash', ['-lc', 'printf %s "$TRAINING_TOKEN"'])).stdout).toBe('secret-token');
+    expect((await wrapped.exec('bash', ['-lc', 'printf %s "$DATABASE_URL"'])).stdout)
+      .toBe('postgres://private-per-world-endpoint');
     expect(JSON.stringify(world.handle)).not.toContain('secret-token');
+    expect(JSON.stringify(world.handle)).not.toContain('private-per-world-endpoint');
+    const serviceHandle = Object.values(world.handle.meta?.serviceEnvironmentHandles as Record<string, string>)[0]!;
+    expect(broker.hasHandle(serviceHandle)).toBe(true);
 
     const tunedBytes = Buffer.from('fine-tuned-model');
     await world.writeFileBuffer!('resources/model/model.bin', tunedBytes);
@@ -79,6 +109,7 @@ describe('project resources', () => {
     await resources.release(consumerWorld.handle);
     await consumerWorld.destroy();
     await resources.release(world.handle);
+    expect(broker.hasHandle(serviceHandle)).toBe(false);
     await world.destroy();
     await resources.deleteAttachment(volume.id);
     expect(allFiles(path.join(dir, 'objects'))).toHaveLength(0);
