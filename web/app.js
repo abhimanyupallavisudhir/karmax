@@ -7114,38 +7114,45 @@ async function wireVaultCards(organizationId) {
   const openImportPanel = async (name, conn) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
-    overlay.innerHTML = `<div class="modal-card" style="max-width:640px;width:92%">
-      <div class="section-h">Import from ${esc(conn?.label || name)}</div>
-      <div class="import-tree" style="max-height:46vh;overflow:auto;border:1px solid var(--line,#333);border-radius:8px;padding:8px;margin-bottom:10px">Loading…</div>
-      <div class="form-row" style="display:flex;gap:14px;flex-wrap:wrap;align-items:center">
-        <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px"><input type="checkbox" class="imp-all"/> Select all</label>
-        <span style="flex:1"></span>
-        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option>auto</option><option>ask</option></select></label>
-        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
-        ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+    overlay.innerHTML = `<div class="modal-card" style="max-width:600px;width:92%">
+      <div class="section-h" style="margin-bottom:8px">Import from ${esc(conn?.label || name)}</div>
+      <div style="border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:12px">
+        <label class="imp-head" style="display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line);background:var(--surface-2);font-size:12px;font-weight:600;cursor:pointer">
+          <input type="checkbox" class="imp-all"/> Select all <span class="imp-count" style="color:var(--ink-3);font-weight:400"></span></label>
+        <div class="import-tree" style="max-height:44vh;overflow:auto;padding:8px 10px">Loading…</div>
       </div>
-      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px">
-        <button class="btn sm" data-imp-cancel>Cancel</button>
-        <button class="btn sm primary" data-imp-go>Import selected</button>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option>auto</option><option>ask</option></select></label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+          ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn sm" data-imp-cancel>Cancel</button>
+          <button class="btn sm primary" data-imp-go>Import</button>
+        </div>
       </div></div>`;
     document.body.appendChild(overlay);
     const close = () => overlay.remove();
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
     overlay.querySelector('[data-imp-cancel]').addEventListener('click', close);
     const tree = overlay.querySelector('.import-tree');
+    const countEl = overlay.querySelector('.imp-count');
+    const refreshCount = () => { const n = tree.querySelectorAll('.imp-pick:checked').length; countEl.textContent = n ? `· ${n} selected` : ''; };
     let ext = [];
     try { ext = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' }); }
     catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
     if (!ext.length) { tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import.</span>'; return; }
     const folders = {};
     ext.forEach((i) => { (folders[i.folder || ''] = folders[i.folder || ''] || []).push(i); });
-    tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:6px">
-      ${f ? `<label style="display:flex;gap:6px;align-items:center;font-weight:600;font-size:12px"><input type="checkbox" class="imp-folder-all"/> 📁 ${esc(f)}</label>` : ''}
+    tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:4px">
+      ${f ? `<label style="display:flex;gap:6px;align-items:center;font-weight:600;font-size:12px;margin:2px 0"><input type="checkbox" class="imp-folder-all"/> 📁 ${esc(f)}</label>` : ''}
       <div style="margin-left:${f ? '18px' : '0'}">${folders[f].map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0">
         <input type="checkbox" class="imp-pick" value="${esc(i.externalId)}"/> ${esc(i.label)}
         <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div></div>`).join('');
-    overlay.querySelector('.imp-all').addEventListener('change', (e) => tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)));
-    tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked))));
+    overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
+    tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
+    tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
     overlay.querySelector('[data-imp-go]').addEventListener('click', async () => {
       const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
       if (!externalIds.length) { toast('Select at least one', true); return; }
@@ -7266,10 +7273,11 @@ async function wireAgentMailCard(organizationId) {
   const body = box.querySelector('.agent-mail-body');
   let data = { address: '', configured: false, messages: [] };
   try { data = await api(`/api/organizations/${encodeURIComponent(organizationId || 'org_personal')}/agent-mail`); } catch {}
-  body.innerHTML = `<div class="form-row"><label>Agent address</label><input value="${esc(data.address)}" readonly class="mono" style="width:100%" /></div>
-    ${data.configured ? '' : '<div class="task-sub" style="color:var(--warn,#e0b15a);margin-bottom:6px">No email service connected yet — connect one in <b>Agent email service</b> above and this address activates automatically. Until then it accepts test ingestion only.</div>'}
+  body.innerHTML = `<div style="font-size:12px;color:var(--ink-2);margin-bottom:4px">Agent address</div>
+    <input value="${esc(data.address)}" readonly class="mono" style="width:100%;margin-bottom:8px" />
+    ${data.configured ? '' : '<p style="color:var(--warn,#e0b15a);font-size:12px;margin:0 0 10px">Not receiving real email yet — set up <b>Agent email</b> above and this address activates automatically.</p>'}
     <div style="font-weight:600;margin:6px 0 4px">Recent messages</div>
-    ${data.messages.length ? data.messages.map((m) => `<div class="queue-item"><div style="flex:1"><b>${esc(m.subject || '(no subject)')}</b> ${m.code ? `<span class="chip" style="color:var(--ok,#4ec9a3)">code ${esc(m.code)}</span>` : ''}<div class="task-sub" style="color:var(--ink-3)">from ${esc(m.from)}${m.link ? ` · <a href="${esc(m.link)}" target="_blank" rel="noopener">link</a>` : ''}</div></div></div>`).join('') : '<span style="color:var(--ink-3)">No messages yet.</span>'}`;
+    ${data.messages.length ? data.messages.map((m) => `<div class="queue-item"><div style="flex:1"><b>${esc(m.subject || '(no subject)')}</b> ${m.code ? `<span class="chip" style="color:var(--ok,#4ec9a3)">code ${esc(m.code)}</span>` : ''}<div class="task-sub" style="color:var(--ink-3)">from ${esc(m.from)}${m.link ? ` · <a href="${esc(m.link)}" target="_blank" rel="noopener">link</a>` : ''}</div></div></div>`).join('') : '<span style="color:var(--ink-3);font-size:12px">No messages yet.</span>'}`;
 }
 
 // Which accounts an agent may use (SPEC §7.3/§6.2) — a checkbox pool, all checked
