@@ -9,6 +9,22 @@ export interface GitResult {
   code: number;
 }
 
+/** Disable every ordinary host Git credential path for tenant-scoped subprocesses. */
+export function isolatedGitEnvironment(): Record<string, string> {
+  return {
+    GH_TOKEN: '',
+    GITHUB_TOKEN: '',
+    SSH_AUTH_SOCK: '',
+    GIT_ASKPASS: '/bin/false',
+    GIT_SSH_COMMAND: 'ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'credential.helper',
+    GIT_CONFIG_VALUE_0: '',
+  };
+}
+
 /** Run a git command in `cwd`. Never throws on non-zero; returns the code.
  *  `opts.env` layers extra vars (e.g. a git profile's GIT_SSH_COMMAND) over the
  *  process env; interactive prompts stay disabled regardless. */

@@ -20,7 +20,7 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
-import { git as hostGit } from '../world/git.js';
+import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
@@ -332,8 +332,14 @@ export interface PrepareChildArgs {
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
-  const gitProfiles = new GitProfiles(store, deps.broker);
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
+
+  const gitProfilesFor = (projectId?: string) => new GitProfiles(
+    store,
+    deps.broker,
+    paths().state,
+    (projectId ? store.getProject(projectId)?.organizationId : undefined) ?? 'org_personal',
+  );
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
     const ev = { type, taskId, ts: Date.now(), payload };
@@ -343,16 +349,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
    *  the world's git profile (stamped on the handle at creation) → GIT_SSH_COMMAND /
-   *  GH_TOKEN, per subprocess. Empty when the world has no profile (host fallback)
-   *  or resolution fails — the op then runs with the host's own auth. */
+   *  GH_TOKEN, per subprocess. The personal organization retains host fallback;
+   *  every other organization gets an explicitly credential-free environment. */
   function gitEnvFor(handle: WorldHandle, taskId?: string): Record<string, string> {
+    const projectId = typeof handle.meta?.projectId === 'string'
+      ? handle.meta.projectId
+      : taskId ? store.getTask(taskId)?.projectId : undefined;
+    const organizationId = projectId
+      ? store.getProject(projectId)?.organizationId ?? 'org_personal'
+      : 'org_personal';
+    const fallback = organizationId === 'org_personal' ? {} : isolatedGitEnvironment();
     const name = handle.meta?.gitProfile;
-    if (typeof name !== 'string' || !name) return {};
+    if (typeof name !== 'string' || !name) return fallback;
     try {
+      const gitProfiles = gitProfilesFor(projectId);
       const profile = gitProfiles.get(name);
-      return profile ? gitProfiles.env(profile, { taskId }) : {};
+      return profile ? { ...fallback, ...gitProfiles.env(profile, { taskId }) } : fallback;
     } catch {
-      return {};
+      return fallback;
     }
   }
 
@@ -434,27 +448,37 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote)
         throw new Error(`hosted deployments cannot run task code in the control plane (${args.kind}); select a remote runner`);
       record(args.taskId, 'world.provisioning', { provider: args.kind });
-      // Resolve the git profile (project → global default → none) and materialize
+      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
+      const project = projectId ? store.getProject(projectId) : undefined;
+      const gitProfiles = gitProfilesFor(projectId);
+      const organizationId = project?.organizationId ?? 'org_personal';
+      // Resolve the git profile (project → organization default → none) and materialize
       // its identity for worktree-scoped config (PLAN-git-config.md §4A). Identity
       // failure downgrades to a warning — the world is still usable locally.
       const profile = gitProfiles.resolve({ gitProfile: args.gitProfile });
       let gitIdentity;
       let gitCredentials;
       try {
-        gitIdentity = profile ? gitProfiles.identity(profile, { taskId: args.taskId }) : undefined;
+        gitIdentity = profile
+          ? gitProfiles.identity(profile, { taskId: args.taskId })
+          : organizationId === 'org_personal'
+            ? undefined
+            : { name: 'karmax', email: `karmax+${organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` };
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` });
       }
       try {
-        gitCredentials = profile ? gitProfiles.worldCredentials(profile, { taskId: args.taskId }) : undefined;
+        gitCredentials = {
+          ...(organizationId === 'org_personal' ? {} : { isolated: true }),
+          ...(profile ? gitProfiles.worldCredentials(profile, { taskId: args.taskId }) : {}),
+        };
+        if (!Object.keys(gitCredentials).length) gitCredentials = undefined;
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` });
       }
       // The project wiki is a platform-owned companion repository. Add it at
       // provisioning time (rather than to deterministic workflow input), so
       // old workflow histories remain replay-compatible.
-      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
-      const project = projectId ? store.getProject(projectId) : undefined;
       const wikiRoot = project
         ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
         : undefined;
@@ -586,9 +610,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: string; role?: AgentRole; task?: TaskInput }): Promise<string[]> {
       const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
       const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
-      const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker });
+      const organizationId = store.getProject(args.projectId)?.organizationId ?? 'org_personal';
+      const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId });
       const all = enumerateCredentials(sources);
-      const layers = readPolicyLayers((k) => store.kvGet(k), { projectId: args.projectId, taskId: args.taskId });
+      const layers = readPolicyLayers((k) => store.kvGet(k), { organizationId, projectId: args.projectId, taskId: args.taskId });
       const profile = args.role && args.task
         ? applyAgentSpec(
           profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId),
@@ -598,7 +623,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const modelProvider = profile ? credentialProvider(profile) : args.provider;
       const keyNamespaces = new Set(credentialAliases(modelProvider));
       const profileAllows = (key: string, handle?: string) =>
-        !profile?.allowedAccounts?.length
+        organizationId !== 'org_personal'
+        || !profile?.allowedAccounts?.length
         || profile.allowedAccounts.includes(key)
         || (!!handle && profile.allowedAccounts.includes(`key:${handle}`));
       const ordered = resolveCredentials(all, layers)
@@ -633,7 +659,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }
         }
       }
-      return ordered.map((c) => c.key);
+      const keys = ordered.map((c) => c.key);
+      // Empty historically means "use the host's ambient/default credential".
+      // That migration fallback belongs only to the personal organization. A
+      // non-personal tenant must wait/escalate instead of borrowing another
+      // tenant's host login, so return a non-existent explicit allow-list entry.
+      return keys.length || organizationId === 'org_personal' || profile?.provider === 'mock'
+        ? keys
+        : [`missing:${organizationId}:${modelProvider}`];
     },
 
     async runAgentTurn(args: RunAgentTurnArgs) {
@@ -641,6 +674,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Apply the per-role agent override from the task form (SPEC §10.5).
       const spec = args.task.agents?.[args.role];
       const profile = applyAgentSpec(baseProfile, spec);
+      const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
       const world = await openWorld(args.worldHandle, args.taskId);
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
@@ -737,7 +771,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // use comes from the profile's allowedAccounts set (SPEC §7.3/§6.2) — first
       // matching entry — falling back to the legacy single `auth` field.
       let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
-      const effAuth = profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider, credentialProvider(profile));
+      const effAuth = organizationId === 'org_personal'
+        ? profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider, credentialProvider(profile))
+        : undefined;
       if (effAuth?.kind === 'apiKeyHandle' && effAuth.handle && deps.broker) {
         const apiKey = deps.broker.resolve(effAuth.handle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
@@ -747,7 +783,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         let home = effAuth.configHome;
         if (!home && effAuth.account && deps.configHomes) {
           const { provider: prov, name } = splitAccountRef(effAuth.account, profile.provider);
-          home = deps.configHomes.ensure(prov, name);
+          home = deps.configHomes.ensure(prov, name, organizationId);
         }
         if (home) resolvedAuth = { configHome: home, ...(tokenToInject(home) ? { oauthToken: tokenToInject(home) } : {}) };
       }
@@ -762,6 +798,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (args.accountApiKeyHandle && deps.broker) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
+      }
+      if (
+        organizationId !== 'org_personal'
+        && profile.provider !== 'mock'
+        && !args.accountConfigHome
+        && !args.accountApiKeyHandle
+      ) {
+        throw new Error(`organization ${organizationId} has no usable ${credentialProvider(profile)} credential; connect an organization login or API key`);
       }
       // API sessions are stateless. Cloud subscription sessions live in their
       // sandbox; a requested cross-world session is materialized explicitly below.
@@ -1104,7 +1148,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Git-profile credentials for the agent subprocess (PLAN-git-config.md
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(() => {
-            const gitEnv = isRemote(args.worldHandle.kind) ? {} : gitEnvFor(args.worldHandle, args.taskId);
+            // Remote provider tools receive repository credentials through the
+            // broker, but the local harness process must still have host Git
+            // credentials scrubbed for non-personal organizations.
+            const gitEnv = isRemote(args.worldHandle.kind) && organizationId === 'org_personal'
+              ? {}
+              : gitEnvFor(args.worldHandle, args.taskId);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
@@ -1244,11 +1293,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
       const roots = repos.length ? repos : [{ name: '', root: handle.root }];
+      const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
       const changedFiles: string[] = [];
       for (const repo of roots) {
         const tracked = await world.exec('git', ['diff', '--name-only', 'base' in repo ? repo.base : base], { cwd: repo.root });
         const untracked = await world.exec('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo.root });
-        const prefix = repos.length > 1 ? `${repo.name}/` : '';
+        // A companion wiki must not make the sole development checkout appear
+        // artificially nested. Keep a stable prefix for wiki changes, while
+        // genuine multi-development-repo worlds retain repository prefixes.
+        const prefix = 'role' in repo && repo.role === 'project-wiki'
+          ? `${repo.name}/`
+          : developmentRepos.length > 1
+            ? `${repo.name}/`
+            : '';
         changedFiles.push(
           ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file}`),
           ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file} (new)`),
@@ -1267,6 +1324,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const profileName = handle.meta?.gitProfile;
       if (typeof profileName === 'string' && profileName) {
         try {
+          const projectId = typeof handle.meta?.projectId === 'string'
+            ? handle.meta.projectId
+            : store.getTask(handle.id)?.projectId;
+          const gitProfiles = gitProfilesFor(projectId);
           const profile = gitProfiles.get(profileName);
           identity = profile ? gitProfiles.identity(profile, { taskId: handle.id }) : undefined;
         } catch {

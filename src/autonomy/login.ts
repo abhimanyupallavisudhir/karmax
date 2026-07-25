@@ -72,8 +72,8 @@ export class LoginManager {
   ) {}
 
   /** Start (or report) a login for an account. Returns the device URL to open. */
-  async connect(provider: Provider, account: string, opts: LoginOptions = {}): Promise<LoginResult> {
-    const configHome = this.homes.ensure(provider, account);
+  async connect(provider: Provider, account: string, opts: LoginOptions = {}, organizationId = 'org_personal'): Promise<LoginResult> {
+    const configHome = this.homes.ensure(provider, account, organizationId);
     // Skip only if fully authed with a native credential. A setup-token-only home
     // re-runs login here to UPGRADE to a full, usage-pollable credential (#6).
     if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
@@ -117,8 +117,8 @@ export class LoginManager {
     return { provider, account, configHome, status: 'failed', detail: 'no login URL captured (is the CLI installed?)' };
   }
 
-  status(provider: Provider, account: string): { provider: Provider; account: string; configHome: string; loggedIn: boolean } {
-    const configHome = this.homes.ensure(provider, account);
+  status(provider: Provider, account: string, organizationId = 'org_personal'): { provider: Provider; account: string; configHome: string; loggedIn: boolean } {
+    const configHome = this.homes.ensure(provider, account, organizationId);
     return { provider, account, configHome, loggedIn: isLoggedIn(provider, configHome) };
   }
 }

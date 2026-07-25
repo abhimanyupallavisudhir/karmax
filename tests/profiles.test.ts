@@ -40,6 +40,52 @@ describe('profile + account management (Global settings backend)', () => {
     expect(JSON.stringify(accounts)).not.toContain('sk-super-secret'); // secret never returned
   });
 
+  it('does not list or reuse agent credentials across organizations', async () => {
+    const acme = h.store.createOrganization({ name: 'Acme' });
+    const beta = h.store.createOrganization({ name: 'Beta' });
+    const acmeBase = `${base}/api/organizations/${acme.id}`;
+    const betaBase = `${base}/api/organizations/${beta.id}`;
+
+    const saved = await fetch(`${acmeBase}/accounts`, {
+      method: 'POST',
+      headers: auth(),
+      body: JSON.stringify({ provider: 'claude', account: 'work', apiKey: 'acme-secret' }),
+    }).then(J);
+    expect(saved.handle).toBe(`claude:${acme.id}:work`);
+
+    const [acmeAccounts, betaAccounts] = await Promise.all([
+      fetch(`${acmeBase}/accounts`, { headers: auth() }).then(J),
+      fetch(`${betaBase}/accounts`, { headers: auth() }).then(J),
+    ]);
+    expect(acmeAccounts.handles).toEqual([saved.handle]);
+    expect(betaAccounts.handles).toEqual([]);
+    expect(JSON.stringify(betaAccounts)).not.toContain('acme');
+
+    const injectedNamespace = await fetch(`${base}/api/accounts`, {
+      method: 'POST',
+      headers: auth(),
+      body: JSON.stringify({ provider: 'claude', account: `${beta.id}:stolen`, apiKey: 'bad-secret' }),
+    });
+    expect(injectedNamespace.status).toBe(400);
+
+    const betaProject = await fetch(`${betaBase}/projects`, {
+      method: 'POST',
+      headers: auth(),
+      body: JSON.stringify({ name: 'Beta project' }),
+    }).then(J);
+    const crossScope = await fetch(`${acmeBase}/credentials/policy`, {
+      method: 'POST',
+      headers: auth(),
+      body: JSON.stringify({
+        scope: 'project',
+        projectId: betaProject.id,
+        policy: { on: [saved.handle] },
+      }),
+    });
+    expect(crossScope.status).toBe(400);
+    expect(h.store.kvGet(`credpolicy:project:${betaProject.id}`)).toBeUndefined();
+  });
+
   it('rejects a profile without a role', async () => {
     const res = await fetch(`${base}/api/profiles`, { method: 'PUT', headers: auth(), body: JSON.stringify({ provider: 'claude' }) });
     expect(res.status).toBe(400);

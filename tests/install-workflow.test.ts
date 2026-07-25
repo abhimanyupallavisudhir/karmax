@@ -26,6 +26,8 @@ describe('install a workflow from git and run a task on it (real dev server)', (
   let client: Client;
   let closeClient: () => Promise<void>;
   let api: KarmaxApi;
+  let store: Store;
+  let workflows: WorkflowManager;
   let token: string;
   let projectId: string;
   let cacheHome: string;
@@ -64,10 +66,10 @@ describe('install a workflow from git and run a task on it (real dev server)', (
     client = c.client;
     closeClient = c.close;
 
-    const store = new Store(':memory:');
+    store = new Store(':memory:');
     store.claimPersonalOrganization('a');
     const tokens = new TokenAuthority();
-    const workflows = new WorkflowManager(mgr, new WorkflowRepoLoader(cacheHome), PackageStore.withBundled());
+    workflows = new WorkflowManager(mgr, new WorkflowRepoLoader(cacheHome), PackageStore.withBundled());
     api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, workflows });
     projectId = store.createProject('P', { defaultBase: 'main', defaultTarget: 'main' }).id;
     token = tokens.mint({ taskId: 't', profileId: 'do', principal: 'user:a', ceiling: ['create-task', 'edit-workflow', 'read-task'], grantorCaps: ['create-task', 'edit-workflow', 'read-task'] }).token;
@@ -95,6 +97,33 @@ describe('install a workflow from git and run a task on it (real dev server)', (
     expect(task.workflow).toBe('note');
     const result = await client.workflow.getHandle(task.id).result();
     expect(result).toEqual({ ran: 'external', echoed: 'echo:hello' });
+  });
+
+  it('makes external workflow availability and Temporal types organization-owned', async () => {
+    const beta = store.createOrganization({ name: 'Beta' });
+    const betaProject = store.createProject('Beta project', {}, beta.id);
+    expect(api.listWorkflows(token, beta.id).some((workflow) => workflow.name === 'note')).toBe(false);
+    await expect(api.createTask(token, { projectId: betaProject.id, workflow: 'note', prompt: 'blocked' }))
+      .rejects.toThrow(/unknown workflow/);
+
+    // The same human-facing name/version may be different code in another
+    // organization. Its tenant-qualified Temporal type keeps both immutable.
+    fs.writeFileSync(
+      path.join(repo, 'workflow.mjs'),
+      `export default async function note(input) { return { ran: 'external', echoed: input?.prompt, tenant: 'beta' }; }\n`,
+    );
+    await git(repo, ['add', '-A']);
+    await gitOrThrow(repo, ['commit', '-q', '-m', 'beta variant at v1']);
+    await api.installWorkflow(token, { url: repo }, beta.id);
+    expect(api.listWorkflows(token, beta.id).some((workflow) => workflow.name === 'note')).toBe(true);
+    const personalType = workflows.resolveStart('note', '1.0.0', 'org_personal')!.startType;
+    const betaType = workflows.resolveStart('note', '1.0.0', beta.id)!.startType;
+    expect(betaType).not.toBe(personalType);
+    expect(betaType).toContain(beta.id);
+    const task = await api.createTask(token, { projectId: betaProject.id, workflow: 'note', prompt: 'beta' });
+    expect(await client.workflow.getHandle(task.id).result()).toMatchObject({ ran: 'external', echoed: 'beta', tenant: 'beta' });
+    const personal = await api.createTask(token, { projectId, workflow: 'note', prompt: 'personal' });
+    expect(await client.workflow.getHandle(personal.id).result()).toMatchObject({ echoed: 'echo:personal' });
   });
 
   it('refuses to install over a built-in workflow name', async () => {

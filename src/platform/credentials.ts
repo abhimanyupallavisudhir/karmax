@@ -35,6 +35,8 @@ export interface CredPolicy {
 }
 
 export interface CredentialSources {
+  /** Tenant that owns every source in this set. */
+  organizationId?: string;
   /** ConfigHomeManager.list() output. */
   logins: { provider: string; account: string; path: string; loggedIn: boolean }[];
   /** Ambient (~/.claude / ~/.codex) login present? */
@@ -50,9 +52,13 @@ export interface CredentialSources {
 /** Enumerate every usable credential from the gathered sources. */
 export function enumerateCredentials(s: CredentialSources): Credential[] {
   const out: Credential[] = [];
+  const organizationId = s.organizationId ?? 'org_personal';
   for (const l of s.logins) {
     if (!l.loggedIn || !l.provider) continue;
-    out.push({ key: `login:${l.provider}:${l.account}`, provider: l.provider, kind: 'login', label: `${l.provider}:${l.account}`, configHome: l.path, account: l.account });
+    const key = organizationId === 'org_personal'
+      ? `login:${l.provider}:${l.account}`
+      : `login:${organizationId}:${l.provider}:${l.account}`;
+    out.push({ key, provider: l.provider, kind: 'login', label: `${l.provider}:${l.account}`, configHome: l.path, account: l.account });
   }
   for (const [provider, present] of Object.entries(s.ambient)) {
     if (present) out.push({ key: `ambient:${provider}`, provider, kind: 'ambient',

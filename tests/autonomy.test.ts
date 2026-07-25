@@ -26,6 +26,25 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('keeps same-named organization logins in disjoint homes and preserves legacy personal homes', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-ch-org-'));
+    const mgr = new ConfigHomeManager(dir);
+    const personal = mgr.ensure('claude', 'work');
+    const acme = mgr.ensure('claude', 'work', 'org_acme');
+    const beta = mgr.ensure('claude', 'work', 'org_beta');
+
+    expect(personal).toBe(path.join(dir, 'claude-work'));
+    expect(new Set([personal, acme, beta]).size).toBe(3);
+    expect(mgr.list('org_acme').map((home) => home.path)).toEqual([acme]);
+    expect(mgr.list('org_beta').map((home) => home.path)).toEqual([beta]);
+    expect(mgr.list().map((home) => home.path)).toEqual([personal]);
+
+    mgr.removeOrganization('org_acme');
+    expect(fs.existsSync(acme)).toBe(false);
+    expect(fs.existsSync(beta)).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('resolves a browser + platform MCP baseline (SPEC §7.5)', () => {
     const servers = mcpServerMap({ browser: 'chrome-devtools', platform: { command: 'node', args: ['mcp.js'] } });
     expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@1.6.0'] });

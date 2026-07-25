@@ -17,6 +17,7 @@ import { KarmaxBus } from './contrib/bus.js';
 import { TokenAuthority } from './platform/tokens.js';
 import { CredentialBroker } from './autonomy/broker.js';
 import { Vault } from './autonomy/vault.js';
+import { GitProfiles } from './autonomy/git-profiles.js';
 import { KarmaxApi } from './platform/api.js';
 import { ContributionRegistry } from './contrib/registry.js';
 import { Overlays } from './store/overlays.js';
@@ -223,7 +224,9 @@ async function main() {
   // so the coordinator can lease/track any of them (SPEC §6.2/§7).
   const { gatherCredentialSources, concurrencyFor } = await import('./platform/credential-sources.js');
   const { enumerateCredentials } = await import('./platform/credentials.js');
-  const creds = enumerateCredentials(gatherCredentialSources({ configHomes, broker }));
+  const creds = store.listOrganizations().flatMap((organization) =>
+    enumerateCredentials(gatherCredentialSources({ configHomes, broker, organizationId: organization.id })),
+  );
   const pool = creds.map((c) => {
     const maxConcurrent = concurrencyFor((k) => store.kvGet(k), c.key);
     return { id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}), ...(maxConcurrent != null ? { maxConcurrent } : {}) };
@@ -233,7 +236,17 @@ async function main() {
     console.log(`  • Registered ${pool.length} credential(s) into the account pool`);
   }
 
-  const workflows = new WorkflowManager(workerManager, new WorkflowRepoLoader(p.workflows), undefined, p.workflows);
+  const workflows = new WorkflowManager(
+    workerManager,
+    new WorkflowRepoLoader(p.workflows),
+    undefined,
+    p.workflows,
+    (organizationId) => {
+      const profiles = new GitProfiles(store, broker, p.state, organizationId);
+      const profile = profiles.resolve(undefined);
+      return profile ? profiles.env(profile, {}) : {};
+    },
+  );
   // Reload workflows installed in previous sessions (SPEC §4.2) and roll the
   // worker once so their tasks — new and in-flight — can run after a restart.
   const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
@@ -269,9 +282,11 @@ async function main() {
     if (ev.type !== 'view.updated' || (ev.payload as { status?: string })?.status !== 'done' || healed.has(ev.taskId)) return;
     const spec = reloadSpecForWorkflowEdit(store.getTask(ev.taskId) ?? {}, 'done');
     if (!spec) return;
+    const task = store.getTask(ev.taskId);
+    const organizationId = task ? store.getProject(task.projectId)?.organizationId : undefined;
     healed.add(ev.taskId);
     workflows
-      .install(spec)
+      .install(spec, organizationId ?? 'org_personal')
       .then((r) => console.log(`  • Self-healed: reloaded ${r.name}@${r.version} after a workflow edit`))
       .catch((e) => console.warn(`  • Workflow reload after edit failed: ${e instanceof Error ? e.message : e}`));
   });
@@ -322,6 +337,7 @@ async function main() {
     worlds,
     githubApp,
     providerConnections,
+    workflows,
     handoffs,
     runners,
     worldAccess,

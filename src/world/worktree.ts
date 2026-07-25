@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos, worldWorkingDirectory } from './types.js';
-import { git, gitOrThrow, isGitRepo, ensureIdentity } from './git.js';
+import { git, gitOrThrow, isGitRepo, ensureIdentity, isolatedGitEnvironment } from './git.js';
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess } from './local-execution.js';
@@ -175,7 +175,7 @@ export class WorktreeProvider implements WorldProvider {
     const temporary = `${destination}.tmp-${process.pid}-${crypto.randomUUID()}`;
     const credentialDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-clone-'));
     const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
-    const env: Record<string, string> = {};
+    const env: Record<string, string> = spec.gitCredentials?.isolated ? isolatedGitEnvironment() : {};
     try {
       if (key) {
         const keyPath = path.join(credentialDir, 'repository.key');

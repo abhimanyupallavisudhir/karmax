@@ -928,6 +928,11 @@ export class Store {
       this.db.prepare('DELETE FROM git_connections WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM github_install_states WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
+      this.db.prepare('DELETE FROM kv WHERE k IN (?, ?, ?)').run(
+        `credpolicy:organization:${organizationId}`,
+        `git:profiles:${organizationId}`,
+        `git:default-profile:${organizationId}`,
+      );
       deleteRows(this.db, 'repositories', 'id', repositoryIds);
       deleteRows(this.db, 'teams', 'id', teamIds);
       deleteRows(this.db, 'tasks', 'id', taskIds);

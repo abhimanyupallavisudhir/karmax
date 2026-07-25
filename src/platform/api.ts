@@ -491,14 +491,14 @@ export class KarmaxApi {
     },
   ): Promise<TaskRecord> {
     const caller = this.require(token, 'create_task', { projectId: args.projectId });
+    const project = this.deps.store.getProject(args.projectId);
+    if (!project) throw new Error(`no project ${args.projectId}`);
     const workflow = args.workflow ?? 'software-dev';
     // Honor a per-project version pin (§21d) so a project can hold on a specific
     // version while others take the latest; unpinned → latest.
-    const start = this.resolveStart(workflow, this.workflowPinFor(args.projectId, workflow));
+    const start = this.resolveStart(workflow, this.workflowPinFor(args.projectId, workflow), project.organizationId);
     if (!start) throw new Error(`unknown workflow "${workflow}"`);
     const { manifest, startType } = start;
-    const project = this.deps.store.getProject(args.projectId);
-    if (!project) throw new Error(`no project ${args.projectId}`);
     const authorization = this.deps.authorization
       ? this.deps.authorization.taskGrant(caller.principal, args.projectId, args.authorizationProfile, caller.caps)
       : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
@@ -818,8 +818,8 @@ export class KarmaxApi {
   }
 
   /** Resolve a workflow's start type + manifest via the manager (installed) or built-ins. */
-  private resolveStart(workflow: string, version?: string): StartResolution | undefined {
-    return this.deps.workflows?.resolveStart(workflow, version) ?? bundledStart(workflow, version);
+  private resolveStart(workflow: string, version?: string, organizationId = 'org_personal'): StartResolution | undefined {
+    return this.deps.workflows?.resolveStart(workflow, version, organizationId) ?? bundledStart(workflow, version);
   }
 
   private pinKey(projectId: string, workflow: string): string {
@@ -834,7 +834,11 @@ export class KarmaxApi {
 
   /** Pin a project to a version of a workflow for new tasks (§21d); empty clears to latest. */
   pinWorkflow(token: string, args: { projectId: string; workflow: string; version?: string }): { workflow: string; version: string } {
-    this.require(token, 'edit_workflow');
+    const project = this.deps.store.getProject(args.projectId);
+    if (!project) throw new Error(`no project ${args.projectId}`);
+    this.require(token, 'edit_workflow', { projectId: args.projectId, organizationId: project.organizationId });
+    if (!this.resolveStart(args.workflow, args.version && args.version !== 'latest' ? args.version : undefined, project.organizationId))
+      throw new Error(`workflow "${args.workflow}" is not available to this organization`);
     const v = args.version && args.version !== 'latest' ? args.version : '';
     this.deps.store.kvSet(this.pinKey(args.projectId, args.workflow), v);
     return { workflow: args.workflow, version: v || 'latest' };
@@ -842,9 +846,11 @@ export class KarmaxApi {
 
   /** The version each installed/built-in workflow is pinned to for a project (else 'latest'). */
   workflowPins(token: string, projectId: string): Record<string, string> {
-    this.require(token, 'list_workflows');
+    const project = this.deps.store.getProject(projectId);
+    if (!project) throw new Error(`no project ${projectId}`);
+    this.require(token, 'list_workflows', { projectId, organizationId: project.organizationId });
     const out: Record<string, string> = {};
-    for (const w of this.deps.workflows?.list() ?? []) out[w.name] = this.workflowPinFor(projectId, w.name) ?? 'latest';
+    for (const w of this.deps.workflows?.list(project.organizationId) ?? []) out[w.name] = this.workflowPinFor(projectId, w.name) ?? 'latest';
     return out;
   }
 
@@ -856,7 +862,7 @@ export class KarmaxApi {
    */
   private async buildStart(task: TaskRecord, migrateToLatest = false): Promise<{ startType: string; input: TaskInput; version: string }> {
     const project = this.deps.store.getProject(task.projectId);
-    const start = this.resolveStart(task.workflow, migrateToLatest ? undefined : task.workflowVersion);
+    const start = this.resolveStart(task.workflow, migrateToLatest ? undefined : task.workflowVersion, project?.organizationId);
     if (!project || !start) throw new Error(`cannot start task ${task.id}`);
     const { manifest, startType } = start;
     // Re-resolve against the CURRENT project/global defaults. The task stored only
@@ -986,7 +992,8 @@ export class KarmaxApi {
         );
       }
     }
-    const started = this.resolveStart(task.workflow, task.workflowVersion);
+    const started = this.resolveStart(task.workflow, task.workflowVersion,
+      this.deps.store.getProject(task.projectId)?.organizationId);
     if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
     return this.deps.store.getTask(taskId)!;
   }
@@ -1043,7 +1050,8 @@ export class KarmaxApi {
       this.deps.store.deleteTask(run.id); // no orphan run row on a wedged engine
       throw e;
     }
-    const started = this.resolveStart(run.workflow, run.workflowVersion);
+    const started = this.resolveStart(run.workflow, run.workflowVersion,
+      this.deps.store.getProject(run.projectId)?.organizationId);
     if (started) this.saveAgentSnapshot(run.id, started.manifest, input);
     return run;
   }
@@ -1075,7 +1083,8 @@ export class KarmaxApi {
         this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
         START_TIMEOUT_MS,
       );
-      const started = this.resolveStart(task.workflow, task.workflowVersion);
+      const started = this.resolveStart(task.workflow, task.workflowVersion,
+        this.deps.store.getProject(task.projectId)?.organizationId);
       if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
     } catch (e) {
       this.deps.store.updateTaskParams(taskId, { ...(task.params as Record<string, unknown>), triggerState: 'armed' } as any);
@@ -1129,7 +1138,8 @@ export class KarmaxApi {
       ...(priority !== undefined ? { priority } : {}),
       ...(_authorization !== undefined ? { _authorization } : {}),
     };
-    const start = this.resolveStart(task.workflow, task.workflowVersion);
+    const start = this.resolveStart(task.workflow, task.workflowVersion,
+      this.deps.store.getProject(task.projectId)?.organizationId);
     const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField) {
       let confirmer = Object.prototype.hasOwnProperty.call(params, confirmerField.name)
@@ -1267,7 +1277,8 @@ export class KarmaxApi {
     if (group.committedAttemptId) throw new Error('no more attempts can be added after an attempt enters Merge');
     const { archived: _archived, draft: _draft, triggers: _triggers, triggerState: _triggerState,
       repeatable: _repeatable, runOf: _runOf, ...workflowParams } = source.params;
-    const start = this.resolveStart(source.workflow, source.workflowVersion);
+    const start = this.resolveStart(source.workflow, source.workflowVersion,
+      this.deps.store.getProject(source.projectId)?.organizationId);
     const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
     if (confirmerField && group.confirmer !== undefined) workflowParams[confirmerField.name] = group.confirmer;
     const attempt = this.deps.store.createTask({
@@ -1569,7 +1580,8 @@ export class KarmaxApi {
         .signal(SIG.collaborationRequested, request.id)
         .catch(() => undefined);
     }
-    const started = this.resolveStart(task.workflow, version);
+    const started = this.resolveStart(task.workflow, version,
+      this.deps.store.getProject(task.projectId)?.organizationId);
     if (started) this.saveAgentSnapshot(taskId, started.manifest, input);
     // Close the short acceptance→first-publish window so the UI cannot offer a
     // second recovery while the replacement run is already starting.
@@ -2316,15 +2328,16 @@ export class KarmaxApi {
         `Nothing was queued — check that Temporal is healthy and try again.`,
       );
     }
-    const started = this.resolveStart(task.workflow, task.workflowVersion);
+    const started = this.resolveStart(task.workflow, task.workflowVersion,
+      this.deps.store.getProject(task.projectId)?.organizationId);
     if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
     return task;
   }
 
   /** Installed + built-in workflows, with versions (§21d). */
-  listWorkflows(token: string): WorkflowSummary[] {
-    this.require(token, 'list_workflows');
-    return this.deps.workflows?.list() ?? [];
+  listWorkflows(token: string, organizationId = 'org_personal'): WorkflowSummary[] {
+    this.require(token, 'list_workflows', { organizationId });
+    return this.deps.workflows?.list(organizationId) ?? [];
   }
 
   /**
@@ -2333,9 +2346,9 @@ export class KarmaxApi {
    * the New Task form can offer any registered workflow. Read-only, session-gated
    * by the gateway, so it takes no capability (matches the prior inline handler).
    */
-  workflowSchemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
+  workflowSchemas(organizationId = 'org_personal'): { name: string; description: string; params: unknown; stages: unknown }[] {
     const taskSchemas = this.deps.workflows
-      ? this.deps.workflows.schemas()
+      ? this.deps.workflows.schemas(organizationId)
       : MANIFESTS.filter((m) => m.kind !== 'coordinator' && m.selectable !== false).map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
     const settingsOnly = MANIFESTS
       .filter((m) => m.kind === 'coordinator' && m.params.length)
@@ -2356,10 +2369,10 @@ export class KarmaxApi {
    * Install a workflow from a git repo and roll the worker to serve it (§21d/§21e).
    * Requires a configured workflow manager; refuses to shadow a built-in name.
    */
-  async installWorkflow(token: string, args: { url: string; ref?: string; name?: string }): Promise<{ name: string; version: string }> {
-    this.require(token, 'install_workflow');
+  async installWorkflow(token: string, args: { url: string; ref?: string; name?: string }, organizationId = 'org_personal'): Promise<{ name: string; version: string }> {
+    this.require(token, 'install_workflow', { organizationId });
     if (!this.deps.workflows) throw new Error('workflow installation is not enabled on this server');
-    return this.deps.workflows.install(args);
+    return this.deps.workflows.install(args, organizationId);
   }
 }
 
