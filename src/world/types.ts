@@ -301,7 +301,10 @@ export function worldWorkingDirectory(handle: WorldHandle): string {
  * the provider-neutral file API. */
 export function worldWorkingRelativePath(handle: WorldHandle, relPath: string): string {
   const safe = worldRelativePath(relPath);
-  const root = handle.root.replace(/\\/g, '/').replace(/\/+$/, '');
+  // Unit adapters and historical serialized handles may only carry an id. In
+  // that single-root compatibility shape, agent-relative is already root-relative.
+  if (!handle.root && !handle.workdir) return safe;
+  const root = (handle.root ?? handle.workdir).replace(/\\/g, '/').replace(/\/+$/, '');
   const workdir = worldWorkingDirectory(handle).replace(/\\/g, '/').replace(/\/+$/, '');
   if (workdir === root) return safe;
   if (!workdir.startsWith(`${root}/`)) throw new Error('working directory escapes world');

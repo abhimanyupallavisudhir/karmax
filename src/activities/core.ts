@@ -664,7 +664,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // That migration fallback belongs only to the personal organization. A
       // non-personal tenant must wait/escalate instead of borrowing another
       // tenant's host login, so return a non-existent explicit allow-list entry.
-      return keys.length || organizationId === 'org_personal'
+      return keys.length || organizationId === 'org_personal' || profile?.provider === 'mock'
         ? keys
         : [`missing:${organizationId}:${modelProvider}`];
     },
@@ -799,7 +799,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
       }
-      if (organizationId !== 'org_personal' && !args.accountConfigHome && !args.accountApiKeyHandle) {
+      if (
+        organizationId !== 'org_personal'
+        && profile.provider !== 'mock'
+        && !args.accountConfigHome
+        && !args.accountApiKeyHandle
+      ) {
         throw new Error(`organization ${organizationId} has no usable ${credentialProvider(profile)} credential; connect an organization login or API key`);
       }
       // API sessions are stateless. Cloud subscription sessions live in their
@@ -1288,11 +1293,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
       const roots = repos.length ? repos : [{ name: '', root: handle.root }];
+      const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
       const changedFiles: string[] = [];
       for (const repo of roots) {
         const tracked = await world.exec('git', ['diff', '--name-only', 'base' in repo ? repo.base : base], { cwd: repo.root });
         const untracked = await world.exec('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo.root });
-        const prefix = repos.length > 1 ? `${repo.name}/` : '';
+        // A companion wiki must not make the sole development checkout appear
+        // artificially nested. Keep a stable prefix for wiki changes, while
+        // genuine multi-development-repo worlds retain repository prefixes.
+        const prefix = 'role' in repo && repo.role === 'project-wiki'
+          ? `${repo.name}/`
+          : developmentRepos.length > 1
+            ? `${repo.name}/`
+            : '';
         changedFiles.push(
           ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file}`),
           ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file} (new)`),
