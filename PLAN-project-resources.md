@@ -298,6 +298,14 @@ Migration is lazy and reversible:
 - keep the old setting until the resulting attachments have been tested;
 - then hide it from normal settings and leave an Advanced compatibility switch.
 
+The explicit **Migrate** action implements that exit ramp without a legacy object
+or secret registry. `.env` values become write-only `secret@1` environment
+attachments, small text files become file-shaped `secret@1` attachments, and
+binary/large files become encrypted file-shaped `volume@1` revisions projected
+at their former world paths. The operation clears `copyGlobs` only after every
+created attachment and revision succeeds, and rolls back partial creations on
+failure.
+
 ## Delivery order
 
 1. **Thin v1 — secrets and forked files:** attachment/revision/lease records,

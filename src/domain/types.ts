@@ -164,6 +164,10 @@ export interface WorldCheckpoint {
   }>;
   filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
   resources?: Array<{ attachmentId: string; revisionId: string }>;
+  /** Accepted provider-neutral runtime declarations pinned at checkpoint time.
+   * Provider snapshots remain accelerators; generated endpoints are excluded. */
+  environment?: ProjectEnvironmentSpec;
+  services?: ProjectService[];
   createdAt: number;
 }
 

@@ -9,6 +9,8 @@ import type { World, WorldHandle, WorldKind, WorldRepo } from './types.js';
 import { worldRepos, worldRepoSource } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
+import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
+import { destroyWorldServices } from './services.js';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -75,7 +77,9 @@ export class WorldCheckpointService {
       id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
       repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length },
-      ...(resourceRefs.length ? { resources: resourceRefs } : {}), createdAt: Date.now(),
+      ...(resourceRefs.length ? { resources: resourceRefs } : {}),
+      ...snapshotProjectRuntime(this.store, projectId),
+      createdAt: Date.now(),
     };
     this.store.saveWorldCheckpoint(checkpoint);
     this.store.attachWorldCheckpoint(handle, checkpoint.id);
@@ -101,6 +105,8 @@ export class WorldCheckpointService {
     const sources = checkpoint.repos.map((repo, index) => repositories[index]?.sshUrl ?? project.config.repos?.[index]);
     if (sources.some((source) => !source)) throw new Error('checkpoint repository enrollment is missing');
     const selected = provider ?? executionConfig.worldProvider ?? 'worktree';
+    const environment = selectProjectEnvironment(this.store, checkpoint.projectId, selected,
+      executionConfig.environment, checkpoint.environment);
     const primary = checkpoint.repos[0];
     const linked = this.store.listProjectRepositories(checkpoint.projectId);
     const repositoryBranches = Object.fromEntries(linked.map((candidate) => {
@@ -113,7 +119,7 @@ export class WorldCheckpointService {
       repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
       branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
       ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
-      network: executionConfig.network, environment: executionConfig.environment, resources: executionConfig.resources });
+      network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
     try {
       if (this.resources) {
         const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
@@ -129,12 +135,20 @@ export class WorldCheckpointService {
           else await world.writeFile(relative, content.toString('utf8'));
         }
       }
+      const runtime = await activateProjectRuntime({ world, store: this.store, projectId: checkpoint.projectId,
+        taskId: checkpoint.worldId, selection: environment, resources: this.resources,
+        services: checkpoint.services, runSetupIfUnbuilt: true });
+      world.handle = runtime.handle;
+      if (runtime.warnings.length)
+        world.handle.warnings = [...(world.handle.warnings ?? []), ...runtime.warnings];
       const registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
-        { runnerPoolId: checkpoint.runnerPoolId, environmentDigest: checkpoint.environmentDigest }) as WorldHandle;
+        { runnerPoolId: checkpoint.runnerPoolId,
+          environmentDigest: environment.digest ?? checkpoint.environmentDigest }) as WorldHandle;
       world.handle = registered;
       return registered;
     } catch (error) {
       await this.resources?.release(world.handle).catch(() => undefined);
+      await destroyWorldServices(checkpoint.worldId).catch(() => undefined);
       await world.destroy().catch(() => undefined);
       throw error;
     }

@@ -611,6 +611,30 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(JSON.stringify(secrets)).not.toContain('postgres://external');
   });
 
+  it('migrates copyGlobs through the typed resource API and returns no secret values', async () => {
+    const repo = await h.makeRepo('copyglobs-api');
+    fs.writeFileSync(`${repo}/.env.local`, 'LEGACY_TOKEN=private-legacy-value\n');
+    fs.writeFileSync(`${repo}/model.bin`, Buffer.from([0, 1, 2, 255]));
+    const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'copyGlobs migration', config: {
+        repos: [repo], copyGlobs: ['.env*', '*.bin'],
+      } }) }).then((response) => response.json());
+    const migrated = await fetch(`${base}/api/projects/${project.id}/resources/import-copyglobs`, {
+      method: 'POST', headers: auth(), body: '{}',
+    });
+    expect(migrated.status).toBe(200);
+    const result: any = await migrated.json();
+    expect(result).toMatchObject({ environmentSecrets: ['LEGACY_TOKEN'], data: ['model.bin'], skipped: [] });
+    expect(JSON.stringify(result)).not.toContain('private-legacy-value');
+    expect(h.store.getProject(project.id)?.config.copyGlobs).toEqual([]);
+    const attachments = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() })
+      .then((response) => response.json()) as any[];
+    expect(attachments.some((attachment) => attachment.target?.name === 'LEGACY_TOKEN')).toBe(true);
+    expect(attachments.some((attachment) => attachment.target?.path === 'model.bin'
+      && attachment.revision?.bytes === 4)).toBe(true);
+    expect(JSON.stringify(attachments)).not.toContain('private-legacy-value');
+  });
+
   it('seeds a brand-new project with the karmax-ready prep task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
     // workflow's onActivate prep task automatically (SPEC §4.6) — no manual

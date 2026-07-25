@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Client } from '@temporalio/client';
 import type { CredentialBroker } from '../autonomy/broker.js';
-import type { ResourceAttachment, ResourceChangeSummary, ResourceRevision } from '../domain/types.js';
+import type { Project, ResourceAttachment, ResourceChangeSummary, ResourceRevision } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
@@ -17,6 +17,8 @@ import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL
 import type { ResourcePublishView } from '../coordinators/resource-publish.js';
 import { credentialResource, snapshotResource } from '../domain/resource-drivers.js';
 import { ensureWorldExcluded } from './secret-exclude.js';
+import { expandPath } from '../util/expand.js';
+import { managedRepoPath } from './worktree.js';
 
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const WORLD_READ_BYTES = 16 * 1024 * 1024;
@@ -26,6 +28,13 @@ interface SnapshotFile { path: string; bytes: number; sha256: string; chunks: st
 interface SnapshotManifest { version: 1; attachmentId: string; files: SnapshotFile[]; rootDigest: string; bytes: number }
 interface SnapshotRef { objectKey: string; sha256: string }
 export interface SnapshotInputFile { path: string; data: Buffer | AsyncIterable<Buffer>; bytes?: number }
+export interface CopyGlobsMigrationResult {
+  environmentSecrets: string[];
+  fileSecrets: string[];
+  data: string[];
+  reused: string[];
+  skipped: string[];
+}
 
 /** Replaceable snapshot data-plane contract (SPEC §11.4). The built-in engine
  * keeps the first release self-contained; production deployments can substitute
@@ -187,7 +196,7 @@ export class ProjectResourceService {
             const revision = this.store.getResourceRevision(revisionId);
             if (!revision) throw new Error(`resource "${attachment.name}" revision is missing`);
             await this.engine.restore(revision, async (file, data, offset) => {
-              const relative = target === '.' ? file : `${target}/${file}`;
+              const relative = fileShaped(attachment) ? target : target === '.' ? file : `${target}/${file}`;
               if (offset === 0) {
                 if (world.writeFileBuffer) await world.writeFileBuffer(relative, data);
                 else await world.writeFile(relative, data.toString('utf8'));
@@ -320,6 +329,99 @@ export class ProjectResourceService {
     throw new Error('resource import source must be a regular file or directory');
   }
 
+  /** One-time exit ramp for the deprecated host-only copyGlobs setting. The
+   * accepted files become ordinary typed attachments at their original world
+   * locations; no compatibility KV/object plane is introduced. */
+  async migrateCopyGlobs(project: Project): Promise<CopyGlobsMigrationResult> {
+    const globs = project.config.copyGlobs ?? [];
+    const result: CopyGlobsMigrationResult = {
+      environmentSecrets: [], fileSecrets: [], data: [], reused: [], skipped: [],
+    };
+    if (!globs.length) return result;
+    const sources = project.config.repos ?? [];
+    const repoNames = copyGlobRepoNames(sources);
+    const created: string[] = [];
+    try {
+      for (let index = 0; index < sources.length; index++) {
+        const source = sources[index]!;
+        const local = expandPath(source);
+        const managed = managedRepoPath(source);
+        const root = fs.existsSync(local) ? local : fs.existsSync(managed) ? managed : undefined;
+        if (!root) throw new Error(`cannot migrate copyGlobs because repository "${source}" has no local checkout`);
+        const entries = fs.readdirSync(root, { withFileTypes: true });
+        const seen = new Set<string>();
+        for (const glob of globs) {
+          const pattern = copyGlobRegExp(glob);
+          for (const entry of entries) {
+            if (!entry.isFile() || !pattern.test(entry.name) || seen.has(entry.name)) continue;
+            seen.add(entry.name);
+            const absolute = path.join(root, entry.name);
+            let data: Buffer;
+            try { data = fs.readFileSync(absolute); }
+            catch (error) {
+              throw new Error(`could not read copyGlobs match "${source}:${entry.name}": ${
+                error instanceof Error ? error.message : String(error)}`);
+            }
+            const target = sources.length > 1 ? `${repoNames[index]}/${entry.name}` : entry.name;
+            const sourceRecord = { migratedFrom: 'copyGlobs', repository: source, path: entry.name };
+            const env = /^\.env(?:\.|$)/i.test(entry.name) ? parseCopyEnv(data.toString('utf8')) : [];
+            if (env.length) {
+              for (const value of env) {
+                const existing = this.store.listResourceAttachments(project.id, true).find((attachment) =>
+                  attachment.driver === 'secret@1' && attachment.target.kind === 'environment'
+                  && attachment.target.name === value.name);
+                if (existing) { result.reused.push(value.name); continue; }
+                const id = newId('resource'), handle = `resource:${id}:credential`;
+                this.broker.registerHandle(handle, value.value);
+                try {
+                  this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
+                    projectId: project.id, name: value.name, driver: 'secret@1',
+                    target: { kind: 'environment', name: value.name }, access: 'read', isolation: 'fork',
+                    source: sourceRecord, credentialHandles: [handle], publish: 'discard' });
+                } catch (error) { this.broker.deleteHandle(handle); throw error; }
+                created.push(id); result.environmentSecrets.push(value.name);
+              }
+              continue;
+            }
+            const existing = this.store.listResourceAttachments(project.id, true).find((attachment) =>
+              attachment.target.kind === 'path' && attachment.target.path === target);
+            if (existing) { result.reused.push(target); continue; }
+            if (!data.includes(0) && data.length <= 64 * 1024) {
+              const id = newId('resource'), handle = `resource:${id}:credential`;
+              this.broker.registerHandle(handle, data.toString('utf8'));
+              try {
+                this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
+                  projectId: project.id, name: copyGlobSecretName(entry.name), driver: 'secret@1',
+                  target: { kind: 'path', path: target }, access: 'read', isolation: 'fork',
+                  source: sourceRecord, credentialHandles: [handle], publish: 'discard' });
+              } catch (error) { this.broker.deleteHandle(handle); throw error; }
+              created.push(id); result.fileSecrets.push(target);
+            } else {
+              const attachment = this.store.createResourceAttachment({ organizationId: project.organizationId!,
+                projectId: project.id, name: `Imported ${entry.name}`, driver: 'volume@1',
+                target: { kind: 'path', path: target }, access: 'read', isolation: 'fork',
+                source: { ...sourceRecord, shape: 'file' }, credentialHandles: [], publish: 'discard' });
+              created.push(attachment.id);
+              await this.importFiles(attachment.id,
+                [{ path: entry.name, data, bytes: data.length }]);
+              result.data.push(target);
+            }
+          }
+        }
+      }
+      this.store.updateProjectConfig(project.id, { copyGlobs: [] });
+      this.store.appendAudit({ principalId: 'system:copyglobs-migration', action: 'resource:migrate-copyglobs',
+        scopeKey: `project:${project.id}`, detail: {
+          environmentSecrets: result.environmentSecrets, fileSecrets: result.fileSecrets,
+          data: result.data, reused: result.reused, skipped: result.skipped,
+        } });
+      return result;
+    } catch (error) {
+      for (const id of created.reverse()) await this.deleteAttachment(id).catch(() => undefined);
+      throw error;
+    }
+  }
+
   /** Remove control-plane records, credentials, and revision manifests. Shared
    * content chunks are left for the snapshot engine's mark-and-sweep policy. */
   async deleteAttachment(attachmentId: string): Promise<void> {
@@ -364,7 +466,8 @@ export class ProjectResourceService {
         refs.push({ attachmentId: attachment.id, revisionId: lease.revisionId });
         continue;
       }
-      const captured = await this.engine.capture(attachment, filesFromWorld(world, safePath(attachment.target.path)));
+      const captured = await this.engine.capture(attachment,
+        filesFromWorld(world, safePath(attachment.target.path), attachment));
       const revision = this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: lease.revisionId,
         engine: this.engine.id, ...captured, metadata: { checkpoint: true }, createdByTaskId: lease.taskId });
       refs.push({ attachmentId: attachment.id, revisionId: revision.id });
@@ -380,7 +483,7 @@ export class ProjectResourceService {
     // Upload the immutable candidate before entering the singleton. The only
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB model
     // upload cannot block another publication merely while bytes are moving.
-    const captured = await this.engine.capture(attachment, filesFromWorld(world, target));
+    const captured = await this.engine.capture(attachment, filesFromWorld(world, target, attachment));
     const revision = this.store.saveResourceRevision({ attachmentId, parentRevisionId: lease.revisionId,
       engine: this.engine.id, ...captured, metadata: { summary }, createdByTaskId: taskId });
     return this.serializePublish(attachmentId, taskId, async () => {
@@ -504,7 +607,17 @@ async function* walkDirectory(root: string): AsyncGenerator<SnapshotInputFile> {
   yield* visit(root);
 }
 
-async function* filesFromWorld(world: World, target: string): AsyncGenerator<SnapshotInputFile> {
+async function* filesFromWorld(world: World, target: string, attachment?: ResourceAttachment): AsyncGenerator<SnapshotInputFile> {
+  if (attachment && fileShaped(attachment)) {
+    const exists = await world.exec('test', ['-f', target]);
+    if (exists.code !== 0) return;
+    const captured = await transactionalSnapshotPath(world, target);
+    const sized = await world.exec('stat', ['-c', '%s', captured.path]);
+    const bytes = sized.code === 0 ? Number(sized.stdout.trim()) : undefined;
+    yield { path: path.posix.basename(target), bytes,
+      data: cleanupChunks(chunksFromWorldFile(world, captured.path, Number.isFinite(bytes) ? bytes : undefined), captured.cleanup) };
+    return;
+  }
   const prefix = target === '.' ? '' : `${target}/`;
   const listed = await world.exec('bash', ['-lc', `test ! -e ${quote(target)} || find ${quote(target)} -type f -not -path '*/.git/*' -not -path '*/.karmax-injection/*' -print0`],
     { timeoutMs: 30 * 60_000 });
@@ -524,7 +637,7 @@ async function* filesFromWorld(world: World, target: string): AsyncGenerator<Sna
 async function manifestFromWorld(attachment: ResourceAttachment, world: World, target: string): Promise<SnapshotManifest> {
   const files: SnapshotFile[] = [];
   let bytes = 0;
-  for await (const file of filesFromWorld(world, target)) {
+  for await (const file of filesFromWorld(world, target, attachment)) {
     const digest = crypto.createHash('sha256');
     let fileBytes = 0;
     for await (const chunk of fixedChunks(file.data)) { digest.update(chunk); fileBytes += chunk.length; }
@@ -607,6 +720,39 @@ async function* cleanupChunks(chunks: AsyncIterable<Buffer>, cleanup?: () => Pro
 }
 function isSecretLike(value: ResourceAttachment): boolean { return credentialResource(value); }
 function isSnapshotDriver(value: string): boolean { return snapshotResource(value); }
+function fileShaped(value: ResourceAttachment): boolean { return value.source.shape === 'file'; }
+function parseCopyEnv(value: string): Array<{ name: string; value: string }> {
+  const entries: Array<{ name: string; value: string }> = [];
+  for (const raw of value.split('\n')) {
+    const match = raw.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    let secret = match[2]!.trim();
+    if ((secret.startsWith('"') && secret.endsWith('"')) || (secret.startsWith("'") && secret.endsWith("'")))
+      secret = secret.slice(1, -1);
+    else secret = secret.replace(/\s+#.*$/, '');
+    if (secret) entries.push({ name: match[1]!, value: secret });
+  }
+  return entries;
+}
+function copyGlobSecretName(file: string): string {
+  const value = file.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toUpperCase() || 'FILE';
+  return /^[A-Z_]/.test(value) ? value : `FILE_${value}`;
+}
+function copyGlobRegExp(glob: string): RegExp {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp(`^${escaped}$`);
+}
+function copyGlobRepoNames(sources: string[]): string[] {
+  const used = new Set<string>();
+  return sources.map((source) => {
+    const base = (source.split(/[/:]/).filter(Boolean).pop() ?? 'repo').replace(/\.git$/i, '')
+      .replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
+    let name = base;
+    for (let suffix = 2; used.has(name); suffix++) name = `${base}-${suffix}`;
+    used.add(name);
+    return name;
+  });
+}
 function safePath(value: string): string { return worldRelativePath(value); }
 function sha256(value: Buffer): string { return crypto.createHash('sha256').update(value).digest('hex'); }
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }

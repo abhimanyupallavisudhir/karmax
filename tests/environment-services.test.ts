@@ -69,9 +69,35 @@ describe('project environment proposals and builds', () => {
     expect(calls).toContain('npm ci');
     expect(killed).toBe(true);
   });
+
+  it('always kills a failed remote builder and identifies the setup command', async () => {
+    let killed = false;
+    const builder: BuilderSandbox = {
+      async run(command) {
+        return command === 'bad setup' ? { exitCode: 1, stderr: 'boom', stdout: '' }
+          : { exitCode: 0, stderr: '', stdout: '' };
+      },
+      async createSnapshot() { throw new Error('must not snapshot a failed build'); },
+      async kill() { killed = true; },
+    };
+    await expect(buildEnvironment({ provider: 'e2b', projectId: 'p', digest: 'd',
+      spec: { setup: ['good setup', 'bad setup'] }, createBuilderSandbox: async () => builder }))
+      .rejects.toThrow(/"bad setup" failed: boom/);
+    expect(killed).toBe(true);
+  });
 });
 
 describe('service proposals', () => {
+  it('validates external connections and per-world service shapes', () => {
+    const services = new ProjectServices(memoryKv());
+    expect(() => services.save('p', { name: 'bad name', kind: 'per-world', image: 'postgres:16' }))
+      .toThrow(/alphanumeric/);
+    expect(() => services.save('p', { name: 'external', kind: 'external' }))
+      .toThrow(/secret resource/);
+    expect(() => services.save('p', { name: 'seed', kind: 'per-world', image: 'postgres:16',
+      seedResourceId: 'resource-1' })).toThrow(/container path/);
+  });
+
   it('derives isolated service recipes from Compose and stores typed resource references', () => {
     const proposals = composeServiceProposals(`
 services:
@@ -92,6 +118,8 @@ services:
     const services = new ProjectServices(memoryKv());
     expect(services.save('p', { ...proposals[0]!, seedResourceId: 'resource-1',
       seedContainerPath: '/docker-entrypoint-initdb.d/seed.sql' }).seedResourceId).toBe('resource-1');
+    expect(composeServiceProposals('metadata: only')).toEqual([]);
+    expect(() => composeServiceProposals('services: {db: {image: [}')).toThrow(/parse/);
   });
 
   it('provisions through the world contract and mounts an existing typed resource as its seed', async () => {
@@ -117,5 +145,17 @@ services:
     const run = calls.find((call) => call[0] === 'docker' && call[1] === 'run')!;
     expect(run).toContain('/workspace/project/resources/database-seed:/docker-entrypoint-initdb.d:ro');
     expect(run.join(' ')).toContain('karmax.task=task-1');
+  });
+
+  it('degrades to a clear warning when the selected world has no Docker', async () => {
+    const world: any = {
+      handle: { kind: 'daytona', id: 'world-2', root: '/workspace', branch: 'task', base: 'main' },
+      async exec() { return { code: 127, stdout: '', stderr: 'docker: not found' }; },
+    };
+    const launched = await launchWorldServices(world, 'task-2',
+      [{ name: 'database', kind: 'per-world', image: 'postgres:16' }], new Map());
+    expect(launched.containers).toEqual([]);
+    expect(launched.env).toEqual({});
+    expect(launched.warnings.join(' ')).toMatch(/need Docker inside this world/);
   });
 });

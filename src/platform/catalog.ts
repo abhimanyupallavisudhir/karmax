@@ -8,6 +8,7 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/projects/:projectId/resources', 'GET|PATCH|DELETE /api/projects/:projectId/resources/:resourceId',
     'POST /api/projects/:projectId/resources/:resourceId/import',
     'GET /api/projects/:projectId/resources/scan',
+    'POST /api/projects/:projectId/resources/import-copyglobs',
     'POST /api/projects/:projectId/resources/:resourceId/uploads',
     'PUT|POST|DELETE /api/resource-uploads/:uploadId?projectId=',
     'GET|POST /api/projects/:projectId/secrets', 'DELETE /api/projects/:projectId/secrets/:name',

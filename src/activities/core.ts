@@ -34,10 +34,8 @@ import { allows, attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
-import { ProjectEnvironment } from '../store/project-environment.js';
-import { bootCommands, setupCommands } from '../world/environment-build.js';
-import { ProjectServices } from '../store/project-services.js';
-import { destroyWorldServices, launchWorldServices } from '../world/services.js';
+import { destroyWorldServices } from '../world/services.js';
+import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
 import {
   AGENT_QUEUE_WORKFLOW,
   QRY_AGENT_QUEUE,
@@ -412,15 +410,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       const project = projectId ? store.getProject(projectId) : undefined;
       const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
-      const projectEnvironment = new ProjectEnvironment(store);
-      const environmentSpec = projectId ? projectEnvironment.spec(projectId) : undefined;
-      const environmentDigest = environmentSpec ? projectEnvironment.digest(environmentSpec) : undefined;
-      const environmentBuild = projectId && environmentDigest
-        ? projectEnvironment.readyBuild(projectId, args.kind, environmentDigest) : undefined;
-      const environmentOverride = environmentBuild && environmentBuild.ref !== 'host'
-        ? { ...executionConfig?.environment,
-            ...(args.kind === 'container' ? { image: environmentBuild.ref } : { snapshot: environmentBuild.ref }) }
-        : executionConfig?.environment;
+      const environmentSelection = projectId
+        ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
+        : { built: false, environment: executionConfig?.environment };
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
         const ctx = activityContext.current();
@@ -444,7 +436,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           gitCredentials,
           ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
           network: executionConfig?.network,
-          environment: environmentOverride,
+          environment: environmentSelection.environment,
           resources: executionConfig?.resources,
         });
       } catch (error) {
@@ -456,32 +448,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
           world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation);
         }
-        if (environmentSpec && !['worktree', 'memory'].includes(args.kind)) {
-          const liveSetup = environmentBuild ? [] : setupCommands(environmentSpec);
-          if (liveSetup.length) record(args.taskId, 'world.warning', {
-            warning: 'environment build is not ready; running setup live (build it in Project Settings → Environment for faster worlds)',
-          });
-          for (const command of [...liveSetup, ...bootCommands(environmentSpec)]) {
-            const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 });
-            if (result.code !== 0) record(args.taskId, 'world.warning', {
-              warning: `environment command "${command}" failed: ${(result.stderr || result.stdout).slice(-300)}`,
-            });
-          }
-        }
         if (projectId) {
-          const services = new ProjectServices(store).list(projectId);
-          const perWorld = services.filter((service) => service.kind === 'per-world');
-          if (perWorld.length) {
-            const resources = new Map(store.listResourceAttachments(projectId)
-              .map((resource) => [resource.id, resource]));
-            const launched = await launchWorldServices(world, args.taskId, perWorld, resources);
-            for (const warning of launched.warnings) record(args.taskId, 'world.warning', { warning });
-            if (Object.keys(launched.env).length && deps.resources)
-              world.handle = deps.resources.registerServiceEnvironment(world.handle, launched.env);
-            if (launched.containers.length) world.handle.meta = {
-              ...world.handle.meta, serviceContainers: launched.containers,
-            };
-          }
+          const runtime = await activateProjectRuntime({ world, store, projectId, taskId: args.taskId,
+            selection: environmentSelection, resources: deps.resources, runSetupIfUnbuilt: true });
+          world.handle = runtime.handle;
+          for (const warning of runtime.warnings) record(args.taskId, 'world.warning', { warning });
         }
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
@@ -490,7 +461,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (projectId) {
           world.handle = store.registerWorld(world.handle, projectId, {
             runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${args.kind}` : 'local'),
-            environmentDigest: environmentDigest
+            environmentDigest: environmentSelection.digest
               ?? (remote ? String(world.handle.meta?.environmentArtifact
                 ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`) : 'karmax-local'),
           }) as WorldHandle;
@@ -499,6 +470,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 });
         for (const warning of world.handle.warnings ?? []) record(args.taskId, 'world.warning', { warning });
       } catch (error) {
+        await destroyWorldServices(args.taskId).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
         throw error;

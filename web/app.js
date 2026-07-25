@@ -6595,6 +6595,7 @@ async function hydrateProjectData(proj) {
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
     box.innerHTML = `${resources.map((resource) => `<div class="queue-item" data-data-resource="${esc(resource.id)}"><div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${resource.access === 'write' ? 'private writable fork' : 'read-only'}</span> <span class="chip">${resource.publish === 'review' ? 'promotable at Review' : 'discard changes'}</span><div class="task-sub"><span class="mono">${esc(resource.target.path)}</span>${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · immutable ${esc(resource.revision.id)}` : ' · awaiting initial upload'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')
       || '<p class="task-sub">No data resources yet. Datasets, model weights, fixtures, and SQLite files become immutable revisions; task changes are explicitly promoted or discarded.</p>'}
+      ${!S.meta?.hosted && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
       ${S.meta?.hosted ? '' : '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button><span class="task-sub">Karmax proposes; nothing uploads until you approve.</span></div><div id="data-proposals"></div>'}
       <details class="settings-disclosure compact"><summary><b>Add data</b><span>Large uploads are resumable and streamed</span></summary>
         <div class="inline-form"><input id="data-name" placeholder="Training data"><input id="data-path" placeholder="resources/training-data"><select id="data-access"><option value="read">read-only</option><option value="write">writable private fork</option></select><select id="data-publish"><option value="discard">discard task changes</option><option value="review">offer Promote at Review</option></select></div>
@@ -6610,6 +6611,15 @@ async function hydrateProjectData(proj) {
         if (!confirm(`Remove ${resource.name}?`)) return;
         await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'DELETE' }); await hydrateProjectData(proj);
       });
+    });
+    $('#data-migrate-copyglobs')?.addEventListener('click', async () => {
+      if (!confirm('Migrate these copied files into typed project resources and disable copyGlobs?')) return;
+      try {
+        const result = await api(`/api/projects/${proj.id}/resources/import-copyglobs`, { method: 'POST', body: '{}' });
+        proj.config.copyGlobs = [];
+        toast(`Migrated ${result.environmentSecrets.length + result.fileSecrets.length} secret${result.environmentSecrets.length + result.fileSecrets.length === 1 ? '' : 's'} and ${result.data.length} data resource${result.data.length === 1 ? '' : 's'}`);
+        await Promise.all([hydrateProjectSecrets(proj), hydrateProjectData(proj)]);
+      } catch (error) { toast(error.message, true); }
     });
     $('#data-discover')?.addEventListener('click', async () => {
       try {

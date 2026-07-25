@@ -1651,6 +1651,19 @@ export class Gateway {
           }
         }
       }
+      const copyGlobsMigration = p.match(/^\/api\/projects\/([^/]+)\/resources\/import-copyglobs$/);
+      if (copyGlobsMigration && method === 'POST') {
+        const project = store.getProject(copyGlobsMigration[1]!);
+        if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
+        if (this.deps.hosted) return this.json(res, 400,
+          { error: 'copyGlobs migration requires access to the project’s local or managed checkout' });
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        try {
+          return this.json(res, 200, await this.deps.resources.migrateCopyGlobs(project));
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       const projectResource = p.match(/^\/api\/projects\/([^/]+)\/resources\/(?!scan$)([^/]+)$/);
       if (projectResource) {
         const resource = store.getResourceAttachment(projectResource[2]!);

@@ -712,6 +712,14 @@ the hosted transport or a checkpointed source of project state. See
 `PLAN-project-resources.md` for the driver contract, built-in drivers, onboarding,
 publication, migration, and delivery order.
 
+Portable checkpoints pin the accepted environment recipe and per-world service
+declarations alongside Git heads and resource revision ids. Restore first
+materializes those revisions and the dirty Git delta, then runs the pinned boot
+hooks and reprovisions the pinned service topology. Generated service endpoints
+are newly leased through the credential broker; they never enter the checkpoint.
+Changing Project Settings therefore affects new worlds without silently changing
+the meaning of an older checkpoint.
+
 ---
 
 ## 12. Remote access (phone / off-laptop)
