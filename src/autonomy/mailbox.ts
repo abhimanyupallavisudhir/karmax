@@ -76,8 +76,8 @@ export class SelfManagedDomainProvider implements MailboxProvider {
     return {
       name: this.name, label: 'Your own domain', kind: 'domain', connected: !!domain, domain,
       help: domain
-        ? `Agents use addresses on ${domain}. Point that domain's inbound mail at POST /api/agent-mail/ingest (set KARMAX_AGENT_MAIL_SECRET) — e.g. Cloudflare Email Routing (free), Mailgun, or SES.`
-        : 'Enter a domain you control and forward its inbound mail to the webhook. Best if you already run a domain; otherwise use a hosted provider for zero DNS setup.',
+        ? `Agents use addresses on ${domain}. Forward that domain's inbound email to karmax (e.g. Cloudflare Email Routing — free).`
+        : 'Use a domain you already own: enter it, then forward its inbound email to karmax.',
     };
   }
   connect(input: ConnectInput): ConnectResult {
@@ -102,23 +102,21 @@ export class HostedMailboxProvider implements MailboxProvider {
     const domain = this.domainFor(config);
     const connected = !!config.apiKeyHandle && !!domain;
     return {
-      name: this.name, label: 'Hosted mailbox (managed)', kind: 'apiKey', connected, domain,
+      name: this.name, label: 'Hosted mailbox', kind: 'apiKey', connected, domain,
       help: connected
-        ? `Connected — agents get addresses on ${domain} automatically, no DNS. Inbound mail is forwarded to karmax for you.`
-        : process.env.KARMAX_HOSTED_MAIL_DOMAIN
-          ? 'Paste your managed inbound-email API key to connect — one field, once, for the whole installation. Every organization then gets an address automatically.'
-          : 'A hosted mailbox is not enabled on this deployment yet — the operator sets KARMAX_HOSTED_MAIL_DOMAIN once. Until then use your own domain, or the local test address.',
+        ? `Connected. Agents get addresses on ${domain} — no DNS to manage.`
+        : 'Enter the domain your inbound-email service handles and its API key. One-time; then every organization gets an address automatically.',
     };
   }
   connect(input: ConnectInput): ConnectResult {
-    if (!process.env.KARMAX_HOSTED_MAIL_DOMAIN) return { status: 'unavailable', detail: 'hosted mailbox is not enabled on this deployment (operator sets KARMAX_HOSTED_MAIL_DOMAIN)' };
-    if (!input.apiKey?.trim()) return { status: 'unavailable', detail: 'paste the managed inbound-email API key' };
-    // The key is stored in the vault by the caller; here we just record that it
-    // exists and the domain to mint on.
-    return { status: 'connected', detail: 'Connected. Every organization now gets a working agent address automatically.', config: { provider: this.name, hostedDomain: process.env.KARMAX_HOSTED_MAIL_DOMAIN } };
+    const domain = input.domain?.trim().replace(/^@/, '').toLowerCase();
+    if (!domain || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain)) return { status: 'unavailable', detail: 'enter the domain your inbound-email service handles, e.g. mail.yoursite.com' };
+    if (!input.apiKey?.trim()) return { status: 'unavailable', detail: 'paste your inbound-email API key' };
+    // The key is stored in the vault by the caller; we record the mint domain.
+    return { status: 'connected', detail: 'Connected. Every organization now gets a working agent address automatically.', config: { provider: this.name, hostedDomain: domain } };
   }
   domainFor(config: MailboxConfig): string | undefined {
-    return config.hostedDomain || process.env.KARMAX_HOSTED_MAIL_DOMAIN || undefined;
+    return config.hostedDomain || undefined;
   }
 }
 

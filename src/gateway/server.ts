@@ -2502,7 +2502,8 @@ export class Gateway {
               if (action === 'connect') { connectors.connect(connName[1]!, String(b.secret ?? '')); return this.json(res, 200, { connected: true }); }
               if (action === 'config') return this.json(res, 200, connectors.setConfig(connName[1]!, { writeBack: !!b.writeBack }));
               if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
-              if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : []));
+              if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],
+                { policy: b.policy, writeBack: typeof b.writeBack === 'boolean' ? b.writeBack : undefined }));
               if (action === 'write-back') return this.json(res, 200, (await connectors.writeBack(connName[1]!, String(b.itemId ?? ''))) ?? { skipped: 'write-back disabled for this connector' });
             } catch (e) {
               return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });

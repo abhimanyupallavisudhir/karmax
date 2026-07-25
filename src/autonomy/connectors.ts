@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CredentialBroker } from './broker.js';
-import { VaultItems, VaultItemType, VaultFieldName } from './vault-items.js';
+import { VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
 
 const pexec = promisify(execFile);
 
@@ -36,6 +36,8 @@ export interface ExternalItem {
   label: string;
   username?: string;
   domains?: string[];
+  /** Grouping for the import UI (folder/collection/vault); '' = ungrouped. */
+  folder?: string;
   /** Secret fields available to pull (so the UI can preview what arrives). */
   fields: VaultFieldName[];
 }
@@ -94,8 +96,12 @@ export class BitwardenConnector implements CredentialConnector {
     }
   }
   async list(): Promise<ExternalItem[]> {
-    const items = JSON.parse(await this.exec('bw', ['list', 'items'], { env: this.env() })) as any[];
-    return items.map((it) => normalizeBitwarden(it)).filter((x): x is ExternalItem => !!x);
+    const [items, folders] = await Promise.all([
+      this.exec('bw', ['list', 'items'], { env: this.env() }).then((s) => JSON.parse(s) as any[]),
+      this.exec('bw', ['list', 'folders'], { env: this.env() }).then((s) => JSON.parse(s) as any[]).catch(() => []),
+    ]);
+    const folderName = new Map<string, string>(folders.map((f: any) => [f.id, f.name]));
+    return items.map((it) => normalizeBitwarden(it, folderName.get(it.folderId) ?? '')).filter((x): x is ExternalItem => !!x);
   }
   async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
     const wanted = new Set(externalIds);
@@ -103,7 +109,7 @@ export class BitwardenConnector implements CredentialConnector {
     const out: ExternalSecretItem[] = [];
     for (const it of items) {
       if (!wanted.has(it.id)) continue;
-      const norm = normalizeBitwarden(it);
+      const norm = normalizeBitwarden(it, '');
       if (!norm) continue;
       const secrets: Partial<Record<VaultFieldName, string>> = {};
       if (it.login?.password) secrets.password = it.login.password;
@@ -127,13 +133,13 @@ export class BitwardenConnector implements CredentialConnector {
   }
 }
 
-function normalizeBitwarden(it: any): ExternalItem | undefined {
+function normalizeBitwarden(it: any, folder: string): ExternalItem | undefined {
   if (it.type === 1 && it.login) {
     const domains = (it.login.uris ?? []).map((u: any) => hostOf(u?.uri)).filter(Boolean);
     return { externalId: it.id, type: 'login', label: it.name ?? 'login', username: it.login.username ?? undefined,
-      domains, fields: ['password', ...(it.login.totp ? (['totp'] as VaultFieldName[]) : [])] };
+      domains, folder, fields: ['password', ...(it.login.totp ? (['totp'] as VaultFieldName[]) : [])] };
   }
-  if (it.type === 2) return { externalId: it.id, type: 'note', label: it.name ?? 'note', fields: ['note'] };
+  if (it.type === 2) return { externalId: it.id, type: 'note', label: it.name ?? 'note', folder, fields: ['note'] };
   return undefined; // cards/identities out of scope for v1
 }
 
@@ -151,14 +157,14 @@ export class OnePasswordConnector implements CredentialConnector {
       await this.exec('op', ['whoami', '--format=json'], { env: this.env() });
       return { name: this.name, label: '1Password', available: true, canPush: true, detail: 'service account connected' };
     } catch {
-      return { name: this.name, label: '1Password', available: false, canPush: true, detail: 'set a 1Password service-account token in Connectors (needs the `op` CLI)' };
+      return { name: this.name, label: '1Password', available: false, canPush: true, detail: 'paste a 1Password service-account token to connect (needs the `op` CLI on this host)' };
     }
   }
   async list(): Promise<ExternalItem[]> {
     const items = JSON.parse(await this.exec('op', ['item', 'list', '--format=json'], { env: this.env() })) as any[];
     return items.map((it) => ({ externalId: it.id, type: categoryType(it.category), label: it.title ?? 'item',
       domains: (it.urls ?? []).map((u: any) => hostOf(u?.href)).filter(Boolean),
-      fields: itemFieldsFor(categoryType(it.category)) }));
+      folder: it.vault?.name ?? '', fields: itemFieldsFor(categoryType(it.category)) }));
   }
   async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
     const out: ExternalSecretItem[] = [];
@@ -220,8 +226,13 @@ export class PassConnector implements CredentialConnector {
   async list(): Promise<ExternalItem[]> {
     // `pass git ls-files`-free enumeration: the tree is under ~/.password-store.
     const raw = await this.exec('pass', ['ls']);
-    return parsePassTree(raw).map((entry) => ({ externalId: entry, type: 'login' as const, label: entry,
-      domains: [hostOf(entry)].filter(Boolean) as string[], fields: ['password'] }));
+    return parsePassTree(raw).map((entry) => {
+      const slash = entry.lastIndexOf('/');
+      return { externalId: entry, type: 'login' as const,
+        label: slash >= 0 ? entry.slice(slash + 1) : entry,
+        folder: slash >= 0 ? entry.slice(0, slash) : '',
+        domains: [hostOf(entry)].filter(Boolean) as string[], fields: ['password'] as VaultFieldName[] };
+    });
   }
   async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
     const out: ExternalSecretItem[] = [];
@@ -417,9 +428,10 @@ export class Connectors {
    * rather than duplicating; new items start with the connector's policy
    * defaults (`use: auto`, `reveal: ask`).
    */
-  async sync(name: string, externalIds: string[]): Promise<{ count: number; itemIds: string[] }> {
+  async sync(name: string, externalIds: string[], opts: { policy?: Partial<VaultItemPolicy>; writeBack?: boolean } = {}): Promise<{ count: number; itemIds: string[] }> {
     const connector = this.get(name);
     if (!connector) throw new Error(`no connector "${name}"`);
+    if (opts.writeBack !== undefined) this.setConfig(name, { writeBack: opts.writeBack });
     const pulled = await connector.pull(externalIds);
     const source = `connector:${name}`;
     const itemIds: string[] = [];
@@ -431,6 +443,9 @@ export class Connectors {
         label: ext.label,
         domains: ext.domains,
         username: ext.username,
+        // Apply the chosen import policy to NEW items only; a re-sync must not
+        // clobber a policy the user has since tuned on an existing item.
+        ...(existing ? {} : { policy: opts.policy }),
         secrets: ext.secrets,
         provenance: { source, externalId: ext.externalId },
       });

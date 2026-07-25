@@ -21,13 +21,11 @@ describe('mailbox providers (§8: connect once, not an env var)', () => {
     expect(p.describe({ domain: 'agents.myco.com' }).connected).toBe(true);
   });
 
-  it('hosted: gated on the deployment enabling it, then connects with one key', () => {
+  it('hosted: operator enters both the domain and the API key (no env var)', () => {
     const p = new HostedMailboxProvider();
-    delete process.env.KARMAX_HOSTED_MAIL_DOMAIN;
-    expect(p.connect({ apiKey: 'k' }).status).toBe('unavailable');
-    process.env.KARMAX_HOSTED_MAIL_DOMAIN = 'mail.karmax.app';
-    expect(p.connect({}).status).toBe('unavailable'); // needs the key
-    const ok = p.connect({ apiKey: 'secret-key' });
+    expect(p.connect({ apiKey: 'k' }).status).toBe('unavailable'); // needs a domain
+    expect(p.connect({ domain: 'mail.karmax.app' }).status).toBe('unavailable'); // needs the key
+    const ok = p.connect({ domain: 'Mail.Karmax.App', apiKey: 'secret-key' });
     expect(ok.status).toBe('connected');
     expect(ok.config).toEqual({ provider: 'hosted', hostedDomain: 'mail.karmax.app' });
     expect(p.domainFor({ provider: 'hosted', hostedDomain: 'mail.karmax.app' })).toBe('mail.karmax.app');

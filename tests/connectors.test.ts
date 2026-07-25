@@ -103,6 +103,14 @@ describe('pass connector', () => {
     const exec: any = async () => { throw new Error('gpg: decryption failed: No secret key'); };
     await expect(new PassConnector(exec).pull(['x'])).rejects.toThrow(/GPG key is locked/);
   });
+  it('exposes folder + basename label for grouping in the import UI', async () => {
+    const exec = scriptedExec({ 'pass ls': 'Password Store\n├── alts\n│   └── stackexchange.com\n└── email.com' });
+    const list = await new PassConnector(exec).list();
+    const se = list.find((i) => i.externalId === 'alts/stackexchange.com')!;
+    expect(se.folder).toBe('alts');
+    expect(se.label).toBe('stackexchange.com');
+    expect(list.find((i) => i.externalId === 'email.com')!.folder).toBe('');
+  });
 });
 
 describe('Connectors sync into the vault (§9)', () => {
@@ -128,6 +136,20 @@ describe('Connectors sync into the vault (§9)', () => {
     const second = await connectors.sync('bitwarden', ['bw1']);
     expect(second.itemIds).toEqual(first.itemIds); // same item id, updated in place
     expect(items.list().filter((i) => i.provenance.externalId === 'bw1')).toHaveLength(1);
+  });
+
+  it('import options apply the chosen policy + write-back to NEW items only', async () => {
+    const { items, store, broker } = makeVault();
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(new BitwardenConnector(() => 'sess', exec));
+    const { itemIds } = await connectors.sync('bitwarden', ['bw1'], { policy: { use: 'ask', reveal: 'never' }, writeBack: true });
+    const vi = items.get(itemIds[0]!)!;
+    expect(vi.policy).toEqual({ use: 'ask', reveal: 'never' });
+    expect(connectors.config('bitwarden').writeBack).toBe(true);
+    // the user later relaxes the policy; a re-sync must NOT clobber it back
+    items.setPolicy(vi.id, { use: 'auto' });
+    await connectors.sync('bitwarden', ['bw1'], { policy: { use: 'ask', reveal: 'never' } });
+    expect(items.get(vi.id)!.policy.use).toBe('auto');
   });
 
   it('updateSecret is field-level: pass rewrites only line 1, keeping notes', async () => {

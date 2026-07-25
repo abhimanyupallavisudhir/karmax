@@ -51,7 +51,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access or report a wrong secret; body {itemId?|domain?, field?, mode?, kind?: access|reset, why})',
     'POST /api/vault/requests/:id/resolve (human: body {action: once|task|always|deny, itemId?})',
     'GET /api/vault/connectors (Bitwarden/1Password/pass mirror status)',
-    'POST /api/vault/connectors/:name/connect|config|list|sync|write-back (selective mirror + opt-in write-back)',
+    'POST /api/vault/connectors/:name/connect|config|list|sync|write-back (selective mirror + opt-in write-back; sync body {externalIds, policy?, writeBack?}; list items carry folder for grouping)',
     'POST /api/vault/passkey/enroll|save|login|release (agent-enrolled passkeys via CDP virtual authenticator)',
   ],
   agentMail: [

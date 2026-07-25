@@ -6768,8 +6768,7 @@ function globalSettingsView(embedded = false) {
     ${quickSettingsForms('global')}
     ${authorizationCard('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
-    ${vaultCard()}
-    ${connectorsCard()}
+    ${passwordsCard()}
     ${vaultRequestsCard()}
     ${mailboxProviderCard()}
     ${agentMailCard()}
@@ -6992,25 +6991,37 @@ const VAULT_SECRET_LABELS = {
   env: [['env', '.env contents (KEY=VALUE per line)']],
   note: [['note', 'note']],
 };
-function vaultCard() {
+// Short label + click-to-expand explanation for the two per-item policies.
+const POL_USE_TIP = 'Blind use = the agent fills this into a login form or gets it as an environment variable, but never sees the secret text itself. “ask” makes it request your approval each time.';
+const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
+function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" onclick="alert(this.getAttribute('title'))">ⓘ</span>`; }
+
+function passwordsCard() {
   return `<div class="card" id="vault-card">
-    <div class="section-h">Credential vault <span class="chip">organization resource</span></div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Site logins, API keys, SSH keys, and .env bags agents may use on your behalf. Secrets are encrypted at rest and <b>write-only</b> here; agents use them through grants you attach per task (or approve when an agent asks). Policy <b>use</b> covers browser fill and env injection (the agent never sees the secret); <b>reveal</b> is plaintext to the agent.</p>
-    <div class="vault-items-list" style="margin-bottom:12px">Loading…</div>
-    <div style="font-weight:600;margin-bottom:4px">Add an item</div>
-    <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap">
-      <select class="vi-type">${Object.keys(VAULT_SECRET_LABELS).map((t) => `<option>${t}</option>`).join('')}</select>
-      <input class="vi-label" placeholder="label (e.g. GitHub — alice)" style="flex:1;min-width:140px" />
-      <input class="vi-domains" placeholder="domains (e.g. github.com)" style="flex:1;min-width:140px" />
-      <input class="vi-username" placeholder="username" style="min-width:120px" />
-      <input class="vi-envvar" placeholder="env var (api/ssh keys)" style="min-width:140px;display:none" />
-    </div></div>
-    <div class="vault-secret-rows"></div>
-    <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <label style="font-size:12px">use <select class="vi-use"><option>auto</option><option>ask</option></select></label>
-      <label style="font-size:12px">reveal <select class="vi-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
-      <button class="btn primary vi-add">Add to vault</button>
-    </div></div>
+    <div class="section-h">Passwords <span class="chip">organization resource</span></div>
+    <div class="vault-items-list" style="margin-bottom:14px">Loading…</div>
+
+    <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
+      ${policyTip('karmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
+    <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
+
+    <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
+      <div style="margin-top:8px">
+      <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap">
+        <select class="vi-type">${Object.keys(VAULT_SECRET_LABELS).map((t) => `<option>${t}</option>`).join('')}</select>
+        <input class="vi-label" placeholder="label (e.g. GitHub — alice)" style="flex:1;min-width:140px" />
+        <input class="vi-domains" placeholder="domains (e.g. github.com)" style="flex:1;min-width:140px" />
+        <input class="vi-username" placeholder="username" style="min-width:120px" />
+        <input class="vi-envvar" placeholder="env var (api/ssh keys)" style="min-width:140px;display:none" />
+      </div></div>
+      <div class="vault-secret-rows"></div>
+      <div class="form-row"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="vi-use"><option>auto</option><option>ask</option></select></label>
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="vi-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+        <button class="btn primary vi-add">Add</button>
+      </div></div>
+      </div>
+    </details>
   </div>`;
 }
 function vaultRequestsCard() {
@@ -7039,16 +7050,18 @@ async function wireVaultCards(organizationId) {
     let items = [];
     try { items = await api(`/api/vault/items${oq}`); } catch {}
     const list = box.querySelector('.vault-items-list');
+    const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
+      : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
     list.innerHTML = items.length
       ? items.map((i) => `<div class="queue-item" data-vi="${esc(i.id)}">
-          <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span>
+          <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
             ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
-            <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}${i.provenance?.source?.startsWith('task:') ? ' · created by an agent' : ''} · secrets: ${esc((i.fields || []).join(', ') || 'none')}</div></div>
-          <label style="font-size:11px">use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          <label style="font-size:11px">reveal <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+            <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
+          <label style="font-size:11px" title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <label style="font-size:11px" title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
           <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button></div>`).join('')
-      : '<span style="color:var(--ink-3)">No vault items yet.</span>';
+      : '<span style="color:var(--ink-3)">No passwords yet — sync from a password manager below, or add one by hand.</span>';
     list.querySelectorAll('[data-vi]').forEach((row) => {
       const item = items.find((x) => x.id === row.dataset.vi);
       const savePolicy = async () => {
@@ -7076,6 +7089,79 @@ async function wireVaultCards(organizationId) {
     }));
     return items;
   };
+  // ── connectors row: connect a store, then open the full import panel ──
+  const renderConnectors = async () => {
+    const list = box.querySelector('.connectors-list');
+    if (!list) return;
+    let conns = [];
+    try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return; }
+    list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
+      <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
+        <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}</div></div>
+      ${c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : 'op service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
+      <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
+      || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
+    list.querySelectorAll('[data-conn]').forEach((row) => {
+      const name = row.dataset.conn;
+      row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
+        try { await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) }); toast('Connected'); renderConnectors(); } catch (e) { toast(e.message, true); }
+      });
+      row.querySelector('[data-conn-import]')?.addEventListener('click', () => openImportPanel(name, conns.find((c) => c.name === name)));
+    });
+  };
+  // The full-fledged import interface (mass select by folder / all, choose the
+  // import policy + write-back once for everything selected).
+  const openImportPanel = async (name, conn) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal-card" style="max-width:640px;width:92%">
+      <div class="section-h">Import from ${esc(conn?.label || name)}</div>
+      <div class="import-tree" style="max-height:46vh;overflow:auto;border:1px solid var(--line,#333);border-radius:8px;padding:8px;margin-bottom:10px">Loading…</div>
+      <div class="form-row" style="display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+        <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px"><input type="checkbox" class="imp-all"/> Select all</label>
+        <span style="flex:1"></span>
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option>auto</option><option>ask</option></select></label>
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+        ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px">
+        <button class="btn sm" data-imp-cancel>Cancel</button>
+        <button class="btn sm primary" data-imp-go>Import selected</button>
+      </div></div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('[data-imp-cancel]').addEventListener('click', close);
+    const tree = overlay.querySelector('.import-tree');
+    let ext = [];
+    try { ext = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' }); }
+    catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
+    if (!ext.length) { tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import.</span>'; return; }
+    const folders = {};
+    ext.forEach((i) => { (folders[i.folder || ''] = folders[i.folder || ''] || []).push(i); });
+    tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:6px">
+      ${f ? `<label style="display:flex;gap:6px;align-items:center;font-weight:600;font-size:12px"><input type="checkbox" class="imp-folder-all"/> 📁 ${esc(f)}</label>` : ''}
+      <div style="margin-left:${f ? '18px' : '0'}">${folders[f].map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0">
+        <input type="checkbox" class="imp-pick" value="${esc(i.externalId)}"/> ${esc(i.label)}
+        <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div></div>`).join('');
+    overlay.querySelector('.imp-all').addEventListener('change', (e) => tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)));
+    tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked))));
+    overlay.querySelector('[data-imp-go]').addEventListener('click', async () => {
+      const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
+      if (!externalIds.length) { toast('Select at least one', true); return; }
+      try {
+        const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
+          externalIds,
+          policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
+          ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+        }) });
+        toast(`Imported ${r.count} item(s)`);
+        close();
+        renderItems();
+        renderConnectors();
+      } catch (e) { toast(e.message, true); }
+    });
+  };
   box.querySelector('.vi-add').addEventListener('click', async () => {
     const secrets = {};
     box.querySelectorAll('.vi-secret').forEach((el) => { if (el.value) secrets[el.dataset.field] = el.value; });
@@ -7090,7 +7176,7 @@ async function wireVaultCards(organizationId) {
         secrets,
       }) });
       box.querySelectorAll('.vi-label,.vi-domains,.vi-username,.vi-envvar,.vi-secret').forEach((el) => (el.value = ''));
-      toast('Added to the vault');
+      toast('Added');
       await renderItems();
       renderRequests();
     } catch (e) { toast(e.message, true); }
@@ -7126,65 +7212,15 @@ async function wireVaultCards(organizationId) {
     })));
   };
   await renderItems();
+  await renderConnectors();
   await renderRequests();
-}
-
-// ── connectors: mirror an external password store into the vault (§9) ─────────
-function connectorsCard() {
-  return `<div class="card" id="connectors-card">
-    <div class="section-h">Password-store connectors <span class="chip">organization resource</span></div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Mirror selected items from Bitwarden, 1Password, or unix <code>pass</code> into the vault above. This is a <b>selective mirror</b>, not a live proxy — agents always resolve credentials from the karmax vault, so a store being down never blocks them. Connect the store's CLI (installed on this host), pick items, and sync.</p>
-    <div class="connectors-list">Loading…</div>
-  </div>`;
-}
-async function wireConnectorsCard(organizationId) {
-  const box = $('#connectors-card');
-  if (!box) return;
-  const oq = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
-  const list = box.querySelector('.connectors-list');
-  let conns = [];
-  try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3)">Connectors need a credential broker.</span>'; return; }
-  list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}" style="flex-wrap:wrap">
-    <div style="flex:1;min-width:180px"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not ready</span>'}
-      <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · last sync: ${c.config.lastSync.count} item(s)` : ''}</div></div>
-    ${c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : 'op service-account token'}" style="min-width:160px" /><button class="btn sm" data-conn-connect>Connect</button>`}
-    ${c.canPush ? `<label style="font-size:11px" title="Let agents push accounts they create back to this store"><input type="checkbox" class="conn-writeback" ${c.config?.writeBack ? 'checked' : ''}/> write-back</label>` : ''}
-    <button class="btn sm" data-conn-list ${c.available ? '' : 'disabled'}>Browse &amp; sync</button>
-    <div class="conn-items" style="flex-basis:100%;margin-top:6px"></div></div>`).join('')
-    || '<span style="color:var(--ink-3)">No connectors.</span>';
-  list.querySelectorAll('[data-conn]').forEach((row) => {
-    const name = row.dataset.conn;
-    row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
-      const secret = row.querySelector('.conn-secret').value;
-      try { await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret }) }); toast('Connected'); wireConnectorsCard(organizationId); } catch (e) { toast(e.message, true); }
-    });
-    row.querySelector('.conn-writeback')?.addEventListener('change', async (e) => {
-      try { await api(`/api/vault/connectors/${name}/config${oq}`, { method: 'POST', body: JSON.stringify({ writeBack: e.target.checked }) }); toast('Saved'); } catch (err) { toast(err.message, true); }
-    });
-    row.querySelector('[data-conn-list]')?.addEventListener('click', async () => {
-      const target = row.querySelector('.conn-items');
-      target.innerHTML = 'Loading…';
-      try {
-        const items = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' });
-        target.innerHTML = items.length
-          ? `<div style="max-height:200px;overflow:auto;border:1px solid var(--line,#333);border-radius:6px;padding:6px">${items.map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0"><input type="checkbox" class="conn-pick" value="${esc(i.externalId)}"/> ${esc(i.label)} <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div>
-            <button class="btn sm primary" data-conn-sync style="margin-top:6px">Sync selected</button>`
-          : '<span style="color:var(--ink-3)">No mirrorable items.</span>';
-        target.querySelector('[data-conn-sync]')?.addEventListener('click', async () => {
-          const externalIds = [...target.querySelectorAll('.conn-pick:checked')].map((b) => b.value);
-          if (!externalIds.length) { toast('Select items first', true); return; }
-          try { const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({ externalIds }) }); toast(`Mirrored ${r.count} item(s)`); wireVaultCards(organizationId); wireConnectorsCard(organizationId); } catch (e) { toast(e.message, true); }
-        });
-      } catch (e) { target.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; }
-    });
-  });
 }
 
 // ── mailbox provider: connect an email backend once for the whole install ─────
 function mailboxProviderCard() {
   return `<div class="card" id="mailbox-provider-card">
-    <div class="section-h">Agent email service <span class="chip">installation-wide</span></div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect an email backend <b>once</b> and every organization automatically gets a working agent address — no per-user setup. <b>Your own domain</b>: enter a domain you control and forward its mail to karmax. <b>Hosted mailbox</b>: connect a managed service with one key, zero DNS.</p>
+    <div class="section-h">Agent email <span class="chip">installation-wide</span></div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents that sign up for accounts need an email address to receive confirmation codes. Set one up here <b>once</b> — every organization then gets its own address automatically.</p>
     <div class="mailbox-providers">Loading…</div>
   </div>`;
 }
@@ -7193,19 +7229,20 @@ async function wireMailboxProviderCard() {
   if (!box) return;
   const list = box.querySelector('.mailbox-providers');
   let data = { providers: [], active: null, domain: null };
-  try { data = await api('/api/agent-mail/providers'); } catch { box.remove(); return; } // no settings:write ⇒ hidden
-  list.innerHTML = data.providers.map((p) => `<div class="queue-item" data-mp="${esc(p.name)}" style="flex-wrap:wrap">
-    <div style="flex:1;min-width:180px"><b>${esc(p.label)}</b> ${p.name === data.active && p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">active</span>' : p.connected ? '<span class="chip">connected</span>' : ''}
+  try { data = await api('/api/agent-mail/providers'); } catch { box.remove(); return; } // no settings:write ⇒ hidden (not the operator)
+  list.innerHTML = data.providers.map((p) => `<div class="queue-item" data-mp="${esc(p.name)}" style="flex-wrap:wrap;align-items:flex-start">
+    <div style="flex:1;min-width:160px"><b>${esc(p.label)}</b> ${p.name === data.active && p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">active</span>' : p.connected ? '<span class="chip">connected</span>' : ''}
       <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
-    ${p.kind === 'domain'
-      ? `<input class="mp-input" placeholder="agents.yourcompany.com" style="min-width:180px" /><button class="btn sm" data-mp-connect>Use this domain</button>`
-      : `<input class="mp-input" type="password" placeholder="managed inbound-email API key" style="min-width:180px" /><button class="btn sm" data-mp-connect>Connect</button>`}
-    </div>`).join('') || '<span style="color:var(--ink-3)">No mailbox providers.</span>';
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      ${p.kind === 'domain'
+        ? `<input class="mp-domain" placeholder="agents.yourcompany.com" style="min-width:180px" />`
+        : `<input class="mp-domain" placeholder="mail.yoursite.com" style="min-width:150px" /><input class="mp-key" type="password" placeholder="API key" style="min-width:140px" />`}
+      <button class="btn sm" data-mp-connect>${p.connected ? 'Update' : 'Set up'}</button>
+    </div></div>`).join('') || '<span style="color:var(--ink-3)">No mailbox providers.</span>';
   list.querySelectorAll('[data-mp]').forEach((row) => {
     row.querySelector('[data-mp-connect]')?.addEventListener('click', async () => {
       const name = row.dataset.mp;
-      const val = row.querySelector('.mp-input').value.trim();
-      const body = { provider: name, ...(name === 'self-managed' ? { domain: val } : { apiKey: val }) };
+      const body = { provider: name, domain: row.querySelector('.mp-domain')?.value.trim(), apiKey: row.querySelector('.mp-key')?.value.trim() };
       try {
         const r = await api('/api/agent-mail/connect', { method: 'POST', body: JSON.stringify(body) });
         if (r.status === 'connected') { toast(r.detail || 'Connected'); wireMailboxProviderCard(); }
@@ -7521,7 +7558,6 @@ function wireGlobalSettings(organizationId) {
   hydrateWorkflows();
   hydrateGitProfiles();
   wireVaultCards(organizationId);
-  wireConnectorsCard(organizationId);
   wireMailboxProviderCard();
   wireAgentMailCard(organizationId);
   wirePaymentsCard('global', undefined, organizationId);
