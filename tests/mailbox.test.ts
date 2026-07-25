@@ -39,7 +39,9 @@ describe('mailbox providers (§8: connect once, not an env var)', () => {
     const r = defaultMailboxRegistry();
     expect(r.activeDomain({})).toBeUndefined();
     expect(r.activeDomain({ provider: 'self-managed', domain: 'x.com' })).toBe('x.com');
-    expect(r.list({}).map((p) => p.name).sort()).toEqual(['hosted', 'self-managed']);
+    expect(r.list({}).map((p) => p.name).sort()).toEqual(['agentmail', 'hosted', 'imap', 'self-managed']);
+    // pull providers are flagged so the UI can group them (work on localhost)
+    expect(r.list({}).filter((p) => p.pull).map((p) => p.name).sort()).toEqual(['agentmail', 'imap']);
   });
 });
 

@@ -258,6 +258,25 @@ async function main() {
   worldLifecycle.start();
   delivery.start();
 
+  // Agent-mail poll loop (PLAN-passwords.md §8): when a PULL provider (IMAP /
+  // AgentMail) is connected, karmax reaches OUT to fetch mail — so it works on a
+  // locally-hosted install with no public URL. Inert until a pull provider is set.
+  const { MailPoller } = await import('./autonomy/mail-pull.js');
+  const { AgentMail } = await import('./autonomy/agent-mail.js');
+  const readMailboxConfig = () => { try { return JSON.parse(store.kvGet('agent-mail:provider') ?? '{}'); } catch { return {}; } };
+  const mailPoller = new MailPoller({
+    store,
+    readConfig: readMailboxConfig,
+    resolveSecret: (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
+    makeIngest: (config) => {
+      const domain = config.domain || config.hostedDomain || config.agentmailDomain || config.fixedAddress?.split('@')[1];
+      const fixedLocal = config.fixedAddress?.split('@')[0];
+      const mail = new AgentMail(store, domain, fixedLocal);
+      return (msg) => mail.ingest(msg);
+    },
+  });
+  mailPoller.start();
+
   // Self-healing loop (SPEC §4.4): when a workflow-edit PR merges (its merge-only
   // task reaches done), reload the edited workflow from its repo so new tasks pick
   // up the published version. Runs in this process (not inside a workflow), so
@@ -358,6 +377,7 @@ async function main() {
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
+    mailPoller.stop();
     worldLifecycle.stop();
     delivery.stop();
     await step(closeGateway());

@@ -7237,28 +7237,39 @@ async function wireMailboxProviderCard() {
   const list = box.querySelector('.mailbox-providers');
   let data = { providers: [], active: null, domain: null, webhookUrl: '', cloudflareWorker: '' };
   try { data = await api('/api/agent-mail/providers'); } catch { box.remove(); return; } // no settings:write ⇒ hidden (not the operator)
-  const steps = {
-    'self-managed': `<b>1.</b> Enter a domain (or subdomain) you own. <b>2.</b> In its DNS host, route inbound email to karmax — on Cloudflare: Email Routing → catch-all → “Send to Worker”, using the worker below (Copy, paste, deploy — done).`,
-    hosted: `<b>1.</b> Sign up with an inbound-email service (CloudMailin, Postmark, Mailgun…) — they give you an <b>address or domain on their domain</b>, no DNS needed. <b>2.</b> Paste it here. <b>3.</b> Paste karmax’s webhook URL (below) into their “deliver to URL” setting.`,
+  // Per-provider input fields (values collected on connect) and one-line steps.
+  const fieldsFor = (p) => {
+    if (p.name === 'agentmail') return `<input class="mp-domain" placeholder="yourhandle.agentmail.to" style="min-width:170px" /><input class="mp-key" type="password" placeholder="AgentMail API key" style="min-width:150px" />`;
+    if (p.name === 'imap') return `<input class="mp-address" placeholder="youragent@gmail.com" style="min-width:170px" /><input class="mp-key" type="password" placeholder="password / app-password" style="min-width:150px" /><input class="mp-host" placeholder="IMAP host (auto)" style="min-width:130px" />`;
+    if (p.kind === 'domain') return `<input class="mp-domain" placeholder="agents.yourcompany.com" style="min-width:180px" /><button class="btn sm" data-mp-worker>Copy Cloudflare Worker</button>`;
+    return `<input class="mp-domain" placeholder="address or domain they gave you" style="min-width:200px" /><input class="mp-key" type="password" placeholder="API key (optional)" style="min-width:130px" />`;
   };
-  list.innerHTML = data.providers.map((p) => `<div class="queue-item" data-mp="${esc(p.name)}" style="flex-wrap:wrap;align-items:flex-start">
-    <div style="flex:1;min-width:220px"><b>${esc(p.label)}</b> ${p.name === data.active && p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">active</span>' : p.connected ? '<span class="chip">connected</span>' : ''}
+  const steps = {
+    agentmail: `Built for agents; <b>works on localhost</b>. Sign up at <b>agentmail.to</b>, paste your API key + assigned domain. karmax makes one real inbox per organization and pulls the mail.`,
+    imap: `<b>Works on localhost</b>, no vendor. Connect any mailbox (a spare Gmail with an <b>app-password</b> is easiest). karmax polls it; organizations get +tagged sub-addresses.`,
+    'self-managed': `Needs karmax reachable from the internet. Enter a domain you own; on Cloudflare use Email Routing → catch-all → “Send to Worker” with the worker below.`,
+    hosted: `Needs karmax reachable from the internet. Sign up with an inbound-email service; paste what they gave you, and paste karmax’s webhook URL (below) into their “deliver to URL”.`,
+  };
+  const section = (title, hint, providers) => providers.length ? `<div style="font-weight:600;font-size:12px;margin:10px 0 4px">${title} <span style="color:var(--ink-3);font-weight:400">${hint}</span></div>` + providers.map((p) => `<div class="queue-item" data-mp="${esc(p.name)}" style="flex-wrap:wrap;align-items:flex-start">
+    <div style="flex:1;min-width:200px"><b>${esc(p.label)}</b> ${p.name === data.active && p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">active</span>' : p.connected ? '<span class="chip">connected</span>' : ''}
       <div class="task-sub" style="color:var(--ink-3)">${steps[p.name] || esc(p.help || '')}</div></div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-      ${p.kind === 'domain'
-        ? `<input class="mp-domain" placeholder="agents.yourcompany.com" style="min-width:180px" /><button class="btn sm" data-mp-worker>Copy Cloudflare Worker</button>`
-        : `<input class="mp-domain" placeholder="address or domain they gave you" style="min-width:200px" /><input class="mp-key" type="password" placeholder="API key (optional)" style="min-width:130px" />`}
-      <button class="btn sm" data-mp-connect>${p.connected ? 'Update' : 'Set up'}</button>
-    </div></div>`).join('') || '<span style="color:var(--ink-3)">No mailbox providers.</span>';
-  list.insertAdjacentHTML('beforeend', `<div style="margin-top:8px">
-    <div style="font-size:12px;color:var(--ink-2);margin-bottom:3px">karmax’s webhook — where the mail service must deliver (secret included):</div>
-    <div style="display:flex;gap:6px"><input readonly class="mono mp-webhook" value="${esc(data.webhookUrl)}" style="flex:1;font-size:11px" /><button class="btn sm" data-mp-copyhook>Copy</button></div></div>`);
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${fieldsFor(p)}<button class="btn sm" data-mp-connect>${p.connected ? 'Update' : 'Set up'}</button></div></div>`).join('') : '';
+  const pull = data.providers.filter((p) => p.pull), push = data.providers.filter((p) => !p.pull);
+  list.innerHTML = (section('Pull', '— karmax fetches the mail; works anywhere, including a local install', pull)
+    + section('Push', '— the mail service delivers to karmax; needs a public URL', push)) || '<span style="color:var(--ink-3)">No mailbox providers.</span>';
+  if (push.length) list.insertAdjacentHTML('beforeend', `<div style="margin-top:8px">
+    <div style="font-size:12px;color:var(--ink-2);margin-bottom:3px">Webhook URL for the push options — where the mail service delivers (secret included):</div>
+    <div style="display:flex;gap:6px"><input readonly class="mono" value="${esc(data.webhookUrl)}" style="flex:1;font-size:11px" /><button class="btn sm" data-mp-copyhook>Copy</button></div></div>`);
   box.querySelector('[data-mp-copyhook]')?.addEventListener('click', () => { navigator.clipboard.writeText(data.webhookUrl); toast('Webhook URL copied'); });
   list.querySelectorAll('[data-mp]').forEach((row) => {
     row.querySelector('[data-mp-worker]')?.addEventListener('click', () => { navigator.clipboard.writeText(data.cloudflareWorker); toast('Worker script copied — paste it into a Cloudflare Email Worker'); });
     row.querySelector('[data-mp-connect]')?.addEventListener('click', async () => {
       const name = row.dataset.mp;
-      const body = { provider: name, domain: row.querySelector('.mp-domain')?.value.trim(), apiKey: row.querySelector('.mp-key')?.value.trim() };
+      const body = { provider: name,
+        domain: row.querySelector('.mp-domain')?.value.trim(),
+        address: row.querySelector('.mp-address')?.value.trim(),
+        imapHost: row.querySelector('.mp-host')?.value.trim() || undefined,
+        apiKey: row.querySelector('.mp-key')?.value.trim() };
       try {
         const r = await api('/api/agent-mail/connect', { method: 'POST', body: JSON.stringify(body) });
         if (r.status === 'connected') { toast(r.detail || 'Connected'); wireMailboxProviderCard(); }

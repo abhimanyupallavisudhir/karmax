@@ -33,6 +33,7 @@
     "@temporalio/workflow": "^1.20.2",
     "better-auth": "^1.6.23",
     "e2b": "^2.33.0",
+    "imapflow": "^1.5.0",
     "node-pty": "^1.1.0",
     "tsx": "^4.19.2",
     "ws": "^8.18.0",

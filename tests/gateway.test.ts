@@ -739,7 +739,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
     const orgId = orgs[0]?.id;
     const providers: any = await (await fetch(`${base}/api/agent-mail/providers`, { headers: auth() })).json();
-    expect(providers.providers.map((p: any) => p.name).sort()).toEqual(['hosted', 'self-managed']);
+    expect(providers.providers.map((p: any) => p.name).sort()).toEqual(['agentmail', 'hosted', 'imap', 'self-managed']);
     const connect = await fetch(`${base}/api/agent-mail/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'self-managed', domain: 'agents.test.co' }) });
     expect(connect.status).toBe(200);
     // a fresh org now mints its address on the connected domain
@@ -749,6 +749,14 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     // an invalid domain is rejected with a clear reason, not stored
     const bad = await fetch(`${base}/api/agent-mail/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'self-managed', domain: 'nonsense' }) });
     expect(bad.status).toBe(400);
+    // pull providers are flagged so the UI can group them (work on localhost)
+    expect(providers.providers.find((p: any) => p.name === 'imap').pull).toBe(true);
+    expect(providers.providers.find((p: any) => p.name === 'self-managed').pull).toBe(false);
+    // connect a pull provider (IMAP): addresses ride +tags on the mailbox
+    const imapOk = await fetch(`${base}/api/agent-mail/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'imap', address: 'agentbox@gmail.com', apiKey: 'app-pass' }) });
+    expect(imapOk.status).toBe(200);
+    const imapAddr: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
+    expect(imapAddr.address).toMatch(/^agentbox\+agent-[0-9a-f]+@gmail\.com$/);
   });
 
   it('cards are organization-scoped: one org never sees or spends another\'s card', async () => {

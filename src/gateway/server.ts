@@ -2598,12 +2598,27 @@ export class Gateway {
         const b = await this.body(req);
         const provider = registry.get(String(b.provider ?? ''));
         if (!provider) return this.json(res, 400, { error: `unknown mailbox provider "${b.provider}"` });
-        const result = provider.connect({ domain: b.domain ? String(b.domain) : undefined, apiKey: b.apiKey ? String(b.apiKey) : undefined });
+        const result = provider.connect({
+          domain: b.domain ? String(b.domain) : undefined,
+          apiKey: b.apiKey ? String(b.apiKey) : undefined,
+          address: b.address ? String(b.address) : undefined,
+          imapHost: b.imapHost ? String(b.imapHost) : undefined,
+          imapPort: b.imapPort ? Number(b.imapPort) : undefined,
+          imapUser: b.imapUser ? String(b.imapUser) : undefined,
+          imapSecure: b.imapSecure === undefined ? undefined : b.imapSecure !== false,
+        });
         if (result.status === 'connected' && result.config) {
-          // A hosted API key is a secret → vault handle, never echoed/stored raw.
+          // Secrets (IMAP password / AgentMail or hosted key) go to the vault by
+          // handle, never echoed or stored raw. The handle name is provider-fixed
+          // so the poller can resolve it.
           let apiKeyHandle: string | undefined;
-          if (b.apiKey && this.deps.broker) { apiKeyHandle = 'mailbox:hosted:auth'; this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey)); }
-          this.setMailboxConfig({ ...this.mailboxConfig(), ...result.config, ...(apiKeyHandle ? { apiKeyHandle } : {}) });
+          if (b.apiKey && this.deps.broker) {
+            apiKeyHandle = b.provider === 'imap' ? 'mailbox:imap:pass' : b.provider === 'agentmail' ? 'mailbox:agentmail:auth' : 'mailbox:hosted:auth';
+            this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey));
+          }
+          // REPLACE (not merge): each provider fully specifies its own config, so
+          // switching providers can't leave a stale field shadowing the new one.
+          this.setMailboxConfig({ ...result.config, ...(apiKeyHandle && b.provider !== 'imap' ? { apiKeyHandle } : {}) });
         }
         return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
       }
@@ -3638,13 +3653,18 @@ export class Gateway {
     this.deps.store.kvSet('agent-mail:provider', JSON.stringify(config));
   }
   private mailboxDomain(): string | undefined {
-    // Resolve without importing the registry synchronously: self-managed keeps
-    // its domain in config; hosted keeps hostedDomain. Either is the mint domain.
-    const config = this.mailboxConfig();
-    return config.domain || config.hostedDomain || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
+    // The mint domain, resolved by the ACTIVE provider so a leftover field from a
+    // previous provider can't win: imap/hosted-fixed use the address host,
+    // agentmail its domain, hosted its domain, self-managed its domain.
+    const c = this.mailboxConfig();
+    if (c.provider === 'imap') return c.fixedAddress?.split('@')[1] || undefined;
+    if (c.provider === 'agentmail') return c.agentmailDomain || undefined;
+    if (c.provider === 'hosted') return c.hostedDomain || undefined;
+    if (c.provider === 'self-managed') return c.domain || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
+    return c.domain || c.hostedDomain || c.agentmailDomain || c.fixedAddress?.split('@')[1] || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
   }
-  /** The single-inbox base local part when the hosted provider issued one
-   *  fixed address (orgs then ride +tags on it); undefined otherwise. */
+  /** The single-inbox base local part when addresses ride +tags on one mailbox
+   *  (hosted fixed-address / IMAP); undefined for domain and AgentMail providers. */
   private mailboxFixedLocal(): string | undefined {
     return this.mailboxConfig().fixedAddress?.split('@')[0] || undefined;
   }

@@ -105,9 +105,10 @@ export function normalizeInbound(b: Record<string, any>): InboundFields {
   return { to: b.to, from: b.from, subject: b.subject, text: looksLikeMime(text) ? extractMimeText(text) : String(text) };
 }
 
-function stripHtml(html?: string): string {
+export function htmlToText(html?: string): string {
   return String(html ?? '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
 }
+const stripHtml = htmlToText;
 
 function looksLikeMime(text: unknown): text is string {
   return typeof text === 'string' && /^(?:[A-Za-z-]+:[^\n]*\r?\n)+\r?\n/.test(text) && /content-type:/i.test(text.slice(0, 4000));
