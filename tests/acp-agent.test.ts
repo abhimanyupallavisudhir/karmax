@@ -25,6 +25,7 @@ record({ env: {
   XDG_DATA_HOME: process.env.XDG_DATA_HOME,
   XAI_API_KEY: process.env.XAI_API_KEY,
   GROK_HOME: process.env.GROK_HOME,
+  KARMAX_CUSTODY_CHAIN: process.env.KARMAX_CUSTODY_CHAIN,
 } });
 let pendingPrompt;
 let terminalId;
@@ -84,7 +85,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     send({ jsonrpc: '2.0', id: 901, method: 'terminal/create', params: {
       sessionId: 'session-new',
       command: process.execPath,
-      args: ['-e', 'process.stdout.write("terminal-ok")'],
+      args: ['-e', 'process.stdout.write("terminal-ok:" + (process.env.KARMAX_CUSTODY_CHAIN || ""))'],
       outputByteLimit: 1024,
     } });
   } else if (msg.id === 901) {
@@ -178,14 +179,16 @@ describe('generic ACP agent adapter', () => {
     ]));
     const permission = records.find((r) => r.id === 900 && r.result);
     expect(permission.result.outcome).toMatchObject({ outcome: 'selected', optionId: 'yes' });
-    expect(records.find((r) => r.id === 903)?.result).toMatchObject({
-      output: 'terminal-ok',
+    const terminalResult = records.find((r) => r.id === 903)?.result;
+    expect(terminalResult).toMatchObject({
       truncated: false,
       exitStatus: { exitCode: 0 },
     });
     const env = records[0].env;
+    expect(terminalResult.output).toMatch(new RegExp(`^terminal-ok:${env.KARMAX_CUSTODY_CHAIN},[0-9a-f-]{36}$`, 'i'));
     expect(env.KIMI_API_KEY).toBe('secret-kimi-key');
     expect(env.XDG_DATA_HOME).toContain('/home/data');
+    expect(env.KARMAX_CUSTODY_CHAIN).toMatch(/[0-9a-f-]{36}$/i);
     expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT)).toMatchObject({
       model: 'kimi/k3',
       permission: { '*': 'allow' },

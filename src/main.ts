@@ -198,8 +198,8 @@ async function main() {
   await workerManager.start();
   console.log('  • Worker started');
 
-  // Process-tree custody (src/agent/custody.ts): reap any agent subprocess
-  // groups a prior incarnation left running after a SIGKILL/crash (systemd-oomd
+  // Process-tree custody (src/agent/custody.ts): reap any agent process scopes
+  // a prior incarnation left running after a SIGKILL/crash (systemd-oomd
   // was the July-5 OOM killer — no graceful teardown ran, so its orphaned
   // agents outlived the host). Only records whose owner process is dead are
   // orphans — agents owned by a live concurrent instance (see the duplicate-
@@ -208,8 +208,16 @@ async function main() {
   // very agent that booted it).
   const { reapOrphans } = await import('./agent/custody.js');
   const orphans = reapOrphans();
-  if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process group(s) from a prior run`);
+  if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process tree(s) from a prior run`);
   if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live karmax instance untouched`);
+  // A concurrently running dogfooding instance can die after this app has
+  // already booted. Sweep periodically so its detached agent/tool descendants
+  // do not wait until the next host restart to be reaped.
+  const orphanSweep = setInterval(() => {
+    const swept = reapOrphans();
+    if (swept.reaped) console.log(`  • Reaped ${swept.reaped} newly orphaned agent process tree(s)`);
+  }, 10_000);
+  orphanSweep.unref();
 
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
@@ -383,6 +391,7 @@ async function main() {
     // worker itself resolves within ~3s (shutdownGraceTime/shutdownForceTime).
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
+    clearInterval(orphanSweep);
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
     worldLifecycle.stop();

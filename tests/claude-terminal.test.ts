@@ -17,6 +17,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 import { ClaudeAdapter } from '../src/agent/claude.js';
+import { CUSTODY_ENV } from '../src/agent/custody.js';
 import { ProviderFailure } from '../src/agent/limits.js';
 import { remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 
@@ -56,6 +57,35 @@ describe('Claude Agent SDK terminal outcome contract', () => {
       alwaysLoad: true,
     });
     expect(sdkState.options.mcpServers.karmax_control).toMatchObject({ type: 'sdk', name: 'karmax_control' });
+  });
+
+  it('stamps locally spawned Claude processes with inherited custody', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-claude-custody-'));
+    const output = path.join(home, 'custody.txt');
+    const previousHome = process.env.KARMAX_HOME;
+    process.env.KARMAX_HOME = home;
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
+    try {
+      await new ClaudeAdapter().runTurn(input, ctx);
+      const child = sdkState.options.spawnClaudeCodeProcess({
+        command: process.execPath,
+        args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(output)}, process.env.${CUSTODY_ENV} || '')`],
+        cwd: home,
+        env: { ...process.env },
+        signal: new AbortController().signal,
+      });
+      await new Promise((resolve) => child.once('close', resolve));
+      expect(fs.readFileSync(output, 'utf8')).toMatch(/[0-9a-f-]{36}$/i);
+      const record = path.join(home, 'state', 'agents', `${child.pid}.json`);
+      const deadline = Date.now() + 2000;
+      while (fs.existsSync(record) && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(fs.existsSync(record)).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.KARMAX_HOME;
+      else process.env.KARMAX_HOME = previousHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('returns only after an explicit SDK success result', async () => {

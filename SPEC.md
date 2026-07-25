@@ -380,6 +380,8 @@ The task view reports the turn's resource boundaries separately: `waitingFor: ac
 
 Between turns — where all waits live — the agent is only a stored session ID. **RAM is consumed strictly during turns, never during waits**, regardless of whether a wait is five seconds or five hours. This is the fix for the naive "long-lived agent process" design that exhausts system resources.
 
+**Process custody follows the turn, not the original process group.** Local adapters stamp a unique, inherited custody ID into every agent process. Tools may freely create new sessions and process groups or launch a nested karmax, Temporal server, browser, test runner, or other long-lived subprocess; those descendants remain in the turn's custody scope. Normal turn release, cancellation, and recovery after a dead owner terminate the whole marked scope before removing its durable custody record. Nested turns append their ID rather than replacing the outer one, so ending either turn reaps the correct subtree. This is lifecycle ownership, not a restriction on what an agent may launch.
+
 **Yield only at turn boundaries.** Anything long the agent triggers (a 20-minute test suite, a build) becomes its own activity or child workflow so the agent's turn can end; a fresh turn resumes with the result. The agent never sits idle holding context.
 
 ### 7.3 Config homes under `~/.karmax`

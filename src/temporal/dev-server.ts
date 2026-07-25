@@ -8,6 +8,7 @@ import { Connection } from '@temporalio/client';
 import { findFreePortFrom, findFreePorts, isPortFree, waitForPort } from '../util/ports.js';
 import { withTimeout } from '../util/timeout.js';
 import { trackProcess } from '../util/processes.js';
+import { CUSTODY_ENV } from '../agent/custody.js';
 
 const execFileP = promisify(execFileCb);
 
@@ -186,6 +187,7 @@ async function unitMainPid(unit: string): Promise<number | undefined> {
  */
 async function spawnViaSystemdRun(args: string[], logPath: string): Promise<{ pid: number; unit: string } | undefined> {
   const unit = `karmax-temporal-${crypto.randomBytes(4).toString('hex')}`;
+  const custody = process.env[CUSTODY_ENV];
   try {
     await execFileP('systemd-run', [
       '--user',
@@ -195,6 +197,7 @@ async function spawnViaSystemdRun(args: string[], logPath: string): Promise<{ pi
       '--service-type=exec',
       `--property=StandardOutput=append:${logPath}`,
       `--property=StandardError=append:${logPath}`,
+      ...(custody ? [`--setenv=${CUSTODY_ENV}=${custody}`] : []),
       '--',
       TEMPORAL_BIN,
       ...args,

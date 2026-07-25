@@ -34,11 +34,12 @@ IMPLEMENTED NOW (this change):
   • Process-tree custody after SIGKILL (the crash half of #2 — the piece that actually
     would have stopped July-5's orphans). New src/agent/custody.ts: every directly-
     spawned agent is written as a pidfile under KARMAX_HOME/state/agents/<pid>.json;
-    codex now spawns DETACHED (own process group) and a mid-turn cancel kills the whole
-    GROUP with SIGTERM→SIGKILL escalation (so codex's descendant tool processes die too);
-    at BOOT, `reapOrphans()` (wired in main.ts) hard-kills any groups a prior incarnation
-    left running and clears the files. A /proc cmdline check guards against PID reuse —
-    where it can't verify (non-Linux) it clears the file without killing.
+    local agents carry an inherited custody chain, so cleanup crosses new process groups
+    and sessions created by shells, Chrome, nested karmax, and test Temporal servers;
+    normal release and cancellation use SIGTERM→SIGKILL escalation across the marked
+    scope, while boot-time and periodic `reapOrphans()` recover scopes whose karmax owner
+    died. Detached group kills remain the fallback for legacy records or scrubbed envs.
+    Exact inherited ids and /proc command checks guard against PID reuse.
   • Cancellation-delivery gap: the Claude Agent-SDK streaming path never heartbeated
     mid-turn, so Temporal could not deliver a cancel to a long SDK turn (codex/Messages
     already did). Added a 10s heartbeat timer to that path — real parity fix.

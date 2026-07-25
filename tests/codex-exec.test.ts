@@ -25,7 +25,7 @@ const outFile = oi >= 0 ? argv[oi + 1] : null;
 if (process.env.STUB_ARGV_OUT) {
   const imgs = [];
   for (let k = 0; k < argv.length; k++) if (argv[k] === '-i') { const pth = argv[k + 1]; imgs.push({ path: pth, exists: fs.existsSync(pth), size: fs.existsSync(pth) ? fs.statSync(pth).size : 0 }); }
-  fs.writeFileSync(process.env.STUB_ARGV_OUT, JSON.stringify({ argv, imgs }));
+  fs.writeFileSync(process.env.STUB_ARGV_OUT, JSON.stringify({ argv, imgs, custody: process.env.KARMAX_CUSTODY_CHAIN }));
 }
 const mode = process.env.STUB_MODE || 'ok';
 if (mode === 'limit') {
@@ -117,6 +117,7 @@ describe('CodexAdapter subscription path (codex exec)', () => {
       expect(rec.imgs.length).toBe(1);
       expect(rec.imgs[0].exists).toBe(true); // the file existed WHILE codex ran
       expect(rec.imgs[0].size).toBe(PNG.length);
+      expect(rec.custody).toMatch(/[0-9a-f-]{36}$/i);
       // …and was cleaned up after the turn finished.
       expect(fs.existsSync(rec.imgs[0].path)).toBe(false);
     } finally {

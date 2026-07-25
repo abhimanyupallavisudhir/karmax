@@ -21,7 +21,7 @@ import { apiKeyEnv, acpHomeEnv, credentialProvider, isAcpProvider, type AcpProvi
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { collectAcpImageBlocks } from './images.js';
 import { activityDetail } from './activity.js';
-import { registerAgent, unregisterAgent, killProcessGroup } from './custody.js';
+import { createCustodyEnv, registerAgent, unregisterAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import type { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 
@@ -33,6 +33,7 @@ interface HarnessSpec {
 
 interface AcpTerminal {
   child: ChildProcess;
+  custodyId: string;
   output: string;
   truncated: boolean;
   limit: number;
@@ -284,6 +285,8 @@ export class AcpAdapter implements AgentAdapter {
 
   async runTurn(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
     const spec = harnessSpec(input);
+    const custody = createCustodyEnv(spec.env);
+    spec.env = custody.env;
     const child = spawn(spec.command, spec.args, {
       cwd: input.world.handle.root,
       env: spec.env,
@@ -295,8 +298,15 @@ export class AcpAdapter implements AgentAdapter {
     child.stderr?.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4000); });
     child.on('error', () => {});
     if (child.pid) {
-      registerAgent({ pid: child.pid, cmd: path.basename(spec.command), provider: this.provider, taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });
-      child.once('exit', trackProcess({ pid: child.pid, kind: 'agent', label: `${this.provider} agent (${input.role})`, taskId: input.world.handle.id, startedAt: Date.now() }));
+      registerAgent({ pid: child.pid, cmd: path.basename(spec.command), provider: this.provider, taskId: input.world.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
+      child.once('exit', trackProcess({
+        pid: child.pid,
+        kind: 'agent',
+        label: `${this.provider} agent (${input.role})`,
+        taskId: input.world.handle.id,
+        startedAt: Date.now(),
+        kill: (signal) => void killAgent(child.pid, signal === 'SIGKILL' ? 0 : 2500, custody.custodyId),
+      }));
     }
 
     let sessionId: string | undefined;
@@ -331,9 +341,10 @@ export class AcpAdapter implements AgentAdapter {
           ...spec.env,
           ...Object.fromEntries((params.env ?? []).map((entry) => [entry.name, entry.value])),
         };
+        const terminalCustody = createCustodyEnv(env);
         const command = spawn(params.command, params.args ?? [], {
           cwd: params.cwd ?? input.world.handle.root,
-          env,
+          env: terminalCustody.env,
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true,
           detached: true,
@@ -342,6 +353,7 @@ export class AcpAdapter implements AgentAdapter {
         const exited = new Promise<{ exitCode?: number | null; signal?: string | null }>((resolve) => { resolveExit = resolve; });
         const terminal: AcpTerminal = {
           child: command,
+          custodyId: terminalCustody.custodyId,
           output: '',
           truncated: false,
           limit: Math.max(1, params.outputByteLimit ?? 1024 * 1024),
@@ -359,8 +371,15 @@ export class AcpAdapter implements AgentAdapter {
           }
         });
         if (command.pid) {
-          registerAgent({ pid: command.pid, cmd: path.basename(params.command), provider: `${this.provider}-terminal`, taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });
-          command.once('exit', trackProcess({ pid: command.pid, kind: 'terminal', label: `${this.provider} terminal`, taskId: input.world.handle.id, startedAt: Date.now() }));
+          registerAgent({ pid: command.pid, cmd: path.basename(params.command), provider: `${this.provider}-terminal`, taskId: input.world.handle.id, role: input.role, owner: process.pid, custodyId: terminalCustody.custodyId, startedAt: Date.now() });
+          command.once('exit', trackProcess({
+            pid: command.pid,
+            kind: 'terminal',
+            label: `${this.provider} terminal`,
+            taskId: input.world.handle.id,
+            startedAt: Date.now(),
+            kill: (signal) => void killAgent(command.pid, signal === 'SIGKILL' ? 0 : 2500, terminalCustody.custodyId),
+          }));
         }
         return { terminalId };
       })
@@ -374,17 +393,16 @@ export class AcpAdapter implements AgentAdapter {
         if (!terminal) throw new Error(`unknown ACP terminal ${params.terminalId}`);
         return terminal.exitStatus ?? await terminal.exited;
       })
-      .onRequest(methods.client.terminal.kill, ({ params }) => {
+      .onRequest(methods.client.terminal.kill, async ({ params }) => {
         const terminal = terminals.get(params.terminalId);
         if (!terminal) throw new Error(`unknown ACP terminal ${params.terminalId}`);
-        if (terminal.child.pid && !terminal.exitStatus) killProcessGroup(terminal.child.pid, 'SIGTERM');
+        if (terminal.child.pid) await killAgent(terminal.child.pid, 2500, terminal.custodyId);
         return {};
       })
-      .onRequest(methods.client.terminal.release, ({ params }) => {
+      .onRequest(methods.client.terminal.release, async ({ params }) => {
         const terminal = terminals.get(params.terminalId);
         if (!terminal) return {};
-        if (terminal.child.pid && !terminal.exitStatus) killProcessGroup(terminal.child.pid, 'SIGTERM');
-        if (terminal.child.pid) unregisterAgent(terminal.child.pid);
+        if (terminal.child.pid) await killAgent(terminal.child.pid, 2500, terminal.custodyId);
         terminals.delete(params.terminalId);
         return {};
       })
@@ -401,7 +419,7 @@ export class AcpAdapter implements AgentAdapter {
 
     const abort = () => {
       if (sessionId && clientContext) void clientContext.notify(methods.agent.session.cancel, { sessionId }).catch(() => undefined);
-      if (child.pid) void killProcessGroup(child.pid, 'SIGTERM');
+      if (child.pid) void killAgent(child.pid, 2500, custody.custodyId);
     };
     if (ctx.signal?.aborted) abort();
     ctx.signal?.addEventListener('abort', abort, { once: true });
@@ -529,14 +547,10 @@ export class AcpAdapter implements AgentAdapter {
       ctx.signal?.removeEventListener('abort', abort);
       try { child.stdin?.end(); } catch { /* closed */ }
       for (const terminal of terminals.values()) {
-        if (terminal.child.pid && !terminal.exitStatus) killProcessGroup(terminal.child.pid, 'SIGTERM');
-        if (terminal.child.pid) unregisterAgent(terminal.child.pid);
+        if (terminal.child.pid) await killAgent(terminal.child.pid, 2500, terminal.custodyId);
       }
       terminals.clear();
-      if (child.pid) {
-        unregisterAgent(child.pid);
-        killProcessGroup(child.pid, 'SIGTERM');
-      }
+      if (child.pid) await killAgent(child.pid, 2500, custody.custodyId);
     }
   }
 }
