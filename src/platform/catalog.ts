@@ -50,6 +50,23 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/organizations/:organizationId/git-profiles/preflight?projectId=',
     'POST /api/organizations/:organizationId/git-profiles/default',
   ],
+  vault: [
+    'GET|POST /api/vault/items (typed credential items; secret fields are write-only)', 'DELETE /api/vault/items/:id',
+    'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?})',
+    'POST /api/vault/resolve (plaintext reveal, per-item grant + policy gated; body {itemId?|domain?, field?})',
+    'POST /api/vault/fill (zero-exposure browser fill via CDP; body {itemId?|domain?, field?, selector, cdpUrl?})',
+    'GET /api/vault/requests?taskId=&status=', 'POST /api/vault/requests (escalate for access or report a wrong secret; body {itemId?|domain?, field?, mode?, kind?: access|reset, why})',
+    'POST /api/vault/requests/:id/resolve (human: body {action: once|task|always|deny, itemId?})',
+    'GET /api/vault/connectors (Bitwarden/1Password/pass mirror status)',
+    'POST /api/vault/connectors/:name/connect|config|list|sync|write-back (selective mirror + opt-in write-back; sync body {externalIds, policy?, writeBack?}; list items carry folder for grouping)',
+    'POST /api/vault/passkey/enroll|save|login|release (agent-enrolled passkeys via CDP virtual authenticator)',
+  ],
+  agentMail: [
+    'GET /api/organizations/:organizationId/agent-mail?since=&match=&limit= (per-organization agent inbox: address + messages, verification code/link extracted)',
+    'GET /api/organizations/:organizationId/agent-mail/providers (mailbox backends + active provider)',
+    'POST /api/organizations/:organizationId/agent-mail/connect (connect this organization mailbox; body {provider, domain?|apiKey?})',
+    'POST /api/agent-mail/ingest?secret= (inbound mail webhook; minted-secret URL shown to the operator; accepts karmax/Postmark/CloudMailin/Mailgun/SendGrid payloads and raw MIME, routed to the recipient organization)',
+  ],
   wiki: [
     'GET /api/organizations/:organizationId/wiki?path= (skill path → page; else table of contents + unconditional entries)',
     'GET|PUT|DELETE /api/organizations/:organizationId/wiki/page?path= (PUT body {path, content, kind: skill|memory, create?, prevPath?})',

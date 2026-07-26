@@ -18,6 +18,7 @@ import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
+import { VaultItems } from '../autonomy/vault-items.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
@@ -746,7 +747,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
       // capabilities = intersection(profile ceiling, granting principal).
-      const grant = args.task.grant ?? DEFAULT_GRANT;
+      // Human-approved credential escalations recorded after creation
+      // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
+      // so the next minted token carries them without touching workflow input.
+      const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
+      const grant = [...(args.task.grant ?? DEFAULT_GRANT), ...orgVaultItems.extensionCaps(args.taskId)];
       const effective = attenuate(profile.capabilities, grant);
       let token: string | undefined;
       if (deps.tokens) {
@@ -1154,10 +1159,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const gitEnv = isRemote(args.worldHandle.kind) && organizationId === 'org_personal'
               ? {}
               : gitEnvFor(args.worldHandle, args.taskId);
+            // Granted `auto` vault items materialize into the subprocess env
+            // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
+            // SSH keys as 0600 file paths. Local worlds only, like gitEnv.
+            // Item resolution is per-organization (the tenant boundary), so bind
+            // to the task's org — not the module-level personal-org instance.
+            const vaultEnv = isRemote(args.worldHandle.kind) ? {} : orgVaultItems.envFor(args.taskId, effective);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
-            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            const extraEnv = { ...vaultEnv, ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
             return Object.keys(extraEnv).length ? { extraEnv } : {};
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
@@ -1209,7 +1220,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(deps.payments
             ? {
                 budget: new BudgetService(store, deps.payments),
-                spendCtx: { projectId: args.task.projectId, taskId: args.taskId },
+                spendCtx: { projectId: args.task.projectId, taskId: args.taskId, organizationId: store.getProject(args.task.projectId)?.organizationId },
                 onSpend: (req: any, outcome: any) => record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }),
               }
             : {}),

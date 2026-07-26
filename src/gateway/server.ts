@@ -115,6 +115,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The wiki is the skills store: reads need the scope's read capability, edits
   // reuse skill:write (agents and developers can both grow it).
   if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
+  // The agent mailbox is a credential surface, org-scoped by its path (the
+  // token/session check enforces the tenant boundary from requestScope).
+  if (/^\/api\/organizations\/[^/]+\/agent-mail(?:\/|$)/.test(p)) return read ? 'credential:read' : 'credential:write';
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
@@ -127,6 +130,19 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return 'credential:write';
   }
   if (p.startsWith('/api/credentials')) return read ? 'credential:read' : 'credential:write';
+  // Vault items (PLAN-passwords.md): admin CRUD is credential:write; agent
+  // write-back is the narrower vault:store; use/reveal/fill/request attempts
+  // need only credential:read — the per-item grant + policy check happens in
+  // the handler against the caller's own capability set.
+  if (p === '/api/vault/store' || p === '/api/vault/passkey/save') return 'vault:store';
+  if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:write';
+  if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : 'credential:write';
+  // Connectors: describe is read; connect/sync/config/write-back are admin.
+  if (p.startsWith('/api/vault/connectors')) return read ? 'credential:read' : 'credential:write';
+  if (p.startsWith('/api/vault')) return 'credential:read';
+  // The agent-mail inbound webhook authenticates with its own shared secret
+  // (like the GitHub webhook), so it needs no capability.
+  if (p === '/api/agent-mail/ingest') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return 'safe-mode:write';
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -351,6 +367,8 @@ export class Gateway {
   /** Remotes verified during this gateway process. Persisted links are retried
    * once after every restart so interrupted first pushes self-heal. */
   private wikiRemotesReady = new Set<string>();
+  /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
+  private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
 
   constructor(private deps: GatewayDeps) {
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess);
@@ -689,6 +707,41 @@ export class Gateway {
       } catch (error) {
         return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
       }
+    }
+    // Agent mailbox inbound webhook (PLAN-passwords.md §8): authenticated by a
+    // configured shared secret, not a karmax session — so it sits with the other
+    // unauthenticated endpoints, before the session gate.
+    if (p === '/api/agent-mail/ingest' && method === 'POST') {
+      const mailMod = await import('../autonomy/agent-mail.js');
+      // Auth: the minted secret (in the copy-pasted webhook URL or a Bearer
+      // header) — forwarding services can rarely set custom headers, so the
+      // query form is the primary one. Legacy env secret stays accepted.
+      const minted = mailMod.ingestSecret(this.deps.store);
+      const presented = url.searchParams.get('secret')
+        ?? (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
+      const legacy = process.env.KARMAX_AGENT_MAIL_SECRET;
+      if (!presented || (presented !== minted && (!legacy || presented !== legacy)))
+        return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL karmax shows the operator)' });
+      // Providers POST different shapes/encodings; parse by content-type and
+      // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw
+      // MIME from the Cloudflare Email Worker).
+      const rawBody = await this.rawBody(req, 8 * 1024 * 1024);
+      const contentType = String(req.headers['content-type'] ?? '');
+      let fields: Record<string, any> = {};
+      try {
+        if (contentType.includes('multipart/form-data')) fields = mailMod.parseMultipart(rawBody.toString('utf8'), contentType);
+        else if (contentType.includes('application/x-www-form-urlencoded')) fields = mailMod.parseUrlEncoded(rawBody.toString('utf8'));
+        else fields = JSON.parse(rawBody.toString('utf8'));
+      } catch {
+        return this.json(res, 400, { error: 'unparseable body (expected JSON, form-urlencoded, or multipart/form-data)' });
+      }
+      const msg = mailMod.normalizeInbound(fields);
+      if (!msg.to || !msg.from) return this.json(res, 400, { error: 'could not find a recipient/sender in the payload' });
+      // Routed by recipient to the owning organization; unknown recipients are
+      // dropped (never leaked into any tenant's inbox). Never echo the message.
+      const { delivered } = new mailMod.AgentMail(this.deps.store)
+        .ingest({ to: mailMod.cleanAddress(msg.to), from: mailMod.cleanAddress(msg.from), subject: msg.subject ? String(msg.subject) : undefined, text: String(msg.text ?? '') });
+      return this.json(res, 200, { delivered });
     }
     const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
     if (githubManifestCallback && method === 'GET' && this.deps.githubApp && this.deps.identity) {
@@ -1857,7 +1910,8 @@ export class Gateway {
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
-        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? '')));
+        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
+          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined));
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {
@@ -2423,17 +2477,338 @@ export class Gateway {
         return this.json(res, 200, await prov.connect());
       }
 
-      // cards (payment resources; SPEC §7.6). Provision/list/fund.
+      // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
+      if (p.startsWith('/api/vault')) {
+        const { VaultItems, ITEM_FIELDS } = await import('../autonomy/vault-items.js');
+        // Bind to the caller's own organization (tenant boundary). The token org
+        // is authoritative and cannot be spoofed — auth() validated it against
+        // membership; the query-param org only ever narrows within it.
+        const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId);
+        const caps = authRecord?.caps ?? [];
+        // A human session's token is task-unscoped; per-task passes/extensions
+        // only ever apply to real task-agent bearers.
+        const callerTaskId = authRecord?.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
+        const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+        const defaultField = (type: string): any =>
+          ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', note: 'note' })[type];
+        const findItem = (b: any) => (b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined);
+
+        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, vault.list());
+        if (p === '/api/vault/items' && method === 'POST') {
+          const b = await this.body(req);
+          const saved = vault.save({
+            id: b.id ? String(b.id) : undefined,
+            type: b.type,
+            label: String(b.label ?? ''),
+            domains: Array.isArray(b.domains) ? b.domains.map(String) : typeof b.domains === 'string' ? b.domains.split(/[,\s]+/).filter(Boolean) : undefined,
+            username: b.username ? String(b.username) : undefined,
+            tags: Array.isArray(b.tags) ? b.tags.map(String) : typeof b.tags === 'string' ? b.tags.split(/[,\s]+/).filter(Boolean) : undefined,
+            envVar: b.envVar ? String(b.envVar) : undefined,
+            policy: b.policy,
+            secrets: b.secrets,
+            provenance: { source: 'manual' },
+          });
+          // A human rotating a mirrored item's secret propagates to the source
+          // store too (field-level, notes preserved) when write-back is on.
+          let propagated;
+          if (b.id && b.secrets && Object.keys(b.secrets).length && saved.provenance.source.startsWith('connector:')) {
+            try {
+              const { defaultConnectors } = await import('../autonomy/connectors.js');
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+                .propagate(saved.id, Object.keys(b.secrets) as any);
+            } catch (e) {
+              propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
+            }
+          }
+          return this.json(res, 200, { ...saved, ...(propagated ? { propagated } : {}) });
+        }
+        const viDel = p.match(/^\/api\/vault\/items\/([^/]+)$/);
+        if (viDel && method === 'DELETE') {
+          vault.delete(viDel[1]!);
+          return this.json(res, 200, { deleted: true });
+        }
+        // Agent write-back (§7 store_credential). Two distinct powers:
+        //  • CREATE (and fully update items this same task created) — the
+        //    narrow vault:store, as before.
+        //  • ROTATE the SECRETS of any item the task's grant covers for use —
+        //    when an agent changes a password on the site, the stored value is
+        //    stale for everyone until it's updated, so rotation rides the same
+        //    authorization as using the credential. Metadata/policy/label edits
+        //    on someone else's item remain a human/credential:write action:
+        //    the rotation path ignores everything except `secrets`.
+        if (p === '/api/vault/store' && method === 'POST') {
+          const b = await this.body(req);
+          if (!callerTaskId && !allows(caps, 'credential:write')) return this.json(res, 400, { error: 'a task-agent token is required' });
+          const prior = b.id ? vault.get(String(b.id)) : undefined;
+          if (b.id && !prior) return this.json(res, 404, { error: `no vault item ${b.id}` });
+          const ownItem = !prior || !callerTaskId || prior.provenance.taskId === callerTaskId || allows(caps, 'credential:write');
+          let saved;
+          if (ownItem) {
+            saved = vault.save({
+              id: prior?.id,
+              type: b.type,
+              label: String(b.label ?? ''),
+              domains: Array.isArray(b.domains) ? b.domains.map(String) : undefined,
+              username: b.username ? String(b.username) : undefined,
+              tags: Array.isArray(b.tags) ? b.tags.map(String) : undefined,
+              envVar: b.envVar ? String(b.envVar) : undefined,
+              policy: b.policy,
+              secrets: b.secrets,
+              provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
+            });
+          } else {
+            // Rotation of a foreign item: allowed iff the task's grant covers it.
+            if (!vault.covered(caps, callerTaskId, prior!))
+              return this.json(res, 403, { error: 'this task was not granted this credential — request_credential first, or create your own item' });
+            const secretFields = Object.keys(b.secrets ?? {});
+            if (!secretFields.length)
+              return this.json(res, 403, { error: 'only the secrets of a granted item can be updated (metadata and policy stay with its owner)' });
+            saved = vault.save({ id: prior!.id, type: prior!.type, secrets: b.secrets });
+            store.appendAudit({ principalId: `task:${callerTaskId}`, action: 'vault.rotated',
+              detail: { itemId: prior!.id, label: prior!.label, fields: secretFields } });
+          }
+          // Best-effort propagation of rotated fields back to the item's source
+          // store (§9 updateSecret) — the vault is already correct either way.
+          let propagated;
+          if (prior && saved.provenance.source.startsWith('connector:') && b.secrets) {
+            try {
+              const { defaultConnectors } = await import('../autonomy/connectors.js');
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+                .propagate(saved.id, Object.keys(b.secrets) as any);
+            } catch (e) {
+              propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
+            }
+          }
+          return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields, ...(propagated ? { propagated } : {}) });
+        }
+        // Plaintext reveal (§5C) — per-item grant + reveal policy, audited.
+        if (p === '/api/vault/resolve' && method === 'POST') {
+          const b = await this.body(req);
+          const item = findItem(b);
+          if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const decision = vault.access(caps, callerTaskId, item, 'reveal', { consume: true });
+          if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+          const field = (b.field as any) ?? defaultField(item.type);
+          if (!ITEM_FIELDS[item.type].includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
+          const value = field === 'totp'
+            ? vault.totp(item, { taskId: callerTaskId, principal })
+            : vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' });
+          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value });
+        }
+        // Zero-exposure browser fill (§5B) — the secret goes gateway → CDP,
+        // never through the agent. `username` fills metadata; `totp` fills the
+        // current code computed broker-side from the stored seed.
+        if (p === '/api/vault/fill' && method === 'POST') {
+          const b = await this.body(req);
+          const item = findItem(b);
+          if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const decision = vault.access(caps, callerTaskId, item, 'use', { consume: true });
+          if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+          const field = String(b.field ?? 'password');
+          const text = field === 'username'
+            ? item.username
+            : field === 'totp'
+              ? vault.totp(item, { taskId: callerTaskId, principal })
+              : vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' });
+          if (!text) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
+          try {
+            const { fillViaCdp } = await import('../autonomy/fill.js');
+            const filled = await fillViaCdp({
+              cdpUrl: String(b.cdpUrl ?? 'http://127.0.0.1:9222'),
+              selector: String(b.selector ?? ''),
+              text,
+              expectDomains: item.domains,
+            });
+            return this.json(res, 200, { status: 'granted', itemId: item.id, filled: true, origin: filled.origin });
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        if (p === '/api/vault/requests' && method === 'GET') {
+          return this.json(res, 200, vault.requests({
+            taskId: url.searchParams.get('taskId') ?? undefined,
+            status: (url.searchParams.get('status') as any) ?? undefined,
+          }));
+        }
+        // The pull model (§7): an agent escalates for an item it lacks.
+        if (p === '/api/vault/requests' && method === 'POST') {
+          const b = await this.body(req);
+          if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
+          return this.json(res, 200, vault.request({
+            taskId: callerTaskId,
+            projectId: authRecord?.projectId,
+            caps,
+            itemId: b.itemId ? String(b.itemId) : undefined,
+            domain: b.domain ? String(b.domain) : undefined,
+            field: b.field,
+            mode: b.mode,
+            kind: b.kind === 'reset' ? 'reset' : undefined,
+            why: b.why ? String(b.why) : undefined,
+          }));
+        }
+        const vres = p.match(/^\/api\/vault\/requests\/([^/]+)\/resolve$/);
+        if (vres && method === 'POST') {
+          const b = await this.body(req);
+          const action = String(b.action ?? '');
+          if (!['once', 'task', 'always', 'deny'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny' });
+          try {
+            return this.json(res, 200, vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined }));
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+
+        // ── external store connectors (§9) ──
+        if (p.startsWith('/api/vault/connectors')) {
+          if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+          const { defaultConnectors } = await import('../autonomy/connectors.js');
+          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId);
+          if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
+          const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
+          if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });
+          if (connName && method === 'POST') {
+            const b = await this.body(req);
+            const action = connName[2];
+            try {
+              if (action === 'connect') { connectors.connect(connName[1]!, String(b.secret ?? '')); return this.json(res, 200, { connected: true }); }
+              if (action === 'config') return this.json(res, 200, connectors.setConfig(connName[1]!, { writeBack: !!b.writeBack }));
+              if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
+              if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],
+                { policy: b.policy, writeBack: typeof b.writeBack === 'boolean' ? b.writeBack : undefined }));
+              if (action === 'write-back') return this.json(res, 200, (await connectors.writeBack(connName[1]!, String(b.itemId ?? ''))) ?? { skipped: 'write-back disabled for this connector' });
+            } catch (e) {
+              return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+            }
+            return this.json(res, 404, { error: 'unknown connector action' });
+          }
+        }
+
+        // ── agent-enrolled passkeys (§8) ──
+        if (p.startsWith('/api/vault/passkey')) {
+          if (!this.passkeys) {
+            const { PasskeyManager } = await import('../autonomy/passkey.js');
+            this.passkeys = new PasskeyManager();
+          }
+          const b = method === 'POST' ? await this.body(req) : {};
+          const item = b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined;
+          try {
+            if (p === '/api/vault/passkey/enroll' && method === 'POST') {
+              const domains = Array.isArray(b.domains) ? b.domains.map(String) : b.domain ? [String(b.domain)] : undefined;
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? 'http://127.0.0.1:9222'), { expectDomains: domains, mode: 'enroll' });
+              return this.json(res, 200, { ...started, next: 'trigger the site\'s "create a passkey" button in the browser, then POST /api/vault/passkey/save with this authenticatorId' });
+            }
+            if (p === '/api/vault/passkey/save' && method === 'POST') {
+              const creds = await this.passkeys.harvest(String(b.authenticatorId ?? ''));
+              if (!creds.length) return this.json(res, 400, { error: 'no passkey was created on the page — trigger the site\'s enroll button first' });
+              const saved = vault.save({
+                type: 'passkey',
+                label: String(b.label ?? (item?.label ? `${item.label} (passkey)` : 'passkey')),
+                domains: Array.isArray(b.domains) ? b.domains.map(String) : creds[0]!.rpId ? [creds[0]!.rpId] : undefined,
+                username: b.username ? String(b.username) : undefined,
+                secrets: { passkey: JSON.stringify(creds) },
+                provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
+              });
+              return this.json(res, 200, { itemId: saved.id, label: saved.label, count: creds.length });
+            }
+            if (p === '/api/vault/passkey/login' && method === 'POST') {
+              if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no passkey item — enroll one first' });
+              const decision = vault.access(caps, callerTaskId, item, 'use', { consume: true });
+              if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+              const creds = JSON.parse(vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' })) as any[];
+              const domains = item.domains;
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? 'http://127.0.0.1:9222'), { expectDomains: domains, mode: 'login', credential: creds[0] });
+              return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
+            }
+            if (p === '/api/vault/passkey/release' && method === 'POST') {
+              this.passkeys.release(String(b.authenticatorId ?? ''));
+              return this.json(res, 200, { released: true });
+            }
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+      }
+
+      // ── agent mailbox (§8): ORGANIZATION-scoped — each org connects its own
+      // email backend (like world providers / payment cards). The org in the
+      // path is enforced by requestScope + the token check, so one tenant can
+      // neither configure nor read another's mail. (The inbound webhook is a
+      // separate unauthenticated shared-secret route before the session gate.)
+      const orgMail = p.match(/^\/api\/organizations\/([^/]+)\/agent-mail(?:\/(providers|connect))?$/);
+      if (orgMail) {
+        const organizationId = orgMail[1]!;
+        const sub = orgMail[2];
+        const { AgentMail } = await import('../autonomy/agent-mail.js');
+        if (!sub && method === 'GET') {
+          const config = this.mailboxConfig(organizationId);
+          const mail = new AgentMail(
+            store,
+            this.mailboxDomain(organizationId),
+            this.mailboxFixedLocal(organizationId),
+            config.agentmailAddress,
+          );
+          return this.json(res, 200, { organizationId, address: mail.address(organizationId), configured: mail.configured(),
+            provider: config.provider, domain: this.mailboxDomain(organizationId),
+            messages: mail.recent(organizationId, { since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
+        }
+        if (sub === 'providers' && method === 'GET') {
+          const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+          const { ingestSecret, cloudflareWorkerScript } = await import('../autonomy/agent-mail.js');
+          const config = this.mailboxConfig(organizationId);
+          // The push webhook URL (secret included) + Cloudflare worker are still
+          // returned for the operator who wants them; the UI hides them for now.
+          const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
+          const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store)}`;
+          return this.json(res, 200, { providers: defaultMailboxRegistry().list(config), active: config.provider, webhookUrl, cloudflareWorker: cloudflareWorkerScript(webhookUrl) });
+        }
+        if (sub === 'connect' && method === 'POST') {
+          const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+          const b = await this.body(req);
+          const provider = defaultMailboxRegistry().get(String(b.provider ?? ''));
+          if (!provider) return this.json(res, 400, { error: `unknown mailbox provider "${b.provider}"` });
+          const result = provider.connect({
+            domain: b.domain ? String(b.domain) : undefined,
+            apiKey: b.apiKey ? String(b.apiKey) : undefined,
+            address: b.address ? String(b.address) : undefined,
+            imapHost: b.imapHost ? String(b.imapHost) : undefined,
+            imapPort: b.imapPort ? Number(b.imapPort) : undefined,
+            imapUser: b.imapUser ? String(b.imapUser) : undefined,
+            imapSecure: b.imapSecure === undefined ? undefined : b.imapSecure !== false,
+          });
+          if (result.status === 'connected' && result.config) {
+            // The provider secret (AgentMail key / IMAP password) → the vault under
+            // an org-scoped handle the poller resolves; never echoed or stored raw.
+            const apiKeyHandle = this.mailboxSecretHandle(organizationId, String(b.provider));
+            if (b.apiKey && this.deps.broker) this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey));
+            // REPLACE (not merge) so switching providers can't leave a stale field.
+            const config = { ...result.config, ...(b.apiKey ? { apiKeyHandle } : {}) };
+            this.setMailboxConfig(organizationId, config);
+            if (config.provider === 'agentmail') {
+              new AgentMail(store, config.agentmailDomain, undefined, config.agentmailAddress).address(organizationId);
+            }
+          }
+          return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
+        }
+      }
+
+      // cards (payment resources; SPEC §7.6) — organization-scoped so a tenant
+      // never spends from another's card. A project card narrows within its org.
       if (p === '/api/cards' && method === 'GET') {
         const pid = url.searchParams.get('projectId') ?? undefined;
-        return this.json(res, 200, store.listCards(pid));
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId;
+        return this.json(res, 200, store.listCards(pid, cardOrg));
       }
       if (p === '/api/cards' && method === 'POST') {
         if (!this.deps.payments) return this.json(res, 400, { error: 'no payment provider configured' });
         const b = await this.body(req);
+        // A non-project card belongs to the caller's own organization (the old
+        // installation-wide "global" card is gone in the multi-tenant model).
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId
+          ?? (b.projectId ? store.getProject(String(b.projectId))?.organizationId : undefined) ?? 'org_personal';
         const card = await this.deps.payments.provisionCard({
-          scope: b.scope === 'global' ? 'global' : 'project',
-          scopeId: b.scope === 'global' ? undefined : b.projectId,
+          scope: b.scope === 'project' ? 'project' : 'organization',
+          scopeId: b.scope === 'project' ? b.projectId : cardOrg,
           label: b.label ?? 'Card',
           cap: Number(b.cap ?? 0),
           merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
@@ -3606,6 +3981,38 @@ export class Gateway {
     }
     return this.auth(req, projectId);
   }
+  /** Organization-scoped mailbox provider config (agent-mail §8). */
+  private mailboxConfig(organizationId: string): import('../autonomy/mailbox.js').MailboxConfig {
+    try {
+      return JSON.parse(this.deps.store.kvGet(`agent-mail:provider:${organizationId}`) ?? '{}');
+    } catch {
+      return {};
+    }
+  }
+  private setMailboxConfig(organizationId: string, config: import('../autonomy/mailbox.js').MailboxConfig): void {
+    this.deps.store.kvSet(`agent-mail:provider:${organizationId}`, JSON.stringify(config));
+  }
+  private mailboxDomain(organizationId: string): string | undefined {
+    // The mint domain, resolved by the ACTIVE provider so a leftover field from a
+    // previous provider can't win: imap/hosted-fixed use the address host,
+    // agentmail its domain, hosted its domain, self-managed its domain.
+    const c = this.mailboxConfig(organizationId);
+    if (c.provider === 'imap') return c.fixedAddress?.split('@')[1] || undefined;
+    if (c.provider === 'agentmail') return c.agentmailDomain || undefined;
+    if (c.provider === 'hosted') return c.hostedDomain || undefined;
+    if (c.provider === 'self-managed') return c.domain || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
+    return c.domain || c.hostedDomain || c.agentmailDomain || c.fixedAddress?.split('@')[1] || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
+  }
+  /** The single-inbox base local part when addresses ride +tags on one mailbox
+   *  (hosted fixed-address / IMAP); undefined for domain and AgentMail providers. */
+  private mailboxFixedLocal(organizationId: string): string | undefined {
+    return this.mailboxConfig(organizationId).fixedAddress?.split('@')[0] || undefined;
+  }
+  /** The org-scoped vault handle a provider's secret is stored under. */
+  private mailboxSecretHandle(organizationId: string, provider: string): string {
+    return `mailbox:${provider}:${organizationId}:auth`;
+  }
+
   private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {
     const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]

@@ -12,14 +12,14 @@ export interface RunTurnDeps {
   onActivity?: (activity: AgentActivity) => void;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
   budget?: {
-    request(ctx: { projectId: string; taskId: string }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
+    request(ctx: { projectId: string; taskId: string; organizationId?: string }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
       status: 'granted' | 'needs_approval' | 'needs_funding' | 'denied';
       reason?: string;
       transactionId?: string;
       shortfall?: number;
     }>;
   };
-  spendCtx?: { projectId: string; taskId: string };
+  spendCtx?: { projectId: string; taskId: string; organizationId?: string };
   onSpend?: (req: any, outcome: any) => void;
   /** Cancellation propagated from the workflow (SPEC §5.6 mid-turn cancel). */
   signal?: AbortSignal;

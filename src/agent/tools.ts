@@ -179,6 +179,126 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'request_credential',
+    description:
+      'Ask for access to a credential in the user\'s vault (a site login, API key, SSH key, or .env bag) that this task was not granted, identified by item_id or the site\'s domain. Returns granted (proceed with fill_credential/get_credential), needs_approval or not_in_vault (a request is parked for the human — stop and report, they will grant/add it and you can retry), or denied (do not re-ask). If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human will fix the item or send you the reset code.',
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string', description: 'A vault item id (list them via platform_request GET /api/vault/items).' },
+        domain: { type: 'string', description: 'The site this credential is for, e.g. "github.com" — used when you do not know the item id.' },
+        mode: { type: 'string', enum: ['use', 'reveal'], description: 'use = fill/inject without seeing the secret (default); reveal = you need the plaintext.' },
+        kind: { type: 'string', enum: ['access', 'reset'], description: 'reset = the stored secret appears invalid; always parks for the human.' },
+        why: { type: 'string', description: 'Why you need it / what failed (shown to the human).' },
+      },
+      required: ['why'],
+    },
+  },
+  {
+    name: 'fill_credential',
+    description:
+      'Type a vault credential into the page open in your browser WITHOUT the secret ever entering your context: karmax resolves it and types it over CDP, verifying the page origin matches the credential\'s domains first. Focus the login page, then call this per field (username, password, then totp if the site asks for a code). Requires the browser to expose a DevTools endpoint (launch Chrome with --remote-debugging-port=9222).',
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
+        field: { type: 'string', enum: ['username', 'password', 'totp'], description: 'Default password. totp types the current one-time code.' },
+        selector: { type: 'string', description: 'CSS selector of the input element to fill.' },
+        cdp_url: { type: 'string', description: 'DevTools endpoint (default http://127.0.0.1:9222).' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'get_credential',
+    description:
+      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, needs_approval/denied per the item\'s reveal policy, or not_in_vault.',
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        domain: { type: 'string' },
+        field: { type: 'string', description: 'password | totp | secret | privateKey | env | note (defaults to the item type\'s main field).' },
+      },
+    },
+  },
+  {
+    name: 'store_credential',
+    description:
+      'Save a credential into the user\'s vault so it outlives this task. Two uses: (1) a credential you just created (registered account, generated password, captured TOTP seed, minted API/SSH key); (2) ROTATION — after you change a password on a site, immediately update the granted item\'s `secrets` here (pass its `id`; metadata is ignored), or everyone is locked out with the stale value. Rotation is allowed for any item this task may use; full edits only for items this task created.',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Omit to create; set to update an item this task created.' },
+        type: { type: 'string', enum: ['login', 'api-key', 'ssh-key', 'env', 'note'] },
+        label: { type: 'string' },
+        domains: { type: 'array', items: { type: 'string' } },
+        username: { type: 'string' },
+        env_var: { type: 'string', description: 'api-key/ssh-key: env var to inject it under in future task worlds.' },
+        secrets: {
+          type: 'object',
+          description: 'Field → secret value. login: password, totp (base32 seed or otpauth:// URI); api-key: secret; ssh-key: privateKey; env: env (KEY=VALUE lines); note: note.',
+        },
+      },
+      required: ['type', 'label'],
+    },
+  },
+  {
+    name: 'check_agent_mail',
+    description:
+      'Read your organization\'s agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Use it to complete "check your email for a code / confirmation link" steps: returns the address to register with plus recent messages with any verification `code` and `link` already extracted. Mailboxes are per organization; you can only read your own. For a code sent to the user\'s own address instead, escalate with raise_to_parent.',
+    parameters: {
+      type: 'object',
+      properties: {
+        organization_id: { type: 'string', description: 'Your organization id (named in your prompt).' },
+        match: { type: 'string', description: 'Filter to messages mentioning this (e.g. the site name or sender).' },
+        since: { type: 'number', description: 'Only messages received after this epoch-ms timestamp.' },
+      },
+      required: ['organization_id'],
+    },
+  },
+  {
+    name: 'enroll_passkey',
+    description:
+      'Enroll a NEW passkey that belongs to karmax on the account open in your browser (you cannot use the user\'s own passkeys — the OS biometric is theirs). karmax prepares a virtual authenticator (origin-verified against `domain`); you then trigger the site\'s "create a passkey / add passkey" button; then call save_passkey with the returned authenticator_id. After this, use_passkey logs in with no 2FA prompt.',
+    parameters: {
+      type: 'object',
+      properties: {
+        domain: { type: 'string', description: 'The site you are enrolling on, e.g. "example.com".' },
+        cdp_url: { type: 'string', description: 'Browser DevTools endpoint (default http://127.0.0.1:9222).' },
+      },
+      required: ['domain'],
+    },
+  },
+  {
+    name: 'save_passkey',
+    description: 'After you triggered the site\'s passkey-create button (see enroll_passkey), store the newly created credential in the vault as a passkey item.',
+    parameters: {
+      type: 'object',
+      properties: {
+        authenticator_id: { type: 'string', description: 'The id returned by enroll_passkey.' },
+        label: { type: 'string' },
+        domains: { type: 'array', items: { type: 'string' } },
+        username: { type: 'string' },
+      },
+      required: ['authenticator_id'],
+    },
+  },
+  {
+    name: 'use_passkey',
+    description:
+      'Log in with a karmax-enrolled passkey: karmax loads the stored credential into a virtual authenticator on the page; you then trigger the site\'s "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticator_id (call the passkey release route when done), or needs_approval/not_in_vault.',
+    parameters: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string' },
+        domain: { type: 'string', description: 'Alternative to item_id: the site domain.' },
+        cdp_url: { type: 'string' },
+      },
+    },
+  },
+  {
     name: 'find_task',
     description: 'Find a task by project id and human-facing project-local number (#100).',
     parameters: { type: 'object', properties: { project_id: { type: 'string' }, number: { type: 'number' } }, required: ['project_id', 'number'] },
@@ -414,6 +534,51 @@ export function platformToolHandlers(
         why: args?.why ? String(args.why) : undefined,
       });
       return JSON.stringify(r);
+    },
+    async request_credential(args) {
+      const r: any = await platformRequest('POST', '/api/vault/requests', {
+        itemId: args?.item_id, domain: args?.domain, mode: args?.mode, kind: args?.kind, why: args?.why ? String(args.why) : undefined,
+      });
+      // Mirror request_spend: a parked request surfaces at the Review gate.
+      if (r?.status === 'needs_approval' || r?.status === 'not_in_vault') {
+        ctx.createReviewInfo({ summary: `Credential access requested: ${args?.item_id ?? args?.domain ?? ''} (${r.status === 'not_in_vault' ? 'not in the vault — add it or ask me to create the account' : 'approval needed'}). ${args?.why ?? ''}`.slice(0, MAX_REVIEW_TEXT_LENGTH) });
+      }
+      return JSON.stringify(r);
+    },
+    async fill_credential(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/fill', {
+        itemId: args?.item_id, domain: args?.domain, field: args?.field,
+        selector: String(args?.selector ?? ''), cdpUrl: args?.cdp_url,
+      }));
+    },
+    async get_credential(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/resolve', {
+        itemId: args?.item_id, domain: args?.domain, field: args?.field,
+      }));
+    },
+    async store_credential(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/store', {
+        id: args?.id, type: args?.type, label: args?.label, domains: args?.domains,
+        username: args?.username, envVar: args?.env_var, secrets: args?.secrets,
+      }));
+    },
+    async check_agent_mail(args) {
+      const q = new URLSearchParams();
+      if (args?.match) q.set('match', String(args.match));
+      if (args?.since) q.set('since', String(args.since));
+      const org = encodeURIComponent(String(args?.organization_id ?? ''));
+      return JSON.stringify(await platformRequest('GET', `/api/organizations/${org}/agent-mail${q.toString() ? `?${q}` : ''}`));
+    },
+    async enroll_passkey(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/enroll', { domain: args?.domain, cdpUrl: args?.cdp_url }));
+    },
+    async save_passkey(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/save', {
+        authenticatorId: String(args?.authenticator_id ?? ''), label: args?.label, domains: args?.domains, username: args?.username,
+      }));
+    },
+    async use_passkey(args) {
+      return JSON.stringify(await platformRequest('POST', '/api/vault/passkey/login', { itemId: args?.item_id, domain: args?.domain, cdpUrl: args?.cdp_url }));
     },
     async find_task(args) {
       return JSON.stringify(await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tasks/by-num/${Number(args?.number)}`));

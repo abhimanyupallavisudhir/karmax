@@ -2,7 +2,7 @@ import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Clien
 import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority } from './tokens.js';
-import { TOOL_CAPABILITY } from './capabilities.js';
+import { TOOL_CAPABILITY, Capability, allows } from './capabilities.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
@@ -483,6 +483,9 @@ export class KarmaxApi {
       quick?: boolean;
       /** Job-shaped permission profile for every agent spawned by this workflow. */
       authorizationProfile?: string;
+      /** Per-task vault item grants (PLAN-passwords.md §6): `use-credential:item:…`
+       *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
+      credentialGrants?: string[];
       /** Total mutually-exclusive attempts to create and queue up front. */
       attempts?: number;
       assignee?: PrincipalRef;
@@ -502,6 +505,7 @@ export class KarmaxApi {
     const authorization = this.deps.authorization
       ? this.deps.authorization.taskGrant(caller.principal, args.projectId, args.authorizationProfile, caller.caps)
       : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
+    this.applyCredentialGrants(authorization, args.credentialGrants, caller.caps);
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
@@ -998,10 +1002,33 @@ export class KarmaxApi {
     return this.deps.store.getTask(taskId)!;
   }
 
+  /**
+   * Layer per-task vault item grants onto the attenuated profile package
+   * (PLAN-passwords.md §6). A creator can attach only items its own grant
+   * covers — or any item when it holds credential administration — so a
+   * confused deputy cannot mint credential access it does not have. Dropped
+   * grants mark the task attenuated rather than failing creation.
+   */
+  private applyCredentialGrants(
+    authorization: { capabilities: Capability[]; attenuated: boolean },
+    requested: string[] | undefined,
+    callerCaps: Capability[],
+  ): void {
+    for (const raw of requested ?? []) {
+      const cap = String(raw);
+      if (!cap.startsWith('use-credential:')) throw new Error(`credentialGrants entries must be use-credential:… capabilities (got ${cap})`);
+      if (allows(callerCaps, cap) || allows(callerCaps, 'credential:write')) {
+        if (!authorization.capabilities.includes(cap)) authorization.capabilities.push(cap);
+      } else {
+        authorization.attenuated = true;
+      }
+    }
+  }
+
   /** Change the job-shaped grant on work that has not started yet. The selected
    * profile is always re-attenuated against the immediate bearer, so an agent
    * cannot use a human principal recorded on the draft as a confused deputy. */
-  setTaskAuthorization(token: string, taskId: string, profileId: string): TaskRecord {
+  setTaskAuthorization(token: string, taskId: string, profileId: string, credentialGrants?: string[]): TaskRecord {
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
     if (!task.params?.draft && task.params?.triggerState !== 'armed' && !task.params?.repeatable)
@@ -1010,6 +1037,7 @@ export class KarmaxApi {
     const authorization = this.deps.authorization
       ? this.deps.authorization.taskGrant(caller.principal, task.projectId, profileId, caller.caps)
       : { profileId, capabilities: caller.caps, attenuated: false };
+    this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
       _authorization: { ...authorization, principal: caller.principal },
