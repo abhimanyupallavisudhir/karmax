@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { GitProfile, ProjectConfig } from '../domain/types.js';
 import { CredentialBroker } from './broker.js';
-import { git } from '../world/git.js';
+import { git, isolatedGitEnvironment } from '../world/git.js';
 import { expandPath } from '../util/expand.js';
 import { paths } from '../config/paths.js';
 
@@ -19,16 +19,21 @@ const pexec = promisify(execFile);
  * handles and are resolved JIT by the broker, per subprocess — never written to
  * any git config file, never journaled (§2 principle 4).
  *
- * Selection: project's `gitProfile` → the global default profile → undefined
- * (host fallback: inject nothing, inherit whatever git/gh auth the host has).
+ * Selection: project's `gitProfile` → its organization default → undefined.
+ * Host fallback is a legacy privilege of org_personal only; other organizations
+ * receive a neutral identity and an explicitly scrubbed Git environment.
  */
 
-const KV_PROFILES = 'git:profiles';
-const KV_DEFAULT = 'git:default-profile';
+const LEGACY_KV_PROFILES = 'git:profiles';
+const LEGACY_KV_DEFAULT = 'git:default-profile';
 
 /** The vault handle for one of a profile's secrets. */
-export function gitHandle(profile: string, kind: 'ssh' | 'signing' | 'token'): string {
-  return `git:${profile}:${kind}`;
+export function gitHandle(profile: string, kind: 'ssh' | 'signing' | 'token', organizationId = 'org_personal'): string {
+  // Existing handles are assigned to the migrated personal organization. New
+  // organizations receive a disjoint vault namespace even when profile names match.
+  return organizationId === 'org_personal'
+    ? `git:${profile}:${kind}`
+    : `git:${organizationId}:${profile}:${kind}`;
 }
 
 /** Identity/signing values materialized into a world's worktree-scoped config. */
@@ -49,10 +54,12 @@ export class GitProfiles {
     private store: GitProfileStore,
     private broker?: CredentialBroker,
     private home = paths().state,
+    private organizationId = 'org_personal',
   ) {}
 
   list(): GitProfile[] {
-    const raw = this.store.kvGet(KV_PROFILES);
+    const raw = this.store.kvGet(this.profilesKey())
+      ?? (this.organizationId === 'org_personal' ? this.store.kvGet(LEGACY_KV_PROFILES) : undefined);
     if (!raw) return [];
     try {
       return JSON.parse(raw) as GitProfile[];
@@ -66,11 +73,13 @@ export class GitProfiles {
   }
 
   defaultProfile(): string | undefined {
-    return this.store.kvGet(KV_DEFAULT) || undefined;
+    return (this.store.kvGet(this.defaultKey())
+      ?? (this.organizationId === 'org_personal' ? this.store.kvGet(LEGACY_KV_DEFAULT) : undefined)) || undefined;
   }
 
   setDefault(name: string | undefined) {
-    this.store.kvSet(KV_DEFAULT, name ?? '');
+    if (name && !this.get(name)) throw new Error(`unknown git profile "${name}" in organization ${this.organizationId}`);
+    this.store.kvSet(this.defaultKey(), name ?? '');
   }
 
   /**
@@ -91,29 +100,29 @@ export class GitProfiles {
     const rec: GitProfile = { name, userName: args.userName.trim(), userEmail: args.userEmail.trim() };
     for (const [kind, value, flag] of secrets) {
       if (value?.trim()) {
-        this.requireBroker().registerHandle(gitHandle(name, kind), value.trim());
+        this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim());
         (rec as any)[flag] = true;
       } else if (prior?.[flag]) {
         (rec as any)[flag] = true; // keep the existing secret
       }
     }
     const rest = this.list().filter((p) => p.name !== name);
-    this.store.kvSet(KV_PROFILES, JSON.stringify([...rest, rec]));
+    this.store.kvSet(this.profilesKey(), JSON.stringify([...rest, rec]));
     // Key material may have changed — drop any materialized copies.
     fs.rmSync(this.keyDir(name), { recursive: true, force: true });
     return rec;
   }
 
   delete(name: string) {
-    this.store.kvSet(KV_PROFILES, JSON.stringify(this.list().filter((p) => p.name !== name)));
+    this.store.kvSet(this.profilesKey(), JSON.stringify(this.list().filter((p) => p.name !== name)));
     if (this.defaultProfile() === name) this.setDefault(undefined);
     for (const kind of ['ssh', 'signing', 'token'] as const) {
-      this.broker?.deleteHandle(gitHandle(name, kind));
+      this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId));
     }
     fs.rmSync(this.keyDir(name), { recursive: true, force: true });
   }
 
-  /** The profile a project's worlds use: project → global default → none (host fallback). */
+  /** The profile a project's worlds use: project → organization default → none. */
   resolve(project: ProjectConfig | undefined): GitProfile | undefined {
     const name = project?.gitProfile?.trim() || this.defaultProfile();
     return name ? this.get(name) : undefined;
@@ -168,22 +177,39 @@ export class GitProfiles {
    * repos' remotes non-interactively. Read-only; never throws.
    */
   async preflight(project: ProjectConfig | undefined): Promise<{
-    tier: 'profile' | 'host';
+    tier: 'profile' | 'host' | 'unconfigured';
     profile?: string;
     checks: { label: string; ok: boolean; detail?: string }[];
   }> {
     const checks: { label: string; ok: boolean; detail?: string }[] = [];
     const profile = this.resolve(project);
-    let env: Record<string, string> = {};
+    if (!profile && this.organizationId !== 'org_personal') {
+      return {
+        tier: 'unconfigured',
+        checks: [{
+          label: 'organization Git account',
+          ok: false,
+          detail: 'No Git profile is configured. Host Git identities and credentials are not shared with organizations.',
+        }],
+      };
+    }
+    let env: Record<string, string> = this.organizationId === 'org_personal' ? {} : isolatedGitEnvironment();
     if (profile) {
       checks.push({ label: 'identity', ok: true, detail: `${profile.userName} <${profile.userEmail}>` });
       checks.push({ label: 'commit signing', ok: !!profile.signingKey, detail: profile.signingKey ? 'ssh signing key stored' : 'no signing key (commits unsigned)' });
       try {
-        env = this.env(profile, {});
+        env = { ...env, ...this.env(profile, {}) };
       } catch (e) {
         checks.push({ label: 'credentials', ok: false, detail: e instanceof Error ? e.message : String(e) });
       }
-      checks.push({ label: 'push auth', ok: !!(profile.sshKey || profile.githubToken), detail: profile.sshKey ? 'ssh key' : profile.githubToken ? 'github token' : 'identity only — pushes use the host’s auth' });
+      checks.push({
+        label: 'push auth',
+        ok: !!(profile.sshKey || profile.githubToken),
+        detail: profile.sshKey ? 'ssh key' : profile.githubToken ? 'github token'
+          : this.organizationId === 'org_personal'
+            ? 'identity only — pushes use the host’s auth'
+            : 'identity only — add an organization SSH key or GitHub token to push',
+      });
     } else {
       const name = await git(process.cwd(), ['config', '--global', 'user.name']);
       checks.push({ label: 'host git identity', ok: name.code === 0 && !!name.stdout.trim(), detail: name.stdout.trim() || 'unset — karmax commits as karmax@localhost' });
@@ -231,11 +257,27 @@ export class GitProfiles {
   }
 
   private resolveSecret(profile: string, kind: 'ssh' | 'signing' | 'token', ctx: { taskId?: string }): string {
-    return this.requireBroker().resolve(gitHandle(profile, kind), { taskId: ctx.taskId, caps: [`use-credential:git:${profile}:*`] });
+    const cap = this.organizationId === 'org_personal'
+      ? `use-credential:git:${profile}:*`
+      : `use-credential:git:${this.organizationId}:${profile}:*`;
+    return this.requireBroker().resolve(gitHandle(profile, kind, this.organizationId), {
+      taskId: ctx.taskId,
+      caps: [cap],
+    });
   }
 
   private keyDir(profile: string): string {
-    return path.join(this.home, 'git-profiles', profile);
+    return this.organizationId === 'org_personal'
+      ? path.join(this.home, 'git-profiles', profile)
+      : path.join(this.home, 'git-profiles', this.organizationId, profile);
+  }
+
+  private profilesKey(): string {
+    return `git:profiles:${this.organizationId}`;
+  }
+
+  private defaultKey(): string {
+    return `git:default-profile:${this.organizationId}`;
   }
 
   private requireBroker(): CredentialBroker {

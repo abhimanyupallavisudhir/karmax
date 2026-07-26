@@ -66,6 +66,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   if (adapterOverride) adapters.set(provider, adapterOverride);
   const profiles = new ProfileResolver(store, provider);
   const bus = new KarmaxBus();
+  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
   const vaultHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-'));
   const objectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-objects-'));
   const broker = new CredentialBroker(new Vault(vaultHome));
@@ -87,6 +88,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
     client,
     tokens,
     payments,
+    contentDir,
     taskQueue: TASK_QUEUE,
     broker,
     resources,
@@ -94,7 +96,6 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);
   let runPromise = worker.run();
 
-  const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus });
   const gateways: Array<() => Promise<void>> = [];
 
@@ -156,6 +157,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
       fs.rmSync(worldsHome, { recursive: true, force: true });
       fs.rmSync(vaultHome, { recursive: true, force: true });
       fs.rmSync(objectHome, { recursive: true, force: true });
+      fs.rmSync(contentDir, { recursive: true, force: true });
     },
     async makeRepo(name: string) {
       const repo = fs.mkdtempSync(path.join(os.tmpdir(), `karmax-repo-${name}-`));

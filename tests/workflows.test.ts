@@ -69,6 +69,37 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(base.stdout).toContain('base');
   });
 
+  it('just-do: keeps working in parallel, then parks at the turn boundary until collaboration settles', async () => {
+    const repo = await h.makeRepo('jd-collaboration');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('justDo', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'parallel join',
+        prompt: '@sleep 1200\n@write own.txt :: requester work',
+      })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    await handle.signal('collaborationRequested', 'collab-test');
+
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 15_000 })
+      .toBe('collaboration');
+    expect((await view(handle)).stage).toBe('do');
+
+    await handle.signal('collaborationSettled', 'collab-test', {
+      id: 'collab-collab-test',
+      role: 'user',
+      text: '@write joined.txt :: publication arrived',
+      ts: Date.now(),
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(repo, ['show', `karmax/${taskId}:own.txt`])).stdout).toContain('requester work');
+    expect((await git(repo, ['show', `karmax/${taskId}:joined.txt`])).stdout).toContain('publication arrived');
+  });
+
   it('script-exec: runs a command and captures its output', async () => {
     const repo = await h.makeRepo('se');
     const taskId = newId('task');
@@ -99,6 +130,62 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(res.stage).toBe('done');
     const onMain = await git(repo, ['show', 'main:goal.txt']);
     expect(onMain.stdout).toContain('achieved');
+  });
+
+  it('goal: a clean partial return triggers another turn until explicit completion', async () => {
+    const repo = await h.makeRepo('goal-persist');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('goal@1.3.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'persist', prompt: '@write persisted.txt :: first pass\n@incomplete' })],
+    });
+    expect((await handle.result()).stage).toBe('done');
+    const finalView = await view(handle);
+    expect(finalView.messages.map((m: any) => m.text).join('\n')).toMatch(/call signal_completion/i);
+    const onMain = await git(repo, ['show', 'main:persisted.txt']);
+    expect(onMain.stdout).toContain('first pass');
+  });
+
+  it('switches Software Dev at Review to Goal without approving the partial Review', async () => {
+    const repo = await h.makeRepo('switch-to-goal');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.3.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'finish autonomously', prompt: '@write switched.txt :: achieved\n@review first pass' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const changed = await handle.executeUpdate('changeWorkflow', { args: ['goal'] }) as any;
+    expect(changed.workflow).toBe('goal');
+    // The switch injects a continuation and goes back through Do; it does not
+    // treat the already-waiting Software Dev review as implicitly confirmed.
+    const res = await handle.result();
+    expect(res.stage).toBe('done');
+    const finalView = await view(handle);
+    expect(finalView.workflow).toBe('goal');
+    expect(finalView.messages.map((m: any) => m.text).join('\n')).toMatch(/entire task is complete/i);
+    const onMain = await git(repo, ['show', 'main:switched.txt']);
+    expect(onMain.stdout).toContain('achieved');
+  });
+
+  it('switches Goal back to Software Dev during Do and restores the Review gate', async () => {
+    const repo = await h.makeRepo('switch-to-dev');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('goal@1.3.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, { title: 'restore review', prompt: '@sleep 1500\n@write reviewed.txt :: ready' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
+    const changed = await handle.executeUpdate('changeWorkflow', { args: ['software-dev'] }) as any;
+    expect(changed.workflow).toBe('software-dev');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    const atReview = await view(handle);
+    expect(atReview.workflow).toBe('software-dev');
+    expect(atReview.status).toBe('waiting');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
   });
 
   it('merge-only: reviews and merges an existing branch (the dogfooded gate)', async () => {
@@ -236,6 +323,89 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await wf.signal('setAgentCapacity', { capacity: 1 });
     await expect.poll(async () => (await q()).capacity, { timeout: 10_000 }).toBe(1);
     expect((await q()).current).toHaveLength(2); // shrinking never kills running turns
+    await wf.terminate('test done');
+  });
+
+  it('acknowledges queued turns without a blocking Update and rotates with an active lease', async () => {
+    const { agentQueueId } = await import('../src/coordinators/names.js');
+    const receiver = await h.client.workflow.start('mergeQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: 'agent-v2-receiver',
+      args: [{ domain: 'agent-v2-receiver' }],
+    });
+    const held = { taskId: 'already-running', turnId: 'already-running#0', role: 'do' };
+    const waiting = { taskId: 'agent-v2-receiver', turnId: 'agent-v2-receiver#0', role: 'merge' };
+    const wf = await h.client.workflow.start('agentQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: `${agentQueueId()}:v2-test`,
+      args: [{
+        capacity: 1,
+        state: { capacity: 1, current: [held], queue: [], processed: 49, modern: true },
+      }],
+    });
+    const initialRunId = (await wf.describe()).runId;
+
+    await wf.signal('requestAgentSlotV2', waiting);
+    await expect(wf.executeUpdate('requestAgentSlotV2', { args: [waiting] })).resolves.toEqual({
+      granted: false,
+      position: 1,
+      capacity: 1,
+    });
+    expect((await wf.query('agentQueue') as any).queue.map((x: any) => x.turnId)).toEqual([waiting.turnId]);
+
+    await wf.signal('releaseAgentSlot', { taskId: held.taskId, turnId: held.turnId });
+    await expect.poll(async () => (await wf.query('agentQueue') as any).current.map((x: any) => x.turnId))
+      .toEqual([waiting.turnId]);
+    await expect.poll(async () => (await wf.describe()).runId).not.toBe(initialRunId);
+    expect((await wf.query('agentQueue') as any).current.map((x: any) => x.turnId)).toEqual([waiting.turnId]);
+
+    await wf.terminate('test done');
+    await receiver.terminate('test done');
+  });
+
+  it('admits a burst through one blocking update per waiter', async () => {
+    const { agentQueueId } = await import('../src/coordinators/names.js');
+    const wf = await h.client.workflow.start('agentQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: `${agentQueueId()}:burst-test`,
+      args: [{ capacity: 2 }],
+    });
+    const items = Array.from({ length: 5 }, (_, i) => ({
+      taskId: `burst-${i}`,
+      turnId: `burst-${i}#0`,
+      role: 'do',
+    }));
+    for (const item of items) await wf.signal('leaseAgentSlot', item);
+    const waits = items.map((item) =>
+      wf.executeUpdate('waitAgentSlot', { args: [{ taskId: item.taskId, turnId: item.turnId }] }) as Promise<boolean>);
+
+    await expect.poll(async () => {
+      const view = await wf.query('agentQueue') as any;
+      return [view.current.map((x: any) => x.turnId), view.queue.map((x: any) => x.turnId)];
+    }, { timeout: 10_000 }).toEqual([
+      ['burst-0#0', 'burst-1#0'],
+      ['burst-2#0', 'burst-3#0', 'burst-4#0'],
+    ]);
+    await expect(Promise.all(waits.slice(0, 2))).resolves.toEqual([true, true]);
+
+    await wf.signal('releaseAgentSlot', { taskId: 'burst-0', turnId: 'burst-0#0' });
+    await wf.signal('releaseAgentSlot', { taskId: 'burst-1', turnId: 'burst-1#0' });
+    await expect(Promise.all(waits.slice(2, 4))).resolves.toEqual([true, true]);
+    await wf.signal('releaseAgentSlot', { taskId: 'burst-2', turnId: 'burst-2#0' });
+    await wf.signal('releaseAgentSlot', { taskId: 'burst-3', turnId: 'burst-3#0' });
+    await expect(waits[4]).resolves.toBe(true);
+
+    await wf.signal('setAgentCapacity', { capacity: 1 });
+    const cancelled = { taskId: 'burst-cancelled', turnId: 'burst-cancelled#0', role: 'do' };
+    await wf.signal('leaseAgentSlot', cancelled);
+    const cancelledWait = wf.executeUpdate('waitAgentSlot', {
+      args: [{ taskId: cancelled.taskId, turnId: cancelled.turnId }],
+    }) as Promise<boolean>;
+    await expect.poll(async () => (await wf.query('agentQueue') as any).queue.map((x: any) => x.turnId))
+      .toContain(cancelled.turnId);
+    await wf.signal('cancelAgentSlot', { taskId: cancelled.taskId, turnId: cancelled.turnId });
+    await expect(cancelledWait).resolves.toBe(false);
+
     await wf.terminate('test done');
   });
 });

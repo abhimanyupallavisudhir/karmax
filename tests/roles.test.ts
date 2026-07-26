@@ -69,6 +69,23 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
 
     expect(applyAgentSpec(profile({ model: 'claude-opus-4-8' }), { provider: 'codex', model: 'gpt-5.6-sol' }).model).toBe('gpt-5.6-sol');
   });
+
+  it('ignores the retired task/profile model-provider override', () => {
+    const resolved = applyAgentSpec(
+      profile({
+        provider: 'opencode',
+        model: 'custom-model',
+        modelProvider: 'xai',
+        auth: { kind: 'configHome', configHome: '/tmp/legacy' },
+        allowedAccounts: ['login:opencode:legacy'],
+      }),
+      { provider: 'opencode', modelProvider: 'google' } as any,
+    );
+    expect(resolved.model).toBe('custom-model');
+    expect(resolved.modelProvider).toBeUndefined();
+    expect(resolved.auth).toBeUndefined();
+    expect(resolved.allowedAccounts).toBeUndefined();
+  });
 });
 
 describe('prompt assembly derives from the declared role (not a hardcoded map)', () => {
@@ -86,6 +103,19 @@ describe('prompt assembly derives from the declared role (not a hardcoded map)',
   it('an undeclared role falls back to the do template rather than breaking', () => {
     const out = assemblePrompt({ profile: profile({ role: 'reviewer' }), role: 'reviewer', task, world });
     expect(out).toContain('# Task'); // do template floor
+  });
+
+  it('includes global and project wiki context in the Confirm-agent prompt', () => {
+    const out = assemblePrompt({
+      profile: profile({ role: 'confirm' }),
+      role: 'confirm',
+      task,
+      world,
+      globalInstructions: 'Organization wiki context',
+      projectInstructions: 'Project wiki context',
+    });
+    expect(out).toContain('Organization wiki context');
+    expect(out).toContain('Project wiki context');
   });
 });
 

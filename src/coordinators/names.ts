@@ -21,9 +21,13 @@ export const SIG_MERGE_GRANTED = 'mergeGranted';
 export const QRY_QUEUE = 'queue';
 
 export const SIG_LEASE_AGENT = 'leaseAgentSlot';
+export const SIG_REQUEST_AGENT = 'requestAgentSlotV2';
+export const SIG_AGENT_SLOT_GRANTED = 'agentSlotGranted';
 export const SIG_CANCEL_AGENT = 'cancelAgentSlot';
 export const SIG_RELEASE_AGENT = 'releaseAgentSlot';
 export const SIG_SET_AGENT_CAPACITY = 'setAgentCapacity';
+export const UPD_WAIT_AGENT = 'waitAgentSlot';
+export const UPD_REQUEST_AGENT = 'requestAgentSlotV2';
 export const QRY_AGENT_QUEUE = 'agentQueue';
 
 export const SIG_ENQUEUE_RESOURCE_PUBLISH = 'enqueueResourcePublish';

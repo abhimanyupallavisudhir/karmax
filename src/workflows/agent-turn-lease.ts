@@ -8,15 +8,47 @@ import {
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { limitFailureClassification } from './failures.js';
-import { SIG_ACCOUNT_GRANTED } from '../coordinators/names.js';
+import { SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
 import { SIG_AGENT_TURN_STATE } from './names.js';
-import type { AgentRole, TaskInput, TaskView } from './contract.js';
+import type { AgentRole, TaskInput, TaskView, WorldHandleLike } from './contract.js';
 
-type Provider = 'claude' | 'codex' | 'mock';
-type Grant = { accountId: string; configHome?: string; apiKeyHandle?: string };
+type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
+type CredentialKind = 'login' | 'ambient' | 'key';
+type Grant = {
+  accountId: string;
+  configHome?: string;
+  apiKeyHandle?: string;
+  credentialKind?: CredentialKind;
+  credentialProvider?: string;
+};
 
-const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
-const agentTurnStateSignal = defineSignal<[{ turnId: string; role: AgentRole; provider?: Provider; state: 'running' }]>(SIG_AGENT_TURN_STATE);
+const accountGrantedSignal = defineSignal<[{
+  turnId: string;
+  accountId: string;
+  configHome?: string;
+  apiKeyHandle?: string;
+  credentialKind?: CredentialKind;
+  credentialProvider?: string;
+}]>(SIG_ACCOUNT_GRANTED);
+const agentSlotGrantedSignal = defineSignal<[{ turnId: string }]>(SIG_AGENT_SLOT_GRANTED);
+const agentTurnStateSignal = defineSignal<[{
+  turnId: string;
+  role: AgentRole;
+  provider?: Provider;
+  state: 'running' | 'waiting-host';
+  detail?: string;
+}]>(SIG_AGENT_TURN_STATE);
+
+type AgentTurnContext = {
+  accountConfigHome?: string;
+  accountApiKeyHandle?: string;
+  accountCredentialKind?: CredentialKind;
+  accountCredentialProvider?: string;
+  agentTurnId: string;
+  agentAdmissionManaged?: true;
+  /** The owning workflow already holds the durable coordinator lease. */
+  agentSlotGranted?: true;
+};
 
 export class AgentTurnCancelled extends Error {}
 export class CredentialUnavailable extends Error {}
@@ -25,6 +57,7 @@ export interface AgentTurnLeaseHost {
   taskId: string;
   projectId: string;
   task(): TaskInput;
+  world(): WorldHandleLike | undefined;
   status(): TaskView['status'];
   setStatus(status: TaskView['status']): void;
   setWaitingFor(waitingFor: TaskView['waitingFor']): void;
@@ -40,6 +73,7 @@ export function createAgentTurnLeaser(
   core: ActivityInterfaceFor<coreActivities>,
   coord: ActivityInterfaceFor<coordinatorActivities>,
   host: AgentTurnLeaseHost,
+  durableAdmission = false,
 ) {
   let accountPool = 0;
   let turnSeq = 0;
@@ -47,13 +81,31 @@ export function createAgentTurnLeaser(
   let resumeStatus: TaskView['status'] = 'active';
   let currentTurn: TaskView['agentTurn'];
   const grants = new Map<string, Grant>();
+  const slotGrants = new Set<string>();
 
   setHandler(accountGrantedSignal, (g) => {
-    grants.set(g.turnId, { accountId: g.accountId, configHome: g.configHome, apiKeyHandle: g.apiKeyHandle });
+    grants.set(g.turnId, {
+      accountId: g.accountId,
+      configHome: g.configHome,
+      apiKeyHandle: g.apiKeyHandle,
+      credentialKind: g.credentialKind,
+      credentialProvider: g.credentialProvider,
+    });
+  });
+  setHandler(agentSlotGrantedSignal, ({ turnId }) => {
+    slotGrants.add(turnId);
   });
   setHandler(agentTurnStateSignal, async (next) => {
     if (!currentTurn || currentTurn.turnId !== next.turnId) return;
-    currentTurn = { ...next };
+    if (next.state === 'waiting-host') {
+      currentTurn = { turnId: next.turnId, role: next.role, provider: next.provider, state: 'waiting-slot' };
+      host.setAgentTurn(currentTurn);
+      host.setWaitingFor({ kind: 'agentSlot', provider: next.provider, detail: next.detail ?? 'Starting agent' });
+      host.setStatus('waiting');
+      await host.publish();
+      return;
+    }
+    currentTurn = { turnId: next.turnId, role: next.role, provider: next.provider, state: 'running' };
     host.setAgentTurn(currentTurn);
     host.setWaitingFor(undefined);
     host.setStatus(resumeStatus);
@@ -64,21 +116,85 @@ export function createAgentTurnLeaser(
     turnId: string,
     role: AgentRole,
     provider: Provider | undefined,
-    fn: (ctx: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) => Promise<T>,
+    fn: (ctx: AgentTurnContext) => Promise<T>,
     home?: string,
     key?: string,
+    credentialKind?: CredentialKind,
+    credentialProvider?: string,
   ): Promise<T> => {
     resumeStatus = host.status() === 'waiting' ? 'active' : host.status();
     currentTurn = { turnId, role, provider, state: 'waiting-slot' };
     host.setAgentTurn(currentTurn);
     host.setStatus('waiting');
-    host.setWaitingFor({ kind: 'agentSlot', provider, detail: 'Waiting for host capacity to run the agent' });
+    host.setWaitingFor({
+      kind: 'agentSlot',
+      provider,
+      detail: durableAdmission ? 'Starting agent' : 'Waiting for host capacity to run the agent',
+    });
     await host.publish();
     const scope = new CancellationScope({ cancellable: true });
     activeScope = scope;
+    let slotHeld = false;
+    let slotRequested = false;
     try {
-      return await scope.run(() => fn({ accountConfigHome: home, accountApiKeyHandle: key, agentTurnId: turnId }));
+      return await scope.run(async () => {
+        if (durableAdmission) {
+          const world = host.world();
+          if (!world) throw new Error('agent world is not ready');
+          const usesHostCapacity = await core.agentUsesHostCapacity({
+            role,
+            task: host.task(),
+            worldHandle: world as any,
+            accountConfigHome: home,
+            accountApiKeyHandle: key,
+            accountCredentialKind: credentialKind,
+            accountCredentialProvider: credentialProvider,
+          });
+          if (usesHostCapacity) {
+            slotRequested = true;
+            const admission = await coord.requestAgentSlot({
+              taskId: host.taskId,
+              turnId,
+              role,
+              provider,
+              title: host.task().title,
+              projectId: host.projectId,
+            });
+            slotHeld = admission.granted || slotGrants.delete(turnId);
+            if (!slotHeld) {
+              host.setWaitingFor({
+                kind: 'agentSlot',
+                provider,
+                detail: 'Waiting for host capacity to start agent',
+              });
+              await host.publish();
+              await condition(() => slotGrants.has(turnId) || host.cancelled());
+              slotHeld = slotGrants.delete(turnId);
+            }
+            if (host.cancelled() && !slotHeld) throw new AgentTurnCancelled();
+            host.setWaitingFor({ kind: 'agentSlot', provider, detail: 'Starting agent' });
+            await host.publish();
+          }
+        }
+        return await fn({
+          accountConfigHome: home,
+          accountApiKeyHandle: key,
+          accountCredentialKind: credentialKind,
+          accountCredentialProvider: credentialProvider,
+          agentTurnId: turnId,
+          ...(durableAdmission ? { agentAdmissionManaged: true as const } : {}),
+          ...(slotHeld ? { agentSlotGranted: true as const } : {}),
+        });
+      });
+    } catch (err) {
+      if (durableAdmission && host.cancelled()) throw new AgentTurnCancelled();
+      throw err;
     } finally {
+      slotGrants.delete(turnId);
+      if (durableAdmission && slotRequested) {
+        if (slotHeld) await coord.releaseAgentSlot(host.taskId, turnId).catch(() => undefined);
+        else await coord.cancelAgentSlot(host.taskId, turnId).catch(() => undefined);
+      }
       if (activeScope === scope) activeScope = undefined;
       if (currentTurn?.turnId === turnId) {
         currentTurn = undefined;
@@ -101,23 +217,28 @@ export function createAgentTurnLeaser(
 
     async run<T>(
       role: AgentRole,
-      fn: (ctx: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) => Promise<T>,
+      fn: (ctx: AgentTurnContext) => Promise<T>,
     ): Promise<T> {
       const turnId = `${host.taskId}#${turnSeq++}`;
       if (accountPool <= 0) return admitted(turnId, role, undefined, fn);
 
       const resolved = await core.resolveProvider({ role, task: host.task() }).catch(() => undefined);
-      const provider = resolved === 'claude' || resolved === 'codex' || resolved === 'mock' ? resolved : undefined;
-      if (!provider) return admitted(turnId, role, undefined, fn);
+      const credentialProvider = typeof resolved === 'string' && resolved ? resolved : undefined;
+      if (!credentialProvider) return admitted(turnId, role, undefined, fn);
       const allowed =
-        provider === 'claude' || provider === 'codex'
-          ? await core.resolveCredentialOrder({ taskId: host.taskId, projectId: host.projectId, provider }).catch(() => undefined)
+        credentialProvider !== 'mock'
+          ? await core.resolveCredentialOrder({ taskId: host.taskId, projectId: host.projectId, provider: credentialProvider, role, task: host.task() }).catch(() => undefined)
+          : undefined;
+      const provider =
+        credentialProvider === 'claude' || credentialProvider === 'codex' || credentialProvider === 'opencode'
+        || credentialProvider === 'kimi' || credentialProvider === 'grok' || credentialProvider === 'mock'
+          ? credentialProvider
           : undefined;
 
-      await coord.leaseAccount(host.taskId, turnId, provider, allowed);
+      await coord.leaseAccount(host.taskId, turnId, credentialProvider, allowed);
       const beforeWait = host.status();
       host.setStatus('waiting');
-      host.setWaitingFor({ kind: 'account', provider });
+      host.setWaitingFor({ kind: 'account', provider: credentialProvider });
       await host.publish();
       await condition(() => grants.has(turnId) || host.cancelled());
       const grant = grants.get(turnId);
@@ -133,14 +254,16 @@ export function createAgentTurnLeaser(
         host.setWaitingFor(undefined);
         host.setStatus(beforeWait === 'waiting' ? 'active' : beforeWait);
         await host.publish();
-        throw new CredentialUnavailable(`No usable ${provider} credential; every allowed credential needs attention.`);
+        throw new CredentialUnavailable(`No usable ${credentialProvider} credential; every allowed credential needs attention.`);
       }
 
       const passthrough = !grant || grant.accountId === '(passthrough)';
       const home = passthrough ? undefined : grant?.configHome;
       const key = passthrough ? undefined : grant?.apiKeyHandle;
+      const credentialKind = passthrough ? undefined : grant?.credentialKind;
+      const leasedCredentialProvider = passthrough ? undefined : grant?.credentialProvider;
       try {
-        return await admitted(turnId, role, provider, fn, home, key);
+        return await admitted(turnId, role, provider, fn, home, key, credentialKind, leasedCredentialProvider);
       } catch (err) {
         if (grant && !passthrough && !host.cancelled()) {
           const cls = limitFailureClassification(err);

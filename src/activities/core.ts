@@ -5,9 +5,18 @@ import { classifyProviderTurnError, isTransportError, isResourceKill, type Limit
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
-import { World, WorldHandle, WorldKind } from '../world/types.js';
+import { World, WorldHandle, WorldKind, worldWorkingDirectory } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
+import {
+  apiKeyEnv,
+  canonicalModelProvider,
+  credentialAliases,
+  credentialMatchesProfile,
+  credentialProvider,
+  MODEL_PROVIDERS,
+  modelProviderFromModel,
+} from '../agent/provider-registry.js';
 import { AgentAdapter } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { acquireAgentSlot, awaitAgentResources } from './agent-slots.js';
@@ -17,9 +26,11 @@ import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
 import { CredentialBroker } from '../autonomy/broker.js';
+import { VaultItems } from '../autonomy/vault-items.js';
 import { GitProfiles } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
-import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, type GitBrokerAuth } from '../world/git-broker.js';
+import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
+import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
 import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
@@ -27,22 +38,24 @@ import { materializeFork } from '../agent/fork.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
 import os from 'node:os';
 import fs from 'node:fs';
+import { paths } from '../config/paths.js';
+import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
-import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
+import { Provider, Message, TaskInput, TaskView, AgentRole } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
 import {
   AGENT_QUEUE_WORKFLOW,
-  QRY_AGENT_QUEUE,
   SIG_CANCEL_AGENT,
   SIG_LEASE_AGENT,
   SIG_RELEASE_AGENT,
   SIG_SET_AGENT_CAPACITY,
+  UPD_WAIT_AGENT,
   agentQueueId,
 } from '../coordinators/names.js';
 
@@ -89,6 +102,12 @@ async function acquireConfirmLock(key: string): Promise<() => void> {
 function classifyTurnError(err: unknown, provider?: Provider): Error {
   const msg = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error ? err : undefined;
+  // Admission happens before a provider process exists. Temporal coordinator
+  // backpressure/outages therefore cannot be an agent error and must retain
+  // their retryable infrastructure classification through this outer boundary.
+  if (err instanceof AgentAdmissionInfrastructureError) {
+    return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
+  }
   const { classification: cls, metadata } = classifyProviderTurnError(err, provider);
   if (cls.limited) {
     return ApplicationFailure.create({
@@ -108,6 +127,14 @@ function classifyTurnError(err: unknown, provider?: Provider): Error {
   if (isResourceKill(msg)) return ApplicationFailure.create({ message: signalKillMessage(msg), type: 'agent-infra', nonRetryable: false, cause });
   if (isTransportError(msg)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   return ApplicationFailure.create({ message: msg, type: 'agent-error', nonRetryable: true, cause });
+}
+
+class AgentAdmissionInfrastructureError extends Error {
+  constructor(cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`agent-slot admission failed: ${detail}`, { cause: cause instanceof Error ? cause : undefined });
+    this.name = 'AgentAdmissionInfrastructureError';
+  }
 }
 
 /**
@@ -139,26 +166,6 @@ function signalKillMessage(raw: string): string {
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
 }
 
-/** Split an account ref that may be "<provider>:<name>" or just "<name>". */
-function splitAccountRef(ref: string, fallback: Provider): { provider: Provider; name: string } {
-  const [maybeProv, ...rest] = ref.split(':');
-  const isProv = rest.length > 0 && (maybeProv === 'claude' || maybeProv === 'codex' || maybeProv === 'mock');
-  return { provider: (isProv ? maybeProv : fallback) as Provider, name: isProv ? rest.join(':') : ref };
-}
-
-/** Derive a single AuthSource from the first usable entry of allowedAccounts
- *  (`login:<provider>:<account>` → configHome; `key:<handle>` → apiKeyHandle). */
-function firstAllowedToAuth(allowed: string[] | undefined, provider: Provider): AuthSource | undefined {
-  if (!allowed?.length) return undefined;
-  // Prefer a login for the profile's provider; else the first login; else a key.
-  const logins = allowed.filter((a) => a.startsWith('login:'));
-  const preferred = logins.find((a) => a.slice('login:'.length).startsWith(`${provider}:`)) ?? logins[0];
-  if (preferred) return { kind: 'configHome', account: preferred.slice('login:'.length) };
-  const key = allowed.find((a) => a.startsWith('key:'));
-  if (key) return { kind: 'apiKeyHandle', handle: key.slice('key:'.length) };
-  return undefined;
-}
-
 export interface CoreActivityDeps {
   store: Store;
   worlds: WorldRegistry;
@@ -176,6 +183,7 @@ export interface CoreActivityDeps {
   payments?: PaymentProvider;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
+  contentDir?: string;
 }
 
 export interface CreateWorldArgs {
@@ -220,23 +228,47 @@ async function acquireWorkflowAgentSlot(args: {
     signalArgs: [{ taskId: args.taskId, turnId: args.turnId, role: args.role, provider: args.provider, title: args.title, projectId: args.projectId }],
   });
   await args.client.workflow.getHandle(id).signal(SIG_SET_AGENT_CAPACITY, { capacity });
-  let lastHeartbeat = 0;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   try {
-    for (;;) {
-      if (args.signal?.aborted) throw args.signal.reason instanceof Error ? args.signal.reason : new Error('agent queue wait cancelled');
-      const view = (await args.client.workflow.getHandle(id).query(QRY_AGENT_QUEUE)) as {
-        current: Array<{ turnId: string }>;
-      };
-      if (view.current.some((x) => x.turnId === args.turnId)) break;
-      if (Date.now() - lastHeartbeat >= 10_000) {
-        args.heartbeat?.();
-        lastHeartbeat = Date.now();
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
-    }
+    if (args.signal?.aborted)
+      throw args.signal.reason instanceof Error ? args.signal.reason : new Error('agent queue wait cancelled');
+    // Keep the long-running activity lease alive while one durable Workflow
+    // Update waits for promotion. This creates O(waiters), not O(waiters × time),
+    // Temporal requests and cannot fill the consistent-query buffer.
+    heartbeatTimer = setInterval(() => {
+      try { args.heartbeat?.(); } catch { /* activity cancellation is handled below */ }
+    }, 10_000);
+    heartbeatTimer.unref?.();
+    const admission = args.client.workflow.getHandle(id).executeUpdate(UPD_WAIT_AGENT, {
+      args: [{
+        taskId: args.taskId,
+        turnId: args.turnId,
+        role: args.role,
+        provider: args.provider,
+        title: args.title,
+        projectId: args.projectId,
+      }],
+    }) as Promise<boolean>;
+    let removeAbortListener = () => {};
+    const granted = await (args.signal
+      ? Promise.race([
+          Promise.resolve(admission),
+          new Promise<never>((_, reject) => {
+            const abort = () => reject(args.signal!.reason instanceof Error
+              ? args.signal!.reason
+              : new Error('agent queue wait cancelled'));
+            args.signal!.addEventListener('abort', abort, { once: true });
+            removeAbortListener = () => args.signal!.removeEventListener('abort', abort);
+          }),
+        ]).finally(() => removeAbortListener())
+      : Promise.resolve(admission));
+    if (!granted) throw new Error('agent queue lease was cancelled before admission');
   } catch (e) {
     await args.client.workflow.getHandle(id).signal(SIG_CANCEL_AGENT, { taskId: args.taskId, turnId: args.turnId }).catch(() => undefined);
-    throw e;
+    if (args.signal?.aborted) throw e;
+    throw new AgentAdmissionInfrastructureError(e);
+  } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
   }
   let released = false;
   return async () => {
@@ -258,15 +290,22 @@ export interface RunAgentTurnArgs {
   task: TaskInput;
   bindings?: Record<string, string>;
   explicitProfileId?: string;
-  /** Config home leased by the account coordinator for this turn (SPEC §6.2);
-   * overrides the profile's own auth home so turns rotate across logins. */
+  /** Config home leased by the account coordinator for this turn (SPEC §6.2). */
   accountConfigHome?: string;
+  /** Kind of credential leased; distinguishes an environment key/ambient login. */
+  accountCredentialKind?: 'login' | 'ambient' | 'key';
+  /** Model/API provider of the exact credential leased by the coordinator. */
+  accountCredentialProvider?: string;
   /** Broker API-key handle leased by the coordinator for this turn (a `key:handle:*`
    * credential); resolved JIT and overrides the auth. Env keys carry no handle —
    * they fall through to the adapter's env credential. */
   accountApiKeyHandle?: string;
   /** Workflow-generated id used to correlate live admission/running signals. */
   agentTurnId?: string;
+  /** Current workflow versions acquire/release the durable queue lease themselves. */
+  agentSlotGranted?: boolean;
+  /** Current workflow versions own admission, including the remote-rail exemption. */
+  agentAdmissionManaged?: boolean;
 }
 
 export interface PrepareChildArgs {
@@ -290,8 +329,14 @@ export interface PrepareChildArgs {
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
 export function makeCoreActivities(deps: CoreActivityDeps) {
   const { store, worlds, profiles } = deps;
-  const gitProfiles = new GitProfiles(store, deps.broker);
   const isRemote = (kind: WorldKind) => worlds.get(kind).capabilities?.remote === true;
+
+  const gitProfilesFor = (projectId?: string) => new GitProfiles(
+    store,
+    deps.broker,
+    paths().state,
+    (projectId ? store.getProject(projectId)?.organizationId : undefined) ?? 'org_personal',
+  );
 
   function record(taskId: string, type: string, payload: Record<string, unknown>) {
     const ev = { type, taskId, ts: Date.now(), payload };
@@ -301,16 +346,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   /** JIT env for remote git/gh operations in this world (PLAN-git-config.md §4B):
    *  the world's git profile (stamped on the handle at creation) → GIT_SSH_COMMAND /
-   *  GH_TOKEN, per subprocess. Empty when the world has no profile (host fallback)
-   *  or resolution fails — the op then runs with the host's own auth. */
+   *  GH_TOKEN, per subprocess. The personal organization retains host fallback;
+   *  every other organization gets an explicitly credential-free environment. */
   function gitEnvFor(handle: WorldHandle, taskId?: string): Record<string, string> {
+    const projectId = typeof handle.meta?.projectId === 'string'
+      ? handle.meta.projectId
+      : taskId ? store.getTask(taskId)?.projectId : undefined;
+    const organizationId = projectId
+      ? store.getProject(projectId)?.organizationId ?? 'org_personal'
+      : 'org_personal';
+    const fallback = organizationId === 'org_personal' ? {} : isolatedGitEnvironment();
     const name = handle.meta?.gitProfile;
-    if (typeof name !== 'string' || !name) return {};
+    if (typeof name !== 'string' || !name) return fallback;
     try {
+      const gitProfiles = gitProfilesFor(projectId);
       const profile = gitProfiles.get(name);
-      return profile ? gitProfiles.env(profile, { taskId }) : {};
+      return profile ? { ...fallback, ...gitProfiles.env(profile, { taskId }) } : fallback;
     } catch {
-      return {};
+      return fallback;
     }
   }
 
@@ -318,10 +371,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : undefined;
     const project = projectId ? store.getProject(projectId) : undefined;
     const linked = projectId ? store.listProjectRepositories(projectId) : [];
-    if (project?.organizationId && linked.length && deps.githubApp) {
+    const wiki = projectId ? store.projectWiki(projectId)?.repository : undefined;
+    if (project?.organizationId && (linked.length || wiki) && deps.githubApp) {
       return async (worldRepo) => {
         const source = worldRepoSource(worldRepo);
-        const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository;
+        const repository = linked.find((candidate) => candidate.repository.sshUrl === source)?.repository
+          ?? (wiki?.sshUrl === source ? wiki : undefined);
         if (!repository) throw new Error(`Git broker rejected repository outside project enrollment: ${source}`);
         return deps.githubApp!.brokerCredentials(repository);
       };
@@ -352,29 +407,88 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return deps.resources ? await deps.resources.prepare(world) : world;
   }
 
+  /** Make the task's live project-wiki checkout host-readable for prompt
+   * assembly. Local providers already expose it directly; remote providers are
+   * copied into a short-lived snapshot through the provider-neutral file API. */
+  async function projectWikiPromptSnapshot(world: World): Promise<{ root: string; release(): void } | undefined> {
+    const repo = worldRepos(world.handle).find((candidate) => candidate.role === 'project-wiki');
+    if (!repo) return undefined;
+    if (fs.existsSync(repo.root)) return { root: repo.root, release: () => {} };
+
+    const worldRoot = world.handle.root.replace(/\\/g, '/').replace(/\/+$/, '');
+    const repoRoot = repo.root.replace(/\\/g, '/').replace(/\/+$/, '');
+    const prefix = path.posix.relative(worldRoot, repoRoot);
+    if (prefix.startsWith('..') || path.posix.isAbsolute(prefix))
+      throw new Error('project wiki is outside the task world');
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-prompt-'));
+    try {
+      for (const file of await world.listFiles()) {
+        if (prefix && file !== prefix && !file.startsWith(`${prefix}/`)) continue;
+        const rel = prefix ? file.slice(prefix.length).replace(/^\/+/, '') : file;
+        if (!rel || rel === '.git' || rel.startsWith('.git/')) continue;
+        const target = path.resolve(root, rel);
+        if (target !== root && !target.startsWith(`${root}${path.sep}`))
+          throw new Error('invalid file path in project wiki checkout');
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, await world.readFileBuffer(file));
+      }
+      return { root, release: () => fs.rmSync(root, { recursive: true, force: true }) };
+    } catch (error) {
+      fs.rmSync(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
   return {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
       const remote = isRemote(args.kind);
       if (process.env.KARMAX_DEPLOYMENT === 'hosted' && !remote)
         throw new Error(`hosted deployments cannot run task code in the control plane (${args.kind}); select a remote runner`);
       record(args.taskId, 'world.provisioning', { provider: args.kind });
-      // Resolve the git profile (project → global default → none) and materialize
+      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
+      const project = projectId ? store.getProject(projectId) : undefined;
+      const gitProfiles = gitProfilesFor(projectId);
+      const organizationId = project?.organizationId ?? 'org_personal';
+      // Resolve the git profile (project → organization default → none) and materialize
       // its identity for worktree-scoped config (PLAN-git-config.md §4A). Identity
       // failure downgrades to a warning — the world is still usable locally.
       const profile = gitProfiles.resolve({ gitProfile: args.gitProfile });
       let gitIdentity;
       let gitCredentials;
       try {
-        gitIdentity = profile ? gitProfiles.identity(profile, { taskId: args.taskId }) : undefined;
+        gitIdentity = profile
+          ? gitProfiles.identity(profile, { taskId: args.taskId })
+          : organizationId === 'org_personal'
+            ? undefined
+            : { name: 'karmax', email: `karmax+${organizationId.replace(/[^a-z0-9.-]/gi, '-')}@localhost` };
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}": ${e instanceof Error ? e.message : e}` });
       }
       try {
-        gitCredentials = profile ? gitProfiles.worldCredentials(profile, { taskId: args.taskId }) : undefined;
+        gitCredentials = {
+          ...(organizationId === 'org_personal' ? {} : { isolated: true }),
+          ...(profile ? gitProfiles.worldCredentials(profile, { taskId: args.taskId }) : {}),
+        };
+        if (!Object.keys(gitCredentials).length) gitCredentials = undefined;
       } catch (e) {
         record(args.taskId, 'world.warning', { warning: `git profile "${profile?.name}" clone credentials: ${e instanceof Error ? e.message : e}` });
       }
-      const requestedSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
+      // The project wiki is a platform-owned companion repository. Add it at
+      // provisioning time (rather than to deterministic workflow input), so
+      // old workflow histories remain replay-compatible.
+      const wikiRoot = project
+        ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
+        : undefined;
+      if (project && !store.projectWiki(project.id)) store.setProjectWikiRepository(project.id);
+      const wikiRepository = project ? store.projectWiki(project.id)?.repository : undefined;
+      if (remote && project && (!wikiRepository || !wikiRepository.private))
+        throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
+      const developmentSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
+      const requestedSources = [
+        ...developmentSources,
+        ...(wikiRoot && (!remote || wikiRepository) ? [wikiRoot] : []),
+      ];
       const cloudSources = remote ? await Promise.all(requestedSources.map((source) => cloudGitSource(source))) : [];
       const worldSources = remote ? cloudSources.map((resolved) => resolved.source) : requestedSources;
       for (let i = 0; i < cloudSources.length; i++) {
@@ -386,29 +500,40 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Older/local workflow histories do not pass projectId into createWorld;
       // the durable task record is the compatibility source for repository
       // enrollment, credentials, and world ownership.
-      const projectId = args.projectId ?? store.getTask(args.taskId)?.projectId;
       const linkedRepositories = projectId ? store.listProjectRepositories(projectId) : [];
       const repositoryBranches = Object.fromEntries(linkedRepositories.map((candidate) => {
         const base = candidate.baseBranch ?? candidate.repository.defaultBranch;
         return [candidate.repository.sshUrl, { base, target: candidate.targetBranch ?? base }];
       }));
-      if (linkedRepositories.length) {
+      if (wikiRoot && requestedSources.includes(wikiRoot))
+        repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
+        base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH,
+      };
+      if (linkedRepositories.length || wikiRepository) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const credentials: Record<string, string> = {};
-        for (const source of worldSources) {
+        for (const [index, source] of worldSources.entries()) {
           const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
-          if (!linked) {
+          const repository = linked?.repository ?? (wikiRepository?.sshUrl === source ? wikiRepository : undefined);
+          if (!repository) {
+            // A configured host checkout is already the authority for this
+            // repository. cloudGitSource resolved its origin only as the cloud
+            // transport and copySources seeds the sandbox from the exact local
+            // commit, so it neither needs nor implies a GitHub catalog
+            // attachment. Requiring enrollment here discarded that provenance
+            // and made a correctly auto-detected local origin fail as soon as
+            // any other source (normally the project wiki) was enrolled.
+            if (cloudSources[index]?.localPath) continue;
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
             continue;
           }
-          if (deps.githubApp) credentials[source] = deps.githubApp.repositorySshKey(linked.repository.id, 'clone');
+          if (deps.githubApp) credentials[source] = deps.githubApp.repositorySshKey(repository.id, 'clone');
         }
         // Repository-scoped read-only keys take precedence for enrolled
         // sources. Local managed clones use the same ephemeral provisioning
         // credential without persisting it.
         if (Object.keys(credentials).length) gitCredentials = { ...gitCredentials, repositories: credentials };
       }
-      const project = projectId ? store.getProject(projectId) : undefined;
       const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
       const environmentSelection = projectId
         ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
@@ -425,8 +550,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         world = await worlds.create(args.kind, {
           taskId: args.taskId,
           organizationId: project?.organizationId,
-          repo: args.repos?.length ? undefined : worldSources[0],
-          repos: args.repos?.length ? worldSources : undefined,
+          repo: worldSources.length === 1 ? worldSources[0] : undefined,
+          repos: worldSources.length > 1 ? worldSources : undefined,
+          scratch: developmentSources.length === 0,
           base: args.base,
           target: args.target,
           branch: args.branch,
@@ -455,8 +581,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           for (const warning of runtime.warnings) record(args.taskId, 'world.warning', { warning });
         }
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
+        if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
+          const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
+          const wiki = world.handle.repos.find((repo) => worldRepoSource(repo) === wikiSource || repo.repo === wikiSource);
+          if (wiki) wiki.role = 'project-wiki';
+        }
+        // A platform-owned companion must not unexpectedly move agents out of
+        // the project's only development repository. Keep `root` as the world
+        // boundary so the wiki remains accessible, and select that development
+        // checkout as the default cwd. Genuine multi-development-repo projects
+        // retain the encompassing root as their working directory.
+        const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
+        if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
         if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
-          repositoryIds: linkedRepositories.map((candidate) => candidate.repository.id) };
+          repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
+            ...(wikiRepository ? [wikiRepository.id] : [])] };
         if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
         if (projectId) {
           world.handle = store.registerWorld(world.handle, projectId, {
@@ -480,28 +619,144 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     /** The effective provider for a role's turn (task override → seeded profile),
      *  so the workflow can lease an account of the right provider (SPEC §6.2). */
-    async resolveProvider(args: { role: AgentRole; task: TaskInput }): Promise<Provider> {
+    async resolveProvider(args: { role: AgentRole; task: TaskInput }): Promise<string> {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
-      return (args.task.agents?.[args.role]?.provider ?? baseProfile.provider) as Provider;
+      return applyAgentSpec(baseProfile, args.task.agents?.[args.role]).provider;
+    },
+
+    /** Whether this turn consumes host model-process capacity. Remote subscription
+     * CLIs run inside their provider world; local turns and API rails run here. */
+    async agentUsesHostCapacity(args: {
+      role: AgentRole;
+      task: TaskInput;
+      worldHandle: WorldHandle;
+      accountConfigHome?: string;
+      accountApiKeyHandle?: string;
+      accountCredentialKind?: 'login' | 'ambient' | 'key';
+      accountCredentialProvider?: string;
+    }): Promise<boolean> {
+      if (!isRemote(args.worldHandle.kind)) return true;
+      if (args.accountCredentialKind === 'key') return true;
+      if (args.accountCredentialKind === 'login' || args.accountCredentialKind === 'ambient') return false;
+
+      // Replay compatibility for workflow histories recorded before credential
+      // metadata accompanied the lease. A broker handle is an API rail; a config
+      // home is a provider-hosted subscription rail.
+      if (args.accountApiKeyHandle && deps.broker) return true;
+      if (args.accountConfigHome) return false;
+
+      const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
+      const profile = applyAgentSpec(baseProfile, args.task.agents?.[args.role]);
+      const modelProvider = args.accountCredentialProvider
+        ? canonicalModelProvider(args.accountCredentialProvider)
+        : credentialProvider(profile);
+      return (
+        (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
+        || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+        || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(modelProvider)])
+      );
     },
 
     /** The ordered, enabled credential keys for a turn's provider, per the credential
      *  policy resolved global→project→task (SPEC §7/§9). The coordinator leases the
-     *  first available one from this list. Empty ⇒ passthrough to the profile default. */
-    async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: 'claude' | 'codex' }): Promise<string[]> {
+     *  first available one from this list. An empty compatible set resolves to a
+     *  denied marker so explicit policy cannot fall through to profile defaults. */
+    async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: string; role?: AgentRole; task?: TaskInput }): Promise<string[]> {
       const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
-      const { enumerateCredentials, credentialsForProvider } = await import('../platform/credentials.js');
-      const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker });
+      const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
+      const organizationId = store.getProject(args.projectId)?.organizationId ?? 'org_personal';
+      const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId });
       const all = enumerateCredentials(sources);
-      const layers = readPolicyLayers((k) => store.kvGet(k), { projectId: args.projectId, taskId: args.taskId });
-      return credentialsForProvider(all, args.provider, layers).map((c) => c.key);
+      const layers = readPolicyLayers((k) => store.kvGet(k), { organizationId, projectId: args.projectId, taskId: args.taskId });
+      const profile = args.role && args.task
+        ? applyAgentSpec(
+          profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId),
+          args.task.agents?.[args.role],
+        )
+        : undefined;
+      const enabled = resolveCredentials(all, layers);
+      let missingNamespace = args.provider;
+      const openCodePrefix = profile?.provider === 'opencode' ? modelProviderFromModel(profile.model) : undefined;
+      const recognizedOpenCodePrefix = !!openCodePrefix && (
+        (MODEL_PROVIDERS as readonly string[]).includes(openCodePrefix)
+        || all.some((candidate) =>
+          candidate.kind === 'key' && credentialAliases(openCodePrefix).includes(candidate.provider),
+        )
+      );
+      if (profile?.provider === 'opencode') {
+        missingNamespace = recognizedOpenCodePrefix ? openCodePrefix! : 'opencode-compatible';
+      }
+      const ordered = enabled.filter((credential) => {
+        if (!profile) return credentialAliases(args.provider).includes(credential.provider);
+        if (profile.provider !== 'opencode') {
+          missingNamespace = credentialProvider(profile);
+          return credentialMatchesProfile(profile, credential);
+        }
+
+        // An OpenCode subscription is harness-native and may carry credentials
+        // for multiple model vendors. API keys are narrowed only when the model
+        // has a recognizable `provider/model` prefix. With an unprefixed or
+        // custom id, the user's general Credentials ordering is authoritative.
+        if (credential.kind !== 'key') {
+          if (credential.provider !== 'opencode') return false;
+          if (!credential.modelProvider) return recognizedOpenCodePrefix;
+          return !recognizedOpenCodePrefix
+            || credentialAliases(openCodePrefix!).includes(credential.modelProvider);
+        }
+        if (!recognizedOpenCodePrefix) return true;
+        return credentialAliases(openCodePrefix!).includes(credential.provider);
+      });
+      // A native OpenCode fork is stored in the source XDG home. Lease that
+      // exact login first so account concurrency, quota failures, and policy
+      // attribution remain honest; never reopen one account after leasing
+      // another. Ambient/API-key sessions have no stored source home.
+      const resume = args.role ? args.task?.agents?.[args.role]?.resumeFrom : undefined;
+      if (profile?.provider === 'opencode' && resume?.taskId) {
+        const srcRole = resume.role ?? args.role!;
+        const raw = store.kvGet(`sessionmeta:${resume.taskId}:${srcRole}`);
+        if (raw) {
+          try {
+            const meta = JSON.parse(raw) as { home?: string; provider?: string };
+            if (meta.home && (!meta.provider || meta.provider === 'opencode')) {
+              const index = ordered.findIndex((credential) =>
+                credential.provider === 'opencode' && credential.configHome === meta.home,
+              );
+              // This is not merely a preference: another free OpenCode account
+              // cannot resolve the source session. Restrict the lease request so
+              // the coordinator waits for this home instead of skipping to a
+              // different account.
+              if (index >= 0) return [ordered[index]!.key];
+              return [`missing:${organizationId}:opencode-fork`];
+            }
+          } catch {
+            /* malformed historical metadata — adapter will report the missing session */
+          }
+        }
+      }
+      const keys = ordered.map((c) => c.key);
+      // An empty compatible set must not fall through to an ambient/profile
+      // credential and bypass an explicit disable. A non-existent allow-list
+      // entry makes the coordinator deny the turn with a credential action.
+      return keys.length || profile?.provider === 'mock'
+        ? keys
+        : [`missing:${organizationId}:${missingNamespace}`];
     },
 
     async runAgentTurn(args: RunAgentTurnArgs) {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId, args.task.projectId);
       // Apply the per-role agent override from the task form (SPEC §10.5).
       const spec = args.task.agents?.[args.role];
-      const profile = applyAgentSpec(baseProfile, spec);
+      let profile = applyAgentSpec(baseProfile, spec);
+      const leasedCredentialProvider = args.accountCredentialProvider
+        ? canonicalModelProvider(args.accountCredentialProvider)
+        : undefined;
+      if (profile.provider === 'opencode' && leasedCredentialProvider) {
+        // Internal, per-turn resolution only. Persisted/task modelProvider values
+        // are stripped by applyAgentSpec; the credential actually leased by the
+        // general policy is the sole authority for custom/unprefixed model ids.
+        profile = { ...profile, modelProvider: leasedCredentialProvider };
+      }
+      const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
       const world = await openWorld(args.worldHandle, args.taskId);
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
@@ -573,7 +828,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // The workflow mints the agent's scoped credential (SPEC §8.3): effective
       // capabilities = intersection(profile ceiling, granting principal).
-      const grant = args.task.grant ?? DEFAULT_GRANT;
+      // Human-approved credential escalations recorded after creation
+      // (PLAN-passwords.md §7 approve-for-task) extend the stored grant here,
+      // so the next minted token carries them without touching workflow input.
+      const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId);
+      const grant = [...(args.task.grant ?? DEFAULT_GRANT), ...orgVaultItems.extensionCaps(args.taskId)];
       const effective = attenuate(profile.capabilities, grant);
       let token: string | undefined;
       if (deps.tokens) {
@@ -594,41 +853,36 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt });
       }
 
-      // JIT-resolve credentials via the broker (never journaled). The account to
-      // use comes from the profile's allowedAccounts set (SPEC §7.3/§6.2) — first
-      // matching entry — falling back to the legacy single `auth` field.
+      // JIT-resolve credentials via the broker (never journaled). Every current
+      // turn receives its selection from the general Credentials policy.
       let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
-      const effAuth = profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider);
-      if (effAuth?.kind === 'apiKeyHandle' && effAuth.handle && deps.broker) {
-        const apiKey = deps.broker.resolve(effAuth.handle, { taskId: args.taskId, profileId: profile.id, caps: effective });
-        resolvedAuth = { apiKey };
-      } else if (effAuth?.kind === 'configHome') {
-        // Either an explicit path, or an account ref resolved to its minted home.
-        // `account` may be "<provider>:<name>" (from the login picker) or just "<name>".
-        let home = effAuth.configHome;
-        if (!home && effAuth.account && deps.configHomes) {
-          const { provider: prov, name } = splitAccountRef(effAuth.account, profile.provider);
-          home = deps.configHomes.ensure(prov, name);
-        }
-        if (home) resolvedAuth = { configHome: home, ...(tokenToInject(home) ? { oauthToken: tokenToInject(home) } : {}) };
-      }
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {
         const tok = tokenToInject(args.accountConfigHome);
         resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome, ...(tok ? { oauthToken: tok } : {}) };
       }
-      // A coordinator-leased broker API-key handle wins over both (SPEC §6.2/§7): a
-      // policy that ordered an API key ahead of (or instead of) logins.
+      // A coordinator-leased API key wins over both (SPEC §6.2/§7). Vault handles
+      // resolve JIT; reserved environment-key references carry only the provider
+      // identity and let the adapter read that provider's process environment.
       if (args.accountApiKeyHandle && deps.broker) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
+      }
+      if (
+        organizationId !== 'org_personal'
+        && profile.provider !== 'mock'
+        && !args.accountConfigHome
+        && !args.accountApiKeyHandle
+      ) {
+        throw new Error(`organization ${organizationId} has no usable ${credentialProvider(profile)} credential; connect an organization login or API key`);
       }
       // API sessions are stateless. Cloud subscription sessions live in their
       // sandbox; a requested cross-world session is materialized explicitly below.
       const apiRail = !!resolvedAuth?.apiKey || (!resolvedAuth && (
         (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY) ||
-        (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+        (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY) ||
+        (profile.provider === 'opencode' && !!process.env[apiKeyEnv(credentialProvider(profile))])
       ));
       const remoteSubscriptionRail = isRemote(args.worldHandle.kind) && !apiRail;
       // ── Fork a prior agent (SPEC §10.5) ──────────────────────────────────────
@@ -642,7 +896,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
         // The config home THIS turn runs under — where the source session must be
         // visible for the provider to resolve it. Shared by both resume paths below.
-        const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), profile.provider === 'codex' ? '.codex' : '.claude');
+        const ambientHome =
+          profile.provider === 'codex' ? '.codex'
+          : profile.provider === 'kimi' ? '.kimi-code'
+          : profile.provider === 'grok' ? '.grok'
+          : profile.provider === 'opencode' ? path.join('.local', 'share', 'opencode')
+          : '.claude';
+        const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), ambientHome);
         if (spec.resumeFrom.sessionId) {
           // A raw pasted provider session id = "continue THIS exact session" (resume,
           // not fork). Materialize it into this turn's (home × world) so the provider
@@ -656,8 +916,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // a session to a file; make it visible in this turn's (home × world) or fail.
           const materialized =
             profile.provider === 'mock' || apiRail
+              || profile.provider === 'opencode' || profile.provider === 'kimi' || profile.provider === 'grok'
               ? true
-              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: world.handle.root });
+              : materializeFork({ provider: profile.provider, session, forkHome, worldPath: worldWorkingDirectory(world.handle) });
           if (!materialized) {
             // The id resolves in NO config home for this provider. Fail loudly instead
             // of handing an unknown id to the adapter, which would silently start a
@@ -681,17 +942,51 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (metaRaw) { try { const m = JSON.parse(metaRaw); srcHome = m.home || undefined; srcProvider = m.provider || undefined; } catch { /* ignore */ } }
           let forked = false;
           if (srcSession && (!srcProvider || srcProvider === profile.provider)) {
-            if (remoteSubscriptionRail) {
-              const sourceHandle = store.currentWorld(spec.resumeFrom.taskId) as WorldHandle | undefined;
-              if (sourceHandle && isRemote(sourceHandle.kind)) {
-                try {
-                  const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
-                  forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
-                } catch { /* source world may have expired; try the durable local home below */ }
-              }
+            // OpenCode sessions live inside the harness's isolated XDG data home.
+            // A native fork must start in the SOURCE home; otherwise account
+            // rotation can hand session/fork to a different empty store. The
+            // credential resolver above requests only this account.
+            const openCodeSourceConnected =
+              profile.provider !== 'opencode'
+              || !srcHome
+              || !!deps.configHomes?.list().some((account) =>
+                account.provider === 'opencode'
+                && account.path === srcHome
+                && account.loggedIn,
+              );
+            if (
+              profile.provider === 'opencode'
+              && srcHome
+              && (!openCodeSourceConnected || resolvedAuth?.configHome !== srcHome)
+            ) {
+              record(args.taskId, 'session.fork-failed', {
+                session: srcSession,
+                reason: 'source-account-unavailable',
+              });
+              throw ApplicationFailure.create({
+                message: 'Cannot fork this OpenCode session because its source login is disabled, disconnected, or was not leased. Enable that OpenCode account and retry.',
+                type: 'agent-error',
+                nonRetryable: true,
+              });
             }
-            if (!forked) forked = materializeFork({ provider: profile.provider, session: srcSession,
-              forkHome, worldPath: world.handle.root, srcHome });
+            // OpenCode advertises ACP session/fork and resolves its own opaque
+            // ids. Kimi and Grok currently do not; their native harnesses are not
+            // admitted, and any historical profile uses the honest replay path.
+            if (profile.provider === 'opencode') {
+              forked = true;
+            } else if (profile.provider !== 'kimi' && profile.provider !== 'grok') {
+              if (remoteSubscriptionRail) {
+                const sourceHandle = store.currentWorld(spec.resumeFrom.taskId) as WorldHandle | undefined;
+                if (sourceHandle && isRemote(sourceHandle.kind)) {
+                  try {
+                    const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
+                    forked = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
+                  } catch { /* source world may have expired; try the durable local home below */ }
+                }
+              }
+              if (!forked) forked = materializeFork({ provider: profile.provider, session: srcSession,
+                forkHome, worldPath: worldWorkingDirectory(world.handle), srcHome });
+            }
             if (forked) {
               session = srcSession;
               fork = true; // adapter branches a NEW session id from it (native fork)
@@ -724,6 +1019,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const { paths } = await import('../config/paths.js');
         bindings = { ...(bindings ?? {}), skills: renderSkillsIndex(listResolveSkills(paths().content)) };
       }
+      // Goal mode: the do agent is told to keep driving across turns until the
+      // objective is verifiably complete. Appended to the built-in working
+      // instructions so it flows through the wiki context and fallback alike.
+      const goalSuffix = args.role === 'do' && (args.task as { goalMode?: boolean }).goalMode
+        ? `
+- Goal mode is active. Continue autonomously across turns until the entire objective is complete and verified. A normal response does not finish the task: call signal_completion only when no required work remains. If you genuinely need a human decision, raise it with the appropriate task tool instead.`
+        : '';
+      const builtinInstructions = goalSuffix ? `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}` : deps.globalInstructions;
       // Wiki context (SPEC §5.4 "global + project instructions"): the built-in
       // working instructions (a virtual unconditional wiki entry), then per
       // scope its unconditional entries in full and the indexed TOC. Read here
@@ -732,9 +1035,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // unreadable, the agent still gets the built-in instructions.
       let projectInstructions: string | undefined;
       let globalInstructions: string | undefined;
+      let wikiSnapshot: { root: string; release(): void } | undefined;
       try {
         const { buildWikiPromptContext } = await import('../wiki/wiki.js');
-        const { paths } = await import('../config/paths.js');
         // Wiki pages the task tags in its prompt/follow-ups (`@proj:…`/`@org:…`)
         // are inlined in full, as are the tokens in the task's wiki-context field
         // (`params.wikiContext`, read fresh here like the wiki content itself;
@@ -743,16 +1046,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           .filter(Boolean)
           .join('\n');
         const wikiContext = store.getTask(args.taskId)?.params?.wikiContext;
+        wikiSnapshot = await projectWikiPromptSnapshot(world);
         projectInstructions = buildWikiPromptContext({
-          contentDir: paths().content,
+          contentDir: deps.contentDir ?? paths().content,
           organizationId: store.getProject(args.task.projectId)?.organizationId,
           projectId: args.task.projectId,
-          builtinInstructions: deps.globalInstructions,
+          projectRoot: wikiSnapshot?.root,
+          builtinInstructions,
           taggedText,
           contextTokens: Array.isArray(wikiContext) ? wikiContext.map(String) : undefined,
         }) || undefined;
       } catch {
-        globalInstructions = deps.globalInstructions ?? GLOBAL_INSTRUCTIONS;
+        globalInstructions = `${deps.globalInstructions ?? GLOBAL_INSTRUCTIONS}${goalSuffix}`;
+      } finally {
+        wikiSnapshot?.release();
       }
       const systemPrompt = assemblePrompt({
         profile,
@@ -856,8 +1163,36 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // call ONLY — the setup above is cheap — and released in `finally` below.
       let releaseSlot: () => void | Promise<void> = () => {};
       let lastEmit: string | undefined;
+      let lastPressureDetail: string | undefined;
       let result;
       try {
+        const signalTurnState = async (
+          state: 'running' | 'waiting-host',
+          detail?: string,
+        ): Promise<void> => {
+          if (!deps.client || !args.agentTurnId) return;
+          await deps.client.workflow
+            .getHandle(args.taskId)
+            .signal(SIG_AGENT_TURN_STATE, {
+              turnId: args.agentTurnId,
+              role: args.role,
+              provider: profile.provider,
+              state,
+              ...(detail ? { detail } : {}),
+            })
+            .catch(() => undefined);
+        };
+        const publishPressure = async (state: { memoryTight: boolean; loadHigh: boolean }) => {
+          const detail =
+            state.memoryTight && state.loadHigh
+              ? 'Waiting for host memory and load to start agent'
+              : state.memoryTight
+                ? 'Waiting for host memory to start agent'
+                : 'Waiting for host load to start agent';
+          if (detail === lastPressureDetail) return;
+          lastPressureDetail = detail;
+          await signalTurnState('waiting-host', detail);
+        };
         // Remote subscription CLIs consume provider-world CPU/RAM, not host
         // capacity. API rails and local subprocesses retain the host admission
         // queue; account-level concurrency is enforced separately for every rail.
@@ -866,7 +1201,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Current workflows carry a stable turn id, so the activity enrolls that
           // turn in the durable/reorderable coordinator before starting the model.
           // Historical executions lack the id and retain the replay-safe file gate.
-          if (args.agentTurnId && deps.client && deps.taskQueue) {
+          if (args.agentAdmissionManaged) {
+            if (!args.agentSlotGranted)
+              throw new AgentAdmissionInfrastructureError('host-running turn started without its durable agent-slot grant');
+            await awaitAgentResources(heartbeat, signal, publishPressure);
+          } else if (args.agentTurnId && deps.client && deps.taskQueue) {
             releaseSlot = await acquireWorkflowAgentSlot({
               client: deps.client,
               taskQueue: deps.taskQueue,
@@ -881,7 +1220,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               signal,
             });
             try {
-              await awaitAgentResources(heartbeat, signal);
+              await awaitAgentResources(heartbeat, signal, publishPressure);
             } catch (e) {
               await releaseSlot();
               releaseSlot = () => {};
@@ -891,12 +1230,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         // The workflow publishes `waiting-slot` immediately after the account grant;
         // only admission itself can truthfully report that the model is now running.
-        if (deps.client && args.agentTurnId) {
-          await deps.client.workflow
-            .getHandle(args.taskId)
-            .signal(SIG_AGENT_TURN_STATE, { turnId: args.agentTurnId, role: args.role, provider: profile.provider, state: 'running' })
-            .catch(() => undefined);
-        }
+        await signalTurnState('running');
         publishLegacyAgentState('running');
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
@@ -912,11 +1246,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Git-profile credentials for the agent subprocess (PLAN-git-config.md
           // §4B): an agent that pushes or runs `gh` acts as the project's account.
           ...(() => {
-            const gitEnv = isRemote(args.worldHandle.kind) ? {} : gitEnvFor(args.worldHandle, args.taskId);
+            // Remote provider tools receive repository credentials through the
+            // broker, but the local harness process must still have host Git
+            // credentials scrubbed for non-personal organizations.
+            const gitEnv = isRemote(args.worldHandle.kind) && organizationId === 'org_personal'
+              ? {}
+              : gitEnvFor(args.worldHandle, args.taskId);
+            // Granted `auto` vault items materialize into the subprocess env
+            // (PLAN-passwords.md §5A): .env bags, API keys under their envVar,
+            // SSH keys as 0600 file paths. Local worlds only, like gitEnv.
+            // Item resolution is per-organization (the tenant boundary), so bind
+            // to the task's org — not the module-level personal-org instance.
+            const vaultEnv = isRemote(args.worldHandle.kind) ? {} : orgVaultItems.envFor(args.taskId, effective);
             // The platform MCP subprocess inherits this short-lived workflow
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
-            const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
+            const extraEnv = { ...vaultEnv, ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
             // Values are resolved from resource leases and broker handles only
             // now, at the activity/subprocess boundary. Keep them separate so a
             // remote adapter can explicitly allowlist only these names.
@@ -975,7 +1320,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(deps.payments
             ? {
                 budget: new BudgetService(store, deps.payments),
-                spendCtx: { projectId: args.task.projectId, taskId: args.taskId },
+                spendCtx: { projectId: args.task.projectId, taskId: args.taskId, organizationId: store.getProject(args.task.projectId)?.organizationId },
                 onSpend: (req: any, outcome: any) => record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }),
               }
             : {}),
@@ -1059,11 +1404,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
       const roots = repos.length ? repos : [{ name: '', root: handle.root }];
+      const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
       const changedFiles: string[] = [];
       for (const repo of roots) {
         const tracked = await world.exec('git', ['diff', '--name-only', 'base' in repo ? repo.base : base], { cwd: repo.root });
         const untracked = await world.exec('git', ['ls-files', '--others', '--exclude-standard'], { cwd: repo.root });
-        const prefix = repos.length > 1 ? `${repo.name}/` : '';
+        // A companion wiki must not make the sole development checkout appear
+        // artificially nested. Keep a stable prefix for wiki changes, while
+        // genuine multi-development-repo worlds retain repository prefixes.
+        const prefix = 'role' in repo && repo.role === 'project-wiki'
+          ? `${repo.name}/`
+          : developmentRepos.length > 1
+            ? `${repo.name}/`
+            : '';
         changedFiles.push(
           ...tracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file}`),
           ...untracked.stdout.split('\n').map((s) => s.trim()).filter(Boolean).map((file) => `${prefix}${file} (new)`),
@@ -1082,6 +1435,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const profileName = handle.meta?.gitProfile;
       if (typeof profileName === 'string' && profileName) {
         try {
+          const projectId = typeof handle.meta?.projectId === 'string'
+            ? handle.meta.projectId
+            : store.getTask(handle.id)?.projectId;
+          const gitProfiles = gitProfilesFor(projectId);
           const profile = gitProfiles.get(profileName);
           identity = profile ? gitProfiles.identity(profile, { taskId: handle.id }) : undefined;
         } catch {
@@ -1187,7 +1544,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(handle);
       const result = await brokerPublishBranch(world, brokerAuthFor(handle, handle.id));
       if (!result.pushed.length || result.skipped.length) {
-        throw new Error(`cloud task branch was not persisted${result.skipped.length ? ` for: ${result.skipped.join(', ')}` : ' because it has no remote repository'}`);
+        throw new Error(`cloud task branch was not persisted${result.skipped.length ? ` for: ${describePublishFailures(result)}` : ' because it has no remote repository'}`);
       }
       record(handle.id, 'push.branch', { branch: handle.branch, repos: result.pushed });
       return { pushed: result.pushed };
@@ -1261,9 +1618,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const pushed: string[] = [];
       const skipped: string[] = [];
       if (isRemote(handle.kind)) {
-        // brokerFinalizeMerge already performed the authenticated target push;
-        // report the policy step as satisfied without re-exporting credentials.
-        pushed.push(...worldRepos(handle).map((repo) => repo.name));
+        for (const r of worldRepos(handle)) {
+          if (!r.localPath) {
+            // brokerFinalizeMerge already performed the authenticated target push;
+            // report the policy step as satisfied without re-exporting credentials.
+            pushed.push(r.name);
+            continue;
+          }
+          // Locally-authoritative repo: the broker landed the merge in the local
+          // checkout and pushed nothing, so the policy push runs from there —
+          // exactly like a worktree world's.
+          const repoTarget = r.target ?? target;
+          const push = await hostGit(r.localPath, ['push', 'origin', repoTarget], { env });
+          if (push.code === 0) {
+            pushed.push(r.name);
+            record(handle.id, 'push.done', { repo: r.name, target: repoTarget });
+          } else {
+            skipped.push(r.name);
+            record(handle.id, 'push.failed', { repo: r.name, target: repoTarget, detail: (push.stderr || push.stdout).slice(0, 300) });
+          }
+        }
         return { pushed, skipped };
       }
       for (const r of worldRepos(handle)) {
@@ -1333,7 +1707,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   const projectId = String(waitingWorld.meta?.projectId ?? '');
                   if (store.listProjectRepositories(projectId).length) {
                     const pushed = await brokerPublishBranch(remoteWorld, brokerAuthFor(waitingWorld, taskId));
-                    if (pushed.skipped.length) throw new Error(`could not persist branch for ${pushed.skipped.join(', ')}`);
+                    if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                     record(taskId, 'push.branch', { branch: waitingWorld.branch, repos: pushed.pushed, reason: 'checkpoint' });
                   }
                 }

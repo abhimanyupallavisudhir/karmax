@@ -9,13 +9,14 @@ import { codexReasoningEffort } from './effort.js';
 import { openaiUserContent, materializeImageFiles } from './images.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { scrubbedEnv } from '../autonomy/config-homes.js';
-import { registerAgent, unregisterAgent, killAgent, killProcessGroup } from './custody.js';
+import { createCustodyEnv, registerAgent, releaseAgent, killAgent } from './custody.js';
 import { trackProcess } from '../util/processes.js';
 import { classifyLimitError, providerErrorFromMessage, providerFailure, type ProviderFailureMetadata } from './limits.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
 import { activityDetail, codexItemActivity } from './activity.js';
 import { ensureRemoteCodexSessionTools, isRemoteAgentWorld, remoteAgentEnv, seedRemoteAgentHome,
   spawnRemoteAgentProcess, syncRemoteAgentHome } from './remote-process.js';
+import { worldWorkingDirectory } from '../world/types.js';
 
 /**
  * Codex/OpenAI provider adapter (SPEC §7.1). Two rails, chosen per profile:
@@ -213,7 +214,7 @@ export class CodexAdapter implements AgentAdapter {
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
     const model = input.profile.model ?? undefined;
     const effort = codexReasoningEffort(model ?? 'gpt-5.5', input.profile.effort);
-    const cwd = input.world.handle.root;
+    const cwd = worldWorkingDirectory(input.world.handle);
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const remote = isRemoteAgentWorld(input.world);
@@ -235,12 +236,14 @@ export class CodexAdapter implements AgentAdapter {
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
     }, Object.keys(input.secretEnv ?? {}));
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+    const custody = remote ? undefined : createCustodyEnv(env);
+    if (custody) env = custody.env;
 
-    // Detached ⇒ its own process group, so killAgent(-pid) reaps codex's descendants.
+    // Detached group is the fallback; the inherited custody marker crosses groups.
     const child: any = remote
       ? spawnRemoteAgentProcess({ world: input.world, provider: 'codex', command: cmd, args: ['app-server'], cwd, env, signal: ctx.signal })
       : spawn(cmd, ['app-server'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
-    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, startedAt: Date.now() });
+    if (child.pid) registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', role: input.role, owner: process.pid, ...(custody ? { custodyId: custody.custodyId } : {}), startedAt: Date.now() });
     const client = new CodexAppServerClient(child.stdin!, child.stdout!);
     const platformHandlers = platformToolHandlers(input.world, ctx);
     let stderr = '';
@@ -427,7 +430,7 @@ export class CodexAdapter implements AgentAdapter {
     // Mid-turn cancel (SPEC §5.6): interrupt the active turn, then reap the group.
     const onAbort = () => {
       if (threadId && currentTurnId) client.request('turn/interrupt', { threadId, turnId: currentTurnId }).catch(() => undefined);
-      if (child.pid) void killAgent(child.pid);
+      if (child.pid) void killAgent(child.pid, 2500, custody?.custodyId);
       else child.kill('SIGTERM');
       settleTurn?.();
     };
@@ -591,9 +594,8 @@ export class CodexAdapter implements AgentAdapter {
       if (followPoll) clearInterval(followPoll);
       try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       client.close();
-      if (child.pid) void killAgent(child.pid);
+      if (child.pid) await killAgent(child.pid, 2500, custody?.custodyId);
       else child.kill('SIGTERM');
-      unregisterAgent(child.pid);
       for (const c of cleanups) { try { c(); } catch { /* ignore */ } }
       if (remoteHome && input.resolvedAuth?.configHome)
         await syncRemoteAgentHome(input.world, 'codex', remoteHome, input.resolvedAuth.configHome);
@@ -629,7 +631,7 @@ export class CodexAdapter implements AgentAdapter {
     const cmd = process.env.KARMAX_CODEX_EXEC_CMD ?? 'codex';
     const model = input.profile.model ?? 'gpt-5.5';
     const effort = codexReasoningEffort(model, input.profile.effort);
-    const cwd = input.world.handle.root;
+    const cwd = worldWorkingDirectory(input.world.handle);
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
     const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
@@ -668,10 +670,10 @@ export class CodexAdapter implements AgentAdapter {
     // Args go straight to execve (no shell), so a multi-line prompt needs no escaping.
     const args = resuming ? ['exec', 'resume', input.session!, ...flags, promptText] : ['exec', ...flags, promptText];
 
-    // Detached ⇒ the child is its own process-group leader, so a kill of the
-    // GROUP (kill(-pid)) reaps codex's descendant tool processes too, not just
-    // the root — the "descendants survive" gap called out in PLAN-efficiency.
-    const child = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    // Keep a detached root group as fallback, while the inherited custody marker
+    // covers descendants that create their own groups/sessions.
+    const custody = createCustodyEnv(env);
+    const child = spawn(cmd, args, { cwd, env: custody.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
 
     // Process-tree custody (src/agent/custody.ts): record the root pid so a
     // boot-time sweep can reap this group if karmax is SIGKILLed mid-turn
@@ -680,20 +682,20 @@ export class CodexAdapter implements AgentAdapter {
     // panel) under its task.
     let untrack = () => {};
     if (child.pid) {
-      registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', taskId: input.world.handle.id, role: input.role, owner: process.pid, startedAt: Date.now() });
+      registerAgent({ pid: child.pid, cmd: path.basename(cmd), provider: 'codex', taskId: input.world.handle.id, role: input.role, owner: process.pid, custodyId: custody.custodyId, startedAt: Date.now() });
       untrack = trackProcess({
         pid: child.pid,
         kind: 'agent',
         label: `codex agent (${input.role})`,
         taskId: input.world.handle.id,
         startedAt: Date.now(),
-        kill: (sig) => (sig === 'SIGKILL' ? killProcessGroup(child.pid, 'SIGKILL') : void killAgent(child.pid)),
+        kill: (sig) => void killAgent(child.pid, sig === 'SIGKILL' ? 0 : 2500, custody.custodyId),
       });
     }
 
-    // Mid-turn cancel (SPEC §5.6): kill the whole process GROUP when the workflow
+    // Mid-turn cancel (SPEC §5.6): kill the whole custody scope when the workflow
     // cancels — SIGTERM, escalating to SIGKILL after a grace window.
-    const onAbort = () => { void killAgent(child.pid); };
+    const onAbort = () => { void killAgent(child.pid, 2500, custody.custodyId); };
     if (ctx.signal?.aborted) onAbort();
     ctx.signal?.addEventListener?.('abort', onAbort, { once: true });
     // Heartbeat so a long turn isn't killed by Temporal's activity timeout.
@@ -782,7 +784,7 @@ export class CodexAdapter implements AgentAdapter {
     if (buf.trim()) handleLine(buf); // flush a trailing partial line
     if (hb) clearInterval(hb);
     cleanupImages(); // remove the temp image files now the child has consumed them
-    unregisterAgent(child.pid); // child has exited — clear its custody record
+    await releaseAgent(child.pid, custody.custodyId); // settle marked background tools, then clear custody
     untrack();
     try { ctx.signal?.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
 

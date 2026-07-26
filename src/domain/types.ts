@@ -8,7 +8,13 @@
 import type { TaskTrigger, TriggerState } from './triggers.js';
 export type { TaskTrigger, TriggerState } from './triggers.js';
 
-export type Provider = 'claude' | 'codex' | 'mock';
+/**
+ * The coding harness that executes a turn. OpenCode is driven through stable
+ * ACP; Kimi/Grok remain in this replay-persistent union for historical workflow
+ * data but are not admitted by the current provider registry. Model vendors are
+ * separate profile properties because OpenCode can use many of them.
+ */
+export type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
 
 export type AgentRole = 'do' | 'merge' | 'resolve' | 'confirm' | (string & {});
 
@@ -315,14 +321,16 @@ export interface WorldHandleRef {
   /** Stable path inside the environment; unlike `root`, never denotes a control-plane path. */
   workspaceRoot?: string;
   root: string;
+  /** Default agent/process directory inside the world boundary. */
+  workdir?: string;
   branch: string;
   base: string;
   repo?: string;
   target?: string;
-  repos?: { name: string; repo: string; root: string; branch: string; base: string; target?: string;
+  repos?: { name: string; role?: 'project-wiki'; repo: string; root: string; branch: string; base: string; target?: string;
     /** True only when a repository attachment pins its own target. False means
      * `target` is the task's initial value and live task updates take precedence. */
-    targetPinned?: boolean; baseSha?: string }[];
+    targetPinned?: boolean; baseSha?: string; localPath?: string }[];
   meta?: Record<string, unknown>;
   warnings?: string[];
 }
@@ -360,9 +368,10 @@ export interface ProjectConfig {
    * happens only when a task explicitly asks its agent to push.
    */
   remote?: RemotePolicy;
-  /** Named git identity/credentials (a GitProfile, Global settings → Git accounts)
-   *  this project's worlds commit and push as. Absent ⇒ the global default
-   *  profile, else the host's own git setup (PLAN-git-config.md §3). */
+  /** Named git identity/credentials (an organization-owned GitProfile)
+   *  this project's worlds commit and push as. Absent ⇒ the organization default
+   *  profile. Only the migrated personal organization may fall back to the
+   *  host's own git setup; other organizations fail closed. */
   gitProfile?: string;
   /** role -> agent profile id. */
   defaultProfiles?: Record<string, string>;
@@ -559,7 +568,8 @@ export interface TaskRecord {
   attemptNumber?: number;
   /**
    * Simple, human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
-   * project's tasks run #1, #2, …, assigned at creation. The UI displays `#num` and
+   * project's queued tasks run #1, #2, …, assigned when first queued. Drafts that
+   * have never been queued have no number. The UI displays `#num` and
    * the URL scheme uses it (`/projects/<name>/tasks/<num>`); the opaque `id` above
    * stays the canonical key (it is the Temporal workflowId, event key, and session
    * key, so it must never change).
@@ -569,6 +579,12 @@ export interface TaskRecord {
   listId: string;
   title: string;
   workflow: string; // workflow definition name
+  /**
+   * Workflow definition that started the current Temporal execution. Normally
+   * identical to `workflow`; it stays fixed while a compatible workflow mode
+   * (software-dev ↔ goal) changes in-flight, preserving the real replay pin.
+   */
+  executionWorkflow?: string;
   workflowVersion: string; // pinned at creation (SPEC §4.4)
   params: TaskParams;
   createdAt: number;
@@ -683,6 +699,8 @@ export interface Tag {
   color?: string;
   /** Which conceptual axis this tag belongs to. */
   kind?: 'type' | 'topic';
+  /** Optional guidance shown at the start of this tag's task-list section. */
+  description?: string;
   createdAt: number;
 }
 
@@ -908,6 +926,8 @@ export interface FieldSpec {
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
   provider: Provider;
+  /** @deprecated Replay-only. Routing comes from the model id + Credentials policy. */
+  modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** Continue a prior agent session: a source task (+ which role's agent) or a
@@ -990,6 +1010,11 @@ export interface TaskView {
   num?: number;
   title: string;
   workflow: string;
+  /** Compatible workflow modes this execution can adopt without replacing its
+   * pinned Temporal workflow. The UI renders these as the in-flight mode picker. */
+  workflowOptions?: string[];
+  /** False once confirmation / the point of no return has begun. */
+  workflowSwitchable?: boolean;
   stage: Stage;
   status: TaskStatus;
   /**
@@ -1040,7 +1065,7 @@ export interface TaskView {
    * UI can show e.g. "Waiting for quota refresh" while a turn waits for a compatible
    * agent login to free up or refresh. Cleared once unparked.
    */
-  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
+  waitingFor?: { kind: 'account' | 'agentSlot' | 'mergeSlot' | 'human' | 'subtask' | 'collaboration' | 'subagent' | 'shell' | 'parent' | 'confirm'; provider?: string; earliestResetAt?: number; detail?: string; audience?: HumanAudience };
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
@@ -1070,6 +1095,8 @@ export interface AgentProfile {
   id: string;
   name: string;
   provider: Provider;
+  /** @internal Resolved leased provider; persisted values are ignored. */
+  modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   role: AgentRole;
@@ -1078,14 +1105,9 @@ export interface AgentProfile {
   /** Capability ceiling this profile may ever attempt (SPEC §8.2). */
   capabilities: string[];
   maxTurns?: number;
+  /** @deprecated Credentials policy is authoritative; persisted values are ignored. */
   auth?: AuthSource;
-  /**
-   * Which accounts this agent may use (SPEC §7.3/§6.2). Each ref is
-   * `login:<provider>:<account>` (a connected config-home login) or
-   * `key:<handle>` (a stored API key). Empty/undefined = all connected accounts.
-   * This set is the agent's credential/lease pool — the coordinator rotates
-   * across exactly these logins.
-   */
+  /** @deprecated Credentials policy is authoritative; persisted values are ignored. */
   allowedAccounts?: string[];
 }
 

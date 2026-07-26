@@ -56,6 +56,24 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('adds tag descriptions to an existing tag catalogue', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-tag-description-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = new Store(dbPath);
+    const project = legacy.createProject('Legacy tags');
+    const tag = legacy.createTag({ projectId: project.id, name: 'frontend' });
+    // Recreate the pre-description schema while preserving its catalogue rows.
+    legacy.db.exec('ALTER TABLE tags DROP COLUMN description');
+    legacy.close();
+
+    const migrated = new Store(dbPath);
+    expect((migrated.db.prepare('PRAGMA table_info(tags)').all() as any[]).map((column) => column.name)).toContain('description');
+    expect(migrated.getTag(tag.id)).toMatchObject({ name: 'frontend' });
+    expect(migrated.updateTag(tag.id, { description: 'Client-facing work.' })?.description).toBe('Client-facing work.');
+    migrated.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('creates a project with a default task list', () => {
     const p = store.createProject('Acme', { defaultBase: 'main' });
     expect(p.id).toMatch(/^proj_/);
@@ -63,6 +81,21 @@ describe('Store', () => {
     expect(lists).toHaveLength(1);
     expect(lists[0]!.name).toBe('Tasks');
     expect(store.getProject(p.id)!.config.defaultBase).toBe('main');
+  });
+
+  it('rejects reserved routing names for projects and organizations', () => {
+    // A project is addressed at /<org>/<project> by the slug of its name, and an
+    // organization owns the top URL segment — a name that slugifies to a built-in
+    // route word (wiki, settings, dashboard, api, …) would be unreachable.
+    for (const name of ['wiki', 'Settings', 'DASHBOARD', 'inbox', 'api', 'tasks', 'queue', ' Wiki ']) {
+      expect(() => store.createProject(name)).toThrow(/reserved/i);
+      expect(() => store.createOrganization({ name })).toThrow(/reserved/i);
+    }
+    // An explicit organization slug is checked too, not just the derived one.
+    expect(() => store.createOrganization({ name: 'Fine name', slug: 'settings' })).toThrow(/reserved/i);
+    // Ordinary names still work, and a name merely containing a reserved word is fine.
+    expect(() => store.createProject('My Wiki Notes')).not.toThrow();
+    expect(store.createOrganization({ name: 'Acme' }).slug).toBe('acme');
   });
 
   it('creates and lists tasks in order', () => {
@@ -92,16 +125,43 @@ describe('Store', () => {
     const second = store.createTask({ projectId: p.id, listId: first.listId, title: first.title, workflow: first.workflow, workflowVersion: first.workflowVersion, params: { prompt: 'second', draft: true }, intentId: first.intentId });
     expect(second.attemptNumber).toBe(2);
     expect(second.num).toBeUndefined();
-    expect(store.listPrincipalTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(store.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(store.listTaskAttempts(p.id).map((t) => t.id)).toEqual([first.id, second.id]);
     const cancelled = { taskId: first.id, title: first.title, workflow: first.workflow, stage: 'cancelled' as const, status: 'cancelled' as const, messages: [], actions: [], state: {}, updatedAt: 1 };
     store.saveView(first.id, cancelled);
     expect(store.attemptGroup(first.id)!.principalAttemptId).toBe(second.id);
-    expect(store.listPrincipalTasks(p.id).map((t) => t.id)).toEqual([second.id]);
-    expect(store.listPrincipalTasks(p.id)[0]!.num).toBe(first.num); // logical # is stable
+    expect(store.listTasks(p.id).map((t) => t.id)).toEqual([second.id]);
+    expect(store.listTasks(p.id)[0]!.num).toBe(first.num); // logical # is stable
     expect(store.getTaskByNum(p.id, first.num!)!.id).toBe(second.id); // permalink follows principal
     expect(store.attemptGroup(second.id)!.confirmer).toEqual({ mode: 'agent' });
     expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'agent' })).not.toThrow();
     expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'human' })).toThrow(/freezes/);
+  });
+
+  it('does not turn persisted attempts into top-level tasks on restart', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-attempt-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const s1 = new Store(dbPath);
+    const p = s1.createProject('Acme');
+    const first = s1.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'first' } });
+    const second = s1.createTask({ projectId: p.id, title: 'Intent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'second' }, intentId: first.intentId });
+    s1.close();
+
+    // Re-running schema migrations must create an intent only for the root task.
+    const s2 = new Store(dbPath);
+    expect(s2.db.prepare('SELECT id FROM task_intents WHERE id=?').get(second.id)).toBeUndefined();
+    expect(s2.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+
+    // Repair databases already polluted by the old migration.
+    s2.db.prepare('INSERT INTO task_intents (id, principalAttemptId, createdAt) VALUES (?, ?, ?)')
+      .run(second.id, second.id, second.createdAt);
+    s2.close();
+    const s3 = new Store(dbPath);
+    expect(s3.db.prepare('SELECT id FROM task_intents WHERE id=?').get(second.id)).toBeUndefined();
+    expect(s3.listTasks(p.id).map((t) => t.id)).toEqual([first.id]);
+    expect(s3.attemptsOf(first.id)).toHaveLength(2);
+    s3.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('grants exactly one Merge commitment and makes the winner principal', () => {
@@ -115,13 +175,29 @@ describe('Store', () => {
     expect(group.principalAttemptId).toBe(second.id);
   });
 
-  it('numbers tasks per project, each starting at #1 (task 10.6)', () => {
+  it('hydrates tags onto attempt-group records (task page reads these)', () => {
+    const p = store.createProject('Acme');
+    const t = store.createTask({ projectId: p.id, title: 'Tagged', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const tag = store.createTag({ projectId: p.id, name: 'dontmerge' });
+    store.setTaskTags(t.id, [tag.id]);
+    // The task page resolves its record via attemptGroup — its attempts must carry tags,
+    // just like listPrincipalTasks does, or the tag renders on the list but not the page.
+    const group = store.attemptGroup(t.id)!;
+    expect(group.attempts.find((a) => a.id === t.id)?.tags).toEqual([tag.id]);
+    expect(store.attemptsOf(t.id).find((a) => a.id === t.id)?.tags).toEqual([tag.id]);
+  });
+
+  it('numbers queued tasks per project, each starting at #1 (task 10.6)', () => {
     const a = store.createProject('Acme');
     const b = store.createProject('Beta');
+    const draft = store.createTask({ projectId: a.id, title: 'A-draft', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'later', draft: true } });
     const a1 = store.createTask({ projectId: a.id, title: 'A-one', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } });
     const b1 = store.createTask({ projectId: b.id, title: 'B-one', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'y' } });
     const a2 = store.createTask({ projectId: a.id, title: 'A-two', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'z' } });
-    // each project runs its own #1, #2, … independently
+    // Never-queued drafts have no number and do not consume one. Each project's
+    // queued work therefore runs its own #1, #2, … independently.
+    expect(draft.num).toBeUndefined();
+    expect(store.getTask(draft.id)!.num).toBeUndefined();
     expect([a1.num, a2.num]).toEqual([1, 2]);
     expect(b1.num).toBe(1);
     // resolvable by (project, number) — drives the /projects/:name/tasks/:num permalink + search
@@ -130,6 +206,26 @@ describe('Store', () => {
     expect(store.getTaskByNum(a.id, 2)!.id).toBe(a2.id);
     expect(store.getTaskByNum(a.id, 99)).toBeUndefined();
     expect(store.getTask(a2.id)!.num).toBe(2);
+
+    // The number is allocated at the queue transition and remains stable if the
+    // transition is invoked again.
+    store.clearDraft(draft.id);
+    expect(store.getTask(draft.id)!.num).toBe(3);
+    store.clearDraft(draft.id);
+    expect(store.getTask(draft.id)!.num).toBe(3);
+  });
+
+  it('assigns one logical number when an alternate draft is queued first', () => {
+    const p = store.createProject('Acme');
+    const first = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'first', draft: true } });
+    const second = store.createTask({ projectId: p.id, title: 'Intent', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'second', draft: true }, intentId: first.intentId });
+    expect(first.num).toBeUndefined();
+    expect(second.num).toBeUndefined();
+
+    store.clearDraft(second.id);
+    expect(store.getTask(first.id)!.num).toBe(1);
+    expect(store.getTask(second.id)!.num).toBe(1);
+    expect(store.getTaskByNum(p.id, 1)!.id).toBe(first.id);
   });
 
   it('backfills per-project task numbers for rows created before the column existed', () => {
@@ -141,6 +237,7 @@ describe('Store', () => {
     const a1 = s1.createTask({ projectId: a.id, title: 'A older', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '1' } });
     const b1 = s1.createTask({ projectId: b.id, title: 'B older', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '2' } });
     const a2 = s1.createTask({ projectId: a.id, title: 'A newer', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '3' } });
+    const draft = s1.createTask({ projectId: a.id, title: 'A draft', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'later', draft: true } });
     // simulate a pre-feature install: no num column, no per-project index
     (s1 as any).db.exec('DROP INDEX IF EXISTS idx_tasks_num_project');
     (s1 as any).db.exec('ALTER TABLE tasks DROP COLUMN num');
@@ -149,6 +246,7 @@ describe('Store', () => {
     expect(s2.getTask(a1.id)!.num).toBe(1);
     expect(s2.getTask(a2.id)!.num).toBe(2);
     expect(s2.getTask(b1.id)!.num).toBe(1); // project B starts fresh at #1
+    expect(s2.getTask(draft.id)!.num).toBeUndefined(); // never-queued legacy drafts stay unnumbered
     // brand-new tasks continue each project's sequence
     expect(s2.createTask({ projectId: a.id, title: 'A next', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '4' } }).num).toBe(3);
     expect(s2.createTask({ projectId: b.id, title: 'B next', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: '5' } }).num).toBe(2);

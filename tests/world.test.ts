@@ -4,6 +4,10 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { git, gitOrThrow, currentBranch, ensureIdentity } from '../src/world/git.js';
+import { WorldRegistry } from '../src/world/registry.js';
+import { Store } from '../src/store/db.js';
+import { makeCoreActivities } from '../src/activities/core.js';
+import { ProfileResolver } from '../src/agent/profiles.js';
 
 describe('WorktreeProvider (real git)', () => {
   let home: string;
@@ -34,6 +38,54 @@ describe('WorktreeProvider (real git)', () => {
     expect(fs.existsSync(world.handle.root)).toBe(false);
     // branch is preserved after destroy
     expect((await git(repo, ['rev-parse', '--verify', 'karmax/abc'])).code).toBe(0);
+  });
+
+  it('attaches the project wiki as a branch-and-merge companion repository', async () => {
+    const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
+    const store = new Store(':memory:');
+    const project = store.createProject('Wiki world', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' });
+    const task = store.createTask({ projectId: project.id, title: 'Edit both', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(home));
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), contentDir });
+    try {
+      const handle = await core.createWorld({ taskId: task.id, repos: [repo], base: 'main', target: 'main', kind: 'worktree' });
+      expect(handle.repos).toHaveLength(2);
+      expect(handle.repos!.find((candidate) => candidate.role === 'project-wiki')).toMatchObject({
+        branch: `karmax/${task.id}`, base: 'main', target: 'main',
+      });
+      expect(handle.workdir).toBe(handle.repos!.find((candidate) => candidate.role !== 'project-wiki')!.root);
+      await worlds.open(handle).then((world) => world.destroy());
+    } finally {
+      fs.rmSync(contentDir, { recursive: true, force: true });
+      store.close();
+    }
+  });
+
+  it('keeps a scratch workspace when the project wiki is the only configured repository', async () => {
+    const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
+    const store = new Store(':memory:');
+    const project = store.createProject('Wiki scratch', { repos: [], defaultBase: 'main', defaultTarget: 'main' });
+    const task = store.createTask({ projectId: project.id, title: 'Scratch task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(home));
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), contentDir });
+    try {
+      const handle = await core.createWorld({ taskId: task.id, base: 'main', target: 'main', kind: 'worktree' });
+      expect(handle.repos).toHaveLength(2);
+      expect(handle.repos!.some((candidate) => candidate.role === 'project-wiki')).toBe(true);
+      expect(handle.repos!.find((candidate) => candidate.root === handle.workdir)?.name).toBe('scratch');
+      const opened = await worlds.open(handle);
+      expect((await opened.exec('pwd', [])).stdout.trim()).toBe(handle.workdir);
+      await opened.destroy();
+    } finally {
+      fs.rmSync(contentDir, { recursive: true, force: true });
+      store.close();
+    }
   });
 
   it('warns (but still forks off HEAD) when the configured base branch does not exist', async () => {

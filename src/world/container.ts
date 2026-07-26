@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
-import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath } from './types.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, ExecOptions, ExecResult, WorldLifecycleState, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldWorkingDirectory } from './types.js';
 import { WorktreeProvider } from './worktree.js';
 import { paths } from '../config/paths.js';
 import { openSpawnedPty, startSpawnedProcess } from './local-execution.js';
@@ -116,7 +116,7 @@ class ContainerWorld implements World {
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const inner = [cmd, ...args].map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
     const dArgs = ['exec'];
-    if (opts.cwd) dArgs.push('-w', this.containerCwdFromAny(opts.cwd));
+    dArgs.push('-w', this.containerCwdFromAny(opts.cwd ?? worldWorkingDirectory(this.handle)));
     for (const [k, v] of Object.entries(opts.env ?? {})) dArgs.push('-e', `${k}=${v}`);
     dArgs.push(this.name, 'bash', '-lc', inner);
     return docker(dArgs, { timeoutMs: opts.timeoutMs });
@@ -140,13 +140,13 @@ class ContainerWorld implements World {
   }
   async startProcess(spec: WorldProcessSpec): Promise<WorldProcess> {
     const args = ['exec'];
-    if (spec.cwd) args.push('-w', this.containerCwd(spec.cwd));
+    args.push('-w', this.containerCwdFromAny(spec.cwd ?? worldWorkingDirectory(this.handle)));
     for (const [key, value] of Object.entries(spec.env ?? {})) args.push('-e', `${key}=${value}`);
     args.push(this.name, 'bash', '-lc', spec.command);
     return startSpawnedProcess('docker', args, { env: process.env, detached: true });
   }
   async openPty(spec: WorldPtySpec = {}): Promise<WorldPty> {
-    const args = ['exec', '-it', '-w', this.containerCwd(spec.cwd)];
+    const args = ['exec', '-it', '-w', this.containerCwdFromAny(spec.cwd ?? worldWorkingDirectory(this.handle))];
     for (const [key, value] of Object.entries(spec.env ?? {})) args.push('-e', `${key}=${value}`);
     args.push(this.name, 'bash', '--norc', '-i');
     return openSpawnedPty('docker', args, spec);

@@ -4,10 +4,11 @@ import { safeParseManifest, parseManifest } from '../src/packages/schema.js';
 import { manifest as bundled } from '../src/contrib/manifests.js';
 import { TaskRecord, TaskStatus } from '../src/domain/types.js';
 
-const task = (over: { workflow?: string; workflowVersion?: string; status?: TaskStatus }): TaskRecord =>
+const task = (over: { workflow?: string; executionWorkflow?: string; workflowVersion?: string; status?: TaskStatus }): TaskRecord =>
   ({
     id: 't', projectId: 'p', listId: 'l', title: 't',
     workflow: over.workflow ?? 'software-dev', workflowVersion: over.workflowVersion ?? '1.0.0',
+    ...(over.executionWorkflow ? { executionWorkflow: over.executionWorkflow } : {}),
     params: {}, createdAt: 0, order: 0,
     lastView: over.status ? ({ status: over.status } as TaskRecord['lastView']) : undefined,
   } as TaskRecord);
@@ -42,9 +43,9 @@ describe('PackageStore (name@version resolution)', () => {
     const store = PackageStore.withBundled();
     const names = new Set(store.list().map((p) => p.name));
     expect(names).toEqual(new Set(['software-dev', 'just-do', 'script-exec', 'goal', 'merge-only', 'merge-queue', 'agent-queue', 'account-coordinator']));
-    expect(store.resolve('software-dev')!.version).toBe('1.2.0');
-    expect(store.resolve('just-do')!.version).toBe('1.1.0');
-    expect(store.resolve('merge-only')!.version).toBe('1.1.0');
+    expect(store.resolve('software-dev')!.version).toBe('1.4.0');
+    expect(store.resolve('just-do')!.version).toBe('1.2.0');
+    expect(store.resolve('merge-only')!.version).toBe('1.2.0');
     expect(store.resolve('software-dev', '1.0.0')!.name).toBe('software-dev');
     expect(store.resolve('nope')).toBeUndefined();
     expect(store.resolve('software-dev', '9.9.9')).toBeUndefined();
@@ -54,7 +55,7 @@ describe('PackageStore (name@version resolution)', () => {
     const store = PackageStore.withBundled();
     store.register({ ...bundled('software-dev'), version: '1.10.0', description: 'newer' });
     store.register({ ...bundled('software-dev'), version: '1.2.0', description: 'mid' });
-    expect(store.versions('software-dev')).toEqual(['1.0.0', '1.1.0', '1.2.0', '1.10.0']); // numeric, not lexical
+    expect(store.versions('software-dev')).toEqual(['1.0.0', '1.1.0', '1.2.0', '1.3.0', '1.4.0', '1.10.0']); // numeric, not lexical
     expect(store.resolve('software-dev')!.version).toBe('1.10.0'); // latest
     expect(store.resolve('software-dev', '1.0.0')!.description).not.toBe('newer'); // old version intact
   });
@@ -73,10 +74,11 @@ describe('version retirement (§21c — never drop code a live execution replays
     const refs = livePinnedRefs([
       task({ status: 'active', workflowVersion: '1.0.0' }),
       task({ status: 'waiting', workflow: 'goal', workflowVersion: '2.0.0' }),
+      task({ status: 'active', workflow: 'goal', executionWorkflow: 'software-dev', workflowVersion: '1.3.0' }),
       task({ status: 'done', workflowVersion: '0.9.0' }), // terminal → not pinned
       task({ status: 'cancelled', workflowVersion: '0.8.0' }),
     ]);
-    expect(refs).toEqual(new Set(['software-dev@1.0.0', 'goal@2.0.0']));
+    expect(refs).toEqual(new Set(['software-dev@1.0.0', 'goal@2.0.0', 'software-dev@1.3.0']));
   });
 
   it('refuses to retire a version a live execution is pinned to, but allows it once drained', () => {
@@ -89,14 +91,16 @@ describe('version retirement (§21c — never drop code a live execution replays
 
     // a newer version with no live executions retires freely
     expect(store.retire('goal', '2.0.0', live)).toBe(true);
-    expect(store.versions('goal')).toEqual(['1.0.0', '1.1.0', '1.2.0']);
+    expect(store.versions('goal')).toEqual(['1.0.0', '1.1.0', '1.2.0', '1.3.0', '1.4.0']);
 
     // once the execution drains (done), the old version can be retired too
     const drained = livePinnedRefs([task({ workflow: 'goal', workflowVersion: '1.0.0', status: 'done' })]);
     expect(store.retire('goal', '1.0.0', drained)).toBe(true);
-    expect(store.resolve('goal')?.version).toBe('1.2.0');
+    expect(store.resolve('goal')?.version).toBe('1.4.0');
     expect(store.retire('goal', '1.1.0', drained)).toBe(true);
     expect(store.retire('goal', '1.2.0', drained)).toBe(true);
+    expect(store.retire('goal', '1.3.0', drained)).toBe(true);
+    expect(store.retire('goal', '1.4.0', drained)).toBe(true);
     expect(store.resolve('goal')).toBeUndefined();
   });
 

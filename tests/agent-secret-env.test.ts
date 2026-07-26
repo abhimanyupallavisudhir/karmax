@@ -15,6 +15,12 @@ import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resou
 describe('agent project-secret delivery', () => {
   it('resolves attachment and service handles JIT into the dedicated turn channel', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-agent-secret-env-'));
+    const previousHome = process.env.KARMAX_HOME;
+    const previousMemoryFloor = process.env.KARMAX_AGENT_MIN_FREE_MB;
+    const previousLoadFactor = process.env.KARMAX_AGENT_MAX_LOAD_FACTOR;
+    process.env.KARMAX_HOME = dir;
+    process.env.KARMAX_AGENT_MIN_FREE_MB = '0';
+    process.env.KARMAX_AGENT_MAX_LOAD_FACTOR = '0';
     const store = new Store(':memory:');
     const project = store.createProject('Secret agent');
     const task = store.createTask({ projectId: project.id, title: 'Use the service', workflow: 'software-dev',
@@ -63,6 +69,14 @@ describe('agent project-secret delivery', () => {
       await resources.deleteProject(project.id);
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });
+      restoreEnv('KARMAX_HOME', previousHome);
+      restoreEnv('KARMAX_AGENT_MIN_FREE_MB', previousMemoryFloor);
+      restoreEnv('KARMAX_AGENT_MAX_LOAD_FACTOR', previousLoadFactor);
     }
   });
 });
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}

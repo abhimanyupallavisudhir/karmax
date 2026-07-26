@@ -3,11 +3,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { paths } from '../config/paths.js';
 import { Provider } from '../domain/types.js';
+import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 
 /**
- * Config homes (SPEC §7.3). karmax mints one config home per (account × profile)
+ * Config homes (SPEC §7.3). karmax mints one config home per
+ * (organization × account × profile)
  * and injects the right CODEX_HOME / CLAUDE_CONFIG_DIR at process spawn — the
- * official isolation mechanism for both tools (auth, settings, sessions, MCP).
+ * official isolation mechanism for each admitted tool (auth, settings,
+ * sessions, MCP).
  *
  * Gotcha (§7.3): spawn each agent with a SCRUBBED, fully isolated environment —
  * unset inherited API keys so they don't leak across profiles.
@@ -15,35 +18,77 @@ import { Provider } from '../domain/types.js';
 export class ConfigHomeManager {
   constructor(private root = paths().configHomes) {}
 
-  /** Ensure (and return) the config home dir for an account × provider. */
-  ensure(provider: Provider, account: string): string {
-    const dir = path.join(this.root, `${provider}-${sanitize(account)}`);
+  /** Ensure (and return) the config home dir for an organization × account × provider.
+   * Historical flat homes belong only to the personal organization. */
+  ensure(provider: Provider, account: string, organizationId = 'org_personal'): string {
+    const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
     fs.mkdirSync(dir, { recursive: true });
     return dir;
   }
 
   /** Delete a login's config home (removes its credentials + settings). */
-  remove(provider: Provider, account: string): void {
-    const dir = path.join(this.root, `${provider}-${sanitize(account)}`);
+  remove(provider: Provider, account: string, organizationId = 'org_personal'): void {
+    const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
   /** Rename a login (move its config home so credentials carry over). */
-  rename(provider: Provider, from: string, to: string): string {
-    const src = path.join(this.root, `${provider}-${sanitize(from)}`);
-    const dst = path.join(this.root, `${provider}-${sanitize(to)}`);
+  rename(provider: Provider, from: string, to: string, organizationId = 'org_personal'): string {
+    const root = this.organizationRoot(organizationId);
+    const src = path.join(root, `${provider}-${sanitize(from)}`);
+    const dst = path.join(root, `${provider}-${sanitize(to)}`);
     if (fs.existsSync(src) && !fs.existsSync(dst)) fs.renameSync(src, dst);
     else fs.mkdirSync(dst, { recursive: true });
     return dst;
   }
 
-  list(): { provider: string; account: string; path: string; loggedIn: boolean }[] {
-    if (!fs.existsSync(this.root)) return [];
-    return fs.readdirSync(this.root).map((name) => {
+  list(organizationId = 'org_personal'): { provider: string; account: string; path: string; loggedIn: boolean; modelProvider?: string }[] {
+    const root = this.organizationRoot(organizationId);
+    if (!fs.existsSync(root)) return [];
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !(organizationId === 'org_personal' && entry.name === 'organizations'))
+      .map(({ name }) => {
       const [provider, ...rest] = name.split('-');
-      const dir = path.join(this.root, name);
-      return { provider: provider ?? '', account: rest.join('-'), path: dir, loggedIn: isLoggedIn(provider ?? '', dir) };
-    });
+      const dir = path.join(root, name);
+      const modelProvider = provider === 'opencode' ? this.modelProvider(dir) : undefined;
+      return {
+        provider: provider ?? '',
+        account: rest.join('-'),
+        path: dir,
+        loggedIn: isLoggedIn(provider ?? '', dir),
+        ...(modelProvider ? { modelProvider } : {}),
+      };
+      });
+  }
+
+  /** Persist the vendor selected by an OpenCode subscription login. */
+  setModelProvider(home: string, modelProvider: string): void {
+    fs.writeFileSync(path.join(home, KARMAX_LOGIN_META_FILE), JSON.stringify({ modelProvider }), { mode: 0o600 });
+  }
+
+  /** Read Karmax metadata, falling back to a single provider in old auth.json files. */
+  modelProvider(home: string): string | undefined {
+    try {
+      const value = JSON.parse(fs.readFileSync(path.join(home, KARMAX_LOGIN_META_FILE), 'utf8')).modelProvider;
+      if (typeof value === 'string' && value) return value;
+    } catch {
+      /* historical login without Karmax metadata */
+    }
+    return openCodeAuthProvider(path.join(home, 'data', 'opencode', 'auth.json'));
+  }
+
+  /** Every managed login, for the host-wide lease coordinator. Ambient homes and
+   * environment keys are intentionally not included here: those legacy host
+   * credentials belong only to org_personal. */
+  listAll(organizationIds: string[]): Array<{ organizationId: string; provider: string; account: string; path: string; loggedIn: boolean; modelProvider?: string }> {
+    return organizationIds.flatMap((organizationId) =>
+      this.list(organizationId).map((login) => ({ organizationId, ...login })),
+    );
+  }
+
+  removeOrganization(organizationId: string): void {
+    if (organizationId === 'org_personal') throw new Error('cannot remove the personal organization config-home namespace');
+    fs.rmSync(this.organizationRoot(organizationId), { recursive: true, force: true });
   }
 
   /**
@@ -76,6 +121,8 @@ export class ConfigHomeManager {
       const toml = Object.entries(servers).map(([name, server]) => codexMcpServer(name, server)).join('');
       fs.writeFileSync(file, preserved.trimEnd() + toml);
     }
+    // ACP transports receive MCP servers in session/new and session/load.
+    // Keeping them out of provider-specific files avoids duplicate servers.
   }
 
   /**
@@ -89,7 +136,7 @@ export class ConfigHomeManager {
    */
   refreshPlatformMcp(gatewayUrl: string): void {
     const platform = platformMcpSpec(gatewayUrl);
-    for (const { provider, path: home } of this.list()) {
+    for (const { provider, path: home } of this.allHomes()) {
       if (provider === 'claude') {
         const file = path.join(home, '.claude.json');
         const cur = readJson(file);
@@ -102,6 +149,26 @@ export class ConfigHomeManager {
         fs.writeFileSync(file, preserved.trimEnd() + codexMcpServer('karmax', platform));
       }
     }
+  }
+
+  private organizationRoot(organizationId: string): string {
+    // Existing installations stored personal homes directly under config-homes.
+    // Keeping that path is the migration: no credentials move, and no other
+    // organization ever enumerates the directory.
+    return organizationId === 'org_personal'
+      ? this.root
+      : path.join(this.root, 'organizations', sanitize(organizationId));
+  }
+
+  private allHomes(): Array<{ provider: string; path: string }> {
+    if (!fs.existsSync(this.root)) return [];
+    const homes = this.list().map(({ provider, path: home }) => ({ provider, path: home }));
+    const organizations = path.join(this.root, 'organizations');
+    if (!fs.existsSync(organizations)) return homes;
+    for (const org of fs.readdirSync(organizations, { withFileTypes: true }).filter((entry) => entry.isDirectory())) {
+      for (const { provider, path: home } of this.list(org.name)) homes.push({ provider, path: home });
+    }
+    return homes;
   }
 }
 
@@ -195,15 +262,30 @@ function readJson(file: string): any {
 /** Is a config home logged in? Checks the provider's own credential file and the
  *  karmax token file we write when a `setup-token` flow prints a token. */
 export function isLoggedIn(provider: string, home: string): boolean {
-  const candidates =
-    provider === 'codex'
-      ? ['auth.json', KARMAX_TOKEN_FILE]
-      : ['.credentials.json', '.claude/.credentials.json', KARMAX_TOKEN_FILE];
+  if (isAcpProvider(provider) && hasAcpHomeLogin(provider, home)) return true;
+  const candidates = provider === 'codex'
+    ? ['auth.json', KARMAX_TOKEN_FILE]
+    : provider === 'claude'
+      ? ['.credentials.json', '.claude/.credentials.json', KARMAX_TOKEN_FILE]
+      : [KARMAX_TOKEN_FILE];
   return candidates.some((f) => fs.existsSync(path.join(home, f)));
 }
 
 /** Where we persist a captured OAuth/setup token for a home. */
 export const KARMAX_TOKEN_FILE = 'karmax-oauth.json';
+export const KARMAX_LOGIN_META_FILE = 'karmax-login.json';
+
+/** Infer a single model vendor from OpenCode's documented auth.json map. */
+export function openCodeAuthProvider(authFile: string): string | undefined {
+  try {
+    const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+    const known = new Set<string>([...MODEL_PROVIDERS, 'claude', 'codex', 'grok']);
+    const providers = Object.keys(auth).filter((key) => known.has(key));
+    return providers.length === 1 ? providers[0] : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Read a captured token for a home (used to inject into the agent env). */
 export function capturedToken(home: string): string | undefined {
@@ -219,7 +301,12 @@ export function capturedToken(home: string): string | undefined {
  *  A setup-token-only home (just `karmax-oauth.json`) is NOT fully authed, so
  *  `connect` re-runs login to upgrade it to a full, usage-pollable credential (#6). */
 export function isFullyAuthed(provider: string, home: string): boolean {
-  const native = provider === 'codex' ? ['auth.json'] : ['.credentials.json', '.claude/.credentials.json'];
+  if (isAcpProvider(provider)) return hasAcpHomeLogin(provider, home);
+  const native = provider === 'codex'
+    ? ['auth.json']
+    : provider === 'claude'
+      ? ['.credentials.json', '.claude/.credentials.json']
+      : [];
   return native.some((f) => fs.existsSync(path.join(home, f)));
 }
 
@@ -240,9 +327,14 @@ export function scrubbedEnv(opts: { provider: Provider; configHome?: string; ext
   delete env.ANTHROPIC_API_KEY;
   delete env.OPENAI_API_KEY;
   delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete env.KIMI_MODEL_API_KEY;
+  delete env.KIMI_MODEL_NAME;
+  delete env.KIMI_MODEL_BASE_URL;
+  for (const provider of MODEL_PROVIDERS) delete env[apiKeyEnv(provider)];
   if (opts.configHome) {
     if (opts.provider === 'claude') env.CLAUDE_CONFIG_DIR = opts.configHome;
     if (opts.provider === 'codex') env.CODEX_HOME = opts.configHome;
+    if (isAcpProvider(opts.provider)) Object.assign(env, acpHomeEnv(opts.provider, opts.configHome));
   }
   return { ...env, ...(opts.extra ?? {}) };
 }

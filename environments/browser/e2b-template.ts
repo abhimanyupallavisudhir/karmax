@@ -12,4 +12,3 @@ await Template.build(template, tag, {
   memoryMB: 4096,
   onBuildLogs: defaultBuildLogger(),
 });
-

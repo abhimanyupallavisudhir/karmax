@@ -19,6 +19,7 @@ function extractFn(name) {
 global.esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 global.inhAttr = (v) => `data-inherit='${esc(JSON.stringify(v ?? null))}'`;
 global.effortSelectHtml = (_cls, _provider, _model, effort) => `<select class="af-effort"><option selected>${effort || ''}</option></select>`;
+global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 global.S = { tasks: [] };
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('renderAgentField'));

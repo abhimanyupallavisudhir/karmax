@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { enumerateCredentials, resolveCredentials, credentialsForProvider, defaultEnabled, isEnabled } from '../src/platform/credentials.js';
-import { agentAccountHandles } from '../src/platform/credential-sources.js';
+import {
+  enumerateCredentials,
+  resolveCredentials,
+  credentialsForProvider,
+  defaultEnabled,
+  isEnabled,
+} from '../src/platform/credentials.js';
+import { agentAccountHandles, credPolicyKey, readPolicyLayers } from '../src/platform/credential-sources.js';
 
 const sources = {
   logins: [
@@ -19,9 +25,10 @@ const keys = (cs: { key: string }[]) => cs.map((c) => c.key);
 
 describe('credential enumeration', () => {
   it('hides infrastructure vault handles from agent account selection', () => {
-    expect(agentAccountHandles(['claude:work', 'codex:personal', 'checkpoint:encryption-key',
+    expect(agentAccountHandles(['claude:work', 'codex:personal', 'kimi:design', 'xai:grok',
+      'checkpoint:encryption-key',
       'github-app:private-key', 'world-provider:org:e2b:api-key']))
-      .toEqual(['claude:work', 'codex:personal']);
+      .toEqual(['claude:work', 'codex:personal', 'kimi:design', 'xai:grok']);
   });
 
   it('lists logged-in logins, ambient logins, env keys, and broker handles', () => {
@@ -34,6 +41,61 @@ describe('credential enumeration', () => {
     expect(all.find((c) => c.key === 'login:claude:manyu')?.configHome).toBe('/h/cm');
     expect(all.find((c) => c.key === 'ambient:claude')?.configHome).toBe('/home/test/.claude');
     expect(all.find((c) => c.key === 'ambient:codex')?.configHome).toBe('/home/test/.codex');
+  });
+
+  it('uses tenant-qualified login and key ids outside the personal organization', () => {
+    const scoped = enumerateCredentials({
+      organizationId: 'org_acme',
+      logins: [{ provider: 'claude', account: 'work', path: '/h/acme', loggedIn: true }],
+      ambient: {},
+      envKeys: {},
+      handles: ['claude:org_acme:metered'],
+    });
+    expect(keys(scoped)).toEqual([
+      'login:org_acme:claude:work',
+      'key:handle:claude:org_acme:metered',
+    ]);
+    expect(agentAccountHandles([
+      'claude:legacy-personal',
+      'claude:org_acme:metered',
+      'claude:org_beta:metered',
+    ], 'org_acme')).toEqual(['claude:org_acme:metered']);
+  });
+
+  it('keeps a model vendor on model-agnostic subscription credentials', () => {
+    const credentials = enumerateCredentials({
+      logins: [{
+        provider: 'opencode',
+        account: 'grok-subscription',
+        path: '/h/oc',
+        loggedIn: true,
+        modelProvider: 'xai',
+      }],
+      ambient: {},
+      envKeys: {},
+      handles: [],
+    });
+    expect(credentials).toEqual([expect.objectContaining({
+      key: 'login:opencode:grok-subscription',
+      provider: 'opencode',
+      modelProvider: 'xai',
+      label: 'opencode:grok-subscription (xai)',
+    })]);
+  });
+
+  it('keeps a detected model vendor on an ambient OpenCode credential', () => {
+    const credentials = enumerateCredentials({
+      logins: [],
+      ambient: { opencode: true },
+      ambientModelProviders: { opencode: 'xai' },
+      envKeys: {},
+      handles: [],
+    });
+    expect(credentials).toEqual([expect.objectContaining({
+      key: 'ambient:opencode',
+      modelProvider: 'xai',
+      label: 'opencode (ambient login · xai)',
+    })]);
   });
 });
 
@@ -55,6 +117,14 @@ describe('default policy: logins/ambient ON, API keys OFF (opt-in)', () => {
 });
 
 describe('enable / disable across scopes (task → project → global)', () => {
+  it('assigns the legacy global policy only to org_personal', () => {
+    const values = new Map([[credPolicyKey.global(), JSON.stringify({ off: ['ambient:claude'] })]]);
+    expect(readPolicyLayers((key) => values.get(key), { organizationId: 'org_personal' }).global?.off)
+      .toEqual(['ambient:claude']);
+    expect(readPolicyLayers((key) => values.get(key), { organizationId: 'org_other' }).global)
+      .toBeUndefined();
+  });
+
   it('a global "on" opts a key in (ranked after logins/ambient)', () => {
     const r = keys(resolveCredentials(all, { global: { on: ['key:codex'] } }));
     expect(r).toContain('key:codex');

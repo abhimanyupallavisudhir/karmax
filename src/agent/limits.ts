@@ -41,7 +41,7 @@ export interface LimitClassification {
 export interface ProviderFailureMetadata {
   kind: ProviderFailureKind;
   permanence: 'hard' | 'transient';
-  provider?: 'claude' | 'codex' | 'mock';
+  provider?: 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
   source: ProviderFailureSource;
   window?: LimitWindow;
   resetHint?: string;

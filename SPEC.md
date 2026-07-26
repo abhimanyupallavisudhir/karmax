@@ -30,11 +30,14 @@ A fourth principle governs all three: **declare, don't guess.** Events, actions,
 
 - **Durable execution engine: Temporal.** This is the spine and is non-negotiable for v1. It provides the durability, event delivery, timers, retries, child workflows, and state queries that the platform would otherwise reimplement badly. See §3.
 - **Language: TypeScript end-to-end** (Temporal TS SDK for workflows/activities, the gateway, and the web UI), for cohesion and shared types across the workflow contract and the UI. (Temporal also supports Python/Go/Java if a different choice is made later; the spec assumes TS.)
-- **Coding agents: Claude Agent SDK and Codex (app-server / SDK)**, behind a provider-adapter interface (§7).
+- **Coding agents:** native Claude Agent SDK and Codex app-server adapters, plus
+  the stable Agent Client Protocol (ACP) for provider-neutral harnesses (§7).
 - **Secrets: a credential broker** backed by a vault (HashiCorp Vault, a cloud secret manager, or 1Password Unified Access). See §8.
 - **Worlds: a provider interface** with local and pluggable remote/sandboxed backends (§11).
 - **Remote access: Tailscale (default) or Cloudflare Tunnel + Access** (§12).
-- **Data home:** `~/.karmax/` holds workflow repos, agent config homes, prompt/skill content, and local state.
+- **Data home:** `~/.karmax/` holds organization-scoped workflow caches and agent
+  config homes, prompt/skill content, and local state. Host-wide storage does not
+  imply host-wide resource ownership.
 
 ---
 
@@ -106,7 +109,9 @@ Keeping these separate resolves most apparent contradictions about editing "a wo
 
 ### 4.2 Repo layout
 
-Each workflow lives in its own git repo under `~/.karmax/workflows/<name>/`:
+Built-ins ship with the host. Each installed workflow is owned by one
+organization and cached under
+`~/.karmax/workflows/organizations/<organization-id>/<name>/`:
 
 ```
 ~/.karmax/workflows/software-dev/
@@ -153,6 +158,8 @@ This PR gate is **the single most important safety boundary in the system**: age
 
 **The wiki is that content system's home.** Each organization and each project owns a wiki under `~/.karmax/content/wiki/<scope>/<id>/` — skills, memories, and prompts are all the same thing to the system. An entry is a **folder** holding a `SKILL.md` or `MEMORY.md` in the standard Agent Skills format (YAML frontmatter, then markdown); the folder name is its title, any other files (scripts, images, even further md files) ride along without becoming entries, and folders without a page file are sections that nest the tree. Frontmatter carries `name`/`description` plus two delivery controls: `delivery: unconditional | indexed` (default indexed) and `importance: <number>` (default 0). An *indexed* entry appears in the **table of contents** agents receive; an *unconditional* entry's full body is sent with every prompt — a scope's "general prompt" is simply an unconditional entry, and the built-in karmax working instructions ship as a bundled default at `@builtin/how-to-work` — an on-disk entry at that exact path is its editable override (the §9 overlay model: editing customizes, deleting the override restores the default; the rest of the `@` namespace stays reserved and built-in identities never rename). Every agent turn receives, in order: the built-in instructions, then per scope (organization, then project) its unconditional entries in full followed by the indexed TOC (names + descriptions only, expanded to every leaf, siblings ordered by importance). When a TOC's estimated tokens exceed 20k, each penultimate list of ≥10 entries keeps its 9 most important and folds the rest behind a `[more…]` link naming the exact expansion call. Agents navigate with `read_wiki` (TOC / section / full page) and grep with `search_wiki`; both are gateway-backed platform tools that run host-side, so they work identically from local worktrees and cloud sandboxes. Reads need the scope's read capability; writes reuse `skill:write` (the wiki *is* the skills store).
 
+Project and organization wiki persistence deliberately differ. A **project wiki is a dedicated Git repository** whose canonical checkout is the directory above. Existing folders migrate in place into its `main` baseline. The wiki repository is provisioned into every task world as a platform-owned companion repo on the task's branch, participates in review and the ordinary multi-repo merge, and is read/written through that live checkout for task-agent calls (including remote-provider worlds). A connected GitHub setup creates a private, project-owned wiki remote and isolated deploy keys; deployment backfills existing projects before accepting task traffic, and later task creation retries incomplete setup. The repository is hidden from the project's normal development-repository picker. The wiki page can inspect the canonical branch, another Git branch, or a task world's live branch through one filterable selector; arbitrary detached branch views are read-only, while a selected live task checkout is editable. The **organization wiki remains filesystem/database state**, shared across the organization, with every write/move/delete appended to an in-database version history; content that predates versioning is first captured as an immutable baseline immediately before its first mutation.
+
 ### 4.5 Versioning and in-flight changes
 
 Finite task workflows rarely need in-flight migration — let running tasks drain on their pinned version. Long-lived coordinators (§6) are the exception: their durable state outlives any code version, so coordinator edits require tested state migrations and Temporal patching for in-flight executions. See §9 for why safe mode does not rescue them.
@@ -169,12 +176,22 @@ Two manifest mechanisms, kept deliberately minimal:
 ### 4.7 Standard workflows shipped in v1
 
 - **software-dev** — branch/world → do → review → PR (optional) → merge → end, with resolve and sub-tasks. Detailed in §5.
-- **just-do** — a single straightforward agent call, no merge machinery.
-- **script-exec** — run a script/command as a task.
-- **goal** — like software-dev, but auto-confirms after the provider reports a verified successful turn completion. `signal_completion` may attach a structured summary but is not required.
+- **goal** — software-dev in autonomous completion mode: keep the Do agent moving
+  until it explicitly reports verified completion, then auto-confirm. A merely
+  successful provider return is not enough in Goal mode; it causes another turn.
+  Software-dev and goal are compatible policies over the same pipeline,
+  so a task may switch between them during Setup, Do, or an unconfirmed Review.
+  Switching software-dev → goal at Review sends the work back through Do rather
+  than implicitly approving a possibly partial review. The execution's Temporal
+  type/version remains pinned throughout; only its policy changes.
 - **merge-only** — the review-and-merge half of software-dev (no Do stage). Starts at the review gate, then optional PR, then merge. Used to review agents' PRs, including edits to workflow repos.
 - **merge-queue** (coordinator) — leases the single merge slot per target branch (§6).
 - **token/account coordinator** — tracks per-account limits and leases agent-account capacity (§6, §7).
+
+`just-do` and `script-exec` remain registered only for replay and API
+backward-compatibility; they are not selectable for new tasks. The normal
+software-dev/goal pair covers user-facing work, and software-dev activation uses
+goal for its automated project-readiness task.
 
 ---
 
@@ -309,8 +326,11 @@ A scarce shared resource is owned by a **singleton coordinator workflow** with a
 - One host-wide singleton, `agent-queue`, leases capacity only around model subprocesses; workflows waiting at Review, on accounts, timers, or I/O do not consume it.
 - Capacity defaults to 3 and is persisted as **Organization settings → Host capacity → Concurrent agent turns**, explicitly labeled installation-wide. `KARMAX_MAX_ACT` remains a distinct worker-throughput limit for all activities, and per-login concurrency remains an account-pool limit.
 - Waiting turns and active leases are explicit coordinator state. The coordinator contributes the reorderable **Agent queue** to the host-owned **Queues** page alongside the merge queue.
+- Admission is a non-blocking durable handshake: the coordinator immediately acknowledges enqueue/position, then signals the owning task when capacity is granted. A queued turn never holds a long-running Workflow Update open.
+- Before enqueue acknowledgement the task says **Starting agent**. Only an acknowledged queue wait says **Waiting for host capacity**; post-grant memory/load backpressure names that live host condition separately.
 - The worker applies live free-memory/load gates after lease grant. Those adaptive safety checks are separate from the configured counting-semaphore capacity because only an activity can inspect live host resources.
-- Current turns enroll by stable turn ID at the existing activity boundary, preserving replay compatibility for workflow histories recorded before this coordinator existed. Dead-task leases are reclaimed after a liveness check.
+- Current task-workflow versions own the stable turn-ID lease across activity retries. Historical versions retain activity-boundary enrollment for replay compatibility. Dead-task leases are reclaimed after a liveness check.
+- The coordinator follows Temporal's continue-as-new recommendation (with a low admission-count fallback), carrying queued and active leases into the new run. Active model turns therefore cannot pin an oversized coordinator history.
 
 ### 6.2 Token / account coordinator
 
@@ -329,12 +349,31 @@ Same pattern, leasing **agent-account capacity** instead of merge slots:
 
 ### 7.1 Agent profile model
 
-A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capabilities, resourceLimits, auth }`. A **provider adapter** translates the profile into the concrete invocation:
+A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capabilities, resourceLimits }`. A **provider adapter** translates the profile into the concrete invocation:
 
 - **Claude** → Claude Agent SDK (same harness as Claude Code; session resume/fork; hooks; MCP).
 - **Codex** → Codex app-server / SDK (structured items/turns/threads; approvals pause a turn; resumable threads).
+- **OpenCode** → the versioned, stable ACP v1 contract.
+  Karmax negotiates capabilities instead of parsing terminal output: structured
+  messages/tool calls/plans, permissions, images, cancellation, per-session MCP,
+  and native load/resume/fork where the harness advertises them.
 
-`auth` references an **auth source**: either a subscription **config home** (a `CODEX_HOME`/`CLAUDE_CONFIG_DIR` directory) or an API-key **credential handle** (§8). Never a raw key inline.
+Kimi Code and Grok Build's native harnesses are not admitted while their ACP
+servers lack stable `session/fork` parity. Kimi and xAI remain model-provider
+namespaces and are available through OpenCode using API keys.
+
+`provider` names the **coding harness**. Model credentials remain ordinary
+entries in the general Credentials policy, with the same organization → project
+→ task enablement and precedence as every other login/key. For OpenCode, a
+recognized `provider/model` model id narrows that ordered pool to compatible API
+keys; an unprefixed or custom model id uses the highest-priority compatible
+credential. The credential actually leased supplies the runtime model-provider
+namespace. There is no separate user-editable credential-provider knob that can
+contradict the Credentials policy.
+
+Authentication is resolved separately through the scoped Credentials policy:
+either a leased subscription **config home** or an API-key **credential handle**
+(§8). Agent profiles never carry raw keys or their own credential allow-list.
 
 ### 7.2 The per-turn execution model
 
@@ -348,17 +387,51 @@ The task view reports the turn's resource boundaries separately: `waitingFor: ac
 
 Between turns — where all waits live — the agent is only a stored session ID. **RAM is consumed strictly during turns, never during waits**, regardless of whether a wait is five seconds or five hours. This is the fix for the naive "long-lived agent process" design that exhausts system resources.
 
+**Process custody follows the turn, not the original process group.** Local adapters stamp a unique, inherited custody ID into every agent process. Tools may freely create new sessions and process groups or launch a nested karmax, Temporal server, browser, test runner, or other long-lived subprocess; those descendants remain in the turn's custody scope. Normal turn release, cancellation, and recovery after a dead owner terminate the whole marked scope before removing its durable custody record. Nested turns append their ID rather than replacing the outer one, so ending either turn reaps the correct subtree. This is lifecycle ownership, not a restriction on what an agent may launch.
+
 **Yield only at turn boundaries.** Anything long the agent triggers (a 20-minute test suite, a build) becomes its own activity or child workflow so the agent's turn can end; a fresh turn resumes with the result. The agent never sits idle holding context.
 
 ### 7.3 Config homes under `~/.karmax`
 
-karmax mints **one config home per (account × profile)** under `~/.karmax`, and injects the right `CODEX_HOME` / `CLAUDE_CONFIG_DIR` at process spawn. This is the official isolation mechanism for both tools and isolates auth, settings, sessions, MCP servers, and skills. Because these are environment variables read at process startup, they apply identically to the CLI, the app-server, and the SDK subprocess. The config home also carries browser MCP config (§7.5). Local CLI agents may load the platform MCP from it; remote Claude exposes the same handlers through its host SDK server, and remote Codex exposes them as app-server dynamic tools over the existing PTY. Consequently a cloud world never needs an inbound route to a locally hosted Karmax merely to use platform tools.
+karmax mints **one config home per (organization × account × profile)** under
+`~/.karmax`. Existing flat homes migrate exclusively to the personal
+organization; no other organization can enumerate or lease them. Karmax then
+injects the harness's documented home variables at process spawn:
+`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or OpenCode's XDG homes. This isolates auth,
+settings, sessions, MCP servers, and skills. Because these variables are read at
+process startup, they apply identically to local CLIs, app servers, and SDK
+subprocesses. ACP harnesses receive browser/platform/workflow MCP servers in
+`session/new`, `session/load`, or `session/fork`, so no provider-private config
+format is parsed. Remote Claude exposes the same handlers through its host SDK
+server, remote Codex exposes them as app-server dynamic tools over the existing
+PTY, and ACP uses its standard session contract. Consequently a cloud world never
+needs an inbound route to a locally hosted Karmax merely to use platform tools.
+Historical Kimi/Grok home handling is retained only for workflow replay while
+those native harnesses are not admitted.
 
-**Gotcha — scrub the environment for *login* isolation, not as a sandbox.** Spawn each agent with a **clean environment per spawn**: unset any inherited `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` so one account's key can't leak across profiles, and inject only the target profile's `CODEX_HOME`/`CLAUDE_CONFIG_DIR`. This mechanism isolates **logins** (auth, settings, sessions, MCP, skills) — it is deliberately **not** a filesystem or process sandbox. The agent still runs as the karmax user against the real home directory; *containing what an agent can read/write/execute is the **world's** job* (§11 — the default worktree is a trusted "runs on your machine" posture; the container/microVM providers are the real boundary), never the config home's. The one requirement this places on the config home: `CODEX_HOME`/`CLAUDE_CONFIG_DIR` must capture *all* account-scoped state, so two profiles sharing the real home cannot cross-contaminate logins. If a tool stashes account state outside its config dir, tighten that capture — do **not** reach for scrubbing the home directory, which conflates login isolation (this section) with sandboxing (§11).
+API-key handles, Git identities/keys, credential precedence, and installed
+workflow availability follow the same organization boundary. Built-in workflow
+code remains platform-wide, but an external package's Temporal type is
+tenant-qualified; two organizations may safely install different commits under
+the same human-facing workflow name and version.
+
+**Gotcha — scrub the environment for *login* isolation, not as a sandbox.**
+Spawn each agent with a **clean environment per spawn**: unset inherited model
+API keys, inject only the leased credential and target harness home, and use
+documented ephemeral config channels (for example OpenCode config content and
+Kimi's `KIMI_MODEL_*` variables). This mechanism isolates **logins**; it is
+deliberately **not** a filesystem or process sandbox. Containing what an agent
+can read/write/execute is the **world's** job (§11).
 
 ### 7.4 Agent communication
 
 - **Point-to-point** (supervisor follow-up to a sub-task at the review gate; a hotfix to one task) = **a signal to that task's workflow**, appended to the agent's next turn. No new machinery; it falls out of signals + the per-turn loop.
+- **Requested cross-task work** (for example, “publish your branch”) = a durable
+  collaboration request plus point-to-point signals. Registration returns immediately,
+  so the requester keeps working during its current turn. If the turn ends first, its
+  workflow parks without an agent process; the target's publication or terminal failure
+  settles the request and injects a deduplicated follow-up that wakes the requester.
+  The event log/store is the durable join state — agents never poll another task.
 - **Fan-out** (a hotfix broadcast to all active tasks touching a file) = **a small workflow** that enumerates targets and signals each. Only orchestrated multi-target comms deserve to be a workflow.
 
 ### 7.5 Browser automation
@@ -467,7 +540,7 @@ Human routing is specified in `PLAN-collaboration.md`. Karmax deliberately does
 not reproduce issue-tracker assignee/delegate/reviewer/follower state. Each
 workflow human wait declares the exact user/team/special audience for that step;
 the per-user inbox is a materialized projection of those workflow events.
-- **Wiki** — the organization and project wikis (§4.4): a tree of skills/memories with a rendered page view, a frontmatter-as-form editor (raw YAML behind a toggle, markdown preview), and an Index showing exactly what agents receive each turn: every unconditional entry in full, then the rendered table of contents (names + descriptions, importance order, [more…] folds). The project wiki is a project tab; the organization wiki is the bottom-left rail link.
+- **Wiki** — the organization and project wikis (§4.4): a tree of skills/memories with a rendered page view, a frontmatter-as-form editor (raw YAML behind a toggle, markdown preview), and an Index showing exactly what agents receive each turn: every unconditional entry in full, then the rendered table of contents (names + descriptions, importance order, [more…] folds). The project wiki is a project tab with a type-to-filter branch/task-world selector; the organization wiki is the bottom-left rail link.
 - **Dashboard** — agent runs, token/limit status across accounts, resources used.
 - **The final composed app UI** with the keyboard-navigation registry.
 
@@ -501,7 +574,11 @@ that canonical set.
 
 The `agent` field type is the reusable control for choosing the agent that runs a role — used both in the task form (per-role override) and in the project/global settings (per-role defaults). It collects an **AgentSpec**: `{ provider, model, effort?, resumeFrom? }`.
 
-- **provider** ∈ `claude | codex` (and `mock` for tests). **model** is a provider-scoped list with a free-text escape (Claude: `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`, …; Codex: `gpt-4.1`, …). **effort** ∈ `low | medium | high | xhigh | max` where the provider/model supports it.
+- **provider** ∈ `claude | codex | opencode` (and `mock` for
+  tests). **model** is a harness-scoped list with a free-text escape; OpenCode uses
+  `provider/model` ids. **effort** ∈ `low | medium | high | xhigh | max` where
+  the harness/model advertises it. Credential enablement and precedence come
+  only from the task/project/organization Credentials policy (§7.1).
 - **resumeFrom** continues a prior agent session: either a **task search** picker (find a previous task; resume its stored session for that role) or a directly-entered **conversation/session id**. The chosen session is passed to `runAgentTurn` as the initial session (§7.2), so the agent continues with its prior context (forking, not mutating, the source).
 
 The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.
@@ -542,7 +619,7 @@ Organizations carry a persisted `slug` (falling back to a slug of the name for r
 
 **Workflows do not own URLs.** This is the answer to "does a workflow own its page?": no. Every page is a first-party **core UI module** (§10.3) whose *route* is host-owned; a workflow only ever *augments* a host page through the declared contribution system (§10.1) — a slot, a widget, an action, a param field — never by claiming a path. The merge queue is the illustrative case: it looks "produced by a workflow," but it is a host route that *projects* the merge-queue **coordinator's** query state (`{queue, current}`, §6.1) joined with each task's `mergeQueue` position. The coordinator is queried; it does not render or route. The same holds for the dashboard (projects the account coordinator's query). Keeping routes host-owned means the URL space is finite, stable, and knowable without loading any workflow package.
 
-**Task numbers (`num`).** Each task carries a simple, human-facing sequential id — numbered **per project**, so every project runs its own `#1`, `#2`, … assigned at creation, alongside the opaque `id`. The **`id` never changes**: it is the Temporal `workflowId`, the event key, and the session key, so it must stay stable for replay and cross-task signalling. `num` is purely the human/URL handle: the UI shows `#num` everywhere a task is named (list rows, drawer header, merge queue, notifications, sub-task links), the permalink is `/<org>/<project>/tasks/:num`, and it is a search key — both the task search box and the "Fork a previous agent" picker match on `#num` as well as title. The store owns `num` (unique per `(projectId, num)`, backfilled per project in creation order for pre-existing installs); the gateway resolves `(:projectId, :num) → id` (so a permalink to an archived/not-yet-loaded task still opens) and mirrors `num` onto the task view (the workflow only knows the opaque `id`).
+**Task numbers (`num`).** Each queued task carries a simple, human-facing sequential id — numbered **per project**, so every project runs its own `#1`, `#2`, … assigned when the task is first queued, alongside the opaque `id`. A never-queued draft has no `num`; if queued work is later moved back to drafts, it retains its number and permalink. The **`id` never changes**: it is the Temporal `workflowId`, the event key, and the session key, so it must stay stable for replay and cross-task signalling. `num` is purely the human/URL handle: the UI shows `#num` everywhere a task is named (list rows, drawer header, merge queue, notifications, sub-task links), the permalink is `/<org>/<project>/tasks/:num`, and it is a search key — both the task search box and the "Fork a previous agent" picker match on `#num` as well as title. The store owns `num` (unique per `(projectId, num)`, with legacy queued work backfilled per project in creation order); the gateway resolves `(:projectId, :num) → id` (so a permalink to an archived/not-yet-loaded task still opens) and mirrors `num` onto the task view (the workflow only knows the opaque `id`).
 
 ---
 

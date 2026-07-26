@@ -7,8 +7,8 @@ import { bootHarness, Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { newId } from '../src/util/id.js';
 import { ConfigHomeManager, scrubbedEnv, mcpServerMap, isLoggedIn, isFullyAuthed, capturedToken, tokenToInject } from '../src/autonomy/config-homes.js';
-import { LoginManager } from '../src/autonomy/login.js';
-import { remoteAccessPlan } from '../src/remote/access.js';
+import { LoginManager, defaultLoginCommand } from '../src/autonomy/login.js';
+import { RemoteAccessController, remoteAccessPlan } from '../src/remote/access.js';
 
 describe('config homes + scrubbed env (SPEC §7.3)', () => {
   it('mints one home per (account × provider) and scrubs inherited keys', () => {
@@ -23,6 +23,25 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(env.ANTHROPIC_API_KEY).toBeUndefined(); // never leaks across profiles
     expect(env.CLAUDE_CONFIG_DIR).toBe(home);
     delete process.env.ANTHROPIC_API_KEY;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps same-named organization logins in disjoint homes and preserves legacy personal homes', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-ch-org-'));
+    const mgr = new ConfigHomeManager(dir);
+    const personal = mgr.ensure('claude', 'work');
+    const acme = mgr.ensure('claude', 'work', 'org_acme');
+    const beta = mgr.ensure('claude', 'work', 'org_beta');
+
+    expect(personal).toBe(path.join(dir, 'claude-work'));
+    expect(new Set([personal, acme, beta]).size).toBe(3);
+    expect(mgr.list('org_acme').map((home) => home.path)).toEqual([acme]);
+    expect(mgr.list('org_beta').map((home) => home.path)).toEqual([beta]);
+    expect(mgr.list().map((home) => home.path)).toEqual([personal]);
+
+    mgr.removeOrganization('org_acme');
+    expect(fs.existsSync(acme)).toBe(false);
+    expect(fs.existsSync(beta)).toBe(true);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -133,6 +152,31 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('uses OpenCode auth selectors and preserves a device verification code', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login-oc-'));
+    const homes = new ConfigHomeManager(dir);
+    const home = homes.ensure('opencode', 'grok');
+    const method = 'xAI Grok OAuth (Headless / Remote / VPS)';
+    const spec = defaultLoginCommand('opencode', home, { modelProvider: 'xai', authMethod: method });
+    expect(spec?.args).toEqual(['auth', 'login', '--provider', 'xai', '--method', method]);
+    expect(spec?.env.XDG_DATA_HOME).toBe(path.join(home, 'data'));
+
+    const login = new LoginManager(homes, () => ({
+      cmd: 'bash',
+      args: ['-c', 'echo "Open https://x.ai/device on any device and enter code: ABCD-1234"; sleep 0.05'],
+      env: {} as Record<string, string>,
+    }));
+    const result = await login.connect('opencode', 'fresh', {
+      modelProvider: 'xai',
+      authMethod: method,
+      urlTimeoutMs: 2000,
+    });
+    expect(result.status).toBe('awaiting_oauth');
+    expect(result.loginUrl).toBe('https://x.ai/device');
+    expect(result.verificationCode).toBe('ABCD-1234');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('reports logged_in when a credentials file already exists (no relaunch)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-login2-'));
     const homes = new ConfigHomeManager(dir);
@@ -237,6 +281,68 @@ describe('remote access plan (SPEC §12)', () => {
   it('falls back to guidance when no tunnel tool is installed', async () => {
     const plan = await remoteAccessPlan(4173, { hasPassword: true, detect: async () => false });
     expect(plan.method).toBe('none');
+    expect(plan.guidance).not.toMatch(/cloudflared|ngrok|funnel/i);
+  });
+  it('reports a missing Tailscale executable as installable, not logged out', async () => {
+    const missing = Object.assign(new Error('spawn tailscale ENOENT'), { code: 'ENOENT', stdout: '', stderr: '' });
+    const controller = new RemoteAccessController({ port: () => 4173, run: async () => { throw missing; } });
+    expect(await controller.status()).toMatchObject({
+      method: 'none',
+      state: 'unavailable',
+      canEnable: false,
+    });
+  });
+  it('detects and enables the private Tailscale route without touching an existing Serve app', async () => {
+    let serve = 'No serve config';
+    const calls: string[][] = [];
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        calls.push(args);
+        if (args[0] === 'status') return { stdout: JSON.stringify({
+          BackendState: 'Running',
+          Self: { DNSName: 'laptop.example.ts.net.' },
+        }), stderr: '' };
+        if (args.join(' ') === 'serve status --json') return { stdout: serve, stderr: '' };
+        if (args[0] === 'serve' && args[1] === '--bg') {
+          serve = 'https://laptop.example.ts.net\n|-- / proxy http://127.0.0.1:4173';
+          return { stdout: 'Serve started', stderr: '' };
+        }
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+    });
+    expect(await controller.status()).toMatchObject({ state: 'available', canEnable: true });
+    expect(await controller.enable()).toMatchObject({
+      state: 'ready',
+      url: 'https://laptop.example.ts.net',
+      canDisable: true,
+    });
+    expect(calls).toContainEqual(['serve', '--bg', 'http://127.0.0.1:4173']);
+  });
+  it('refuses to overwrite another Tailscale Serve route', async () => {
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => args[0] === 'status'
+        ? { stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }), stderr: '' }
+        : { stdout: 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:9000', stderr: '' },
+    });
+    expect(await controller.enable()).toMatchObject({ state: 'conflict', canEnable: false, canDisable: false });
+  });
+  it('reports a hosted HTTPS installation as ready without invoking Tailscale', async () => {
+    const controller = new RemoteAccessController({
+      port: () => 4505,
+      hosted: true,
+      publicUrl: 'https://karmax.example.com',
+      run: async () => { throw new Error('must not run'); },
+    });
+    expect(await controller.status()).toEqual({
+      method: 'hosted',
+      state: 'ready',
+      url: 'https://karmax.example.com',
+      detail: 'This hosted installation already uses authenticated HTTPS.',
+      canEnable: false,
+      canDisable: false,
+    });
   });
 });
 

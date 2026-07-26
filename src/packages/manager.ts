@@ -7,9 +7,13 @@ import { ExternalWorkflowRef } from './bundle.js';
 import { WORKFLOW_TYPE, qualifiedType } from '../workflows/names.js';
 import { MANIFESTS, WorkflowManifest } from '../contrib/manifests.js';
 import { bundledStart, StartResolution } from '../platform/resolve-start.js';
+import { isolatedGitEnvironment } from '../world/git.js';
 
 /** One installed package, persisted so it can be reloaded at boot from disk. */
 interface InstalledRecord {
+  /** Missing only on registries written before organizations; those installs
+   * migrate to org_personal and retain their historical Temporal type. */
+  organizationId?: string;
   name: string;
   version: string;
   sha: string; // the exact commit — the version's true identity (§4.3)
@@ -37,14 +41,20 @@ export interface WorkflowSummary {
 export class WorkflowManager {
   private external = new Map<string, ExternalWorkflowRef>(); // type → bundle ref
   private shaByType = new Map<string, string>(); // type → the commit its code came from
+  private shaByPackage = new Map<string, string>(); // organization + manifest name/version → commit
+  private stores = new Map<string, PackageStore>();
 
   constructor(
     private worker: WorkerManager,
     private loader: WorkflowRepoLoader,
-    private store: PackageStore = PackageStore.withBundled(),
+    store: PackageStore = PackageStore.withBundled(),
     /** Directory for the persisted install registry; omit to disable persistence (tests). */
     private cacheHome?: string,
-  ) {}
+    /** Organization Git-profile credentials, resolved only for the install fetch. */
+    private gitEnvironment?: (organizationId: string) => Record<string, string>,
+  ) {
+    this.stores.set('org_personal', store);
+  }
 
   private get registryFile(): string | undefined {
     return this.cacheHome ? path.join(this.cacheHome, 'installed.json') : undefined;
@@ -70,16 +80,17 @@ export class WorkflowManager {
 
   /** The package store, for callers that resolve manifests directly. */
   get packages(): PackageStore {
-    return this.store;
+    return this.storeFor('org_personal');
   }
 
-  /** Every registered workflow (built-in + installed), with versions. */
-  list(): WorkflowSummary[] {
+  /** Every workflow available to one organization (built-ins + its installs). */
+  list(organizationId = 'org_personal'): WorkflowSummary[] {
+    const store = this.storeFor(organizationId);
     const bundled = new Set(MANIFESTS.map((m) => m.name));
-    const names = [...new Set(this.store.list().map((p) => p.name))].sort();
+    const names = [...new Set(store.list().map((p) => p.name))].sort();
     return names.map((name) => {
-      const latest = this.store.resolve(name)!;
-      return { name, description: latest.description, versions: this.store.versions(name), latest: latest.version, source: bundled.has(name) ? 'bundled' : 'external' };
+      const latest = store.resolve(name)!;
+      return { name, description: latest.description, versions: store.versions(name), latest: latest.version, source: bundled.has(name) ? 'bundled' : 'external' };
     });
   }
 
@@ -87,29 +98,34 @@ export class WorkflowManager {
    * Install (or add a version of) a workflow from a git repo, then roll the
    * worker to serve it. Refuses to shadow a built-in name.
    */
-  async install(spec: { url: string; ref?: string; name?: string }): Promise<{ name: string; version: string }> {
+  async install(spec: { url: string; ref?: string; name?: string }, organizationId = 'org_personal'): Promise<{ name: string; version: string }> {
     // Peek at the name to reject built-in collisions before doing the fetch when possible.
     if (spec.name && WORKFLOW_TYPE[spec.name]) throw new Error(`"${spec.name}" is a built-in workflow; edit it through the PR gate, not install`);
     // Load + validate WITHOUT registering yet — a rejected package must not touch state.
-    const pkg = await this.loader.load(spec);
+    const pkg = await this.loader.load(spec, undefined, organizationId, {
+      ...(organizationId === 'org_personal' ? {} : isolatedGitEnvironment()),
+      ...(this.gitEnvironment?.(organizationId) ?? {}),
+    });
     if (WORKFLOW_TYPE[pkg.manifest.name]) throw new Error(`"${pkg.manifest.name}" is a built-in workflow; edit it through the PR gate, not install`);
     if (!pkg.workflowEntry) throw new Error(`package "${pkg.manifest.name}" ships no workflow module (workflow.ts|js|mjs)`);
-    const type = qualifiedType(pkg.manifest.name, pkg.manifest.version);
+    const type = externalWorkflowType(organizationId, pkg.manifest.name, pkg.manifest.version);
     // Version identity is load-bearing: a task pinned to name@version replays that
     // version's code forever (§21b). Re-publishing the same version from a
     // different commit would swap code under in-flight executions, so refuse it —
     // an edit must bump the version (§4.3/§4.4). Re-installing the same commit is
     // an idempotent no-op.
-    const priorSha = this.shaByType.get(type);
+    const packageKey = `${organizationId}:${qualifiedType(pkg.manifest.name, pkg.manifest.version)}`;
+    const priorSha = this.shaByPackage.get(packageKey);
     if (priorSha && priorSha !== pkg.sha) {
       throw new Error(`${pkg.manifest.name}@${pkg.manifest.version} was already published from commit ${priorSha.slice(0, 8)}; bump the version to publish new code`);
     }
     if (priorSha === pkg.sha) return { name: pkg.manifest.name, version: pkg.manifest.version }; // no-op
-    this.store.register(pkg.manifest);
+    this.storeFor(organizationId).register(pkg.manifest);
     this.external.set(type, { type, entryFile: pkg.workflowEntry, exportName: manifestExport(pkg.manifest) });
     this.shaByType.set(type, pkg.sha);
+    this.shaByPackage.set(packageKey, pkg.sha);
     await this.worker.refresh([...this.external.values()]);
-    this.persist(pkg.manifest.name, pkg.manifest.version, pkg.sha, pkg.dir);
+    this.persist(organizationId, pkg.manifest.name, pkg.manifest.version, pkg.sha, pkg.dir);
     return { name: pkg.manifest.name, version: pkg.manifest.version };
   }
 
@@ -127,10 +143,18 @@ export class WorkflowManager {
         if (!fs.existsSync(r.dir)) throw new Error('snapshot missing');
         const { manifest, workflowEntry } = await this.loader.inspect(r.dir);
         if (!workflowEntry) throw new Error('no workflow module');
-        this.store.register(manifest);
-        const type = qualifiedType(manifest.name, manifest.version);
+        const organizationId = r.organizationId ?? 'org_personal';
+        this.storeFor(organizationId).register(manifest);
+        // Legacy personal installs already have running executions pinned to the
+        // old unqualified package type. Keep that export forever; new records are
+        // tenant-qualified so two organizations may install the same name/version
+        // from different commits without code or replay collisions.
+        const type = r.organizationId
+          ? externalWorkflowType(organizationId, manifest.name, manifest.version)
+          : qualifiedType(manifest.name, manifest.version);
         this.external.set(type, { type, entryFile: workflowEntry, exportName: manifestExport(manifest) });
         this.shaByType.set(type, r.sha);
+        this.shaByPackage.set(`${organizationId}:${qualifiedType(manifest.name, manifest.version)}`, r.sha);
         loaded++;
       } catch (e) {
         onWarn(`could not restore workflow ${r.name}@${r.version}: ${e instanceof Error ? e.message : String(e)}`);
@@ -140,9 +164,32 @@ export class WorkflowManager {
     return loaded;
   }
 
-  private persist(name: string, version: string, sha: string, dir: string): void {
-    const records = this.readRegistry().filter((r) => !(r.name === name && r.version === version));
-    records.push({ name, version, sha, dir });
+  /** Remove one tenant's selectable packages after all of its task executions
+   * have been terminated as part of organization deletion. */
+  async removeOrganization(organizationId: string): Promise<void> {
+    if (organizationId === 'org_personal') throw new Error('cannot remove personal organization workflows');
+    const records = this.readRegistry();
+    const removed = records.filter((record) => record.organizationId === organizationId);
+    for (const record of removed) {
+      const type = externalWorkflowType(organizationId, record.name, record.version);
+      this.external.delete(type);
+      this.shaByType.delete(type);
+      this.shaByPackage.delete(`${organizationId}:${qualifiedType(record.name, record.version)}`);
+    }
+    this.stores.delete(organizationId);
+    this.writeRegistry(records.filter((record) => record.organizationId !== organizationId));
+    if (removed.length) await this.worker.refresh([...this.external.values()]);
+    if (this.cacheHome) {
+      const safe = organizationId.replace(/[^a-z0-9_.-]/gi, '-');
+      fs.rmSync(path.join(this.cacheHome, 'organizations', safe), { recursive: true, force: true });
+    }
+  }
+
+  private persist(organizationId: string, name: string, version: string, sha: string, dir: string): void {
+    const records = this.readRegistry().filter((r) =>
+      !((r.organizationId ?? 'org_personal') === organizationId && r.name === name && r.version === version),
+    );
+    records.push({ organizationId, name, version, sha, dir });
     this.writeRegistry(records);
   }
 
@@ -151,23 +198,44 @@ export class WorkflowManager {
    * installed (§10.4/§21d) — so an installed workflow is pickable in the New Task
    * form, not just via the API. Coordinators are excluded (not user-startable).
    */
-  schemas(): { name: string; description: string; params: unknown; stages: unknown }[] {
-    return [...new Set(this.store.list().map((p) => p.name))]
-      .map((name) => this.store.resolve(name)!)
-      .filter((m) => m.kind !== 'coordinator')
+  schemas(organizationId = 'org_personal'): { name: string; description: string; params: unknown; stages: unknown }[] {
+    const store = this.storeFor(organizationId);
+    return [...new Set(store.list().map((p) => p.name))]
+      .map((name) => store.resolve(name)!)
+      .filter((m) => m.kind !== 'coordinator' && m.selectable !== false)
       .map((m) => ({ name: m.name, description: m.description, params: m.params, stages: m.stages }));
   }
 
   /** Resolve how to start `workflow` (built-in or installed) at an optional version. */
-  resolveStart(workflow: string, version?: string): StartResolution | undefined {
+  resolveStart(workflow: string, version?: string, organizationId = 'org_personal'): StartResolution | undefined {
     const builtIn = bundledStart(workflow, version);
     if (builtIn) return builtIn;
-    const m = this.store.resolve(workflow, version);
-    if (m && this.external.has(qualifiedType(workflow, m.version))) {
-      return { startType: qualifiedType(workflow, m.version), manifest: m };
+    const m = this.storeFor(organizationId).resolve(workflow, version);
+    const scopedType = m ? externalWorkflowType(organizationId, workflow, m.version) : undefined;
+    const legacyType = organizationId === 'org_personal' && m ? qualifiedType(workflow, m.version) : undefined;
+    const type = scopedType && this.external.has(scopedType)
+      ? scopedType
+      : legacyType && this.external.has(legacyType) ? legacyType : undefined;
+    if (m && type) {
+      return { startType: type, manifest: m };
     }
     return undefined;
   }
+
+  private storeFor(organizationId: string): PackageStore {
+    let store = this.stores.get(organizationId);
+    if (!store) {
+      store = PackageStore.withBundled();
+      this.stores.set(organizationId, store);
+    }
+    return store;
+  }
+}
+
+/** Internal Temporal workflow types are tenant-qualified. Human-facing manifest
+ * names stay unchanged within each organization. */
+export function externalWorkflowType(organizationId: string, name: string, version: string): string {
+  return `external:${organizationId}:${qualifiedType(name, version)}`;
 }
 
 /** The workflow module's export to use as the durable function (default when unset). */

@@ -39,7 +39,9 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
   let checked = 0;
   let settled = 0;
   for (const project of store.listProjects()) {
-    for (const t of store.listTasks(project.id)) {
+    // Reconciliation operates on Temporal executions, not logical list rows:
+    // every sibling attempt has its own workflow that must be settled.
+    for (const t of store.listTaskAttempts(project.id)) {
       if (t.params?.draft) continue; // drafts are intentionally not started
       if (t.params?.triggerState === 'armed') continue; // armed triggered tasks have no workflow yet
       if (t.params?.repeatable) continue; // a series never runs its own workflow — only its runs do

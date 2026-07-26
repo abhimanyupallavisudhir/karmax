@@ -17,11 +17,12 @@ import { KarmaxBus } from './contrib/bus.js';
 import { TokenAuthority } from './platform/tokens.js';
 import { CredentialBroker } from './autonomy/broker.js';
 import { Vault } from './autonomy/vault.js';
+import { GitProfiles } from './autonomy/git-profiles.js';
 import { KarmaxApi } from './platform/api.js';
 import { ContributionRegistry } from './contrib/registry.js';
 import { Overlays } from './store/overlays.js';
 import { Gateway } from './gateway/server.js';
-import { remoteAccessPlan } from './remote/access.js';
+import { RemoteAccessController, remoteAccessPlan } from './remote/access.js';
 import { withTimeout } from './util/timeout.js';
 import { registerAppInstance } from './util/instance.js';
 import { AuthorizationService } from './platform/authorization.js';
@@ -196,13 +197,14 @@ async function main() {
     payments,
     configHomes,
     resources,
+    contentDir: p.content,
     taskQueue: TASK_QUEUE,
   });
   await workerManager.start();
   console.log('  • Worker started');
 
-  // Process-tree custody (src/agent/custody.ts): reap any agent subprocess
-  // groups a prior incarnation left running after a SIGKILL/crash (systemd-oomd
+  // Process-tree custody (src/agent/custody.ts): reap any agent process scopes
+  // a prior incarnation left running after a SIGKILL/crash (systemd-oomd
   // was the July-5 OOM killer — no graceful teardown ran, so its orphaned
   // agents outlived the host). Only records whose owner process is dead are
   // orphans — agents owned by a live concurrent instance (see the duplicate-
@@ -211,10 +213,18 @@ async function main() {
   // very agent that booted it).
   const { reapOrphans } = await import('./agent/custody.js');
   const orphans = reapOrphans();
-  if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process group(s) from a prior run`);
+  if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process tree(s) from a prior run`);
   if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live karmax instance untouched`);
   const serviceOrphans = await sweepOrphanedServiceContainers((taskId) => store.worldState(taskId)).catch(() => 0);
   if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
+  // A concurrently running dogfooding instance can die after this app has
+  // already booted. Sweep periodically so its detached agent/tool descendants
+  // do not wait until the next host restart to be reaped.
+  const orphanSweep = setInterval(() => {
+    const swept = reapOrphans();
+    if (swept.reaped) console.log(`  • Reaped ${swept.reaped} newly orphaned agent process tree(s)`);
+  }, 10_000);
+  orphanSweep.unref();
 
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
@@ -229,17 +239,38 @@ async function main() {
   // so the coordinator can lease/track any of them (SPEC §6.2/§7).
   const { gatherCredentialSources, concurrencyFor } = await import('./platform/credential-sources.js');
   const { enumerateCredentials } = await import('./platform/credentials.js');
-  const creds = enumerateCredentials(gatherCredentialSources({ configHomes, broker }));
+  const creds = store.listOrganizations().flatMap((organization) =>
+    enumerateCredentials(gatherCredentialSources({ configHomes, broker, organizationId: organization.id })),
+  );
   const pool = creds.map((c) => {
     const maxConcurrent = concurrencyFor((k) => store.kvGet(k), c.key);
-    return { id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}), ...(maxConcurrent != null ? { maxConcurrent } : {}) };
+    const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
+    return {
+      id: c.key,
+      configHome: c.configHome ?? '',
+      provider: c.provider,
+      kind: c.kind,
+      ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}),
+      ...(credentialProvider ? { credentialProvider } : {}),
+      ...(maxConcurrent != null ? { maxConcurrent } : {}),
+    };
   });
   if (pool.length) {
     await coordClient.registerAccounts(pool).catch((e) => console.warn('  • credential pool register failed', String(e)));
     console.log(`  • Registered ${pool.length} credential(s) into the account pool`);
   }
 
-  const workflows = new WorkflowManager(workerManager, new WorkflowRepoLoader(p.workflows), undefined, p.workflows);
+  const workflows = new WorkflowManager(
+    workerManager,
+    new WorkflowRepoLoader(p.workflows),
+    undefined,
+    p.workflows,
+    (organizationId) => {
+      const profiles = new GitProfiles(store, broker, p.state, organizationId);
+      const profile = profiles.resolve(undefined);
+      return profile ? profiles.env(profile, {}) : {};
+    },
+  );
   // Reload workflows installed in previous sessions (SPEC §4.2) and roll the
   // worker once so their tasks — new and in-flight — can run after a restart.
   const restored = await workflows.restore((m) => console.warn('  •', m)).catch(() => 0);
@@ -265,6 +296,31 @@ async function main() {
   worldLifecycle.start();
   delivery.start();
 
+  // Agent-mail poll loop (PLAN-passwords.md §8): when a PULL provider (IMAP /
+  // AgentMail) is connected, karmax reaches OUT to fetch mail — so it works on a
+  // locally-hosted install with no public URL. Inert until a pull provider is set.
+  const { MailPoller } = await import('./autonomy/mail-pull.js');
+  const { AgentMail } = await import('./autonomy/agent-mail.js');
+  const readMailboxConfig = (organizationId: string) => {
+    try { return JSON.parse(store.kvGet(`agent-mail:provider:${organizationId}`) ?? '{}'); }
+    catch { return {}; }
+  };
+  const mailPoller = new MailPoller({
+    store,
+    readConfigs: () => store.listOrganizations().map(({ id: organizationId }) => ({
+      organizationId,
+      config: readMailboxConfig(organizationId),
+    })),
+    resolveSecret: (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
+    makeIngest: (_organizationId, config) => {
+      const domain = config.domain || config.hostedDomain || config.agentmailDomain || config.fixedAddress?.split('@')[1];
+      const fixedLocal = config.fixedAddress?.split('@')[0];
+      const mail = new AgentMail(store, domain, fixedLocal, config.agentmailAddress);
+      return (msg) => mail.ingest(msg);
+    },
+  });
+  mailPoller.start();
+
   // Self-healing loop (SPEC §4.4): when a workflow-edit PR merges (its merge-only
   // task reaches done), reload the edited workflow from its repo so new tasks pick
   // up the published version. Runs in this process (not inside a workflow), so
@@ -275,9 +331,11 @@ async function main() {
     if (ev.type !== 'view.updated' || (ev.payload as { status?: string })?.status !== 'done' || healed.has(ev.taskId)) return;
     const spec = reloadSpecForWorkflowEdit(store.getTask(ev.taskId) ?? {}, 'done');
     if (!spec) return;
+    const task = store.getTask(ev.taskId);
+    const organizationId = task ? store.getProject(task.projectId)?.organizationId : undefined;
     healed.add(ev.taskId);
     workflows
-      .install(spec)
+      .install(spec, organizationId ?? 'org_personal')
       .then((r) => console.log(`  • Self-healed: reloaded ${r.name}@${r.version} after a workflow edit`))
       .catch((e) => console.warn(`  • Workflow reload after edit failed: ${e instanceof Error ? e.message : e}`));
   });
@@ -299,6 +357,12 @@ async function main() {
   }
 
   const staticDir = fileURLToPath(new URL('../web', import.meta.url));
+  let gatewayPort = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : 4505;
+  const remoteAccess = new RemoteAccessController({
+    port: () => gatewayPort,
+    hosted: deployment.hosted,
+    publicUrl,
+  });
   const gateway = new Gateway({
     api,
     store,
@@ -322,6 +386,7 @@ async function main() {
     worlds,
     githubApp,
     providerConnections,
+    workflows,
     handoffs,
     runners,
     worldAccess,
@@ -329,9 +394,11 @@ async function main() {
     resources,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
+    remoteAccess,
   });
   const preferred = process.env.KARMAX_PORT ? Number(process.env.KARMAX_PORT) : undefined;
   const { url, internalUrl, port, close: closeGateway } = await gateway.listen(preferred);
+  gatewayPort = port;
   // Activities read this lazily when an agent invokes the complete platform API.
   // Keep service-to-service agent/MCP traffic on the control plane's loopback,
   // even when browsers use a public TLS URL through a reverse proxy.
@@ -345,8 +412,10 @@ async function main() {
   console.log(`\n  ✓ karmax is running:  ${url}\n`);
   if (!identity.hasUsers()) console.log('  (first run — create the initial administrator in the browser)');
   try {
-    const remote = await remoteAccessPlan(port, { hasPassword: true });
-    console.log(`\n  Remote access (${remote.method}):\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
+    if (!deployment.hosted) {
+      const remote = await remoteAccessPlan(port, { hasPassword: true });
+      console.log(`\n  ${remote.guidance.replace(/\n/g, '\n  ')}\n`);
+    }
   } catch {
     /* ignore */
   }
@@ -364,8 +433,10 @@ async function main() {
     // worker itself resolves within ~3s (shutdownGraceTime/shutdownForceTime).
     const step = (p: Promise<unknown>) => withTimeout(Promise.resolve(p), 3500).catch(() => {});
     serverWatch.stop(); // don't respawn Temporal out from under a shutdown
+    clearInterval(orphanSweep);
     instance.release(); // drop our live-instance pidfile
     triggerScheduler.stop();
+    mailPoller.stop();
     worldLifecycle.stop();
     delivery.stop();
     await step(closeGateway());

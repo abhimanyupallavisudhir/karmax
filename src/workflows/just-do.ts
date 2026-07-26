@@ -27,6 +27,8 @@ const turns = proxyActivities<coreActivities>({
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
 export const followUpSignal = defineSignal<[Message]>('followUp');
+export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
+export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const viewQuery = defineQuery<TaskView>('view');
@@ -42,12 +44,21 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, true);
 }
 
+/** Durable non-blocking host admission. */
+export async function justDoV1_2(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, true, true);
+}
+
 /** Immutable replay entry for executions pinned to justDo@1.0.0. */
 export async function justDoV1(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, false);
 }
 
-async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ stage: Stage }> {
+async function justDoImpl(
+  input: TaskInput,
+  managedTurns: boolean,
+  durableAdmission = false,
+): Promise<{ stage: Stage }> {
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -62,6 +73,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
   let waitingFor: TaskView['waitingFor'];
   let agentTurn: TaskView['agentTurn'];
   let seen = 0;
+  const pendingCollaborations = new Set<string>();
   const base = input.base ?? input.project.defaultBase ?? 'main';
   // Who confirms at the Review gate (SPEC §5.2): the ordered confirm layers, played
   // sequentially — every layer must approve; [] ⇒ auto-confirm. Legacy {mode} shapes
@@ -81,7 +93,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     return {
       taskId, title: input.title, workflow: 'just-do', stage, status, messages: msgs, reviewInfo,
       actions: actions(), state: { worldReady: !!world }, branch: world?.branch, base,
-      world, worldPath: world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
+      world, worldPath: world?.workdir ?? world?.root, parentTaskId: input.parentTaskId, waitingFor, agentTurn, updatedAt: workflowInfo().historyLength,
     };
   }
   const publish = async () => core.publishView(taskId, view());
@@ -90,13 +102,14 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
         taskId,
         projectId: input.projectId,
         task: () => input,
+        world: () => world,
         status: () => status,
         setStatus: (next) => { status = next; },
         setWaitingFor: (next) => { waitingFor = next; },
         setAgentTurn: (next) => { agentTurn = next; },
         cancelled: () => cancelled,
         publish,
-      })
+      }, durableAdmission)
     : undefined;
 
   /** Run one Confirm-agent turn (SPEC §5.2): review the work, return a verdict, or
@@ -109,7 +122,15 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
       const task = layerSpec.provider ? { ...input, agents: { ...(input.agents ?? {}), confirm: { ...layerSpec, provider: layerSpec.provider } } } : input;
       // A fresh turn each Review so the reviewer judges the current work (up-to-date
       // system prompt); a mid-turn retry still resumes via runAgentTurn heartbeat details.
-      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+      const invoke = (lease?: {
+        accountConfigHome?: string;
+        accountApiKeyHandle?: string;
+        accountCredentialKind?: 'login' | 'ambient' | 'key';
+        accountCredentialProvider?: string;
+        agentTurnId: string;
+        agentAdmissionManaged?: true;
+        agentSlotGranted?: true;
+      }) =>
         turns.runAgentTurn({
           taskId,
           role: 'confirm',
@@ -134,7 +155,16 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
   setHandler(viewQuery, view);
   setHandler(pendingMessagesQuery, (_role, fromIndex) => msgs.slice(Math.max(0, fromIndex)));
   setHandler(followUpSignal, (m) => {
-    msgs.push({ ...m, ts: m.ts || msgs.length });
+    if (!msgs.some((candidate) => candidate.id === m.id))
+      msgs.push({ ...m, ts: m.ts || msgs.length });
+  });
+  setHandler(collaborationRequestedSignal, (requestId) => {
+    pendingCollaborations.add(requestId);
+  });
+  setHandler(collaborationSettledSignal, (requestId, message) => {
+    pendingCollaborations.delete(requestId);
+    if (!msgs.some((candidate) => candidate.id === message.id))
+      msgs.push({ ...message, ts: message.ts || msgs.length });
   });
   setHandler(confirmSignal, () => {
     confirmed = true;
@@ -162,7 +192,15 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     try {
       // On resume the session already holds the first `seen` messages, so send only
       // the delta after them (a follow-up), not the whole conversation again.
-      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+      const invoke = (lease?: {
+        accountConfigHome?: string;
+        accountApiKeyHandle?: string;
+        accountCredentialKind?: 'login' | 'ambient' | 'key';
+        accountCredentialProvider?: string;
+        agentTurnId: string;
+        agentAdmissionManaged?: true;
+        agentSlotGranted?: true;
+      }) =>
         turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input, ...(lease ? lease : {}) });
       turn = leaser ? await leaser.run('do', invoke) : await invoke();
     } catch (err) {
@@ -181,6 +219,20 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     // turn's last poll stay after `seen` → delivered on the next turn.
     seen = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
     if (turn.reviewInfo) reviewInfo = turn.reviewInfo;
+    if (pendingCollaborations.size > 0) {
+      status = 'waiting';
+      waitingFor = {
+        kind: 'collaboration',
+        detail: `Waiting for ${pendingCollaborations.size} background collaboration request(s)`,
+      };
+      await publish();
+      await condition(() => cancelled || pendingCollaborations.size === 0 || msgs.length > seen);
+      if (cancelled) break;
+      status = 'active';
+      waitingFor = undefined;
+      continue;
+    }
+    if (msgs.length > seen) continue;
     stage = 'review';
     status = 'waiting';
     // Play the confirm layers in order (SPEC §5.2): every layer must approve; a

@@ -43,6 +43,12 @@ async function makeRepo(name: string): Promise<string> {
 }
 
 describe('GitProfiles registry (PLAN-git-config §3)', () => {
+  it('assigns the legacy flat registry only to org_personal', () => {
+    kv.set('git:profiles', JSON.stringify([{ name: 'legacy', userName: 'Old', userEmail: 'old@example.test' }]));
+    expect(profiles.get('legacy')?.userName).toBe('Old');
+    expect(new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_other').list()).toEqual([]);
+  });
+
   it('saves, lists, defaults and deletes profiles; secrets live in the vault as flags', () => {
     profiles.save({ name: 'personal', userName: 'Jane', userEmail: 'jane@example.com', githubToken: 'ghp_secret' });
     profiles.save({ name: 'work', userName: 'Jane W', userEmail: 'jane@corp.com' });
@@ -72,6 +78,25 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     expect(profiles.env(profiles.get('p')!, {}).GH_TOKEN).toBe('tok-1');
     profiles.save({ name: 'p', userName: 'J2', userEmail: 'j2@x.com', githubToken: 'tok-2' });
     expect(profiles.env(profiles.get('p')!, {}).GH_TOKEN).toBe('tok-2');
+  });
+
+  it('isolates same-named profiles and vault handles between organizations', async () => {
+    const acme = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_acme');
+    const beta = new GitProfiles(store, broker, path.join(tmp, 'state'), 'org_beta');
+    acme.save({ name: 'work', userName: 'Acme Bot', userEmail: 'bot@acme.test', githubToken: 'acme-token' });
+    beta.save({ name: 'work', userName: 'Beta Bot', userEmail: 'bot@beta.test', githubToken: 'beta-token' });
+    acme.setDefault('work');
+
+    expect(acme.resolve({})?.userEmail).toBe('bot@acme.test');
+    expect(beta.resolve({})).toBeUndefined();
+    expect(acme.env(acme.get('work')!, {}).GH_TOKEN).toBe('acme-token');
+    expect(beta.env(beta.get('work')!, {}).GH_TOKEN).toBe('beta-token');
+    expect(gitHandle('work', 'token', 'org_acme')).not.toBe(gitHandle('work', 'token', 'org_beta'));
+
+    acme.delete('work');
+    expect(beta.get('work')?.userEmail).toBe('bot@beta.test');
+    expect(broker.hasHandle(gitHandle('work', 'token', 'org_beta'))).toBe(true);
+    expect((await acme.preflight({})).tier).toBe('unconfigured');
   });
 
   it('env(): ssh key materialized 0600 with GIT_SSH_COMMAND; token → GH_TOKEN + askpass', () => {
@@ -237,6 +262,78 @@ describe('remote policy (PLAN-git-config §5)', () => {
       const merged = await core.finalizeMergeActivity(handle, 'main');
       expect(merged.merged).toBe(true);
       expect((await git(repo, ['log', '-1', '--format=%an <%ae>', 'main'])).stdout.trim()).toBe('Jane <jane@example.com>');
+      await core.destroyWorld(handle);
+    } finally {
+      delete process.env.KARMAX_HOME;
+    }
+  });
+
+  it('fails closed on personal credentials and host Git identity for another organization', async () => {
+    process.env.KARMAX_HOME = path.join(tmp, 'tenant-home');
+    try {
+      const repo = await makeRepo('tenant-repo');
+      const { Store } = await import('../src/store/db.js');
+      const { WorldRegistry } = await import('../src/world/registry.js');
+      const { ProfileResolver } = await import('../src/agent/profiles.js');
+      const { makeCoreActivities } = await import('../src/activities/core.js');
+      const store2 = new Store(':memory:');
+      const organization = store2.createOrganization({ name: 'Acme' });
+      const project = store2.createProject('Acme project', {}, organization.id);
+      broker.registerHandle('claude:personal-key', 'must-not-leak');
+      const worlds = new WorldRegistry();
+      worlds.register(new WorktreeProvider(path.join(tmp, 'tenant-worlds')));
+      const core = makeCoreActivities({
+        store: store2,
+        worlds,
+        adapters: new Map(),
+        profiles: new ProfileResolver(store2, 'claude'),
+        broker,
+      });
+
+      const order = await core.resolveCredentialOrder({
+        taskId: 'tenant-task',
+        projectId: project.id,
+        provider: 'claude',
+      });
+      expect(order).toEqual([`missing:${organization.id}:claude`]);
+      expect(order).not.toContain('key:handle:claude:personal-key');
+
+      const organizationHandle = `claude:${organization.id}:work`;
+      broker.registerHandle(organizationHandle, 'tenant-key');
+      store2.upsertProfile({
+        id: 'do-default',
+        name: 'Do',
+        role: 'do',
+        provider: 'claude',
+        capabilities: [],
+        // A historical profile restriction is ignored; the scoped Credentials
+        // policy is the only routing authority.
+        allowedAccounts: ['key:claude:personal-key'],
+      });
+      expect(await core.resolveCredentialOrder({
+        taskId: 'tenant-task',
+        projectId: project.id,
+        provider: 'claude',
+        role: 'do',
+        task: { projectId: project.id } as any,
+      })).toEqual([`key:handle:${organizationHandle}`]);
+
+      const handle = await core.createWorld({
+        taskId: 'tenant-task',
+        projectId: project.id,
+        repo,
+        base: 'main',
+        target: 'main',
+        kind: 'worktree',
+      });
+      const world = await worlds.open(handle);
+      const cwd = handle.workdir ?? handle.root;
+      await world.writeFile(path.relative(handle.root, path.join(cwd, 'tenant.txt')), 'isolated');
+      await git(cwd, ['add', '-A']);
+      const committed = await git(cwd, ['commit', '-q', '-m', 'tenant']);
+      expect(committed.code, committed.stderr).toBe(0);
+      expect((await git(cwd, ['log', '-1', '--format=%an <%ae>'])).stdout.trim())
+        .toBe(`karmax <karmax+${organization.id.replace(/[^a-z0-9.-]/gi, '-')}@localhost>`);
       await core.destroyWorld(handle);
     } finally {
       delete process.env.KARMAX_HOME;

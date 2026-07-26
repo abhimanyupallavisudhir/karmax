@@ -52,6 +52,23 @@ import {
 import { resourceDriver } from '../domain/resource-drivers.js';
 import { newId } from '../util/id.js';
 
+export type CollaborationRequestStatus = 'pending' | 'completed' | 'failed';
+
+export interface CollaborationRequest {
+  id: string;
+  requesterTaskId: string;
+  targetTaskId: string;
+  targetRole: string;
+  action: 'publish_branch';
+  status: CollaborationRequestStatus;
+  afterSeq: number;
+  createdAt: number;
+  updatedAt: number;
+  settledAt?: number;
+  result?: Record<string, unknown>;
+  notifiedAt?: number;
+}
+
 /**
  * Terminal statuses that auto-archive a task when it first reaches one (see
  * `Store.saveView`). Only fully-resolved outcomes — a failed task stays visible
@@ -220,6 +237,16 @@ export class Store {
         targetBranch TEXT, ord INTEGER NOT NULL,
         PRIMARY KEY (projectId, repositoryId)
       );
+      CREATE TABLE IF NOT EXISTS project_wikis (
+        projectId TEXT PRIMARY KEY, repositoryId TEXT, createdAt INTEGER NOT NULL,
+        updatedAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS organization_wiki_versions (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, path TEXT NOT NULL,
+        version INTEGER NOT NULL, operation TEXT NOT NULL, kind TEXT,
+        content TEXT, principal TEXT, previousPath TEXT, createdAt INTEGER NOT NULL,
+        UNIQUE (organizationId, path, version)
+      );
       CREATE TABLE IF NOT EXISTS repository_deploy_keys (
         repositoryId TEXT PRIMARY KEY, cloneKeyId TEXT NOT NULL, writeKeyId TEXT NOT NULL,
         cloneHandle TEXT NOT NULL, writeHandle TEXT NOT NULL, createdAt INTEGER NOT NULL
@@ -352,6 +379,16 @@ export class Store {
         seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL,
         type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS collaboration_requests (
+        id TEXT PRIMARY KEY, requesterTaskId TEXT NOT NULL, targetTaskId TEXT NOT NULL,
+        targetRole TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL,
+        afterSeq INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        settledAt INTEGER, result TEXT, notifiedAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_collaboration_requests_target_status
+        ON collaboration_requests(targetTaskId, status);
+      CREATE INDEX IF NOT EXISTS idx_collaboration_requests_requester_status
+        ON collaboration_requests(requesterTaskId, status);
       CREATE TABLE IF NOT EXISTS kv (
         k TEXT PRIMARY KEY, v TEXT NOT NULL
       );
@@ -366,7 +403,7 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS tags (
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
-        parentId TEXT, color TEXT, kind TEXT, createdAt INTEGER NOT NULL
+        parentId TEXT, color TEXT, kind TEXT, description TEXT, createdAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS task_tags (
         taskId TEXT NOT NULL, tagId TEXT NOT NULL, PRIMARY KEY (taskId, tagId)
@@ -435,17 +472,27 @@ export class Store {
     if (!invitationCols.some((c) => c.name === 'profileId')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN profileId TEXT');
     const previewCols = this.db.prepare('PRAGMA table_info(preview_leases)').all() as any[];
     if (!previewCols.some((c) => c.name === 'hostname')) this.db.exec('ALTER TABLE preview_leases ADD COLUMN hostname TEXT');
+    const wikiVersionCols = this.db.prepare('PRAGMA table_info(organization_wiki_versions)').all() as any[];
+    if (!wikiVersionCols.some((c) => c.name === 'previousPath'))
+      this.db.exec('ALTER TABLE organization_wiki_versions ADD COLUMN previousPath TEXT');
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_preview_hostname ON preview_leases(hostname) WHERE hostname IS NOT NULL');
     if (!projectCols.some((c) => c.name === 'organizationId')) this.db.exec('ALTER TABLE projects ADD COLUMN organizationId TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(organizationId)');
     if (!cols.some((c) => c.name === 'intentId')) this.db.exec('ALTER TABLE tasks ADD COLUMN intentId TEXT');
     if (!cols.some((c) => c.name === 'attemptNumber')) this.db.exec('ALTER TABLE tasks ADD COLUMN attemptNumber INTEGER');
-    // Existing rows become single-attempt intents. This is deliberately idempotent.
+    // Legacy rows become single-attempt intents. Alternate attempts already point
+    // at their root intent and must never acquire an intent row of their own:
+    // doing so makes the alternate look like a second top-level task after boot.
     this.db.exec(`
       UPDATE tasks SET intentId = id WHERE intentId IS NULL;
       UPDATE tasks SET attemptNumber = 1 WHERE attemptNumber IS NULL;
       INSERT OR IGNORE INTO task_intents (id, principalAttemptId, createdAt)
-        SELECT id, id, createdAt FROM tasks;
+        SELECT id, id, createdAt FROM tasks WHERE id = intentId;
+      DELETE FROM task_intents
+        WHERE EXISTS (
+          SELECT 1 FROM tasks
+          WHERE tasks.id = task_intents.id AND tasks.intentId <> task_intents.id
+        );
       CREATE INDEX IF NOT EXISTS idx_tasks_intent ON tasks(intentId, attemptNumber);
     `);
     if (!cols.some((c) => c.name === 'notes')) {
@@ -455,6 +502,8 @@ export class Store {
     if (!cols.some((c) => c.name === 'assignee')) this.db.exec('ALTER TABLE tasks ADD COLUMN assignee TEXT');
     if (!cols.some((c) => c.name === 'delegate')) this.db.exec('ALTER TABLE tasks ADD COLUMN delegate TEXT');
     if (!cols.some((c) => c.name === 'confirmationPolicy')) this.db.exec('ALTER TABLE tasks ADD COLUMN confirmationPolicy TEXT');
+    const tagCols = this.db.prepare('PRAGMA table_info(tags)').all() as { name: string }[];
+    if (!tagCols.some((c) => c.name === 'description')) this.db.exec('ALTER TABLE tags ADD COLUMN description TEXT');
 
     // Existing installs become one personal organization. The fixed id makes the
     // migration idempotent and gives bootstrapping code a stable tenant to claim.
@@ -468,8 +517,15 @@ export class Store {
     this.db.exec("UPDATE organization_invitations SET role='member' WHERE role='billing'");
     this.db.exec("UPDATE team_memberships SET role='member' WHERE role='lead'");
     this.db.exec("UPDATE projects SET organizationId = 'org_personal' WHERE organizationId IS NULL");
+    // A software-dev@1.3 execution can switch its user-facing mode to Goal (and
+    // back) without replacing the Temporal workflow. Keep the actual execution
+    // definition separately so replay/version-retirement accounting stays true.
+    if (!cols.some((c) => c.name === 'executionWorkflow')) {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN executionWorkflow TEXT');
+      this.db.exec('UPDATE tasks SET executionWorkflow = workflow WHERE executionWorkflow IS NULL');
+    }
     // Simple human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
-    // project's tasks run #1, #2, … A separate integer alongside the opaque `id`
+    // project's queued tasks run #1, #2, … A separate integer alongside the opaque `id`
     // (which stays the Temporal workflowId and must never change). The per-project
     // unique index doubles as the migration marker: if it isn't present yet, we
     // (re)assign numbers per project in creation order — this both backfills fresh
@@ -483,9 +539,14 @@ export class Store {
       const projects = this.db.prepare('SELECT DISTINCT projectId FROM tasks').all() as any[];
       const upd = this.db.prepare('UPDATE tasks SET num = ? WHERE id = ?');
       for (const { projectId } of projects) {
-        // Creation order within the project (createdAt, rowid as a stable tiebreak).
+        // Queue time was not recorded by old schemas, so preserve creation order
+        // for work that had started and leave never-queued drafts unnumbered.
         const rows = this.db
-          .prepare('SELECT id FROM tasks WHERE projectId = ? ORDER BY createdAt, rowid')
+          .prepare(`SELECT root.id FROM tasks root
+            WHERE root.projectId = ? AND root.id = root.intentId
+              AND EXISTS (SELECT 1 FROM tasks attempt WHERE attempt.intentId = root.intentId
+                AND COALESCE(json_extract(attempt.params, '$.draft'), 0) = 0)
+            ORDER BY root.createdAt, root.rowid`)
           .all(projectId) as any[];
         let n = 0;
         for (const r of rows) upd.run(++n, r.id);
@@ -494,9 +555,7 @@ export class Store {
     }
   }
 
-  /** Next task number within a project: MAX(num)+1 scoped to that project. node:sqlite
-   *  is synchronous and single-threaded, so read-then-write within one createTask
-   *  call cannot race. */
+  /** Next task number within a project: MAX(num)+1 scoped to that project. */
   private nextTaskNum(projectId: string): number {
     return (
       (this.db.prepare('SELECT COALESCE(MAX(num), 0) AS m FROM tasks WHERE projectId = ?').get(projectId) as any)
@@ -508,6 +567,7 @@ export class Store {
 
   createProject(name: string, config: ProjectConfig = {}, organizationId = 'org_personal'): Project {
     if (!this.getOrganization(organizationId)) throw new Error(`no organization ${organizationId}`);
+    assertRoutableName('project', name);
     validateProjectExecutionConfig(config);
     const p: Project = { id: newId('proj'), organizationId, name, createdAt: Date.now(), config };
     this.db
@@ -666,6 +726,8 @@ export class Store {
       deleteRows(this.db, 'task_confirmation', 'taskId', taskIds);
       deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds);
       deleteRows(this.db, 'task_tags', 'taskId', taskIds);
+      deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
+      deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
       deleteRows(this.db, 'events', 'taskId', taskIds);
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
@@ -687,7 +749,7 @@ export class Store {
       deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds);
       this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id);
       this.deleteProjectKv([id], taskIds);
-      for (const table of ['project_memberships', 'project_repositories', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
+      for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id);
       deleteRows(this.db, 'teams', 'id', teamIds);
       deleteRows(this.db, 'tasks', 'id', taskIds);
@@ -702,6 +764,7 @@ export class Store {
   // ─── Organizations, teams, and repository catalogue ───────────────────
 
   createOrganization(input: { name: string; slug?: string; kind?: Organization['kind']; ownerUserId?: string }): Organization {
+    assertRoutableName('organization', input.name, input.slug);
     const slug = uniqueSlug(input.slug ?? input.name, (candidate) => !!this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate));
     const organization: Organization = {
       id: newId('org'), name: input.name.trim() || 'Untitled organization', slug,
@@ -766,6 +829,12 @@ export class Store {
       task_subscribers: rowsFor(this.db, 'task_subscribers', 'taskId', taskIds),
       task_confirmation: rowsFor(this.db, 'task_confirmation', 'taskId', taskIds),
       confirmation_votes: rowsFor(this.db, 'confirmation_votes', 'taskId', taskIds),
+      collaboration_requests: [
+        ...new Map([
+          ...rowsFor(this.db, 'collaboration_requests', 'requesterTaskId', taskIds),
+          ...rowsFor(this.db, 'collaboration_requests', 'targetTaskId', taskIds),
+        ].map((row) => [String(row.id), row])).values(),
+      ],
       events: rowsFor(this.db, 'events', 'taskId', taskIds),
       tags: rowsFor(this.db, 'tags', 'projectId', projectIds),
       task_tags: rowsFor(this.db, 'task_tags', 'taskId', taskIds),
@@ -773,6 +842,8 @@ export class Store {
       git_connections: selectRows(this.db, 'git_connections', 'organizationId=?', [organizationId]),
       repositories: rowsFor(this.db, 'repositories', 'id', repositoryIds),
       project_repositories: rowsFor(this.db, 'project_repositories', 'projectId', projectIds),
+      project_wikis: rowsFor(this.db, 'project_wikis', 'projectId', projectIds),
+      organization_wiki_versions: selectRows(this.db, 'organization_wiki_versions', 'organizationId=?', [organizationId]),
       // Public key IDs make external cleanup auditable; credential-broker handles
       // and private material never belong in an export.
       repository_deploy_keys: rowsFor(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds)
@@ -876,6 +947,8 @@ export class Store {
       deleteRows(this.db, 'task_confirmation', 'taskId', taskIds);
       deleteRows(this.db, 'confirmation_votes', 'taskId', taskIds);
       deleteRows(this.db, 'task_tags', 'taskId', taskIds);
+      deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds);
+      deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds);
       deleteRows(this.db, 'events', 'taskId', taskIds);
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
@@ -886,7 +959,7 @@ export class Store {
       deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'attachment_scopes', 'projectId', projectIds);
       this.deleteProjectKv(projectIds, taskIds);
-      for (const table of ['project_memberships', 'project_repositories', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
+      for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         deleteRows(this.db, table, 'projectId', projectIds);
       this.db.prepare('DELETE FROM preview_leases WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId);
@@ -900,9 +973,15 @@ export class Store {
       this.db.prepare('DELETE FROM organization_identity_policy WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_invitations WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM organization_wiki_versions WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM git_connections WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM github_install_states WHERE organizationId=?').run(organizationId);
       this.db.prepare('DELETE FROM kv WHERE k=?').run(`organization-execution:${organizationId}`);
+      this.db.prepare('DELETE FROM kv WHERE k IN (?, ?, ?)').run(
+        `credpolicy:organization:${organizationId}`,
+        `git:profiles:${organizationId}`,
+        `git:default-profile:${organizationId}`,
+      );
       deleteRows(this.db, 'repositories', 'id', repositoryIds);
       deleteRows(this.db, 'teams', 'id', teamIds);
       deleteRows(this.db, 'tasks', 'id', taskIds);
@@ -1316,6 +1395,7 @@ export class Store {
     const projects = (this.db.prepare('SELECT DISTINCT projectId FROM project_repositories WHERE repositoryId=?').all(id) as any[])
       .map((r) => String(r.projectId));
     this.db.prepare('DELETE FROM project_repositories WHERE repositoryId=?').run(id);
+    this.db.prepare('UPDATE project_wikis SET repositoryId=NULL, updatedAt=? WHERE repositoryId=?').run(Date.now(), id);
     this.db.prepare('DELETE FROM repository_deploy_keys WHERE repositoryId=?').run(id);
     this.db.prepare('DELETE FROM repositories WHERE id=?').run(id);
     for (const projectId of projects) this.syncProjectRepositoryConfig(projectId);
@@ -1399,6 +1479,85 @@ export class Store {
         targetBranch: r.prTargetBranch ?? undefined, order: r.prOrd, repository: rowToRepository(r) }));
   }
 
+  projectWiki(projectId: string): { projectId: string; repository?: Repository; createdAt: number; updatedAt: number } | undefined {
+    const row = this.db.prepare('SELECT * FROM project_wikis WHERE projectId=?').get(projectId) as any;
+    if (!row) return undefined;
+    return {
+      projectId,
+      repository: row.repositoryId ? this.getRepository(String(row.repositoryId)) : undefined,
+      createdAt: Number(row.createdAt),
+      updatedAt: Number(row.updatedAt),
+    };
+  }
+
+  repositoryIsProjectWiki(repositoryId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM project_wikis WHERE repositoryId=? LIMIT 1').get(repositoryId);
+  }
+
+  setProjectWikiRepository(projectId: string, repositoryId?: string): void {
+    if (!this.getProject(projectId)) throw new Error(`no project ${projectId}`);
+    if (repositoryId && !this.getRepository(repositoryId)) throw new Error(`no repository ${repositoryId}`);
+    const now = Date.now();
+    this.db.prepare(`INSERT INTO project_wikis (projectId, repositoryId, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?) ON CONFLICT(projectId) DO UPDATE SET
+      repositoryId=excluded.repositoryId, updatedAt=excluded.updatedAt`)
+      .run(projectId, repositoryId ?? null, now, now);
+  }
+
+  recordOrganizationWikiVersion(input: {
+    organizationId: string;
+    path: string;
+    operation: 'baseline' | 'write' | 'delete' | 'move';
+    kind?: 'skill' | 'memory';
+    content?: string;
+    principal?: string;
+    previousPath?: string;
+    /** Insert only when this path has no recorded history. Used to snapshot
+     * pre-versioning content immediately before its first mutation. */
+    ifEmpty?: boolean;
+  }): boolean {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (input.ifEmpty && this.db.prepare(`SELECT 1 FROM organization_wiki_versions
+          WHERE organizationId=? AND path=? LIMIT 1`).get(input.organizationId, input.path)) {
+        this.db.exec('COMMIT');
+        return false;
+      }
+      const version = Number((this.db.prepare(`SELECT COALESCE(MAX(version), 0) + 1 n
+        FROM organization_wiki_versions WHERE organizationId=? AND path=?`)
+        .get(input.organizationId, input.path) as any).n);
+      this.db.prepare(`INSERT INTO organization_wiki_versions
+        (id, organizationId, path, version, operation, kind, content, principal, previousPath, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(newId('wikiver'), input.organizationId, input.path, version, input.operation,
+          input.kind ?? null, input.content ?? null, input.principal ?? null,
+          input.previousPath ?? null, Date.now());
+      this.db.exec('COMMIT');
+      return true;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  organizationWikiHistory(organizationId: string, wikiPath?: string): Array<{
+    id: string; organizationId: string; path: string; version: number; operation: string;
+    kind?: string; content?: string; principal?: string; previousPath?: string; createdAt: number;
+  }> {
+    const rows = wikiPath
+      ? this.db.prepare(`SELECT * FROM organization_wiki_versions
+          WHERE organizationId=? AND (path=? OR previousPath=?)
+          ORDER BY createdAt DESC, rowid DESC`).all(organizationId, wikiPath, wikiPath)
+      : this.db.prepare(`SELECT * FROM organization_wiki_versions WHERE organizationId=?
+          ORDER BY createdAt DESC, rowid DESC`).all(organizationId);
+    return (rows as any[]).map((row) => ({
+      id: row.id, organizationId: row.organizationId, path: row.path, version: Number(row.version),
+      operation: row.operation, kind: row.kind ?? undefined, content: row.content ?? undefined,
+      principal: row.principal ?? undefined, previousPath: row.previousPath ?? undefined,
+      createdAt: Number(row.createdAt),
+    }));
+  }
+
   detachProjectRepository(projectId: string, repositoryId: string): void {
     this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, repositoryId);
     this.syncProjectRepositoryConfig(projectId);
@@ -1414,7 +1573,9 @@ export class Store {
     if (!projectBefore) throw new Error(`no project ${projectId}`);
     // A catalog SSH URL carries its GitHub connection/deploy-key metadata. Keep
     // those attachments synchronized automatically; users edit one plain list.
-    const catalog = projectBefore.organizationId ? this.listRepositories(projectBefore.organizationId) : [];
+    const catalog = projectBefore.organizationId
+      ? this.listRepositories(projectBefore.organizationId).filter((repository) => !this.repositoryIsProjectWiki(repository.id))
+      : [];
     const wanted = new Map(catalog.filter((repository) => sources.includes(repository.sshUrl)).map((repository) => [repository.id, repository]));
     for (const attachment of this.listProjectRepositories(projectId))
       if (!wanted.has(attachment.repositoryId)) this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, attachment.repositoryId);
@@ -1512,11 +1673,15 @@ export class Store {
       id,
       intentId,
       attemptNumber,
-      num: input.intentId ? undefined : this.nextTaskNum(input.projectId),
+      // Alternate attempts share the root's number. A new logical task receives
+      // its number now only when it is being created directly into the queue;
+      // drafts receive one in clearDraft(), at their queue transition.
+      num: input.intentId || input.params.draft ? undefined : this.nextTaskNum(input.projectId),
       projectId: input.projectId,
       listId,
       title: input.title,
       workflow: input.workflow,
+      executionWorkflow: input.workflow,
       workflowVersion: input.workflowVersion,
       params: input.params,
       createdAt: Date.now(),
@@ -1529,8 +1694,8 @@ export class Store {
     };
     this.db
       .prepare(
-        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber, createdBy, assignee, delegate, confirmationPolicy)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, num, projectId, listId, title, workflow, executionWorkflow, workflowVersion, params, createdAt, ord, parentTaskId, lastView, notes, intentId, attemptNumber, createdBy, assignee, delegate, confirmationPolicy)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
@@ -1539,6 +1704,7 @@ export class Store {
         t.listId,
         t.title,
         t.workflow,
+        t.executionWorkflow!,
         t.workflowVersion,
         JSON.stringify(t.params),
         t.createdAt,
@@ -1565,8 +1731,10 @@ export class Store {
   attemptsOf(taskOrIntentId: string): TaskRecord[] {
     const t = this.getTask(taskOrIntentId);
     const intentId = t?.intentId ?? taskOrIntentId;
-    return (this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
+    const tasks = (this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.intentId = ? ORDER BY t.attemptNumber`).all(intentId) as any[]).map(rowToTask);
+    const projectId = t?.projectId ?? tasks[0]?.projectId;
+    return projectId ? this.attachTags(projectId, tasks) : tasks;
   }
 
   attemptGroup(taskOrIntentId: string): { intentId: string; principalAttemptId: string; committedAttemptId?: string; confirmer?: unknown; attempts: TaskRecord[] } | undefined {
@@ -1579,9 +1747,10 @@ export class Store {
   }
 
   /** One row per logical task: only the current principal appears in list/search. */
-  listPrincipalTasks(projectId: string): TaskRecord[] {
+  listTasks(projectId: string): TaskRecord[] {
     const rows = this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
-      JOIN task_intents i ON i.principalAttemptId=t.id JOIN tasks root ON root.id=i.id
+      JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+      JOIN tasks root ON root.id=i.id
       WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId) as any[];
     return this.attachTags(projectId, rows.map(rowToTask));
   }
@@ -1648,7 +1817,8 @@ export class Store {
     return r ? this.getTask(r.id) : undefined;
   }
 
-  listTasks(projectId: string): TaskRecord[] {
+  /** Every attempt execution. Internal lifecycle work must opt into this explicitly. */
+  listTaskAttempts(projectId: string): TaskRecord[] {
     const tasks = (
       this.db
         .prepare('SELECT * FROM tasks WHERE projectId = ? ORDER BY ord, createdAt')
@@ -1742,6 +1912,17 @@ export class Store {
     this.db.prepare('UPDATE tasks SET workflowVersion = ? WHERE id = ?').run(workflowVersion, taskId);
   }
 
+  /** Change only the user-facing compatible workflow mode. The execution pin is
+   * intentionally untouched; the running deterministic workflow owns the switch. */
+  setTaskWorkflow(taskId: string, workflow: string) {
+    this.db.prepare('UPDATE tasks SET workflow = ? WHERE id = ?').run(workflow, taskId);
+  }
+
+  /** Record the workflow definition of a newly-started/recovered Temporal run. */
+  setTaskExecutionWorkflow(taskId: string, workflow: string) {
+    this.db.prepare('UPDATE tasks SET executionWorkflow = ? WHERE id = ?').run(workflow, taskId);
+  }
+
   /** Update a task's display title (e.g. to track an edited prompt). */
   setTaskTitle(taskId: string, title: string) {
     if (title) this.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run(title, taskId);
@@ -1765,11 +1946,32 @@ export class Store {
     this.updateTaskParams(taskId, { ...t.params, priority: p });
   }
 
-  /** Mark a draft task as queued (clear its draft flag). */
+  /**
+   * Mark a draft task as queued. The human-facing number belongs to the logical
+   * task (the intent root), and is minted exactly once at this transition.
+   * A previously queued task that was moved back to drafts keeps its permalink.
+   */
   clearDraft(taskId: string) {
     const t = this.getTask(taskId);
     if (!t) return;
+    // A single UPDATE makes MAX+1 allocation safe even if two Store instances
+    // queue tasks concurrently against the same SQLite database.
+    this.db.prepare(`UPDATE tasks SET num = (
+      SELECT COALESCE(MAX(num), 0) + 1 FROM tasks WHERE projectId = ?
+    ) WHERE id = ? AND num IS NULL`).run(t.projectId, t.intentId ?? t.id);
     this.updateTaskParams(taskId, { ...t.params, draft: false });
+  }
+
+  /** Compensate a queue failure. Numbers minted by that failed transition may be
+   * released, but numbers from an earlier successful queue are permanent. */
+  restoreDraft(taskId: string, releaseNumber = false) {
+    const t = this.getTask(taskId);
+    if (!t) return;
+    this.updateTaskParams(taskId, { ...t.params, draft: true });
+    if (!releaseNumber) return;
+    const intentId = t.intentId ?? t.id;
+    const stillQueued = this.attemptsOf(intentId).some((attempt) => !attempt.params.draft);
+    if (!stillQueued) this.db.prepare('UPDATE tasks SET num = NULL WHERE id = ?').run(intentId);
   }
 
   /** Hard-delete a task row + its events (used for drafts, which never ran). */
@@ -2131,7 +2333,7 @@ export class Store {
     return r ? rowToTag(r) : undefined;
   }
 
-  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Tag {
+  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Tag {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
@@ -2147,7 +2349,7 @@ export class Store {
           projectId: input.projectId,
           name: segments[i]!,
           parentId,
-          ...(isLeaf ? { color: input.color, kind: input.kind } : {}),
+          ...(isLeaf ? { color: input.color, kind: input.kind, description: input.description } : {}),
         });
         parentId = leaf.id;
       }
@@ -2157,15 +2359,26 @@ export class Store {
   }
 
   /** Create-or-reuse a single tag under an explicit parent (no path parsing). */
-  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Tag {
+  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Tag {
     const name = input.name.trim();
     if (!name) throw new Error('tag name required');
+    if (input.parentId) {
+      const parent = this.getTag(input.parentId);
+      if (!parent || parent.projectId !== input.projectId) throw new Error('tag parent must belong to the same project');
+    }
     // Reuse an existing sibling with the same (case-insensitive) name rather than
     // minting a duplicate — tag catalogues should stay small and canonical.
     const existing = this.db
       .prepare("SELECT * FROM tags WHERE projectId = ? AND lower(name) = lower(?) AND IFNULL(parentId, '') = IFNULL(?, '')")
       .get(input.projectId, name, input.parentId ?? null) as any;
-    if (existing) return rowToTag(existing);
+    if (existing) {
+      const patch = {
+        ...(input.color !== undefined ? { color: input.color } : {}),
+        ...(input.kind !== undefined ? { kind: input.kind } : {}),
+        ...(input.description?.trim() ? { description: input.description } : {}),
+      };
+      return Object.keys(patch).length ? this.updateTag(existing.id, patch)! : rowToTag(existing);
+    }
     const t: Tag = {
       id: newId('tag'),
       projectId: input.projectId,
@@ -2173,22 +2386,28 @@ export class Store {
       parentId: input.parentId,
       color: input.color,
       kind: input.kind,
+      description: input.description?.trim() || undefined,
       createdAt: Date.now(),
     };
     this.db
-      .prepare('INSERT INTO tags (id, projectId, name, parentId, color, kind, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(t.id, t.projectId, t.name, t.parentId ?? null, t.color ?? null, t.kind ?? null, t.createdAt);
+      .prepare('INSERT INTO tags (id, projectId, name, parentId, color, kind, description, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(t.id, t.projectId, t.name, t.parentId ?? null, t.color ?? null, t.kind ?? null, t.description ?? null, t.createdAt);
     return t;
   }
 
-  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null }): Tag | undefined {
+  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null; description?: string | null }): Tag | undefined {
     const cur = this.getTag(id);
     if (!cur) return undefined;
+    const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
+    if (nextParentId) {
+      const parent = this.getTag(nextParentId);
+      if (!parent || parent.projectId !== cur.projectId) throw new Error('tag parent must belong to the same project');
+    }
     // Guard against a cycle: a tag can't be reparented under itself or a descendant.
-    if (patch.parentId) {
+    if (nextParentId) {
       const all = this.listTags(cur.projectId);
       const byId = new Map(all.map((t) => [t.id, t]));
-      let p: string | undefined = patch.parentId;
+      let p: string | undefined = nextParentId;
       const seen = new Set<string>();
       while (p) {
         if (p === id || seen.has(p)) throw new Error('tag cannot be its own ancestor');
@@ -2196,16 +2415,22 @@ export class Store {
         p = byId.get(p)?.parentId;
       }
     }
+    const nextName = patch.name?.trim() || cur.name;
+    const duplicate = this.db
+      .prepare("SELECT id FROM tags WHERE projectId = ? AND id <> ? AND lower(name) = lower(?) AND IFNULL(parentId, '') = IFNULL(?, '')")
+      .get(cur.projectId, id, nextName, nextParentId ?? null) as { id: string } | undefined;
+    if (duplicate) throw new Error('a sibling tag with that name already exists');
     const next: Tag = {
       ...cur,
-      name: patch.name?.trim() || cur.name,
-      parentId: patch.parentId === null ? undefined : patch.parentId ?? cur.parentId,
+      name: nextName,
+      parentId: nextParentId,
       color: patch.color === null ? undefined : patch.color ?? cur.color,
       kind: patch.kind === null ? undefined : patch.kind ?? cur.kind,
+      description: patch.description === null ? undefined : patch.description !== undefined ? patch.description.trim() || undefined : cur.description,
     };
     this.db
-      .prepare('UPDATE tags SET name = ?, parentId = ?, color = ?, kind = ? WHERE id = ?')
-      .run(next.name, next.parentId ?? null, next.color ?? null, next.kind ?? null, id);
+      .prepare('UPDATE tags SET name = ?, parentId = ?, color = ?, kind = ?, description = ? WHERE id = ?')
+      .run(next.name, next.parentId ?? null, next.color ?? null, next.kind ?? null, next.description ?? null, id);
     return next;
   }
 
@@ -2406,6 +2631,124 @@ export class Store {
   }
 
   // ─── Event log (live stream) ─────────────────────────────────────────────────
+
+  createCollaborationRequest(input: {
+    requesterTaskId: string;
+    targetTaskId: string;
+    targetRole?: string;
+    action: CollaborationRequest['action'];
+  }): CollaborationRequest {
+    const now = Date.now();
+    const afterSeq = Number((this.db.prepare('SELECT COALESCE(MAX(seq), 0) seq FROM events').get() as any)?.seq ?? 0);
+    const request: CollaborationRequest = {
+      id: newId('collab'),
+      requesterTaskId: input.requesterTaskId,
+      targetTaskId: input.targetTaskId,
+      targetRole: input.targetRole ?? 'do',
+      action: input.action,
+      status: 'pending',
+      afterSeq,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.db.prepare(`INSERT INTO collaboration_requests
+      (id, requesterTaskId, targetTaskId, targetRole, action, status, afterSeq, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      request.id, request.requesterTaskId, request.targetTaskId, request.targetRole,
+      request.action, request.status, request.afterSeq, request.createdAt, request.updatedAt,
+    );
+    return request;
+  }
+
+  getCollaborationRequest(id: string): CollaborationRequest | undefined {
+    const row = this.db.prepare('SELECT * FROM collaboration_requests WHERE id=?').get(id) as any;
+    return row ? this.collaborationRequestFromRow(row) : undefined;
+  }
+
+  listCollaborationRequests(input: {
+    requesterTaskId?: string;
+    targetTaskId?: string;
+    status?: CollaborationRequestStatus;
+    unnotified?: boolean;
+  } = {}): CollaborationRequest[] {
+    const clauses: string[] = [];
+    const args: any[] = [];
+    if (input.requesterTaskId) { clauses.push('requesterTaskId=?'); args.push(input.requesterTaskId); }
+    if (input.targetTaskId) { clauses.push('targetTaskId=?'); args.push(input.targetTaskId); }
+    if (input.status) { clauses.push('status=?'); args.push(input.status); }
+    if (input.unnotified) clauses.push("status!='pending' AND notifiedAt IS NULL");
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+    return (this.db.prepare(`SELECT * FROM collaboration_requests${where} ORDER BY createdAt, id`).all(...args) as any[])
+      .map((row) => this.collaborationRequestFromRow(row));
+  }
+
+  settleCollaborationRequests(
+    targetTaskId: string,
+    status: Exclude<CollaborationRequestStatus, 'pending'>,
+    result: Record<string, unknown>,
+    eventSeq?: number,
+  ): CollaborationRequest[] {
+    const pending = this.listCollaborationRequests({ targetTaskId, status: 'pending' })
+      .filter((request) => eventSeq === undefined || eventSeq > request.afterSeq);
+    if (!pending.length) return [];
+    const now = Date.now();
+    const update = this.db.prepare(`UPDATE collaboration_requests
+      SET status=?, result=?, updatedAt=?, settledAt=?
+      WHERE id=? AND status='pending'`);
+    const settled: CollaborationRequest[] = [];
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const request of pending) {
+        const changed = update.run(status, JSON.stringify(result), now, now, request.id).changes;
+        if (changed) settled.push({ ...request, status, result, updatedAt: now, settledAt: now });
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return settled;
+  }
+
+  settleCollaborationRequest(
+    id: string,
+    status: Exclude<CollaborationRequestStatus, 'pending'>,
+    result: Record<string, unknown>,
+  ): CollaborationRequest | undefined {
+    const request = this.getCollaborationRequest(id);
+    if (!request || request.status !== 'pending') return undefined;
+    const now = Date.now();
+    const changed = this.db.prepare(`UPDATE collaboration_requests
+      SET status=?, result=?, updatedAt=?, settledAt=?
+      WHERE id=? AND status='pending'`).run(status, JSON.stringify(result), now, now, id).changes;
+    return changed ? { ...request, status, result, updatedAt: now, settledAt: now } : undefined;
+  }
+
+  markCollaborationRequestNotified(id: string): void {
+    this.db.prepare("UPDATE collaboration_requests SET notifiedAt=?, updatedAt=? WHERE id=? AND status!='pending'")
+      .run(Date.now(), Date.now(), id);
+  }
+
+  deleteCollaborationRequest(id: string): void {
+    this.db.prepare('DELETE FROM collaboration_requests WHERE id=?').run(id);
+  }
+
+  private collaborationRequestFromRow(row: any): CollaborationRequest {
+    return {
+      id: String(row.id),
+      requesterTaskId: String(row.requesterTaskId),
+      targetTaskId: String(row.targetTaskId),
+      targetRole: String(row.targetRole),
+      action: row.action as CollaborationRequest['action'],
+      status: row.status as CollaborationRequestStatus,
+      afterSeq: Number(row.afterSeq),
+      createdAt: Number(row.createdAt),
+      updatedAt: Number(row.updatedAt),
+      ...(row.settledAt == null ? {} : { settledAt: Number(row.settledAt) }),
+      ...(row.result == null ? {} : { result: JSON.parse(String(row.result)) as Record<string, unknown> }),
+      ...(row.notifiedAt == null ? {} : { notifiedAt: Number(row.notifiedAt) }),
+    };
+  }
 
   appendEvent(ev: KarmaxEvent): number {
     const info = this.db
@@ -3032,7 +3375,7 @@ export class Store {
 
   // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────
 
-  createCard(c: { id: string; provider: string; scope: 'project' | 'global'; scopeId?: string; label: string; cap: number; available: number; merchantLock?: string[]; createdAt: number }) {
+  createCard(c: { id: string; provider: string; scope: 'project' | 'organization' | 'global'; scopeId?: string; label: string; cap: number; available: number; merchantLock?: string[]; createdAt: number }) {
     this.db
       .prepare('INSERT INTO cards (id, provider, scope, scopeId, label, cap, available, merchantLock, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(c.id, c.provider, c.scope, c.scopeId ?? null, c.label, c.cap, c.available, c.merchantLock ? JSON.stringify(c.merchantLock) : null, c.createdAt);
@@ -3041,11 +3384,19 @@ export class Store {
     const r = this.db.prepare('SELECT * FROM cards WHERE id = ?').get(id) as any;
     return r ? cardRow(r) : undefined;
   }
-  /** Cards visible to a project: its own project-scope cards plus all global cards. */
-  listCards(projectId?: string): any[] {
+  /**
+   * Cards visible in a scope: a project sees its own project cards plus its
+   * organization's cards; an organization view sees its own cards. Legacy
+   * `scope='global'` cards (created before cards were org-scoped) remain visible
+   * to the personal organization only, so a hosted tenant never spends from
+   * another tenant's — or the installation's — card.
+   */
+  listCards(projectId?: string, organizationId?: string): any[] {
+    const org = organizationId ?? (projectId ? this.getProject(projectId)?.organizationId : undefined) ?? 'org_personal';
+    const legacyGlobal = org === 'org_personal' ? " OR scope='global'" : '';
     const rows = projectId
-      ? (this.db.prepare("SELECT * FROM cards WHERE scope='global' OR (scope='project' AND scopeId=?) ORDER BY createdAt").all(projectId) as any[])
-      : (this.db.prepare('SELECT * FROM cards ORDER BY createdAt').all() as any[]);
+      ? (this.db.prepare(`SELECT * FROM cards WHERE (scope='organization' AND scopeId=?) OR (scope='project' AND scopeId=?)${legacyGlobal} ORDER BY createdAt`).all(org, projectId) as any[])
+      : (this.db.prepare(`SELECT * FROM cards WHERE (scope='organization' AND scopeId=?)${legacyGlobal} ORDER BY createdAt`).all(org) as any[]);
     return rows.map(cardRow);
   }
   updateCard(id: string, patch: { available?: number; cap?: number }) {
@@ -3191,6 +3542,33 @@ function uniqueSlug(value: string, used: (candidate: string) => boolean): string
   let candidate = base;
   for (let n = 2; used(candidate); n++) candidate = `${base}-${n}`;
   return candidate;
+}
+
+/** Path segments the web router and gateway own. An organization owns the top URL
+ *  segment by its slug, and a project is addressed at `/<org>/<project>` by the
+ *  slug of its name — so a name that slugifies to one of these words would be
+ *  shadowed by a built-in route and unreachable in the console (e.g. a project
+ *  named "wiki" collides with the organization wiki view). Reject those names at
+ *  creation. Keep this in sync with `web/app.js` (`parseRoute` / `ORG_VIEWS`) and
+ *  the gateway's `/api` + `/ws` prefixes. */
+const RESERVED_ROUTE_SLUGS = new Set([
+  // gateway-owned top-level prefixes
+  'api', 'ws',
+  // top-level routes / legacy org paths (an org slug is the first URL segment)
+  'invite', 'projects', 'organization', 'organizations',
+  // organization-level views — ORG_VIEWS (a project slug is the segment after the org)
+  'dashboard', 'settings', 'inbox', 'wiki', 'profile',
+  // project-level tabs
+  'tasks', 'queue', 'activity',
+]);
+
+/** Throw a user-facing error if `name` (or an explicit `slug`) resolves to a
+ *  reserved routing word. Applied at the single creation choke points for
+ *  projects and organizations. */
+function assertRoutableName(kind: 'project' | 'organization', name: string, slug?: string): void {
+  const s = slugify(slug ?? name);
+  if (RESERVED_ROUTE_SLUGS.has(s))
+    throw new Error(`"${s}" is a reserved name and can't be used for a ${kind}. Please choose a different name.`);
 }
 
 function validateProjectExecutionConfig(config: ProjectConfig): void {
@@ -3383,6 +3761,7 @@ function rowToTag(r: any): Tag {
     parentId: r.parentId ?? undefined,
     color: r.color ?? undefined,
     kind: r.kind ?? undefined,
+    description: r.description ?? undefined,
     createdAt: r.createdAt,
   };
 }
@@ -3410,6 +3789,7 @@ function rowToTask(r: any): TaskRecord {
     listId: r.listId,
     title: r.title,
     workflow: r.workflow,
+    executionWorkflow: r.executionWorkflow ?? r.workflow,
     workflowVersion: r.workflowVersion,
     params: JSON.parse(r.params),
     createdAt: r.createdAt,

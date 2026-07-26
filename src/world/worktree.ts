@@ -4,8 +4,8 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos } from './types.js';
-import { git, gitOrThrow, isGitRepo, ensureIdentity } from './git.js';
+import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, ExecResult, WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, worldRelativePath, worldRepos, worldWorkingDirectory } from './types.js';
+import { git, gitOrThrow, isGitRepo, ensureIdentity, isolatedGitEnvironment } from './git.js';
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess } from './local-execution.js';
@@ -53,6 +53,10 @@ export class WorktreeProvider implements WorldProvider {
             `or run \`git init\` at that path.`,
         );
       }
+    }
+    if (spec.scratch && resolvedSources.length) {
+      const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
+      resolvedSources.unshift({ repo: scratch, source: 'scratch', managed: false });
     }
 
     const repos: WorldRepo[] = [];
@@ -177,7 +181,7 @@ export class WorktreeProvider implements WorldProvider {
     const temporary = `${destination}.tmp-${process.pid}-${crypto.randomUUID()}`;
     const credentialDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-local-clone-'));
     const key = spec.gitCredentials?.repositories?.[source] ?? spec.gitCredentials?.sshKey;
-    const env: Record<string, string> = {};
+    const env: Record<string, string> = spec.gitCredentials?.isolated ? isolatedGitEnvironment() : {};
     try {
       if (key) {
         const keyPath = path.join(credentialDir, 'repository.key');
@@ -304,7 +308,7 @@ class WorktreeWorld implements World {
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     try {
       const { stdout, stderr } = await pexec(cmd, args, {
-        cwd: opts.cwd ?? this.handle.root,
+        cwd: opts.cwd ?? worldWorkingDirectory(this.handle),
         timeout: opts.timeoutMs ?? 120_000,
         maxBuffer: 64 * 1024 * 1024,
         env: opts.env ? { ...process.env, ...opts.env } : process.env,
@@ -335,11 +339,17 @@ class WorktreeWorld implements World {
   }
 
   async startProcess(spec: WorldProcessSpec): Promise<WorldProcess> {
-    return startLocalProcess(this.handle.root, spec);
+    return startLocalProcess(this.handle.root, {
+      ...spec,
+      cwd: spec.cwd ?? worldWorkingDirectory(this.handle),
+    });
   }
 
   async openPty(spec: WorldPtySpec = {}): Promise<WorldPty> {
-    return openLocalPty(this.handle.root, spec);
+    return openLocalPty(this.handle.root, {
+      ...spec,
+      cwd: spec.cwd ?? worldWorkingDirectory(this.handle),
+    });
   }
 
   async listFiles(): Promise<string[]> {

@@ -54,6 +54,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   it('exposes contributions (slots, commands, event schemas)', async () => {
     const c: any = await (await fetch(`${base}/api/contributions`, { headers: auth() })).json();
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
+    expect(c.commands.find((x: any) => x.id === 'nav.notifications')?.keybinding).toBe('g N');
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);
     expect(c.slots.some((s: any) => s.workflow === 'agent-queue' && s.contribution.slot === 'queue-panel')).toBe(true);
@@ -286,11 +287,24 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(artifact.status).toBe(200);
     expect(await artifact.text()).toContain('hello-artifact');
 
-    // a bad index is rejected; artifact traversal is refused
+    // Agent-authored absolute paths are resolved back into this task's world by
+    // the conversation file endpoint; source files open inline as text.
+    const file = await fetch(`${base}/api/tasks/${task.id}/file?path=${encodeURIComponent(`${view.worldPath}/out.txt`)}`, { headers: auth() });
+    expect(file.status).toBe(200);
+    expect(file.headers.get('content-type')).toContain('text/plain');
+    expect(await file.text()).toContain('hello-artifact');
+
+    // A bad index is rejected; neither artifact nor conversation-file paths may
+    // traverse outside the task world.
     const bad = await fetch(`${base}/api/tasks/${task.id}/review-action`, { method: 'POST', headers: auth(), body: JSON.stringify({ index: 99 }) });
     expect(bad.status).toBe(404);
     const escape = await fetch(`${base}/api/tasks/${task.id}/artifact?path=${encodeURIComponent('../../../etc/passwd')}`, { headers: auth() });
     expect(escape.status).toBe(400);
+    const fileEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=${encodeURIComponent('/etc/passwd')}`, { headers: auth() });
+    expect(fileEscape.status).toBe(400);
+    await fs.promises.symlink('/etc/passwd', `${view.worldPath}/escape-link`);
+    const symlinkEscape = await fetch(`${base}/api/tasks/${task.id}/file?path=escape-link`, { headers: auth() });
+    expect(symlinkEscape.status).toBe(400);
   });
 
   it('inherits defaults live: drafts store only overrides and re-resolve when queued', async () => {
@@ -637,8 +651,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
 
   it('seeds a brand-new project with the karmax-ready prep task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
-    // workflow's onActivate prep task automatically (SPEC §4.6) — no manual
-    // "activate workflow" step. Covers both create-project routes.
+    // workflow's current onActivate Goal prep task automatically (SPEC §4.6) —
+    // no manual "activate workflow" step. Covers both create-project routes.
     const post = (path: string, body: unknown) =>
       fetch(`${base}${path}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then((r) => r.json());
     const prepTitle = 'Make this project karmax-ready';
@@ -647,7 +661,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       const tasks: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
       const prep = tasks.find((t: any) => t.title === prepTitle);
       expect(prep, `new project via ${path} should get the prep task`).toBeTruthy();
-      expect(prep.workflow).toBe('just-do');
+      expect(prep.workflow).toBe('goal');
     }
   });
 
@@ -664,8 +678,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(fields.find((f: any) => f.key === 'tag')).toBeTruthy();
 
     // Hierarchical tags: frontend/web + a bug label.
-    const front: any = await post(`/api/projects/${project.id}/tags`, { name: 'frontend', kind: 'topic' });
-    const web: any = await post(`/api/projects/${project.id}/tags`, { name: 'web', parentId: front.id, kind: 'topic' });
+    const front: any = await post(`/api/projects/${project.id}/tags`, { name: 'frontend', kind: 'topic', description: 'All client work.' });
+    const web: any = await post(`/api/projects/${project.id}/tags`, { name: 'web', parentId: front.id, kind: 'topic', description: 'Browser client work.' });
     const bug: any = await post(`/api/projects/${project.id}/tags`, { name: 'bug', kind: 'type' });
     expect(web.parentId).toBe(front.id);
 
@@ -687,6 +701,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const byBug: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('tag:bug priority:>=3 group:tag')}`);
     expect(byBug.total).toBe(1);
     expect(byBug.groups.some((g: any) => g.key === bug.id)).toBe(true);
+    const byHierarchy: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('group:tag')}`);
+    const frontendGroup = byHierarchy.groups.find((g: any) => g.key === front.id);
+    expect(byHierarchy.hierarchical).toBe(true);
+    expect(frontendGroup).toMatchObject({ label: 'frontend', description: 'All client work.', count: 1 });
+    expect(frontendGroup.children[0]).toMatchObject({ key: web.id, label: 'web', description: 'Browser client work.', count: 1 });
 
     // A negated/free-text query finds the other task.
     const docs: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('docs -tag:bug')}`);
@@ -719,5 +738,187 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const views: any = await get(`/api/projects/${project.id}/views`);
     expect(views.map((v: any) => v.name)).toContain('Urgent frontend');
     expect(views.find((v: any) => v.id === view.id).query.filters[0].field).toBe('tag');
+  });
+
+  // ── vault items + the credential pull model over HTTP (PLAN-passwords.md) ──
+  it('vault item lifecycle: add, list without secrets, policy-gated reveal, delete', async () => {
+    const created: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'login', label: 'GitHub (test)', domains: 'github.com', username: 'octo',
+      policy: { use: 'auto', reveal: 'ask' }, secrets: { password: 'hunter2' },
+    }) })).json();
+    expect(created.id).toBeTruthy();
+    expect(created.fields).toEqual(['password']);
+    expect(JSON.stringify(created)).not.toContain('hunter2');
+    const items: any = await (await fetch(`${base}/api/vault/items`, { headers: auth() })).json();
+    expect(JSON.stringify(items)).not.toContain('hunter2');
+    expect(items.map((i: any) => i.id)).toContain(created.id);
+
+    // reveal policy 'ask' gates even an all-capability caller
+    const asked: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com' }) })).json();
+    expect(asked.status).toBe('needs_approval');
+    await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({ id: created.id, type: 'login', label: created.label, domains: created.domains, policy: { reveal: 'auto' } }) });
+    const revealed: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com' }) })).json();
+    expect(revealed.status).toBe('granted');
+    expect(revealed.value).toBe('hunter2');
+    expect(revealed.username).toBe('octo');
+
+    // escalation requests are for task agents, not human sessions
+    const noTask: any = await (await fetch(`${base}/api/vault/requests`, { method: 'POST', headers: auth(), body: JSON.stringify({ domain: 'github.com', why: 'x' }) })).json();
+    expect(noTask.error).toMatch(/task-agent/);
+
+    await fetch(`${base}/api/vault/items/${created.id}`, { method: 'DELETE', headers: auth() });
+    const after: any = await (await fetch(`${base}/api/vault/items`, { headers: auth() })).json();
+    expect(after.map((i: any) => i.id)).not.toContain(created.id);
+  });
+
+  it('agent pull model: needs_approval → human grants for the task → retry succeeds', async () => {
+    const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'api-key', label: 'Service key', policy: { use: 'auto', reveal: 'auto' }, secrets: { secret: 'sk-999' },
+    }) })).json();
+    // A task-agent bearer whose grant does NOT cover the item (the do-role
+    // ceiling admits use-credential:*, but the task grant carries no item cap).
+    const minted = h.tokens.mint({ taskId: 'task_vaulttest', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read'] });
+    const agentAuth = { authorization: `Bearer ${minted.token}`, 'content-type': 'application/json' };
+
+    const first: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }) })).json();
+    expect(first.status).toBe('needs_approval');
+    const req: any = await (await fetch(`${base}/api/vault/requests`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id, mode: 'reveal', why: 'need the key' }) })).json();
+    expect(req.status).toBe('needs_approval');
+    expect(req.requestId).toBeTruthy();
+    // the human resolves it for the whole task (durable grant extension)
+    const resolved: any = await (await fetch(`${base}/api/vault/requests/${req.requestId}/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ action: 'task' }) })).json();
+    expect(resolved.status).toBe('granted');
+    const second: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }) })).json();
+    expect(second.status).toBe('granted');
+    expect(second.value).toBe('sk-999');
+    // and only for that task — a sibling task with the same shape stays parked
+    const other = h.tokens.mint({ taskId: 'task_other', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read'] });
+    const third: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: { authorization: `Bearer ${other.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ itemId: item.id }) })).json();
+    expect(third.status).toBe('needs_approval');
+  });
+
+  it('rotation rides the use-grant: a granted task updates a foreign item\'s secret, nothing else', async () => {
+    const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'login', label: 'Rotatable', domains: 'rot.example.com', policy: { use: 'auto', reveal: 'auto' }, secrets: { password: 'old' },
+    }) })).json();
+    const granted = h.tokens.mint({ taskId: 'task_rot', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'vault:store', 'use-credential:*'], grantorCaps: ['credential:read', 'vault:store', `use-credential:item:${item.id}`] });
+    const grantedAuth = { authorization: `Bearer ${granted.token}`, 'content-type': 'application/json' };
+    // secrets-only update on an item this task did NOT create → allowed by the grant
+    const rotated: any = await (await fetch(`${base}/api/vault/store`, { method: 'POST', headers: grantedAuth, body: JSON.stringify({ id: item.id, type: 'login', secrets: { password: 'new' } }) })).json();
+    expect(rotated.id).toBe(item.id);
+    const value: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ itemId: item.id }) })).json();
+    expect(value.value).toBe('new');
+    // metadata-only update on a foreign item → refused
+    const meta = await fetch(`${base}/api/vault/store`, { method: 'POST', headers: grantedAuth, body: JSON.stringify({ id: item.id, type: 'login', label: 'hijacked' }) });
+    expect(meta.status).toBe(403);
+    const listed: any = await (await fetch(`${base}/api/vault/items`, { headers: auth() })).json();
+    expect(listed.find((i: any) => i.id === item.id).label).toBe('Rotatable');
+    // an UNgranted task cannot rotate
+    const ungranted = h.tokens.mint({ taskId: 'task_norot', profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'vault:store', 'use-credential:*'], grantorCaps: ['credential:read', 'vault:store'] });
+    const denied = await fetch(`${base}/api/vault/store`, { method: 'POST', headers: { authorization: `Bearer ${ungranted.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ id: item.id, type: 'login', secrets: { password: 'evil' } }) });
+    expect(denied.status).toBe(403);
+    // a reset report parks with its kind for the human
+    const reset: any = await (await fetch(`${base}/api/vault/requests`, { method: 'POST', headers: grantedAuth, body: JSON.stringify({ itemId: item.id, kind: 'reset', why: 'site rejected it' }) })).json();
+    expect(reset.status).toBe('needs_approval');
+    const reqs: any = await (await fetch(`${base}/api/vault/requests?status=pending`, { headers: auth() })).json();
+    expect(reqs.find((r: any) => r.id === reset.requestId).kind).toBe('reset');
+  });
+
+  it('lists the external-store connectors (describe, unauthenticated CLIs report not-ready)', async () => {
+    const conns: any = await (await fetch(`${base}/api/vault/connectors`, { headers: auth() })).json();
+    expect(conns.map((c: any) => c.name).sort()).toEqual(['1password', 'bitwarden', 'pass']);
+    // In CI none of the CLIs are configured, so each reports a clear reason.
+    for (const c of conns) { expect(typeof c.available).toBe('boolean'); expect(c.detail).toBeTruthy(); }
+  });
+
+  it('agent mailbox: per-org address, shared-secret ingest, reads, and tenant isolation', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    expect(orgId).toBeTruthy();
+    const addr: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
+    expect(addr.address).toMatch(/@/);
+    // the webhook secret is MINTED by karmax and rides in the copy-pasted URL
+    const providers: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail/providers`, { headers: auth() })).json();
+    expect(providers.webhookUrl).toContain('/api/agent-mail/ingest?secret=');
+    expect(providers.cloudflareWorker).toContain('async email(message');
+    const hook = new URL(providers.webhookUrl);
+    const ingest = `${base}${hook.pathname}${hook.search}`;
+    const rejected = await fetch(`${base}/api/agent-mail/ingest`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: addr.address, from: 'x@y.com', text: 'code 314159' }) });
+    expect(rejected.status).toBe(401);
+    const ok: any = await (await fetch(ingest, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: addr.address, from: 'noreply@github.com', subject: 'Verify', text: 'Your code is 314159' }) })).json();
+    expect(ok.delivered).toBe(true);
+    // provider-shaped payloads normalize too (Mailgun urlencoded)
+    const mg: any = await (await fetch(ingest, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ recipient: addr.address, sender: 'no-reply@stripe.com', subject: 'Code', 'body-plain': 'Your code is 271828' }).toString() })).json();
+    expect(mg.delivered).toBe(true);
+    // mail to an address no organization owns is dropped
+    const dropped: any = await (await fetch(ingest, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: 'stranger@agent.local', from: 'x@y.com', text: 'code 999999' }) })).json();
+    expect(dropped.delivered).toBe(false);
+    const inbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail?match=github`, { headers: auth() })).json();
+    expect(inbox.messages[0].code).toBe('314159');
+    const inbox2: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail?match=stripe`, { headers: auth() })).json();
+    expect(inbox2.messages[0].code).toBe('271828');
+    // an agent token scoped to ANOTHER organization cannot read this inbox
+    const foreign = h.tokens.mint({ taskId: 'task_mail', profileId: 'do', principal: 'user:test',
+      organizationId: 'org_other', ceiling: ['credential:read'], grantorCaps: ['credential:read'] });
+    const denied = await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: { authorization: `Bearer ${foreign.token}` } });
+    expect(denied.status).toBe(403);
+  });
+
+  it('mailbox provider: connect a domain in Settings (no env var) and addresses adopt it', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const providers: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail/providers`, { headers: auth() })).json();
+    expect(providers.providers.map((p: any) => p.name).sort()).toEqual(['agentmail', 'hosted', 'imap', 'self-managed']);
+    const connect = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'self-managed', domain: 'agents.test.co' }) });
+    expect(connect.status).toBe(200);
+    // a fresh org now mints its address on the connected domain
+    const addr: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
+    expect(addr.address.endsWith('@agents.test.co')).toBe(true);
+    expect(addr.configured).toBe(true);
+    // an invalid domain is rejected with a clear reason, not stored
+    const bad = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'self-managed', domain: 'nonsense' }) });
+    expect(bad.status).toBe(400);
+    // pull providers are flagged so the UI can group them (work on localhost)
+    expect(providers.providers.find((p: any) => p.name === 'imap').pull).toBe(true);
+    expect(providers.providers.find((p: any) => p.name === 'self-managed').pull).toBe(false);
+    // connect a pull provider (IMAP): addresses ride +tags on the mailbox
+    const imapOk = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, { method: 'POST', headers: auth(), body: JSON.stringify({ provider: 'imap', address: 'agentbox@gmail.com', apiKey: 'app-pass' }) });
+    expect(imapOk.status).toBe(200);
+    const imapAddr: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
+    expect(imapAddr.address).toMatch(/^agentbox\+agent-[0-9a-f]+@gmail\.com$/);
+  });
+
+  it('connects an existing AgentMail inbox for only that organization', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const connect = await fetch(`${base}/api/organizations/${orgId}/agent-mail/connect`, {
+      method: 'POST',
+      headers: auth(),
+      body: JSON.stringify({ provider: 'agentmail', domain: 'MyInbox@agentmail.to', apiKey: 'am-test-key' }),
+    });
+    expect(connect.status).toBe(200);
+    const mailbox: any = await (await fetch(`${base}/api/organizations/${orgId}/agent-mail`, { headers: auth() })).json();
+    expect(mailbox.address).toBe('myinbox@agentmail.to');
+    expect(mailbox.configured).toBe(true);
+    expect(h.store.kvGet(`agent-mail:provider:${orgId}`)).toContain('mailbox:agentmail:');
+    expect(h.store.kvGet('agent-mail:provider')).toBeUndefined();
+  });
+
+  it('cards are organization-scoped: one org never sees or spends another\'s card', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const made: any = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { method: 'POST', headers: auth(), body: JSON.stringify({ scope: 'organization', label: 'Org card', cap: 100000 }) })).json();
+    expect(made.scope).toBe('organization');
+    expect(made.scopeId).toBe(orgId);
+    const mine: any = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { headers: auth() })).json();
+    expect(mine.map((c: any) => c.id)).toContain(made.id);
+    // a different org's card listing does not include it
+    const others: any = await (await fetch(`${base}/api/cards?organizationId=org_elsewhere`, { headers: auth() })).json();
+    expect(others.map((c: any) => c.id)).not.toContain(made.id);
   });
 });

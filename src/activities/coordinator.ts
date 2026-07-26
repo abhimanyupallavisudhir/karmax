@@ -1,24 +1,30 @@
 import type { Client } from '@temporalio/client';
 import {
   MERGE_QUEUE_WORKFLOW,
+  AGENT_QUEUE_WORKFLOW,
   ACCOUNT_COORDINATOR_WORKFLOW,
   SIG_ENQUEUE,
   SIG_RELEASE,
   SIG_PRIORITIZE,
   SIG_CANCEL_MERGE,
+  SIG_REQUEST_AGENT,
+  SIG_CANCEL_AGENT,
+  SIG_RELEASE_AGENT,
   SIG_LEASE_ACCOUNT,
   SIG_CANCEL_ACCOUNT,
   SIG_RETURN_ACCOUNT,
   SIG_REGISTER_ACCOUNTS,
   UPD_REPORT_EXHAUSTED,
   UPD_SET_ACCOUNT_AVAILABILITY,
+  UPD_REQUEST_AGENT,
   QRY_QUEUE,
   QRY_ACCOUNTS,
   mergeQueueId,
+  agentQueueId,
   accountCoordinatorId,
 } from '../coordinators/names.js';
 
-type AccountProvider = 'claude' | 'codex' | 'mock';
+type AccountProvider = string;
 type CredKind = 'login' | 'ambient' | 'key';
 type LimitWindow = '5h' | 'weekly' | 'model';
 type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';
@@ -26,6 +32,9 @@ type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention
 export interface CoordinatorActivityDeps {
   client: Client;
   taskQueue: string;
+  store?: {
+    getSettings(scopeKey: string, workflow: string): Record<string, unknown> | undefined;
+  };
 }
 
 /**
@@ -97,6 +106,45 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         return desc.status.name === 'RUNNING';
       } catch {
         return false;
+      }
+    },
+
+    // ── agent-turn coordinator (SPEC §6.1a) ──
+    /** Enqueue and immediately acknowledge one turn. A queued request is granted
+     * later by a durable signal from the coordinator to the owning task workflow. */
+    async requestAgentSlot(item: {
+      taskId: string;
+      turnId: string;
+      role: string;
+      provider?: string;
+      title?: string;
+      projectId?: string;
+    }): Promise<{ granted: boolean; position: number; capacity: number }> {
+      const saved = Number(deps.store?.getSettings('global', 'agent-queue')?.capacity);
+      const capacity = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 3;
+      await client.workflow.signalWithStart(AGENT_QUEUE_WORKFLOW, {
+        workflowId: agentQueueId(),
+        taskQueue,
+        args: [{ capacity }],
+        signal: SIG_REQUEST_AGENT,
+        signalArgs: [item],
+      });
+      return await client.workflow.getHandle(agentQueueId()).executeUpdate(UPD_REQUEST_AGENT, {
+        args: [item],
+      }) as { granted: boolean; position: number; capacity: number };
+    },
+    async cancelAgentSlot(taskId: string, turnId: string): Promise<void> {
+      try {
+        await client.workflow.getHandle(agentQueueId()).signal(SIG_CANCEL_AGENT, { taskId, turnId });
+      } catch {
+        /* coordinator gone — nothing to cancel */
+      }
+    },
+    async releaseAgentSlot(taskId: string, turnId: string): Promise<void> {
+      try {
+        await client.workflow.getHandle(agentQueueId()).signal(SIG_RELEASE_AGENT, { taskId, turnId });
+      } catch {
+        /* coordinator gone — its lease is already gone too */
       }
     },
 

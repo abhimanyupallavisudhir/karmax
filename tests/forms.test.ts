@@ -45,7 +45,8 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     expect(sd.params.find((f: any) => f.name === 'agent:do').type).toBe('agent');
     // each workflow serves its own lifecycle stages (drives the pipeline UI)
     expect(sd.stages.map((s: any) => s.key)).toEqual(['setup', 'do', 'review', 'pr', 'merge', 'done']);
-    expect(schema.find((s: any) => s.name === 'just-do').stages.map((s: any) => s.key)).toEqual(['setup', 'do', 'review', 'done']);
+    expect(schema.map((s: any) => s.name)).not.toContain('just-do');
+    expect(schema.map((s: any) => s.name)).not.toContain('script-exec');
   });
 
   it('round-trips global and project settings', async () => {
@@ -55,6 +56,31 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     const ps = await get(`/api/settings/project/${projectId}/software-dev`);
     expect(ps.base).toBe('main');
     expect(ps.repos).toEqual([repo]);
+  });
+
+  it('changes a running task from Software Dev to Goal through the task endpoint', async () => {
+    const task = await post(`/api/projects/${projectId}/tasks`, {
+      title: 'Switchable',
+      workflow: 'software-dev',
+      params: { prompt: '@write endpoint-switch.txt :: done\n@review waiting' },
+    });
+    const review = await poll(task.id, 'review');
+    expect(review.workflowSwitchable).toBe(true);
+    const changed = await fetch(`${base}/api/tasks/${task.id}/workflow`, {
+      method: 'PATCH',
+      headers: auth(),
+      body: JSON.stringify({ workflow: 'goal' }),
+    }).then(J);
+    expect(changed.workflow).toBe('goal');
+    const done = await poll(task.id, 'done');
+    expect(done.workflow).toBe('goal');
+    // The searchable mode changes, while replay accounting retains the actual
+    // Temporal definition that started this run.
+    expect(h.store.getTask(task.id)).toMatchObject({
+      workflow: 'goal',
+      executionWorkflow: 'software-dev',
+      workflowVersion: '1.4.0',
+    });
   });
 
   it('saves a draft (not queued), then queues it to completion', async () => {

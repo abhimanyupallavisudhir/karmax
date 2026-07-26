@@ -26,6 +26,14 @@ const ICON = {
   send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
 };
+const DEFAULT_TASK_QUERY = 'group:tag';
+
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  installPrompt = event;
+});
+window.addEventListener('appinstalled', () => { installPrompt = null; });
 
 const S = {
   token: null,
@@ -54,7 +62,7 @@ const S = {
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
-  search: '', // the working query string (Linear-style tokens + free text)
+  search: DEFAULT_TASK_QUERY, // the working query string (Linear-style tokens + free text)
   // Task organization (PLAN-search-views): a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
@@ -80,7 +88,8 @@ const S = {
 // Non-principal attempts are intentionally absent from S.tasks because the list
 // has one row per logical task. Page lookups must also consult the loaded group.
 function taskRecord(id) {
-  return (S.attemptGroup?.attempts || []).find((t) => t.id === id) || (S.tasks || []).find((t) => t.id === id);
+  return (S.attemptGroup?.attempts || []).find((t) => t.id === id)
+    || (S.tasks || []).find((t) => t.id === id);
 }
 
 // ── URL routing (SPEC §10.6) ────────────────────────────────────────────────
@@ -223,6 +232,7 @@ async function applyRoute() {
         await loadCollaboration().catch(() => {});
       }
     }
+    await loadOrganizationRuntimeCatalog();
     // Bare /<org> → that org's default project (or its dashboard); pre-org URLs
     // (/dashboard, /organization, …) → rewrite to the org-prefixed form. Only
     // redirect when the canonical path actually differs, so an unresolvable slug
@@ -261,6 +271,7 @@ async function applyRoute() {
   }
   const pid = proj.id;
   S.organizationId = proj.organizationId || S.organizationId;
+  await loadOrganizationRuntimeCatalog();
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
@@ -268,7 +279,7 @@ async function applyRoute() {
     // new project (they'd otherwise re-run the old query against new data and
     // highlight a view/cursor that doesn't exist here).
     S.projectId = pid;
-    S.search = '';
+    S.search = DEFAULT_TASK_QUERY;
     S.activeView = null;
     S.searchResult = null;
     S.cursorId = null;
@@ -342,6 +353,18 @@ function installLinkRouter() {
   });
 }
 
+// Tag chips are navigation everywhere they appear. Capture before row/form click
+// handlers so a chip never opens a task or mutates its tags as a side effect.
+function installTagRouter() {
+  document.addEventListener('click', (ev) => {
+    const chip = ev.target.closest('[data-tag-link]');
+    if (!chip) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    navigateToTagSection(chip.dataset.tagLink);
+  }, true);
+}
+
 // Push a task permalink (in place), remembering where to return on close.
 function goToTask(id) { return spaNavigate(taskUrl(id)); }
 
@@ -384,9 +407,8 @@ function principalLabel(principal) {
 const WORKFLOWS = [
   { id: 'software-dev', label: 'Software dev' },
   { id: 'goal', label: 'Goal (auto-run)' },
-  { id: 'just-do', label: 'Just do' },
-  { id: 'script-exec', label: 'Script' },
 ];
+const workflowLabel = (id) => WORKFLOWS.find((w) => w.id === id)?.label || id;
 
 const NODES = [
   { key: 'setup', label: 'Setup' },
@@ -398,9 +420,11 @@ const NODES = [
 ];
 
 // Provider → model choices for the agent field (free-text also allowed).
+const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 const MODELS = {
   claude: ['claude-sonnet-5', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-fable-5'],
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
+  opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   mock: ['mock'],
 };
 function modelOptions(provider) {
@@ -587,7 +611,7 @@ function renderAgentField(f, spec, inherited) {
   const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId);
   return `<div class="agent-field" data-agent="${esc(role)}" ${inhAttr(inh)}>
     <div class="agent-controls">
-      <select class="af-provider">${['claude', 'codex', 'mock'].map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
+      <select class="af-provider">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
       <div class="combo af-model-combo" style="flex:1;min-width:140px">
         <input class="af-model" placeholder="model" value="${esc(e.model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
@@ -667,7 +691,7 @@ function cfLayerHtml(f, layer, agentDefault) {
       <div class="task-sub">Comma-separated. Teams use readable routes such as @team:leaders. Add sequential human steps when different people must confirm in order.</div>
     </div>
     <div class="cf-agent" style="margin-top:8px;${isAgent ? '' : 'display:none'}">${renderAgentField(f, isAgent ? layer : agentDefault, isAgent ? {} : agentDefault)}
-      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
+      <div style="font-size:11px;color:var(--ink-3);margin:8px 0 4px">Review-request prompt — sent to this agent at each Review. Type @ to add context from the wiki. Placeholders: {{prompt}} (the task prompt), {{response}} (the agent's latest response); also {{reviewInfo}}, {{changedFiles}}, {{transcript}}.</div>
       <textarea class="cf-prompt" rows="6" style="width:100%;resize:vertical">${esc(promptVal)}</textarea>
     </div>
   </div>`;
@@ -950,6 +974,16 @@ function cfSync(box) {
   if (empty) empty.style.display = rows.length ? 'none' : '';
 }
 
+// Review-request prompts accept the same project/org wiki mentions as the task
+// prompt and follow-up composer. The resolver scans the rendered request when the
+// Confirm turn starts; wireWikiMention supplies the shared search/picker UI.
+function wireConfirmerWikiPrompts(root) {
+  // Kept guarded for hosts upgrading from a build before wiki mentions existed;
+  // current builds always provide the shared picker.
+  if (typeof wireWikiMention !== 'function') return;
+  root.querySelectorAll('.cf-prompt').forEach((prompt) => wireWikiMention(prompt, S.projectId));
+}
+
 // Confirmer fields: an editable layer list. Row controls are delegated to the box
 // so a reset (which re-renders the rows) needs no re-wiring; only dynamically
 // added agent sub-forms are wired as they appear.
@@ -985,6 +1019,7 @@ function wireConfirmerField(box) {
       if (kind === 'agent' && firstHuman) list.insertBefore(row, firstHuman);
       else list.appendChild(row);
       row.querySelectorAll('.agent-field').forEach(wireAgentBox);
+      wireConfirmerWikiPrompts(row);
       cfSync(box); changed();
     }
   });
@@ -998,6 +1033,7 @@ function wireConfirmerField(box) {
     const hb = row.querySelector('.cf-human');
     if (hb) hb.style.display = e.target.value === 'human' ? '' : 'none';
   });
+  wireConfirmerWikiPrompts(box);
   cfSync(box);
 }
 
@@ -1095,6 +1131,7 @@ function resetConfirmerField(box, attr = 'data-inherit') {
   // the box, so only the fresh agent sub-forms need wiring.
   list.innerHTML = cfListHtml(f, cfLayersOf(inh), agentDefault);
   list.querySelectorAll('.agent-field').forEach(wireAgentBox);
+  wireConfirmerWikiPrompts(list);
   cfSync(box);
   // This composite control is rebuilt rather than assigned through an input.
   // Emit the same event as a user edit so draft auto-save persists the reset;
@@ -1573,7 +1610,9 @@ async function boot() {
   }
   if (!S.organizationId) S.organizationId = S.projects.find((p) => p.organizationId)?.organizationId || S.organizations[0]?.id || null;
   await loadCollaboration().catch(() => {});
-  const projectScope = S.projectId ? `?projectId=${encodeURIComponent(S.projectId)}` : '';
+  const projectScope = S.projectId
+    ? `?projectId=${encodeURIComponent(S.projectId)}`
+    : S.organizationId ? `?organizationId=${encodeURIComponent(S.organizationId)}` : '';
   try {
     S.contributions = await api(`/api/contributions${projectScope}`);
     S.schema = await api(`/api/schema${projectScope}`);
@@ -1584,6 +1623,7 @@ async function boot() {
   renderShell();
   bindKeys();
   installLinkRouter();
+  installTagRouter();
   // A background repaint deferred to protect an open menu / text-selection gets
   // flushed once that interaction releases (setTimeout lets focus + selection
   // settle first). selectionchange fires constantly, so it only pokes the flush
@@ -1599,6 +1639,22 @@ async function loadProjects() {
   S.projects = await api('/api/projects');
   if (!S.projectId && S.projects[0]) S.projectId = S.projects[0].id;
   if (S.projectId) S.organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
+}
+
+async function loadOrganizationRuntimeCatalog() {
+  if (!S.organizationId || S.catalogOrganizationId === S.organizationId) return;
+  const query = `?organizationId=${encodeURIComponent(S.organizationId)}`;
+  try {
+    const [schema, models] = await Promise.all([
+      api(`/api/schema${query}`),
+      api(`/api/models${query}`),
+    ]);
+    S.schema = schema;
+    S.modelCatalog = models.providers;
+    S.catalogOrganizationId = S.organizationId;
+  } catch {
+    // Keep the last usable built-in catalog; task creation remains server-validated.
+  }
 }
 
 async function loadOrganizations() {
@@ -1664,6 +1720,7 @@ function tagPathStr(id) {
   while (cur && !seen.has(cur.id)) { seen.add(cur.id); parts.unshift(cur.name); cur = cur.parentId ? tagById(cur.parentId) : null; }
   return parts.join('/');
 }
+function tagSectionId(id) { return `tag-section-${id}`; }
 const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
 
 // Evaluate the working query on the server and stash the result. The default list
@@ -1677,7 +1734,12 @@ async function runSearch() {
     const live = new Map(S.tasks.map((t) => [t.id, t]));
     const overlay = (t) => ({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
     r.tasks = (r.tasks || []).map(overlay);
-    if (r.groups) r.groups = r.groups.map((g) => ({ ...g, tasks: (g.tasks || []).map(overlay) }));
+    const overlayGroups = (groups) => (groups || []).map((g) => ({
+      ...g,
+      tasks: (g.tasks || []).map(overlay),
+      ...(g.children ? { children: overlayGroups(g.children) } : {}),
+    }));
+    if (r.groups) r.groups = overlayGroups(r.groups);
     S.searchResult = r;
   } catch { S.searchResult = null; }
 }
@@ -1696,6 +1758,24 @@ async function setQuery(q) {
   if (box) box.value = S.search;
   await runSearch();
   if (S.tab === 'tasks') renderMain();
+}
+
+// Leave any detail/modal surface, restore the canonical tag-grouped list, and
+// place the requested tag section at the top of the viewport.
+async function navigateToTagSection(tagId) {
+  const tag = tagById(tagId);
+  if (!tag) return;
+  $('#modal-root').innerHTML = '';
+  S.activeView = null;
+  S.search = DEFAULT_TASK_QUERY;
+  await go(projectRoute(tag.projectId));
+  const section = document.getElementById(tagSectionId(tagId));
+  if (!section) return;
+  section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  section.classList.remove('tag-section-target');
+  requestAnimationFrame(() => section.classList.add('tag-section-target'));
+  section.querySelector('.tag-section-heading')?.focus({ preventScroll: true });
+  setTimeout(() => section.classList.remove('tag-section-target'), 1600);
 }
 
 // Replace a directive token (group:/sort:) in the query string, or remove it when
@@ -1748,7 +1828,7 @@ function connectWs() {
         S.liveOutput = ev.payload.text;
         updateLiveBubble();
       } else if (ev.type === 'agent.activity' || ev.type === 'conversation.message') {
-        if (S.taskTab === 'checkin') renderTaskPage();
+        if (S.taskTab === 'checkin') scheduleTaskPageRender();
         else renderTaskEvents();
       }
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result') {
@@ -1781,6 +1861,7 @@ function renderShell() {
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
+      <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
       <div class="brand"><span class="mark">◇</span> karmax</div>
       <select class="org-switcher" id="org-switcher" title="Organization">
         ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
@@ -1797,6 +1878,7 @@ function renderShell() {
     </div>
     <div class="body">
       <div class="rail" id="rail"></div>
+      <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>`;
   // Project-scoped query/filtering lives in the task list. The topbar finder is
@@ -1804,6 +1886,21 @@ function renderShell() {
   $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#topbar-help').addEventListener('click', openHelp);
+  const closeMobileNav = () => {
+    $('#rail')?.classList.remove('mobile-open');
+    $('#rail-scrim')?.classList.remove('visible');
+    $('#mobile-menu')?.setAttribute('aria-expanded', 'false');
+  };
+  $('#mobile-menu')?.addEventListener('click', () => {
+    const open = !$('#rail')?.classList.contains('mobile-open');
+    $('#rail')?.classList.toggle('mobile-open', open);
+    $('#rail-scrim')?.classList.toggle('visible', open);
+    $('#mobile-menu')?.setAttribute('aria-expanded', String(open));
+  });
+  $('#rail-scrim')?.addEventListener('click', closeMobileNav);
+  $('#rail')?.addEventListener('click', (event) => {
+    if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
+  });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
   $('#org-switcher')?.addEventListener('change', async (e) => {
     if (e.target.value === '__new') return createOrganization();
@@ -1820,6 +1917,14 @@ function renderShell() {
 function renderRail() {
   const rail = $('#rail');
   if (!rail) return;
+  // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
+  // event. If the user has keyboard-focused a rail row (g P → j/k), the innerHTML
+  // swap would drop that focus a few seconds later, "un-focusing" the sidebar under
+  // them. Snapshot the focused row's stable identity and re-focus the matching row.
+  const active = document.activeElement;
+  const focusedKey = active && rail.contains(active)
+    ? (active.dataset.id ? `[data-id="${active.dataset.id}"]` : active.id ? `#${active.id}` : active.dataset.tab ? `[data-tab="${active.dataset.tab}"]` : null)
+    : null;
   rail.innerHTML = `
     <div class="label">Projects</div>
     ${S.projects.filter((p) => !S.organizationId || p.organizationId === S.organizationId)
@@ -1839,6 +1944,7 @@ function renderRail() {
   // Dashboard/Wiki/Settings entries are real <a> links — installLinkRouter()
   // routes their plain click in place and the browser handles new-tab gestures.
   $('#new-project')?.addEventListener('click', newProject);
+  if (focusedKey) { try { rail.querySelector(focusedKey)?.focus({ preventScroll: true }); } catch {} }
 }
 
 function switchTab(tab) {
@@ -1863,9 +1969,13 @@ function captureFocus(root) {
   if (tag !== 'SELECT' && typeof el.selectionStart === 'number') {
     st.selectionStart = el.selectionStart;
     st.selectionEnd = el.selectionEnd;
-    // A multi-line field scrolls its own content; a fresh element resets to the
-    // top, so snapshot the internal scroll and put it back with the caret.
+    // A field scrolls its own content; a fresh element resets to the top-left, so
+    // snapshot the internal scroll and put it back with the caret. scrollLeft is
+    // the one that bites in a single-line <input>: setSelectionRange restores the
+    // caret but does NOT re-scroll the box to reveal it, so a long line otherwise
+    // snaps back to its start on every WS-driven repaint while the caret stays put.
     st.scrollTop = el.scrollTop;
+    st.scrollLeft = el.scrollLeft;
   }
   return st;
 }
@@ -1885,6 +1995,7 @@ function restoreFocus(root, st) {
     try { el.setSelectionRange(st.selectionStart, st.selectionEnd); } catch {}
   }
   if (typeof st.scrollTop === 'number') el.scrollTop = st.scrollTop;
+  if (typeof st.scrollLeft === 'number') el.scrollLeft = st.scrollLeft;
 }
 
 // A background (WebSocket-driven) refresh repaints #main by swapping its
@@ -1918,6 +2029,19 @@ function flushBgRender() {
   if (main && interactionInFlight(main)) return; // still busy — wait for the next release
   bgRenderQueued = false;
   renderMain();
+}
+
+// A live agent emits a burst of conversation.message / agent.activity events (each
+// tool call is one), and every one used to fire a full renderTaskPage() rebuild
+// synchronously — so a single turn could repaint the whole page a dozen times in a
+// frame, which is what made scrolling the conversation feel janky. Coalesce the
+// WS-driven repaints into one per animation frame: the last state wins and the
+// browser paints once, at a frame boundary.
+let taskPageRenderQueued = false;
+function scheduleTaskPageRender() {
+  if (taskPageRenderQueued) return;
+  taskPageRenderQueued = true;
+  requestAnimationFrame(() => { taskPageRenderQueued = false; renderTaskPage(); });
 }
 
 // ── main content ───────────────────────────────────────────────────────────
@@ -1994,15 +2118,17 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// The default list transparently hides two kinds of noise unless the query opts in:
-// archived tasks (`-is:archived`) and the auto-spawned *runs* of a repeatable series
-// (`-is:run`), so a cron series doesn't flood the list — its template still shows, and
-// you drill into runs with `is:run` (or the Repeatable/Archived views). Archived and runs
-// are therefore just facets, not toggles. The clean `S.search` stays in the box; only the
-// evaluated query carries the defaults. If the query already mentions a facet, we leave it.
+// The default list transparently hides three kinds of noise unless the query opts in:
+// archived tasks (`-is:archived`), the auto-spawned *runs* of a repeatable series
+// (`-is:run`), and delegated *sub-tasks* (`-is:subtask`) — a sub-task lives under its
+// parent's detail page, not as a sibling at the top level, so a fan-out of children
+// doesn't flood the list. Its parent still shows, and you drill into children with
+// `is:subtask` (or the Sub-tasks/Repeatable/Archived views). These are therefore just
+// facets, not toggles. The clean `S.search` stays in the box; only the evaluated query
+// carries the defaults. If the query already mentions a facet, we leave it.
 // The task-picker overlay passes its own facet list (e.g. the fork search keeps archived).
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
-function effectiveQuery(q, facets = ['archived', 'run']) {
+function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
   let s = (q || '').trim();
   for (const facet of facets) if (!queryMentionsFacet(s, facet)) s = `${s} -is:${facet}`.trim();
   return s;
@@ -2015,10 +2141,11 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:subtasks', name: 'Sub-tasks', icon: '↳', query: 'is:subtask' },
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
-// The saved-views switcher — every chip is a query. "All" is the default; then the
+// The saved-views switcher — every chip is a query. "All" is the tag-grouped default; then the
 // built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
   const builtins = BUILTIN_VIEWS
@@ -2126,27 +2253,34 @@ function tasksView() {
   // hide runs from every list surface (flat + grouped) below.
   S._runsBySeries = {};
   for (const t of S.tasks) if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
-  const notRun = (t) => !t.params?.runOf;
+  // Runs nest under their series row and sub-tasks nest under their parent's detail page,
+  // so by default neither belongs in the flat top-level list. The server already drops both
+  // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
+  // and it opts back in when the query explicitly asks for that facet (the Sub-tasks view's
+  // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
+  const keepRun = queryMentionsFacet(S.search, 'run');
+  const keepSub = queryMentionsFacet(S.search, 'subtask');
+  const topLevel = (t) => (keepRun || !t.params?.runOf) && (keepSub || !t.parentTaskId);
   // The server already applied the query (incl. the default -is:archived from effectiveQuery).
   // Fallback (before the first result lands) filters client-side and drops archived to match.
   const flat = (r
     ? r.tasks
     : S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-  ).filter(notRun);
+  ).filter(topLevel);
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
   let body;
   if (groups) {
-    body = groups
-      .map((g) => {
-        const gt = g.tasks.filter(notRun);
+    body = r.hierarchical
+      ? groups.map((g) => tagGroupHtml(g, topLevel)).join('')
+      : groups.map((g) => {
+        const gt = g.tasks.filter(topLevel);
         return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
-      })
-      .join('');
+      }).join('');
   } else {
     body = flat.map(taskRow).join('');
   }
-  const empty = S.search
+  const empty = S.search !== DEFAULT_TASK_QUERY
     ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
     : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
@@ -2163,22 +2297,52 @@ function tasksView() {
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
-        ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
+        ${S.search !== DEFAULT_TASK_QUERY ? `<button class="search-x" id="q-clear" title="Restore the default view (Esc)">✕</button>` : ''}
       </div>
       ${viewsBar()}
       ${queryToolbarHtml(S.search || '', 'q', `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`)}
     </div>
     <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
-      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
+      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search !== DEFAULT_TASK_QUERY ? ' · filtered' : ''}</span>
     </div>
     ${body || empty}`;
+}
+
+function tagGroupHtml(group, keep, depth = 0) {
+  const ownTasks = (group.tasks || []).filter(keep);
+  const children = (group.children || []).map((child) => tagGroupHtml(child, keep, depth + 1)).join('');
+  const count = tagGroupVisibleTasks(group, keep).size;
+  if (!count) return '';
+  const tag = tagById(group.key);
+  const level = Math.min(6, depth + 2);
+  const edit = tag
+    ? `<button class="icon-btn tag-section-edit" data-edit-tag="${esc(tag.id)}" title="Edit ${esc(group.path || group.label)}" aria-label="Edit tag">✎</button>`
+    : '';
+  const description = tag?.description
+    ? `<div class="tag-section-description">${esc(tag.description)}</div>`
+    : '';
+  return `<section class="tag-section tag-depth-${Math.min(depth, 5)}" id="${esc(tagSectionId(group.key))}" data-tag-section="${esc(group.key)}">
+    <h${level} class="tag-section-heading" tabindex="-1">
+      <span class="tag-section-name">${esc(group.label)}</span>
+      <span class="pill">${count}</span>${edit}
+    </h${level}>
+    ${description}
+    <div class="tag-section-tasks">${ownTasks.map(taskRow).join('')}</div>
+    <div class="tag-section-children">${children}</div>
+  </section>`;
+}
+
+function tagGroupVisibleTasks(group, keep, seen = new Map()) {
+  for (const task of group.tasks || []) if (keep(task)) seen.set(task.id, task);
+  for (const child of group.children || []) tagGroupVisibleTasks(child, keep, seen);
+  return seen;
 }
 
 // Small colored tag chip + priority flag shown on a task row.
 function tagChips(t) {
   if (!t.tags || !t.tags.length) return '';
   return t.tags
-    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<span class="tag-chip ${tag.kind || ''}"${c}>${esc(tagPathStr(id))}</span>`; })
+    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<button type="button" class="tag-chip tag-link ${tag.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`; })
     .join('');
 }
 function priorityFlag(t) {
@@ -2233,12 +2397,11 @@ function seriesRow(t) {
 function runSubRow(r) {
   const v = r.lastView || {};
   const status = v.status || 'active';
-  const stage = v.stage || 'setup';
   return `
     <div class="task-row run-row" data-id="${r.id}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stage)}</span></div>
+        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span></div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
       <div class="task-right">${pipeline(v)}</div>
@@ -2311,12 +2474,13 @@ function customBranch(v, taskId) {
   return v.branch && v.branch !== `karmax/${taskId}`;
 }
 
-// Human-facing stage label. In the `merge` stage a task is either waiting for
-// its merge-queue slot or actively merging — the merge agent only runs once the
-// slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
-// "merge queued" for the wait, which the raw `stage` alone hides.
+// Human-facing task-state label. A wait reason is more useful than the pipeline
+// position while a task is parked: the pipeline already shows that it is in Do,
+// Review, etc. In the `merge` stage, old/in-flight views may not have waitingFor,
+// so retain the mergeGranted fallback for their merge-queue wait (SPEC §6.1).
 function stageLabel(v) {
   if (v.state?.draft) return 'draft';
+  if (v.waitingFor) return waitingText(v.waitingFor);
   const stage = v.stage || 'setup';
   if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
   return stage;
@@ -2378,12 +2542,12 @@ function pipelineLarge(v) {
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
 function wireOrgControls() {
   const main = $('#main');
-  // Saved-view chips: each selects a query; "All" is the default (empty) view.
+  // Saved-view chips: each selects a query; "All" is the default tag-grouped view.
   main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      if (id === '__all__') { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
       if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
@@ -2402,21 +2566,21 @@ function wireOrgControls() {
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
-        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
+        if (S.activeView === id) { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); } else renderMain();
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
   $('#manage-tags')?.addEventListener('click', openTagsManager);
-  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
     search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search !== DEFAULT_TASK_QUERY) { e.stopPropagation(); S.activeView = null; setQuery(DEFAULT_TASK_QUERY); } });
   }
 
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => { S.activeView = null; setQuery(q); } });
@@ -2678,47 +2842,117 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   search.focus();
 }
 
-// Project tag catalogue manager — create/rename/recolor/reparent/delete tags.
-function openTagsManager() {
+// Project tag catalogue manager — create and fully edit tag metadata/hierarchy.
+function openTagsManager(initialEditId = null) {
   const root = $('#modal-root');
+  let editingId = initialEditId;
+  const refresh = async () => {
+    await loadOrg();
+    if (S.tab === 'tasks') await runSearch();
+    draw();
+    if (S.tab === 'tasks') renderMain();
+  };
   const draw = () => {
+    const sorted = S.tags.slice().sort((a, b) => tagPathStr(a.id).localeCompare(tagPathStr(b.id)));
     const rows = S.tags.length
-      ? S.tags.map((t) => `<div class="tagm-row">
-          <span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''}>${esc(tagPathStr(t.id))}</span>
-          <span class="pal-sub">${esc(t.kind || '')}</span>
+      ? sorted.map((t) => `<div class="tagm-row ${editingId === t.id ? 'active' : ''}">
+          <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
+          <span class="tagm-summary">
+            <span class="pal-sub">${esc(t.kind || 'general')}</span>
+            ${t.description ? `<span class="tagm-description">${esc(t.description)}</span>` : ''}
+          </span>
           <span class="q-spacer"></span>
-          <button class="btn sm" data-rename="${t.id}">Rename</button>
-          <button class="btn sm danger" data-deltag="${t.id}">Delete</button>
+          <button class="btn sm" data-edittag="${esc(t.id)}">Edit</button>
+          <button class="btn sm danger" data-deltag="${esc(t.id)}">Delete</button>
         </div>`).join('')
       : `<div class="pal-empty">No tags yet.</div>`;
-    root.innerHTML = `<div class="palette-scrim" id="tagm-scrim"><div class="palette tagm">
-      <div class="fp-head">Tags</div>
+    const editing = tagById(editingId);
+    const blockedParents = new Set(editing ? [editing.id] : []);
+    if (editing) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const tag of S.tags) if (tag.parentId && blockedParents.has(tag.parentId) && !blockedParents.has(tag.id)) {
+          blockedParents.add(tag.id);
+          changed = true;
+        }
+      }
+    }
+    const parentOptions = sorted
+      .filter((tag) => !blockedParents.has(tag.id))
+      .map((tag) => `<option value="${esc(tag.id)}" ${editing?.parentId === tag.id ? 'selected' : ''}>${esc(tagPathStr(tag.id))}</option>`)
+      .join('');
+    const editForm = editing ? `<div class="tagm-form tagm-edit">
+      <div class="tagm-form-head"><div><b>Edit tag</b><span class="pal-sub">${esc(tagPathStr(editing.id))}</span></div><button class="icon-btn" id="tagm-cancel-edit" aria-label="Close editor">✕</button></div>
+      <label>Name<input id="tagm-edit-name" class="title-in" value="${esc(editing.name)}" /></label>
+      <label>Parent<select id="tagm-edit-parent" class="q-sel"><option value="">No parent (top level)</option>${parentOptions}</select></label>
+      <label>Kind<select id="tagm-edit-kind" class="q-sel"><option value="" ${!editing.kind ? 'selected' : ''}>general</option><option value="topic" ${editing.kind === 'topic' ? 'selected' : ''}>topic</option><option value="type" ${editing.kind === 'type' ? 'selected' : ''}>type</option></select></label>
+      <label class="tagm-color-field">Color <input id="tagm-edit-color" type="color" value="${esc(editing.color || '#6b7fd7')}" /><span><input id="tagm-edit-use-color" type="checkbox" ${editing.color ? 'checked' : ''} /> Use color</span></label>
+      <label class="tagm-description-field">Description<textarea id="tagm-edit-description" rows="4" placeholder="Optional context shown at the start of this tag's section.">${esc(editing.description || '')}</textarea></label>
+      <div class="tagm-actions"><button class="btn primary" id="tagm-save-edit">Save changes</button></div>
+    </div>` : '';
+    root.innerHTML = `<div class="palette-scrim" id="tagm-scrim"><div class="palette tagm" role="dialog" aria-label="Manage tags">
+      <div class="fp-head"><span>Tags</span><span class="pal-sub">Organize the task list into nested sections.</span><button class="icon-btn" id="tagm-close" aria-label="Close">✕</button></div>
       <div id="tagm-list">${rows}</div>
-      <div class="tagm-new">
-        <input id="tagm-name" class="title-in" placeholder="new tag  ·  use / for nesting (e.g. frontend/web)" />
-        <select id="tagm-kind" class="q-sel"><option value="topic">topic</option><option value="type">type</option></select>
-        <input id="tagm-color" type="color" value="#6b7fd7" title="color" />
-        <button class="btn primary" id="tagm-add">Add tag</button>
+      ${editForm}
+      <div class="tagm-form tagm-new">
+        <div class="tagm-form-head"><b>Create a tag</b><span class="pal-sub">Use / in the name to create nested parents.</span></div>
+        <label>Name or path<input id="tagm-name" class="title-in" placeholder="e.g. frontend/web" /></label>
+        <label>Kind<select id="tagm-kind" class="q-sel"><option value="">general</option><option value="topic" selected>topic</option><option value="type">type</option></select></label>
+        <label class="tagm-color-field">Color <input id="tagm-color" type="color" value="#6b7fd7" /><span><input id="tagm-use-color" type="checkbox" checked /> Use color</span></label>
+        <label class="tagm-description-field">Description<textarea id="tagm-description" rows="3" placeholder="Optional context shown at the start of this tag's section."></textarea></label>
+        <div class="tagm-actions"><button class="btn primary" id="tagm-add">Create tag</button></div>
       </div>
       <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth).</div>
     </div></div>`;
-    $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') root.innerHTML = ''; });
+    const close = () => (root.innerHTML = '');
+    $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') close(); });
+    $('#tagm-close').addEventListener('click', close);
     const addTag = async () => {
       const name = $('#tagm-name').value.trim(); if (!name) return;
       try {
-        await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({ name, kind: $('#tagm-kind').value, color: $('#tagm-color').value }) });
-        await loadOrg(); draw();
+        const kind = $('#tagm-kind').value || undefined;
+        await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({
+          name,
+          kind,
+          color: $('#tagm-use-color').checked ? $('#tagm-color').value : undefined,
+          description: $('#tagm-description').value,
+        }) });
+        await refresh();
+        toast(`Created tag “${name}”`);
       } catch (e) { toast(e.message, true); }
     };
     $('#tagm-add').addEventListener('click', addTag);
-    $('#tagm-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') addTag(); });
-    root.querySelectorAll('[data-rename]').forEach((b) => b.addEventListener('click', async () => {
-      const t = tagById(b.dataset.rename); const name = prompt('Rename tag:', t?.name); if (!name) return;
-      try { await api(`/api/tags/${b.dataset.rename}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await loadOrg(); draw(); if (S.tab === 'tasks') renderMain(); } catch (e) { toast(e.message, true); }
+    $('#tagm-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addTag(); } });
+    root.querySelectorAll('[data-edittag]').forEach((button) => button.addEventListener('click', () => {
+      editingId = button.dataset.edittag;
+      draw();
     }));
+    $('#tagm-cancel-edit')?.addEventListener('click', () => { editingId = null; draw(); });
+    $('#tagm-save-edit')?.addEventListener('click', async () => {
+      const name = $('#tagm-edit-name').value.trim();
+      if (!name) return toast('Tag name is required', true);
+      try {
+        await api(`/api/tags/${editing.id}`, { method: 'PATCH', body: JSON.stringify({
+          name,
+          parentId: $('#tagm-edit-parent').value || null,
+          kind: $('#tagm-edit-kind').value || null,
+          color: $('#tagm-edit-use-color').checked ? $('#tagm-edit-color').value : null,
+          description: $('#tagm-edit-description').value,
+        }) });
+        await refresh();
+        toast('Tag updated');
+      } catch (e) { toast(e.message, true); }
+    });
     root.querySelectorAll('[data-deltag]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm('Delete this tag? Its children are promoted to its parent and it is removed from all tasks.')) return;
-      try { await api(`/api/tags/${b.dataset.deltag}`, { method: 'DELETE' }); await loadOrg(); draw(); if (S.tab === 'tasks') { await runSearch(); renderMain(); } } catch (e) { toast(e.message, true); }
+      const tag = tagById(b.dataset.deltag);
+      if (!confirm(`Delete “${tagPathStr(tag?.id)}”? Its children are promoted to its parent and it is removed from every task.`)) return;
+      try {
+        await api(`/api/tags/${b.dataset.deltag}`, { method: 'DELETE' });
+        if (editingId === b.dataset.deltag) editingId = null;
+        await refresh();
+        toast('Tag deleted');
+      } catch (e) { toast(e.message, true); }
     }));
   };
   draw();
@@ -2726,6 +2960,12 @@ function openTagsManager() {
 
 function wireTasksView() {
   wireOrgControls();
+  $('#main').querySelectorAll('[data-edit-tag]').forEach((button) =>
+    button.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openTagsManager(button.dataset.editTag);
+    }),
+  );
   $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => wireTaskNav(e, () => e.dataset.id));
   $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
@@ -3083,6 +3323,10 @@ async function openTaskForm(workflow, draft, seedText) {
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
             </div>` : ''}
+            <div class="form-row" data-row="__vault">
+              <div class="label-row"><label title="Which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Agents can request more mid-task; you approve each request.">Vault credentials</label></div>
+              <div id="tf-vault-grants" style="font-size:12px">Loading…</div>
+            </div>
             <div class="form-row" data-row="__creds">
               <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Credentials</label></div>
               <div id="cred-editor-newtask">Loading…</div>
@@ -3174,6 +3418,26 @@ async function openTaskForm(workflow, draft, seedText) {
   const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+  // The vault credential picker (PLAN-passwords.md §6): item grants layered onto
+  // the authorization package. Checkbox changes ride the #tf-body change
+  // listener into auto-save; grants persist via createTask/PATCH authorization.
+  (async () => {
+    const box = $('#tf-vault-grants');
+    if (!box) return;
+    // Vault items are organization-scoped — read the project's org's vault.
+    const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
+    let items = [];
+    try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); } catch { box.closest('[data-row="__vault"]')?.remove(); return; }
+    if (!items.length) {
+      box.closest('[data-row="__vault"]')?.remove();
+      return;
+    }
+    const granted = new Set((draft?.params?._authorization?.capabilities || [])
+      .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
+    box.innerHTML = items.map((i) => `<label style="display:flex;gap:6px;align-items:center;margin:2px 0;cursor:pointer">
+      <input type="checkbox" class="tf-vault-grant" value="use-credential:item:${esc(i.id)}" ${granted.has(i.id) ? 'checked' : ''} />
+      <span>${esc(i.label)}</span> <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(', ')) : ''}</span></label>`).join('');
+  })();
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
 
@@ -3202,7 +3466,12 @@ async function openTaskForm(workflow, draft, seedText) {
     // the replace:true auto-save preserves the user's choice.
     const ctx = $('#tf-context');
     if (ctx) body.wikiContext = String(ctx.value).split(/\s+/).map((t) => t.trim()).filter((t) => /^@(proj|org):\S/i.test(t));
-    return { body, notes: $('#tf-notes')?.value ?? '', authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization };
+    return {
+      body, notes: $('#tf-notes')?.value ?? '',
+      authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization,
+      // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
+      credentialGrants: [...document.querySelectorAll('.tf-vault-grant:checked')].map((b) => b.value),
+    };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
   // guards against spawning empty drafts just from opening the form.
@@ -3245,14 +3514,14 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
+          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
         }
-        if (localCred && hasPolicy()) await api(`/api/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
         // Quiet auto-save indicator in the page head. Guard on the form token: this
         // chain link can land after a NEWER form instance has mounted its own head.
@@ -3286,7 +3555,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, credentialGrants: state.credentialGrants, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -3322,13 +3591,13 @@ async function openTaskForm(workflow, draft, seedText) {
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
         await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
+        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
-        if (localCred && hasPolicy()) await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
+        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
+        if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
         // requested siblings have been materialised.
@@ -3337,13 +3606,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
-        await api('/api/credentials/policy', { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
+        await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -3480,7 +3749,7 @@ async function renderSeriesPage(rec) {
 function runPageRow(r) {
   const v = r.lastView || {};
   const status = v.status || 'active';
-  return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(v.stage || 'setup')}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
+  return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(stageLabel(v))}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
 // One compact selectable row per execution. The list remains one row per intent;
@@ -3576,14 +3845,23 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    // paramDefaults keys off the fetched view's workflow, so it follows the batch.
-    S.paramDefaults = await loadParamDefaults(taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
+  // Param defaults only feed the Parameters tab, and resolving them costs a git
+  // subprocess (defaultBranch) on the server — so they used to add that latency to
+  // the *front* of every task open (the paint waited on them). They key off the
+  // task's (project, workflow), which never change while it's open, so load them
+  // once, after the first paint, and repaint only if the user is still here and
+  // actually looking at the Parameters tab.
+  loadParamDefaults(taskId).then((d) => {
+    if (S.selected !== taskId) return; // navigated away before it landed
+    S.paramDefaults = d;
+    if (S.taskTab === 'parameters') renderTaskPage();
+  });
 }
 async function refreshTask() {
   if (!S.selected) return;
@@ -3608,7 +3886,10 @@ async function refreshTask() {
     S.widgets = widgets;
     S.sessions = sessions;
     S.attemptGroup = attempts;
-    S.paramDefaults = await loadParamDefaults(id);
+    // paramDefaults are NOT refetched here: they key off (project, workflow), which
+    // can't change under a live task, so the value from openTask still holds. This
+    // refresh runs on every `view.updated` WS push — re-resolving defaults would
+    // spawn a git subprocess (defaultBranch) on each one, for a value that never moved.
   } catch {}
   renderTaskPage();
 }
@@ -3641,7 +3922,14 @@ function closeTaskDom() {
 // page's Parameters tab (running tasks) and the task form (drafts).
 function orgEditorHtml(rec) {
   const prio = Number(rec?.params?.priority || 0);
-  const tags = (rec?.tags || []).map((id) => { const t = tagById(id); if (!t) return ''; return `<span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} data-untag="${id}" title="Remove">${esc(tagPathStr(id))} ✕</span>`; }).join('');
+  const tags = (rec?.tags || []).map((id) => {
+    const t = tagById(id); if (!t) return '';
+    const color = t.color ? `style="--tag:${esc(t.color)}"` : '';
+    return `<span class="tag-assignment" ${color}>
+      <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
+      <button type="button" class="tag-remove" data-untag="${esc(id)}" title="Remove ${esc(tagPathStr(id))} from this task" aria-label="Remove tag">×</button>
+    </span>`;
+  }).join('');
   const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? '▲ ' : ''}${n[0].toUpperCase() + n.slice(1)}</option>`).join('');
   return `<div class="org-editor">
     <label class="org-prio">Priority
@@ -3683,7 +3971,8 @@ function wireOrgEditor(rootEl, rec, opts) {
     if (S.tab === 'tasks') await runSearch();
     afterChange();
   };
-  box.querySelectorAll('[data-untag]').forEach((el) => el.addEventListener('click', () => {
+  box.querySelectorAll('[data-untag]').forEach((el) => el.addEventListener('click', (ev) => {
+    ev.stopPropagation();
     setTags((rec.tags || []).filter((id) => id !== el.dataset.untag)).catch((e) => toast(e.message, true));
   }));
   box.querySelector('.org-add-tag')?.addEventListener('click', () => openTagPicker(rec, setTags));
@@ -3709,6 +3998,15 @@ function openTagPicker(rec, setTags) {
   root.innerHTML = `<div class="palette-scrim" id="tp-scrim"><div class="palette fp">
     <input id="tp-in" placeholder="Type a tag…  use / for nesting (e.g. frontend/web)" autocomplete="off" spellcheck="false" />
     <div id="tp-list"></div>
+    <div id="tp-create-meta" class="tp-create-meta" hidden>
+      <div class="pal-sub">Optional details for the new tag</div>
+      <div class="tp-create-row">
+        <select id="tp-create-kind" class="q-sel"><option value="">general</option><option value="topic" selected>topic</option><option value="type">type</option></select>
+        <input id="tp-create-color" type="color" value="#6b7fd7" title="Tag color" />
+        <label><input id="tp-create-use-color" type="checkbox" checked /> Use color</label>
+      </div>
+      <textarea id="tp-create-description" rows="3" placeholder="Description shown at the start of this tag's section (optional)"></textarea>
+    </div>
   </div></div>`;
   const input = $('#tp-in');
   const list = $('#tp-list');
@@ -3718,7 +4016,12 @@ function openTagPicker(rec, setTags) {
     try {
       let id = item.id;
       if (item.create) {
-        const t = await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({ name: item.name }) });
+        const t = await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({
+          name: item.name,
+          kind: $('#tp-create-kind').value || undefined,
+          color: $('#tp-create-use-color').checked ? $('#tp-create-color').value : undefined,
+          description: $('#tp-create-description').value,
+        }) });
         await loadOrg();
         id = t.id;
       }
@@ -3737,6 +4040,7 @@ function openTagPicker(rec, setTags) {
     // Offer creation when the typed text doesn't already exist verbatim as a path.
     const exists = q && S.tags.some((t) => tagPathStr(t.id).toLowerCase() === ql);
     if (q && !exists) items.unshift({ create: true, name: q, path: q });
+    $('#tp-create-meta').hidden = !q || !!exists;
     active = 0;
     draw();
   };
@@ -3795,6 +4099,7 @@ function renderTaskPage() {
   main.innerHTML = `
     <div class="task-page">
       <div class="tp-head">
+        ${parentTaskContext(v)}
         <div class="row1">
           <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
@@ -3803,10 +4108,16 @@ function renderTaskPage() {
           <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
         </div>
         <div class="meta">
-          <span>${esc(v.workflow)}${rec?.workflowVersion ? ` <span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
+          <span>${v.workflowOptions?.length > 1
+            ? `<select id="tp-workflow-mode" aria-label="Workflow mode" title="${v.workflowSwitchable ? 'Switch workflow mode' : 'Workflow mode is locked after confirmation begins'}" ${v.workflowSwitchable ? '' : 'disabled'}>
+                ${v.workflowOptions.map((w) => `<option value="${esc(w)}" ${w === v.workflow ? 'selected' : ''}>${esc(workflowLabel(w))}</option>`).join('')}
+              </select>`
+            : esc(workflowLabel(v.workflow))}
+            ${rec?.workflowVersion ? `<span class="mono" style="color:var(--ink-3)">v${esc(rec.workflowVersion)}</span>` : ''}</span>
           ${customBranch(v, v.taskId) ? `<span>⎇ ${esc(v.branch)}</span>` : ''}
           ${v.targetBranch ? `<span>→ ${esc(v.targetBranch)}</span>` : ''}
           ${v.mergeQueue ? `<span>queue #${v.mergeQueue.position}/${v.mergeQueue.total}</span>` : ''}
+          ${rec ? orgEditorHtml(rec) : ''}
         </div>
         ${taskAttempts(v)}
         <div class="tabs tp-tabs">
@@ -3827,7 +4138,9 @@ function renderTaskPage() {
     }),
   );
   wireAttempts(v);
+  wireWorkflowMode(v);
   wireActions(v); // the footer action bar lives on every tab
+  wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
   if (tab === 'overview') {
     wireNotes(v);
     wireReviewActions(v);
@@ -3836,8 +4149,8 @@ function renderTaskPage() {
     wireCheckinSidebar(v);
     wireFollowups(v);
     wireTerminal(v.taskId);
+    wireWorldFileLinks(v);
   } else if (tab === 'parameters') {
-    wireTaskOrg(v);
     wireParams(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
   } else if (tab === 'advanced') {
@@ -3923,6 +4236,40 @@ function restoreThreadSelection(thread, snap) {
     sel.removeAllRanges();
     sel.addRange(range);
   } catch {}
+}
+
+function wireWorkflowMode(v) {
+  const select = document.getElementById('tp-workflow-mode');
+  if (!select) return;
+  select.addEventListener('change', async () => {
+    const prior = v.workflow;
+    const workflow = select.value;
+    select.disabled = true;
+    try {
+      const changed = await api(`/api/tasks/${v.taskId}/workflow`, {
+        method: 'PATCH',
+        body: JSON.stringify({ workflow }),
+      });
+      v.workflow = changed.workflow;
+      const rec = taskRecord(v.taskId);
+      if (rec) rec.workflow = changed.workflow;
+      toast(changed.workflow === 'goal'
+        ? 'Goal mode enabled — the agent will continue autonomously'
+        : 'Software Dev mode enabled — the task will stop at Review');
+      await Promise.all([refreshTask(), refreshTasks()]);
+      // The workflow just changed, and param defaults key off it — reload them here
+      // (refreshTask deliberately doesn't, to avoid a git subprocess per WS refresh).
+      loadParamDefaults(v.taskId).then((d) => {
+        if (S.selected !== v.taskId) return;
+        S.paramDefaults = d;
+        if (S.taskTab === 'parameters') renderTaskPage();
+      });
+    } catch (e) {
+      select.value = prior;
+      select.disabled = !v.workflowSwitchable;
+      toast(e.message, true);
+    }
+  });
 }
 
 // Switch the open task page to another of its tabs, pinning the tab in the URL
@@ -4076,7 +4423,56 @@ function makeTermScreen(maxLines = 2000) {
       row = Math.max(0, row - drop);
     }
   }
-  return { write, render: () => lines.join('\n') };
+  // render() joins the authoritative buffer; an optional `pending` string is the
+  // predicted (locally-echoed, not-yet-confirmed) tail — overlaid at the cursor
+  // without mutating the buffer, so the next server byte reconciles cleanly.
+  return {
+    write,
+    cursor: () => ({ row, col }),
+    render: (pending = '') => {
+      if (!pending) return lines.join('\n');
+      const out = lines.slice();
+      let line = out[row] ?? '';
+      if (line.length < col) line += ' '.repeat(col - line.length);
+      out[row] = line.slice(0, col) + pending + line.slice(col + pending.length);
+      return out.join('\n');
+    },
+  };
+}
+
+// Predictive local echo (mosh-style, conservative). Typing into a cloud world's
+// PTY costs a full network round-trip before the remote shell echoes the char
+// back, so without prediction every keystroke feels laggy. We optimistically
+// render printable characters the instant they're typed (`term.pending`), then
+// reconcile against the authoritative server stream: each echoed printable byte
+// confirms and drops one predicted char; anything unexpected (an escape sequence,
+// a mismatch — completion, prompt redraw, program output) discards the whole
+// prediction and lets the server drive. Non-printable keys (Enter, arrows, Tab,
+// Ctrl-*) can't be predicted safely, so they clear pending and defer to the shell.
+function predictInput(bytes, ctrl) {
+  if (!term) return;
+  if (!ctrl && bytes.length === 1 && bytes >= ' ' && bytes !== '\x7f') {
+    term.pending += bytes;                       // printable → echo locally now
+  } else if (bytes === '\x7f' && term.pending) {
+    term.pending = term.pending.slice(0, -1);    // backspace an unconfirmed char
+  } else {
+    term.pending = '';                           // Enter/arrows/Tab/Ctrl-* → server drives
+  }
+}
+
+// Consume the server's echo of characters we already predicted, so they don't
+// render twice. Stops (and discards remaining predictions) on the first byte that
+// doesn't match — the server is authoritative from that point on.
+function reconcilePrediction(data) {
+  if (!term || !term.pending) return;
+  for (let i = 0; i < data.length && term.pending; i++) {
+    const ch = data[i];
+    const code = data.charCodeAt(i);
+    if (ch === '\x1b') { term.pending = ''; return; }   // escape/redraw → drop predictions
+    if (code < 32 || code === 127) continue;            // ignore CR/LF/other controls
+    if (ch === term.pending[0]) term.pending = term.pending.slice(1); // confirmed
+    else { term.pending = ''; return; }                 // mismatch → server wins
+  }
 }
 
 // Translate a browser keydown into the bytes a PTY expects. Returns null to let
@@ -4111,13 +4507,13 @@ function keyToPtyBytes(e) {
 function bindTermScreen(out) {
   if (!term || !out) return;
   out.classList.remove('hidden');
-  out.textContent = term.screen.render();
-  out.scrollTop = out.scrollHeight;
+  const repaint = () => { out.textContent = term.screen.render(term.pending); out.scrollTop = out.scrollHeight; };
+  repaint();
   const ws = term.ws;
   ws.onmessage = (m) => {
     try {
       const msg = JSON.parse(m.data);
-      if (msg.type === 'data') { term.screen.write(msg.data); out.textContent = term.screen.render(); out.scrollTop = out.scrollHeight; }
+      if (msg.type === 'data') { reconcilePrediction(msg.data); term.screen.write(msg.data); repaint(); }
     } catch {}
   };
   const send = (data) => { if (term && term.ws && term.ws.readyState === 1) term.ws.send(JSON.stringify({ type: 'input', data })); };
@@ -4130,12 +4526,16 @@ function bindTermScreen(out) {
     e.preventDefault();
     e.stopPropagation();                                                // consumed by the shell — never let it trigger an app shortcut
     send(bytes);
+    predictInput(bytes, e.ctrlKey);                                     // optimistic local echo — hides the round-trip on cloud worlds
+    repaint();
   };
   out.onpaste = (e) => {
     const text = (e.clipboardData || window.clipboardData)?.getData('text');
     if (!text) return;
     e.preventDefault();
     send(text);
+    term.pending = '';                                                  // multi-line paste: let the shell echo authoritatively
+    repaint();
   };
 }
 
@@ -4143,9 +4543,10 @@ function openTerminal(taskId) {
   if (term && term.ws) { try { term.ws.close(); } catch {} }           // one check-in shell at a time
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/terminal?taskId=${encodeURIComponent(taskId)}${S.token ? `&token=${encodeURIComponent(S.token)}` : ''}`);
-  term = { taskId, ws, screen: makeTermScreen() };
+  term = { taskId, ws, screen: makeTermScreen(), pending: '' };
   ws.onclose = () => {
     if (!term || term.ws !== ws) return;                               // superseded by a newer session
+    term.pending = '';
     term.screen.write('\r\n[terminal closed]\r\n');
     const out = document.getElementById('term-out');
     if (out) out.textContent = term.screen.render();
@@ -4333,6 +4734,79 @@ function setStopBtn(running, procId, taskId) {
   };
 }
 
+// A child should always feel like part of its parent task, never like an orphaned
+// page. Keep the relationship in the task-page masthead where it reads as
+// navigation; `taskRecord` normally supplies the human title/number from the
+// project task pool, with a compact id fallback for old or partially loaded data.
+function parentTaskContext(v) {
+  const child = taskRecord(v.taskId);
+  const parentId = v.parentTaskId || child?.parentTaskId;
+  if (!parentId) return '';
+  const parent = taskRecord(parentId);
+  const label = parent
+    ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
+    : numLabel(parentId);
+  return `<button type="button" class="tp-parent" data-open="${esc(parentId)}" aria-label="Open parent task ${esc(label)}">
+    <span class="tp-parent-kicker">Sub-task of</span>
+    <span class="tp-parent-title">${esc(label)}</span>
+    <span class="tp-parent-arrow" aria-hidden="true">›</span>
+  </button>`;
+}
+
+// Turn workflow vocabulary into the one short state phrase a person needs while
+// scanning delegated work. The pipeline still carries exact stage progression;
+// this copy carries meaning.
+function subTaskState(rec) {
+  const v = rec?.lastView || {};
+  const status = v.status || 'active';
+  const stage = v.stage || 'setup';
+  if (status === 'done' || stage === 'done') return { label: 'Complete', tone: 'done', complete: true };
+  if (status === 'failed') return { label: 'Failed', tone: 'failed', complete: false };
+  if (status === 'cancelled') return { label: 'Cancelled', tone: 'cancelled', complete: false };
+  if (stage === 'escalated' || status === 'blocked') return { label: 'Needs direction', tone: 'blocked', complete: false };
+  if (stage === 'review') return { label: 'Ready to return', tone: 'waiting', complete: false };
+  if (v.waitingFor?.kind === 'parent') return { label: 'Waiting on parent', tone: 'waiting', complete: false };
+  if (status === 'waiting') return { label: 'Waiting', tone: 'waiting', complete: false };
+  return { label: 'In progress', tone: 'active', complete: false };
+}
+
+function subTasksSection(v) {
+  if (!v.subTasks?.length) return '';
+  const children = v.subTasks.map((id) => {
+    const rec = taskRecord(id);
+    const state = subTaskState(rec);
+    return { id, rec, state };
+  });
+  const complete = children.filter((child) => child.state.complete).length;
+  const progress = Math.round((complete / children.length) * 100);
+  const rows = children.map(({ id, rec, state }) => {
+    const title = rec?.title || `Sub-task ${numLabel(id)}`;
+    const childView = { workflow: rec?.workflow || v.workflow, ...(rec?.lastView || {}) };
+    return `<button type="button" class="subtask-row" data-open="${esc(id)}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
+      <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
+      <span class="subtask-identity">
+        <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
+        <span class="subtask-copy">${esc(state.label)} <span aria-hidden="true">·</span> ${esc(stageLabel(childView))}</span>
+      </span>
+      <span class="subtask-pipeline" aria-hidden="true">${pipeline(childView)}</span>
+      <span class="subtask-arrow" aria-hidden="true">›</span>
+    </button>`;
+  }).join('');
+  return `<section class="subtasks" aria-labelledby="subtasks-title">
+    <div class="subtasks-head">
+      <div>
+        <div class="subtasks-kicker">Delegated work</div>
+        <h3 id="subtasks-title">Sub-tasks</h3>
+      </div>
+      <div class="subtasks-count"><strong>${complete}</strong> of ${children.length} complete</div>
+    </div>
+    <div class="subtasks-progress" role="progressbar" aria-label="Sub-task completion" aria-valuemin="0" aria-valuemax="${children.length}" aria-valuenow="${complete}">
+      <span style="--subtask-progress:${progress}%"></span>
+    </div>
+    <div class="subtask-list">${rows}</div>
+  </section>`;
+}
+
 // ── the four task-page tabs ───────────────────────────────────────────────────
 // Overview: what the task IS and where it stands — pipeline, review, widgets,
 // sub-tasks, notes. Everything shown comes off the workflow's declared view.
@@ -4363,23 +4837,21 @@ function overviewTab(v) {
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
   const waiting = v.waitingFor
-    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
     : '';
-  const subtasks = v.subTasks?.length
-    ? `<div class="section-h">Sub-tasks</div>${v.subTasks.map((id) => `<div class="task-sub"><a class="branch sub-open" data-spa href="${taskUrl(id)}" style="cursor:pointer">↳ ${esc(numLabel(id))}</a></div>`).join('')}`
-    : '';
+  const subtasks = subTasksSection(v);
   return `
     <div class="section-h">Pipeline</div>
     ${pipelineLarge(v)}
     ${error}
     ${waiting}
     ${agentTurn}
+    ${subtasks}
     ${review}
     ${renderWidgetGroups(S.widgets)}
-    ${subtasks}
     ${notesSection(v)}`;
 }
 
@@ -4468,7 +4940,7 @@ function checkinTab(v) {
 function conversationPane(v, t) {
   if (!t) return '<div class="empty"><div class="big">No conversations yet</div>Agents appear here once the workflow starts one.</div>';
   const entries = conversationEntries(t);
-  const msgs = entries.map(renderConversationEntry).join('') || '<div class="msg system">No messages yet</div>';
+  const msgs = entries.map((entry) => renderConversationEntry(entry, v)).join('') || '<div class="msg system">No messages yet</div>';
   // Only the stage's own conversation gets the #live-bubble (one per page,
   // updated by the WS stream).
   const hasStructuredMessages = entries.some((entry) => entry.type === 'activity' && entry.activity.kind === 'message');
@@ -4584,16 +5056,91 @@ function conversationTimeHtml(ts) {
   return `<time datetime="${new Date(Number(ts)).toISOString()}" title="${esc(new Date(Number(ts)).toLocaleString())}">${esc(label)}</time>`;
 }
 
-function renderConversationEntry(entry) {
+// Render the small Markdown-link subset agents use for file citations without
+// changing the stored transcript. The anchor keeps the agent's exact href (so
+// Copy Link Address and every transcript/copy surface retain the original); a
+// click handler below may resolve it through the task's world instead.
+function renderConversationText(text, role, v = S.view) {
+  const source = String(text ?? '');
+  if (role !== 'agent') return esc(source);
+  const link = /\[([^\]\n]+)\]\(\s*(<[^>\n]+>|[^\s)]+)(?:\s+["'][^\n)]*["'])?\s*\)/g;
+  let html = '';
+  let at = 0;
+  for (const match of source.matchAll(link)) {
+    html += esc(source.slice(at, match.index));
+    const href = match[2].startsWith('<') ? match[2].slice(1, -1) : match[2];
+    const worldFile = worldFileTarget(href, v?.worldPath);
+    html += `<a href="${esc(href)}" target="_blank" rel="noopener"${worldFile ? ` class="world-file-link" data-world-file="${esc(href)}"` : ''}>${esc(match[1])}</a>`;
+    at = match.index + match[0].length;
+  }
+  return html + esc(source.slice(at));
+}
+
+// Agent links commonly carry editor-style locations (`file.ts:12:4` or
+// `file.ts#L12`). Separate that location from the path sent to the gateway.
+function worldFileTarget(raw, worldPath) {
+  if (!raw || !worldPath) return null;
+  let value = String(raw).trim();
+  if (/^file:\/\//i.test(value)) {
+    try { value = decodeURIComponent(new URL(value).pathname); } catch { return null; }
+  }
+  let line;
+  const fragment = value.match(/#L(\d+)(?:-L?\d+)?$/i);
+  if (fragment) {
+    line = Number(fragment[1]);
+    value = value.slice(0, fragment.index);
+  } else {
+    const suffix = value.match(/:(\d+)(?::\d+)?$/);
+    if (suffix) {
+      line = Number(suffix[1]);
+      value = value.slice(0, suffix.index);
+    }
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value) && !/^[a-z]:[\\/]/i.test(value)) return null;
+  if (!value || value.startsWith('#') || value.startsWith('?')) return null;
+  // Absolute paths must name this task's world. Relative paths are resolved by
+  // the server against the world root and confined there authoritatively.
+  if (value.startsWith('/')) {
+    const root = String(worldPath).replace(/\/+$/, '');
+    if (value !== root && !value.startsWith(`${root}/`)) return null;
+  }
+  return { path: value, line };
+}
+
+function fileLinksEnabled() {
+  const user = typeof S.user === 'object' ? S.user?.id : S.user;
+  return localStorage.getItem(`karmax-appearance:${user || 'local'}:world-file-links`) !== 'off';
+}
+
+function setFileLinksEnabled(enabled) {
+  const user = typeof S.user === 'object' ? S.user?.id : S.user;
+  localStorage.setItem(`karmax-appearance:${user || 'local'}:world-file-links`, enabled ? 'on' : 'off');
+}
+
+// Markdown mode renders anchors itself; mark the in-world ones afterwards so
+// the same click interception (wireWorldFileLinks) applies in both modes.
+function annotateWorldFileLinks(html, v = S.view) {
+  return String(html).replace(/<a href="([^"]*)"/g, (anchor, href) =>
+    worldFileTarget(href, v?.worldPath) ? `${anchor} class="world-file-link" data-world-file="${href}"` : anchor);
+}
+
+// Agent message bodies: Markdown (with world-file annotation) when enabled,
+// else the plain path that renders only the file-citation link subset.
+function renderAgentMessageBody(text, v = S.view) {
+  return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text), v) : renderConversationText(text, 'agent', v);
+}
+
+function renderConversationEntry(entry, v = S.view) {
   const md = markdownEnabled() ? ' md' : '';
   if (entry.type === 'message') {
     const m = entry.message;
     const role = m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
-    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${renderMessageBody(m.text)}</div>${renderMessageImages(m.images)}</div>`;
+    const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v) : renderMessageBody(m.text);
+    return `<div class="msg ${m.role}"><div class="msg-meta"><span class="role">${role}</span>${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}</div>`;
   }
   const a = entry.activity;
   if (a.kind === 'message') {
-    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderMessageBody(a.title)}</div></div>`;
+    return `<div class="msg agent"><div class="msg-meta"><span class="role">Agent</span>${conversationTimeHtml(entry.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(a.title)}</div><div class="msg-text${md}">${renderAgentMessageBody(a.title, v)}</div></div>`;
   }
   const icons = { reasoning: '◇', command: '›_', file: '±', tool: '⚙', search: '⌕', subagent: '⑂', status: '·', turn: '●', error: '!' };
   const detail = a.detail
@@ -4605,11 +5152,67 @@ function renderConversationEntry(entry) {
   </div>`;
 }
 
+function fileViewerHtml(text, title, line) {
+  const rows = String(text).split('\n');
+  const code = rows.map((row, i) => `<div class="line${line === i + 1 ? ' selected' : ''}" id="L${i + 1}"><a href="#L${i + 1}">${i + 1}</a><span>${esc(row) || ' '}</span></div>`).join('');
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><style>
+    :root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#e6edf3;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+    header{position:sticky;top:0;z-index:1;padding:10px 16px;background:#161b22;border-bottom:1px solid #30363d;color:#b1bac4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    main{padding:8px 0 28px;min-width:max-content}.line{display:flex;min-height:20px}.line:target,.line.selected{background:#3b2e00}.line>a{width:64px;padding:0 14px;color:#6e7681;text-align:right;text-decoration:none;user-select:none}.line>span{white-space:pre;padding-right:24px}
+  </style></head><body><header>${esc(title)}</header><main>${code}</main></body></html>`;
+}
+
+async function openWorldFile(anchor, v) {
+  const target = worldFileTarget(anchor.dataset.worldFile, v?.worldPath);
+  if (!target) return;
+  const popup = window.open('', '_blank');
+  if (popup) {
+    popup.opener = null;
+    popup.document.title = 'Opening file…';
+    popup.document.body.textContent = 'Opening file…';
+  }
+  try {
+    const url = `/api/tasks/${encodeURIComponent(v.taskId)}/file?path=${encodeURIComponent(target.path)}`;
+    const res = await fetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
+    if (!res.ok) throw new Error((await res.json().catch(() => null))?.error || 'could not open file');
+    const type = res.headers.get('content-type') || '';
+    if (!/^text\//i.test(type) && !/json|javascript|xml/i.test(type)) {
+      const objectUrl = URL.createObjectURL(await res.blob());
+      if (popup) popup.location.replace(objectUrl);
+      else window.open(objectUrl, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+      return;
+    }
+    const html = fileViewerHtml(await res.text(), anchor.dataset.worldFile, target.line);
+    if (popup) {
+      popup.document.open();
+      popup.document.write(html);
+      popup.document.close();
+      if (target.line) popup.location.hash = `L${target.line}`;
+    } else {
+      const objectUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+      window.open(objectUrl, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    }
+  } catch (e) {
+    if (popup) popup.close();
+    toast(e.message, true);
+  }
+}
+
+function wireWorldFileLinks(v) {
+  document.querySelectorAll('.world-file-link').forEach((anchor) => anchor.addEventListener('click', (event) => {
+    if (!fileLinksEnabled()) return;
+    event.preventDefault();
+    openWorldFile(anchor, v);
+  }));
+}
+
 function conversationPresence(v, t) {
   if (v.agentTurn?.role === t.role) {
     return v.agentTurn.state === 'running'
       ? { label: 'Working now', tone: 'working' }
-      : { label: 'Waiting for an agent slot', tone: 'waiting' };
+      : { label: v.waitingFor?.detail || 'Starting agent', tone: 'waiting' };
   }
   if (t.role === liveRoleFor(v) && v.waitingFor) return { label: v.waitingFor.detail || `Waiting for ${v.waitingFor.kind}`, tone: 'waiting' };
   if (v.status === 'failed') return { label: 'Failed', tone: 'failed' };
@@ -4698,7 +5301,7 @@ async function materializeLocalCheckout(v, session) {
   const host = document.createElement('div'); $('#modal-root').appendChild(host);
   host.innerHTML = `<div class="palette-scrim local-handoff-scrim"><div class="palette picker" style="max-width:760px">
     <div class="fp-head">Ready locally <span class="q-spacer"></span><button class="icon-btn local-handoff-close">✕</button></div>
-    <p class="task-sub">Karmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world was parked again.</p>
+    <p class="task-sub">Karmax published the committed cloud branch through its Git broker and materialized a separate checkout on this machine. The cloud world stays isolated and is parked when no terminal or review process is using it.</p>
     <div class="section-h">Local checkout</div><pre class="raw">${esc(checkout.cwd)}</pre>
     <button class="btn sm local-copy" data-value="${esc(`cd ${JSON.stringify(checkout.cwd)} && $SHELL`)}">Copy shell command</button>
     ${fork ? `<div class="section-h" style="margin-top:14px">Fork this agent locally</div><pre class="raw">${esc(fork)}</pre><button class="btn sm local-copy" data-value="${esc(fork)}">Copy fork command</button>` : ''}
@@ -4737,10 +5340,9 @@ async function copyNativeAttachCommand(v) {
 // priority + tags (organization), the workflow's declared params (editable or
 // frozen per its lifecycle), and the per-task credential policy.
 function parametersTab(v) {
-  const rec = taskRecord(v.taskId);
+  // Priority + tags (organization metadata) now live in the page header, above the
+  // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
   return `
-    <div class="section-h">Organization</div>
-    ${rec ? orgEditorHtml(rec) : '<div class="task-sub" style="color:var(--ink-3)">Priority + tags load with the task list.</div>'}
     ${paramsSection(v)}
     <div class="section-h">Credentials</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
@@ -4764,6 +5366,10 @@ function renderDiff(d) {
 }
 
 // Human label for a "waiting for" indicator (SPEC §6.2).
+function waitingProviderLabel(provider) {
+  return { claude: 'Claude', codex: 'Codex', opencode: 'OpenCode' }[provider] || provider || 'compatible';
+}
+
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
@@ -4771,11 +5377,12 @@ function waitingLabel(w) {
     // wait also covers plain lease contention (another task holds the login) and
     // grant latency, where asserting a quota cause sends the user to check a
     // dashboard that rightly shows nothing wrong.
-    case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to become available'}`;
+    case 'account': return `a ${waitingProviderLabel(w.provider)} login${w.earliestResetAt ? ' (quota refresh)' : ' to become available'}`;
     case 'agentSlot': return w.detail || 'a host agent slot';
-    case 'mergeSlot': return 'a merge slot';
+    case 'mergeSlot': return w.detail || 'a merge slot';
     case 'human': return w.detail ? `human input (${w.detail})` : 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
+    case 'collaboration': return w.detail || 'another task agent';
     case 'subagent': return w.detail || 'its sub-agents to finish';
     case 'shell': return w.detail || 'a background job to finish';
     case 'parent': return 'the parent task to respond';
@@ -4784,12 +5391,26 @@ function waitingLabel(w) {
   }
 }
 
+// Complete sentence fragment used by compact chips and the task-page wait card.
+// Some workflow details are already phrased as "Waiting for/to …"; most waiting
+// labels are noun phrases. Normalize both without producing "Waiting for Waiting
+// for …" for agent-slot and collaboration waits.
+function waitingText(w) {
+  const label = waitingLabel(w);
+  if (/^starting\b/i.test(label)) return label.replace(/^starting/i, 'Starting');
+  if (/^waiting\s+(?:for|to)\b/i.test(label)) return label.replace(/^waiting/i, 'Waiting');
+  return `Waiting for ${label}`;
+}
+
 // A CLI command to FORK this agent's session into the user's terminal — a branched
 // copy that's safe to open even while the agent is running (it never mutates the live
 // session). Claude: --resume … --fork-session; Codex: `codex fork <id>` (SPEC §10.5, #3).
 function forkCommandFor(sess, worldPath) {
   if (sess.provider === 'codex') return `cd "${worldPath}" && CODEX_HOME="${sess.home}" codex fork ${sess.id}`;
-  return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
+  if (sess.provider === 'claude') return `cd "${worldPath}" && CLAUDE_CONFIG_DIR="${sess.home}" claude --resume ${sess.id} --fork-session`;
+  // ACP makes forking available to karmax protocol-to-protocol. Until a harness
+  // documents an equivalent safe terminal command, don't manufacture one.
+  return '';
 }
 
 // Credential-policy editor (SPEC §7/§9): order credentials by precedence and
@@ -4797,14 +5418,16 @@ function forkCommandFor(sess, worldPath) {
 // higher ones; API keys are off by default when a subscription exists.
 async function renderCredentialEditor(el, scope, opts = {}) {
   if (!el) return;
+  const organizationId = opts.organizationId || projectById(opts.projectId)?.organizationId || S.organizationId || 'org_personal';
+  const organizationBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
   const q = new URLSearchParams();
   if (opts.projectId) q.set('projectId', opts.projectId);
   if (opts.taskId) q.set('taskId', opts.taskId);
   let data, accounts = { logins: [] };
   try {
     [data, accounts] = await Promise.all([
-      api(`/api/credentials?${q.toString()}`),
-      api('/api/accounts').catch(() => ({ logins: [] })),
+      api(`${organizationBase}/credentials?${q.toString()}`),
+      api(`${organizationBase}/accounts`).catch(() => ({ logins: [] })),
     ]);
   } catch { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">Credentials unavailable.</div>'; return; }
   // Effective policy for this scope. Normally the server computes it (global→project→
@@ -4833,7 +5456,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   const ordered = [...(sd.enabled || []).filter((k) => byKey[k]), ...(data.credentials || []).map((c) => c.key).filter((k) => !enabled.has(k))];
   if (!ordered.length) { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">No credentials yet — connect a login or add an API key below.</div>'; return; }
   const loginByKey = {};
-  for (const l of accounts.logins || []) loginByKey[`login:${l.provider}:${l.account}`] = l;
+  for (const l of accounts.logins || []) loginByKey[l.key || `login:${l.provider}:${l.account}`] = l;
   const canManage = scope === 'global'; // rename/delete a login only at the global scope
   el.innerHTML = `<div class="cred-list">${ordered
     .map((key) => {
@@ -4844,7 +5467,8 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       const acct = canManage && c.kind === 'login';
       // Compact inline chip: the kind is obvious from the label (a login is
       // provider:account; ambient is its home path; a key gets a 🔑), so no chip.
-      const label = c.kind === 'ambient' ? (c.provider === 'codex' ? '~/.codex' : '~/.claude') : c.label;
+      const ambientHomes = { claude: '~/.claude', codex: '~/.codex', opencode: '~/.local/share/opencode', kimi: '~/.kimi-code', grok: '~/.grok' };
+      const label = c.kind === 'ambient' ? (ambientHomes[c.provider] || `ambient ${c.provider}`) : c.label;
       const icon = c.kind === 'key' ? '🔑 ' : '';
       return `<div class="cred-row${isOn ? '' : ' off'}" draggable="true" data-key="${esc(key)}" title="${esc(c.provider)} ${esc(c.kind)} · drag to set precedence">
         <span class="cred-drag">⠿</span>
@@ -4859,7 +5483,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     // persist immediately, keyed by taskId/projectId scope.
     if (opts.local) { opts.onChange?.(policy); renderCredentialEditor(el, scope, { ...opts, policy }); return; }
     const authScope = opts.taskId ? `?taskId=${encodeURIComponent(opts.taskId)}` : opts.projectId ? `?projectId=${encodeURIComponent(opts.projectId)}` : '';
-    try { await api(`/api/credentials/policy${authScope}`, { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
+    try { await api(`${organizationBase}/credentials/policy${authScope}`, { method: 'POST', body: JSON.stringify({ scope, projectId: opts.projectId, taskId: opts.taskId, policy }) }); }
     catch (e) { toast(e.message, true); }
     renderCredentialEditor(el, scope, opts);
   };
@@ -4874,12 +5498,12 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
       const to = prompt(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;
-      try { await api(`/api/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
+      try { await api(`${organizationBase}/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'PATCH', body: JSON.stringify({ account: to }) }); toast('Login renamed'); renderCredentialEditor(el, scope, opts); }
       catch (e) { toast(e.message, true); }
     });
     row.querySelector('.cred-del')?.addEventListener('click', async () => {
       if (!confirm(`Delete login ${login.provider}:${login.account}? Its stored credentials are removed.`)) return;
-      try { await api(`/api/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'DELETE' }); toast('Login deleted'); renderCredentialEditor(el, scope, opts); }
+      try { await api(`${organizationBase}/accounts/logins/${login.provider}/${encodeURIComponent(login.account)}`, { method: 'DELETE' }); toast('Login deleted'); renderCredentialEditor(el, scope, opts); }
       catch (e) { toast(e.message, true); }
     });
   });
@@ -5086,7 +5710,7 @@ function paramsSection(v) {
   const footer = editable.size
     ? `<button class="btn sm primary" id="params-save">Save changes</button>`
     : `<div class="task-sub" style="color:var(--ink-3)">Locked after queue — send a follow-up to change direction.</div>`;
-  return `<div class="section-h">Parameters</div><div id="tp-params">${rows}${footer}</div>`;
+  return `<div class="section-h">Parameters</div><div id="tp-params" class="parameter-fields">${rows}${footer}</div>`;
 }
 
 // Best-known current value of a param for a running task (the view carries a few;
@@ -5215,7 +5839,7 @@ function wireActions(v) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  // Sub-task references are real <a> permalinks; installLinkRouter() handles them.
+  $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
 }
 
 // Wire the per-conversation follow-up boxes (SPEC §5.6): each box carries the
@@ -5704,12 +6328,16 @@ async function renderDashboard() {
   const box = $('#dash');
   if (!box) return;
   try {
-    const [d, u, diag] = await Promise.all([
+    const organizationId = S.organizationId || 'org_personal';
+    const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
+    const [d, u, credentialData, diag] = await Promise.all([
       api('/api/dashboard'),
-      api('/api/accounts/usage').catch(() => ({ usage: {}, pollable: [] })),
+      api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
+      api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
       api('/api/diagnostics').catch(() => null),
     ]);
-    const accounts = d.accounts?.accounts || [];
+    const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
+    const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
     const usage = u.usage || {};
     const pollable = new Set(u.pollable || []);
     box.innerHTML = `
@@ -5753,11 +6381,11 @@ async function renderDashboard() {
                 <label style="display:inline-flex;align-items:center;gap:4px;color:var(--ink-3);font-size:12px">max concurrent <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" title="How many agent turns may run on this login at once; leave empty = unlimited" style="width:52px;padding:2px 6px" /></label>
               </div>
             </div>`;
-          }).join('') + (d.accounts.waiting ? `<div class="task-sub" style="color:var(--ink-3);margin-top:6px">${d.accounts.waiting} turn(s) waiting for a login</div>` : '')
+          }).join('')
         : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`;
     const recheck = async (btn, body) => {
       const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
-      try { await api('/api/accounts/usage/recheck', { method: 'POST', body: JSON.stringify(body) }); }
+      try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
       catch (e) { toast(e.message, true); }
       btn.textContent = label; renderDashboard();
     };
@@ -5767,7 +6395,7 @@ async function renderDashboard() {
     // one attempt a minute so a failing probe can't loop the dashboard.
     if ([...pollable].some((id) => !usage[id] || usage[id].stale) && Date.now() - (S.usageAutoAt || 0) > 60_000) {
       S.usageAutoAt = Date.now();
-      api('/api/accounts/usage/recheck', { method: 'POST', body: JSON.stringify({}) }).then(() => {
+      api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify({}) }).then(() => {
         // Skip the re-render if the user is mid-edit in the panel (e.g. concurrency).
         const el = document.activeElement;
         if (S.tab === 'dashboard' && !(box.contains(el) && /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName || ''))) renderDashboard();
@@ -5776,14 +6404,14 @@ async function renderDashboard() {
     box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
     box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
     box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
-      await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
+      await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
       renderDashboard();
     }));
     box.querySelectorAll('.acct-conc').forEach((inp) => {
       inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } });
       inp.addEventListener('change', async () => {
         const v = inp.value.trim(); // empty = unlimited
-        await api('/api/accounts/concurrency', { method: 'POST', body: JSON.stringify({ accountId: inp.dataset.id, max: v === '' ? null : Number(v) }) })
+        await api(`${accountBase}/accounts/concurrency`, { method: 'POST', body: JSON.stringify({ accountId: inp.dataset.id, max: v === '' ? null : Number(v) }) })
           .then(() => toast('Concurrency updated')).catch((e) => toast(e.message, true));
         renderDashboard();
       });
@@ -5794,7 +6422,7 @@ async function renderDashboard() {
       const mins = Number(ans);
       const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
       if (!resetAt || isNaN(resetAt)) { toast('Could not parse a time', true); return; }
-      await api('/api/accounts/availability', { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
+      await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
       renderDashboard();
     }));
     // Keep the host panel live without re-rendering (and disrupting focus on) the
@@ -6030,7 +6658,8 @@ const quickDefaultsHeader = () => '';
 // agents get with each prompt) or the selected entry. The open entry rides in
 // the URL hash so wiki pages deep-link like settings panes.
 function wikiScopeInfo(proj) {
-  if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki` };
+  if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
+    selector: S.wikiViews?.[proj.id] || '' };
   const org = currentOrg();
   if (!org) return null;
   return { scope: 'organization', id: org.id, title: org.name, base: `/api/organizations/${encodeURIComponent(org.id)}/wiki` };
@@ -6041,9 +6670,19 @@ function wikiView(proj) {
   if (!info) return `<div class="empty">No organization yet.</div>`;
   return `<div class="organization-settings wiki-page"><div class="settings-header"><div>
       <h1 class="page-title">${esc(info.title)} — wiki</h1>
-    </div></div>
+    </div>${proj ? `<div class="wiki-view-picker"><label for="wiki-view-input">Viewing</label>
+      <input id="wiki-view-input" list="wiki-view-options" placeholder="Default branch" autocomplete="off">
+      <datalist id="wiki-view-options"></datalist></div>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
+}
+
+function wikiUrl(info, suffix = '', params = {}) {
+  const url = new URL(`${info.base}${suffix}`, location.origin);
+  if (info.selector?.startsWith('task:')) url.searchParams.set('taskId', info.selector.slice(5));
+  else if (info.selector?.startsWith('branch:')) url.searchParams.set('branch', info.selector.slice(7));
+  for (const [key, value] of Object.entries(params)) if (value != null && value !== '') url.searchParams.set(key, value);
+  return `${url.pathname}${url.search}`;
 }
 
 const wikiIsDefault = (e) => (e.labels || []).includes('default');
@@ -6062,16 +6701,40 @@ async function wireWikiView(proj) {
   const nav = $('#wiki-nav');
   const pane = $('#wiki-pane');
   if (!info || !nav || !pane) return;
+  if (proj) {
+    try {
+      const refs = await api(`${info.base}/refs`);
+      const input = $('#wiki-view-input');
+      const options = $('#wiki-view-options');
+      const entries = [
+        { value: '', label: `Default branch · ${refs.defaultBranch}` },
+        ...(refs.tasks || []).map((task) => ({ value: `task:${task.id}`, label: `#${task.num || '–'} ${task.title} · ${task.branch}` })),
+        ...(refs.branches || []).filter((branch) => branch !== refs.defaultBranch)
+          .map((branch) => ({ value: `branch:${branch}`, label: `Branch · ${branch}` })),
+      ];
+      const selected = entries.find((entry) => entry.value === info.selector) || entries[0];
+      input.value = selected.label;
+      options.innerHTML = entries.map((entry) => `<option value="${esc(entry.label)}"></option>`).join('');
+      input.onchange = () => {
+        const chosen = entries.find((entry) => entry.label === input.value.trim());
+        if (!chosen) return;
+        S.wikiViews ||= {};
+        S.wikiViews[proj.id] = chosen.value;
+        S.wikiEditing = null;
+        wireWikiView(proj);
+      };
+    } catch { /* the canonical wiki remains usable without the selector metadata */ }
+  }
   const key = `${info.scope}:${info.id}`;
   let data;
-  try { data = await api(info.base); }
+  try { data = await api(wikiUrl(info)); }
   catch (e) { pane.innerHTML = `<span class="task-sub">${esc(e.message)}</span>`; nav.textContent = ''; return; }
   const sel = decodeURIComponent((location.hash || '').slice(1));
 
   nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
     <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
     ${wikiTreeHtml(data.toc?.children, sel)}
-    <button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>`;
+    ${data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
   const open = (path) => {
     S.wikiEditing = null;
     history.replaceState({ kx: 1 }, '', location.pathname + (path ? `#${encodeURIComponent(path)}` : ''));
@@ -6083,7 +6746,10 @@ async function wireWikiView(proj) {
 
   // A page fetch goes through the base route so built-ins resolve (a virtual
   // built-in has no on-disk page for /page to find).
-  const fetchPage = async (p) => (await api(`${info.base}?path=${encodeURIComponent(p)}`)).page;
+  const fetchPage = async (p) => {
+    const read = await api(wikiUrl(info, '', { path: p }));
+    return read.page ? { ...read.page, _wikiWritable: read.view?.writable !== false } : null;
+  };
   // A background re-render (WS task event) must not blow away an in-progress
   // editor: restore it for the same scope before painting the read view.
   if (S.wikiEditing?.wikiKey === key) {
@@ -6341,7 +7007,7 @@ function renderWikiHome(info, proj, pane, data) {
   pane.innerHTML = (data.unconditional || []).map((u) => `
     <div class="card wiki-uncond">
       <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
-        <button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button></div>
+        ${data.view?.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}</div>
       <div class="msg-text md wiki-md">${renderMessageBody(u.body || '')}</div>
     </div>`).join('') + (data.tocText ? `
     <div class="card wiki-uncond">
@@ -6351,7 +7017,7 @@ function renderWikiHome(info, proj, pane, data) {
   typesetMath(pane);
   pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
     try {
-      const read = await api(`${info.base}?path=${encodeURIComponent(b.dataset.path)}`);
+      const read = await api(wikiUrl(info, '', { path: b.dataset.path }));
       if (!read.page) return toast('Entry not found', true);
       history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(read.page.path)}`);
       renderWikiEditor(info, proj, pane, read.page);
@@ -6375,7 +7041,7 @@ function renderWikiPage(info, proj, pane, page) {
     <div class="card">
       <div class="msg-text md wiki-md">${renderMessageBody(wikiBody(page.content))}</div>
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:10px"><button class="btn sm" id="wiki-page-edit">Edit</button>${remove}</div>
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? '<span class="task-sub">Read-only branch view</span>' : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}</div>
     </div>`;
   typesetMath(pane);
   $('#wiki-page-delete')?.addEventListener('click', async () => {
@@ -6384,7 +7050,7 @@ function renderWikiPage(info, proj, pane, page) {
       : `Delete “${page.name}” (${page.path})? Its folder and attached files go with it.`;
     if (!confirm(q)) return;
     try {
-      await api(`${info.base}/page?path=${encodeURIComponent(page.path)}`, { method: 'DELETE' });
+      await api(wikiUrl(info, '/page', { path: page.path }), { method: 'DELETE' });
       if (!page.builtin) history.replaceState({ kx: 1 }, '', location.pathname);
       wireWikiView(proj);
     } catch (e) { toast(e.message, true); }
@@ -6496,7 +7162,7 @@ function renderWikiEditor(info, proj, pane, page) {
     if (isNew) body.create = true;
     else if (path !== page.path) body.prevPath = page.path;
     try {
-      await api(`${info.base}/page`, { method: 'PUT', body: JSON.stringify(body) });
+      await api(wikiUrl(info, '/page'), { method: 'PUT', body: JSON.stringify(body) });
       S.wikiEditing = null;
       history.replaceState({ kx: 1 }, '', `${location.pathname}#${encodeURIComponent(path)}`);
       wireWikiView(proj);
@@ -6556,7 +7222,7 @@ async function hydrateProjectGitProfile(proj) {
   const box = $('#project-git-profile'); if (!box) return;
   try {
     const [profiles, defaults] = await Promise.all([
-      api('/api/git-profiles'),
+      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-profiles`),
       api(`/api/settings/project/${encodeURIComponent(proj.id)}/__common__`).catch(() => ({})),
     ]);
     box.innerHTML = `<div class="inline-form"><label>Git profile <select id="project-git-profile-select"><option value="">Organization default${profiles.defaultProfile ? ` — ${esc(profiles.defaultProfile)}` : ''}</option>${profiles.profiles.map((profile) => `<option value="${esc(profile.name)}" ${defaults.gitProfile === profile.name ? 'selected' : ''}>${esc(profile.name)} · ${esc(profile.userName)}</option>`).join('')}</select></label><button class="btn sm" id="project-git-profile-save">Save</button></div>`;
@@ -6988,7 +7654,11 @@ async function hydrateWorkflowPins(projectId) {
   if (!box) return;
   let list = [];
   let pins = {};
-  try { [list, pins] = await Promise.all([api('/api/workflows'), api(`/api/projects/${projectId}/workflow-pins`)]); }
+  const organizationId = projectById(projectId)?.organizationId || S.organizationId || 'org_personal';
+  try { [list, pins] = await Promise.all([
+    api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`),
+    api(`/api/projects/${projectId}/workflow-pins`),
+  ]); }
   catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>'; return; }
   box.innerHTML = list.map((w) => {
     const pinned = pins[w.name] ?? 'latest';
@@ -7042,15 +7712,15 @@ function wireSettingsView(proj) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  wirePaymentsCard('project', proj.id);
+  wirePaymentsCard('project', proj.id, proj.organizationId);
   $('#git-preflight-run')?.addEventListener('click', async () => {
     const out = $('#git-preflight-result');
     const btn = $('#git-preflight-run');
     btn.disabled = true;
     out.innerHTML = 'Checking identity, credentials and remote reachability…';
     try {
-      const r = await api(`/api/git-profiles/preflight?projectId=${encodeURIComponent(proj.id)}`);
-      out.innerHTML = `<div style="margin-bottom:4px">Tier: <b>${r.tier === 'profile' ? `git profile “${esc(r.profile)}”` : 'host fallback (no profile configured)'}</b></div>` +
+      const r = await api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-profiles/preflight?projectId=${encodeURIComponent(proj.id)}`);
+      out.innerHTML = `<div style="margin-bottom:4px">Tier: <b>${r.tier === 'profile' ? `git profile “${esc(r.profile)}”` : r.tier === 'host' ? 'host fallback (personal organization)' : 'not configured — isolated from host Git accounts'}</b></div>` +
         r.checks.map((c) => `<div>${c.ok ? '🟢' : '🔴'} <b>${esc(c.label)}</b> — ${esc(c.detail || (c.ok ? 'ok' : 'failed'))}</div>`).join('');
     } catch (e) {
       out.textContent = e.message;
@@ -7138,19 +7808,26 @@ function globalSettingsView(embedded = false) {
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
     ${authorizationCard('global')}
-    <div class="settings-section-title" id="settings-payments"><div>Payments<small>What tasks may spend, and the cards they spend from</small></div></div>
+    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
+    ${passwordsCard()}
+    ${vaultRequestsCard()}
+    ${agentMailCard()}
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
     <div class="card" id="accounts-card">
-      <div class="section-h">Agent accounts <span class="chip">installation resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The installation's logins and API keys, with organization defaults controlling how tasks use them. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
+      <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">This organization's logins and API keys. They are never offered to another organization. <b>Drag</b> to set precedence; toggle <b>On/Off</b>. Projects and tasks can narrow or reorder the pool.</p>
       <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
 
       <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude or Codex account to use its subscription. Each gets an isolated config home you can switch between (dodges token limits). karmax opens the provider's own login — you complete it; karmax never types your credentials.</p>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Connect a Claude, Codex, or explicitly supported OpenCode subscription. Each gets an isolated config home you can switch between. karmax opens the provider's own login — you complete it; karmax never types your credentials.</p>
       <div class="form-row"><label>Connect a login</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <select id="login-provider"><option>claude</option><option>codex</option></select>
+          <select id="login-provider"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select>
+          <select id="login-opencode-target" hidden title="Subscription routed through OpenCode">
+            <option value="xai|xAI Grok OAuth (Headless / Remote / VPS)">SuperGrok / Grok or X Premium (device code)</option>
+            <option value="xai|xAI Grok OAuth (SuperGrok Subscription)">SuperGrok / Grok or X Premium (local browser)</option>
+          </select>
           <input id="login-name" placeholder="account name (e.g. personal)" style="flex:1;min-width:120px" />
           <select id="login-browser" title="Browser MCP baseline for this profile">
             <option value="none">no browser MCP</option>
@@ -7160,12 +7837,17 @@ function globalSettingsView(embedded = false) {
           <button class="btn primary" id="login-connect">Connect</button>
         </div>
         <div id="login-result" style="font-size:12px;margin-top:6px"></div>
+        <div id="login-opencode-note" hidden style="font-size:11px;color:var(--ink-3);margin-top:4px">OpenCode stores this subscription in its isolated home. Kimi and Google consumer subscriptions are not claimed here; use a Kimi/Google API key (or Google Vertex credentials) instead.</div>
       </div>
 
       <div style="font-weight:600;margin:14px 0 4px">Register an API key</div>
       <div class="form-row"><label>Register a key</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <select id="acct-provider"><option>claude</option><option>codex</option></select>
+          <input id="acct-provider" list="model-provider-options" value="kimi" placeholder="model provider" style="width:150px" />
+          <datalist id="model-provider-options">
+            <option value="kimi"><option value="xai"><option value="google"><option value="openai"><option value="anthropic">
+            <option value="moonshotai"><option value="openrouter"><option value="groq"><option value="mistral"><option value="deepseek">
+          </datalist>
           <input id="acct-name" placeholder="account name (e.g. work)" style="flex:1;min-width:120px" />
           <input id="acct-key" type="password" placeholder="API key" style="flex:1;min-width:160px" />
           <button class="btn" id="acct-add">Register</button>
@@ -7174,7 +7856,7 @@ function globalSettingsView(embedded = false) {
       </div>
     </div>
     <div class="card" id="git-accounts-card">
-      <div class="section-h">Git accounts <span class="chip">installation resource</span></div>
+      <div class="section-h">Git accounts <span class="chip">organization resource</span></div>
       <p style="color:var(--ink-2);margin-top:0;font-size:12px">Named commit identities and SSH credentials for repository work. Secrets go straight to the encrypted vault and are injected only into the git subprocess that needs them.</p>
       <div id="git-profiles-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Add / update a profile</label>
@@ -7195,8 +7877,8 @@ function globalSettingsView(embedded = false) {
     </div>
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
-      <div class="section-h">Workflows <span class="chip">installation resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The orchestration recipes tasks run on. Built-ins ship with karmax; you can install more from a git repo. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
+      <div class="section-h">Workflows <span class="chip">organization resource</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with karmax; workflows installed here are available only to this organization. A workflow is version-pinned per task — an upgrade only affects new tasks, never a running one.</p>
       <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
       <div class="form-row"><label>Install from a git repo</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -7211,15 +7893,101 @@ function globalSettingsView(embedded = false) {
     <div class="card" id="resilience-card">
       <div class="section-h">Resilience</div>
       <div class="switch"><input type="checkbox" id="safe-mode" ${S.meta?.safeMode ? 'checked' : ''} /><label for="safe-mode">Installation safe mode (boot vanilla: all overlays off)</label></div>
+    </div>
+    <div class="settings-section-title" id="settings-access"><div>Access<small>How you open Karmax from another device</small></div></div>
+    <div class="card phone-access-card" id="phone-access-card">
+      <div class="section-h">Phone access <span class="chip">private by default</span></div>
+      <div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div>
     </div>`;
 }
 
-async function hydrateGitProfiles() {
+function phoneInstallHelp() {
+  if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) {
+    return '<span class="phone-installed">Installed on this device ✓</span>';
+  }
+  return `<button class="btn sm" id="install-karmax">Add Karmax to this phone</button>
+    <span class="task-sub" id="phone-install-note">No native Karmax app is needed.</span>`;
+}
+
+function renderPhoneAccess(status) {
+  const box = $('#phone-access-status');
+  if (!box) return;
+  const ready = status.state === 'ready';
+  const hosted = status.method === 'hosted';
+  const label = ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
+    : status.state === 'needs-login' ? 'Sign-in needed'
+      : status.state === 'conflict' ? 'Already in use' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
+  const link = status.url
+    ? `<a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a>`
+    : '';
+  const setup = hosted
+    ? '<li>Open this same HTTPS address on your phone.</li>'
+    : `<li>Install <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Tailscale</a> on your phone and sign in to the same tailnet.</li>
+       <li>Open the private Karmax address shown here. Keep Tailscale connected.</li>`;
+  box.innerHTML = `<div class="phone-access-head"><span class="remote-state ${ready ? 'ready' : ''}">${esc(label)}</span>${link}</div>
+    <p>${esc(status.detail)}</p>
+    ${ready ? `<ol class="phone-steps">${setup}<li>Use Karmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
+      <div class="phone-access-actions">${phoneInstallHelp()}${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}</div>`
+      : `<div class="phone-access-actions">
+          ${status.canEnable ? '<button class="btn sm primary" id="remote-enable">Turn on private access</button>' : ''}
+          ${status.method === 'none' ? '<a class="btn sm" href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Install Tailscale</a>' : ''}
+          <button class="btn sm" id="remote-refresh">Check again</button>
+        </div>`}
+    <p class="phone-security">${hosted ? 'Karmax authentication and HTTPS protect every session.' : 'This uses Tailscale Serve—not Funnel. Karmax stays bound to localhost and is never made public.'}</p>`;
+
+  const act = async (action, button) => {
+    button.disabled = true;
+    button.textContent = action === 'enable' ? 'Turning on…' : 'Turning off…';
+    try {
+      renderPhoneAccess(await api('/api/remote-access', { method: 'POST', body: JSON.stringify({ action }) }));
+    } catch (error) {
+      toast(error.message, true);
+      hydratePhoneAccess();
+    }
+  };
+  $('#remote-enable')?.addEventListener('click', (event) => act('enable', event.currentTarget));
+  $('#remote-disable')?.addEventListener('click', (event) => act('disable', event.currentTarget));
+  $('#remote-refresh')?.addEventListener('click', hydratePhoneAccess);
+  $('#install-karmax')?.addEventListener('click', async () => {
+    const note = $('#phone-install-note');
+    if (installPrompt) {
+      await installPrompt.prompt();
+      await installPrompt.userChoice;
+      installPrompt = null;
+      if (note) note.textContent = 'Karmax can now open from your Home Screen.';
+      return;
+    }
+    const ios = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    if (note) note.textContent = ios
+      ? 'Tap Share, then “Add to Home Screen”.'
+      : 'Open your browser menu, then choose “Install app” or “Add to Home screen”.';
+  });
+}
+
+async function hydratePhoneAccess() {
+  const box = $('#phone-access-status');
+  if (!box) return;
+  try {
+    renderPhoneAccess(await api('/api/remote-access'));
+  } catch (error) {
+    box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`;
+  }
+}
+
+async function hydrateGitProfiles(organizationId = S.organizationId) {
   const box = $('#git-profiles-list');
   if (!box) return;
   let data = { profiles: [], defaultProfile: null };
-  try { data = await api('/api/git-profiles'); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
-  if (!data.profiles.length) { box.innerHTML = '<span style="color:var(--ink-3)">No git profiles yet — worlds use the host’s own git setup.</span>'; return; }
+  const base = `/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`;
+  try { data = await api(base); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load git profiles.</span>'; return; }
+  if (!data.profiles.length) {
+    box.innerHTML = `<span style="color:var(--ink-3)">No git profiles yet — ${
+      organizationId === 'org_personal'
+        ? 'personal projects use the host’s own Git setup.'
+        : 'projects remain isolated from the host’s Git identity and credentials.'
+    }</span>`;
+    return;
+  }
   box.innerHTML = data.profiles.map((p) => `<div class="queue-item" data-gitp="${esc(p.name)}">
       <div style="flex:1"><b>${esc(p.name)}</b>
         ${data.defaultProfile === p.name ? '<span class="chip">default</span>' : `<button class="btn sm" data-gitp-default="${esc(p.name)}">make default</button>`}
@@ -7230,20 +7998,20 @@ async function hydrateGitProfiles() {
     </div>`).join('');
   box.querySelectorAll('[data-gitp-del]').forEach((b) => b.addEventListener('click', async () => {
     if (!confirm(`Delete git profile "${b.dataset.gitpDel}" (and its stored secrets)?`)) return;
-    try { await api(`/api/git-profiles/${encodeURIComponent(b.dataset.gitpDel)}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
-    hydrateGitProfiles();
+    try { await api(`${base}/${encodeURIComponent(b.dataset.gitpDel)}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
+    hydrateGitProfiles(organizationId);
   }));
   box.querySelectorAll('[data-gitp-default]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api('/api/git-profiles/default', { method: 'POST', body: JSON.stringify({ name: b.dataset.gitpDefault }) }); } catch (e) { toast(e.message, true); }
-    hydrateGitProfiles();
+    try { await api(`${base}/default`, { method: 'POST', body: JSON.stringify({ name: b.dataset.gitpDefault }) }); } catch (e) { toast(e.message, true); }
+    hydrateGitProfiles(organizationId);
   }));
 }
 
-async function hydrateWorkflows() {
+async function hydrateWorkflows(organizationId = S.organizationId) {
   const box = $('#workflows-list');
   if (!box) return;
   let list = [];
-  try { list = await api('/api/workflows'); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>'; return; }
+  try { list = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows`); } catch { box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflows.</span>'; return; }
   if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
   box.innerHTML = list.map((w) => `<div class="queue-item">
       <div style="flex:1"><b>${esc(w.name)}</b>
@@ -7298,9 +8066,12 @@ async function wirePaymentProviders(box) {
     } catch (e) { toast(e.message, true); }
   }));
 }
-async function wirePaymentsCard(scope, projectId) {
+async function wirePaymentsCard(scope, projectId, organizationId) {
   const box = $(`[data-payments="${scope}"]`);
   if (!box) return;
+  // Non-project cards belong to the organization (tenant boundary), not the
+  // whole installation. `scope==='global'` here is the org-settings surface.
+  const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
   if (scope === 'global') await wirePaymentProviders(box);
   const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
@@ -7317,8 +8088,11 @@ async function wirePaymentsCard(scope, projectId) {
   });
   const renderCards = async () => {
     let cards = [];
-    try { cards = await api(`/api/cards${projectId ? `?projectId=${projectId}` : ''}`); } catch {}
-    if (scope === 'global') cards = cards.filter((c) => c.scope === 'global');
+    const q = [projectId ? `projectId=${projectId}` : '', orgQ].filter(Boolean).join('&');
+    try { cards = await api(`/api/cards${q ? `?${q}` : ''}`); } catch {}
+    // The org-settings surface shows the org's own cards (+ legacy global);
+    // the project surface shows project cards (its org's cards appear too).
+    if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope}</span><div class="task-sub">available ${usd(c.available)} / cap ${usd(c.cap)}</div></div>
@@ -7335,7 +8109,7 @@ async function wirePaymentsCard(scope, projectId) {
     const label = box.querySelector('.card-label').value.trim() || 'Card';
     const cap = box.querySelector('.card-cap').value;
     try {
-      await api('/api/cards', { method: 'POST', body: JSON.stringify({ scope, projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
+      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ scope: scope === 'project' ? 'project' : 'organization', projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
       box.querySelector('.card-label').value = '';
       box.querySelector('.card-cap').value = '';
       toast('Card added');
@@ -7344,30 +8118,303 @@ async function wirePaymentsCard(scope, projectId) {
   });
 }
 
-// Which accounts an agent may use (SPEC §7.3/§6.2) — a checkbox pool, all checked
-// by default. The checked set becomes the agent's credential + lease-rotation pool.
-function accountChecks(p, handles, logins) {
-  const refs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
-  if (!refs.length) return `<span style="color:var(--ink-3);font-size:12px">No accounts connected — the agent uses the ambient login.</span>`;
-  const all = !p.allowedAccounts || !p.allowedAccounts.length; // unset ⇒ all allowed
-  const on = (ref) => all || p.allowedAccounts.includes(ref);
-  const box = (ref, label, warn) =>
-    `<label style="display:inline-flex;gap:5px;align-items:center;font-size:12px;margin:2px 10px 2px 0">
-      <input type="checkbox" class="pf-acct" value="${esc(ref)}" ${on(ref) ? 'checked' : ''} /> ${esc(label)}${warn ? ' <span style="color:var(--warn,#e0b15a)">(not signed in)</span>' : ''}</label>`;
-  return (
-    logins.map((l) => box(`login:${l.provider}:${l.account}`, `${l.provider}:${l.account}`, !l.loggedIn)).join('') +
-    handles.map((h) => box(`key:${h}`, `key · ${h}`, false)).join('')
-  );
+// ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
+const VAULT_SECRET_LABELS = {
+  login: [['password', 'password'], ['totp', 'TOTP seed (base32 or otpauth:// URI)']],
+  'api-key': [['secret', 'API key']],
+  'ssh-key': [['privateKey', 'private key (PEM)']],
+  env: [['env', '.env contents (KEY=VALUE per line)']],
+  note: [['note', 'note']],
+};
+// Short label + click-to-expand explanation for the two per-item policies.
+const POL_USE_TIP = 'Blind use = the agent fills this into a login form or gets it as an environment variable, but never sees the secret text itself. “ask” makes it request your approval each time.';
+const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
+function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" onclick="alert(this.getAttribute('title'))">ⓘ</span>`; }
+
+function passwordsCard() {
+  return `<div class="card" id="vault-card">
+    <div class="section-h">Passwords <span class="chip">organization resource</span></div>
+    <div class="vault-items-list" style="margin-bottom:14px">Loading…</div>
+
+    <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
+      ${policyTip('karmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
+    <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
+
+    <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
+      <div style="margin-top:8px">
+      <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap">
+        <select class="vi-type">${Object.keys(VAULT_SECRET_LABELS).map((t) => `<option>${t}</option>`).join('')}</select>
+        <input class="vi-label" placeholder="label (e.g. GitHub — alice)" style="flex:1;min-width:140px" />
+        <input class="vi-domains" placeholder="domains (e.g. github.com)" style="flex:1;min-width:140px" />
+        <input class="vi-username" placeholder="username" style="min-width:120px" />
+        <input class="vi-envvar" placeholder="env var (api/ssh keys)" style="min-width:140px;display:none" />
+      </div></div>
+      <div class="vault-secret-rows"></div>
+      <div class="form-row"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="vi-use"><option>auto</option><option>ask</option></select></label>
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="vi-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+        <button class="btn primary vi-add">Add</button>
+      </div></div>
+      </div>
+    </details>
+  </div>`;
+}
+function vaultRequestsCard() {
+  return `<div class="card" id="vault-requests-card">
+    <div class="section-h">Credential access requests</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted (or one that isn't in the vault yet — add it above, then approve, or tell the agent to create the account itself). <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto.</p>
+    <div class="vault-requests-list">Loading…</div>
+  </div>`;
+}
+async function wireVaultCards(organizationId) {
+  const box = $('#vault-card');
+  if (!box) return;
+  // Vault items + requests are organization-scoped; every call carries the org.
+  const oq = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+  const secretRows = () => {
+    const type = box.querySelector('.vi-type').value;
+    box.querySelector('.vi-envvar').style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
+    box.querySelector('.vault-secret-rows').innerHTML = VAULT_SECRET_LABELS[type].map(([field, label]) =>
+      `<div class="form-row"><label>${esc(label)}</label>${field === 'env' || field === 'privateKey' || field === 'note'
+        ? `<textarea class="vi-secret" data-field="${field}" rows="3" style="width:100%"></textarea>`
+        : `<input class="vi-secret" data-field="${field}" type="password" autocomplete="off" />`}</div>`).join('');
+  };
+  secretRows();
+  box.querySelector('.vi-type').addEventListener('change', secretRows);
+  const renderItems = async () => {
+    let items = [];
+    try { items = await api(`/api/vault/items${oq}`); } catch {}
+    const list = box.querySelector('.vault-items-list');
+    const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
+      : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
+    list.innerHTML = items.length
+      ? items.map((i) => `<div class="queue-item" data-vi="${esc(i.id)}">
+          <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
+            ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
+            <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
+          <label style="font-size:11px" title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <label style="font-size:11px" title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
+          <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button></div>`).join('')
+      : '<span style="color:var(--ink-3)">No passwords yet — sync from a password manager below, or add one by hand.</span>';
+    list.querySelectorAll('[data-vi]').forEach((row) => {
+      const item = items.find((x) => x.id === row.dataset.vi);
+      const savePolicy = async () => {
+        try {
+          await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
+          toast('Policy saved');
+        } catch (e) { toast(e.message, true); }
+      };
+      row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
+      row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+    });
+    list.querySelectorAll('[data-vi-rotate]').forEach((b) => b.addEventListener('click', async () => {
+      const item = items.find((x) => x.id === b.dataset.viRotate);
+      const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
+      const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
+      if (!value) return;
+      try {
+        const r = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
+        toast(r.propagated?.connector ? `Secret updated (also pushed to ${r.propagated.connector})` : 'Secret updated');
+      } catch (e) { toast(e.message, true); }
+    }));
+    list.querySelectorAll('[data-vi-del]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Delete this vault item (and its secrets)?')) return;
+      try { await api(`/api/vault/items/${b.dataset.viDel}${oq}`, { method: 'DELETE' }); renderItems(); } catch (e) { toast(e.message, true); }
+    }));
+    return items;
+  };
+  // ── connectors row: connect a store, then open the full import panel ──
+  const renderConnectors = async () => {
+    const list = box.querySelector('.connectors-list');
+    if (!list) return;
+    let conns = [];
+    try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return; }
+    list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
+      <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
+        <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}</div></div>
+      ${c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : 'op service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
+      <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
+      || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
+    list.querySelectorAll('[data-conn]').forEach((row) => {
+      const name = row.dataset.conn;
+      row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
+        try { await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) }); toast('Connected'); renderConnectors(); } catch (e) { toast(e.message, true); }
+      });
+      row.querySelector('[data-conn-import]')?.addEventListener('click', () => openImportPanel(name, conns.find((c) => c.name === name)));
+    });
+  };
+  // The full-fledged import interface (mass select by folder / all, choose the
+  // import policy + write-back once for everything selected).
+  const openImportPanel = async (name, conn) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal-card" style="max-width:600px;width:92%">
+      <div class="section-h" style="margin-bottom:8px">Import from ${esc(conn?.label || name)}</div>
+      <div style="border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:12px">
+        <label class="imp-head" style="display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line);background:var(--surface-2);font-size:12px;font-weight:600;cursor:pointer">
+          <input type="checkbox" class="imp-all"/> Select all <span class="imp-count" style="color:var(--ink-3);font-weight:400"></span></label>
+        <div class="import-tree" style="max-height:44vh;overflow:auto;padding:8px 10px">Loading…</div>
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option>auto</option><option>ask</option></select></label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+          ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn sm" data-imp-cancel>Cancel</button>
+          <button class="btn sm primary" data-imp-go>Import</button>
+        </div>
+      </div></div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('[data-imp-cancel]').addEventListener('click', close);
+    const tree = overlay.querySelector('.import-tree');
+    const countEl = overlay.querySelector('.imp-count');
+    const refreshCount = () => { const n = tree.querySelectorAll('.imp-pick:checked').length; countEl.textContent = n ? `· ${n} selected` : ''; };
+    let ext = [];
+    try { ext = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' }); }
+    catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
+    if (!ext.length) { tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import.</span>'; return; }
+    const folders = {};
+    ext.forEach((i) => { (folders[i.folder || ''] = folders[i.folder || ''] || []).push(i); });
+    tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:4px">
+      ${f ? `<label style="display:flex;gap:6px;align-items:center;font-weight:600;font-size:12px;margin:2px 0"><input type="checkbox" class="imp-folder-all"/> 📁 ${esc(f)}</label>` : ''}
+      <div style="margin-left:${f ? '18px' : '0'}">${folders[f].map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0">
+        <input type="checkbox" class="imp-pick" value="${esc(i.externalId)}"/> ${esc(i.label)}
+        <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div></div>`).join('');
+    overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
+    tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
+    tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
+    overlay.querySelector('[data-imp-go]').addEventListener('click', async () => {
+      const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
+      if (!externalIds.length) { toast('Select at least one', true); return; }
+      try {
+        const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
+          externalIds,
+          policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
+          ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+        }) });
+        toast(`Imported ${r.count} item(s)`);
+        close();
+        renderItems();
+        renderConnectors();
+      } catch (e) { toast(e.message, true); }
+    });
+  };
+  box.querySelector('.vi-add').addEventListener('click', async () => {
+    const secrets = {};
+    box.querySelectorAll('.vi-secret').forEach((el) => { if (el.value) secrets[el.dataset.field] = el.value; });
+    try {
+      await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({
+        type: box.querySelector('.vi-type').value,
+        label: box.querySelector('.vi-label').value,
+        domains: box.querySelector('.vi-domains').value,
+        username: box.querySelector('.vi-username').value || undefined,
+        envVar: box.querySelector('.vi-envvar').value || undefined,
+        policy: { use: box.querySelector('.vi-use').value, reveal: box.querySelector('.vi-reveal').value },
+        secrets,
+      }) });
+      box.querySelectorAll('.vi-label,.vi-domains,.vi-username,.vi-envvar,.vi-secret').forEach((el) => (el.value = ''));
+      toast('Added');
+      await renderItems();
+      renderRequests();
+    } catch (e) { toast(e.message, true); }
+  });
+  const renderRequests = async () => {
+    const rbox = $('#vault-requests-card .vault-requests-list');
+    if (!rbox) return;
+    let requests = [];
+    let items = [];
+    try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
+    const pending = requests.filter((r) => r.status === 'pending');
+    const recent = requests.filter((r) => r.status !== 'pending').slice(-5).reverse();
+    const itemLabel = (id) => items.find((i) => i.id === id)?.label || id;
+    rbox.innerHTML = (pending.length
+      ? pending.map((r) => `<div class="queue-item" data-vreq="${esc(r.id)}">
+          <div style="flex:1"><b>${r.itemId ? esc(itemLabel(r.itemId)) : `${esc(r.domain || '?')} <span class="chip" style="color:var(--warn,#e0b15a)">not in vault</span>`}</b>
+            ${r.kind === 'reset' ? '<span class="chip" style="color:var(--warn,#e0b15a)">reported invalid</span>' : `<span class="chip">${esc(r.mode)}</span>`}
+            <div class="task-sub" style="color:var(--ink-3)">task <a data-spa href="#" onclick="return false">${esc(r.taskId)}</a>${r.why ? ` — ${esc(r.why)}` : ''}${r.kind === 'reset' ? '<br>The stored secret failed. Fix it (Update secret in the vault above, or send the task a follow-up with the reset code), then grant to let the agent retry.' : ''}</div></div>
+          ${r.itemId ? '' : `<select class="vreq-bind"><option value="">bind to item…</option>${items.map((i) => `<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`}
+          <button class="btn sm" data-vreq-act="once">Once</button>
+          <button class="btn sm" data-vreq-act="task">This task</button>
+          <button class="btn sm" data-vreq-act="always">Always</button>
+          <button class="btn sm" data-vreq-act="deny">Deny</button></div>`).join('')
+      : '<span style="color:var(--ink-3)">No pending requests.</span>')
+      + (recent.length ? `<div class="task-sub" style="color:var(--ink-3);margin-top:8px">${recent.map((r) => `${r.status} · ${r.itemId ? esc(itemLabel(r.itemId)) : esc(r.domain || '?')} (${esc(r.resolution?.action || '')})`).join('<br>')}</div>` : '');
+    rbox.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((b) => b.addEventListener('click', async () => {
+      const itemId = row.querySelector('.vreq-bind')?.value || undefined;
+      try {
+        await api(`/api/vault/requests/${row.dataset.vreq}/resolve${oq}`, { method: 'POST', body: JSON.stringify({ action: b.dataset.vreqAct, itemId }) });
+        toast(b.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted — tell the task to retry (or it will pick it up next turn)');
+        renderRequests();
+      } catch (e) { toast(e.message, true); }
+    })));
+  };
+  await renderItems();
+  await renderConnectors();
+  await renderRequests();
 }
 
-function profileRow(p, handles, logins, scope) {
+// ── organization AgentMail inbox ──────────────────────────────────────────────
+function agentMailCard() {
+  return `<div class="card" id="agent-mail-card">
+    <div class="section-h">Agent email</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Email for agents to receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Create an AgentMail account here.</a></p>
+    <div class="inline-form">
+      <input id="agentmail-address" type="email" placeholder="AgentMail address" />
+      <input id="agentmail-key" type="password" placeholder="AgentMail API key" />
+      <button class="btn sm" id="agentmail-connect">Set up</button>
+    </div>
+    <div id="agentmail-result" class="task-sub"></div>
+  </div>`;
+}
+async function wireAgentMailCard(organizationId) {
+  const box = $('#agent-mail-card');
+  if (!box) return;
+  const org = encodeURIComponent(organizationId || 'org_personal');
+  const address = $('#agentmail-address');
+  const result = $('#agentmail-result');
+  try {
+    const data = await api(`/api/organizations/${org}/agent-mail`);
+    if (data.configured) {
+      address.value = data.address;
+      result.textContent = 'Connected';
+    }
+  } catch {}
+  $('#agentmail-connect')?.addEventListener('click', async () => {
+    const apiKey = $('#agentmail-key').value.trim();
+    const domain = address.value.trim();
+    if (!domain || !apiKey) return toast('AgentMail address and API key required', true);
+    const button = $('#agentmail-connect');
+    button.disabled = true;
+    try {
+      await api(`/api/organizations/${org}/agent-mail/connect`, {
+        method: 'POST',
+        body: JSON.stringify({ provider: 'agentmail', domain, apiKey }),
+      });
+      $('#agentmail-key').value = '';
+      result.textContent = 'Connected';
+      toast('Agent email connected');
+    } catch (e) {
+      result.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
+function profileRow(p, scope) {
   const inherited = scope === 'project' && p.scope === 'inherited';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
     <div style="font-weight:600;margin-bottom:6px">${esc(p.name)} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${esc(p.role)}</span> ${usedBy}
       ${inherited ? '<span class="chip" title="Using the organization/installation default; edit to create a project override">inherited</span>' : scope === 'project' ? '<span class="chip">project override</span>' : ''}</div>
     <div class="agent-profile-controls">
-      <select class="pf-provider">${['claude', 'codex', 'mock'].map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
+      <select class="pf-provider">${AGENT_PROVIDERS.map((x) => `<option ${x === p.provider ? 'selected' : ''}>${x}</option>`).join('')}</select>
       <div class="combo pf-model-combo" style="flex:1;min-width:140px">
         <input class="pf-model" placeholder="model" value="${esc(p.model || '')}" autocomplete="off" />
         <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
@@ -7376,7 +8423,7 @@ function profileRow(p, handles, logins, scope) {
       ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
-    <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins)}</div></div>
+    <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
       ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
@@ -7390,8 +8437,6 @@ function profileRow(p, handles, logins, scope) {
 // The standing Confirm-agent profile is not shown: review agents are configured
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
-  let handles = [], logins = [];
-  try { const a = await api('/api/accounts'); handles = a.handles || []; logins = a.logins || []; } catch {}
   let profiles = [];
   try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
   profiles = profiles.filter((p) => p.role !== 'confirm');
@@ -7400,10 +8445,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   const doP = profiles.find((p) => p.role === 'do');
   const mergeP = profiles.find((p) => p.role === 'merge');
   const rest = profiles.filter((p) => p !== doP && p !== mergeP);
-  const allRefs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
-  // unset/empty allowedAccounts ⇒ all allowed — normalize before comparing roles
-  const normAllowed = (p) => (p.allowedAccounts?.length ? [...p.allowedAccounts].sort() : [...allRefs].sort());
-  const essence = (p) => JSON.stringify({ provider: p.provider, model: p.model || '', effort: p.effort || '', maxTurns: p.maxTurns ?? null, accounts: normAllowed(p) });
+  const essence = (p) => JSON.stringify({ provider: p.provider, model: p.model || '', effort: p.effort || '', maxTurns: p.maxTurns ?? null });
   const separate = !!(doP && mergeP && essence(doP) !== essence(mergeP));
   const unified = doP && mergeP
     ? { ...doP, id: '__unified__', name: 'Agent', role: 'do + merge', scope: doP.scope === 'project' || mergeP.scope === 'project' ? 'project' : doP.scope }
@@ -7411,11 +8453,11 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
     : unified
       ? `<div class="profiles-group">
-          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, handles, logins, scope)}</div>
+          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, scope)}</div>
           <label class="agent-separate-toggle"><input type="checkbox" class="profiles-separate" ${separate ? 'checked' : ''}> Separate Do and Merge agent configurations</label>
-          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, handles, logins, scope)).join('')}</div>
-        </div>${rest.map((p) => profileRow(p, handles, logins, scope)).join('')}`
-      : profiles.map((p) => profileRow(p, handles, logins, scope)).join('');
+          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, scope)).join('')}</div>
+        </div>${rest.map((p) => profileRow(p, scope)).join('')}`
+      : profiles.map((p) => profileRow(p, scope)).join('');
   list.querySelector('.profiles-separate')?.addEventListener('change', (e) => {
     list.querySelector('.profiles-unified').hidden = e.target.checked;
     list.querySelector('.profiles-separated').hidden = !e.target.checked;
@@ -7431,15 +8473,11 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   });
   list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
     const card = b.closest('[data-profile]');
-    const checked = [...card.querySelectorAll('.pf-acct:checked')].map((c) => c.value);
-    // all checked ⇒ store nothing (means "all", stays correct as accounts are added)
-    const allowedAccounts = allRefs.length && checked.length < allRefs.length ? checked : undefined;
     const knobs = {
       provider: card.querySelector('.pf-provider').value,
       model: card.querySelector('.pf-model').value.trim() || undefined,
       effort: card.querySelector('.pf-effort').value || undefined,
       maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
-      allowedAccounts,
     };
     // The unified row IS the Do and Merge defaults: one Save writes both roles.
     const targets = b.dataset.saveprofile === '__unified__' ? [doP, mergeP] : [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
@@ -7447,7 +8485,8 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       for (const orig of targets) {
         await api('/api/profiles', { method: 'PUT', body: JSON.stringify({
           role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined,
-          projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities, ...knobs,
+          projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities,
+          ...knobs,
         }) });
       }
       await hydrateProfiles(scope, projectId, organizationId);
@@ -7497,8 +8536,8 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
 // The logins + API keys now live in the unified credential manager (#cred-editor-global:
 // drag to reorder, On/Off to enable/disable, ✎/✕ to rename/delete a login). This just
 // refreshes it after a connect/register/delete.
-async function hydrateAccounts() {
-  await renderCredentialEditor($('#cred-editor-global'), 'global');
+async function hydrateAccounts(organizationId = S.organizationId) {
+  await renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId });
 }
 
 function profilesCard(scope) {
@@ -7620,16 +8659,19 @@ async function hydrateAuthorization(scope, projectId) {
 }
 
 function wireGlobalSettings(organizationId) {
+  hydratePhoneAccess();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
-  renderCredentialEditor($('#cred-editor-global'), 'global'); // the merged accounts + precedence list
+  renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }); // the organization's accounts + precedence list
   hydrateProfiles('global', undefined, organizationId);
   hydrateReviewRoute('global', undefined, organizationId);
   hydrateAuthorization('global');
-  hydrateWorkflows();
-  hydrateGitProfiles();
-  wirePaymentsCard('global');
+  hydrateWorkflows(organizationId);
+  hydrateGitProfiles(organizationId);
+  wireVaultCards(organizationId);
+  wirePaymentsCard('global', undefined, organizationId);
+  wireAgentMailCard(organizationId);
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
     const userName = $('#gitp-username').value.trim();
@@ -7638,7 +8680,7 @@ function wireGlobalSettings(organizationId) {
     if (!name || !userName || !userEmail) return toast('profile name, user.name and user.email required', true);
     const btn = $('#gitp-save'); btn.disabled = true;
     try {
-      await api('/api/git-profiles', { method: 'POST', body: JSON.stringify({
+      await api(`/api/organizations/${encodeURIComponent(organizationId)}/git-profiles`, { method: 'POST', body: JSON.stringify({
         name, userName, userEmail,
         githubToken: $('#gitp-token').value.trim() || undefined,
         sshKey: $('#gitp-ssh').value.trim() || undefined,
@@ -7647,7 +8689,7 @@ function wireGlobalSettings(organizationId) {
       out.innerHTML = `🟢 Saved <b>${esc(name)}</b>. Secrets went to the vault and are never shown again.`;
       out.style.color = 'var(--ok, green)';
       for (const id of ['#gitp-token', '#gitp-ssh', '#gitp-signing']) $(id).value = '';
-      hydrateGitProfiles();
+      hydrateGitProfiles(organizationId);
     } catch (e) {
       out.textContent = e.message;
       out.style.color = 'var(--bad, crimson)';
@@ -7662,11 +8704,11 @@ function wireGlobalSettings(organizationId) {
     out.textContent = 'Fetching, validating, and loading the workflow…';
     out.style.color = 'var(--ink-2)';
     try {
-      const r = await api('/api/workflows/install', { method: 'POST', body: JSON.stringify({ url, ref: ref || undefined }) });
+      const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/workflows/install`, { method: 'POST', body: JSON.stringify({ url, ref: ref || undefined }) });
       out.innerHTML = `🟢 Installed <b>${esc(r.name)}</b> v${esc(r.version)} — the worker was rolled to serve it, no restart needed.`;
       out.style.color = 'var(--ok, green)';
       $('#wf-url').value = ''; $('#wf-ref').value = '';
-      hydrateWorkflows();
+      hydrateWorkflows(organizationId);
     } catch (e) {
       out.textContent = e.message;
       out.style.color = 'var(--bad, crimson)';
@@ -7678,35 +8720,48 @@ function wireGlobalSettings(organizationId) {
     const apiKey = $('#acct-key').value.trim();
     if (!account || !apiKey) return toast('account name + key required', true);
     try {
-      await api('/api/accounts', { method: 'POST', body: JSON.stringify({ provider, account, apiKey }) });
+      await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts`, { method: 'POST', body: JSON.stringify({ provider, account, apiKey }) });
       $('#acct-key').value = '';
       $('#acct-name').value = '';
       toast('Key registered');
-      hydrateAccounts();
+      hydrateAccounts(organizationId);
     } catch (e) { toast(e.message, true); }
   });
   $('#login-connect')?.addEventListener('click', async () => {
     const provider = $('#login-provider').value;
     const account = $('#login-name').value.trim();
     const browserMcp = $('#login-browser').value;
+    const [modelProvider, authMethod] = provider === 'opencode'
+      ? $('#login-opencode-target').value.split('|', 2)
+      : [];
     const out = $('#login-result');
     if (!account) return toast('account name required', true);
     out.textContent = 'Launching provider login…';
     out.style.color = 'var(--ink-2)';
     try {
       const btn = $('#login-connect'); btn.disabled = true;
-      const r = await api('/api/accounts/connect', { method: 'POST', body: JSON.stringify({ provider, account, browserMcp }) });
+      const r = await api(`/api/organizations/${encodeURIComponent(organizationId)}/accounts/connect`, {
+        method: 'POST',
+        body: JSON.stringify({ provider, account, browserMcp, modelProvider, authMethod }),
+      });
       btn.disabled = false;
       if (r.status === 'logged_in') { out.innerHTML = '🟢 Already signed in.'; out.style.color = 'var(--ok, green)'; }
       else if (r.status === 'awaiting_oauth' && r.loginUrl) {
-        out.innerHTML = `Open this URL to finish signing in (karmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>`;
+        out.innerHTML = `Open this URL to finish signing in (karmax won't type your credentials):<br><a href="${esc(r.loginUrl)}" target="_blank" rel="noopener" class="mono">${esc(r.loginUrl)}</a>${r.verificationCode ? `<br>Verification code: <b class="mono">${esc(r.verificationCode)}</b>` : ''}`;
         out.style.color = 'var(--ink-1)';
       } else { out.textContent = `Could not start login: ${r.detail || r.status}`; out.style.color = 'var(--bad, crimson)'; }
       $('#login-name').value = '';
-      hydrateAccounts();
+      hydrateAccounts(organizationId);
       hydrateProfiles('global', undefined, organizationId);
     } catch (e) { $('#login-connect').disabled = false; out.textContent = e.message; out.style.color = 'var(--bad, crimson)'; }
   });
+  const syncLoginTarget = () => {
+    const show = $('#login-provider')?.value === 'opencode';
+    if ($('#login-opencode-target')) $('#login-opencode-target').hidden = !show;
+    if ($('#login-opencode-note')) $('#login-opencode-note').hidden = !show;
+  };
+  $('#login-provider')?.addEventListener('change', syncLoginTarget);
+  syncLoginTarget();
   $('#main').querySelectorAll('[data-save]').forEach((b) =>
     b.addEventListener('click', async () => {
       const wf = b.dataset.save;
@@ -7738,6 +8793,7 @@ function updateBell() {
   const n = S.inbox.filter((item) => item.unread).length;
   badge.textContent = n;
   badge.classList.toggle('hidden', n === 0);
+  $('#bell')?.classList.toggle('active', S.tab === 'inbox');
 }
 function inboxView() {
   const prefs = S.deliveryPreferences || { browser: true, email: false, slack: false, routine: true };
@@ -7823,6 +8879,7 @@ function profileView() {
       <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
       <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
       <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
+      <div class="switch"><input type="checkbox" id="profile-file-links" ${fileLinksEnabled() ? 'checked' : ''} /><label for="profile-file-links">Open agent file links in their task world</label></div>
       <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">These are per-browser display choices, applied the next time a conversation renders.</p>
     </div>
     <div class="card">
@@ -7845,6 +8902,7 @@ function wireProfileView() {
     if (S.taskTab === 'checkin') renderTaskPage();
     toast(`MathJax ${e.target.checked ? 'on' : 'off'}`);
   });
+  $('#profile-file-links')?.addEventListener('change', (e) => setFileLinksEnabled(e.target.checked));
   $('#profile-logout')?.addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch {}
     location.reload();
@@ -7926,7 +8984,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
@@ -8419,7 +9477,10 @@ function moveCursor(delta) {
   rows[i].focus?.(); // rows carry tabindex=0, so the cursor and Tab order agree
 }
 function cursorRow() { return cursorRows().find((r) => rowKey(r) === S.cursorId); }
-function openCursorRow() { cursorRow()?.click(); }
+// A data-id row navigates through its .row-link `<a>` overlay (the delegated
+// link router only fires for anchors), so click that; draft rows carry their
+// own click handler on the div, so fall back to the row itself.
+function openCursorRow() { const r = cursorRow(); if (r) (r.querySelector('a.row-link') || r).click(); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows.
 function taskOrder() {
@@ -8468,7 +9529,14 @@ function closeTopOverlay() {
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
 function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
+// A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
+// it modifies. It must be transparent to the chord buffer — otherwise pressing
+// Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
+// would land here between the two steps, match nothing, and reset the pending
+// `g` before `P` ever arrives.
+function isBareModifier(key) { return key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta'; }
 function dispatchKey(e) {
+  if (isBareModifier(e.key)) return false;
   const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
   const cmds = allCommands().filter((c) => c.keys && c.available);
   const candidates = chordCandidates(cmds, CHORD.pending, snap);

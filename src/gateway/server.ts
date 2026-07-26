@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
+import type { TaskView } from '../domain/types.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -24,12 +25,13 @@ import { withTimeout } from '../util/timeout.js';
 import { AgentSpec, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
-import { claudeModels, codexModels, mergeModels, type ModelCatalog } from '../agent/models.js';
+import { acpModels, claudeModels, codexModels, opencodeModels, mergeModels, type ModelCatalog } from '../agent/models.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, allows } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -37,10 +39,16 @@ import { newId } from '../util/id.js';
 import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
+import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, snapshotResource } from '../domain/resource-drivers.js';
 import { managedRepoPath } from '../world/worktree.js';
+import { paths } from '../config/paths.js';
+import { ensureProjectWikiRepository, setProjectWikiRemote } from '../wiki/repository.js';
+import { worldWorkingRelativePath } from '../world/types.js';
+import { enumerateCredentials } from '../platform/credentials.js';
+import { gatherCredentialSources } from '../platform/credential-sources.js';
 
 export interface GatewayDeps {
   api: KarmaxApi;
@@ -65,6 +73,7 @@ export interface GatewayDeps {
   worlds: WorldRegistry;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   providerConnections?: import('../world/connections.js').WorldProviderConnectionService;
+  workflows?: import('../packages/manager.js').WorkflowManager;
   handoffs?: import('../world/handoff.js').WorldHandoffService;
   runners?: import('../world/runners.js').RunnerPoolService;
   worldAccess?: import('../world/access.js').WorldAccessService;
@@ -72,6 +81,7 @@ export interface GatewayDeps {
   resources?: import('../world/resources.js').ProjectResourceService;
   cellId?: string;
   hosted?: boolean;
+  remoteAccess?: RemoteAccessController;
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
@@ -87,6 +97,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/resource-uploads/')) return 'project:settings:write';
   if (p === '/api/logout') return 'none';
   if (p === '/api/dashboard') return 'diagnostic:read';
+  if (p === '/api/remote-access') return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/diagnostics')) return 'diagnostic:read';
   if (p === '/api/metrics') return 'diagnostic:read';
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
@@ -103,9 +114,16 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/teams/.test(p)) return read ? 'team:read' : 'team:write';
   if (/^\/api\/organizations\/[^/]+\/(members|invitations)/.test(p)) return read ? 'organization:member:read' : 'organization:member:write';
+  if (/^\/api\/organizations\/[^/]+\/(?:accounts|git-profiles|credentials)(?:\/|$)/.test(p))
+    return read ? 'credential:read' : 'credential:write';
+  if (/^\/api\/organizations\/[^/]+\/workflows(?:\/|$)/.test(p))
+    return read ? 'workflow:read' : (p.includes('/install') ? 'workflow:install' : 'workflow:edit');
   // The wiki is the skills store: reads need the scope's read capability, edits
   // reuse skill:write (agents and developers can both grow it).
   if (/^\/api\/organizations\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'organization:read' : 'skill:write';
+  // The agent mailbox is a credential surface, org-scoped by its path (the
+  // token/session check enforces the tenant boundary from requestScope).
+  if (/^\/api\/organizations\/[^/]+\/agent-mail(?:\/|$)/.test(p)) return read ? 'credential:read' : 'credential:write';
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/organizations\/[^/]+/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/tasks\/[^/]+\/(responsibility|subscribers)/.test(p)) return p.endsWith('/subscribers') ? 'task:subscribe' : 'task:assign';
@@ -118,6 +136,19 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     return 'credential:write';
   }
   if (p.startsWith('/api/credentials')) return read ? 'credential:read' : 'credential:write';
+  // Vault items (PLAN-passwords.md): admin CRUD is credential:write; agent
+  // write-back is the narrower vault:store; use/reveal/fill/request attempts
+  // need only credential:read — the per-item grant + policy check happens in
+  // the handler against the caller's own capability set.
+  if (p === '/api/vault/store' || p === '/api/vault/passkey/save') return 'vault:store';
+  if (/^\/api\/vault\/requests\/[^/]+\/resolve$/.test(p)) return 'credential:write';
+  if (p.startsWith('/api/vault/items')) return read ? 'credential:read' : 'credential:write';
+  // Connectors: describe is read; connect/sync/config/write-back are admin.
+  if (p.startsWith('/api/vault/connectors')) return read ? 'credential:read' : 'credential:write';
+  if (p.startsWith('/api/vault')) return 'credential:read';
+  // The agent-mail inbound webhook authenticates with its own shared secret
+  // (like the GitHub webhook), so it needs no capability.
+  if (p === '/api/agent-mail/ingest') return 'none';
   if (p.startsWith('/api/cards') || p.startsWith('/api/payments')) return read ? 'payment:read' : 'payment:write';
   if (p === '/api/safe-mode') return 'safe-mode:write';
   if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
@@ -150,6 +181,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/fork-agent$/.test(p)) return 'task:conversation:fork';
   if (p === '/api/agent/git/publish') return 'task:git:publish';
   if (p === '/api/agent/git/import' || p === '/api/agent/git/refresh-upstream') return 'task:git:import';
+  if (p === '/api/agent/collaboration/request') return 'task:conversation:message';
+  if (/\/file$/.test(p)) return 'task:conversation:read';
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
@@ -284,7 +317,23 @@ const MIME: Record<string, string> = {
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.cjs': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.ts': 'text/plain; charset=utf-8',
+  '.tsx': 'text/plain; charset=utf-8',
+  '.jsx': 'text/javascript; charset=utf-8',
+  '.py': 'text/plain; charset=utf-8',
+  '.rs': 'text/plain; charset=utf-8',
+  '.go': 'text/plain; charset=utf-8',
+  '.java': 'text/plain; charset=utf-8',
+  '.rb': 'text/plain; charset=utf-8',
+  '.sh': 'text/plain; charset=utf-8',
+  '.yml': 'text/plain; charset=utf-8',
+  '.yaml': 'text/plain; charset=utf-8',
+  '.toml': 'text/plain; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
   '.ico': 'image/x-icon',
 };
 
@@ -322,9 +371,14 @@ export class Gateway {
   /** Runs review "run" actions (dev servers, scripts) in the task's world. */
   private reviewActions: ReviewActionRunner;
   private attachments = new AttachmentStore();
-  private modelCatalog?: { at: number; value: ModelCatalog };
+  private modelCatalog = new Map<string, { at: number; value: ModelCatalog }>();
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string }>();
   private fanout: DurableEventFanout;
+  /** Remotes verified during this gateway process. Persisted links are retried
+   * once after every restart so interrupted first pushes self-heal. */
+  private wikiRemotesReady = new Set<string>();
+  /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
+  private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
 
   constructor(private deps: GatewayDeps) {
     this.reviewActions = new ReviewActionRunner(deps.worlds, deps.store, deps.runners, deps.worldAccess, deps.resources);
@@ -402,6 +456,11 @@ export class Gateway {
       void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
     });
 
+    // Deployment migration for projects that predate companion wiki repos.
+    // Complete this before binding the listener so scheduled/immediate task
+    // starts cannot race the backfill, and a local migration error cannot leave
+    // a half-started HTTP server behind.
+    for (const project of this.deps.store.listProjects()) await this.ensureProjectWiki(project);
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       server.once('error', onError);
@@ -660,6 +719,41 @@ export class Gateway {
         return this.json(res, 401, { error: error instanceof Error ? error.message : String(error) });
       }
     }
+    // Agent mailbox inbound webhook (PLAN-passwords.md §8): authenticated by a
+    // configured shared secret, not a karmax session — so it sits with the other
+    // unauthenticated endpoints, before the session gate.
+    if (p === '/api/agent-mail/ingest' && method === 'POST') {
+      const mailMod = await import('../autonomy/agent-mail.js');
+      // Auth: the minted secret (in the copy-pasted webhook URL or a Bearer
+      // header) — forwarding services can rarely set custom headers, so the
+      // query form is the primary one. Legacy env secret stays accepted.
+      const minted = mailMod.ingestSecret(this.deps.store);
+      const presented = url.searchParams.get('secret')
+        ?? (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
+      const legacy = process.env.KARMAX_AGENT_MAIL_SECRET;
+      if (!presented || (presented !== minted && (!legacy || presented !== legacy)))
+        return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL karmax shows the operator)' });
+      // Providers POST different shapes/encodings; parse by content-type and
+      // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw
+      // MIME from the Cloudflare Email Worker).
+      const rawBody = await this.rawBody(req, 8 * 1024 * 1024);
+      const contentType = String(req.headers['content-type'] ?? '');
+      let fields: Record<string, any> = {};
+      try {
+        if (contentType.includes('multipart/form-data')) fields = mailMod.parseMultipart(rawBody.toString('utf8'), contentType);
+        else if (contentType.includes('application/x-www-form-urlencoded')) fields = mailMod.parseUrlEncoded(rawBody.toString('utf8'));
+        else fields = JSON.parse(rawBody.toString('utf8'));
+      } catch {
+        return this.json(res, 400, { error: 'unparseable body (expected JSON, form-urlencoded, or multipart/form-data)' });
+      }
+      const msg = mailMod.normalizeInbound(fields);
+      if (!msg.to || !msg.from) return this.json(res, 400, { error: 'could not find a recipient/sender in the payload' });
+      // Routed by recipient to the owning organization; unknown recipients are
+      // dropped (never leaked into any tenant's inbox). Never echo the message.
+      const { delivered } = new mailMod.AgentMail(this.deps.store)
+        .ingest({ to: mailMod.cleanAddress(msg.to), from: mailMod.cleanAddress(msg.from), subject: msg.subject ? String(msg.subject) : undefined, text: String(msg.text ?? '') });
+      return this.json(res, 200, { delivered });
+    }
     const githubManifestCallback = p.match(/^\/api\/github\/manifest\/callback(?:\/([^/]+))?$/);
     if (githubManifestCallback && method === 'GET' && this.deps.githubApp && this.deps.identity) {
       const code = url.searchParams.get('code') ?? '';
@@ -688,6 +782,8 @@ export class Gateway {
       if (!pending) return this.githubCallbackPage(res, 400, 'This GitHub authorization link is invalid, expired, or belongs to another user.');
       try {
         await this.deps.githubApp.authorizeUser(identity.user.id, code, this.githubPublicUrl(req));
+        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
+          await this.ensureProjectWiki(project, identity.user.id);
         res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=ready&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
@@ -710,6 +806,8 @@ export class Gateway {
           res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl) });
           return void res.end();
         }
+        for (const project of this.deps.store.listProjects().filter((candidate) => candidate.organizationId === pending.organizationId))
+          await this.ensureProjectWiki(project, identity.user.id);
         res.writeHead(303, { location: `${organizationSettingsPath(this.deps.store, pending.organizationId)}?github=connected&organizationId=${encodeURIComponent(pending.organizationId)}` });
         return void res.end();
       } catch (error) {
@@ -826,6 +924,11 @@ export class Gateway {
     }
     const token = session.apiToken;
     const { api, store } = this.deps;
+    const organizationResource = p.match(/^\/api\/organizations\/([^/]+)\/(accounts|git-profiles|credentials|workflows)(\/.*)?$/);
+    const resourceOrganizationId = organizationResource?.[1] ?? requestedScope.organizationId ?? 'org_personal';
+    const resourcePath = organizationResource
+      ? `/api/${organizationResource[2]}${organizationResource[3] ?? ''}`
+      : p;
 
     const required = capabilityForRequest(method, p, url);
     let authRecord = this.deps.tokens.verify(token);
@@ -861,6 +964,17 @@ export class Gateway {
       }
       if (p === '/api/platform' && method === 'GET') return this.json(res, 200, PLATFORM_API_CATALOG);
       if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
+      if (p === '/api/remote-access' && method === 'GET') {
+        if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
+        return this.json(res, 200, await this.deps.remoteAccess.status());
+      }
+      if (p === '/api/remote-access' && method === 'POST') {
+        if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
+        const b = await this.body(req);
+        if (b.action === 'enable') return this.json(res, 200, await this.deps.remoteAccess.enable());
+        if (b.action === 'disable') return this.json(res, 200, await this.deps.remoteAccess.disable());
+        return this.json(res, 400, { error: 'action must be enable or disable' });
+      }
 
       // Organization is the hosted tenant boundary. Collection discovery is
       // filtered by membership; every nested request was minted an
@@ -872,8 +986,11 @@ export class Gateway {
       if (p === '/api/organizations' && method === 'POST') {
         if (!session.userId) return this.json(res, 400, { error: 'a human account is required' });
         const b = await this.body(req);
-        const organization = store.createOrganization({ name: String(b.name ?? 'My organization'),
-          slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: session.userId });
+        let organization;
+        try {
+          organization = store.createOrganization({ name: String(b.name ?? 'My organization'),
+            slug: b.slug ? String(b.slug) : undefined, kind: b.kind === 'personal' ? 'personal' : 'team', ownerUserId: session.userId });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         this.deps.authorization?.bootstrapOrganizationOwner(`user:${session.userId}`, session.userId, organization.id);
         return this.json(res, 200, organization);
       }
@@ -935,6 +1052,14 @@ export class Gateway {
         for (const connection of this.deps.providerConnections?.list(organizationId) ?? [])
           this.deps.providerConnections?.delete(organizationId, connection.provider);
         this.deps.resources?.deleteOrganizationKey(organizationId);
+        const { GitProfiles } = await import('../autonomy/git-profiles.js');
+        const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, organizationId);
+        for (const profile of gitProfiles.list()) gitProfiles.delete(profile.name);
+        const { agentAccountHandles } = await import('../platform/credential-sources.js');
+        for (const handle of agentAccountHandles(this.deps.broker?.listHandles() ?? [], organizationId))
+          this.deps.broker?.deleteHandle(handle);
+        this.deps.configHomes?.removeOrganization(organizationId);
+        await this.deps.workflows?.removeOrganization(organizationId);
         store.deleteOrganization(organizationId);
         for (const attachmentId of resources.attachmentIds)
           if (!store.attachmentIsScoped(attachmentId)) this.attachments.delete(attachmentId);
@@ -1045,7 +1170,10 @@ export class Gateway {
         if (method === 'POST') {
           const b = await this.body(req);
           if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub App is not configured' });
-          return this.json(res, 200, await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? '')));
+          const connected = await this.deps.githubApp.connectInstallation(organizationId, String(b.installationId ?? ''));
+          for (const project of store.listProjects().filter((candidate) => candidate.organizationId === organizationId))
+            await this.ensureProjectWiki(project, session.userId);
+          return this.json(res, 200, connected);
         }
       }
       const githubAppSetup = p.match(/^\/api\/organizations\/([^/]+)\/github\/app$/);
@@ -1100,13 +1228,16 @@ export class Gateway {
           const repositories: import('../domain/types.js').Repository[] = [];
           for (const connection of store.listGitConnections(githubRefresh[1]!))
             repositories.push(...await this.deps.githubApp.reconcile(connection));
+          for (const project of store.listProjects().filter((candidate) => candidate.organizationId === githubRefresh[1]))
+            await this.ensureProjectWiki(project, session.userId);
           return this.json(res, 200, { repositories, count: repositories.length });
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationRepositories = p.match(/^\/api\/organizations\/([^/]+)\/repositories$/);
       if (organizationRepositories) {
         const organizationId = organizationRepositories[1]!;
-        if (method === 'GET') return this.json(res, 200, store.listRepositories(organizationId));
+        if (method === 'GET') return this.json(res, 200,
+          store.listRepositories(organizationId).filter((repository) => !store.repositoryIsProjectWiki(repository.id)));
         if (method === 'POST') {
           if (this.deps.hosted) return this.json(res, 400, { error: 'Hosted repositories must be imported through the GitHub App' });
           const b = await this.body(req);
@@ -1135,8 +1266,12 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listProjects().filter((project) => project.organizationId === organizationId));
         if (method === 'POST') {
           const b = await this.body(req);
-          const project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
+          let project;
+          try {
+            project = store.createProject(String(b.name ?? 'New project'), normalizeConfig(b.config), organizationId);
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (session.userId) store.setProjectMembership(project.id, { kind: 'user', userId: session.userId }, 'owner');
+          await this.ensureProjectWiki(project, session.userId);
           await this.spawnProjectPrepTask(token, project.id);
           return this.json(res, 200, project);
         }
@@ -1368,7 +1503,11 @@ export class Gateway {
         if (this.deps.hosted)
           return this.json(res, 400, { error: 'hosted projects must be created inside an organization' });
         const b = await this.body(req);
-        const project = store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true));
+        let project;
+        try {
+          project = store.createProject(b.name ?? 'New project', normalizeConfig(b.config, true));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+        await this.ensureProjectWiki(project, session.userId);
         await this.spawnProjectPrepTask(token, project.id);
         return this.json(res, 200, project);
       }
@@ -1854,10 +1993,13 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, store.listProjectRepositories(projectId));
         if (method === 'POST') {
           const b = await this.body(req);
-          return this.json(res, 200, store.attachProjectRepository({ projectId, repositoryId: String(b.repositoryId),
+          const attached = store.attachProjectRepository({ projectId, repositoryId: String(b.repositoryId),
             baseBranch: b.baseBranch ? String(b.baseBranch) : undefined,
             targetBranch: b.targetBranch ? String(b.targetBranch) : undefined,
-            order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined }));
+            order: Number.isFinite(Number(b.order)) ? Number(b.order) : undefined });
+          const project = store.getProject(projectId);
+          if (project) await this.ensureProjectWiki(project, session.userId);
+          return this.json(res, 200, attached);
         }
       }
       const projectRepositorySources = p.match(/^\/api\/projects\/([^/]+)\/repository-sources$/);
@@ -1874,7 +2016,9 @@ export class Gateway {
               const unknown = repos.filter((repo: string) => !known.has(repo));
               if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
             }
-            return this.json(res, 200, store.setProjectRepositorySources(project.id, repos)); }
+            const saved = store.setProjectRepositorySources(project.id, repos);
+            await this.ensureProjectWiki(saved, session.userId);
+            return this.json(res, 200, saved); }
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
@@ -1895,11 +2039,23 @@ export class Gateway {
           const limit = Number(url.searchParams.get('limit') ?? '0');
           const offset = Number(url.searchParams.get('offset') ?? '0');
           const page = limit > 0 ? filtered.slice(offset, offset + limit) : filtered;
+          // The list only needs each task's chip/queue fields (stage/status/state/
+          // waitingFor/mergeQueue/…), never its conversation. Dropping the heavy view
+          // fields — `messages`, `transcripts`, `reviewInfo` — shrinks this response by
+          // ~80% (they were the bulk of a multi-MB payload for a few hundred tasks).
+          // It matters because loadTasks() refetches the whole list on navigation AND
+          // on every WS-debounced refresh, so the fat body was paid over and over. The
+          // full view is still served per task by /api/tasks/:id when a task is opened.
+          const trimListView = (v: TaskView | undefined) => {
+            if (!v) return v;
+            const { messages: _m, transcripts: _t, reviewInfo: _r, ...rest } = v;
+            return rest;
+          };
           // enrich with the freshest live view where possible
           const enriched = await Promise.all(
             page.map(async (t) => {
               const view = await api.getTaskView(token, t.id).catch(() => t.lastView);
-              return { ...t, lastView: view ?? t.lastView };
+              return { ...t, lastView: trimListView(view ?? t.lastView) };
             }),
           );
           if (limit > 0) return this.json(res, 200, { tasks: enriched, total: filtered.length, offset });
@@ -1907,6 +2063,8 @@ export class Gateway {
         }
         if (method === 'POST') {
           const b = await this.body(req);
+          const project = store.getProject(projectId);
+          if (project) await this.ensureProjectWiki(project, session.userId);
           const task = await api.createTask(token, { projectId, ...b });
           return this.json(res, 200, task);
         }
@@ -1933,7 +2091,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, await api.listTags(token, projectId));
         if (method === 'POST') {
           const b = await this.body(req);
-          return this.json(res, 200, await api.createTag(token, { projectId, name: b.name, parentId: b.parentId, color: b.color, kind: b.kind }));
+          return this.json(res, 200, await api.createTag(token, { projectId, name: b.name, parentId: b.parentId, color: b.color, kind: b.kind, description: b.description }));
         }
       }
       const tagMatch = p.match(/^\/api\/tags\/([^/]+)$/);
@@ -2081,6 +2239,9 @@ export class Gateway {
       }
       const queueMatch = p.match(/^\/api\/tasks\/([^/]+)\/queue$/);
       if (queueMatch && method === 'POST') {
+        const queued = store.getTask(queueMatch[1]!);
+        const project = queued ? store.getProject(queued.projectId) : undefined;
+        if (project) await this.ensureProjectWiki(project, session.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
@@ -2129,10 +2290,20 @@ export class Gateway {
           return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
         }
       }
+      const workflowMatch = p.match(/^\/api\/tasks\/([^/]+)\/workflow$/);
+      if (workflowMatch && method === 'PATCH') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.changeWorkflow(token, workflowMatch[1]!, String(b.workflow ?? '')));
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
-        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? '')));
+        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
+          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined));
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {
@@ -2229,6 +2400,19 @@ export class Gateway {
         try { return this.json(res, 200, await api.refreshUpstream(token, b.branch ? String(b.branch) : undefined)); }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
+      if (p === '/api/agent/collaboration/request' && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 202, await api.requestAgentAction(token, {
+            taskId: String(b.taskId ?? ''),
+            role: b.role ? String(b.role) : undefined,
+            action: String(b.action ?? '') as 'publish_branch',
+            message: b.message ? String(b.message) : undefined,
+          }));
+        } catch (error) {
+          return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       const desktopMatch = p.match(/^\/api\/tasks\/([^/]+)\/desktop$/);
       if (desktopMatch && method === 'GET') {
         const taskId = desktopMatch[1]!;
@@ -2324,7 +2508,7 @@ export class Gateway {
         const task = store.getTask(taskId);
         const project = task ? store.getProject(task.projectId) : undefined;
         const b = await this.body(req);
-        const relPath = String(b.path ?? '');
+          const relPath = String(b.path ?? '');
         if (!task || !project?.organizationId || !relPath) return this.json(res, 400, { error: 'task and artifact path are required' });
         const handle = worldHandleForView(task.lastView, taskId, store.effectiveProjectConfig(project));
         if (!handle) return this.json(res, 404, { error: 'no world for this task' });
@@ -2332,7 +2516,7 @@ export class Gateway {
         try {
           access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
           const world = access?.world ?? await this.deps.worlds.open(handle);
-          const data = await world.readFileBuffer(relPath);
+          const data = await world.readFileBuffer(worldWorkingRelativePath(handle, relPath));
           if (data.length > 100 * 1024 * 1024) return this.json(res, 413, { error: 'artifact exceeds 100 MiB' });
           const id = newId('artifact');
           const name = String(b.name ?? path.basename(relPath)).slice(0, 240) || 'artifact';
@@ -2444,6 +2628,13 @@ export class Gateway {
         else if (lease.runnerLeaseId) this.deps.runners?.release(lease.runnerLeaseId, lease.provider);
         return this.json(res, 200, { ok: true });
       }
+      // Conversation file links are readable wherever the conversation itself
+      // is readable. They use the same world confinement as review artifacts,
+      // but unknown extensions default to inline text for a useful source view.
+      const fileMatch = p.match(/^\/api\/tasks\/([^/]+)\/file$/);
+      if (fileMatch && method === 'GET') {
+        return this.serveArtifact(res, fileMatch[1]!, url.searchParams.get('path') ?? '', true);
+      }
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
@@ -2542,29 +2733,36 @@ export class Gateway {
       // family per scope; KarmaxApi enforces read/write capabilities and path
       // safety, so the wiki works identically for humans (UI) and agents
       // (read_wiki/search_wiki/platform_request, including from cloud worlds).
-      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search|suggest))?$/);
+      const wikiMatch = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/wiki(?:\/(page|search|suggest|refs|history))?$/);
       if (wikiMatch) {
         const scope = wikiMatch[1] === 'projects' ? ('project' as const) : ('organization' as const);
         const id = wikiMatch[2]!;
         const sub = wikiMatch[3];
+        const selector = {
+          ...(url.searchParams.get('taskId') ? { taskId: String(url.searchParams.get('taskId')) } : {}),
+          ...(url.searchParams.get('branch') ? { branch: String(url.searchParams.get('branch')) } : {}),
+        };
         try {
-          if (!sub && method === 'GET') return this.json(res, 200, api.readWiki(token, scope, id, url.searchParams.get('path') ?? ''));
+          if (!sub && method === 'GET') return this.json(res, 200, await api.readWikiResolved(token, scope, id, url.searchParams.get('path') ?? '', selector));
           if (sub === 'page') {
             if (method === 'GET') {
-              const read = api.readWiki(token, scope, id, String(url.searchParams.get('path') ?? ''));
+              const read = await api.readWikiResolved(token, scope, id, String(url.searchParams.get('path') ?? ''), selector);
               return 'page' in read ? this.json(res, 200, read.page) : this.json(res, 404, { error: 'wiki page not found' });
             }
             if (method === 'PUT') {
               const b = await this.body(req);
-              return this.json(res, 200, api.saveWikiPage(token, scope, id, {
+              return this.json(res, 200, await api.saveWikiPageResolved(token, scope, id, {
                 path: String(b.path ?? ''), content: String(b.content ?? ''), kind: b.kind === 'memory' ? 'memory' : 'skill',
                 create: b.create === true, prevPath: b.prevPath ? String(b.prevPath) : undefined,
-              }));
+              }, selector));
             }
-            if (method === 'DELETE') return this.json(res, 200, api.deleteWikiPage(token, scope, id, String(url.searchParams.get('path') ?? '')));
+            if (method === 'DELETE') return this.json(res, 200, await api.deleteWikiPageResolved(token, scope, id, String(url.searchParams.get('path') ?? ''), selector));
           }
-          if (sub === 'search' && method === 'GET') return this.json(res, 200, api.searchWiki(token, scope, id, String(url.searchParams.get('q') ?? '')));
-          if (sub === 'suggest' && method === 'GET') return this.json(res, 200, api.suggestWiki(token, scope, id, String(url.searchParams.get('q') ?? '')));
+          if (sub === 'search' && method === 'GET') return this.json(res, 200, await api.searchWikiResolved(token, scope, id, String(url.searchParams.get('q') ?? ''), selector));
+          if (sub === 'suggest' && method === 'GET') return this.json(res, 200, await api.suggestWikiResolved(token, scope, id, String(url.searchParams.get('q') ?? ''), selector));
+          if (sub === 'refs' && method === 'GET' && scope === 'project') return this.json(res, 200, api.wikiViews(token, id));
+          if (sub === 'history' && method === 'GET' && scope === 'organization')
+            return this.json(res, 200, api.organizationWikiHistory(token, id, url.searchParams.get('path') ?? undefined));
         } catch (error) {
           if (error instanceof CapabilityError) throw error;
           const conflict = /already exists/.test(String((error as Error)?.message));
@@ -2584,12 +2782,17 @@ export class Gateway {
       }
 
       // Installed + built-in workflows, and installing a new one from a git repo (§21d).
-      if (p === '/api/workflows' && method === 'GET') return this.json(res, 200, api.listWorkflows(token));
-      if (p === '/api/workflows/install' && method === 'POST') {
+      if (resourcePath === '/api/workflows' && method === 'GET')
+        return this.json(res, 200, api.listWorkflows(token, resourceOrganizationId));
+      if (resourcePath === '/api/workflows/install' && method === 'POST') {
         const b = await this.body(req);
         if (!b.url) return this.json(res, 400, { error: 'url required' });
         try {
-          return this.json(res, 200, await api.installWorkflow(token, { url: String(b.url), ref: b.ref ? String(b.ref) : undefined, name: b.name ? String(b.name) : undefined }));
+          return this.json(res, 200, await api.installWorkflow(token, {
+            url: String(b.url),
+            ref: b.ref ? String(b.ref) : undefined,
+            name: b.name ? String(b.name) : undefined,
+          }, resourceOrganizationId));
         } catch (e) {
           if (e instanceof CapabilityError) throw e;
           // fetch/validation/collision failures are user-facing input errors
@@ -2611,7 +2814,24 @@ export class Gateway {
         // Annotate each profile with the workflow(s) that declare its role, so the
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
         const { roleDef } = await import('../contrib/manifests.js');
-        const withRole = (pr: any) => ({ ...pr, roleWorkflows: roleDef(pr.role)?.workflows ?? [] });
+        const withRole = (pr: any) => {
+          const {
+            modelProvider: _legacyModelProvider,
+            allowedAccounts: _legacyAllowedAccounts,
+            auth: _legacyAuth,
+            ...visibleProfile
+          } = pr;
+          if (visibleProfile.inherited) {
+            const {
+              modelProvider: _legacyInheritedProvider,
+              allowedAccounts: _legacyInheritedAllowedAccounts,
+              auth: _legacyInheritedAuth,
+              ...visibleInherited
+            } = visibleProfile.inherited;
+            visibleProfile.inherited = visibleInherited;
+          }
+          return { ...visibleProfile, roleWorkflows: roleDef(pr.role)?.workflows ?? [] };
+        };
         const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
         if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr)).map(withRole));
@@ -2627,16 +2847,30 @@ export class Gateway {
       // Codex app-server expose this metadata; cache it because each refresh boots a
       // short-lived provider subprocess for every distinct connected login.
       if (p === '/api/models' && method === 'GET') {
-        return this.json(res, 200, await this.availableModels(url.searchParams.get('refresh') === '1'));
+        return this.json(res, 200, await this.availableModels(
+          url.searchParams.get('refresh') === '1',
+          requestedScope.organizationId ?? 'org_personal',
+        ));
       }
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
+        if (b.provider !== undefined && !isAgentProvider(b.provider)) {
+          return this.json(res, 400, { error: `unknown agent provider "${String(b.provider)}"` });
+        }
         const { roleDef } = await import('../contrib/manifests.js');
         if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
         const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
         if (!id) return this.json(res, 400, { error: 'profile needs id or projectId' });
-        const { projectId: _pid, scope: _s, inherited: _i, ...rest } = b;
+        const {
+          projectId: _pid,
+          scope: _s,
+          inherited: _i,
+          modelProvider: _legacyModelProvider,
+          allowedAccounts: _legacyAllowedAccounts,
+          auth: _legacyAuth,
+          ...rest
+        } = b;
         store.upsertProfile({ provider: 'claude', capabilities: [], ...rest, id });
         return this.json(res, 200, store.getProfile(id) ?? null);
       }
@@ -2660,17 +2894,338 @@ export class Gateway {
         return this.json(res, 200, await prov.connect());
       }
 
-      // cards (payment resources; SPEC §7.6). Provision/list/fund.
+      // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
+      if (p.startsWith('/api/vault')) {
+        const { VaultItems, ITEM_FIELDS } = await import('../autonomy/vault-items.js');
+        // Bind to the caller's own organization (tenant boundary). The token org
+        // is authoritative and cannot be spoofed — auth() validated it against
+        // membership; the query-param org only ever narrows within it.
+        const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const vault = new VaultItems(store, this.deps.broker, undefined, organizationId);
+        const caps = authRecord?.caps ?? [];
+        // A human session's token is task-unscoped; per-task passes/extensions
+        // only ever apply to real task-agent bearers.
+        const callerTaskId = authRecord?.taskId && authRecord.taskId !== '*' ? authRecord.taskId : undefined;
+        const principal = authRecord?.principal ?? (session.userId ? `user:${session.userId}` : session.user);
+        const defaultField = (type: string): any =>
+          ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', note: 'note' })[type];
+        const findItem = (b: any) => (b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined);
+
+        if (p === '/api/vault/items' && method === 'GET') return this.json(res, 200, vault.list());
+        if (p === '/api/vault/items' && method === 'POST') {
+          const b = await this.body(req);
+          const saved = vault.save({
+            id: b.id ? String(b.id) : undefined,
+            type: b.type,
+            label: String(b.label ?? ''),
+            domains: Array.isArray(b.domains) ? b.domains.map(String) : typeof b.domains === 'string' ? b.domains.split(/[,\s]+/).filter(Boolean) : undefined,
+            username: b.username ? String(b.username) : undefined,
+            tags: Array.isArray(b.tags) ? b.tags.map(String) : typeof b.tags === 'string' ? b.tags.split(/[,\s]+/).filter(Boolean) : undefined,
+            envVar: b.envVar ? String(b.envVar) : undefined,
+            policy: b.policy,
+            secrets: b.secrets,
+            provenance: { source: 'manual' },
+          });
+          // A human rotating a mirrored item's secret propagates to the source
+          // store too (field-level, notes preserved) when write-back is on.
+          let propagated;
+          if (b.id && b.secrets && Object.keys(b.secrets).length && saved.provenance.source.startsWith('connector:')) {
+            try {
+              const { defaultConnectors } = await import('../autonomy/connectors.js');
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+                .propagate(saved.id, Object.keys(b.secrets) as any);
+            } catch (e) {
+              propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
+            }
+          }
+          return this.json(res, 200, { ...saved, ...(propagated ? { propagated } : {}) });
+        }
+        const viDel = p.match(/^\/api\/vault\/items\/([^/]+)$/);
+        if (viDel && method === 'DELETE') {
+          vault.delete(viDel[1]!);
+          return this.json(res, 200, { deleted: true });
+        }
+        // Agent write-back (§7 store_credential). Two distinct powers:
+        //  • CREATE (and fully update items this same task created) — the
+        //    narrow vault:store, as before.
+        //  • ROTATE the SECRETS of any item the task's grant covers for use —
+        //    when an agent changes a password on the site, the stored value is
+        //    stale for everyone until it's updated, so rotation rides the same
+        //    authorization as using the credential. Metadata/policy/label edits
+        //    on someone else's item remain a human/credential:write action:
+        //    the rotation path ignores everything except `secrets`.
+        if (p === '/api/vault/store' && method === 'POST') {
+          const b = await this.body(req);
+          if (!callerTaskId && !allows(caps, 'credential:write')) return this.json(res, 400, { error: 'a task-agent token is required' });
+          const prior = b.id ? vault.get(String(b.id)) : undefined;
+          if (b.id && !prior) return this.json(res, 404, { error: `no vault item ${b.id}` });
+          const ownItem = !prior || !callerTaskId || prior.provenance.taskId === callerTaskId || allows(caps, 'credential:write');
+          let saved;
+          if (ownItem) {
+            saved = vault.save({
+              id: prior?.id,
+              type: b.type,
+              label: String(b.label ?? ''),
+              domains: Array.isArray(b.domains) ? b.domains.map(String) : undefined,
+              username: b.username ? String(b.username) : undefined,
+              tags: Array.isArray(b.tags) ? b.tags.map(String) : undefined,
+              envVar: b.envVar ? String(b.envVar) : undefined,
+              policy: b.policy,
+              secrets: b.secrets,
+              provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
+            });
+          } else {
+            // Rotation of a foreign item: allowed iff the task's grant covers it.
+            if (!vault.covered(caps, callerTaskId, prior!))
+              return this.json(res, 403, { error: 'this task was not granted this credential — request_credential first, or create your own item' });
+            const secretFields = Object.keys(b.secrets ?? {});
+            if (!secretFields.length)
+              return this.json(res, 403, { error: 'only the secrets of a granted item can be updated (metadata and policy stay with its owner)' });
+            saved = vault.save({ id: prior!.id, type: prior!.type, secrets: b.secrets });
+            store.appendAudit({ principalId: `task:${callerTaskId}`, action: 'vault.rotated',
+              detail: { itemId: prior!.id, label: prior!.label, fields: secretFields } });
+          }
+          // Best-effort propagation of rotated fields back to the item's source
+          // store (§9 updateSecret) — the vault is already correct either way.
+          let propagated;
+          if (prior && saved.provenance.source.startsWith('connector:') && b.secrets) {
+            try {
+              const { defaultConnectors } = await import('../autonomy/connectors.js');
+              propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
+                .propagate(saved.id, Object.keys(b.secrets) as any);
+            } catch (e) {
+              propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
+            }
+          }
+          return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields, ...(propagated ? { propagated } : {}) });
+        }
+        // Plaintext reveal (§5C) — per-item grant + reveal policy, audited.
+        if (p === '/api/vault/resolve' && method === 'POST') {
+          const b = await this.body(req);
+          const item = findItem(b);
+          if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const decision = vault.access(caps, callerTaskId, item, 'reveal', { consume: true });
+          if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+          const field = (b.field as any) ?? defaultField(item.type);
+          if (!ITEM_FIELDS[item.type].includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
+          const value = field === 'totp'
+            ? vault.totp(item, { taskId: callerTaskId, principal })
+            : vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' });
+          return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value });
+        }
+        // Zero-exposure browser fill (§5B) — the secret goes gateway → CDP,
+        // never through the agent. `username` fills metadata; `totp` fills the
+        // current code computed broker-side from the stored seed.
+        if (p === '/api/vault/fill' && method === 'POST') {
+          const b = await this.body(req);
+          const item = findItem(b);
+          if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const decision = vault.access(caps, callerTaskId, item, 'use', { consume: true });
+          if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+          const field = String(b.field ?? 'password');
+          const text = field === 'username'
+            ? item.username
+            : field === 'totp'
+              ? vault.totp(item, { taskId: callerTaskId, principal })
+              : vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' });
+          if (!text) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
+          try {
+            const { fillViaCdp } = await import('../autonomy/fill.js');
+            const filled = await fillViaCdp({
+              cdpUrl: String(b.cdpUrl ?? 'http://127.0.0.1:9222'),
+              selector: String(b.selector ?? ''),
+              text,
+              expectDomains: item.domains,
+            });
+            return this.json(res, 200, { status: 'granted', itemId: item.id, filled: true, origin: filled.origin });
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        if (p === '/api/vault/requests' && method === 'GET') {
+          return this.json(res, 200, vault.requests({
+            taskId: url.searchParams.get('taskId') ?? undefined,
+            status: (url.searchParams.get('status') as any) ?? undefined,
+          }));
+        }
+        // The pull model (§7): an agent escalates for an item it lacks.
+        if (p === '/api/vault/requests' && method === 'POST') {
+          const b = await this.body(req);
+          if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
+          return this.json(res, 200, vault.request({
+            taskId: callerTaskId,
+            projectId: authRecord?.projectId,
+            caps,
+            itemId: b.itemId ? String(b.itemId) : undefined,
+            domain: b.domain ? String(b.domain) : undefined,
+            field: b.field,
+            mode: b.mode,
+            kind: b.kind === 'reset' ? 'reset' : undefined,
+            why: b.why ? String(b.why) : undefined,
+          }));
+        }
+        const vres = p.match(/^\/api\/vault\/requests\/([^/]+)\/resolve$/);
+        if (vres && method === 'POST') {
+          const b = await this.body(req);
+          const action = String(b.action ?? '');
+          if (!['once', 'task', 'always', 'deny'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny' });
+          try {
+            return this.json(res, 200, vault.resolve(vres[1]!, { action: action as any, by: principal, itemId: b.itemId ? String(b.itemId) : undefined }));
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+
+        // ── external store connectors (§9) ──
+        if (p.startsWith('/api/vault/connectors')) {
+          if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
+          const { defaultConnectors } = await import('../autonomy/connectors.js');
+          const connectors = defaultConnectors(store, vault, this.deps.broker, organizationId);
+          if (p === '/api/vault/connectors' && method === 'GET') return this.json(res, 200, await connectors.describe());
+          const connName = p.match(/^\/api\/vault\/connectors\/([^/]+)(?:\/([^/]+))?$/);
+          if (connName && !connectors.get(connName[1]!)) return this.json(res, 404, { error: `no connector "${connName[1]}"` });
+          if (connName && method === 'POST') {
+            const b = await this.body(req);
+            const action = connName[2];
+            try {
+              if (action === 'connect') { connectors.connect(connName[1]!, String(b.secret ?? '')); return this.json(res, 200, { connected: true }); }
+              if (action === 'config') return this.json(res, 200, connectors.setConfig(connName[1]!, { writeBack: !!b.writeBack }));
+              if (action === 'list') return this.json(res, 200, await connectors.get(connName[1]!)!.list());
+              if (action === 'sync') return this.json(res, 200, await connectors.sync(connName[1]!, Array.isArray(b.externalIds) ? b.externalIds.map(String) : [],
+                { policy: b.policy, writeBack: typeof b.writeBack === 'boolean' ? b.writeBack : undefined }));
+              if (action === 'write-back') return this.json(res, 200, (await connectors.writeBack(connName[1]!, String(b.itemId ?? ''))) ?? { skipped: 'write-back disabled for this connector' });
+            } catch (e) {
+              return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+            }
+            return this.json(res, 404, { error: 'unknown connector action' });
+          }
+        }
+
+        // ── agent-enrolled passkeys (§8) ──
+        if (p.startsWith('/api/vault/passkey')) {
+          if (!this.passkeys) {
+            const { PasskeyManager } = await import('../autonomy/passkey.js');
+            this.passkeys = new PasskeyManager();
+          }
+          const b = method === 'POST' ? await this.body(req) : {};
+          const item = b.itemId ? vault.get(String(b.itemId)) : b.domain ? vault.findByDomain(String(b.domain))[0] : undefined;
+          try {
+            if (p === '/api/vault/passkey/enroll' && method === 'POST') {
+              const domains = Array.isArray(b.domains) ? b.domains.map(String) : b.domain ? [String(b.domain)] : undefined;
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? 'http://127.0.0.1:9222'), { expectDomains: domains, mode: 'enroll' });
+              return this.json(res, 200, { ...started, next: 'trigger the site\'s "create a passkey" button in the browser, then POST /api/vault/passkey/save with this authenticatorId' });
+            }
+            if (p === '/api/vault/passkey/save' && method === 'POST') {
+              const creds = await this.passkeys.harvest(String(b.authenticatorId ?? ''));
+              if (!creds.length) return this.json(res, 400, { error: 'no passkey was created on the page — trigger the site\'s enroll button first' });
+              const saved = vault.save({
+                type: 'passkey',
+                label: String(b.label ?? (item?.label ? `${item.label} (passkey)` : 'passkey')),
+                domains: Array.isArray(b.domains) ? b.domains.map(String) : creds[0]!.rpId ? [creds[0]!.rpId] : undefined,
+                username: b.username ? String(b.username) : undefined,
+                secrets: { passkey: JSON.stringify(creds) },
+                provenance: { source: callerTaskId ? `task:${callerTaskId}` : 'manual', taskId: callerTaskId },
+              });
+              return this.json(res, 200, { itemId: saved.id, label: saved.label, count: creds.length });
+            }
+            if (p === '/api/vault/passkey/login' && method === 'POST') {
+              if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no passkey item — enroll one first' });
+              const decision = vault.access(caps, callerTaskId, item, 'use', { consume: true });
+              if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+              const creds = JSON.parse(vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' })) as any[];
+              const domains = item.domains;
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? 'http://127.0.0.1:9222'), { expectDomains: domains, mode: 'login', credential: creds[0] });
+              return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
+            }
+            if (p === '/api/vault/passkey/release' && method === 'POST') {
+              this.passkeys.release(String(b.authenticatorId ?? ''));
+              return this.json(res, 200, { released: true });
+            }
+          } catch (e) {
+            return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+      }
+
+      // ── agent mailbox (§8): ORGANIZATION-scoped — each org connects its own
+      // email backend (like world providers / payment cards). The org in the
+      // path is enforced by requestScope + the token check, so one tenant can
+      // neither configure nor read another's mail. (The inbound webhook is a
+      // separate unauthenticated shared-secret route before the session gate.)
+      const orgMail = p.match(/^\/api\/organizations\/([^/]+)\/agent-mail(?:\/(providers|connect))?$/);
+      if (orgMail) {
+        const organizationId = orgMail[1]!;
+        const sub = orgMail[2];
+        const { AgentMail } = await import('../autonomy/agent-mail.js');
+        if (!sub && method === 'GET') {
+          const config = this.mailboxConfig(organizationId);
+          const mail = new AgentMail(
+            store,
+            this.mailboxDomain(organizationId),
+            this.mailboxFixedLocal(organizationId),
+            config.agentmailAddress,
+          );
+          return this.json(res, 200, { organizationId, address: mail.address(organizationId), configured: mail.configured(),
+            provider: config.provider, domain: this.mailboxDomain(organizationId),
+            messages: mail.recent(organizationId, { since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
+        }
+        if (sub === 'providers' && method === 'GET') {
+          const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+          const { ingestSecret, cloudflareWorkerScript } = await import('../autonomy/agent-mail.js');
+          const config = this.mailboxConfig(organizationId);
+          // The push webhook URL (secret included) + Cloudflare worker are still
+          // returned for the operator who wants them; the UI hides them for now.
+          const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
+          const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store)}`;
+          return this.json(res, 200, { providers: defaultMailboxRegistry().list(config), active: config.provider, webhookUrl, cloudflareWorker: cloudflareWorkerScript(webhookUrl) });
+        }
+        if (sub === 'connect' && method === 'POST') {
+          const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+          const b = await this.body(req);
+          const provider = defaultMailboxRegistry().get(String(b.provider ?? ''));
+          if (!provider) return this.json(res, 400, { error: `unknown mailbox provider "${b.provider}"` });
+          const result = provider.connect({
+            domain: b.domain ? String(b.domain) : undefined,
+            apiKey: b.apiKey ? String(b.apiKey) : undefined,
+            address: b.address ? String(b.address) : undefined,
+            imapHost: b.imapHost ? String(b.imapHost) : undefined,
+            imapPort: b.imapPort ? Number(b.imapPort) : undefined,
+            imapUser: b.imapUser ? String(b.imapUser) : undefined,
+            imapSecure: b.imapSecure === undefined ? undefined : b.imapSecure !== false,
+          });
+          if (result.status === 'connected' && result.config) {
+            // The provider secret (AgentMail key / IMAP password) → the vault under
+            // an org-scoped handle the poller resolves; never echoed or stored raw.
+            const apiKeyHandle = this.mailboxSecretHandle(organizationId, String(b.provider));
+            if (b.apiKey && this.deps.broker) this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey));
+            // REPLACE (not merge) so switching providers can't leave a stale field.
+            const config = { ...result.config, ...(b.apiKey ? { apiKeyHandle } : {}) };
+            this.setMailboxConfig(organizationId, config);
+            if (config.provider === 'agentmail') {
+              new AgentMail(store, config.agentmailDomain, undefined, config.agentmailAddress).address(organizationId);
+            }
+          }
+          return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
+        }
+      }
+
+      // cards (payment resources; SPEC §7.6) — organization-scoped so a tenant
+      // never spends from another's card. A project card narrows within its org.
       if (p === '/api/cards' && method === 'GET') {
         const pid = url.searchParams.get('projectId') ?? undefined;
-        return this.json(res, 200, store.listCards(pid));
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId;
+        return this.json(res, 200, store.listCards(pid, cardOrg));
       }
       if (p === '/api/cards' && method === 'POST') {
         if (!this.deps.payments) return this.json(res, 400, { error: 'no payment provider configured' });
         const b = await this.body(req);
+        // A non-project card belongs to the caller's own organization (the old
+        // installation-wide "global" card is gone in the multi-tenant model).
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId
+          ?? (b.projectId ? store.getProject(String(b.projectId))?.organizationId : undefined) ?? 'org_personal';
         const card = await this.deps.payments.provisionCard({
-          scope: b.scope === 'global' ? 'global' : 'project',
-          scopeId: b.scope === 'global' ? undefined : b.projectId,
+          scope: b.scope === 'project' ? 'project' : 'organization',
+          scopeId: b.scope === 'project' ? b.projectId : cardOrg,
           label: b.label ?? 'Card',
           cap: Number(b.cap ?? 0),
           merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
@@ -2687,30 +3242,59 @@ export class Gateway {
 
       // accounts: API-key handles (broker; secrets write-only) + config-home
       // logins (SPEC §7.3 — switchable per-account subscriptions).
-      if (p === '/api/accounts' && method === 'GET') {
+      if (resourcePath === '/api/accounts' && method === 'GET') {
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
         return this.json(res, 200, {
-          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? []),
+          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? [], resourceOrganizationId),
           // never expose the home's absolute path to the browser
-          logins: (this.deps.configHomes?.list() ?? []).map((a) => ({ provider: a.provider, account: a.account, loggedIn: a.loggedIn })),
+          logins: (this.deps.configHomes?.list(resourceOrganizationId) ?? []).map((a) => ({
+            provider: a.provider,
+            account: a.account,
+            loggedIn: a.loggedIn,
+            key: resourceOrganizationId === 'org_personal'
+              ? `login:${a.provider}:${a.account}`
+              : `login:${resourceOrganizationId}:${a.provider}:${a.account}`,
+          })),
         });
       }
-      if (p === '/api/accounts' && method === 'POST') {
+      if (resourcePath === '/api/accounts' && method === 'POST') {
         const b = await this.body(req);
         if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
         if (!b.provider || !b.account || !b.apiKey) return this.json(res, 400, { error: 'provider, account, apiKey required' });
-        const handle = `${b.provider}:${b.account}`;
+        const provider = String(b.provider);
+        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(provider)) {
+          return this.json(res, 400, { error: 'model provider must be a simple id (letters, numbers, dot, underscore, hyphen)' });
+        }
+        const account = String(b.account);
+        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(account)) {
+          return this.json(res, 400, { error: 'account must be a simple id (letters, numbers, dot, underscore, hyphen)' });
+        }
+        const handle = resourceOrganizationId === 'org_personal'
+          ? `${provider}:${account}`
+          : `${provider}:${resourceOrganizationId}:${account}`;
         this.deps.broker.registerHandle(handle, String(b.apiKey));
+        await this.refreshLoginPool();
         return this.json(res, 200, { handle }); // never echoes the secret
       }
       // connect an account login: mint a config home + launch the provider's own
       // OAuth, return the device URL for the user to complete (we never type creds).
-      if (p === '/api/accounts/connect' && method === 'POST') {
+      if (resourcePath === '/api/accounts/connect' && method === 'POST') {
         if (!this.deps.login) return this.json(res, 400, { error: 'no login manager configured' });
         const b = await this.body(req);
-        const provider = b.provider === 'codex' ? 'codex' : 'claude';
+        if (!isLoginProvider(b.provider)) return this.json(res, 400, { error: `unsupported login provider: ${String(b.provider ?? '')}` });
+        const provider = b.provider;
         if (!b.account) return this.json(res, 400, { error: 'account required' });
-        const result = await this.deps.login.connect(provider, String(b.account));
+        const modelProvider = b.modelProvider === undefined ? undefined : String(b.modelProvider);
+        const authMethod = b.authMethod === undefined ? undefined : String(b.authMethod);
+        if (provider === 'opencode') {
+          if (!modelProvider || !/^[a-z0-9][a-z0-9._-]*$/i.test(modelProvider)) {
+            return this.json(res, 400, { error: 'OpenCode login requires a simple model-provider id' });
+          }
+          if (!authMethod || authMethod.length > 160 || /[\r\n\0]/.test(authMethod)) {
+            return this.json(res, 400, { error: 'OpenCode login requires a valid auth-method label' });
+          }
+        }
+        const result = await this.deps.login.connect(provider, String(b.account), { modelProvider, authMethod }, resourceOrganizationId);
         // Seed the config home's MCP baseline (SPEC §7.5/§3.4): the karmax platform
         // MCP (always) + an optional browser MCP. The scoped token is injected at
         // spawn; here we bake in the gateway URL only.
@@ -2728,17 +3312,19 @@ export class Gateway {
         return this.json(res, 200, safe);
       }
       // edit (rename) / delete a connected login
-      const loginMatch = p.match(/^\/api\/accounts\/logins\/([^/]+)\/(.+)$/);
+      const loginMatch = resourcePath.match(/^\/api\/accounts\/logins\/([^/]+)\/(.+)$/);
       if (loginMatch && (method === 'DELETE' || method === 'PATCH')) {
         if (!this.deps.configHomes) return this.json(res, 400, { error: 'no config homes configured' });
-        const provider = (loginMatch[1] === 'codex' ? 'codex' : 'claude') as Provider;
+        const rawProvider = loginMatch[1];
+        if (!isLoginProvider(rawProvider)) return this.json(res, 400, { error: `unsupported login provider: ${rawProvider}` });
+        const provider = rawProvider;
         const account = decodeURIComponent(loginMatch[2]!);
         if (method === 'DELETE') {
-          this.deps.configHomes.remove(provider, account);
+          this.deps.configHomes.remove(provider, account, resourceOrganizationId);
         } else {
           const b = await this.body(req);
           if (!b.account) return this.json(res, 400, { error: 'new account name required' });
-          this.deps.configHomes.rename(provider, account, String(b.account));
+          this.deps.configHomes.rename(provider, account, String(b.account), resourceOrganizationId);
         }
         await this.refreshLoginPool();
         return this.json(res, 200, { ok: true });
@@ -2747,17 +3333,17 @@ export class Gateway {
       // Git profiles (PLAN-git-config.md §3): named git identity + credentials for
       // the repos karmax works on. The registry is public; secrets are write-only
       // into the vault (never echoed) and resolved JIT by the broker at use time.
-      if (p === '/api/git-profiles' && method === 'GET') {
+      if (resourcePath === '/api/git-profiles' && method === 'GET') {
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        const gp = new GitProfiles(store, this.deps.broker);
+        const gp = new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId);
         return this.json(res, 200, { profiles: gp.list(), defaultProfile: gp.defaultProfile() ?? null });
       }
-      if (p === '/api/git-profiles' && method === 'POST') {
+      if (resourcePath === '/api/git-profiles' && method === 'POST') {
         const b = await this.body(req);
         if (!this.deps.broker) return this.json(res, 400, { error: 'no credential broker configured' });
         if (!b.name || !b.userName || !b.userEmail) return this.json(res, 400, { error: 'name, userName, userEmail required' });
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        const gp = new GitProfiles(store, this.deps.broker);
+        const gp = new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId);
         try {
           const rec = gp.save({
             name: String(b.name),
@@ -2773,35 +3359,42 @@ export class Gateway {
           return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
         }
       }
-      const gitProfileMatch = p.match(/^\/api\/git-profiles\/([^/]+)$/);
+      const gitProfileMatch = resourcePath.match(/^\/api\/git-profiles\/([^/]+)$/);
       if (gitProfileMatch && method === 'DELETE') {
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        new GitProfiles(store, this.deps.broker).delete(decodeURIComponent(gitProfileMatch[1]!));
+        new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId)
+          .delete(decodeURIComponent(gitProfileMatch[1]!));
         return this.json(res, 200, { ok: true });
       }
       // The doctor check (PLAN-git-config.md §7): which tier a project's remote
       // ops resolve to (profile / host fallback) and whether it can reach the
       // repos' remotes non-interactively. Read-only.
-      if (p === '/api/git-profiles/preflight' && method === 'GET') {
+      if (resourcePath === '/api/git-profiles/preflight' && method === 'GET') {
         const projectId = url.searchParams.get('projectId') ?? undefined;
         const project = projectId ? store.getProject(projectId) : undefined;
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        return this.json(res, 200, await new GitProfiles(store, this.deps.broker).preflight(project?.config));
+        const organizationId = project?.organizationId ?? resourceOrganizationId;
+        if (project && organizationId !== resourceOrganizationId)
+          return this.json(res, 400, { error: 'project does not belong to this organization' });
+        return this.json(res, 200, await new GitProfiles(store, this.deps.broker, undefined, organizationId).preflight(project?.config));
       }
-      if (p === '/api/git-profiles/default' && method === 'POST') {
+      if (resourcePath === '/api/git-profiles/default' && method === 'POST') {
         const b = await this.body(req);
         const { GitProfiles } = await import('../autonomy/git-profiles.js');
-        new GitProfiles(store, this.deps.broker).setDefault(b.name ? String(b.name) : undefined);
+        new GitProfiles(store, this.deps.broker, undefined, resourceOrganizationId)
+          .setDefault(b.name ? String(b.name) : undefined);
         return this.json(res, 200, { ok: true });
       }
 
       // Manual availability override for an agent login (SPEC §6.2): force a login
       // on/off or edit its reset time (e.g. after upgrading a plan) without waiting
       // for the old refresh. Signals the account coordinator directly.
-      if (p === '/api/accounts/availability' && method === 'POST') {
+      if (resourcePath === '/api/accounts/availability' && method === 'POST') {
         if (!this.deps.client) return this.json(res, 400, { error: 'no temporal client' });
         const b = await this.body(req);
         if (!b.accountId || !b.status) return this.json(res, 400, { error: 'accountId and status required' });
+        if (!this.organizationCredentialKeys(resourceOrganizationId).includes(String(b.accountId)))
+          return this.json(res, 404, { error: 'credential not found in this organization' });
         const status = ['available', 'manual-off', 'needs-attention', 'exhausted'].includes(b.status) ? b.status : 'exhausted';
         const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
         await makeCoordinatorActivities({ client: this.deps.client, taskQueue: this.deps.taskQueue }).setAccountAvailability({
@@ -2815,9 +3408,11 @@ export class Gateway {
       // Per-login concurrency cap — how many agent turns may run on this login at once.
       // `max` = a positive integer, or null/empty for unlimited. Persisted + re-applied
       // to the coordinator immediately (concurrency doesn't cost extra quota).
-      if (p === '/api/accounts/concurrency' && method === 'POST') {
+      if (resourcePath === '/api/accounts/concurrency' && method === 'POST') {
         const b = await this.body(req);
         if (!b.accountId) return this.json(res, 400, { error: 'accountId required' });
+        if (!this.organizationCredentialKeys(resourceOrganizationId).includes(String(b.accountId)))
+          return this.json(res, 404, { error: 'credential not found in this organization' });
         const { concurrencyKey } = await import('../platform/credential-sources.js');
         const { UNLIMITED_CONCURRENCY } = await import('../coordinators/names.js');
         const n = b.max == null || b.max === '' ? UNLIMITED_CONCURRENCY : Math.floor(Number(b.max));
@@ -2830,11 +3425,15 @@ export class Gateway {
       // Proactive quota (#6): real usage % + reset for each pollable subscription.
       // GET returns the cached snapshots; recheck re-probes on demand (the button).
       // API-key/setup-token creds aren't pollable → they show reactive status.
-      if (p === '/api/accounts/usage' && method === 'GET') {
+      if (resourcePath === '/api/accounts/usage' && method === 'GET') {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
         const { isUsagePollable, isUsageStale } = await import('../agent/usage.js');
-        const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+        const creds = enumerateCredentials(gatherCredentialSources({
+          configHomes: this.deps.configHomes,
+          broker: this.deps.broker,
+          organizationId: resourceOrganizationId,
+        }));
         const usage: Record<string, unknown> = {};
         const pollable: string[] = [];
         for (const c of creds) {
@@ -2855,23 +3454,34 @@ export class Gateway {
         }
         return this.json(res, 200, { usage, pollable });
       }
-      if (p === '/api/accounts/usage/recheck' && method === 'POST') {
+      if (resourcePath === '/api/accounts/usage/recheck' && method === 'POST') {
         const b = await this.body(req);
         const only = b.accountId ? String(b.accountId) : undefined;
-        const usage = await this.refreshUsage(only);
+        const usage = await this.refreshUsage(only, resourceOrganizationId);
         return this.json(res, 200, { usage });
       }
 
       // Credential policy (SPEC §7/§9): list every credential + its effective
       // enablement per scope (global→project→task), and set a scope's ordering /
       // enable-disable overrides.
-      if (p === '/api/credentials' && method === 'GET') {
+      if (resourcePath === '/api/credentials' && method === 'GET') {
         const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources, parsePolicy, credPolicyKey } = await import('../platform/credential-sources.js');
-        const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
         const projectId = url.searchParams.get('projectId') ?? undefined;
         const taskId = url.searchParams.get('taskId') ?? undefined;
-        const g = parsePolicy(store.kvGet(credPolicyKey.global()));
+        const scopedProjectId = projectId ?? (taskId ? store.getTask(taskId)?.projectId : undefined);
+        const scopedOrganizationId = scopedProjectId
+          ? store.getProject(scopedProjectId)?.organizationId ?? resourceOrganizationId
+          : resourceOrganizationId;
+        if (scopedOrganizationId !== resourceOrganizationId)
+          return this.json(res, 400, { error: 'credential scope does not belong to this organization' });
+        const creds = enumerateCredentials(gatherCredentialSources({
+          configHomes: this.deps.configHomes,
+          broker: this.deps.broker,
+          organizationId: scopedOrganizationId,
+        }));
+        const g = parsePolicy(store.kvGet(credPolicyKey.organization(scopedOrganizationId)))
+          ?? (scopedOrganizationId === 'org_personal' ? parsePolicy(store.kvGet(credPolicyKey.global())) : undefined);
         const pr = projectId ? parsePolicy(store.kvGet(credPolicyKey.project(projectId))) : undefined;
         const tk = taskId ? parsePolicy(store.kvGet(credPolicyKey.task(taskId))) : undefined;
         const enabledKeys = (layers: { global?: unknown; project?: unknown; task?: unknown }) =>
@@ -2883,13 +3493,26 @@ export class Gateway {
           ...(taskId ? { task: { own: tk ?? {}, enabled: enabledKeys({ global: g, project: pr, task: tk }) } } : {}),
         });
       }
-      if (p === '/api/credentials/policy' && method === 'POST') {
+      if (resourcePath === '/api/credentials/policy' && method === 'POST') {
         const b = await this.body(req);
         const { credPolicyKey } = await import('../platform/credential-sources.js');
-        const key =
-          b.scope === 'task' && b.taskId ? credPolicyKey.task(String(b.taskId))
-          : b.scope === 'project' && b.projectId ? credPolicyKey.project(String(b.projectId))
-          : credPolicyKey.global();
+        let key: string;
+        if (b.scope === 'task') {
+          const task = b.taskId ? store.getTask(String(b.taskId)) : undefined;
+          const project = task ? store.getProject(task.projectId) : undefined;
+          if (!task || project?.organizationId !== resourceOrganizationId)
+            return this.json(res, 400, { error: 'credential scope does not belong to this organization' });
+          key = credPolicyKey.task(task.id);
+        } else if (b.scope === 'project') {
+          const project = b.projectId ? store.getProject(String(b.projectId)) : undefined;
+          if (!project || project.organizationId !== resourceOrganizationId)
+            return this.json(res, 400, { error: 'credential scope does not belong to this organization' });
+          key = credPolicyKey.project(project.id);
+        } else if (b.scope === 'global' || b.scope === 'organization') {
+          key = credPolicyKey.organization(resourceOrganizationId);
+        } else {
+          return this.json(res, 400, { error: 'scope must be organization, global, project, or task' });
+        }
         store.kvSet(key, JSON.stringify(b.policy ?? {}));
         return this.json(res, 200, { ok: true });
       }
@@ -2897,7 +3520,7 @@ export class Gateway {
       // workflow parameter schemas (SPEC §10.4) — drives task forms + settings forms
       if (p === '/api/schema' && method === 'GET') {
         // Built-in + installed workflows, so the New Task form offers both (§21d).
-        return this.json(res, 200, api.workflowSchemas());
+        return this.json(res, 200, api.workflowSchemas(requestedScope.organizationId ?? 'org_personal'));
       }
       if (p === '/api/events/catalog' && method === 'GET') {
         // Workflow + platform events for the event-trigger picker (SPEC §5).
@@ -3111,25 +3734,84 @@ export class Gateway {
     }
   }
 
-  private async availableModels(refresh = false): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
-    if (!refresh && this.modelCatalog && Date.now() - this.modelCatalog.at < 5 * 60_000) {
-      return { providers: this.modelCatalog.value, refreshedAt: this.modelCatalog.at };
+  /** Initialize the local canonical wiki immediately. When GitHub is fully
+   * connected and the creating human authorized, also create its private
+   * companion remote; otherwise the local repo remains ready and this is
+   * retried naturally when a project is next set up. */
+  private async ensureProjectWiki(project: import('../domain/types.js').Project, userId?: string): Promise<void> {
+    const root = ensureProjectWikiRepository(paths().content, project.id);
+    if (!this.deps.store.projectWiki(project.id)) this.deps.store.setProjectWikiRepository(project.id);
+    const current = this.deps.store.projectWiki(project.id)?.repository;
+    if (current && this.wikiRemotesReady.has(project.id)) return;
+    if (!this.deps.githubApp) return;
+    const organizationId = project.organizationId ?? 'org_personal';
+    const candidates = [...new Set([
+      ...(userId ? [userId] : []),
+      ...this.deps.store.listOrganizationMemberships(organizationId)
+        .sort((a, b) => Number(b.role === 'owner') - Number(a.role === 'owner'))
+        .map((membership) => membership.userId),
+    ])];
+    const actor = candidates.find((candidate) => this.deps.githubApp!.status(candidate).userAuthorized);
+    if (!actor) return;
+    const connections = this.deps.store.listGitConnections(organizationId);
+    const attachedConnectionIds = [...new Set(this.deps.store.listProjectRepositories(project.id)
+      .map((candidate) => candidate.repository.gitConnectionId).filter((id): id is string => Boolean(id)))];
+    const connection = current?.gitConnectionId
+      ? connections.find((candidate) => candidate.id === current.gitConnectionId)
+      : attachedConnectionIds.length === 1
+      ? connections.find((candidate) => candidate.id === attachedConnectionIds[0])
+      : connections.length === 1 ? connections[0] : undefined;
+    if (!connection) return;
+    try {
+      const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
+      // Preserve the remote identity across project renames. The deterministic
+      // name is only for the first provisioning attempt.
+      const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
+      const repository = await this.deps.githubApp.ensureRepository(connection.id, actor, {
+        name, description: `Karmax project wiki for ${project.name}`,
+        private: true, defaultBranch: 'main', autoInit: false,
+      });
+      // Link before the push so even a transient network failure keeps this
+      // platform-owned repository out of the ordinary project repo picker.
+      this.deps.store.setProjectWikiRepository(project.id, repository.id);
+      setProjectWikiRemote(root, repository.sshUrl, this.deps.githubApp.repositorySshKey(repository.id, 'write'));
+      this.wikiRemotesReady.add(project.id);
+    } catch (error) {
+      console.warn(`[karmax] could not create wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
+    }
+  }
+
+  private async availableModels(refresh = false, organizationId = 'org_personal'): Promise<{ providers: ModelCatalog; refreshedAt: number }> {
+    const cached = this.modelCatalog.get(organizationId);
+    if (!refresh && cached && Date.now() - cached.at < 5 * 60_000) {
+      return { providers: cached.value, refreshedAt: cached.at };
     }
     const { gatherCredentialSources } = await import('../platform/credential-sources.js');
     const { enumerateCredentials } = await import('../platform/credentials.js');
-    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
-    const homes = (provider: 'claude' | 'codex') => {
+    const creds = enumerateCredentials(gatherCredentialSources({
+      configHomes: this.deps.configHomes,
+      broker: this.deps.broker,
+      organizationId,
+    }));
+    type CatalogProvider = Exclude<Provider, 'mock'>;
+    const homes = (provider: CatalogProvider) => {
       const values = creds.filter((c) => c.provider === provider && c.kind !== 'key').map((c) => c.configHome);
       // No subscription login: let the provider process use the ambient API key.
-      if (!values.length && creds.some((c) => c.provider === provider && c.kind === 'key')) values.push(undefined);
+      if (!values.length && creds.some((c) => credentialAliases(provider).includes(c.provider) && c.kind === 'key')) values.push(undefined);
       return [...new Set(values)];
     };
-    const settled = async (provider: 'claude' | 'codex') => {
-      const fn = provider === 'claude' ? claudeModels : codexModels;
+    const settled = async (provider: CatalogProvider) => {
+      const fn =
+        provider === 'claude' ? claudeModels
+        : provider === 'codex' ? codexModels
+        : provider === 'opencode' ? opencodeModels
+        : (home?: string) => acpModels(provider, home);
       const results = await Promise.all(homes(provider).map((home) => fn(home).catch(() => [])));
       return mergeModels(results);
     };
-    const [claude, codex] = await Promise.all([settled('claude'), settled('codex')]);
+    const [claude, codex, opencode] = await Promise.all([
+      settled('claude'), settled('codex'), settled('opencode'),
+    ]);
     // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
@@ -3137,9 +3819,23 @@ export class Gateway {
         { id: 'claude-sonnet-5' }, { id: 'claude-opus-4-8' }, { id: 'claude-haiku-4-5' }, { id: 'claude-fable-5' },
       ],
       codex: codex.length ? codex : [{ id: 'gpt-5.5' }, { id: 'gpt-5.4-mini' }],
+      opencode: opencode.length ? opencode : [
+        { id: 'kimi/kimi-for-coding' },
+        { id: 'kimi/k3', effort: ['low', 'high', 'max'] },
+        { id: 'google/gemini-3.6-pro' },
+        { id: 'xai/grok-4.5' },
+      ],
+      // Retained only for stored-profile/backward-compatible typing. The native
+      // Kimi harness is disabled until its ACP server supports session/fork.
+      kimi: [],
+      // Retained only for stored-profile/backward-compatible typing. Grok's
+      // current ACP server does not advertise session/fork.
+      grok: [],
+      mock: [{ id: 'mock' }],
     };
-    this.modelCatalog = { at: Date.now(), value };
-    return { providers: value, refreshedAt: this.modelCatalog.at };
+    const next = { at: Date.now(), value };
+    this.modelCatalog.set(organizationId, next);
+    return { providers: value, refreshedAt: next.at };
   }
 
   /** For each agent field, resolve the concrete provider/model the server would
@@ -3149,12 +3845,26 @@ export class Gateway {
    *  rotation reflects the current set (called after connect/rename/delete). */
   private async refreshLoginPool(): Promise<void> {
     if (!this.deps.configHomes || !this.deps.client) return;
-    const { gatherCredentialSources, concurrencyFor } = await import('../platform/credential-sources.js');
-    const { enumerateCredentials } = await import('../platform/credentials.js');
-    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }));
+    const { concurrencyFor } = await import('../platform/credential-sources.js');
+    const creds = this.deps.store.listOrganizations().flatMap((organization) =>
+      enumerateCredentials(gatherCredentialSources({
+        configHomes: this.deps.configHomes,
+        broker: this.deps.broker,
+        organizationId: organization.id,
+      })),
+    );
     const pool = creds.map((c) => {
       const maxConcurrent = concurrencyFor((k) => this.deps.store.kvGet(k), c.key);
-      return { id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}), ...(maxConcurrent != null ? { maxConcurrent } : {}) };
+      const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
+      return {
+        id: c.key,
+        configHome: c.configHome ?? '',
+        provider: c.provider,
+        kind: c.kind,
+        ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}),
+        ...(credentialProvider ? { credentialProvider } : {}),
+        ...(maxConcurrent != null ? { maxConcurrent } : {}),
+      };
     });
     if (!pool.length) return;
     const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
@@ -3167,12 +3877,14 @@ export class Gateway {
    *  Overlapping rechecks (auto-refresh + button, multiple tabs) share one in-flight
    *  probe per login rather than spawning duplicate CLIs. */
   private usageProbes = new Map<string, Promise<unknown>>();
-  private async refreshUsage(only?: string): Promise<Record<string, unknown>> {
+  private async refreshUsage(only?: string, organizationId = 'org_personal'): Promise<Record<string, unknown>> {
     const { store } = this.deps;
-    const { enumerateCredentials } = await import('../platform/credentials.js');
-    const { gatherCredentialSources } = await import('../platform/credential-sources.js');
     const { probeClaudeUsage, probeCodexUsage, isUsagePollable } = await import('../agent/usage.js');
-    const creds = enumerateCredentials(gatherCredentialSources({ configHomes: this.deps.configHomes, broker: this.deps.broker }))
+    const creds = enumerateCredentials(gatherCredentialSources({
+      configHomes: this.deps.configHomes,
+      broker: this.deps.broker,
+      organizationId,
+    }))
       .filter((c) => isUsagePollable(c) && (!only || c.key === only));
     const out: Record<string, unknown> = {};
     await Promise.all(creds.map(async (c) => {
@@ -3188,6 +3900,14 @@ export class Gateway {
       out[c.key] = await probe;
     }));
     return out;
+  }
+
+  private organizationCredentialKeys(organizationId: string): string[] {
+    return enumerateCredentials(gatherCredentialSources({
+      configHomes: this.deps.configHomes,
+      broker: this.deps.broker,
+      organizationId,
+    })).map((credential) => credential.key);
   }
 
   private enrichAgentDefaults(m: import('../contrib/manifests.js').WorkflowManifest, vals: Record<string, unknown>, projectId?: string) {
@@ -3259,20 +3979,50 @@ export class Gateway {
   }
 
   /** Serve an artifact through its world provider. The browser never receives a
-   * host/sandbox path and remote worlds need no public filesystem endpoint. */
-  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string) {
+   * host/sandbox path and remote worlds need no public filesystem endpoint.
+   * `sourceFile` (conversation file links) defaults unknown extensions to an
+   * inline text view instead of a download, for a useful source view. */
+  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
     const task = this.deps.store.getTask(taskId);
     const handle = worldHandleForView(task?.lastView, taskId, task ? this.deps.store.effectiveProjectConfig(task.projectId) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
+    // Relative artifact paths are authored from the agent's default cwd, while
+    // provider file APIs are rooted at the whole world boundary. Absolute
+    // citations may name any checkout inside that boundary.
+    const root = String(handle.root ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+    const normalized = relPath.replace(/\\/g, '/');
+    if (normalized.startsWith('/')) {
+      if (normalized !== root && !normalized.startsWith(`${root}/`))
+        return this.json(res, 400, { error: 'path escapes world' });
+      relPath = normalized.slice(root.length + 1) || '.';
+    } else {
+      try { relPath = worldWorkingRelativePath(handle, relPath); }
+      catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
     let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
     try {
       access = this.deps.worldAccess ? await this.deps.worldAccess.open(taskId, handle) : undefined;
       const world = access?.world ?? await this.deps.worlds.open(handle);
+      // A symlink inside a host-visible world must not read outside it (the
+      // provider's lexical traversal guard cannot see link targets). Remote
+      // sandboxes confine reads at the provider boundary instead.
+      const hostBase = path.resolve(handle.root ?? '');
+      const hostPath = relPath === '.' ? hostBase : path.resolve(hostBase, relPath);
+      if (fs.existsSync(hostPath)) {
+        const real = await fs.promises.realpath(hostPath);
+        const realBase = await fs.promises.realpath(hostBase).catch(() => hostBase);
+        if (real !== realBase && !real.startsWith(realBase + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
+      }
       const data = await world.readFileBuffer(relPath);
+      const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
+      const looksTextual = !data.subarray(0, 8192).includes(0);
       res.writeHead(200, {
-        'content-type': ARTIFACT_MIME[path.extname(relPath).toLowerCase()] ?? 'application/octet-stream',
+        'content-type': inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
         'content-length': String(data.length),
+        'content-disposition': `inline; filename="${path.basename(relPath).replace(/["\\\r\n]/g, '_')}"`,
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
       });
       res.end(data);
     } catch (error) {
@@ -3658,6 +4408,38 @@ export class Gateway {
     }
     return this.auth(req, projectId);
   }
+  /** Organization-scoped mailbox provider config (agent-mail §8). */
+  private mailboxConfig(organizationId: string): import('../autonomy/mailbox.js').MailboxConfig {
+    try {
+      return JSON.parse(this.deps.store.kvGet(`agent-mail:provider:${organizationId}`) ?? '{}');
+    } catch {
+      return {};
+    }
+  }
+  private setMailboxConfig(organizationId: string, config: import('../autonomy/mailbox.js').MailboxConfig): void {
+    this.deps.store.kvSet(`agent-mail:provider:${organizationId}`, JSON.stringify(config));
+  }
+  private mailboxDomain(organizationId: string): string | undefined {
+    // The mint domain, resolved by the ACTIVE provider so a leftover field from a
+    // previous provider can't win: imap/hosted-fixed use the address host,
+    // agentmail its domain, hosted its domain, self-managed its domain.
+    const c = this.mailboxConfig(organizationId);
+    if (c.provider === 'imap') return c.fixedAddress?.split('@')[1] || undefined;
+    if (c.provider === 'agentmail') return c.agentmailDomain || undefined;
+    if (c.provider === 'hosted') return c.hostedDomain || undefined;
+    if (c.provider === 'self-managed') return c.domain || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
+    return c.domain || c.hostedDomain || c.agentmailDomain || c.fixedAddress?.split('@')[1] || process.env.KARMAX_AGENT_MAIL_DOMAIN || undefined;
+  }
+  /** The single-inbox base local part when addresses ride +tags on one mailbox
+   *  (hosted fixed-address / IMAP); undefined for domain and AgentMail providers. */
+  private mailboxFixedLocal(organizationId: string): string | undefined {
+    return this.mailboxConfig(organizationId).fixedAddress?.split('@')[0] || undefined;
+  }
+  /** The org-scoped vault handle a provider's secret is stored under. */
+  private mailboxSecretHandle(organizationId: string, provider: string): string {
+    return `mailbox:${provider}:${organizationId}:auth`;
+  }
+
   private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {
     const projectId = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]

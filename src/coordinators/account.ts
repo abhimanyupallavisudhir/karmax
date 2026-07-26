@@ -41,7 +41,7 @@ import {
  * are stored in state and converted to sleeps here; the wall-clock/timezone math
  * that PRODUCES a reset instant lives in the reporting activity (SPEC §3.1).
  */
-export type AccountProvider = 'claude' | 'codex' | 'mock';
+export type AccountProvider = string;
 /** available → leasable; exhausted → auto-refreshes at resetAt; manual-off → user
  *  turned it off; needs-attention → a HARD failure (billing/auth) that needs a human. */
 export type AccountStatus = 'available' | 'exhausted' | 'manual-off' | 'needs-attention';
@@ -57,6 +57,8 @@ export interface AccountState {
   kind?: CredKind;
   /** For a key credential: the broker handle to resolve JIT (else the env key). */
   apiKeyHandle?: string;
+  /** Model/API vendor represented by this credential. */
+  credentialProvider?: string;
   /** Max concurrent turns on this account. */
   maxConcurrent: number;
   inUse: number;
@@ -102,6 +104,7 @@ export interface RegisteredAccount {
   provider?: AccountProvider;
   kind?: CredKind;
   apiKeyHandle?: string;
+  credentialProvider?: string;
   maxConcurrent?: number;
 }
 
@@ -197,6 +200,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
         if (a.provider) existing.provider = a.provider;
         if (a.kind) existing.kind = a.kind;
         if (a.apiKeyHandle !== undefined) existing.apiKeyHandle = a.apiKeyHandle || undefined;
+        existing.credentialProvider = a.credentialProvider || undefined;
         if (a.maxConcurrent != null) existing.maxConcurrent = a.maxConcurrent; // apply raises/lowers
       } else {
         accounts.push({
@@ -205,6 +209,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
           provider: a.provider ?? 'claude',
           ...(a.kind ? { kind: a.kind } : {}),
           ...(a.apiKeyHandle ? { apiKeyHandle: a.apiKeyHandle } : {}),
+          ...(a.credentialProvider ? { credentialProvider: a.credentialProvider } : {}),
           maxConcurrent: defMax,
           inUse: 0,
           status: 'available',
@@ -337,6 +342,8 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
           accountId: free?.id ?? '(passthrough)',
           configHome: free?.configHome,
           ...(free?.apiKeyHandle ? { apiKeyHandle: free.apiKeyHandle } : {}),
+          ...(free?.kind ? { credentialKind: free.kind } : {}),
+          ...(free?.credentialProvider ? { credentialProvider: free.credentialProvider } : {}),
         });
       } catch (e) {
         log.warn(`account grant signal to ${req.taskId} failed; freeing`, { e: String(e) });

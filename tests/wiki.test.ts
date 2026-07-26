@@ -21,10 +21,17 @@ import {
   BUILTIN_WIKI_ENTRIES,
   resolveBuiltins,
 } from '../src/wiki/wiki.js';
+import { ensureProjectWikiRepository, commitProjectWiki, projectWikiBranches, projectWikiBranchView } from '../src/wiki/repository.js';
+import { execFileSync } from 'node:child_process';
+import { WorldRegistry } from '../src/world/registry.js';
 import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
+import { makeCoreActivities } from '../src/activities/core.js';
+import { ProfileResolver } from '../src/agent/profiles.js';
+import { Gateway } from '../src/gateway/server.js';
+import { KarmaxBus } from '../src/contrib/bus.js';
 
 /**
  * The org/project wiki (skills, memories, prompts — one content system). Cheap
@@ -435,6 +442,9 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
     try {
       const rw = mint(['project:read', 'organization:read', 'skill:write']);
       k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: '---\ndescription: how\n---\nShip it.', kind: 'skill', create: true });
+      const projectRoot = wikiRoot(contentDir, 'project', project.id);
+      expect(fs.existsSync(path.join(projectRoot, '.git'))).toBe(true);
+      expect(execFileSync('git', ['-C', projectRoot, 'log', '-1', '--format=%s'], { encoding: 'utf8' })).toContain('wiki: update guides/deploys');
       // Creating again at the same path is refused; a plain update is fine.
       expect(() => k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: 'x', create: true })).toThrow(/already exists/);
       k.saveWikiPage(rw, 'project', project.id, { path: 'guides/deploys', content: '---\ndescription: how\n---\nShip it now.' });
@@ -455,11 +465,40 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       expect(builtinPage.page.builtin).toBe(true);
       // Editing a built-in writes its override; deleting the override restores the default.
       k.saveWikiPage(rw, 'organization', organization.id, { path: BUILTIN_WIKI_ENTRIES[0]!.path, content: '---\nlabels: default\n---\nOur own rules.' });
+      expect(k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).versions[0])
+        .toMatchObject({ version: 2, operation: 'write', content: expect.stringContaining('Our own rules.') });
+      expect(k.organizationWikiHistory(rw, organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).versions[1])
+        .toMatchObject({ version: 1, operation: 'baseline', content: expect.stringContaining('# How to work') });
       const edited = k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any;
       expect(edited.page).toMatchObject({ builtin: true, overridden: true });
-      expect(edited.page.content).toContain('Our own rules.');
       expect(k.deleteWikiPage(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path).deleted).toBe(true);
       expect((k.readWiki(rw, 'organization', organization.id, BUILTIN_WIKI_ENTRIES[0]!.path) as any).page.overridden).toBeUndefined();
+      k.saveWikiPage(rw, 'organization', organization.id, {
+        path: 'rules/original',
+        content: 'Original rules.',
+        create: true,
+      });
+      k.saveWikiPage(rw, 'organization', organization.id, {
+        path: 'rules/renamed',
+        prevPath: 'rules/original',
+        content: 'Renamed rules.',
+      });
+      expect(k.organizationWikiHistory(rw, organization.id, 'rules/original').versions[0])
+        .toMatchObject({ operation: 'move', path: 'rules/renamed', previousPath: 'rules/original' });
+      // A page that predates the version-history feature is captured before its
+      // first overwrite, so the prior state remains recoverable.
+      const organizationRoot = wikiRoot(contentDir, 'organization', organization.id);
+      writeWikiPage(organizationRoot, 'legacy/page', 'Before history.', 'memory', { create: true });
+      k.saveWikiPage(rw, 'organization', organization.id, {
+        path: 'legacy/page',
+        content: 'After history.',
+        kind: 'memory',
+      });
+      expect(k.organizationWikiHistory(rw, organization.id, 'legacy/page').versions)
+        .toMatchObject([
+          { version: 2, operation: 'write', content: 'After history.' },
+          { version: 1, operation: 'baseline', content: 'Before history.' },
+        ]);
       expect(k.searchWiki(rw, 'project', project.id, 'ship').hits.length).toBeGreaterThan(0);
       expect(k.deleteWikiPage(rw, 'project', project.id, 'guides/shipping').deleted).toBe(true);
       // Read-only token: reads fine, writes denied.
@@ -470,5 +509,207 @@ describe('KarmaxApi wiki surface (what the gateway routes and MCP tools call)', 
       expect(() => k.readWiki(rw, 'project', 'nope')).toThrow(/no project/);
       expect(fs.existsSync(path.join(contentDir, 'wiki', 'project', project.id))).toBe(true);
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+});
+
+describe('project wiki git branches', () => {
+  it('migrates existing pages in place and materializes isolated branch views', () => {
+    const contentDir = tmp();
+    try {
+      const root = wikiRoot(contentDir, 'project', 'p1');
+      writeWikiPage(root, 'notes/first', 'Before git.');
+      ensureProjectWikiRepository(contentDir, 'p1');
+      execFileSync('git', ['-C', root, 'switch', '-q', '-c', 'karmax/task-1']);
+      writeWikiPage(root, 'notes/first', 'Only on the task branch.');
+      commitProjectWiki(root, 'wiki: task edit');
+      execFileSync('git', ['-C', root, 'switch', '-q', 'main']);
+      expect(readWikiPage(root, 'notes/first')!.content).toBe('Before git.');
+      expect(projectWikiBranches(root)).toEqual(expect.arrayContaining(['main', 'karmax/task-1']));
+      const view = projectWikiBranchView(contentDir, 'p1', 'karmax/task-1');
+      expect(readWikiPage(view, 'notes/first')!.content).toBe('Only on the task branch.');
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+
+  it('assembles each turn from the task branch checkout, not canonical main', () => {
+    const contentDir = tmp();
+    try {
+      const canonical = wikiRoot(contentDir, 'project', 'p1');
+      const taskRoot = path.join(contentDir, 'task-wiki');
+      writeWikiPage(canonical, 'rules/review', 'Canonical instructions.', 'skill',
+        { create: true });
+      writeWikiPage(taskRoot, 'rules/review', 'Task-branch instructions.', 'skill',
+        { create: true });
+      const prompt = buildWikiPromptContext({
+        contentDir,
+        projectId: 'p1',
+        projectRoot: taskRoot,
+        contextTokens: ['@proj:rules/review'],
+      });
+      expect(prompt).toContain('Task-branch instructions.');
+      expect(prompt).not.toContain('Canonical instructions.');
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+});
+
+describe('existing project wiki remote backfill', () => {
+  it('uses an authorized organization owner and completes before the gateway becomes ready', async () => {
+    const home = tmp();
+    const remotes = path.join(home, 'remotes');
+    fs.mkdirSync(remotes);
+    const previousHome = process.env.KARMAX_HOME;
+    const previousGit = {
+      count: process.env.GIT_CONFIG_COUNT,
+      key: process.env.GIT_CONFIG_KEY_0,
+      value: process.env.GIT_CONFIG_VALUE_0,
+    };
+    process.env.KARMAX_HOME = home;
+    process.env.GIT_CONFIG_COUNT = '1';
+    process.env.GIT_CONFIG_KEY_0 = `url.file://${remotes}/.insteadOf`;
+    process.env.GIT_CONFIG_VALUE_0 = 'git@github.com:acme/';
+
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Backfill org', ownerUserId: 'owner' });
+    const project = store.createProject('Existing project', {}, organization.id);
+    const connection = store.upsertGitConnection({
+      organizationId: organization.id,
+      provider: 'github',
+      installationId: '42',
+      accountLogin: 'acme',
+      accountType: 'Organization',
+    });
+    const actors: string[] = [];
+    const inputs: Array<{ name: string; private?: boolean }> = [];
+    const githubApp = {
+      status: (userId?: string) => ({ userAuthorized: userId === 'owner' }),
+      async ensureRepository(_connectionId: string, userId: string, input: { name: string; private?: boolean }) {
+        actors.push(userId);
+        inputs.push(input);
+        execFileSync('git', ['init', '-q', '--bare', path.join(remotes, `${input.name}.git`)]);
+        return store.upsertRepository({
+          organizationId: organization.id,
+          provider: 'github',
+          providerId: '77',
+          owner: 'acme',
+          name: input.name,
+          sshUrl: `git@github.com:acme/${input.name}.git`,
+          defaultBranch: 'main',
+          private: true,
+          gitConnectionId: connection.id,
+        });
+      },
+      repositorySshKey: () => 'unused-for-file-transport',
+    };
+    const worlds = new WorldRegistry();
+    const gateway = new Gateway({
+      store,
+      worlds,
+      githubApp,
+      bus: new KarmaxBus(),
+      tokens: new TokenAuthority(),
+      staticDir: fs.mkdtempSync(path.join(home, 'static-')),
+    } as any);
+    try {
+      const listening = await gateway.listen(49_000);
+      await listening.close();
+      expect(actors).toEqual(['owner']);
+      expect(inputs).toMatchObject([{ private: true }]);
+      const linked = store.projectWiki(project.id)?.repository;
+      expect(linked).toMatchObject({ private: true, gitConnectionId: connection.id });
+      expect(execFileSync('git', ['--git-dir', path.join(remotes, `${linked!.name}.git`),
+        'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim()).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      store.close();
+      if (previousHome === undefined) delete process.env.KARMAX_HOME;
+      else process.env.KARMAX_HOME = previousHome;
+      if (previousGit.count === undefined) delete process.env.GIT_CONFIG_COUNT;
+      else process.env.GIT_CONFIG_COUNT = previousGit.count;
+      if (previousGit.key === undefined) delete process.env.GIT_CONFIG_KEY_0;
+      else process.env.GIT_CONFIG_KEY_0 = previousGit.key;
+      if (previousGit.value === undefined) delete process.env.GIT_CONFIG_VALUE_0;
+      else process.env.GIT_CONFIG_VALUE_0 = previousGit.value;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('remote task wiki views', () => {
+  it('reads and edits the live provider checkout rather than the global wiki', async () => {
+    const contentDir = tmp();
+    const store = new Store(':memory:');
+    const organization = store.createOrganization({ name: 'Remote org' });
+    const project = store.createProject('Remote project', {}, organization.id);
+    const task = store.createTask({ projectId: project.id, title: 'Cloud task', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'x' } });
+    const root = '/remote/world';
+    const repoRoot = `${root}/project-wiki`;
+    const handle: any = { kind: 'fake-remote', id: task.id, root, branch: `karmax/${task.id}`, base: 'main',
+      repos: [{ name: 'project-wiki', role: 'project-wiki', repo: 'git@github.com:acme/wiki.git',
+        root: repoRoot, branch: `karmax/${task.id}`, base: 'main', target: 'main' }] };
+    store.registerWorld(handle, project.id);
+    const files = new Map<string, Buffer>([['project-wiki/notes/live/SKILL.md', Buffer.from('Live branch.')]]);
+    const commits: string[] = [];
+    const world: any = {
+      handle,
+      listFiles: async () => [...files.keys()],
+      readFileBuffer: async (file: string) => files.get(file)!,
+      readFile: async (file: string) => files.get(file)!.toString('utf8'),
+      writeFileBuffer: async (file: string, value: Buffer) => { files.set(file, Buffer.from(value)); },
+      writeFile: async (file: string, value: string) => { files.set(file, Buffer.from(value)); },
+      exec: async (cmd: string, args: string[]) => {
+        if (cmd === 'git' && args[0] === 'commit') commits.push(args.at(-1)!);
+        return { code: 0, stdout: '', stderr: '' };
+      },
+      destroy: async () => {},
+    };
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'fake-remote', parkable: false, capabilities: { remote: true },
+      create: async () => world, open: async () => world } as any);
+    const tokens = new TokenAuthority();
+    const token = tokens.mint({ taskId: task.id, profileId: 'do', principal: `task-agent:${task.id}:do`,
+      projectId: project.id, organizationId: organization.id,
+      ceiling: ['project:read', 'skill:write'], grantorCaps: ['project:read', 'skill:write'] }).token;
+    const api = new KarmaxApi({ store, client: {} as any, taskQueue: 'tq', tokens, contentDir, worlds } as any);
+    try {
+      expect((await api.readWikiResolved(token, 'project', project.id, 'notes/live') as any).page.content).toBe('Live branch.');
+      await api.saveWikiPageResolved(token, 'project', project.id,
+        { path: 'notes/live', content: 'Changed remotely.' });
+      expect(files.get('project-wiki/notes/live/SKILL.md')!.toString()).toBe('Changed remotely.');
+      expect(commits).toEqual(['wiki: update notes/live']);
+      expect(readWikiPage(ensureProjectWikiRepository(contentDir, project.id), 'notes/live')).toBeUndefined();
+
+      files.set('project-wiki/notes/prompt/SKILL.md', Buffer.from('Instructions from the remote task branch.'));
+      let systemPrompt = '';
+      const adapter: any = {
+        provider: 'mock',
+        runTurn: async (input: any) => {
+          systemPrompt = input.systemPrompt;
+          return { termination: { kind: 'success', status: 'mock.completed' }, output: 'done' };
+        },
+      };
+      const core = makeCoreActivities({
+        store,
+        worlds,
+        adapters: new Map([['mock', adapter]]),
+        profiles: new ProfileResolver(store, 'mock'),
+        contentDir,
+      });
+      await core.runAgentTurn({
+        taskId: task.id,
+        role: 'do',
+        worldHandle: handle,
+        messages: [{ id: 'm1', role: 'user', text: 'continue', ts: 0 }],
+        task: {
+          projectId: project.id,
+          project: {},
+          title: task.title,
+          prompt: 'Follow @proj:notes/prompt',
+          workflow: 'software-dev',
+        } as any,
+      });
+      expect(systemPrompt).toContain('Instructions from the remote task branch.');
+    } finally {
+      store.close();
+      fs.rmSync(contentDir, { recursive: true, force: true });
+    }
   });
 });

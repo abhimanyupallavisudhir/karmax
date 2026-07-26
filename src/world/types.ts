@@ -22,6 +22,9 @@ export type WorldKind = string;
  * a single task can span a fleet of repos (e.g. a frontend + backend).
  */
 export interface WorldRepo {
+  /** Platform-owned companion repository. It participates in branching and
+   * merge like every other repo, while callers can still identify its role. */
+  role?: 'project-wiki';
   /** Short, world-unique name (usually the source repo's basename). For a
    *  multi-repo world this is the subdirectory the repo is checked out into. */
   name: string;
@@ -30,6 +33,13 @@ export interface WorldRepo {
   /** Configured network source when `repo` is a managed local checkout. Remote
    *  providers keep the URL directly in `repo`, so this is normally absent. */
   source?: string;
+  /** Host checkout this repo was provisioned from (remote worlds whose project
+   *  repo is a local path). When present, that checkout is the AUTHORITATIVE
+   *  repository: broker merges land there and upstream refreshes read from it
+   *  — `repo` (the SSH remote) is only the sandbox's clone transport. Without
+   *  it, cloud and local merges would land in two different places (origin vs
+   *  the local repo) and the two histories would silently diverge. */
+  localPath?: string;
   /** Absolute worktree path (where this repo is checked out in the world). */
   root: string;
   /** The branch work happens on in this repo. */
@@ -52,6 +62,10 @@ export interface WorldHandle extends WorldHandleRef {
    *  single-repo world this IS the worktree; for a multi-repo world it is the
    *  parent directory holding one worktree subdirectory per repo. */
   root: string;
+  /** Default directory for agent turns and commands. The world boundary remains
+   *  `root`; this may point at the sole development repo when platform-owned
+   *  companion repos (such as the project wiki) make the world multi-repo. */
+  workdir?: string;
   /** The branch work happens on. */
   branch: string;
   /** Base branch this world forked from. */
@@ -90,6 +104,10 @@ export interface WorldSpec {
   repo?: string;
   /** Source repos for a multi-repo world. Takes precedence over `repo`. Empty ⇒ scratch. */
   repos?: string[];
+  /** Keep a scratch working directory in addition to configured companion
+   * repositories. Used by repository-less projects whose wiki still branches
+   * with the task, without turning the wiki checkout into the task workspace. */
+  scratch?: boolean;
   base: string;
   target?: string;
   /** Check out this existing branch instead of creating karmax/<taskId> (merge-only). */
@@ -100,13 +118,15 @@ export interface WorldSpec {
   /** Host checkouts corresponding to `repos`, used only by the trusted
    * provisioner to upload requested gitignored files into a remote clone. */
   copySources?: Array<string | undefined>;
-  /** Worktree-scoped identity/signing for every commit made in this world
-   *  (PLAN-git-config.md §4A). Absent ⇒ host identity, else karmax@localhost. */
+  /** Worktree-scoped identity/signing for every commit made in this world.
+   * Absent is retained only for the personal organization's host fallback. */
   gitIdentity?: WorldGitIdentity;
   /** Ephemeral clone credentials resolved inside the create-world activity.
    * Providers may install them into the isolated world, but must never persist
    * their values in WorldHandle or logs. */
   gitCredentials?: {
+    /** Disable host gh/SSH/helper fallback when no explicit key matches. */
+    isolated?: boolean;
     /** Compatibility key for one repository/local profiles. */
     sshKey?: string;
     /** SSH URL -> distinct read-only clone key for hosted repository records. */
@@ -279,4 +299,25 @@ export function worldRelativePath(relPath: string): string {
   const parts = normalized.split('/').filter((p) => p && p !== '.');
   if (parts.some((p) => p === '..')) throw new Error('path escapes world');
   return parts.join('/') || '.';
+}
+
+/** Default process/agent directory, tolerant of handles created before the
+ * distinction between a world's boundary and its working directory existed. */
+export function worldWorkingDirectory(handle: WorldHandle): string {
+  return handle.workdir ?? handle.root;
+}
+
+/** Translate an agent-relative path into the root-relative namespace used by
+ * the provider-neutral file API. */
+export function worldWorkingRelativePath(handle: WorldHandle, relPath: string): string {
+  const safe = worldRelativePath(relPath);
+  // Unit adapters and historical serialized handles may only carry an id. In
+  // that single-root compatibility shape, agent-relative is already root-relative.
+  if (!handle.root && !handle.workdir) return safe;
+  const root = (handle.root ?? handle.workdir).replace(/\\/g, '/').replace(/\/+$/, '');
+  const workdir = worldWorkingDirectory(handle).replace(/\\/g, '/').replace(/\/+$/, '');
+  if (workdir === root) return safe;
+  if (!workdir.startsWith(`${root}/`)) throw new Error('working directory escapes world');
+  const prefix = workdir.slice(root.length + 1);
+  return safe === '.' ? prefix : `${prefix}/${safe}`;
 }

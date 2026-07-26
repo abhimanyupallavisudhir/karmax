@@ -18,10 +18,11 @@ export interface PlatformOps {
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
-  listTags(projectId: string): Promise<{ path: string; kind?: string }[]>;
+  listTags(projectId: string): Promise<{ path: string; kind?: string; description?: string }[]>;
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
+  requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
   saveSkill(a: { name: string; content: string }): Promise<unknown>;
   readWiki(scope: 'organization' | 'project', id: string, path?: string): Promise<unknown>;
@@ -89,10 +90,10 @@ function compactSearch(result: any, tags: any[]): { total: number; tasks: Compac
   });
   return { total: result?.total ?? 0, tasks: (result?.tasks ?? []).map(one) };
 }
-function compactTags(tags: any[]): { path: string; kind?: string }[] {
+function compactTags(tags: any[]): { path: string; kind?: string; description?: string }[] {
   const byId = tagsById(tags);
   return (tags ?? [])
-    .map((t) => ({ path: tagPathOf(t.id, byId), kind: t.kind }))
+    .map((t) => ({ path: tagPathOf(t.id, byId), kind: t.kind, description: t.description }))
     .sort((a, b) => a.path.localeCompare(b.path));
 }
 
@@ -110,10 +111,11 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     tagTask: (id, add, remove) => api.tagTask(getToken(), id, { add, remove }),
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role) => void (await api.signalTask(getToken(), id, sig as any, text, role)),
+    requestAgentAction: (a) => api.requestAgentAction(getToken(), a),
     reorderQueue: (domain, id) => api.reorderQueue(getToken(), domain, id),
     saveSkill: (a) => api.saveSkill(getToken(), a) as Promise<unknown>,
-    readWiki: async (scope, id, path) => api.readWiki(getToken(), scope, id, path ?? ''),
-    searchWiki: async (scope, id, query) => api.searchWiki(getToken(), scope, id, query),
+    readWiki: async (scope, id, path) => api.readWikiResolved(getToken(), scope, id, path ?? ''),
+    searchWiki: async (scope, id, query) => api.searchWikiResolved(getToken(), scope, id, query),
     proposeWorkflowEdit: (a) => api.proposeWorkflowEdit(getToken(), a),
     findTask: (pid, num) => api.findTask(getToken(), pid, num),
     listAgents: (id) => api.listTaskAgents(getToken(), id),
@@ -179,6 +181,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     tagTask: (id, add, remove) => req(`/api/tasks/${id}/tag`, { method: 'POST', body: JSON.stringify({ add, remove }) }) as Promise<{ tags: string[] }>,
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role }) })),
+    requestAgentAction: (a) => req('/api/agent/collaboration/request', { method: 'POST', body: JSON.stringify(a) }),
     reorderQueue: async (domain, taskId) => void (await req(`/api/queue/prioritize`, { method: 'POST', body: JSON.stringify({ domain, taskId }) })),
     saveSkill: (a) => req(`/api/skills`, { method: 'POST', body: JSON.stringify(a) }),
     readWiki: (scope, id, path) => req(`/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/wiki?path=${encodeURIComponent(path ?? '')}`),
@@ -318,6 +321,17 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     { description: 'Send a follow-up into an attached agent conversation. This works for original or forked tasks and is delivered live when that agent is running.', inputSchema: { taskId: z.string(), role: z.string().default('do'), message: z.string() } },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, 'followUp', a.message, a.role); return 'message delivered'; }),
   );
+  server.registerTool(
+    'request_agent_action',
+    {
+      description: 'Ask another task agent to publish its branch in the background. Returns immediately with a durable request id; Karmax injects completion or failure into this agent automatically. Continue other work and do not poll.',
+      inputSchema: {
+        taskId: z.string(), role: z.string().default('do'),
+        action: z.literal('publish_branch'), message: z.string().optional(),
+      },
+    },
+    async (a) => wrap(() => ops.requestAgentAction(a)),
+  );
   server.registerTool('list_events', { description: 'Read durable karmax events for a task after an optional sequence number.', inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(() => ops.listEvents(a.taskId, a.since)));
   server.registerTool('publish_task_branch', {
     description: 'Publish this task’s clean, committed branch through Karmax’s trusted Git broker so another agent can import it.', inputSchema: {},
@@ -330,6 +344,85 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     description: 'Fetch the latest upstream base/target branch into refs/remotes/origin without placing Git credentials in this world.',
     inputSchema: { branch: z.string().optional() },
   }, async (a) => wrap(() => ops.refreshUpstream(a.branch)));
+  // Vault credentials (PLAN-passwords.md) — thin wrappers over the gateway's
+  // /api/vault surface so the pull model is first-class, not buried behind
+  // platform_request. Available on the gateway-backed bridge; the in-process
+  // apiOps embedding reports the same platform_request limitation.
+  server.registerTool(
+    'request_credential',
+    {
+      description:
+        'Ask for access to a credential in the user\'s vault (site login, API key, SSH key, .env bag) this task was not granted, by itemId or site domain. granted → proceed (fill_credential/get_credential); needs_approval or not_in_vault → a request is parked for the human: stop and report, retry after they grant/add it; denied → do not re-ask. If a stored credential turns out to be WRONG (the site rejects it) and you cannot self-reset (recovery goes to the human\'s own inbox, not the agent mailbox), report it with kind: "reset" — the human fixes the item or sends you the reset code.',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), mode: z.enum(['use', 'reveal']).optional(), kind: z.enum(['access', 'reset']).optional(), why: z.string() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/requests', a)),
+  );
+  server.registerTool(
+    'fill_credential',
+    {
+      description:
+        'Type a vault credential into the page open in your browser WITHOUT the secret entering your context — karmax resolves and types it over CDP after verifying the page origin matches the credential\'s domains. Call once per field (username, password, then totp for a one-time code). The browser must expose DevTools (launch Chrome with --remote-debugging-port=9222).',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string(), cdpUrl: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/fill', a)),
+  );
+  server.registerTool(
+    'get_credential',
+    {
+      description:
+        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents) — the audited last resort; prefer fill_credential for logins. Returns granted with the value, needs_approval/denied per the item\'s reveal policy, or not_in_vault.',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/resolve', a)),
+  );
+  server.registerTool(
+    'store_credential',
+    {
+      description:
+        'Save a credential into the user\'s vault so it outlives this task. Two uses: (1) a credential you just created (registered account, generated password, captured TOTP seed, minted API/SSH key); (2) ROTATION — after you change a password on a site, immediately update the granted item\'s secrets here (pass its id; metadata is ignored), or everyone is locked out with the stale value. Secrets are write-only: login → {password, totp}, api-key → {secret}, ssh-key → {privateKey}, env → {env}, note → {note}. Rotation is allowed for any item this task may use; full edits only for items this task created.',
+      inputSchema: {
+        id: z.string().optional(), type: z.enum(['login', 'api-key', 'ssh-key', 'env', 'note']), label: z.string(),
+        domains: z.array(z.string()).optional(), username: z.string().optional(), envVar: z.string().optional(),
+        secrets: z.record(z.string(), z.string()).optional(),
+      },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/store', a)),
+  );
+  server.registerTool(
+    'check_agent_mail',
+    {
+      description:
+        'Read your organization\'s agent mailbox — the dedicated inbox for accounts YOU register (never the user\'s personal email). Completes "check your email for a code / link" steps: returns the address to register with plus recent messages with any verification code and link already extracted. Mailboxes are per organization; you can only read your own.',
+      inputSchema: { organizationId: z.string(), match: z.string().optional(), since: z.number().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('GET', `/api/organizations/${encodeURIComponent(a.organizationId)}/agent-mail${a.match || a.since ? `?${new URLSearchParams({ ...(a.match ? { match: a.match } : {}), ...(a.since ? { since: String(a.since) } : {}) })}` : ''}`)),
+  );
+  server.registerTool(
+    'enroll_passkey',
+    {
+      description:
+        'Enroll a NEW passkey belonging to karmax on the account open in your browser (the user\'s own passkeys are unusable — the OS biometric is theirs). karmax preps a virtual authenticator (origin-verified); you trigger the site\'s "create a passkey" button; then call save_passkey with the returned authenticatorId. Afterwards use_passkey logs in with no 2FA prompt.',
+      inputSchema: { domain: z.string(), cdpUrl: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/enroll', a)),
+  );
+  server.registerTool(
+    'save_passkey',
+    {
+      description: 'After triggering the site\'s passkey-create button (see enroll_passkey), store the newly created credential in the vault as a passkey item.',
+      inputSchema: { authenticatorId: z.string(), label: z.string().optional(), domains: z.array(z.string()).optional(), username: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/save', a)),
+  );
+  server.registerTool(
+    'use_passkey',
+    {
+      description:
+        'Log in with a karmax-enrolled passkey: karmax loads the stored credential into a virtual authenticator on the page; you trigger the site\'s "sign in with a passkey" button. The secret never enters your context. Returns granted with an authenticatorId (release it when done via platform_request POST /api/vault/passkey/release), or needs_approval/not_in_vault.',
+      inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), cdpUrl: z.string().optional() },
+    },
+    async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/passkey/login', a)),
+  );
   server.registerTool(
     'describe_platform',
     { description: 'Describe the complete administrative API available through platform_request.', inputSchema: {} },
@@ -362,7 +455,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     },
     async (a) => wrap(() => ops.searchTasks(a.projectId, a.query ?? '')),
   );
-  server.registerTool('list_tags', { description: 'List a project\'s tag catalogue as `a/b/c` paths (with kind: type|topic).', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTags(a.projectId)));
+  server.registerTool('list_tags', { description: 'List a project\'s tag catalogue as `a/b/c` paths, with kind and optional section description.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTags(a.projectId)));
   server.registerTool(
     'tag_task',
     {

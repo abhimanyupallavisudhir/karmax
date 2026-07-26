@@ -25,6 +25,9 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
 export function defaultModel(provider: Provider): string | undefined {
   if (provider === 'codex') return process.env.KARMAX_OPENAI_MODEL ?? 'gpt-5.5';
   if (provider === 'claude') return process.env.KARMAX_CLAUDE_MODEL ?? 'claude-sonnet-5';
+  if (provider === 'opencode') return process.env.KARMAX_OPENCODE_MODEL ?? 'kimi/kimi-for-coding';
+  if (provider === 'kimi') return process.env.KARMAX_KIMI_MODEL ?? 'kimi-for-coding';
+  if (provider === 'grok') return process.env.KARMAX_GROK_MODEL ?? 'grok-build';
   return undefined;
 }
 
@@ -32,34 +35,30 @@ export function defaultModel(provider: Provider): string | undefined {
  *  forms so the field reads a real value, not a bare "effort" placeholder. It is
  *  display-only: leaving a profile's effort unset still lets the provider pick. */
 export function defaultEffort(provider: Provider): string | undefined {
-  if (provider === 'codex' || provider === 'claude') return 'medium';
+  if (provider === 'codex' || provider === 'claude' || provider === 'opencode' || provider === 'kimi' || provider === 'grok') return 'medium';
   return undefined;
 }
 
 /** Apply a per-task agent spec without carrying provider-scoped settings across
- * providers. A profile's model/auth/account allow-list belongs to its provider:
- * changing Claude → Codex (or vice versa) must not leave the old provider's
- * model or credentials attached to the new adapter. */
+ * providers. A model belongs to its harness; credential routing is stripped
+ * here and resolved independently by the scoped Credentials policy. */
 export function applyAgentSpec(base: AgentProfile, spec?: AgentSpec): AgentProfile {
-  if (!spec) return base;
+  // `modelProvider` used to be independently editable. It duplicated the
+  // ordered Credentials policy and could disagree with it. Keep the wire/storage
+  // member for replay compatibility, but never let persisted task/profile input
+  // route a turn; core stamps the provider of the credential actually leased.
+  const { modelProvider: _legacyModelProvider, ...cleanBase } = base;
+  if (!spec) return cleanBase;
   const provider = spec.provider ?? base.provider;
   const sameProvider = provider === base.provider;
   const model = spec.model ?? (sameProvider ? base.model : defaultModel(provider));
   const effort = spec.effort ?? (sameProvider ? base.effort : undefined);
-  const {
-    model: _model,
-    effort: _effort,
-    auth: _auth,
-    allowedAccounts: _allowedAccounts,
-    ...common
-  } = base;
+  const { model: _model, effort: _effort, auth: _auth, allowedAccounts: _allowedAccounts, ...common } = cleanBase;
   return {
     ...common,
     provider,
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
-    ...(sameProvider && base.auth ? { auth: base.auth } : {}),
-    ...(sameProvider && base.allowedAccounts ? { allowedAccounts: base.allowedAccounts } : {}),
   };
 }
 

@@ -8,4 +8,3 @@ await page.setContent('<title>karmax browser ready</title><main>ready</main>');
 if (await page.title() !== 'karmax browser ready') throw new Error('Chromium render smoke test failed');
 await page.screenshot({ path: '/tmp/karmax-browser-smoke.png' });
 await browser.close();
-

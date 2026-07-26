@@ -24,7 +24,7 @@ function extractFn(name) {
 // A minimal element mock supporting the bits the helpers use.
 function makeEl(tag, id) {
   return {
-    tagName: tag, id, value: '', selectionStart: 0, selectionEnd: 0,
+    tagName: tag, id, value: '', selectionStart: 0, selectionEnd: 0, scrollTop: 0, scrollLeft: 0,
     _focused: false,
     focus() { this._focused = true; ROOT._active = this; },
     setSelectionRange(a, b) { this.selectionStart = a; this.selectionEnd = b; },
@@ -69,6 +69,24 @@ restoreFocus(ROOT, st);
 ok(newInput.value === 'fix the login b', 'restores typed value onto fresh input');
 ok(newInput._focused === true, 'restores focus');
 ok(newInput.selectionStart === 15 && newInput.selectionEnd === 15, 'restores caret position');
+
+// ── Scenario: a single-line input scrolled horizontally (long value) keeps its
+//    view across the swap — setSelectionRange restores the caret but NOT the box's
+//    scrollLeft, so without this the field snaps back to the start on every WS
+//    repaint while the caret stays at the end (the reported "view resets" glitch).
+const longInput = makeEl('INPUT', 'new-task');
+longInput.value = 'a very long task description that has scrolled the input horizontally';
+longInput.selectionStart = longInput.selectionEnd = longInput.value.length;
+longInput.scrollLeft = 240;
+ROOT = { _active: longInput, contains: (el) => el === longInput || el === ROOT._new,
+  querySelector: () => ROOT._new };
+const scrollSt = captureFocus(ROOT);
+ok(scrollSt.scrollLeft === 240, 'captures the input horizontal scroll offset');
+const freshLong = makeEl('INPUT', 'new-task');
+ROOT._new = freshLong; // fresh element resets scrollLeft to 0
+ROOT._active = null;
+restoreFocus(ROOT, scrollSt);
+ok(freshLong.scrollLeft === 240, 'restores horizontal scroll (view stays put, not reset to start)');
 
 // ── Scenario: nothing focused inside main → no snapshot, no crash ──
 ROOT._active = null;
