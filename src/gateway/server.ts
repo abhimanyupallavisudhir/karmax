@@ -2303,7 +2303,9 @@ export class Gateway {
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
         return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
-          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined));
+          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
+          b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
+            ? b.credentialPolicies as any : undefined));
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {

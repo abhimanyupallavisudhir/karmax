@@ -3257,15 +3257,24 @@ function wireDepPicker(values, selfId) {
   paint(existing?.tasks || []);
 }
 
-// Full vault-item chooser used by the compact task-form button. This deliberately
-// mirrors the password-manager import panel: mass selection at the top, a bounded
-// scrolling list, a live selected count, and explicit Cancel/Apply actions.
-function openVaultGrantPicker(items, selectedIds, onApply) {
+function vaultItemSearchText(item) {
+  return [
+    item.label, item.type, item.username, item.envVar,
+    ...(item.domains || []), ...(item.tags || []),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+// Full vault-item chooser used by the compact task-form button. It mirrors the
+// password-manager import panel, while allowing sparse policy overrides for this
+// task. "Inherit" deliberately stays sparse so global policy edits keep flowing.
+function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
+  const localPolicies = JSON.parse(JSON.stringify(policyOverrides || {}));
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `<div class="modal-card vault-grant-modal" role="dialog" aria-modal="true" aria-labelledby="vault-grant-title">
     <div class="section-h" id="vault-grant-title">Vault credentials</div>
     <p class="vault-grant-help">Choose which credentials agents working on this task may use.</p>
+    <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
     <div class="vault-grant-box">
       <label class="vault-grant-head">
         <input type="checkbox" class="vault-grant-all" ${items.length ? '' : 'disabled'} />
@@ -3274,15 +3283,30 @@ function openVaultGrantPicker(items, selectedIds, onApply) {
       </label>
       <div class="vault-grant-tree">${
         items.length
-          ? items.map((item) => `<label class="vault-grant-item">
-              <input type="checkbox" class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
-              <span class="vault-grant-item-text">
-                <span>${esc(item.label)}</span>
-                <span class="vault-grant-meta mono">${esc(item.type)}${item.domains?.length ? ` · ${esc(item.domains.join(', '))}` : ''}</span>
+          ? items.map((item) => {
+            const override = localPolicies[item.id] || {};
+            const useOptions = [
+              ['', `inherit (${item.policy?.use || 'auto'})`], ['auto', 'auto'], ['ask', 'ask'],
+            ].map(([value, label]) => `<option value="${value}" ${override.use === value || (!override.use && !value) ? 'selected' : ''}>${label}</option>`).join('');
+            const revealOptions = [
+              ['', `inherit (${item.policy?.reveal || 'ask'})`], ['auto', 'auto'], ['ask', 'ask'], ['never', 'never'],
+            ].map(([value, label]) => `<option value="${value}" ${override.reveal === value || (!override.reveal && !value) ? 'selected' : ''}>${label}</option>`).join('');
+            return `<div class="vault-grant-item" data-vault-item="${esc(item.id)}">
+              <label class="vault-grant-choice">
+                <input type="checkbox" class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
+                <span class="vault-grant-item-text">
+                  <span>${esc(item.label)}</span>
+                  <span class="vault-grant-meta mono">${esc(item.type)}${item.username ? ` · ${esc(item.username)}` : ''}${item.domains?.length ? ` · ${esc(item.domains.join(', '))}` : ''}</span>
+                </span>
+              </label>
+              <span class="vault-grant-policies">
+                <label title="${esc(POL_USE_TIP)}">blind use <select class="vault-task-use" ${selectedIds.has(item.id) ? '' : 'disabled'}>${useOptions}</select></label>
+                <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vault-task-reveal" ${selectedIds.has(item.id) ? '' : 'disabled'}>${revealOptions}</select></label>
               </span>
-            </label>`).join('')
+            </div>`;
+          }).join('')
           : '<span class="vault-grant-empty">No vault credentials are available.</span>'
-      }</div>
+      }<span class="vault-grant-empty vault-search-empty" hidden>No credentials match your search.</span></div>
     </div>
     <div class="vault-grant-actions">
       <button type="button" class="btn sm" data-vault-cancel>Cancel</button>
@@ -3292,22 +3316,52 @@ function openVaultGrantPicker(items, selectedIds, onApply) {
   document.body.appendChild(overlay);
   const all = overlay.querySelector('.vault-grant-all');
   const picks = [...overlay.querySelectorAll('.vault-grant-pick')];
+  const rows = [...overlay.querySelectorAll('[data-vault-item]')];
   const selectedCount = overlay.querySelector('.vault-grant-selected');
+  const search = overlay.querySelector('.vault-search');
   const opener = document.activeElement;
   const close = () => { overlay.remove(); opener?.focus?.(); };
   const refreshCount = () => {
     const n = picks.filter((pick) => pick.checked).length;
+    const visible = picks.filter((pick) => !pick.closest('[data-vault-item]').hidden);
+    const selectedVisible = visible.filter((pick) => pick.checked).length;
     selectedCount.textContent = `· ${n} selected`;
-    all.checked = !!picks.length && n === picks.length;
-    all.indeterminate = n > 0 && n < picks.length;
+    all.disabled = !visible.length;
+    all.checked = !!visible.length && selectedVisible === visible.length;
+    all.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+    rows.forEach((row) => {
+      const enabled = row.querySelector('.vault-grant-pick').checked;
+      row.querySelectorAll('.vault-task-use,.vault-task-reveal').forEach((select) => { select.disabled = !enabled; });
+    });
   };
   refreshCount();
   all.addEventListener('change', () => {
-    picks.forEach((pick) => { pick.checked = all.checked; });
+    picks.filter((pick) => !pick.closest('[data-vault-item]').hidden)
+      .forEach((pick) => { pick.checked = all.checked; });
     refreshCount();
   });
   overlay.querySelector('.vault-grant-tree').addEventListener('change', (e) => {
     if (e.target.classList.contains('vault-grant-pick')) refreshCount();
+    const row = e.target.closest('[data-vault-item]');
+    if (row && (e.target.classList.contains('vault-task-use') || e.target.classList.contains('vault-task-reveal'))) {
+      const itemId = row.dataset.vaultItem;
+      const use = row.querySelector('.vault-task-use').value;
+      const reveal = row.querySelector('.vault-task-reveal').value;
+      const next = { ...(use ? { use } : {}), ...(reveal ? { reveal } : {}) };
+      if (Object.keys(next).length) localPolicies[itemId] = next;
+      else delete localPolicies[itemId];
+    }
+  });
+  search.addEventListener('input', () => {
+    const query = search.value.trim().toLowerCase();
+    let visible = 0;
+    rows.forEach((row) => {
+      const item = items.find((candidate) => candidate.id === row.dataset.vaultItem);
+      row.hidden = !!query && !vaultItemSearchText(item).includes(query);
+      if (!row.hidden) visible++;
+    });
+    overlay.querySelector('.vault-search-empty').hidden = visible > 0 || !items.length;
+    refreshCount();
   });
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
   overlay.addEventListener('keydown', (e) => {
@@ -3315,10 +3369,12 @@ function openVaultGrantPicker(items, selectedIds, onApply) {
   });
   overlay.querySelector('[data-vault-cancel]').addEventListener('click', close);
   overlay.querySelector('[data-vault-apply]').addEventListener('click', () => {
-    onApply(new Set(picks.filter((pick) => pick.checked).map((pick) => pick.value)));
+    const selected = new Set(picks.filter((pick) => pick.checked).map((pick) => pick.value));
+    const selectedPolicies = Object.fromEntries(Object.entries(localPolicies).filter(([itemId]) => selected.has(itemId)));
+    onApply(selected, selectedPolicies);
     close();
   });
-  (picks[0] || all || overlay.querySelector('[data-vault-apply]')).focus();
+  search.focus();
 }
 
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
@@ -3512,6 +3568,7 @@ async function openTaskForm(workflow, draft, seedText) {
   // listener; grants persist via createTask/PATCH authorization.
   const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
+  let vaultCredentialPolicies = JSON.parse(JSON.stringify(draft?.params?._authorization?.credentialPolicies || {}));
   (async () => {
     const button = $('#tf-vault-open');
     const count = $('#tf-vault-count');
@@ -3527,9 +3584,10 @@ async function openTaskForm(workflow, draft, seedText) {
     };
     refreshCount();
     button.disabled = false;
-    button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, (selected) => {
+    button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, vaultCredentialPolicies, (selected, policies) => {
       vaultGrantIds.clear();
       selected.forEach((id) => vaultGrantIds.add(id));
+      vaultCredentialPolicies = policies;
       refreshCount();
       button.dispatchEvent(new Event('change', { bubbles: true }));
     }));
@@ -3567,6 +3625,7 @@ async function openTaskForm(workflow, draft, seedText) {
       authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization,
       // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
       credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
+      credentialPolicies: vaultCredentialPolicies,
     };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
@@ -3610,12 +3669,12 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
+          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
         }
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
@@ -3651,7 +3710,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, credentialGrants: state.credentialGrants, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, credentialGrants: state.credentialGrants, credentialPolicies: state.credentialPolicies, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -3687,12 +3746,12 @@ async function openTaskForm(workflow, draft, seedText) {
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
         await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
+        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
+        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
@@ -3702,13 +3761,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -8270,7 +8329,10 @@ function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" o
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
-    <div class="vault-items-list" style="margin-bottom:14px">Loading…</div>
+    <button type="button" class="btn vault-manage-button" id="vault-manage-open" disabled>
+      <span>Vault credentials</span>
+      <span class="vault-manage-count">Loading…</span>
+    </button>
 
     <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
       ${policyTip('karmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
@@ -8317,49 +8379,101 @@ async function wireVaultCards(organizationId) {
   };
   secretRows();
   box.querySelector('.vi-type').addEventListener('change', secretRows);
+  let vaultItems = [];
+  const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
+    : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
   const renderItems = async () => {
-    let items = [];
-    try { items = await api(`/api/vault/items${oq}`); } catch {}
-    const list = box.querySelector('.vault-items-list');
-    const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
-      : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
-    list.innerHTML = items.length
-      ? items.map((i) => `<div class="queue-item" data-vi="${esc(i.id)}">
+    const button = box.querySelector('#vault-manage-open');
+    try {
+      vaultItems = await api(`/api/vault/items${oq}`);
+      button.disabled = false;
+      button.querySelector('.vault-manage-count').textContent = `${vaultItems.length} item${vaultItems.length === 1 ? '' : 's'}`;
+    } catch {
+      vaultItems = [];
+      button.disabled = true;
+      button.querySelector('.vault-manage-count').textContent = 'Unavailable';
+    }
+    return vaultItems;
+  };
+  const openVaultManager = () => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal-card vault-manager-modal" role="dialog" aria-modal="true" aria-labelledby="vault-manager-title">
+      <div class="vault-manager-head">
+        <div><div class="section-h" id="vault-manager-title">Vault credentials</div>
+          <p class="vault-grant-help">Manage organization defaults, rotate secrets, or remove credentials.</p></div>
+        <button type="button" class="icon-btn" data-vault-manager-close aria-label="Close">×</button>
+      </div>
+      <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
+      <div class="vault-manager-list"></div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const list = overlay.querySelector('.vault-manager-list');
+    const search = overlay.querySelector('.vault-search');
+    const filterRows = () => {
+      const query = search.value.trim().toLowerCase();
+      let visible = 0;
+      list.querySelectorAll('[data-vi]').forEach((row) => {
+        const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
+        row.hidden = !!query && !vaultItemSearchText(item).includes(query);
+        if (!row.hidden) visible++;
+      });
+      const empty = list.querySelector('.vault-search-empty');
+      if (empty) empty.hidden = visible > 0 || !vaultItems.length;
+    };
+    const paint = () => {
+      list.innerHTML = vaultItems.length
+        ? vaultItems.map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
           <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
             ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
-          <label style="font-size:11px" title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          <label style="font-size:11px" title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
           <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button></div>`).join('')
-      : '<span style="color:var(--ink-3)">No passwords yet — sync from a password manager below, or add one by hand.</span>';
-    list.querySelectorAll('[data-vi]').forEach((row) => {
-      const item = items.find((x) => x.id === row.dataset.vi);
-      const savePolicy = async () => {
+        : '<span class="vault-grant-empty">No passwords yet — sync from a password manager or add one by hand.</span>';
+      list.insertAdjacentHTML('beforeend', '<span class="vault-grant-empty vault-search-empty" hidden>No credentials match your search.</span>');
+      list.querySelectorAll('[data-vi]').forEach((row) => {
+        const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
+        const savePolicy = async () => {
+          try {
+            const updated = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
+            Object.assign(item, updated.item || updated);
+            toast('Policy saved');
+          } catch (e) { toast(e.message, true); }
+        };
+        row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
+        row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+      });
+      list.querySelectorAll('[data-vi-rotate]').forEach((button) => button.addEventListener('click', async () => {
+        const item = vaultItems.find((candidate) => candidate.id === button.dataset.viRotate);
+        const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
+        const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
+        if (!value) return;
         try {
-          await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
-          toast('Policy saved');
+          const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
+          toast(result.propagated?.connector ? `Secret updated (also pushed to ${result.propagated.connector})` : 'Secret updated');
         } catch (e) { toast(e.message, true); }
-      };
-      row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
-      row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
-    });
-    list.querySelectorAll('[data-vi-rotate]').forEach((b) => b.addEventListener('click', async () => {
-      const item = items.find((x) => x.id === b.dataset.viRotate);
-      const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
-      const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
-      if (!value) return;
-      try {
-        const r = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
-        toast(r.propagated?.connector ? `Secret updated (also pushed to ${r.propagated.connector})` : 'Secret updated');
-      } catch (e) { toast(e.message, true); }
-    }));
-    list.querySelectorAll('[data-vi-del]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm('Delete this vault item (and its secrets)?')) return;
-      try { await api(`/api/vault/items/${b.dataset.viDel}${oq}`, { method: 'DELETE' }); renderItems(); } catch (e) { toast(e.message, true); }
-    }));
-    return items;
+      }));
+      list.querySelectorAll('[data-vi-del]').forEach((button) => button.addEventListener('click', async () => {
+        if (!confirm('Delete this vault item (and its secrets)?')) return;
+        try {
+          await api(`/api/vault/items/${button.dataset.viDel}${oq}`, { method: 'DELETE' });
+          await renderItems();
+          paint();
+        } catch (e) { toast(e.message, true); }
+      }));
+      filterRows();
+    };
+    paint();
+    const close = () => overlay.remove();
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+    overlay.querySelector('[data-vault-manager-close]').addEventListener('click', close);
+    search.addEventListener('input', filterRows);
+    search.focus();
   };
+  box.querySelector('#vault-manage-open').addEventListener('click', openVaultManager);
   // ── connectors row: connect a store, then open the full import panel ──
   const renderConnectors = async () => {
     const list = box.querySelector('.connectors-list');

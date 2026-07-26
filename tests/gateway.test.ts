@@ -741,6 +741,49 @@ describe('gateway HTTP API (real server end-to-end)', () => {
   });
 
   // ── vault items + the credential pull model over HTTP (PLAN-passwords.md) ──
+  it('persists task credential policies and applies edits to agent access', async () => {
+    const item: any = await (await fetch(`${base}/api/vault/items`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        type: 'login', label: 'Task-specific policy', domains: 'policy.example.com',
+        policy: { use: 'ask', reveal: 'never' }, secrets: { password: 'task-secret' },
+      }),
+    })).json();
+    const project: any = await (await fetch(`${base}/api/projects`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ name: 'Vault policy project' }),
+    })).json();
+    const cap = `use-credential:item:${item.id}`;
+    const task: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        workflow: 'just-do', command: 'later', draft: true,
+        credentialGrants: [cap],
+        credentialPolicies: { [item.id]: { use: 'auto', reveal: 'ask' } },
+      }),
+    })).json();
+    expect(task.params._authorization.credentialPolicies[item.id]).toEqual({ use: 'auto', reveal: 'ask' });
+
+    const minted = h.tokens.mint({
+      taskId: task.id, profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read', cap],
+    });
+    const agentAuth = { authorization: `Bearer ${minted.token}`, 'content-type': 'application/json' };
+    const asked: any = await (await fetch(`${base}/api/vault/resolve`, {
+      method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }),
+    })).json();
+    expect(asked.status).toBe('needs_approval'); // task "ask" overrides global "never"
+
+    const patched: any = await (await fetch(`${base}/api/tasks/${task.id}/authorization`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({
+        profileId: 'developer', credentialGrants: [cap],
+        credentialPolicies: { [item.id]: { use: 'auto', reveal: 'auto' } },
+      }),
+    })).json();
+    expect(patched.params._authorization.credentialPolicies[item.id].reveal).toBe('auto');
+    const revealed: any = await (await fetch(`${base}/api/vault/resolve`, {
+      method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }),
+    })).json();
+    expect(revealed).toMatchObject({ status: 'granted', value: 'task-secret' });
+  });
+
   it('vault item lifecycle: add, list without secrets, policy-gated reveal, delete', async () => {
     const created: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
       type: 'login', label: 'GitHub (test)', domains: 'github.com', username: 'octo',
