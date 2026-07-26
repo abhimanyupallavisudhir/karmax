@@ -24,14 +24,15 @@ global.S = {
   attemptGroup: {
     principalAttemptId: 'attempt-1',
     attempts: [
-      { id: 'attempt-1', attemptNumber: 1, params: {}, lastView: { stage: 'do', status: 'active', state: {} } },
-      { id: 'attempt-2', attemptNumber: 2, params: { draft: true } },
+      { id: 'attempt-1', attemptNumber: 1, params: {}, lastView: { stage: 'do', status: 'active', state: {}, stageTransitions: [{ target: 'human', label: 'Waiting for human input' }, { target: 'done', label: 'Done' }] } },
+      { id: 'attempt-2', attemptNumber: 2, params: { draft: true }, lastView: { stage: 'setup', status: 'waiting', state: { draft: true }, stageTransitions: [{ target: 'do', label: 'Queue' }, { target: 'done', label: 'Done' }] } },
     ],
   },
 };
 
 eval(extractFn('taskRecord'));
 eval(extractFn('stageLabel'));
+eval(extractFn('stageIndicator'));
 eval(extractFn('taskAttempts'));
 
 let pass = 0, fail = 0;
@@ -46,6 +47,8 @@ ok(html.includes('data-attempt-select="attempt-1"'), 'principal can be selected 
 ok(html.includes('data-attempt-select="attempt-2"'), 'draft can be selected');
 ok(html.includes('attempt-card selected') && html.includes('aria-current="true"'), 'current attempt is visibly and semantically selected');
 ok(!html.includes('<details') && !html.includes('View full attempt'), 'switching needs no expansion or secondary action');
+ok((html.match(/data-stage-move=/g) || []).length === 2, 'every attempt owns its own stage dropdown');
+ok(html.includes('Waiting for human input') && html.includes('Queue'), 'attempt menus render their distinct server-advertised moves');
 ok(taskRecord('attempt-2')?.params?.draft === true, 'task page resolves non-principal records from the attempt group');
 ok(stageLabel({ stage: 'setup', state: { draft: true } }) === 'draft', 'draft stage is labelled clearly');
 
@@ -53,7 +56,7 @@ ok(stageLabel({ stage: 'setup', state: { draft: true } }) === 'draft', 'draft st
 // which prevents principal auto-redirection from snapping the page back.
 const buttons = ['attempt-1', 'attempt-2'].map((id) => ({
   dataset: { attemptSelect: id },
-  addEventListener(_event, handler) { this.click = handler; },
+  addEventListener(event, handler) { this[event] = handler; },
 }));
 global.document = {
   getElementById: () => null,
@@ -67,7 +70,7 @@ global.openTaskForm = () => {};
 global.toast = () => {};
 eval(extractFn('wireAttempts'));
 wireAttempts({ taskId: 'attempt-2' });
-buttons[0].click();
+buttons[0].click({ target: { closest: () => null } });
 ok(JSON.stringify(opened) === JSON.stringify([['attempt-1', 'overview', true]]), 'principal row switches back explicitly');
 
 console.log(`\n${pass} passed, ${fail} failed`);

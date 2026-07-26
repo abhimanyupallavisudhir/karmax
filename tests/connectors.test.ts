@@ -120,6 +120,35 @@ describe('pass connector', () => {
     expect(se.label).toBe('stackexchange.com');
     expect(list.find((i) => i.externalId === 'email.com')!.folder).toBe('');
   });
+  it('extracts the actual site and username from a foldered pass path', async () => {
+    const exec = scriptedExec({
+      'find -L': found(
+        'software/www.overleaf.com/alice@example.com',
+        'srajma/.archived/forum.obsidian.md/srajma',
+        'secrets/GITHUB_ACCESS_TOKENS',
+      ),
+      'pass show software/www.overleaf.com/alice@example.com': 'pw\n',
+    });
+    const connector = new PassConnector(exec, root);
+    const listed = await connector.list();
+    expect(listed.find((i) => i.externalId.includes('overleaf'))).toMatchObject({
+      domains: ['www.overleaf.com'],
+      username: 'alice@example.com',
+    });
+    expect(listed.find((i) => i.externalId.includes('obsidian'))).toMatchObject({
+      domains: ['forum.obsidian.md'],
+      username: 'srajma',
+    });
+    expect(listed.find((i) => i.externalId.includes('GITHUB_ACCESS'))).toMatchObject({
+      domains: [],
+    });
+    expect(await connector.pull(['software/www.overleaf.com/alice@example.com'])).toEqual([
+      expect.objectContaining({
+        domains: ['www.overleaf.com'],
+        username: 'alice@example.com',
+      }),
+    ]);
+  });
   it('ignores non-GPG files in both the import view and pull commands', async () => {
     const files = [
       path.join(root, 'alts', 'real.md.gpg'),
@@ -256,5 +285,28 @@ describe('Connectors sync into the vault (§9)', () => {
     expect(result?.externalId).toBe('karmax/new');
     expect(pushed[0].secrets.password).toBe('genpw');
     expect(items.get(created.id)!.provenance.externalId).toBe('karmax/new');
+  });
+
+  it('automatically applies enabled connector write-back to a created item', async () => {
+    const { items, store, broker } = makeVault();
+    const pushed: any[] = [];
+    const connector = new PassConnector(scriptedExec({}));
+    (connector as any).push = async (item: any) => {
+      pushed.push(item);
+      return { externalId: 'karmax/automatic' };
+    };
+    const connectors = new Connectors(store, items, broker);
+    connectors.register(connector);
+    connectors.setConfig('pass', { writeBack: true });
+    const created = items.save({
+      type: 'login', label: 'automatic', secrets: { password: 'generated' },
+      provenance: { source: 'task:t1', taskId: 't1' },
+    });
+
+    expect(await connectors.writeBackCreated(created.id)).toEqual([
+      { connector: 'pass', externalId: 'karmax/automatic' },
+    ]);
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0].secrets.password).toBe('generated');
   });
 });

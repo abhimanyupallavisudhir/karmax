@@ -125,6 +125,7 @@ export class WorktreeProvider implements WorldProvider {
       fs.rmSync(wt, { recursive: true, force: true });
     }
     await git(repo, ['worktree', 'prune']);
+    if (spec.resetBranch) await git(repo, ['branch', '-D', branch]);
     // Reuse the branch if it already exists, else create it.
     const branchExists = (await git(repo, ['rev-parse', '--verify', branch])).code === 0;
     const addArgs = branchExists

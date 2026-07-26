@@ -17,7 +17,13 @@ export interface CdpFillArgs {
   /** CSS selector of the input to fill. */
   selector: string;
   /** The secret. Never echoed in results or errors. */
-  text: string;
+  text?: string;
+  /**
+   * Preferred host-side resolver. It is called only after both the live page
+   * origin and selector have been verified, so a rejected phishing target
+   * does not even resolve/audit the vault value.
+   */
+  resolveText?: () => string;
   /** The page origin must suffix-match one of these (from the vault item). */
   expectDomains?: string[];
   timeoutMs?: number;
@@ -31,7 +37,9 @@ export async function fillViaCdp(args: CdpFillArgs): Promise<{ origin: string }>
       returnByValue: true,
     });
     if (focus?.result?.value !== true) throw new Error(`no element matches selector ${args.selector}`);
-    await session.call('Input.insertText', { text: args.text });
+    const text = args.resolveText?.() ?? args.text;
+    if (text === undefined) throw new Error('credential fill has no value resolver');
+    await session.call('Input.insertText', { text });
     return { origin };
   } finally {
     session.close();

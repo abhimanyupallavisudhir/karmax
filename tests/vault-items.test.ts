@@ -273,10 +273,13 @@ describe('zero-exposure CDP fill (§5B)', () => {
 
   it('refuses to fill when the page origin does not match the item domains', async () => {
     const b = await mockBrowser('https://evil.com');
+    let resolved = false;
     try {
       // the target list claims evil.com too, so selection fails the domain filter
-      await expect(fillViaCdp({ cdpUrl: `http://127.0.0.1:${b.port}`, selector: '#password', text: 's3cret', expectDomains: ['github.com'] }))
+      await expect(fillViaCdp({ cdpUrl: `http://127.0.0.1:${b.port}`, selector: '#password',
+        resolveText: () => { resolved = true; return 's3cret'; }, expectDomains: ['github.com'] }))
         .rejects.toThrow(/no open page matches/);
+      expect(resolved).toBe(false);
       expect(b.received.find((m) => m.method === 'Input.insertText')).toBeUndefined();
     } finally {
       await b.close();
