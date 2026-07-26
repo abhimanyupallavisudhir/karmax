@@ -16,6 +16,16 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/projects/:projectId/environment', 'GET /api/projects/:projectId/environment/proposal',
     'POST /api/projects/:projectId/environment/build',
   ],
+  sourceControl: [
+    'GET|PUT /api/projects/:projectId/repository-sources',
+    'GET|POST /api/projects/:projectId/repositories',
+    'DELETE /api/projects/:projectId/repositories/:repositoryId',
+    'GET|POST /api/organizations/:organizationId/repositories',
+    'POST /api/organizations/:organizationId/repositories/create (requires an authorized human GitHub identity)',
+    'GET /api/organizations/:organizationId/git-connections',
+    'GET /api/organizations/:organizationId/github/app',
+    'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize|refresh (OAuth/install redirects require a human identity)',
+  ],
   tasks: [
     'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
     'GET /api/projects/:projectId/search?q=', 'GET|POST /api/projects/:projectId/tags',

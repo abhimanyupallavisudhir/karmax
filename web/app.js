@@ -6,6 +6,17 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+  let amount = bytes; let unit = -1;
+  do { amount /= 1024; unit++; } while (amount >= 1024 && unit < units.length - 1);
+  const digits = amount >= 100 ? 0 : amount >= 10 ? 1 : 2;
+  return `${Number(amount.toFixed(digits))} ${units[unit]}`;
+}
+
 // Small, code-native icons used by icon-only controls. Keeping them inline makes
 // the no-build-step console self-contained while still giving every button a
 // proper text alternative through its aria-label/title.
@@ -6495,16 +6506,25 @@ function renderWikiEditor(info, proj, pane, page) {
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
   return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
-    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project-git">Git &amp; GitHub</a><a href="#project-secrets">Secrets</a><a href="#project-data">Data</a><a href="#project-services">Services</a><a href="#project-environment">Environment</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
-    <div class="settings-section-title" id="project-git"><div>Git &amp; GitHub<small>The repositories this project works on, and the identity it commits with</small></div></div>
+    <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-compute">Compute</a><a href="#project-agents">Agent logins</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced">Advanced</a></nav><div class="settings-content">
+    <div class="settings-section-title" id="project"><div>Project<small>Everything tasks need beyond their instructions: code, credentials, state, live systems, and tools</small></div></div>
+    <div class="project-kind-guide" aria-label="Project dependency guide">
+      <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
+      <button type="button" data-project-jump="project-secrets"><b>Secret</b><span>A sensitive value</span></button>
+      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files Karmax versions</span></button>
+      <button type="button" data-project-jump="project-services"><b>Service</b><span>A live system tasks call</span></button>
+      <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
+    </div>
+    <div class="project-agent-note"><span aria-hidden="true">⌁</span><div><b>Agent-manageable by design</b><small>Agents with the matching repository, project-settings, and credential permissions can manage every section through the scoped platform API. Secret values remain write-only.</small></div></div>
+    <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2><p>The repositories this project works on, and the identity it commits with.</p></div></div>
     <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><div id="project-git-profile">Loading Git profiles…</div><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection and Git accounts</a><div id="git-preflight-card" style="margin-top:12px"><button class="btn sm" id="git-preflight-run">Check Git setup</button><div id="git-preflight-result" style="margin-top:8px;font-size:12px"></div></div></div>
-    <div class="settings-section-title" id="project-secrets"><div>Secrets<small>Paste values only when needed; the repository supplies the names</small></div></div>
+    <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2><p>Sensitive values injected only when a task needs them. Values are never shown again.</p></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="settings-section-title" id="project-data"><div>Data<small>Versioned datasets, model weights, fixtures, and development databases</small></div></div>
+    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data</h2><p>Files Karmax snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
-    <div class="settings-section-title" id="project-services"><div>Services<small>Shared connections or a private container for every task world</small></div></div>
+    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
-    <div class="settings-section-title" id="project-environment"><div>Environment<small>Proposed from the repo, built once, and copied into each world</small></div></div>
+    <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="settings-section-title" id="project-compute"><div>Compute<small>Where this project's tasks run</small></div></div>${cloudEnvironmentCard(proj)}
     <div class="settings-section-title" id="project-agents"><div>Agent logins<small>Which accounts do this project's work, in what order</small></div></div>
@@ -6554,14 +6574,19 @@ async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box) return;
   try {
     const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
-    box.innerHTML = `${secrets.map((secret) => `<div class="queue-item"><div style="flex:1"><b>${esc(secret.name)}</b> <span class="chip">${secret.file ? `file · ${esc(secret.file)}` : `env · ${esc(secret.variable || secret.name)}`}</span> <span class="chip">vault configured</span></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')
-      || '<p class="task-sub">No values are required up front. Karmax asks when code first needs one.</p>'}
+    box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')
+      || '<div class="project-empty"><b>No project secrets yet.</b><br>That is fine—Karmax can ask for a value when code first needs one, and can discover expected names from <span class="mono">.env.example</span>.</div>'}
       ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
-      <div class="inline-form" style="margin-top:8px"><input id="project-secret-name" placeholder="DATABASE_URL" style="max-width:190px"><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="value (write-only)" style="flex:1;min-width:160px"><input id="project-secret-file" placeholder="file path (optional)" style="max-width:190px"><button class="btn sm primary" id="project-secret-save">Save</button></div>
-      <p class="task-sub">Values are never shown again. File secrets are 0600, checkpoint-excluded, and privately Git-excluded in each task worktree.</p>
+      <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
+        <div class="project-form-grid">
+          <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in Karmax.</small></label>
+          <label class="form-row"><span>Value</span><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="Write-only value"><small class="field-help">Encrypted immediately and never returned by the API.</small></label>
+          <label class="form-row wide"><span>Deliver as a private file <small>(optional)</small></span><input id="project-secret-file" placeholder=".secrets/service-account.json"><small class="field-help">Leave blank to inject it as an environment variable with the name above. File secrets are mode 0600 and privately Git-excluded.</small></label>
+        </div><div class="project-form-actions"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
+      </details>
       <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
-      $('#project-secret-name').value = button.dataset.name; $('#project-secret-value').focus();
+      $('#project-secret-add').open = true; $('#project-secret-name').value = button.dataset.name; $('#project-secret-value').focus();
     }));
     box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Remove this secret and its vault value?')) return;
@@ -6593,13 +6618,20 @@ async function hydrateProjectData(proj) {
   try {
     const all = await api(`/api/projects/${encodeURIComponent(proj.id)}/resources`);
     const resources = all.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver));
-    box.innerHTML = `${resources.map((resource) => `<div class="queue-item" data-data-resource="${esc(resource.id)}"><div style="flex:1"><b>${esc(resource.name)}</b> <span class="chip">${resource.access === 'write' ? 'private writable fork' : 'read-only'}</span> <span class="chip">${resource.publish === 'review' ? 'promotable at Review' : 'discard changes'}</span><div class="task-sub"><span class="mono">${esc(resource.target.path)}</span>${resource.revision ? ` · ${formatBytes(resource.revision.bytes)} · immutable ${esc(resource.revision.id)}` : ' · awaiting initial upload'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')
-      || '<p class="task-sub">No data resources yet. Datasets, model weights, fixtures, and SQLite files become immutable revisions; task changes are explicitly promoted or discarded.</p>'}
+    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">?</span><div><b>Data or Service?</b> Choose Data when Karmax should capture and version the files. If tasks connect directly to a live S3 bucket, database, or API, add it under Services and keep its access key under Secrets.</div></div>
+      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>awaiting first import</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')
+      || '<div class="project-empty"><b>No versioned data yet.</b><br>Use discovery for likely ignored files, or add a dataset, model, fixture directory, or development database below.</div>'}
       ${!S.meta?.hosted && proj.config?.copyGlobs?.length ? `<div class="proposal-card"><div><b>Replace legacy copied files</b><p class="task-sub"><span class="mono">${proj.config.copyGlobs.map(esc).join(', ')}</span> currently comes from the host checkout. Migrate it once into typed secrets and immutable data revisions at the same world paths.</p></div><button class="btn sm primary" id="data-migrate-copyglobs">Migrate</button></div>` : ''}
-      ${S.meta?.hosted ? '' : '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button><span class="task-sub">Karmax proposes; nothing uploads until you approve.</span></div><div id="data-proposals"></div>'}
-      <details class="settings-disclosure compact"><summary><b>Add data</b><span>Large uploads are resumable and streamed</span></summary>
-        <div class="inline-form"><input id="data-name" placeholder="Training data"><input id="data-path" placeholder="resources/training-data"><select id="data-access"><option value="read">read-only</option><option value="write">writable private fork</option></select><select id="data-publish"><option value="discard">discard task changes</option><option value="review">offer Promote at Review</option></select></div>
-        <div class="inline-form">${S.meta?.hosted ? '' : '<input id="data-source" placeholder="/local/path (optional)" style="flex:1">'}<input id="data-files" type="file" multiple webkitdirectory><button class="btn sm primary" id="data-add">Add</button></div>
+      ${S.meta?.hosted ? '' : '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button><span class="task-sub">Karmax scans ignored files and proposes a classification; nothing is imported until you approve.</span></div><div id="data-proposals"></div>'}
+      <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b><span>Large uploads are resumable and streamed</span></summary>
+        <div class="project-form-grid">
+          <label class="form-row"><span>Name</span><input id="data-name" placeholder="Training data"><small class="field-help">A human-readable name in Project settings.</small></label>
+          <label class="form-row"><span>Available to tasks at</span><input id="data-path" placeholder="data/training-data"><small class="field-help">The destination path inside every task world—not a path on this machine.</small></label>
+          <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select><small class="field-help">Writable data is isolated so concurrent tasks cannot corrupt each other.</small></label>
+          <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select><small class="field-help">Promote publishes a new immutable revision; it never overwrites bytes in place.</small></label>
+          ${S.meta?.hosted ? '' : '<label class="form-row wide"><span>Import from this Karmax machine <small>(optional)</small></span><input id="data-source" placeholder="/srv/project-data/training"><small class="field-help">An existing host file or directory copied once into the first revision. This is the source; “Available to tasks at” above is the destination.</small></label>'}
+          <label class="form-row wide"><span>Or upload a folder from this browser <small>(optional)</small></span><input id="data-files" type="file" multiple webkitdirectory><small class="field-help">Choose either a host path or a browser folder. Uploads resume safely if interrupted.</small></label>
+        </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
       </details>`;
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
       const resource = resources.find((item) => item.id === row.dataset.dataResource);
@@ -6626,9 +6658,10 @@ async function hydrateProjectData(proj) {
         const scan = await api(`/api/projects/${proj.id}/resources/scan`), target = $('#data-proposals');
         const proposals = scan.proposals.filter((proposal) => proposal.suggested.driver === 'volume@1');
         target.innerHTML = proposals.map((proposal, index) => `<div class="proposal-card" data-index="${index}"><div style="flex:1"><b>${esc(proposal.path)}</b> <span class="chip">${esc(proposal.kind)}</span><p class="task-sub">${esc(proposal.reason)}${proposal.bytes != null ? ` · ${formatBytes(proposal.bytes)}` : ''}</p></div><button class="btn sm primary accept-data-proposal">Use proposal</button></div>`).join('')
-          || '<p class="task-sub">No likely data resources found.</p>';
+          || '<div class="project-empty">Nothing looks like project data. Karmax checked ignored files for large directories, databases, models, and datasets; you can still add one manually.</div>';
         target.querySelectorAll('.accept-data-proposal').forEach((button) => button.addEventListener('click', () => {
           const proposal = proposals[Number(button.closest('[data-index]').dataset.index)];
+          $('#data-add-panel').open = true;
           $('#data-name').value = proposal.path.split('/').pop() || 'Data';
           $('#data-path').value = proposal.suggested.target.path;
           $('#data-access').value = proposal.suggested.access;
@@ -6640,18 +6673,19 @@ async function hydrateProjectData(proj) {
     });
     $('#data-add')?.addEventListener('click', async () => {
       const name = $('#data-name').value.trim(); if (!name) return toast('Name is required', true);
+      const files = [...$('#data-files').files];
+      if ($('#data-source')?.value.trim() && files.length) return toast('Choose a host path or a browser folder, not both', true);
       const button = $('#data-add'); button.disabled = true;
       try {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
-          name, driver: 'volume@1', target: { kind: 'path', path: $('#data-path').value.trim() || `resources/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
+          name, driver: 'volume@1', target: { kind: 'path', path: $('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
           access: $('#data-access').value, isolation: 'fork', publish: $('#data-publish').value,
           sourcePath: $('#data-source')?.value.trim() || undefined,
         }) });
-        const files = [...$('#data-files').files];
         if (files.length) await uploadResourceFiles(proj.id, created.id, files,
           (done, total) => { button.textContent = `Uploading ${Math.round(done / total * 100)}%`; });
         toast('Data resource added'); await hydrateProjectData(proj);
-      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Add'; }
+      } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Add data'; }
     });
   } catch (error) { box.textContent = error.message; }
 }
@@ -6664,10 +6698,32 @@ async function hydrateProjectServices(proj) {
     ]);
     const secrets = resources.filter((resource) => ['secret@1', 'database@1', 'service@1'].includes(resource.driver));
     const data = resources.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver) && resource.target.kind === 'path');
-    box.innerHTML = `${services.map((service) => `<div class="queue-item"><div style="flex:1"><b>${esc(service.name)}</b> <span class="chip">${esc(service.kind)}</span>${service.image ? ` <span class="chip">${esc(service.image)}</span>` : ''}${service.urlEnv ? ` <span class="chip">${esc(service.urlEnv)}</span>` : ''}</div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')
-      || '<p class="task-sub">No services yet. Shared production services use a credential resource; per-world services give every task an isolated container.</p>'}
-      <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button></div><div id="service-proposals"></div>
-      <details class="settings-disclosure compact"><summary><b>Add a service manually</b></summary><div class="inline-form"><input id="service-name" placeholder="postgres"><select id="service-kind"><option value="per-world">per-world container</option><option value="external">external connection</option></select><input id="service-image" placeholder="postgres:16"><input id="service-port" placeholder="5432" style="max-width:80px"><input id="service-url-env" placeholder="DATABASE_URL"><input id="service-url-template" placeholder="postgres://…@{host}:{port}/db" style="flex:1"></div><div class="inline-form"><label>Connection secret <select id="service-connection"><option value="">—</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select></label><label>Seed data <select id="service-seed"><option value="">—</option>${data.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)} · ${esc(resource.target.path)}</option>`).join('')}</select></label><input id="service-seed-path" placeholder="/docker-entrypoint-initdb.d/seed.sql"><button class="btn sm primary" id="service-save">Save</button></div></details>`;
+    box.innerHTML = `<div class="project-help-callout"><span class="callout-mark">↗</span><div><b>A service stays live.</b> Use an external service for an API, hosted database, or S3 bucket tasks call directly. Use a per-task container for an isolated development dependency such as Postgres or Redis. Credentials belong in Secrets.</div></div>
+      ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')
+      || '<div class="project-empty"><b>No services configured.</b><br>Discover development services from Compose, or add a live external connection or isolated per-task container manually.</div>'}
+      <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button><span class="task-sub">Review suggestions before anything starts.</span></div><div id="service-proposals"></div>
+      <details class="settings-disclosure compact"><summary><b>Add a service manually</b><span>External connection or per-task container</span></summary>
+        <div class="project-form-grid">
+          <label class="form-row"><span>Name</span><input id="service-name" placeholder="Postgres development database"></label>
+          <label class="form-row"><span>How tasks reach it</span><select id="service-kind"><option value="per-world">Start a private container for every task</option><option value="external">Connect to an existing external service</option></select></label>
+        </div>
+        <div class="service-fields" data-service-kind="per-world"><div class="project-form-grid">
+          <label class="form-row"><span>Container image</span><input id="service-image" placeholder="postgres:16"></label>
+          <label class="form-row"><span>Container port</span><input id="service-port" inputmode="numeric" placeholder="5432"></label>
+          <label class="form-row"><span>Give its URL to tasks as</span><input id="service-url-env" placeholder="DATABASE_URL"><small class="field-help">The environment-variable name, not the secret value.</small></label>
+          <label class="form-row"><span>Connection URL template</span><input id="service-url-template" placeholder="postgres://user:pass@{host}:{port}/db"><small class="field-help">Karmax replaces host and port for each isolated world.</small></label>
+          <label class="form-row"><span>Optional seed data</span><select id="service-seed"><option value="">No seed data</option>${data.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)} · ${esc(resource.target.path)}</option>`).join('')}</select></label>
+          <label class="form-row"><span>Seed destination in container</span><input id="service-seed-path" placeholder="/docker-entrypoint-initdb.d/seed.sql"></label>
+        </div></div>
+        <div class="service-fields" data-service-kind="external" hidden><div class="project-form-grid">
+          <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. Karmax passes only an opaque credential handle to the task world.</small></label>
+        </div></div>
+        <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
+      </details>`;
+    const syncServiceFields = () => box.querySelectorAll('[data-service-kind]').forEach((fields) => {
+      fields.hidden = fields.dataset.serviceKind !== $('#service-kind').value;
+    });
+    $('#service-kind')?.addEventListener('change', syncServiceFields); syncServiceFields();
     box.querySelectorAll('.service-delete').forEach((button) => button.addEventListener('click', async () => {
       await api(`/api/projects/${proj.id}/services?name=${encodeURIComponent(button.dataset.name)}`, { method: 'DELETE' });
       await hydrateProjectServices(proj);
@@ -6686,9 +6742,12 @@ async function hydrateProjectServices(proj) {
     });
     $('#service-save')?.addEventListener('click', async () => {
       const kind = $('#service-kind').value;
+      const name = $('#service-name').value.trim();
+      if (!name) return toast('Service name is required', true);
+      if (kind === 'external' && !$('#service-connection').value) return toast('Choose a connection secret first', true);
       try {
         await api(`/api/projects/${proj.id}/services`, { method: 'POST', body: JSON.stringify({
-          name: $('#service-name').value.trim(), kind,
+          name, kind,
           ...(kind === 'external' ? { connectionResourceId: $('#service-connection').value } : {
             image: $('#service-image').value.trim(), containerPort: Number($('#service-port').value) || undefined,
             urlEnv: $('#service-url-env').value.trim() || undefined,
@@ -6707,11 +6766,14 @@ async function hydrateProjectEnvironment(proj) {
   try {
     const { spec, digest, builds } = await api(`/api/projects/${proj.id}/environment`);
     const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip">${esc(record.digest.slice(0, 8))}${digest && record.digest !== digest ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div></div>`;
-    box.innerHTML = `<div class="proposal-card"><b>Repository-derived setup</b><p class="task-sub">Karmax reads devcontainer.json and lockfiles, then proposes a recipe. Review it before saving; existing CI and production are untouched.</p><button class="btn sm primary" id="environment-propose">Discover and propose</button><div id="environment-evidence"></div></div>
-      <div class="inline-form"><input id="environment-image" value="${esc(spec?.image || '')}" placeholder="base image or provider template" style="flex:1"><label class="switch"><input id="environment-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span>Include Docker for per-world services</span></label></div>
-      <textarea id="environment-setup" rows="3" style="width:100%" placeholder="setup commands — baked once">${esc((spec?.setup || []).join('\n'))}</textarea>
-      <textarea id="environment-boot" rows="2" style="width:100%" placeholder="boot commands — run in each world">${esc((spec?.boot || []).join('\n'))}</textarea>
-      <div class="inline-form"><button class="btn sm" id="environment-save">Save proposal</button><button class="btn sm primary" id="environment-build">Build now</button></div>
+    box.innerHTML = `<div class="proposal-card"><div><b>Start from the repository</b><p class="task-sub">Karmax reads devcontainer.json and lockfiles, then fills in a recipe for you to review. It never changes CI or production.</p><div id="environment-evidence"></div></div><button class="btn sm primary" id="environment-propose">Discover environment</button></div>
+      <div class="project-form-grid">
+        <label class="form-row wide"><span>Base image or provider template</span><input id="environment-image" value="${esc(spec?.image || '')}" placeholder="node:22-bookworm"><small class="field-help">The operating-system and language-tooling starting point for every task world.</small></label>
+        <label class="form-row wide"><span>Setup commands</span><textarea id="environment-setup" rows="4" placeholder="npm ci">${esc((spec?.setup || []).join('\n'))}</textarea><small class="field-help">Expensive installation commands baked into a reusable build when supported.</small></label>
+        <label class="form-row wide"><span>Boot commands</span><textarea id="environment-boot" rows="3" placeholder="npm run db:migrate">${esc((spec?.boot || []).join('\n'))}</textarea><small class="field-help">Commands rerun whenever a fresh or restored task world starts.</small></label>
+        <label class="switch form-row wide"><input id="environment-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span><b>Include Docker</b><small class="field-help">Required when per-task Services run as containers inside the world.</small></span></label>
+      </div>
+      <div class="project-form-actions"><button class="btn sm" id="environment-save">Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
       ${builds.length ? `<div class="section-h">Builds</div>${builds.map(build).join('')}` : '<p class="task-sub">No build yet. Cloud worlds run setup live until the recipe is built.</p>'}`;
     $('#environment-propose')?.addEventListener('click', async () => {
       try {
@@ -6887,9 +6949,9 @@ async function hydrateProjectAccess(proj) {
       ${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`; }).join('') || '<p class="task-sub">No project access overrides.</p>'}
       <datalist id="project-principal-options">${candidates.map((candidate) => `<option value="${esc(candidate.value)}"></option>`).join('')}</datalist>
       <div class="inline-form"><input id="project-member-principal" list="project-principal-options" placeholder="Type a person, @team:…, or @all"><select id="project-member-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="project-member-add">Add</button></div>`;
-    repositoryBox.innerHTML = `<div class="section-h">Repositories</div>
+    repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Every task receives an isolated checkout of each repository. Choose a connected GitHub repository, paste a Git URL, or—when self-hosting—use an existing local checkout.</p>
       <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
-      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /local/path'}"><button class="btn sm project-repository-remove" aria-label="Remove repository">−</button></div>`).join('')}</div>
+      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /srv/code/repo'}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
       ${!githubApp.configured ? '<div class="inline-form"><button class="btn sm primary" id="project-setup-github">Connect GitHub</button></div>'
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
@@ -6908,7 +6970,7 @@ async function hydrateProjectAccess(proj) {
     }));
     const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
     wireRepositoryRemoves();
-    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><input list="project-repository-options" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /local/path'}"><button class="btn sm project-repository-remove" aria-label="Remove repository">−</button></div>`); wireRepositoryRemoves(); });
+    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${S.meta?.hosted ? '' : ' or /srv/code/repo'}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
     $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
     $('#project-setup-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/app-manifest`, { method: 'POST', body: JSON.stringify({ publicUrl: location.origin }) }); const form = document.createElement('form'); form.method = 'POST'; form.action = result.action; const manifest = document.createElement('input'); manifest.type = 'hidden'; manifest.name = 'manifest'; manifest.value = JSON.stringify(result.manifest); form.appendChild(manifest); document.body.appendChild(form); form.submit(); } catch (error) { toast(error.message, true); } });
     $('#project-connect-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/install-url`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
@@ -7831,9 +7893,12 @@ function wireSettingsNavigation() {
       event.preventDefault();
       history.replaceState(history.state, '', location.pathname + link.getAttribute('href'));
       activate(link.getAttribute('href').slice(1));
-      $('#main')?.scrollTo?.(0, 0);
+      $('#main')?.closest('.main')?.scrollTo?.(0, 0);
       window.scrollTo(0, 0);
     };
+  });
+  layout.querySelectorAll('[data-project-jump]').forEach((button) => {
+    button.onclick = () => document.getElementById(button.dataset.projectJump)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
   activate(location.hash.slice(1));
 }
