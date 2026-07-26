@@ -26,7 +26,7 @@ const ICON = {
   send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
 };
-const DEFAULT_TASK_QUERY = 'group:tag';
+const TAG_SECTION_QUERY = 'group:tag';
 
 let installPrompt = null;
 window.addEventListener('beforeinstallprompt', (event) => {
@@ -62,7 +62,7 @@ const S = {
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
-  search: DEFAULT_TASK_QUERY, // the working query string (Linear-style tokens + free text)
+  search: '', // the working query string (Linear-style tokens + free text)
   // Task organization (PLAN-search-views): a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
@@ -279,7 +279,7 @@ async function applyRoute() {
     // new project (they'd otherwise re-run the old query against new data and
     // highlight a view/cursor that doesn't exist here).
     S.projectId = pid;
-    S.search = DEFAULT_TASK_QUERY;
+    S.search = '';
     S.activeView = null;
     S.searchResult = null;
     S.cursorId = null;
@@ -1767,7 +1767,7 @@ async function navigateToTagSection(tagId) {
   if (!tag) return;
   $('#modal-root').innerHTML = '';
   S.activeView = null;
-  S.search = DEFAULT_TASK_QUERY;
+  S.search = TAG_SECTION_QUERY;
   await go(projectRoute(tag.projectId));
   const section = document.getElementById(tagSectionId(tagId));
   if (!section) return;
@@ -2134,10 +2134,11 @@ function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
   return s;
 }
 
-// Built-in starter views that make the new task shapes (schedules, dependency-blocked,
-// repeatable series) first-class instead of buried. Each is just a query string; they
+// Built-in starter views that make useful organization modes and new task shapes
+// first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
 const BUILTIN_VIEWS = [
+  { id: 'builtin:sectioned', name: 'Sectioned', icon: '§', query: TAG_SECTION_QUERY },
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
@@ -2145,7 +2146,7 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
-// The saved-views switcher — every chip is a query. "All" is the tag-grouped default; then the
+// The saved-views switcher — every chip is a query. "All" is the default; then the
 // built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
   const builtins = BUILTIN_VIEWS
@@ -2283,7 +2284,7 @@ function tasksView() {
   } else {
     body = flat.map((t) => taskRow(t)).join('');
   }
-  const empty = S.search !== DEFAULT_TASK_QUERY
+  const empty = S.search
     ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
     : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
@@ -2300,13 +2301,13 @@ function tasksView() {
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
-        ${S.search !== DEFAULT_TASK_QUERY ? `<button class="search-x" id="q-clear" title="Restore the default view (Esc)">✕</button>` : ''}
+        ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
       </div>
       ${viewsBar()}
       ${queryToolbarHtml(S.search || '', 'q', `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`)}
     </div>
     <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
-      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search !== DEFAULT_TASK_QUERY ? ' · filtered' : ''}</span>
+      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
     </div>
     ${body || empty}`;
 }
@@ -2561,12 +2562,12 @@ function pipelineLarge(v) {
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
 function wireOrgControls() {
   const main = $('#main');
-  // Saved-view chips: each selects a query; "All" is the default tag-grouped view.
+  // Saved-view chips: each selects a query; "All" is the default (empty) view.
   main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === '__all__') { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); return; }
+      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
       if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
@@ -2585,21 +2586,21 @@ function wireOrgControls() {
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
-        if (S.activeView === id) { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); } else renderMain();
+        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
   $('#manage-tags')?.addEventListener('click', openTagsManager);
-  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
     search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search !== DEFAULT_TASK_QUERY) { e.stopPropagation(); S.activeView = null; setQuery(DEFAULT_TASK_QUERY); } });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
   }
 
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => { S.activeView = null; setQuery(q); } });
