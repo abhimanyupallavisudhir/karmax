@@ -19,6 +19,7 @@ import {
   UPD_REQUEST_AGENT,
   QRY_QUEUE,
   QRY_ACCOUNTS,
+  QRY_ACCOUNT_LEASE,
   mergeQueueId,
   agentQueueId,
   accountCoordinatorId,
@@ -162,7 +163,12 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
     /** Request a credential lease for a turn (the coordinator signals the task back).
      *  `allowed` = the credential policy's ordered, enabled keys for this turn; the
      *  coordinator grants the first available one (empty ⇒ passthrough). */
-    async leaseAccount(taskId: string, turnId: string, provider?: AccountProvider, allowed?: string[]): Promise<void> {
+    async leaseAccount(
+      taskId: string,
+      turnId: string,
+      provider?: AccountProvider,
+      allowed?: string[],
+    ): Promise<{ waiting: boolean }> {
       await client.workflow.signalWithStart(ACCOUNT_COORDINATOR_WORKFLOW, {
         workflowId: accountCoordinatorId(),
         taskQueue,
@@ -170,6 +176,13 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signal: SIG_LEASE_ACCOUNT,
         signalArgs: [{ taskId, turnId, provider, allowed }],
       });
+      // A consistent query after signal acceptance observes the coordinator after
+      // it has either parked this request or sent its grant/denial signal. This
+      // lets the task publish a login-wait label only for a genuine queue wait.
+      return await client.workflow.getHandle(accountCoordinatorId()).query(
+        QRY_ACCOUNT_LEASE,
+        { taskId, turnId },
+      ) as { waiting: boolean };
     },
     /** Remove a not-yet-granted account request when its task/turn is cancelled. */
     async cancelAccount(taskId: string, turnId: string): Promise<void> {

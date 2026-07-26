@@ -158,6 +158,27 @@ describe('account coordinator — quota engine', () => {
     await coord.terminate('done');
   });
 
+  it('acknowledges whether a lease actually parked or was granted immediately', async () => {
+    const coord = await startCoord([A({ id: 'A' })]);
+    const activities = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    const immediate = await grantee();
+
+    await expect(activities.leaseAccount(immediate.id, 'immediate', 'claude')).resolves.toEqual({
+      waiting: false,
+    });
+    await expect.poll(async () => (await acct('A')).inUse, { timeout: 10_000 }).toBe(1);
+
+    const parked = await grantee();
+    await expect(activities.leaseAccount(parked.id, 'parked', 'claude')).resolves.toEqual({
+      waiting: true,
+    });
+    expect((await accounts()).waiting).toBe(1);
+
+    await immediate.h.signal('finish');
+    await parked.h.signal('finish');
+    await coord.terminate('done');
+  });
+
   it('also DENIES provider-fallback requests when every compatible credential needs attention', async () => {
     const coord = await startCoord([A({ id: 'A', status: 'needs-attention' })]);
     const g = await grantee();

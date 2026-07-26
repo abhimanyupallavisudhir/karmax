@@ -1008,10 +1008,15 @@ async function softwareDevImpl(
         ? credentialProvider
         : undefined;
     const turnId = `${taskId}#${turnSeq++}`;
-    await coord.leaseAccount(taskId, turnId, credentialProvider, allowed);
+    const lease = await coord.leaseAccount(taskId, turnId, credentialProvider, allowed);
     const priorStatus = status;
     status = 'waiting';
-    waitingFor = { kind: 'account', provider: credentialProvider };
+    // The existing publication command is retained for replay. New activity
+    // results say whether the request really parked; old recorded void results
+    // keep the historical account-wait state.
+    waitingFor = lease?.waiting === false
+      ? { kind: 'agentSlot', provider: displayProvider, detail: 'Starting agent' }
+      : { kind: 'account', provider: credentialProvider };
     await publish();
     if (liveAgentStates) {
       // The coordinator owns refresh timers and signals every grant. An arbitrary

@@ -235,10 +235,15 @@ export function createAgentTurnLeaser(
           ? credentialProvider
           : undefined;
 
-      await coord.leaseAccount(host.taskId, turnId, credentialProvider, allowed);
+      const lease = await coord.leaseAccount(host.taskId, turnId, credentialProvider, allowed);
       const beforeWait = host.status();
       host.setStatus('waiting');
-      host.setWaitingFor({ kind: 'account', provider: credentialProvider });
+      // Historical activity results decode as undefined and retain their recorded
+      // account-wait publication. New executions distinguish a real parked lease
+      // from an immediate grant without changing the workflow command sequence.
+      host.setWaitingFor(lease?.waiting === false
+        ? { kind: 'agentSlot', provider, detail: 'Starting agent' }
+        : { kind: 'account', provider: credentialProvider });
       await host.publish();
       await condition(() => grants.has(turnId) || host.cancelled());
       const grant = grants.get(turnId);
