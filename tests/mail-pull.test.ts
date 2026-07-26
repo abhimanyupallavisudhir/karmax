@@ -6,7 +6,7 @@ import { AgentMail } from '../src/autonomy/agent-mail.js';
 function store(seed: Record<string, string> = {}): PullStore & { kv: Map<string, string>; orgs: { id: string }[] } {
   const kv = new Map<string, string>(Object.entries(seed));
   const orgs: { id: string }[] = [];
-  return { kv, orgs, kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v), listOrganizations: () => orgs, appendAudit: () => 0 };
+  return { kv, orgs, kvGet: (k) => kv.get(k), kvSet: (k, v) => void kv.set(k, v), appendAudit: () => 0 };
 }
 
 describe('mailbox pull providers: connect', () => {
