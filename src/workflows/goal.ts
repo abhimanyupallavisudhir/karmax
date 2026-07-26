@@ -1,4 +1,11 @@
-import { softwareDev, softwareDevV1, softwareDevV1_2, softwareDevV1_3, SoftwareDevInput } from './software-dev.js';
+import {
+  softwareDev,
+  softwareDevV1,
+  softwareDevV1_2,
+  softwareDevV1_3,
+  softwareDevV1_4,
+  SoftwareDevInput,
+} from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
 
 /**
@@ -20,6 +27,11 @@ export async function goalV1_2(input: TaskInput): Promise<{ stage: Stage; sha?: 
  * before confirmation. */
 export async function goalV1_3(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_3({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Durable non-blocking host admission. */
+export async function goalV1_4(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_4({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

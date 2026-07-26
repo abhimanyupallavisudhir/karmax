@@ -210,11 +210,18 @@ export function hostStats() {
   };
 }
 
-export async function awaitAgentResources(onWait?: () => void, signal?: AbortSignal): Promise<void> {
+export async function awaitAgentResources(
+  onWait?: () => void,
+  signal?: AbortSignal,
+  onPressure?: (state: { memoryTight: boolean; loadHigh: boolean }) => void | Promise<void>,
+): Promise<void> {
   if (minFreeMb() <= 0 && maxLoadFactor() <= 0) return;
   const deadline = Date.now() + MEM_WAIT_MAX_MS;
-  while ((memoryTight() || loadHigh()) && Date.now() < deadline) {
+  for (;;) {
+    const state = pressure();
+    if (!state.backpressure || Date.now() >= deadline) break;
     if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('agent slot wait cancelled');
+    await onPressure?.(state);
     onWait?.();
     await delay(MEM_POLL_MS);
   }

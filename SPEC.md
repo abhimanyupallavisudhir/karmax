@@ -326,8 +326,11 @@ A scarce shared resource is owned by a **singleton coordinator workflow** with a
 - One host-wide singleton, `agent-queue`, leases capacity only around model subprocesses; workflows waiting at Review, on accounts, timers, or I/O do not consume it.
 - Capacity defaults to 3 and is persisted as **Organization settings → Host capacity → Concurrent agent turns**, explicitly labeled installation-wide. `KARMAX_MAX_ACT` remains a distinct worker-throughput limit for all activities, and per-login concurrency remains an account-pool limit.
 - Waiting turns and active leases are explicit coordinator state. The coordinator contributes the reorderable **Agent queue** to the host-owned **Queues** page alongside the merge queue.
+- Admission is a non-blocking durable handshake: the coordinator immediately acknowledges enqueue/position, then signals the owning task when capacity is granted. A queued turn never holds a long-running Workflow Update open.
+- Before enqueue acknowledgement the task says **Starting agent**. Only an acknowledged queue wait says **Waiting for host capacity**; post-grant memory/load backpressure names that live host condition separately.
 - The worker applies live free-memory/load gates after lease grant. Those adaptive safety checks are separate from the configured counting-semaphore capacity because only an activity can inspect live host resources.
-- Current turns enroll by stable turn ID at the existing activity boundary, preserving replay compatibility for workflow histories recorded before this coordinator existed. Dead-task leases are reclaimed after a liveness check.
+- Current task-workflow versions own the stable turn-ID lease across activity retries. Historical versions retain activity-boundary enrollment for replay compatibility. Dead-task leases are reclaimed after a liveness check.
+- The coordinator follows Temporal's continue-as-new recommendation (with a low admission-count fallback), carrying queued and active leases into the new run. Active model turns therefore cannot pin an oversized coordinator history.
 
 ### 6.2 Token / account coordinator
 
@@ -346,7 +349,7 @@ Same pattern, leasing **agent-account capacity** instead of merge slots:
 
 ### 7.1 Agent profile model
 
-A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capabilities, resourceLimits, auth }`. A **provider adapter** translates the profile into the concrete invocation:
+A declarative spec: `{ provider, model, effort, tools/mcp, promptTemplates, capabilities, resourceLimits }`. A **provider adapter** translates the profile into the concrete invocation:
 
 - **Claude** → Claude Agent SDK (same harness as Claude Code; session resume/fork; hooks; MCP).
 - **Codex** → Codex app-server / SDK (structured items/turns/threads; approvals pause a turn; resumable threads).
@@ -359,14 +362,18 @@ Kimi Code and Grok Build's native harnesses are not admitted while their ACP
 servers lack stable `session/fork` parity. Kimi and xAI remain model-provider
 namespaces and are available through OpenCode using API keys.
 
-`provider` names the **coding harness**. `modelProvider` optionally names the
-credential namespace (`kimi`, `google`, `xai`, `openai`, …); for OpenCode it is
-normally inferred from the `provider/model` model id. This separation lets the
-same OpenCode harness run Kimi, Gemini, Grok, Anthropic, OpenAI, OpenRouter, or
-another supported backend without pretending the model vendor is the harness.
+`provider` names the **coding harness**. Model credentials remain ordinary
+entries in the general Credentials policy, with the same organization → project
+→ task enablement and precedence as every other login/key. For OpenCode, a
+recognized `provider/model` model id narrows that ordered pool to compatible API
+keys; an unprefixed or custom model id uses the highest-priority compatible
+credential. The credential actually leased supplies the runtime model-provider
+namespace. There is no separate user-editable credential-provider knob that can
+contradict the Credentials policy.
 
-`auth` references an **auth source**: either a subscription **config home** or an
-API-key **credential handle** (§8). Never a raw key inline.
+Authentication is resolved separately through the scoped Credentials policy:
+either a leased subscription **config home** or an API-key **credential handle**
+(§8). Agent profiles never carry raw keys or their own credential allow-list.
 
 ### 7.2 The per-turn execution model
 
@@ -568,10 +575,10 @@ that canonical set.
 The `agent` field type is the reusable control for choosing the agent that runs a role — used both in the task form (per-role override) and in the project/global settings (per-role defaults). It collects an **AgentSpec**: `{ provider, model, effort?, resumeFrom? }`.
 
 - **provider** ∈ `claude | codex | opencode` (and `mock` for
-  tests). **modelProvider** optionally selects the model credential namespace.
-  **model** is a harness-scoped list with a free-text escape; OpenCode uses
+  tests). **model** is a harness-scoped list with a free-text escape; OpenCode uses
   `provider/model` ids. **effort** ∈ `low | medium | high | xhigh | max` where
-  the harness/model advertises it.
+  the harness/model advertises it. Credential enablement and precedence come
+  only from the task/project/organization Credentials policy (§7.1).
 - **resumeFrom** continues a prior agent session: either a **task search** picker (find a previous task; resume its stored session for that role) or a directly-entered **conversation/session id**. The chosen session is passed to `runAgentTurn` as the initial session (§7.2), so the agent continues with its prior context (forking, not mutating, the source).
 
 The AgentSpec resolved per role flows into the workflow as `input.agents[role]`; `runAgentTurn` builds the effective agent profile from it (overriding the stored profile's provider/model/effort) and applies the resume session on the first turn. This keeps the agent's declarative profile model (§7.1) intact — the field is just the UI for assembling per-use overrides.

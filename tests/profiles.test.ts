@@ -91,13 +91,24 @@ describe('profile + account management (Global settings backend)', () => {
     expect(res.status).toBe(400);
   });
 
-  it('stores per-agent allowedAccounts (the checkbox pool; 1d)', async () => {
+  it('ignores retired per-profile credential routing fields', async () => {
     const saved = await fetch(`${base}/api/profiles`, {
       method: 'PUT',
       headers: auth(),
-      body: JSON.stringify({ id: 'merge-default', role: 'merge', name: 'Merge agent', provider: 'claude', capabilities: [], allowedAccounts: ['login:claude:work'] }),
+      body: JSON.stringify({
+        id: 'merge-default',
+        role: 'merge',
+        name: 'Merge agent',
+        provider: 'claude',
+        capabilities: [],
+        modelProvider: 'anthropic',
+        allowedAccounts: ['login:claude:work'],
+        auth: { kind: 'configHome', configHome: '/tmp/legacy' },
+      }),
     }).then(J);
-    expect(saved.allowedAccounts).toEqual(['login:claude:work']);
+    expect(saved.modelProvider).toBeUndefined();
+    expect(saved.allowedAccounts).toBeUndefined();
+    expect(saved.auth).toBeUndefined();
   });
 
   it('supports project-scoped profile overrides that fall back to global (1e)', async () => {

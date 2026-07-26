@@ -20,7 +20,11 @@ export function buildActivities(deps: ActivityDeps = {}) {
     Object.assign(activities, makeCoreActivities(deps as CoreActivityDeps));
   }
   if (deps.client && deps.taskQueue) {
-    Object.assign(activities, makeCoordinatorActivities({ client: deps.client, taskQueue: deps.taskQueue }));
+    Object.assign(activities, makeCoordinatorActivities({
+      client: deps.client,
+      taskQueue: deps.taskQueue,
+      ...(deps.store ? { store: deps.store } : {}),
+    }));
   }
   return activities;
 }
