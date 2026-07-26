@@ -2328,12 +2328,11 @@ function seriesRow(t) {
 function runSubRow(r) {
   const v = r.lastView || {};
   const status = v.status || 'active';
-  const stage = v.stage || 'setup';
   return `
     <div class="task-row run-row" data-id="${r.id}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
-        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stage)}</span></div>
+        <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span></div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
       </div>
       <div class="task-right">${pipeline(v)}</div>
@@ -2406,12 +2405,13 @@ function customBranch(v, taskId) {
   return v.branch && v.branch !== `karmax/${taskId}`;
 }
 
-// Human-facing stage label. In the `merge` stage a task is either waiting for
-// its merge-queue slot or actively merging — the merge agent only runs once the
-// slot is granted (SPEC §6.1), so `mergeGranted` distinguishes the two. Surface
-// "merge queued" for the wait, which the raw `stage` alone hides.
+// Human-facing task-state label. A wait reason is more useful than the pipeline
+// position while a task is parked: the pipeline already shows that it is in Do,
+// Review, etc. In the `merge` stage, old/in-flight views may not have waitingFor,
+// so retain the mergeGranted fallback for their merge-queue wait (SPEC §6.1).
 function stageLabel(v) {
   if (v.state?.draft) return 'draft';
+  if (v.waitingFor) return waitingText(v.waitingFor);
   const stage = v.stage || 'setup';
   if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
   return stage;
@@ -3604,7 +3604,7 @@ async function renderSeriesPage(rec) {
 function runPageRow(r) {
   const v = r.lastView || {};
   const status = v.status || 'active';
-  return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(v.stage || 'setup')}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
+  return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(stageLabel(v))}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
 // One compact selectable row per execution. The list remains one row per intent;
@@ -4605,7 +4605,7 @@ function overviewTab(v) {
     : '';
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
   const waiting = v.waitingFor
-    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ Waiting for ${esc(waitingLabel(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(v.agentTurn.role)} agent · ${v.agentTurn.state === 'running' ? 'running' : 'waiting for a host slot'}${v.agentTurn.provider ? ` · ${esc(v.agentTurn.provider)}` : ''}</div>`
@@ -5134,6 +5134,10 @@ function renderDiff(d) {
 }
 
 // Human label for a "waiting for" indicator (SPEC §6.2).
+function waitingProviderLabel(provider) {
+  return { claude: 'Claude', codex: 'Codex', opencode: 'OpenCode' }[provider] || provider || 'compatible';
+}
+
 function waitingLabel(w) {
   if (!w) return '';
   switch (w.kind) {
@@ -5141,9 +5145,9 @@ function waitingLabel(w) {
     // wait also covers plain lease contention (another task holds the login) and
     // grant latency, where asserting a quota cause sends the user to check a
     // dashboard that rightly shows nothing wrong.
-    case 'account': return `a ${w.provider || 'compatible'} login${w.earliestResetAt ? ' (quota refresh)' : ' to become available'}`;
+    case 'account': return `a ${waitingProviderLabel(w.provider)} login${w.earliestResetAt ? ' (quota refresh)' : ' to become available'}`;
     case 'agentSlot': return w.detail || 'a host agent slot';
-    case 'mergeSlot': return 'a merge slot';
+    case 'mergeSlot': return w.detail || 'a merge slot';
     case 'human': return w.detail ? `human input (${w.detail})` : 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
     case 'collaboration': return w.detail || 'another task agent';
@@ -5153,6 +5157,16 @@ function waitingLabel(w) {
     case 'confirm': return w.detail ? `the confirm agent to review (${w.detail})` : 'the confirm agent to review';
     default: return w.detail || w.kind;
   }
+}
+
+// Complete sentence fragment used by compact chips and the task-page wait card.
+// Some workflow details are already phrased as "Waiting for/to …"; most waiting
+// labels are noun phrases. Normalize both without producing "Waiting for Waiting
+// for …" for agent-slot and collaboration waits.
+function waitingText(w) {
+  const label = waitingLabel(w);
+  if (/^waiting\s+(?:for|to)\b/i.test(label)) return label.replace(/^waiting/i, 'Waiting');
+  return `Waiting for ${label}`;
 }
 
 // A CLI command to FORK this agent's session into the user's terminal — a branched

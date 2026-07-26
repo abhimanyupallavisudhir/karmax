@@ -578,10 +578,12 @@ describe('existing project wiki remote backfill', () => {
       accountType: 'Organization',
     });
     const actors: string[] = [];
+    const inputs: Array<{ name: string; private?: boolean }> = [];
     const githubApp = {
       status: (userId?: string) => ({ userAuthorized: userId === 'owner' }),
-      async createRepository(_connectionId: string, userId: string, input: { name: string }) {
+      async ensureRepository(_connectionId: string, userId: string, input: { name: string; private?: boolean }) {
         actors.push(userId);
+        inputs.push(input);
         execFileSync('git', ['init', '-q', '--bare', path.join(remotes, `${input.name}.git`)]);
         return store.upsertRepository({
           organizationId: organization.id,
@@ -610,6 +612,7 @@ describe('existing project wiki remote backfill', () => {
       const listening = await gateway.listen(49_000);
       await listening.close();
       expect(actors).toEqual(['owner']);
+      expect(inputs).toMatchObject([{ private: true }]);
       const linked = store.projectWiki(project.id)?.repository;
       expect(linked).toMatchObject({ private: true, gitConnectionId: connection.id });
       expect(execFileSync('git', ['--git-dir', path.join(remotes, `${linked!.name}.git`),

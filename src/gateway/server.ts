@@ -3347,13 +3347,13 @@ export class Gateway {
     if (!connection) return;
     try {
       const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
-      const name = `${base}-wiki-${project.id.slice(-8)}`;
-      const repository = current ?? this.deps.store.listRepositories(organizationId)
-        .find((candidate) => candidate.gitConnectionId === connection.id && candidate.name === name)
-        ?? await this.deps.githubApp.createRepository(connection.id, actor, {
-          name, description: `Karmax project wiki for ${project.name}`,
-          private: true, defaultBranch: 'main', autoInit: false,
-        });
+      // Preserve the remote identity across project renames. The deterministic
+      // name is only for the first provisioning attempt.
+      const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
+      const repository = await this.deps.githubApp.ensureRepository(connection.id, actor, {
+        name, description: `Karmax project wiki for ${project.name}`,
+        private: true, defaultBranch: 'main', autoInit: false,
+      });
       // Link before the push so even a transient network failure keeps this
       // platform-owned repository out of the ordinary project repo picker.
       this.deps.store.setProjectWikiRepository(project.id, repository.id);

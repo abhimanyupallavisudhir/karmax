@@ -297,9 +297,7 @@ export class GitHubAppService {
   }): Promise<Repository> {
     const connection = this.store.getGitConnection(connectionId);
     if (!connection) throw new Error('GitHub connection not found');
-    const name = input.name.trim();
-    if (!name || name.length > 100 || !/^[A-Za-z0-9._-]+$/.test(name))
-      throw new Error('repository name may contain letters, numbers, dots, dashes, and underscores');
+    const name = this.repositoryName(input.name);
     const userToken = await this.userToken(userId);
     const pathname = connection.accountType === 'Organization'
       ? `/orgs/${encodeURIComponent(connection.accountLogin)}/repos`
@@ -308,16 +306,73 @@ export class GitHubAppService {
       method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
         private: input.private !== false, auto_init: input.autoInit !== false }),
     });
+    return this.enrollRepository(connection, userToken, created, input.defaultBranch);
+  }
+
+  /** Idempotently provision a platform-owned repository. A previous attempt can
+   * succeed at GitHub and then be interrupted before the durable record or
+   * deploy keys are saved; retrying must adopt that exact private repository
+   * instead of repeatedly failing with GitHub's "name already exists" 422. */
+  async ensureRepository(connectionId: string, userId: string, input: {
+    name: string; description?: string; private?: boolean; defaultBranch?: string; autoInit?: boolean;
+  }): Promise<Repository> {
+    const connection = this.store.getGitConnection(connectionId);
+    if (!connection) throw new Error('GitHub connection not found');
+    const name = this.repositoryName(input.name);
+    const userToken = await this.userToken(userId);
+    let repository: GitHubRepositoryPayload;
+    try {
+      repository = await this.request<GitHubRepositoryPayload>(
+        `/repos/${encodeURIComponent(connection.accountLogin)}/${encodeURIComponent(name)}`, userToken,
+      );
+      if (repository.archived) throw new Error(`existing GitHub repository ${connection.accountLogin}/${name} is archived`);
+      if (input.private !== false && !repository.private)
+        throw new Error(`existing GitHub repository ${connection.accountLogin}/${name} must be private`);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('GitHub API 404')) throw error;
+      const pathname = connection.accountType === 'Organization'
+        ? `/orgs/${encodeURIComponent(connection.accountLogin)}/repos`
+        : '/user/repos';
+      repository = await this.request<GitHubRepositoryPayload>(pathname, userToken, {
+        method: 'POST', body: JSON.stringify({ name, description: input.description?.trim().slice(0, 350) || undefined,
+          private: input.private !== false, auto_init: input.autoInit !== false }),
+      });
+    }
+    return this.enrollRepository(connection, userToken, repository, input.defaultBranch);
+  }
+
+  private repositoryName(input: string): string {
+    const name = input.trim();
+    if (!name || name.length > 100 || !/^[A-Za-z0-9._-]+$/.test(name))
+      throw new Error('repository name may contain letters, numbers, dots, dashes, and underscores');
+    return name;
+  }
+
+  private async enrollRepository(connection: GitConnection, userToken: string,
+    created: GitHubRepositoryPayload, defaultBranch?: string): Promise<Repository> {
     // Installation may have been limited to selected repositories. User
-    // authorization lets Karmax enroll the new repository without sending the
-    // operator back through GitHub settings.
-    await this.request(`/user/installations/${encodeURIComponent(connection.installationId)}/repositories/${encodeURIComponent(String(created.id))}`,
-      userToken, { method: 'PUT' });
+    // authorization lets Karmax enroll the repository without sending the
+    // operator back through GitHub settings. The PUT is idempotent for selected
+    // installations; installations covering every repository may reject it,
+    // but their installation token can already see the repository.
+    try {
+      await this.request(`/user/installations/${encodeURIComponent(connection.installationId)}/repositories/${encodeURIComponent(String(created.id))}`,
+        userToken, { method: 'PUT' });
+    } catch (error) {
+      this.tokenCache.delete(connection.id);
+      const installationToken = await this.installationToken(connection);
+      try {
+        await this.request(`/repos/${encodeURIComponent(created.owner.login)}/${encodeURIComponent(created.name)}`,
+          installationToken);
+      } catch {
+        throw error;
+      }
+    }
     this.tokenCache.delete(connection.id);
     const installationToken = await this.installationToken(connection);
     const repository = this.store.upsertRepository({ organizationId: connection.organizationId, provider: 'github',
       providerId: String(created.id), owner: created.owner.login, name: created.name, sshUrl: created.ssh_url,
-      defaultBranch: input.defaultBranch?.trim() || created.default_branch || 'main', private: created.private,
+      defaultBranch: defaultBranch?.trim() || created.default_branch || 'main', private: created.private,
       gitConnectionId: connection.id });
     await this.ensureDeployKeys(repository, installationToken);
     return repository;

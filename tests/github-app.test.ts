@@ -76,6 +76,63 @@ describe('GitHub App integration', () => {
     store.close(); fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('adopts an existing private repository after interrupted provisioning', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-adopt-'));
+    const store = new Store(':memory:');
+    const broker = new CredentialBroker(new Vault(dir));
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
+    broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey);
+    broker.registerHandle('github-app:user:owner:authorization', JSON.stringify({ accessToken: 'user-token' }));
+    const organization = store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+    const connection = store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' });
+    let keyId = 700;
+    const calls: Array<{ path: string; method: string }> = [];
+    const payload = { id: 77, name: 'project-wiki', private: true,
+      ssh_url: 'git@github.com:acme/project-wiki.git', default_branch: 'main', owner: { login: 'acme' } };
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      calls.push({ path: url.pathname, method: init.method ?? 'GET' });
+      if (url.pathname === '/repos/acme/project-wiki' && init.method !== 'POST') return Response.json(payload);
+      if (url.pathname === '/repos/acme/public-wiki' && init.method !== 'POST')
+        return Response.json({ ...payload, id: 78, name: 'public-wiki', private: false,
+          ssh_url: 'git@github.com:acme/public-wiki.git' });
+      if (url.pathname === '/orgs/acme/repos' && init.method === 'POST')
+        return Response.json({ ...payload, id: 79, name: 'all-repos-wiki',
+          ssh_url: 'git@github.com:acme/all-repos-wiki.git' });
+      if (url.pathname === '/repos/acme/all-repos-wiki' && init.method !== 'POST')
+        return Response.json({ ...payload, id: 79, name: 'all-repos-wiki',
+          ssh_url: 'git@github.com:acme/all-repos-wiki.git' });
+      if (url.pathname === '/user/installations/42/repositories/77' && init.method === 'PUT')
+        return new Response(null, { status: 204 });
+      if (url.pathname === '/user/installations/42/repositories/79' && init.method === 'PUT')
+        return new Response('installation has access to all repositories', { status: 422 });
+      if (url.pathname === '/app/installations/42/access_tokens')
+        return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/repos/acme/project-wiki/keys' && init.method === 'POST')
+        return Response.json({ id: ++keyId });
+      if (url.pathname === '/repos/acme/all-repos-wiki/keys' && init.method === 'POST')
+        return Response.json({ id: ++keyId });
+      return new Response('not found', { status: 404 });
+    };
+    const service = new GitHubAppService(store, broker, { appId: '123', fetch: fakeFetch as typeof fetch,
+      keyPair: async () => ({ privateKey: `PRIVATE-${keyId}`, publicKey: `ssh-ed25519 PUBLIC-${keyId}` }) });
+
+    const repository = await service.ensureRepository(connection.id, 'owner',
+      { name: 'project-wiki', private: true, autoInit: false });
+    expect(repository).toMatchObject({ providerId: '77', name: 'project-wiki', private: true });
+    expect(store.repositoryDeployKeys(repository.id)).toBeTruthy();
+    expect(calls.some((call) => call.path === '/orgs/acme/repos' && call.method === 'POST')).toBe(false);
+    expect(calls).toContainEqual({ path: '/user/installations/42/repositories/77', method: 'PUT' });
+    await expect(service.ensureRepository(connection.id, 'owner',
+      { name: 'public-wiki', private: true })).rejects.toThrow('must be private');
+    await expect(service.createRepository(connection.id, 'owner',
+      { name: 'all-repos-wiki', private: true })).resolves.toMatchObject({ providerId: '79' });
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('imports installation repositories, creates separate clone/write deploy keys, verifies webhooks, and cleans up removal', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-app-'));
     const store = new Store(':memory:');
