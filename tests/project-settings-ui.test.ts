@@ -31,18 +31,36 @@ describe('Project settings browser source', () => {
     expect(settings).not.toContain('<a href="#project-data">Data</a>');
     for (const id of ['project-git', 'project-secrets', 'project-data', 'project-services', 'project-environment'])
       expect(settings).toContain(`id="${id}"`);
-    expect(settings).toContain('Agent-manageable by design');
+    expect(settings).not.toContain('Agent-manageable by design');
   });
 
   it('explains data locations and the Data/Service/S3 boundary', () => {
     const data = source.slice(source.indexOf('async function hydrateProjectData('), source.indexOf('async function hydrateProjectServices('));
     const services = source.slice(source.indexOf('async function hydrateProjectServices('), source.indexOf('async function hydrateProjectEnvironment('));
     expect(data).toContain('Data or Service?');
-    expect(data).toContain('Available to tasks at');
-    expect(data).toContain('Import from this Karmax machine');
+    expect(data).toContain('Mount at path <small>(repo-relative)</small>');
+    expect(data).toContain('Import from local path');
     expect(data).toContain('formatBytes(proposal.bytes)');
     expect(services).toContain('S3 bucket');
     expect(services).toContain('external service');
+  });
+
+  it('keeps forms concise and offers optional base-image suggestions', () => {
+    for (const removed of [
+      'The repositories this project works on, and the identity it commits with.',
+      'Sensitive values injected only when a task needs them. Values are never shown again.',
+      'No versioned data yet.',
+      'A human-readable name in Project settings.',
+      'The destination path inside every task world',
+      'Expensive installation commands baked into a reusable build',
+      'No build yet.',
+    ]) expect(source).not.toContain(removed);
+    expect(source).toContain('Local repo, GitHub, or Git URL');
+    expect(source).toContain('Base image <small>(optional)</small>');
+    expect(source).toContain('list="environment-image-options"');
+    expect(source).toContain('python:3.13-slim');
+    expect(source).toContain('uv sync');
+    expect(source).toContain('uv run python manage.py migrate');
   });
 
   it('resets the actual scroll container when switching settings panes', () => {

@@ -58,6 +58,7 @@ describe('project environment proposals and builds', () => {
     expect(bootCommands({ includeDocker: true })[0]).toContain('dockerd');
 
     const calls: string[] = [];
+    let builderBase: string | undefined;
     let killed = false;
     const builder: BuilderSandbox = {
       async run(command) { calls.push(command); return { exitCode: 0, stderr: '', stdout: '' }; },
@@ -65,7 +66,9 @@ describe('project environment proposals and builds', () => {
       async kill() { killed = true; },
     };
     expect(await buildEnvironment({ provider: 'e2b', projectId: 'p', digest: 'd',
-      spec: { setup: ['npm ci'] }, createBuilderSandbox: async () => builder })).toEqual({ ref: 'snapshot-1' });
+      spec: { image: 'node:22-slim', setup: ['npm ci'] }, connection: { template: 'compute-template' },
+      createBuilderSandbox: async (base) => { builderBase = base; return builder; } })).toEqual({ ref: 'snapshot-1' });
+    expect(builderBase).toBe('compute-template');
     expect(calls).toContain('npm ci');
     expect(killed).toBe(true);
   });

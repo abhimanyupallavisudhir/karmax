@@ -16,7 +16,7 @@ export interface EnvironmentBuildInput {
   projectId: string;
   digest: string;
   spec: ProjectEnvironmentSpec;
-  connection?: { apiKey?: string; apiUrl?: string; target?: string };
+  connection?: { apiKey?: string; apiUrl?: string; target?: string; template?: string };
   createBuilderSandbox?: (base: string | undefined, options: { apiKey?: string }) => Promise<BuilderSandbox>;
 }
 export interface BuilderSandbox {
@@ -76,7 +76,9 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
       async kill() { await sandbox.kill().catch(() => undefined); },
     } satisfies BuilderSandbox;
   });
-  const builder = await create(input.spec.image,
+  // ProjectEnvironmentSpec.image is an OCI base for container/Daytona builds.
+  // E2B launches from its provider-native template configured under Compute.
+  const builder = await create(input.connection?.template,
     { ...(input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {}) });
   try {
     for (const command of setupCommands(input.spec)) {

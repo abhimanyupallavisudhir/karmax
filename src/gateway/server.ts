@@ -1537,7 +1537,8 @@ export class Gateway {
             const { buildEnvironment } = await import('../world/environment-build.js');
             void buildEnvironment({ provider, projectId: project.id, digest, spec,
               ...(connection ? { connection: { apiKey: connection.apiKey,
-                apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target } } : {}) })
+                apiUrl: (connection.config as any)?.apiUrl, target: (connection.config as any)?.target,
+                template: (connection.config as any)?.template } } : {}) })
               .then((result) => environments.recordBuild(project.id,
                 { provider, digest, ref: result.ref, status: 'ready' }))
               .catch((error) => environments.recordBuild(project.id,
