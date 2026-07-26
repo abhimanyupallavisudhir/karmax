@@ -179,4 +179,82 @@ describe('finalizeMerge (work must actually land)', () => {
     expect(onMain.stdout).not.toContain('<<<<<<<');
     await world.destroy();
   });
+
+  it('skips an unchanged project wiki when its canonical checkout is dirty', async () => {
+    const wiki = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-'));
+    await gitOrThrow(wiki, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(wiki);
+    fs.writeFileSync(path.join(wiki, 'MEMORY.md'), 'canonical memory\n');
+    await git(wiki, ['add', '-A']);
+    await git(wiki, ['commit', '-q', '-m', 'init wiki']);
+
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({
+      taskId: 'wiki-noop',
+      repos: [repo, wiki],
+      base: 'main',
+      target: 'main',
+      repositoryBranches: {
+        [repo]: { base: 'main', target: 'main' },
+        [wiki]: { base: 'main', target: 'main' },
+      },
+    });
+    const source = world.handle.repos!.find((candidate) => candidate.repo === repo)!;
+    const companion = world.handle.repos!.find((candidate) => candidate.repo === wiki)!;
+    companion.role = 'project-wiki';
+
+    try {
+      fs.writeFileSync(path.join(source.root, 'feature.js'), 'export const feature = true;\n');
+      await git(source.root, ['add', '-A']);
+      await git(source.root, ['commit', '-q', '-m', 'source work']);
+
+      // This is unrelated canonical wiki work. It must remain untouched, and an
+      // unchanged task wiki branch must not prevent the source repo from landing.
+      fs.writeFileSync(path.join(wiki, 'MEMORY.md'), 'uncommitted canonical edit\n');
+      const result = await finalizeMerge(world, 'main');
+
+      expect(result.merged).toBe(true);
+      expect((await git(repo, ['show', 'main:feature.js'])).stdout).toContain('feature');
+      expect(fs.readFileSync(path.join(wiki, 'MEMORY.md'), 'utf8')).toBe('uncommitted canonical edit\n');
+      expect((await git(wiki, ['status', '--porcelain'])).stdout).toContain('MEMORY.md');
+    } finally {
+      await world.destroy();
+      fs.rmSync(wiki, { recursive: true, force: true });
+    }
+  });
+
+  it('still blocks a changed project wiki on a dirty canonical checkout and labels it clearly', async () => {
+    const wiki = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-'));
+    await gitOrThrow(wiki, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(wiki);
+    fs.writeFileSync(path.join(wiki, 'MEMORY.md'), 'canonical memory\n');
+    await git(wiki, ['add', '-A']);
+    await git(wiki, ['commit', '-q', '-m', 'init wiki']);
+
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({
+      taskId: 'wiki-changed',
+      repos: [repo, wiki],
+      base: 'main',
+      target: 'main',
+    });
+    const companion = world.handle.repos!.find((candidate) => candidate.repo === wiki)!;
+    companion.role = 'project-wiki';
+
+    try {
+      fs.writeFileSync(path.join(companion.root, 'task-memory.md'), 'task wiki edit\n');
+      await git(companion.root, ['add', '-A']);
+      await git(companion.root, ['commit', '-q', '-m', 'task wiki work']);
+      fs.writeFileSync(path.join(wiki, 'MEMORY.md'), 'uncommitted canonical edit\n');
+
+      const result = await finalizeMerge(world, 'main');
+
+      expect(result.merged).toBe(false);
+      expect(result.note).toMatch(/^project wiki ".+": target "main" worktree has uncommitted changes/);
+      expect((await git(wiki, ['show', 'main:task-memory.md'])).code).not.toBe(0);
+    } finally {
+      await world.destroy();
+      fs.rmSync(wiki, { recursive: true, force: true });
+    }
+  });
 });
