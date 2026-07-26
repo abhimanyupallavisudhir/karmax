@@ -917,7 +917,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
             const extraEnv = { ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
-            return Object.keys(extraEnv).length ? { extraEnv } : {};
+            // Values are resolved from resource leases and broker handles only
+            // now, at the activity/subprocess boundary. Keep them separate so a
+            // remote adapter can explicitly allowlist only these names.
+            const secretEnv = deps.resources?.environmentFor(world.handle) ?? {};
+            return {
+              ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
+              ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
+            };
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),

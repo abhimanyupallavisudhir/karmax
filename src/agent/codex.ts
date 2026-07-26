@@ -228,11 +228,12 @@ export class CodexAdapter implements AgentAdapter {
     // its sandbox-local rollout metadata before a true native resume/fork.
     if (remoteHome && input.session)
       await ensureRemoteCodexSessionTools(input.world, remoteHome, input.session, dynamicTools);
-    let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome, ...(input.extraEnv ? { extra: input.extraEnv } : {}) });
+    let env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
+      extra: { ...(input.secretEnv ?? {}), ...(input.extraEnv ?? {}) } });
     if (remoteHome) env = remoteAgentEnv('codex', remoteHome.absolute, {
       ...env,
       KARMAX_GATEWAY_URL: process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
-    });
+    }, Object.keys(input.secretEnv ?? {}));
     if (remoteHome?.runtimeBin) env.PATH = `${remoteHome.runtimeBin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Detached ⇒ its own process group, so killAgent(-pid) reaps codex's descendants.
@@ -631,7 +632,8 @@ export class CodexAdapter implements AgentAdapter {
     const cwd = input.world.handle.root;
     // CODEX_HOME = the leased config home (its auth.json holds the subscription
     // login). scrubbedEnv also strips OPENAI_API_KEY so a stray key can't shadow it.
-    const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome, ...(input.extraEnv ? { extra: input.extraEnv } : {}) });
+    const env = scrubbedEnv({ provider: 'codex', configHome: input.resolvedAuth?.configHome,
+      extra: { ...(input.secretEnv ?? {}), ...(input.extraEnv ?? {}) } });
 
     const resuming = !!input.session;
     // The messages to actually send: the whole conversation on a fresh thread, only

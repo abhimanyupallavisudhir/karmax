@@ -268,6 +268,10 @@ promotion may commit; otherwise a partial publish is explicit and retryable.
 - `shared + write` requires a dedicated capability and an explicit task grant.
 - Secret projections live outside checkpointed paths and are erased/revoked on
   park, checkpoint, cancellation, generation change, and release.
+- Environment-shaped secrets and leased service endpoints are resolved at each
+  turn boundary and injected into the agent subprocess as well as world execution.
+  Remote agents receive only the names resolved from that task's active leases;
+  provider homes and scoped control-plane credentials cannot be shadowed.
 - File-shaped secret projections are also added to the private exclude file for
   that Git worktree, so an agent cannot accidentally stage one; the exclusion
   must not affect sibling worlds or the user's checkout.
@@ -302,7 +306,9 @@ The explicit **Migrate** action implements that exit ramp without a legacy objec
 or secret registry. `.env` values become write-only `secret@1` environment
 attachments, small text files become file-shaped `secret@1` attachments, and
 binary/large files become encrypted file-shaped `volume@1` revisions projected
-at their former world paths. The operation clears `copyGlobs` only after every
+at their former world paths. Classification reads at most the small-secret limit
+plus one byte; anything larger streams into the snapshot engine instead of being
+buffered in the control plane. The operation clears `copyGlobs` only after every
 created attachment and revision succeeds, and rolls back partial creations on
 failure.
 

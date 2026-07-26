@@ -23,6 +23,7 @@ import { managedRepoPath } from './worktree.js';
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const WORLD_READ_BYTES = 16 * 1024 * 1024;
 const RESOURCE_KEY_PREFIX = 'resource-store:key:';
+const COPY_GLOB_SECRET_BYTES = 64 * 1024;
 
 interface SnapshotFile { path: string; bytes: number; sha256: string; chunks: string[] }
 interface SnapshotManifest { version: 1; attachmentId: string; files: SnapshotFile[]; rootDigest: string; bytes: number }
@@ -232,25 +233,32 @@ export class ProjectResourceService {
 
   /** Resolve environment/service projections each time a world is opened. Raw
    * values live only in this wrapper and disappear with the activity. */
-  withEnvironment(world: World): World {
+  environmentFor(handle: WorldHandle): Record<string, string> {
     const env: Record<string, string> = {};
-    const serviceHandles = world.handle.meta?.serviceEnvironmentHandles;
+    const serviceHandles = handle.meta?.serviceEnvironmentHandles;
     if (serviceHandles && typeof serviceHandles === 'object') {
-      for (const [name, handle] of Object.entries(serviceHandles as Record<string, unknown>)) {
-        if (typeof handle !== 'string') continue;
-        env[name] = this.broker.resolve(handle, {
-          taskId: world.handle.id,
-          caps: [`use-credential:${handle}`],
+      for (const [name, secretHandle] of Object.entries(serviceHandles as Record<string, unknown>)) {
+        if (typeof secretHandle !== 'string') continue;
+        env[name] = this.broker.resolve(secretHandle, {
+          taskId: handle.id,
+          caps: [`use-credential:${secretHandle}`],
         });
       }
     }
-    for (const lease of this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1)) {
+    for (const lease of this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
       if (lease.state !== 'active') continue;
       const attachment = this.store.getResourceAttachment(lease.attachmentId);
       if (!attachment || !isSecretLike(attachment)) continue;
       if (attachment.target.kind === 'environment' || attachment.target.kind === 'service')
         env[attachment.target.name] = this.resolveSecret(attachment, lease.taskId);
     }
+    return env;
+  }
+
+  /** Resolve environment/service projections each time a world is opened. Raw
+   * values live only in this wrapper and disappear with the activity. */
+  withEnvironment(world: World): World {
+    const env = this.environmentFor(world.handle);
     return Object.keys(env).length ? new EnvironmentWorld(world, env) : world;
   }
 
@@ -356,15 +364,15 @@ export class ProjectResourceService {
             if (!entry.isFile() || !pattern.test(entry.name) || seen.has(entry.name)) continue;
             seen.add(entry.name);
             const absolute = path.join(root, entry.name);
-            let data: Buffer;
-            try { data = fs.readFileSync(absolute); }
+            let data: Buffer | undefined;
+            try { data = await readSmallFile(absolute, COPY_GLOB_SECRET_BYTES); }
             catch (error) {
               throw new Error(`could not read copyGlobs match "${source}:${entry.name}": ${
                 error instanceof Error ? error.message : String(error)}`);
             }
             const target = sources.length > 1 ? `${repoNames[index]}/${entry.name}` : entry.name;
             const sourceRecord = { migratedFrom: 'copyGlobs', repository: source, path: entry.name };
-            const env = /^\.env(?:\.|$)/i.test(entry.name) ? parseCopyEnv(data.toString('utf8')) : [];
+            const env = data && /^\.env(?:\.|$)/i.test(entry.name) ? parseCopyEnv(data.toString('utf8')) : [];
             if (env.length) {
               for (const value of env) {
                 const existing = this.store.listResourceAttachments(project.id, true).find((attachment) =>
@@ -386,7 +394,7 @@ export class ProjectResourceService {
             const existing = this.store.listResourceAttachments(project.id, true).find((attachment) =>
               attachment.target.kind === 'path' && attachment.target.path === target);
             if (existing) { result.reused.push(target); continue; }
-            if (!data.includes(0) && data.length <= 64 * 1024) {
+            if (data && !data.includes(0)) {
               const id = newId('resource'), handle = `resource:${id}:credential`;
               this.broker.registerHandle(handle, data.toString('utf8'));
               try {
@@ -402,8 +410,10 @@ export class ProjectResourceService {
                 target: { kind: 'path', path: target }, access: 'read', isolation: 'fork',
                 source: { ...sourceRecord, shape: 'file' }, credentialHandles: [], publish: 'discard' });
               created.push(attachment.id);
+              const stat = await fs.promises.stat(absolute);
               await this.importFiles(attachment.id,
-                [{ path: entry.name, data, bytes: data.length }]);
+                [{ path: entry.name, data: data ?? fs.createReadStream(absolute) as AsyncIterable<Buffer>,
+                  bytes: stat.size }]);
               result.data.push(target);
             }
           }
@@ -605,6 +615,25 @@ async function* walkDirectory(root: string): AsyncGenerator<SnapshotInputFile> {
     }
   };
   yield* visit(root);
+}
+
+/** Read only files small enough to become credential-backed resources. The
+ * extra byte closes the stat/read race: a file that grows while migration runs
+ * is classified as a streamed snapshot instead of being buffered without bound. */
+async function readSmallFile(file: string, maximumBytes: number): Promise<Buffer | undefined> {
+  const handle = await fs.promises.open(file, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(maximumBytes + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    return offset > maximumBytes ? undefined : buffer.subarray(0, offset);
+  } finally {
+    await handle.close();
+  }
 }
 
 async function* filesFromWorld(world: World, target: string, attachment?: ResourceAttachment): AsyncGenerator<SnapshotInputFile> {

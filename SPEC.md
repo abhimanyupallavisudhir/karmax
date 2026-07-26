@@ -665,9 +665,13 @@ not retroactively called a merge.
 Only attachment ids, immutable revision ids, and non-secret lease ids may enter
 workflow history and world handles. Raw secret values, signed object URLs, live
 database URLs, and provider tokens are resolved just in time by activities and
-placed on a non-checkpointed injection surface. Checkpoint restore always mints
-new leases. Resource drivers own idempotent prepare/materialize/diff/publish/release
-hooks, quiescing requirements, retention, and provider-specific acceleration.
+placed on a non-checkpointed injection surface. Environment-shaped resources
+must reach both world commands and the local or remote agent subprocess itself;
+remote delivery forwards only the explicitly resolved resource names. Control-plane
+tokens and provider-home variables take precedence over resource values. Checkpoint
+restore always mints new leases. Resource drivers own idempotent
+prepare/materialize/diff/publish/release hooks, quiescing requirements, retention,
+and provider-specific acceleration.
 
 The portable filesystem resource is an encrypted content-addressed snapshot.
 Karmax owns the resource-revision envelope, policy, identity, and lease semantics;
@@ -708,7 +712,9 @@ and never becomes a resource revision.
 `copyGlobs` is a deprecated, self-hosted compatibility/import adapter. Historical
 projects remain readable, but new hosted projects use vault injection and resource
 revisions. A copied ignored file is task-private and non-publishable; it is never
-the hosted transport or a checkpointed source of project state. See
+the hosted transport or a checkpointed source of project state. Migration reads
+only a bounded prefix when deciding whether a match is a small secret; larger
+matches stream directly into encrypted snapshot storage. See
 `PLAN-project-resources.md` for the driver contract, built-in drivers, onboarding,
 publication, migration, and delivery order.
 

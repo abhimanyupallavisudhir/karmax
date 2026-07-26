@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -66,5 +66,43 @@ describe('typed copyGlobs migration', () => {
     await resources.deleteProject(project.id);
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('streams oversized matches instead of reading them into control-plane memory for classification', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-copyglobs-stream-'));
+    const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
+    await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
+    fs.writeFileSync(path.join(repo, 'app.txt'), 'tracked\n');
+    await git(repo, ['add', 'app.txt']); await gitOrThrow(repo, ['commit', '-q', '-m', 'base']);
+    const oversized = path.join(repo, '.env.large');
+    fs.writeFileSync(oversized, Buffer.alloc(128 * 1024, 'x'));
+
+    const store = new Store(':memory:');
+    const project = store.createProject('Large legacy state', {
+      repos: [repo], copyGlobs: ['.env.large'], defaultBase: 'main',
+    });
+    const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
+    const resources = new ProjectResourceService(store, new WorldRegistry(),
+      new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
+    const originalRead = fs.readFileSync.bind(fs);
+    const fullRead = vi.spyOn(fs, 'readFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (path.resolve(String(file)) === path.resolve(oversized))
+        throw new Error('migration attempted an unbounded whole-file read');
+      return originalRead(file, ...(args as []));
+    }) as typeof fs.readFileSync);
+    try {
+      const result = await resources.migrateCopyGlobs(project);
+      expect(result.data).toEqual(['.env.large']);
+      expect(result.environmentSecrets).toEqual([]);
+      const attachment = store.listResourceAttachments(project.id)
+        .find((candidate) => candidate.target.kind === 'path' && candidate.target.path === '.env.large')!;
+      expect(store.getResourceRevision(attachment.currentRevisionId!)?.bytes).toBe(128 * 1024);
+      expect(fullRead).not.toHaveBeenCalledWith(oversized);
+    } finally {
+      fullRead.mockRestore();
+      await resources.deleteProject(project.id);
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

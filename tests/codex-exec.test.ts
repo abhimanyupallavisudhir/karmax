@@ -27,6 +27,12 @@ if (process.env.STUB_ARGV_OUT) {
   for (let k = 0; k < argv.length; k++) if (argv[k] === '-i') { const pth = argv[k + 1]; imgs.push({ path: pth, exists: fs.existsSync(pth), size: fs.existsSync(pth) ? fs.statSync(pth).size : 0 }); }
   fs.writeFileSync(process.env.STUB_ARGV_OUT, JSON.stringify({ argv, imgs }));
 }
+if (process.env.STUB_ENV_OUT) {
+  fs.writeFileSync(process.env.STUB_ENV_OUT, JSON.stringify({
+    DATABASE_URL: process.env.DATABASE_URL,
+    KARMAX_TOKEN: process.env.KARMAX_TOKEN,
+  }));
+}
 const mode = process.env.STUB_MODE || 'ok';
 if (mode === 'limit') {
   process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'th_stub' }) + '\\n');
@@ -76,6 +82,7 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     delete process.env.KARMAX_CODEX_EXEC_CMD;
     delete process.env.KARMAX_CODEX_USE_EXEC;
     delete process.env.STUB_MODE;
+    delete process.env.STUB_ENV_OUT;
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
@@ -84,6 +91,23 @@ describe('CodexAdapter subscription path (codex exec)', () => {
     const r = await adapter.runTurn(makeInput() as any, ctx);
     expect(r.output).toContain('FINAL ANSWER');
     expect(r.session).toBe('th_stub');
+  });
+
+  it('injects project secrets into the local Codex subprocess with control env taking precedence', async () => {
+    const output = path.join(dir, 'env.json');
+    process.env.STUB_ENV_OUT = output;
+    try {
+      const input = makeInput() as any;
+      input.secretEnv = { DATABASE_URL: 'postgres://task-db', KARMAX_TOKEN: 'resource-value' };
+      input.extraEnv = { KARMAX_TOKEN: 'scoped-turn-token' };
+      await adapter.runTurn(input, ctx);
+      expect(JSON.parse(fs.readFileSync(output, 'utf8'))).toEqual({
+        DATABASE_URL: 'postgres://task-db',
+        KARMAX_TOKEN: 'scoped-turn-token',
+      });
+    } finally {
+      delete process.env.STUB_ENV_OUT;
+    }
   });
 
   it('throws a usage-limit error carrying the reset on a turn.failed limit event', async () => {
