@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import { CredentialBroker } from './broker.js';
 import { VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
@@ -214,7 +216,10 @@ function itemFieldsFor(type: VaultItemType): VaultFieldName[] {
 
 export class PassConnector implements CredentialConnector {
   readonly name = 'pass';
-  constructor(private exec: Exec = realExec) {}
+  constructor(
+    private exec: Exec = realExec,
+    private storeDir = path.resolve(process.env.PASSWORD_STORE_DIR || path.join(os.homedir(), '.password-store')),
+  ) {}
   async describe(): Promise<ConnectorInfo> {
     try {
       await this.exec('pass', ['ls']);
@@ -224,9 +229,7 @@ export class PassConnector implements CredentialConnector {
     }
   }
   async list(): Promise<ExternalItem[]> {
-    // `pass git ls-files`-free enumeration: the tree is under ~/.password-store.
-    const raw = await this.exec('pass', ['ls']);
-    return parsePassTree(raw).map((entry) => {
+    return (await this.entries()).map((entry) => {
       const slash = entry.lastIndexOf('/');
       return { externalId: entry, type: 'login' as const,
         label: slash >= 0 ? entry.slice(slash + 1) : entry,
@@ -235,8 +238,14 @@ export class PassConnector implements CredentialConnector {
     });
   }
   async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
+    // Treat the store itself as the authority, not ids posted back by the UI.
+    // Besides preventing stale/tampered selections from reaching `pass show`,
+    // this keeps non-GPG files out of the import execution path as well as the
+    // preview.
+    const entries = new Set(await this.entries());
     const out: ExternalSecretItem[] = [];
     for (const id of externalIds) {
+      if (!entries.has(id)) continue;
       let body: string;
       try {
         body = await this.exec('pass', ['show', id]);
@@ -255,6 +264,18 @@ export class PassConnector implements CredentialConnector {
         fields: Object.keys(secrets) as VaultFieldName[], secrets });
     }
     return out;
+  }
+  private async entries(): Promise<string[]> {
+    // `pass ls` cannot be used for enumeration: its `tree` output includes
+    // arbitrary files from the store and merely removes `.gpg` from encrypted
+    // entries. Inspect the filenames instead, so `notes.md` is ignored while a
+    // legitimate password named `notes.md.gpg` is exposed as `notes.md`.
+    const raw = await this.exec('find', [
+      '-L', this.storeDir,
+      '-path', path.join(this.storeDir, '.git'), '-prune',
+      '-o', '-type', 'f', '-name', '*.gpg', '-print0',
+    ]);
+    return parsePassFiles(raw, this.storeDir);
   }
   /**
    * Field-level update that preserves the notes on lines 2+: read the whole
@@ -303,9 +324,6 @@ export class PassConnector implements CredentialConnector {
   }
 }
 
-/** ANSI SGR colour codes `tree` (behind `pass ls`) wraps directory names in. */
-const ANSI = /\x1b\[[0-9;]*m/g;
-
 /** Turn a raw GPG failure into an actionable message (§ the pass-unlock story:
  *  karmax never stores your GPG passphrase; it relies on gpg-agent being
  *  unlocked, which is the self-hosted reality). */
@@ -318,31 +336,16 @@ function gpgHint(e: unknown): string {
   return msg;
 }
 
-/** Turn `tree`-style `pass ls` output into flat store paths. `pass` does not
- *  mark folders, so a node is a leaf iff nothing nests under it (lookahead). */
-export function parsePassTree(raw: string): string[] {
-  const nodes: { depth: number; name: string }[] = [];
-  // `pass ls` shells out to `tree`, which colours directory names with ANSI SGR
-  // codes. Strip them first, or they end up inside the entry path and the later
-  // `pass show <path>` fails with "not in the password store".
-  for (const line of raw.replace(ANSI, '').split('\n')) {
-    if (!line.trim() || /password store/i.test(line)) continue;
-    const connector = line.search(/[├└]── /);
-    if (connector < 0) continue;
-    const depth = connector / 4 + 1; // 4 columns of indentation per level
-    const name = line.slice(connector + 4).trim().replace(/\/$/, '');
-    if (name) nodes.push({ depth, name });
-  }
-  const out: string[] = [];
-  const stack: string[] = [];
-  nodes.forEach((node, i) => {
-    stack[node.depth - 1] = node.name;
-    stack.length = node.depth;
-    const next = nodes[i + 1];
-    const isLeaf = !next || next.depth <= node.depth;
-    if (isLeaf) out.push(stack.join('/'));
+/** Convert NUL-separated `find` results into the ids accepted by `pass show`. */
+export function parsePassFiles(raw: string, storeDir: string): string[] {
+  const root = path.resolve(storeDir);
+  const entries = raw.split('\0').flatMap((file) => {
+    if (!file) return [];
+    const relative = path.relative(root, path.resolve(file));
+    if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || !relative.endsWith('.gpg')) return [];
+    return [relative.slice(0, -'.gpg'.length).split(path.sep).join('/')];
   });
-  return out;
+  return entries.sort();
 }
 
 function hostOf(value?: string): string {

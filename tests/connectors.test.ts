@@ -10,7 +10,7 @@ import {
   BitwardenConnector,
   OnePasswordConnector,
   PassConnector,
-  parsePassTree,
+  parsePassFiles,
   type Exec,
 } from '../src/autonomy/connectors.js';
 
@@ -80,18 +80,23 @@ describe('1Password connector', () => {
 });
 
 describe('pass connector', () => {
-  it('parses the tree into flat store paths', () => {
-    const tree = `Password Store\n├── github.com\n│   └── alice\n└── email.com`;
-    expect(parsePassTree(tree)).toEqual(['github.com/alice', 'email.com']);
-  });
-  it('strips ANSI colour codes that `tree` wraps directory names in', () => {
-    // Real `pass ls` output colourises folders (the bug the user hit).
-    const tree = 'Password Store\n\x1b[01;34m├── \x1b[0m\x1b[01;34malts\x1b[0m\n\x1b[01;34m│   └── \x1b[0mstackexchange.com\n\x1b[01;34m│       └── \x1b[0malice@example.com';
-    expect(parsePassTree(tree)).toEqual(['alts/stackexchange.com/alice@example.com']);
+  const root = path.join(os.tmpdir(), 'password-store');
+  const found = (...ids: string[]) => ids.map((id) => path.join(root, `${id}.gpg`)).join('\0') + '\0';
+
+  it('turns only .gpg files into flat store paths', () => {
+    const files = [
+      path.join(root, 'email.com.gpg'),
+      path.join(root, 'alts', 'stackexchange.com.gpg'),
+      path.join(root, 'alts', 'ANON_POSTS.md'),
+    ].join('\0') + '\0';
+    expect(parsePassFiles(files, root)).toEqual(['alts/stackexchange.com', 'email.com']);
   });
   it('treats ONLY the first line as the password; notes never become the credential (V)', async () => {
-    const exec = scriptedExec({ 'pass show github.com': 'hunter2\nusername: alice\nsome random note\notpauth://totp/x?secret=SEED\nmore notes' });
-    const c = new PassConnector(exec);
+    const exec = scriptedExec({
+      'find -L': found('github.com'),
+      'pass show github.com': 'hunter2\nusername: alice\nsome random note\notpauth://totp/x?secret=SEED\nmore notes',
+    });
+    const c = new PassConnector(exec, root);
     const [pulled] = await c.pull(['github.com']);
     expect(pulled!.secrets.password).toBe('hunter2');
     expect(pulled!.secrets.totp).toContain('otpauth://');
@@ -100,16 +105,40 @@ describe('pass connector', () => {
     expect(JSON.stringify(pulled!.secrets)).not.toContain('username');
   });
   it('surfaces a clear unlock hint when GPG is locked', async () => {
-    const exec: any = async () => { throw new Error('gpg: decryption failed: No secret key'); };
-    await expect(new PassConnector(exec).pull(['x'])).rejects.toThrow(/GPG key is locked/);
+    const exec: Exec = async (cmd) => {
+      if (cmd === 'find') return found('x');
+      throw new Error('gpg: decryption failed: No secret key');
+    };
+    await expect(new PassConnector(exec, root).pull(['x'])).rejects.toThrow(/GPG key is locked/);
   });
   it('exposes folder + basename label for grouping in the import UI', async () => {
-    const exec = scriptedExec({ 'pass ls': 'Password Store\n├── alts\n│   └── stackexchange.com\n└── email.com' });
-    const list = await new PassConnector(exec).list();
+    const files = [path.join(root, 'alts', 'stackexchange.com.gpg'), path.join(root, 'email.com.gpg')].join('\0') + '\0';
+    const exec = scriptedExec({ 'find -L': files });
+    const list = await new PassConnector(exec, root).list();
     const se = list.find((i) => i.externalId === 'alts/stackexchange.com')!;
     expect(se.folder).toBe('alts');
     expect(se.label).toBe('stackexchange.com');
     expect(list.find((i) => i.externalId === 'email.com')!.folder).toBe('');
+  });
+  it('ignores non-GPG files in both the import view and pull commands', async () => {
+    const files = [
+      path.join(root, 'alts', 'real.md.gpg'),
+      path.join(root, 'alts', 'ANON_POSTS.md'),
+    ].join('\0') + '\0';
+    const calls: string[] = [];
+    const exec: Exec = async (cmd, args) => {
+      const key = [cmd, ...args].join(' ');
+      calls.push(key);
+      if (cmd === 'find') return files;
+      if (key === 'pass show alts/real.md') return 'hunter2\n';
+      throw new Error(`unexpected command: ${key}`);
+    };
+    const connector = new PassConnector(exec, root);
+
+    expect((await connector.list()).map((item) => item.externalId)).toEqual(['alts/real.md']);
+    const pulled = await connector.pull(['alts/ANON_POSTS.md', 'alts/real.md']);
+    expect(pulled.map((item) => item.externalId)).toEqual(['alts/real.md']);
+    expect(calls).not.toContain('pass show alts/ANON_POSTS.md');
   });
 });
 
