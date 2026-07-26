@@ -1358,7 +1358,11 @@ export class KarmaxApi {
   }
 
   /** Drawer-only projection for an unqueued attempt, which has no workflow view. */
-  getDraftView(token: string, taskId: string): TaskView | undefined {
+  getDraftView(
+    token: string,
+    taskId: string,
+    group?: { committedAttemptId?: string },
+  ): TaskView | undefined {
     this.require(token, 'get_task');
     const record = this.deps.store.getTask(taskId);
     if (!record?.params?.draft) return undefined;
@@ -1376,13 +1380,18 @@ export class KarmaxApi {
       state: { draft: true },
       updatedAt: record.createdAt,
     };
-    view.stageTransitions = this.availableStageTransitions(record, view);
+    view.stageTransitions = this.availableStageTransitions(record, view, group);
     return view;
   }
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks', { projectId });
     return this.deps.store.listTasks(projectId);
+  }
+
+  async listTaskSummaries(token: string, projectId: string): Promise<TaskRecord[]> {
+    this.require(token, 'list_tasks', { projectId });
+    return this.deps.store.listTaskSummaries(projectId);
   }
 
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
@@ -1429,17 +1438,24 @@ export class KarmaxApi {
     return {
       ...group,
       attempts: group.attempts.map((attempt) => attempt.params.draft
-        ? { ...attempt, lastView: this.getDraftView(token, attempt.id) }
+        ? { ...attempt, lastView: this.getDraftView(token, attempt.id, group) }
         : attempt.lastView
-          ? { ...attempt, lastView: { ...attempt.lastView, stageTransitions: this.availableStageTransitions(attempt, attempt.lastView) } }
+          ? { ...attempt, lastView: {
+              ...attempt.lastView,
+              stageTransitions: this.availableStageTransitions(attempt, attempt.lastView, group),
+            } }
           : attempt),
     };
   }
 
   /** The single transition policy shared by the selected task header, every
    * attempt row, and the mutation endpoint. */
-  private availableStageTransitions(task: TaskRecord, view: TaskView): StageTransition[] {
-    const group = this.deps.store.attemptGroup(task.id);
+  private availableStageTransitions(
+    task: TaskRecord,
+    view: TaskView,
+    knownGroup?: { committedAttemptId?: string },
+  ): StageTransition[] {
+    const group = knownGroup ?? this.deps.store.attemptGroup(task.id);
     const jayadratha = !!group?.committedAttemptId;
     const resumable = task.workflow === 'software-dev' || task.workflow === 'goal';
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
@@ -1730,10 +1746,10 @@ export class KarmaxApi {
     });
   }
 
-  async taskEvents(token: string, taskId: string, since = 0) {
+  async taskEvents(token: string, taskId: string, since = 0, limit?: number) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_events', { projectId: task?.projectId, taskId });
-    return this.deps.store.eventsSince(taskId, since);
+    return this.deps.store.eventsSince(taskId, since, limit);
   }
 
   // ─── Search & organization (task search / views — PLAN-search-views) ─────────
@@ -1751,7 +1767,13 @@ export class KarmaxApi {
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
     const caller = this.require(token, 'search_tasks', { projectId });
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
-    const tasks = this.deps.store.listTasks(projectId);
+    // Conversation search is intentionally explicit. Every other query uses the
+    // compact projection so routine list filtering never parses all transcripts.
+    const needsConversation = q.filters?.some((clause) =>
+      clause.field === 'conversation' || clause.field === 'says') ?? false;
+    const tasks = needsConversation
+      ? this.deps.store.listTasks(projectId)
+      : this.deps.store.listTaskSummaries(projectId);
     const tags = this.deps.store.listTags(projectId);
     const principal = principalRefOf(caller.principal);
     return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });

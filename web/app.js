@@ -1810,6 +1810,49 @@ function stringifyQuery(q) {
 
 // ── websocket live stream ──────────────────────────────────────────────────
 let refreshTimer = null;
+const LIST_RELOAD_EVENTS = new Set([
+  'task.created',
+  'task.deleted',
+  'task.tags-changed',
+  'task.responsibility-changed',
+]);
+
+// view.updated already contains the compact fields shown by list rows. Apply that
+// projection locally instead of refetching every task (and re-running search) for
+// every event on the global stream.
+function patchTaskListFromEvent(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
+  if (!task) return false;
+  const payload = ev.payload || {};
+  const previous = task.lastView || {};
+  const waitingFor = payload.waitingFor
+    ? { ...(previous.waitingFor || {}), kind: payload.waitingFor }
+    : undefined;
+  const agentTurn = payload.agentTurn
+    ? {
+        ...(previous.agentTurn || {}),
+        state: payload.agentTurn,
+        ...(payload.agentRole ? { role: payload.agentRole } : {}),
+      }
+    : undefined;
+  task.lastView = {
+    ...previous,
+    ...(payload.stage ? { stage: payload.stage } : {}),
+    ...(payload.status ? { status: payload.status } : {}),
+    waitingFor,
+    agentTurn,
+  };
+  return true;
+}
+
+function scheduleTaskListReload() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
+  }, 350);
+}
+
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}`);
@@ -1820,8 +1863,10 @@ function connectWs() {
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') bgRenderMain();
+    const patchedList = patchTaskListFromEvent(ev);
     if (S.selected && ev.taskId === S.selected) {
       S.taskEvents.push(ev);
+      if (S.taskEvents.length > 400) S.taskEvents.shift();
       if (ev.type === 'agent.output' && ev.payload?.text) {
         // Provider adapters emit the current complete block, not a token delta.
         // Replacing avoids the old "H / He / Hello" cumulative transcript.
@@ -1838,22 +1883,45 @@ function connectWs() {
         refreshTask(); // the session id was just published mid-turn → show the live fork command
       } else renderTaskEvents();
     }
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => { if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks(); }, 350);
-    if (S.organizationId && ['view.updated', 'task.responsibility-changed', 'task.mentioned'].includes(ev.type))
+    if (patchedList) {
+      // Re-evaluate only the active query: stage/status changes can alter filter
+      // membership, but they do not require the expensive all-tasks endpoint.
+      if (S.tab === 'tasks' && !S.selected) scheduleSearch();
+      if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
+      renderRail();
+    } else if (LIST_RELOAD_EVENTS.has(ev.type)) {
+      // True membership/metadata changes are rare and do require a durable reload.
+      scheduleTaskListReload();
+    }
+    // Collaboration state changes only for collaboration events. Reloading five
+    // organization endpoints for every workflow view transition multiplied the
+    // websocket refresh storm without changing any of that data.
+    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned'].includes(ev.type))
       setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
 }
 
+let taskRefreshPromise = null;
 async function refreshTasks() {
+  // Navigation, mutations, and a structural websocket event can converge here.
+  // Share one in-flight refresh so slow hosts cannot accumulate duplicate list
+  // scans behind the event loop.
+  if (taskRefreshPromise) return taskRefreshPromise;
+  taskRefreshPromise = (async () => {
+    try {
+      await loadTasks();
+      if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
+      if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
+      renderRail();
+      if (S.tab === 'queue' && !S.selected) seedQueue();
+    } catch {}
+  })();
   try {
-    await loadTasks();
-    if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-    if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
-    renderRail();
-    if (S.tab === 'queue' && !S.selected) seedQueue();
-  } catch {}
+    await taskRefreshPromise;
+  } finally {
+    taskRefreshPromise = null;
+  }
 }
 
 // ── shell ────────────────────────────────────────────────────────────────────
@@ -4022,27 +4090,39 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.paramDefaults = {};
   S.attemptGroup = null;
   try {
-    // Fetch the four independent resources in parallel — they used to be four serial
-    // round-trips, which stacked latency (each page open paid the sum, not the max).
-    // `renderTaskPage` no-ops while `S.view` is null, so assigning them together (rather
-    // than one-at-a-time) also avoids rendering a half-populated page mid-fetch.
+    // Start secondary resources in parallel, but let the compact task projection
+    // paint as soon as it arrives. A large event history or a slow session lookup
+    // must never hold the entire task page hostage.
     const draft = !!rec?.params?.draft;
-    const [view, events, widgets, sessions, attempts] = await Promise.all([
-      api(`/api/tasks/${taskId}`),
-      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0`),
+    const details = Promise.all([
+      // The websocket keeps this window current. Older history remains durable,
+      // but opening a task should have a fixed memory and response-size budget.
+      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0&limit=300`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
     ]);
+    const view = await api(`/api/tasks/${taskId}`);
+    if (S.selected !== taskId) return;
     S.view = view;
-    S.taskEvents = events;
-    S.widgets = widgets;
-    S.sessions = sessions;
-    S.attemptGroup = attempts;
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
+    renderTaskPage();
+
+    const [events, widgets, sessions, attempts] = await details;
+    if (S.selected !== taskId) return;
+    // Events may have arrived over the websocket while the bounded durable window
+    // was loading. Preserve those instead of replacing them with the older response.
+    const durableSeqs = new Set(events.map((event) => event.seq).filter((seq) => seq != null));
+    S.taskEvents = [
+      ...events,
+      ...S.taskEvents.filter((event) => event.seq == null || !durableSeqs.has(event.seq)),
+    ].slice(-400);
+    S.widgets = widgets;
+    S.sessions = sessions;
+    S.attemptGroup = attempts;
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
   // Param defaults only feed the Parameters tab, and resolving them costs a git

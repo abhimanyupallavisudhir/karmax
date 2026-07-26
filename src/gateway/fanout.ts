@@ -16,7 +16,10 @@ export class DurableEventFanout {
   private draining = false;
 
   constructor(private store: Store, bus?: KarmaxBus, intervalMs = 500) {
-    this.cursor = store.allEventsSince(0).at(-1)?.seq ?? 0;
+    // This used to call allEventsSince(0).at(-1), parsing the entire append-only
+    // event log just to learn one integer. On a real karmax home that is tens of
+    // MiB of JSON and hundreds of MiB of short-lived objects at every boot.
+    this.cursor = store.latestEventSeq();
     this.timer = setInterval(() => void this.drain(), intervalMs);
     this.timer.unref();
     this.offBus = bus?.onAny(() => void this.drain());
@@ -38,7 +41,10 @@ export class DurableEventFanout {
     this.draining = true;
     try {
       for (;;) {
-        const rows = this.store.allEventsSince(this.cursor).slice(0, 500);
+        // Consume the oldest page after the cursor. allEventsSince(..., limit)
+        // intentionally returns the newest page for activity/history views; using
+        // it here would skip the middle of bursts larger than one page.
+        const rows = this.store.nextEventsSince(this.cursor, 500);
         if (!rows.length) break;
         for (const event of rows) {
           this.cursor = Math.max(this.cursor, event.seq ?? 0);

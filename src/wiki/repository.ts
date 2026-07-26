@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { wikiRoot } from './wiki.js';
 
 export const PROJECT_WIKI_BRANCH = 'main';
@@ -12,7 +12,25 @@ function git(root: string, args: string[], env?: NodeJS.ProcessEnv): string {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     env: env ? { ...process.env, ...env } : process.env,
+    // Remote wiki provisioning runs before the gateway binds. An unreachable SSH
+    // endpoint must fail best-effort setup, never freeze the entire task system.
+    timeout: 15_000,
+    killSignal: 'SIGKILL',
   }).trim();
+}
+
+function gitAsync(root: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('git', ['-C', root, ...args], {
+      encoding: 'utf8',
+      env: env ? { ...process.env, ...env } : process.env,
+      timeout: 15_000,
+      killSignal: 'SIGKILL',
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout.trim());
+    });
+  });
 }
 
 /** Existing project wiki folders are migrated in place: initializing Git does
@@ -77,15 +95,15 @@ export function projectWikiBranchView(contentDir: string, projectId: string, ref
   return view;
 }
 
-export function setProjectWikiRemote(root: string, remote: string, sshKey: string): void {
+export async function setProjectWikiRemote(root: string, remote: string, sshKey: string): Promise<void> {
   try { git(root, ['remote', 'set-url', 'origin', remote]); }
   catch { git(root, ['remote', 'add', 'origin', remote]); }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-wiki-key-'));
   const key = path.join(dir, 'id');
   try {
     fs.writeFileSync(key, sshKey, { mode: 0o600 });
-    git(root, ['push', '-u', 'origin', `${PROJECT_WIKI_BRANCH}:${PROJECT_WIKI_BRANCH}`], {
-      GIT_SSH_COMMAND: `ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`,
+    await gitAsync(root, ['push', '-u', 'origin', `${PROJECT_WIKI_BRANCH}:${PROJECT_WIKI_BRANCH}`], {
+      GIT_SSH_COMMAND: `ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1`,
     });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
