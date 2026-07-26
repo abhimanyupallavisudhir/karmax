@@ -515,10 +515,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (linkedRepositories.length || wikiRepository) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const credentials: Record<string, string> = {};
-        for (const source of worldSources) {
+        for (const [index, source] of worldSources.entries()) {
           const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
           const repository = linked?.repository ?? (wikiRepository?.sshUrl === source ? wikiRepository : undefined);
           if (!repository) {
+            // A configured host checkout is already the authority for this
+            // repository. cloudGitSource resolved its origin only as the cloud
+            // transport and copySources seeds the sandbox from the exact local
+            // commit, so it neither needs nor implies a GitHub catalog
+            // attachment. Requiring enrollment here discarded that provenance
+            // and made a correctly auto-detected local origin fail as soon as
+            // any other source (normally the project wiki) was enrolled.
+            if (cloudSources[index]?.localPath) continue;
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
             continue;
           }
