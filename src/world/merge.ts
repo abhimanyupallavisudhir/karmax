@@ -55,12 +55,13 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
     const res = await finalizeMergeRepo(r, targetFor(r), world.handle.id, identity);
     landedFiles.push(...res.landedFiles.map((f) => `${r.name}/${f}`));
     if (!res.merged) {
+      const label = r.role === 'project-wiki' ? `project wiki "${r.name}"` : `repo "${r.name}"`;
       return {
         merged: false,
         landedFiles,
         conflict: res.conflict,
         dirty: res.dirty ? res.dirty.split('\n').map((f) => `${r.name}/${f}`).join('\n') : undefined,
-        note: `repo "${r.name}": ${res.note ?? (res.conflict ? 'merge conflict' : 'merge failed')}`,
+        note: `${label}: ${res.note ?? (res.conflict ? 'merge conflict' : 'merge failed')}`,
       };
     }
     sha = res.sha;
@@ -156,6 +157,18 @@ export async function finalizeMergeRepo(worldRepo: WorldRepo, target: string, wo
   if ((await git(repo, ['rev-parse', '--verify', target])).code !== 0) {
     const baseRef = (await git(repo, ['rev-parse', '--verify', base])).code === 0 ? base : 'HEAD';
     await git(repo, ['branch', target, baseRef]);
+  }
+
+  // A companion repo participates in every task world even when the task never
+  // touched it (notably the project wiki). If its branch introduces no changes,
+  // there is nothing to land: do not let unrelated, uncommitted work in that
+  // repo's canonical checkout block changes in the other repos. The target's
+  // committed ref is the comparison point, so this does not ignore actual task
+  // work and does not inspect or mutate the dirty checkout.
+  const unique = await git(repo, ['diff', '--quiet', `${target}...${branch}`]);
+  if (unique.code === 0) {
+    const targetSha = await git(repo, ['rev-parse', target]);
+    return { merged: true, sha: targetSha.stdout.trim(), landedFiles, note: baseNote };
   }
 
   // 2. Bring the target into the branch so conflicts surface here (resolvable
