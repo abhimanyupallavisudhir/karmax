@@ -404,10 +404,16 @@ Implementation notes (phases 4–5):
      (edit-existing) stay distinct so write-back can never clobber notes.
 
 Implementation notes:
-- Existing installs keep their seeded role profiles (`seedProfiles` does not
-  overwrite), so the do-role's new `credential:read`/`vault:store`/
-  `use-credential:*` ceiling applies to fresh stores; an existing install
-  edits the do profile once (or deletes it to reseed).
+- Existing installs preserve customized profiles, while exact known historical
+  built-in authorization profiles migrate to the current defaults. This gives
+  future tasks `vault:store` without silently widening a user-edited profile;
+  already-created task grants remain frozen.
+- Agent-created items automatically follow every enabled connector write-back
+  policy from `store_credential`; the agent does not also need the
+  administrative `credential:write` capability. Unix `pass` imports recognize
+  folder/domain/username paths (for example
+  `software/www.overleaf.com/alice@example.com`) rather than treating the first
+  folder as the fill domain.
 - `fill_credential` discovers the CDP endpoint from inside the world, so the
   §5B trust boundary holds against prompt injection (live origin check over
   CDP), not against a malicious agent standing up a fake CDP server — stated

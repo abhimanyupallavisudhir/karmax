@@ -86,6 +86,35 @@ export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
   },
 ];
 
+// Exact snapshots seeded by the last pre-vault/organization-role release.
+// Built-ins are customizable, so seed migrations must never overwrite an
+// arbitrary profile merely because it still has `builtin: true`. Matching a
+// complete historical capability set lets old untouched installs acquire new
+// platform primitives while preserving every genuinely customized profile.
+const LEGACY_BUILTIN_CAPABILITIES: Partial<Record<AuthorizationProfileId, Capability[][]>> = {
+  developer: [[
+    'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
+    'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+  ]],
+  maintainer: [[
+    'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
+    'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+    'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
+    'workflow:install', 'workflow:edit',
+  ]],
+  operator: [[
+    'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
+    'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+    'project:edit', 'project:settings:*', 'queue:write', 'profile:write',
+    'workflow:install', 'workflow:edit', 'project:create', 'diagnostic:read',
+    'process:*', 'credential:*', 'payment:*', 'settings:*', 'safe-mode:write',
+  ]],
+};
+
+function sameCapabilities(a: Capability[], b: Capability[]): boolean {
+  return a.length === b.length && a.every((capability) => b.includes(capability));
+}
+
 export const projectScope = (projectId: string): AuthorizationScope => `project:${projectId}`;
 export const organizationScope = (organizationId: string): AuthorizationScope => `organization:${organizationId}`;
 
@@ -96,7 +125,16 @@ export class AuthorizationService {
 
   seed(): void {
     for (const profile of DEFAULT_AUTHORIZATION_PROFILES) {
-      if (!this.store.getAuthorizationProfile('global', profile.id)) this.store.setAuthorizationProfile('global', profile as any);
+      const stored = this.store.getAuthorizationProfile('global', profile.id) as AuthorizationProfile | undefined;
+      if (!stored) {
+        this.store.setAuthorizationProfile('global', profile as any);
+        continue;
+      }
+      const historical = LEGACY_BUILTIN_CAPABILITIES[profile.id] ?? [];
+      if (stored.builtin && stored.name === profile.name && stored.description === profile.description
+        && historical.some((caps) => sameCapabilities(stored.capabilities, caps))) {
+        this.store.setAuthorizationProfile('global', profile as any);
+      }
     }
     if (!this.store.kvGet('authz:default:global')) this.store.kvSet('authz:default:global', 'developer');
   }

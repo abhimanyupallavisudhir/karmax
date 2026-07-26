@@ -10,6 +10,10 @@ import type { WorkflowManager, WorkflowSummary } from '../packages/manager.js';
 import {
   mergeQueueId,
   agentQueueId,
+  accountCoordinatorId,
+  SIG_CANCEL_MERGE,
+  SIG_CANCEL_AGENT,
+  SIG_CANCEL_ACCOUNT,
   SIG_PRIORITIZE,
   SIG_REORDER,
   SIG_SET_AGENT_CAPACITY,
@@ -17,7 +21,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -60,6 +64,9 @@ export interface TriggerArmer {
 }
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
+const stageName = (stage: string) => stage === 'human'
+  ? 'Waiting for human input'
+  : stage.charAt(0).toUpperCase() + stage.slice(1);
 const agentSnapshotKey = (taskId: string) => `task-agents:${taskId}`;
 const wikiFiles = (root: string): string[] => {
   const out: string[] = [];
@@ -790,6 +797,15 @@ export class KarmaxApi {
     }
   }
 
+  /** `_discardProgress` is serialized into one accepted start only. Keeping it on
+   * the record would make a later cancellation recovery delete the new work. */
+  private consumeDiscardProgress(taskId: string): void {
+    const task = this.deps.store.getTask(taskId);
+    if (!task?.params._discardProgress) return;
+    const { _discardProgress: _used, ...params } = task.params as Record<string, unknown>;
+    this.deps.store.updateTaskParams(taskId, params as any);
+  }
+
   /** Keep the execution snapshot aligned with a workflow-accepted in-flight
    * agent retune. Rejected fields never reach here, so the stored display cannot
    * claim a change that the running workflow refused. */
@@ -872,7 +888,8 @@ export class KarmaxApi {
     // Re-resolve against the CURRENT project/global defaults. The task stored only
     // its own overrides, so a draft queued after a default change picks up the new
     // default (SPEC §10.4). Meta fields (profiles/draft/archived/triggers) aren't overrides.
-    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, _authorization, ...overrides } = task.params as Record<string, unknown>;
+    const { profiles, draft: _d, archived: _a, triggers: _t, triggerState: _ts, images, _authorization,
+      _discardProgress, ...overrides } = task.params as Record<string, unknown>;
     const resolved = await this.resolveTaskParams(manifest, project, overrides as ValueMap);
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it
     // once prevents attempts queued days apart from inheriting different reviewers.
@@ -898,6 +915,7 @@ export class KarmaxApi {
     input.intentId = task.intentId ?? task.id;
     if (profiles) input.profiles = profiles as Record<string, string>;
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
+    if (_discardProgress === true) input.discardProgress = true;
     return { startType, input, version: manifest.version };
   }
 
@@ -999,6 +1017,7 @@ export class KarmaxApi {
     const started = this.resolveStart(task.workflow, task.workflowVersion,
       this.deps.store.getProject(task.projectId)?.organizationId);
     if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
+    this.consumeDiscardProgress(taskId);
     return this.deps.store.getTask(taskId)!;
   }
 
@@ -1114,6 +1133,7 @@ export class KarmaxApi {
       const started = this.resolveStart(task.workflow, task.workflowVersion,
         this.deps.store.getProject(task.projectId)?.organizationId);
       if (started) this.saveAgentSnapshot(task.id, started.manifest, input);
+      this.consumeDiscardProgress(taskId);
     } catch (e) {
       this.deps.store.updateTaskParams(taskId, { ...(task.params as Record<string, unknown>), triggerState: 'armed' } as any);
       throw e;
@@ -1226,10 +1246,12 @@ export class KarmaxApi {
     const enrich = (view: TaskView | undefined): TaskView | undefined => {
       if (!view) return view;
       const agents = this.readAgentSnapshot(taskId);
+      const task = this.deps.store.getTask(taskId);
       return {
         ...view,
-        notes: this.deps.store.getTask(taskId)?.notes,
+        notes: task?.notes,
         ...(agents ? { agents } : {}),
+        ...(task ? { stageTransitions: this.availableStageTransitions(task, view) } : {}),
         ...(view.status === 'failed' && view.workflow === 'software-dev' && !view.pointOfNoReturnPassed
           ? { actions: FAILED_RECOVERY_ACTIONS() }
           : {}),
@@ -1274,7 +1296,7 @@ export class KarmaxApi {
     this.require(token, 'get_task');
     const record = this.deps.store.getTask(taskId);
     if (!record?.params?.draft) return undefined;
-    return {
+    const view: TaskView = {
       taskId: record.id,
       title: record.title,
       workflow: record.workflow,
@@ -1288,6 +1310,8 @@ export class KarmaxApi {
       state: { draft: true },
       updatedAt: record.createdAt,
     };
+    view.stageTransitions = this.availableStageTransitions(record, view);
+    return view;
   }
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
@@ -1333,7 +1357,261 @@ export class KarmaxApi {
   attemptGroup(token: string, taskId: string) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'get_task', { projectId: task?.projectId, taskId });
-    return this.deps.store.attemptGroup(taskId);
+    const group = this.deps.store.attemptGroup(taskId);
+    if (!group) return group;
+    return {
+      ...group,
+      attempts: group.attempts.map((attempt) => attempt.params.draft
+        ? { ...attempt, lastView: this.getDraftView(token, attempt.id) }
+        : attempt.lastView
+          ? { ...attempt, lastView: { ...attempt.lastView, stageTransitions: this.availableStageTransitions(attempt, attempt.lastView) } }
+          : attempt),
+    };
+  }
+
+  /** The single transition policy shared by the selected task header, every
+   * attempt row, and the mutation endpoint. */
+  private availableStageTransitions(task: TaskRecord, view: TaskView): StageTransition[] {
+    const group = this.deps.store.attemptGroup(task.id);
+    const jayadratha = !!group?.committedAttemptId;
+    const resumable = task.workflow === 'software-dev' || task.workflow === 'goal';
+    const origin = view.state?.humanPauseOrigin as Stage | undefined;
+    const cancelledFrom = view.state?.cancelledFrom as Stage | undefined;
+    const manuallyDoneFrom = view.state?.manuallyDoneFrom as Stage | 'draft' | 'human' | undefined;
+    const result: StageTransition[] = [];
+    const add = (move: StageTransition) => {
+      if (!result.some((candidate) => candidate.target === move.target)) result.push(move);
+    };
+
+    if (task.params.draft) {
+      add({ target: 'do', label: 'Queue', description: 'Start this draft.' });
+      add({ target: 'done', label: 'Done', description: 'Mark this draft done without running it.' });
+      return result;
+    }
+    if (view.status === 'done') {
+      if (manuallyDoneFrom) {
+        add({
+          target: manuallyDoneFrom,
+          label: manuallyDoneFrom === 'draft' ? 'Back to Draft' : `Restore ${stageName(manuallyDoneFrom)}`,
+          description: 'Undo the manual completion and restore its prior stage.',
+        });
+      }
+      return result; // natural completion is immutable
+    }
+    if (view.status === 'cancelled') {
+      if (resumable && cancelledFrom && cancelledFrom !== 'cancelled') {
+        add({ target: cancelledFrom, label: `Restore ${stageName(cancelledFrom)}`, description: 'Resume from the stage active when this attempt was cancelled.' });
+      }
+      if (!jayadratha) add({ target: 'draft', label: 'Draft', description: 'Discard progress and make this attempt editable again.', danger: true });
+      add({ target: 'done', label: 'Done', description: 'Mark this cancelled attempt done manually.' });
+      return result;
+    }
+    if (view.status === 'failed') {
+      if (resumable && !view.pointOfNoReturnPassed)
+        add({ target: 'do', label: 'Retry Do', description: 'Recover the preserved work and retry the task.' });
+      if (!jayadratha && !view.pointOfNoReturnPassed)
+        add({ target: 'draft', label: 'Draft', description: 'Discard failed progress and start over later.', danger: true });
+      add({ target: 'done', label: 'Done', description: 'Stop treating this failure as active work.' });
+      return result;
+    }
+
+    if (origin) {
+      add({ target: origin, label: `Resume ${stageName(origin)}`, description: 'Leave the human hold and resume the originating stage.' });
+    } else if (resumable && view.stage !== 'escalated' && view.waitingFor?.kind !== 'human') {
+      add({ target: 'human', label: 'Waiting for human input', description: 'Stop current activity and hold this attempt for a person.' });
+    }
+    if (resumable && view.stage === 'review' && !origin)
+      add({ target: 'do', label: 'Do', description: 'Return the reviewed work to the Do agent.' });
+    if (!jayadratha && !view.pointOfNoReturnPassed)
+      add({ target: 'draft', label: 'Draft', description: 'Discard all execution progress and make the attempt editable.', danger: true });
+    add({ target: 'done', label: 'Done', description: 'Stop all activity and mark this attempt done manually.' });
+    return result;
+  }
+
+  private transitionCheckpoint(view: TaskView, resumeStage: Stage, pausedForHuman = false): TaskRecoveryCheckpoint {
+    const saved = view.state?.transitionCheckpoint as TaskRecoveryCheckpoint | undefined;
+    const source = saved ?? {
+      world: view.status === 'cancelled'
+        ? undefined
+        : (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined,
+      messages: view.messages,
+      transcripts: view.transcripts,
+      reviewInfo: view.reviewInfo,
+      seen: typeof view.state?.turnsSeen === 'number' ? view.state.turnsSeen : view.messages.length,
+      target: view.targetBranch,
+    };
+    return {
+      ...source,
+      messages: source.messages.map((message) => ({ ...message })),
+      transcripts: source.transcripts?.map((transcript) => ({
+        ...transcript,
+        messages: transcript.messages.map((message) => ({ ...message })),
+      })),
+      resumeStage,
+      ...(pausedForHuman ? { pausedForHuman: true } : {}),
+    };
+  }
+
+  /** Stop every execution-owned source of activity before replacing or
+   * terminalizing a run. Coordinator cancellation is explicit because workflow
+   * termination cannot run deterministic finally blocks. */
+  private async stopTaskActivity(task: TaskRecord, view: TaskView, reason: string): Promise<void> {
+    const handle = this.deps.client.workflow.getHandle(task.id);
+    await handle.terminate(reason).catch((error) => {
+      if (!(error instanceof WorkflowNotFoundError)) throw error;
+    });
+
+    const turnId = view.agentTurn?.turnId;
+    const signals: Promise<unknown>[] = [];
+    if (turnId) {
+      signals.push(this.deps.client.workflow.getHandle(agentQueueId()).signal(SIG_CANCEL_AGENT, { taskId: task.id, turnId }));
+      signals.push(this.deps.client.workflow.getHandle(accountCoordinatorId()).signal(SIG_CANCEL_ACCOUNT, { taskId: task.id, turnId }));
+    }
+    const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
+    const domains = world?.repos?.length
+      ? world.repos.map((repo) => `${repo.localPath ?? repo.repo}:${repo.target ?? view.targetBranch ?? 'main'}`)
+      : view.stage === 'merge'
+        ? [`${world?.repo ?? task.projectId}:${view.targetBranch ?? 'main'}`]
+        : [];
+    for (const domain of [...new Set(domains)]) {
+      signals.push(this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
+        workflowId: mergeQueueId(domain),
+        taskQueue: this.deps.taskQueue,
+        args: [{ domain }],
+        signal: SIG_CANCEL_MERGE,
+        signalArgs: [{ taskId: task.id }],
+      }));
+    }
+    await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
+  }
+
+  private async startTransitionReplacement(task: TaskRecord, view: TaskView, resumeStage: Stage, pausedForHuman = false): Promise<TaskView> {
+    const { startType, input, version } = await this.buildStart(task, true);
+    input.recovery = this.transitionCheckpoint(view, resumeStage, pausedForHuman);
+    await withTimeout(this.deps.client.workflow.start(startType, {
+      taskQueue: this.deps.taskQueue,
+      workflowId: task.id,
+      workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE,
+      args: [input],
+    }), START_TIMEOUT_MS);
+    this.deps.store.setTaskWorkflowVersion(task.id, version);
+    this.deps.store.setTaskExecutionWorkflow(task.id, task.workflow);
+    this.deps.store.updateTaskParams(task.id, { ...task.params, archived: false, draft: false });
+    const {
+      manuallyDoneFrom: _manuallyDoneFrom,
+      manuallyDoneView: _manuallyDoneView,
+      transitionCheckpoint: _transitionCheckpoint,
+      humanPauseOrigin: _humanPauseOrigin,
+      cancelledFrom: _cancelledFrom,
+      ...priorState
+    } = view.state;
+    const starting: TaskView = {
+      ...view,
+      stage: resumeStage,
+      status: pausedForHuman ? 'waiting' : 'active',
+      waitingFor: pausedForHuman ? { kind: 'human', audience: ['@creator'], detail: `Paused during ${resumeStage}` } : undefined,
+      agentTurn: undefined,
+      error: undefined,
+      state: {
+        ...priorState,
+        cancelled: false,
+        ...(pausedForHuman ? { humanPauseOrigin: resumeStage } : {}),
+        recoveryWorld: input.recovery.world,
+      },
+      updatedAt: Date.now(),
+    };
+    this.deps.store.saveView(task.id, starting);
+    return { ...starting, stageTransitions: this.availableStageTransitions(this.deps.store.getTask(task.id)!, starting) };
+  }
+
+  /** Move one attempt to an explicitly advertised lifecycle destination. */
+  async moveTaskStage(token: string, taskId: string, target: string): Promise<TaskView> {
+    const task = this.deps.store.getTask(taskId);
+    this.require(token, 'signal_task', { projectId: task?.projectId, taskId });
+    if (!task) throw new Error(`no task ${taskId}`);
+    const view = task.params.draft ? this.getDraftView(token, taskId) : task.lastView;
+    if (!view) throw new Error('task has no lifecycle state yet');
+    const move = this.availableStageTransitions(task, view).find((candidate) => candidate.target === target);
+    if (!move) throw new Error(`cannot move this attempt from ${stageName(view.stage)} to ${stageName(target)}`);
+
+    if (task.params.draft && target === 'do') {
+      await this.queueTask(token, taskId);
+      return (await this.getTaskView(token, taskId, { live: true }))!;
+    }
+
+    if (target === 'done') {
+      const from = task.params.draft ? 'draft' : view.state?.humanPauseOrigin ? 'human' : view.stage;
+      const checkpoint = task.params.draft ? undefined : this.transitionCheckpoint(view, view.stage);
+      if (!task.params.draft && !['done', 'cancelled', 'failed'].includes(view.status))
+        await this.stopTaskActivity(task, view, 'Task marked done manually');
+      if (task.params.draft) this.deps.store.clearDraft(taskId);
+      const done: TaskView = {
+        ...view,
+        stage: 'done',
+        status: 'done',
+        waitingFor: undefined,
+        agentTurn: undefined,
+        actions: [],
+        state: {
+          ...view.state,
+          draft: false,
+          manuallyDoneFrom: from,
+          ...(checkpoint ? { transitionCheckpoint: checkpoint } : {}),
+          ...(['cancelled', 'failed'].includes(view.status) ? { manuallyDoneView: view } : {}),
+        },
+        updatedAt: Date.now(),
+      };
+      this.deps.store.saveView(taskId, done);
+      return { ...done, stageTransitions: this.availableStageTransitions(this.deps.store.getTask(taskId)!, done) };
+    }
+
+    const manuallyDoneFrom = view.state?.manuallyDoneFrom as Stage | 'draft' | 'human' | undefined;
+    if (view.status === 'done' && manuallyDoneFrom === 'draft' && target === 'draft') {
+      this.deps.store.updateTaskParams(taskId, { ...task.params, draft: true, archived: false });
+      return this.getDraftView(token, taskId)!;
+    }
+    if (view.status === 'done' && (target === 'cancelled' || target === 'failed')) {
+      const previous = view.state?.manuallyDoneView as TaskView | undefined;
+      if (!previous || previous.stage !== target) throw new Error(`the prior ${target} state is unavailable`);
+      const restored = { ...previous, updatedAt: Date.now() };
+      this.deps.store.saveView(taskId, restored);
+      this.deps.store.updateTaskParams(taskId, { ...task.params, archived: false });
+      return { ...restored, stageTransitions: this.availableStageTransitions(this.deps.store.getTask(taskId)!, restored) };
+    }
+    if (view.status === 'done' && manuallyDoneFrom === 'human' && target === 'human') {
+      const checkpoint = view.state?.transitionCheckpoint as TaskRecoveryCheckpoint | undefined;
+      const origin = checkpoint?.resumeStage;
+      if (!origin) throw new Error('the prior human hold origin is unavailable');
+      return this.startTransitionReplacement(task, view, origin, true);
+    }
+
+    if (target === 'draft') {
+      if (!['done', 'cancelled', 'failed'].includes(view.status))
+        await this.stopTaskActivity(task, view, 'Task moved back to Draft');
+      const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
+      if (world && this.deps.worlds) {
+        const opened = await this.deps.worlds.open(world).catch(() => undefined);
+        await opened?.destroy().catch(() => undefined);
+      }
+      this.deps.store.updateTaskParams(taskId, {
+        ...task.params,
+        draft: true,
+        archived: false,
+        _discardProgress: true,
+      });
+      this.deps.store.electPrincipal(task.intentId ?? task.id);
+      return this.getDraftView(token, taskId)!;
+    }
+
+    if (view.state?.humanPauseOrigin === target) {
+      await this.deps.client.workflow.getHandle(taskId).signal(SIG.retry);
+      return (await this.getTaskView(token, taskId, { live: true }))!;
+    }
+
+    if (!['done', 'cancelled', 'failed'].includes(view.status))
+      await this.stopTaskActivity(task, view, target === 'human' ? 'Task paused for human input' : `Task moved to ${target}`);
+    const resumeStage = target === 'human' ? view.stage : target as Stage;
+    return this.startTransitionReplacement(task, view, resumeStage, target === 'human');
   }
 
   /** Resolve the human-facing project-local number (#100) without guessing ids. */

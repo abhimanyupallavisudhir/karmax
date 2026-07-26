@@ -26,7 +26,7 @@ const ICON = {
   send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
 };
-const DEFAULT_TASK_QUERY = 'group:tag';
+const TAG_SECTION_QUERY = 'group:tag';
 
 let installPrompt = null;
 window.addEventListener('beforeinstallprompt', (event) => {
@@ -62,7 +62,7 @@ const S = {
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
-  search: DEFAULT_TASK_QUERY, // the working query string (Linear-style tokens + free text)
+  search: '', // the working query string (Linear-style tokens + free text)
   // Task organization (PLAN-search-views): a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
@@ -279,7 +279,7 @@ async function applyRoute() {
     // new project (they'd otherwise re-run the old query against new data and
     // highlight a view/cursor that doesn't exist here).
     S.projectId = pid;
-    S.search = DEFAULT_TASK_QUERY;
+    S.search = '';
     S.activeView = null;
     S.searchResult = null;
     S.cursorId = null;
@@ -1767,7 +1767,7 @@ async function navigateToTagSection(tagId) {
   if (!tag) return;
   $('#modal-root').innerHTML = '';
   S.activeView = null;
-  S.search = DEFAULT_TASK_QUERY;
+  S.search = TAG_SECTION_QUERY;
   await go(projectRoute(tag.projectId));
   const section = document.getElementById(tagSectionId(tagId));
   if (!section) return;
@@ -2134,10 +2134,11 @@ function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
   return s;
 }
 
-// Built-in starter views that make the new task shapes (schedules, dependency-blocked,
-// repeatable series) first-class instead of buried. Each is just a query string; they
+// Built-in starter views that make useful organization modes and new task shapes
+// first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
 const BUILTIN_VIEWS = [
+  { id: 'builtin:sectioned', name: 'Sectioned', icon: '§', query: TAG_SECTION_QUERY },
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
@@ -2145,7 +2146,7 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
-// The saved-views switcher — every chip is a query. "All" is the tag-grouped default; then the
+// The saved-views switcher — every chip is a query. "All" is the default; then the
 // built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
   const builtins = BUILTIN_VIEWS
@@ -2272,15 +2273,18 @@ function tasksView() {
   let body;
   if (groups) {
     body = r.hierarchical
-      ? groups.map((g) => tagGroupHtml(g, topLevel)).join('')
+      ? [
+        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => taskRow(t, { showTags: false })),
+        ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g, topLevel)),
+      ].join('')
       : groups.map((g) => {
         const gt = g.tasks.filter(topLevel);
-        return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
+        return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => taskRow(t)).join('')}`;
       }).join('');
   } else {
-    body = flat.map(taskRow).join('');
+    body = flat.map((t) => taskRow(t)).join('');
   }
-  const empty = S.search !== DEFAULT_TASK_QUERY
+  const empty = S.search
     ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
     : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
@@ -2297,13 +2301,13 @@ function tasksView() {
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
-        ${S.search !== DEFAULT_TASK_QUERY ? `<button class="search-x" id="q-clear" title="Restore the default view (Esc)">✕</button>` : ''}
+        ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
       </div>
       ${viewsBar()}
       ${queryToolbarHtml(S.search || '', 'q', `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`)}
     </div>
     <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
-      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search !== DEFAULT_TASK_QUERY ? ' · filtered' : ''}</span>
+      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
     </div>
     ${body || empty}`;
 }
@@ -2316,18 +2320,18 @@ function tagGroupHtml(group, keep, depth = 0) {
   const tag = tagById(group.key);
   const level = Math.min(6, depth + 2);
   const edit = tag
-    ? `<button class="icon-btn tag-section-edit" data-edit-tag="${esc(tag.id)}" title="Edit ${esc(group.path || group.label)}" aria-label="Edit tag">✎</button>`
+    ? `<button class="tag-section-edit" data-edit-tag="${esc(tag.id)}" title="Edit ${esc(group.path || group.label)}" aria-label="Edit tag">Edit</button>`
     : '';
   const description = tag?.description
-    ? `<div class="tag-section-description">${esc(tag.description)}</div>`
+    ? `<p class="tag-section-description">${esc(tag.description)}</p>`
     : '';
   return `<section class="tag-section tag-depth-${Math.min(depth, 5)}" id="${esc(tagSectionId(group.key))}" data-tag-section="${esc(group.key)}">
     <h${level} class="tag-section-heading" tabindex="-1">
       <span class="tag-section-name">${esc(group.label)}</span>
-      <span class="pill">${count}</span>${edit}
+      <span class="tag-section-count">${count} task${count === 1 ? '' : 's'}</span>${edit}
     </h${level}>
     ${description}
-    <div class="tag-section-tasks">${ownTasks.map(taskRow).join('')}</div>
+    <div class="tag-section-tasks">${ownTasks.map((t) => taskRow(t, { showTags: false })).join('')}</div>
     <div class="tag-section-children">${children}</div>
   </section>`;
 }
@@ -2408,7 +2412,7 @@ function runSubRow(r) {
     </div>`;
 }
 
-function taskRow(t) {
+function taskRow(t, { showTags = true } = {}) {
   const isDraft = t.params?.draft;
   if (t.params?.repeatable) return seriesRow(t);
   if (t.params?.triggerState === 'armed') {
@@ -2431,7 +2435,7 @@ function taskRow(t) {
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${tagChips(t)}</div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Queue</button>
@@ -2457,7 +2461,7 @@ function taskRow(t) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
-          ${priorityFlag(t)}${tagChips(t)}
+          ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
@@ -2484,6 +2488,22 @@ function stageLabel(v) {
   const stage = v.stage || 'setup';
   if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
   return stage;
+}
+
+// The stage indicator is also the lifecycle control. The server supplies the
+// exact moves for this attempt, so siblings may legitimately have different
+// menus (e.g. the Jayadratha winner vs a superseded/cancelled attempt).
+function stageIndicator(v, taskId, compact = false) {
+  const moves = v.stageTransitions || [];
+  const label = stageLabel(v);
+  if (!moves.length) return `<span class="chip ${esc(v.status || '')}">${esc(label)}</span>`;
+  return `<label class="stage-picker${compact ? ' compact' : ''}" title="Move this attempt to another stage">
+    <span class="sr-only">Move ${esc(label)} stage</span>
+    <select data-stage-move="${esc(taskId)}" aria-label="Move attempt from ${esc(label)}">
+      <option value="" selected>${esc(label)} ▾</option>
+      ${moves.map((move) => `<option value="${esc(move.target)}" ${move.danger ? 'data-danger="true"' : ''}>→ ${esc(move.label)}</option>`).join('')}
+    </select>
+  </label>`;
 }
 
 // The workflow's declared stages (SPEC §5), or the software-dev default.
@@ -2542,12 +2562,12 @@ function pipelineLarge(v) {
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
 function wireOrgControls() {
   const main = $('#main');
-  // Saved-view chips: each selects a query; "All" is the default tag-grouped view.
+  // Saved-view chips: each selects a query; "All" is the default (empty) view.
   main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === '__all__') { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); return; }
+      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
       if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
@@ -2566,21 +2586,21 @@ function wireOrgControls() {
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
-        if (S.activeView === id) { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); } else renderMain();
+        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
   $('#manage-tags')?.addEventListener('click', openTagsManager);
-  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
     search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search !== DEFAULT_TASK_QUERY) { e.stopPropagation(); S.activeView = null; setQuery(DEFAULT_TASK_QUERY); } });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
   }
 
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => { S.activeView = null; setQuery(q); } });
@@ -3839,14 +3859,14 @@ function taskAttempts(v) {
     const committed = a.id === g.committedAttemptId;
     const selected = a.id === v.taskId;
     const status = av.status || (a.params?.draft ? 'waiting' : 'active');
-    return `<button type="button" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
+    return `<div role="button" tabindex="0" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-check">${selected ? '✓' : ''}</span>
       <span class="status-dot ${esc(status)}"></span>
       <b>Attempt ${a.attemptNumber || 1}</b>
       ${principal ? '<span class="chip">principal</span>' : ''}
       ${committed ? '<span class="chip done" title="Attempt has been irrevocably selected as the winner; sibling attempts will not be allowed to pass">jayadratha</span>' : ''}
-      <span class="attempt-stage">${esc(a.params?.draft ? 'draft' : stageLabel(av))}</span>
-    </button>`;
+      <span class="attempt-stage">${stageIndicator(a.params?.draft ? { ...av, state: { ...(av.state || {}), draft: true } } : av, a.id, true)}</span>
+    </div>`;
   }).join('');
   return `<div class="attempts"><div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span><button class="btn sm" id="add-attempt" ${g.committedAttemptId ? 'disabled title="An attempt has entered Merge"' : ''}>＋ New attempt</button></div>${rows}</div>`;
 }
@@ -3860,8 +3880,47 @@ function wireAttempts(v) {
       openTaskForm(draft.workflow, draft);
     } catch (e) { toast(e.message, true); }
   });
-  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', () => {
+  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', (event) => {
+    if (event?.target?.closest?.('[data-stage-move]')) return;
     if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+  }));
+  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('keydown', (event) => {
+    if ((event.key === 'Enter' || event.key === ' ') && !event.target.closest('[data-stage-move]')) {
+      event.preventDefault();
+      if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+    }
+  }));
+}
+
+function wireStageTransitions(v) {
+  document.querySelectorAll('[data-stage-move]').forEach((select) => select.addEventListener('change', async (event) => {
+    event.stopPropagation();
+    const target = select.value;
+    if (!target) return;
+    const taskId = select.dataset.stageMove;
+    const attempt = S.attemptGroup?.attempts?.find((candidate) => candidate.id === taskId);
+    const sourceView = taskId === v.taskId ? v : attempt?.lastView || {};
+    const move = (sourceView.stageTransitions || []).find((candidate) => candidate.target === target);
+    const destructive = move?.danger;
+    if (destructive && !confirm(`${move.label} will permanently discard this attempt's existing execution progress. Continue?`)) {
+      select.value = '';
+      return;
+    }
+    select.disabled = true;
+    try {
+      await api(`/api/tasks/${taskId}/stage`, { method: 'POST', body: JSON.stringify({ target }) });
+      toast(`Moved to ${move?.label || target}`);
+      await refreshTasks();
+      if (taskId === v.taskId) await refreshTask();
+      else {
+        S.attemptGroup = await api(`/api/tasks/${v.taskId}/attempts`);
+        renderTaskPage();
+      }
+    } catch (error) {
+      select.disabled = false;
+      select.value = '';
+      toast(error.message, true);
+    }
   }));
 }
 
@@ -4181,7 +4240,7 @@ function renderTaskPage() {
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
           ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
-          <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
+          ${stageIndicator(v, v.taskId)}
         </div>
         <div class="meta">
           <span>${v.workflowOptions?.length > 1
@@ -4214,6 +4273,7 @@ function renderTaskPage() {
     }),
   );
   wireAttempts(v);
+  wireStageTransitions(v);
   wireWorkflowMode(v);
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab

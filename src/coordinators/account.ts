@@ -20,6 +20,7 @@ import {
   UPD_REPORT_EXHAUSTED,
   UPD_SET_ACCOUNT_AVAILABILITY,
   QRY_ACCOUNTS,
+  QRY_ACCOUNT_LEASE,
 } from './names.js';
 
 /**
@@ -119,6 +120,10 @@ export const setAccountAvailabilitySignal = defineSignal<[{ accountId: string; s
 export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; window: LimitWindow; resetAt: number; note?: string }]>(UPD_REPORT_EXHAUSTED);
 export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
+export const accountLeaseQuery = defineQuery<
+  { waiting: boolean },
+  [{ taskId: string; turnId: string }]
+>(QRY_ACCOUNT_LEASE);
 
 // A long backstop poll so the park loop periodically re-checks even absent a
 // signal; refresh timing itself is driven by each account's `resetAt`.
@@ -282,6 +287,9 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       note: a.note,
     })),
     waiting: queue.length,
+  }));
+  setHandler(accountLeaseQuery, ({ taskId, turnId }) => ({
+    waiting: queue.some((req) => req.taskId === taskId && req.turnId === turnId),
   }));
 
   for (;;) {

@@ -265,6 +265,30 @@ Stage-gated actions:
 - **In the merge queue:** position in queue, reorder / cancel-if-allowed.
 - **Post-merge:** read-only links to the PR and commit.
 
+The stage indicator is also the lifecycle-move control. Its choices are projected
+per attempt; the client never guesses routes from a stage name. The platform owns
+cross-cutting moves because it can see both workflow state and the intent's winner
+lease:
+
+- **Waiting for human input** is a resumable hold, not a pipeline stage. Moving
+  there stops the current agent/activity, withdraws agent/account/merge-queue
+  requests, preserves the world and conversation, and records the originating
+  stage. Resume returns to that exact stage.
+- **Done (manual)** performs the same stop/drain, records that it was manually
+  completed, and is reversible to its recorded origin. A naturally completed task
+  is immutable: it has no synthetic undo route.
+- **Cancelled** records the stage at which cancellation occurred. A resumable
+  workflow may be restarted at that stage; a destructive Draft reset remains the
+  safe fallback for workflows without a stage checkpoint.
+- **Draft** is destructive: the execution and world are stopped and removed, and
+  the next Setup recreates the task branch from its base. It is unavailable once
+  any attempt holds the monotonic Jayadratha winner lease. A human hold and manual
+  Done remain legal after that lease because neither permits a sibling to commit.
+
+Stopping a workflow execution alone is insufficient: termination cannot run its
+deterministic cleanup blocks. The platform therefore explicitly cancels every
+known coordinator request before projecting the replacement/terminal view.
+
 ### 5.6 Reference workflow code (illustrative)
 
 ```ts
@@ -379,7 +403,7 @@ either a leased subscription **config home** or an API-key **credential handle**
 
 **The workflow is the long-lived (but cheap) thing; the agent runs one turn at a time inside an activity (expensive, but ephemeral).** `runAgentTurn`:
 
-The task view reports the turn's resource boundaries separately: `waitingFor: account` while credential capacity is being leased, `waitingFor: agentSlot` / `agentTurn: waiting-slot` after the account grant while host admission is pending, and `agentTurn: running` only after the activity has acquired the host slot. The workflow publishes the post-grant transition immediately; it must not leave the last account-wait snapshot visible for the duration of a running turn.
+The task view reports the turn's resource boundaries separately: `waitingFor: account` only after the credential coordinator acknowledges that the request is genuinely parked, `waitingFor: agentSlot` while an immediately granted turn starts or host admission is pending, and `agentTurn: running` only after the activity has acquired the host slot. The workflow publishes the post-grant transition immediately; normal grant latency must say **Starting agent**, not flash a false login-availability wait or leave the last account-wait snapshot visible for the duration of a running turn.
 
 1. Spins up / resumes the agent session (via session/thread ID stored in workflow state).
 2. Lets the agent work until the provider emits a verified successful terminal event. Failed, interrupted, cancelled, truncated, or transport-ended terminal states throw even if partial text exists. Structured assistant errors (quota, authentication, billing, overload/server failure, output truncation) and provider-marked text-only API errors are classified before a later generic terminal result can erase their cause; recoverable infrastructure interruptions retry and resume the checkpointed provider session.

@@ -112,6 +112,8 @@ export interface WorldSpec {
   target?: string;
   /** Check out this existing branch instead of creating karmax/<taskId> (merge-only). */
   branch?: string;
+  /** Delete an existing task branch before provisioning it from `base`. */
+  resetBranch?: boolean;
   /** @deprecated Host-local compatibility input. Resource attachments replace
    * this for hosted/non-Git project state (SPEC §11.4). */
   copyGlobs?: string[];

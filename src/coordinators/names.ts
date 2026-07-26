@@ -50,6 +50,8 @@ export const SIG_SET_ACCOUNT_AVAILABILITY = 'setAccountAvailability';
 export const UPD_REPORT_EXHAUSTED = 'reportExhaustedSync';
 export const UPD_SET_ACCOUNT_AVAILABILITY = 'setAccountAvailabilitySync';
 export const QRY_ACCOUNTS = 'accounts';
+/** Acknowledges whether one exact lease request is still parked after enqueue. */
+export const QRY_ACCOUNT_LEASE = 'accountLease';
 
 export const SIG_REQUEST_SPEND = 'requestSpend';
 export const SIG_APPROVE_SPEND = 'approveSpend';
