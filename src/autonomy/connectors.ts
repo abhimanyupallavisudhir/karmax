@@ -231,10 +231,12 @@ export class PassConnector implements CredentialConnector {
   async list(): Promise<ExternalItem[]> {
     return (await this.entries()).map((entry) => {
       const slash = entry.lastIndexOf('/');
+      const { domain, username } = passEntryMetadata(entry);
       return { externalId: entry, type: 'login' as const,
         label: slash >= 0 ? entry.slice(slash + 1) : entry,
         folder: slash >= 0 ? entry.slice(0, slash) : '',
-        domains: [hostOf(entry)].filter(Boolean) as string[], fields: ['password'] as VaultFieldName[] };
+        domains: domain ? [domain] : [], ...(username ? { username } : {}),
+        fields: ['password'] as VaultFieldName[] };
     });
   }
   async pull(externalIds: string[]): Promise<ExternalSecretItem[]> {
@@ -260,7 +262,9 @@ export class PassConnector implements CredentialConnector {
       const otp = lines.slice(1).find((l) => l.trim().startsWith('otpauth://'))?.trim();
       const secrets: Partial<Record<VaultFieldName, string>> = { password };
       if (otp) secrets.totp = otp;
-      out.push({ externalId: id, type: 'login', label: id, domains: [hostOf(id)].filter(Boolean) as string[],
+      const { domain, username } = passEntryMetadata(id);
+      out.push({ externalId: id, type: 'login', label: id, domains: domain ? [domain] : [],
+        ...(username ? { username } : {}),
         fields: Object.keys(secrets) as VaultFieldName[], secrets });
     }
     return out;
@@ -355,6 +359,28 @@ function hostOf(value?: string): string {
   } catch {
     return '';
   }
+}
+
+/**
+ * `pass` has no schema: folders are commonly followed by a hostname and then
+ * a username (`software/www.overleaf.com/alice@example.com`). Treating the
+ * whole store path as a URL makes the first folder look like the host, which
+ * produces unusable and unsafe domain metadata. Find the first DNS-looking
+ * path component instead and use the final component as the username when it
+ * follows that host.
+ */
+function passEntryMetadata(entry: string): { domain?: string; username?: string } {
+  const parts = entry.split('/').map((part) => part.trim()).filter(Boolean);
+  const domainIndex = parts.findIndex((part) => {
+    if (part.includes('@') || part.startsWith('.') || !part.includes('.')) return false;
+    const host = hostOf(part);
+    return host === part.toLowerCase()
+      && host.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
+  });
+  if (domainIndex < 0) return {};
+  const domain = hostOf(parts[domainIndex]);
+  const username = domainIndex < parts.length - 1 ? parts.at(-1) : undefined;
+  return { domain, ...(username ? { username } : {}) };
 }
 
 // ── the registry + sync service (state in the store kv) ───────────────────────
@@ -481,6 +507,29 @@ export class Connectors {
     // Record the external id so a later re-sync updates rather than duplicates.
     this.items.setExternalId(item.id, result.externalId);
     return result;
+  }
+
+  /**
+   * Push a newly-created vault item to every connector whose write-back toggle
+   * is enabled. This is the automatic half of the signup contract: an agent
+   * only needs `vault:store`; it must not also need the administrative
+   * `credential:write` capability merely to honor an operator's existing
+   * connector policy. Failures are reported per connector while the karmax
+   * vault remains the durable source of truth.
+   */
+  async writeBackCreated(itemId: string): Promise<Array<{ connector: string; externalId?: string; error?: string }>> {
+    const results: Array<{ connector: string; externalId?: string; error?: string }> = [];
+    for (const name of this.names()) {
+      const connector = this.get(name);
+      if (!connector?.push || !this.config(name).writeBack) continue;
+      try {
+        const pushed = await this.writeBack(name, itemId);
+        if (pushed) results.push({ connector: name, externalId: pushed.externalId });
+      } catch (e) {
+        results.push({ connector: name, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return results;
   }
 
   /**

@@ -3006,7 +3006,22 @@ export class Gateway {
               propagated = { error: `vault updated, but pushing to the source store failed: ${e instanceof Error ? e.message : String(e)}` } as any;
             }
           }
-          return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields, ...(propagated ? { propagated } : {}) });
+          // A newly registered account follows the operator's connector
+          // write-back policy automatically. Requiring the task to call the
+          // administrative connector endpoint would make the advertised
+          // `vault:store` capability insufficient for its only purpose.
+          let writeBack: Array<{ connector: string; externalId?: string; error?: string }> = [];
+          if (!prior) {
+            const { defaultConnectors } = await import('../autonomy/connectors.js');
+            writeBack = await defaultConnectors(store, vault, this.deps.broker, organizationId).writeBackCreated(saved.id);
+            for (const result of writeBack) {
+              store.appendAudit({ principalId: callerTaskId ? `task:${callerTaskId}` : principal,
+                action: result.error ? 'vault.write_back.failed' : 'vault.write_back',
+                detail: { itemId: saved.id, ...result } });
+            }
+          }
+          return this.json(res, 200, { id: saved.id, label: saved.label, type: saved.type, fields: saved.fields,
+            ...(propagated ? { propagated } : {}), ...(writeBack?.length ? { writeBack } : {}) });
         }
         // Plaintext reveal (§5C) — per-item grant + reveal policy, audited.
         if (p === '/api/vault/resolve' && method === 'POST') {
@@ -3032,18 +3047,18 @@ export class Gateway {
           const decision = vault.access(caps, callerTaskId, item, 'use', { consume: true });
           if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
           const field = String(b.field ?? 'password');
-          const text = field === 'username'
-            ? item.username
-            : field === 'totp'
-              ? vault.totp(item, { taskId: callerTaskId, principal })
-              : vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' });
-          if (!text) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
+          if (field === 'username' && !item.username) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
+          if (field !== 'username' && !item.fields.includes(field as any)) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           try {
             const { fillViaCdp } = await import('../autonomy/fill.js');
             const filled = await fillViaCdp({
               cdpUrl: String(b.cdpUrl ?? 'http://127.0.0.1:9222'),
               selector: String(b.selector ?? ''),
-              text,
+              resolveText: () => field === 'username'
+                ? item.username!
+                : field === 'totp'
+                  ? vault.totp(item, { taskId: callerTaskId, principal })
+                  : vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' }),
               expectDomains: item.domains,
             });
             return this.json(res, 200, { status: 'granted', itemId: item.id, filled: true, origin: filled.origin });

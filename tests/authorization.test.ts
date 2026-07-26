@@ -21,6 +21,29 @@ describe('durable authorization policy', () => {
     expect(authz.defaultProfile('p2')).toBe('developer');
   });
 
+  it('migrates untouched legacy built-ins without overwriting customized profiles', () => {
+    const store = new Store(':memory:');
+    store.setAuthorizationProfile('global', {
+      id: 'developer', name: 'Developer', builtin: true,
+      description: 'Work with tasks, conversations, review actions, queues, and skills inside assigned projects.',
+      capabilities: [
+        'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read',
+        'credential:read', 'skill:write', 'resolve-decision', 'confirm-decision', 'merge-into:*',
+      ],
+    });
+    new AuthorizationService(store);
+    expect(store.getAuthorizationProfile('global', 'developer').capabilities).toEqual(
+      expect.arrayContaining(['vault:store', 'organization:read', 'repository:read']),
+    );
+
+    store.setAuthorizationProfile('global', {
+      id: 'maintainer', name: 'My maintainer', builtin: true, description: 'custom',
+      capabilities: ['project:read', 'task:read'],
+    });
+    new AuthorizationService(store);
+    expect(store.getAuthorizationProfile('global', 'maintainer').capabilities).toEqual(['project:read', 'task:read']);
+  });
+
   it('caps a requested task profile at the creator and records attenuation', () => {
     const store = new Store(':memory:');
     const authz = new AuthorizationService(store);
