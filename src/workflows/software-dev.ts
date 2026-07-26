@@ -215,6 +215,11 @@ export async function softwareDevV1_4(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.4.0');
 }
 
+/** Resumable platform lifecycle transitions (human hold / terminal restoration). */
+export async function softwareDevV1_5(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.5.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
@@ -223,16 +228,17 @@ export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: S
 
 async function softwareDevImpl(
   input: SoftwareDevInput,
-  behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0',
+  behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0',
 ): Promise<{ stage: Stage; sha?: string }> {
   const liveAgentStates = behaviorVersion !== '1.0.0';
   const providerTerminalCompletion =
-    behaviorVersion === '1.2.0' || behaviorVersion === '1.3.0' || behaviorVersion === '1.4.0';
-  const modeSwitching = behaviorVersion === '1.3.0' || behaviorVersion === '1.4.0';
-  const durableAgentAdmission = behaviorVersion === '1.4.0';
+    behaviorVersion === '1.2.0' || behaviorVersion === '1.3.0' || behaviorVersion === '1.4.0' || behaviorVersion === '1.5.0';
+  const modeSwitching = behaviorVersion === '1.3.0' || behaviorVersion === '1.4.0' || behaviorVersion === '1.5.0';
+  const durableAgentAdmission = behaviorVersion === '1.4.0' || behaviorVersion === '1.5.0';
   const taskId = input.taskId;
   const recovery = input.recovery;
-  let stage: Stage = recovery ? 'do' : 'setup';
+  const recoveryStage = recovery?.resumeStage ?? (recovery ? 'do' : 'setup');
+  let stage: Stage = recoveryStage;
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = recovery
     ? recovery.messages.map((m) => ({ ...m }))
@@ -245,6 +251,7 @@ async function softwareDevImpl(
   let confirmed = false;
   let cancelled = false;
   let retryRequested = false;
+  let humanPauseActive = !!recovery?.pausedForHuman;
   let world: WorldHandleLike | undefined = recovery?.world;
   let session: string | undefined = recovery?.session;
   // The config home that minted `session`. Provider sessions are login-bound, so a
@@ -257,6 +264,7 @@ async function softwareDevImpl(
   let agentTurnResumeStatus: TaskView['status'] = 'active';
   let reviewInfo: ReviewInfo | undefined = recovery?.reviewInfo;
   let error: string | undefined;
+  let terminalOrigin: Stage | undefined;
   let pr: { url: string; number: number } | undefined;
   let mergeQueuePos: { position: number; total: number } | undefined;
   // How many times we've re-prompted the agent to wait for its own in-harness
@@ -509,6 +517,8 @@ async function softwareDevImpl(
         // for a replacement run to OPEN this world; reconstructing it through
         // createWorld would force-remove the dirty worktree and lose work.
         recoveryWorld: world,
+        ...(terminalOrigin ? { cancelledFrom: terminalOrigin } : {}),
+        ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
       },
       branch: world?.branch,
       base,
@@ -1355,13 +1365,49 @@ async function softwareDevImpl(
   await publish();
   if (!world) {
     world = (await withResolve('setup', () =>
-      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind }),
+      core.createWorld({ taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress }),
     )) as WorldHandleLike;
   }
   // One-shot probe: does the account pool exist? (self-configuring; 0 = off)
   accountPool = await coord.accountPoolSize().catch(() => 0);
 
+  // A platform-requested human hold is deliberately outside the pipeline. Keep
+  // the originating stage visible, but park until the platform sends Retry to
+  // resume it. The replacement history owns no agent/queue activity while held.
+  if (recovery?.pausedForHuman) {
+    stage = recoveryStage;
+    status = 'waiting';
+    waitingFor = { kind: 'human', audience: ['@creator'], detail: `Paused during ${recoveryStage}` };
+    retryRequested = false;
+    await publish();
+    await condition(() => retryRequested || cancelled);
+    waitingFor = undefined;
+    if (cancelled) return await abort();
+    retryRequested = false;
+    status = 'active';
+    humanPauseActive = false;
+  }
+
+  // Restoring a cancelled/manual-done Review returns to the decision gate without
+  // rerunning completed Do work. Confirm advances; a follow-up returns to Do.
+  let restoredReviewApproved = false;
+  if (recoveryStage === 'review') {
+    stage = 'review';
+    status = 'waiting';
+    waitingFor = { kind: 'human', audience: ['@creator'], detail: 'Restored review' };
+    confirmed = false;
+    const reviewSeen = msgs.length;
+    await publish();
+    await condition(() => confirmed || cancelled || msgs.length > reviewSeen);
+    waitingFor = undefined;
+    if (cancelled) return await abort();
+    restoredReviewApproved = confirmed;
+    confirmed = restoredReviewApproved;
+    status = 'active';
+  }
+
   // ── Do ⇄ Review ──
+  if (!restoredReviewApproved && recoveryStage !== 'pr' && recoveryStage !== 'merge') {
   for (;;) {
     // Each iteration starts fresh in Do — clears any park state left by a prior
     // sub-task wait (status 'waiting'/waitingFor 'subtask').
@@ -1652,8 +1698,10 @@ async function softwareDevImpl(
       continue;
     }
   }
+  }
 
   // ── PR (optional) ──
+  if (recoveryStage !== 'merge') {
   stage = 'pr';
   status = 'active';
   await publish();
@@ -1664,6 +1712,7 @@ async function softwareDevImpl(
     await publish();
     const opened = await withResolve('pr', () => core.openPr(world as any, target));
     if (opened) pr = opened;
+  }
   }
 
   // ── Merge (point of no return) ──
@@ -1840,6 +1889,7 @@ async function softwareDevImpl(
 
   // ── helpers ──
   async function abort() {
+    terminalOrigin = stage;
     stage = 'cancelled';
     status = 'cancelled';
     await cancelChildren(liveAgentStates); // don't strand children when we go away

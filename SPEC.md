@@ -265,6 +265,30 @@ Stage-gated actions:
 - **In the merge queue:** position in queue, reorder / cancel-if-allowed.
 - **Post-merge:** read-only links to the PR and commit.
 
+The stage indicator is also the lifecycle-move control. Its choices are projected
+per attempt; the client never guesses routes from a stage name. The platform owns
+cross-cutting moves because it can see both workflow state and the intent's winner
+lease:
+
+- **Waiting for human input** is a resumable hold, not a pipeline stage. Moving
+  there stops the current agent/activity, withdraws agent/account/merge-queue
+  requests, preserves the world and conversation, and records the originating
+  stage. Resume returns to that exact stage.
+- **Done (manual)** performs the same stop/drain, records that it was manually
+  completed, and is reversible to its recorded origin. A naturally completed task
+  is immutable: it has no synthetic undo route.
+- **Cancelled** records the stage at which cancellation occurred. A resumable
+  workflow may be restarted at that stage; a destructive Draft reset remains the
+  safe fallback for workflows without a stage checkpoint.
+- **Draft** is destructive: the execution and world are stopped and removed, and
+  the next Setup recreates the task branch from its base. It is unavailable once
+  any attempt holds the monotonic Jayadratha winner lease. A human hold and manual
+  Done remain legal after that lease because neither permits a sibling to commit.
+
+Stopping a workflow execution alone is insufficient: termination cannot run its
+deterministic cleanup blocks. The platform therefore explicitly cancels every
+known coordinator request before projecting the replacement/terminal view.
+
 ### 5.6 Reference workflow code (illustrative)
 
 ```ts

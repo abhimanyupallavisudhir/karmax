@@ -2272,13 +2272,16 @@ function tasksView() {
   let body;
   if (groups) {
     body = r.hierarchical
-      ? groups.map((g) => tagGroupHtml(g, topLevel)).join('')
+      ? [
+        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => taskRow(t, { showTags: false })),
+        ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g, topLevel)),
+      ].join('')
       : groups.map((g) => {
         const gt = g.tasks.filter(topLevel);
-        return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
+        return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => taskRow(t)).join('')}`;
       }).join('');
   } else {
-    body = flat.map(taskRow).join('');
+    body = flat.map((t) => taskRow(t)).join('');
   }
   const empty = S.search !== DEFAULT_TASK_QUERY
     ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
@@ -2316,18 +2319,18 @@ function tagGroupHtml(group, keep, depth = 0) {
   const tag = tagById(group.key);
   const level = Math.min(6, depth + 2);
   const edit = tag
-    ? `<button class="icon-btn tag-section-edit" data-edit-tag="${esc(tag.id)}" title="Edit ${esc(group.path || group.label)}" aria-label="Edit tag">✎</button>`
+    ? `<button class="tag-section-edit" data-edit-tag="${esc(tag.id)}" title="Edit ${esc(group.path || group.label)}" aria-label="Edit tag">Edit</button>`
     : '';
   const description = tag?.description
-    ? `<div class="tag-section-description">${esc(tag.description)}</div>`
+    ? `<p class="tag-section-description">${esc(tag.description)}</p>`
     : '';
   return `<section class="tag-section tag-depth-${Math.min(depth, 5)}" id="${esc(tagSectionId(group.key))}" data-tag-section="${esc(group.key)}">
     <h${level} class="tag-section-heading" tabindex="-1">
       <span class="tag-section-name">${esc(group.label)}</span>
-      <span class="pill">${count}</span>${edit}
+      <span class="tag-section-count">${count} task${count === 1 ? '' : 's'}</span>${edit}
     </h${level}>
     ${description}
-    <div class="tag-section-tasks">${ownTasks.map(taskRow).join('')}</div>
+    <div class="tag-section-tasks">${ownTasks.map((t) => taskRow(t, { showTags: false })).join('')}</div>
     <div class="tag-section-children">${children}</div>
   </section>`;
 }
@@ -2408,7 +2411,7 @@ function runSubRow(r) {
     </div>`;
 }
 
-function taskRow(t) {
+function taskRow(t, { showTags = true } = {}) {
   const isDraft = t.params?.draft;
   if (t.params?.repeatable) return seriesRow(t);
   if (t.params?.triggerState === 'armed') {
@@ -2431,7 +2434,7 @@ function taskRow(t) {
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${tagChips(t)}</div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Queue</button>
@@ -2457,7 +2460,7 @@ function taskRow(t) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
-          ${priorityFlag(t)}${tagChips(t)}
+          ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>
@@ -2484,6 +2487,22 @@ function stageLabel(v) {
   const stage = v.stage || 'setup';
   if (stage === 'merge' && !v.state?.mergeGranted) return 'merge queued';
   return stage;
+}
+
+// The stage indicator is also the lifecycle control. The server supplies the
+// exact moves for this attempt, so siblings may legitimately have different
+// menus (e.g. the Jayadratha winner vs a superseded/cancelled attempt).
+function stageIndicator(v, taskId, compact = false) {
+  const moves = v.stageTransitions || [];
+  const label = stageLabel(v);
+  if (!moves.length) return `<span class="chip ${esc(v.status || '')}">${esc(label)}</span>`;
+  return `<label class="stage-picker${compact ? ' compact' : ''}" title="Move this attempt to another stage">
+    <span class="sr-only">Move ${esc(label)} stage</span>
+    <select data-stage-move="${esc(taskId)}" aria-label="Move attempt from ${esc(label)}">
+      <option value="" selected>${esc(label)} ▾</option>
+      ${moves.map((move) => `<option value="${esc(move.target)}" ${move.danger ? 'data-danger="true"' : ''}>→ ${esc(move.label)}</option>`).join('')}
+    </select>
+  </label>`;
 }
 
 // The workflow's declared stages (SPEC §5), or the software-dev default.
@@ -3763,14 +3782,14 @@ function taskAttempts(v) {
     const committed = a.id === g.committedAttemptId;
     const selected = a.id === v.taskId;
     const status = av.status || (a.params?.draft ? 'waiting' : 'active');
-    return `<button type="button" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
+    return `<div role="button" tabindex="0" class="attempt-card${principal ? ' principal' : ''}${selected ? ' selected' : ''}" data-attempt-select="${a.id}" ${selected ? 'aria-current="true"' : ''}>
       <span class="attempt-check">${selected ? '✓' : ''}</span>
       <span class="status-dot ${esc(status)}"></span>
       <b>Attempt ${a.attemptNumber || 1}</b>
       ${principal ? '<span class="chip">principal</span>' : ''}
       ${committed ? '<span class="chip done" title="Attempt has been irrevocably selected as the winner; sibling attempts will not be allowed to pass">jayadratha</span>' : ''}
-      <span class="attempt-stage">${esc(a.params?.draft ? 'draft' : stageLabel(av))}</span>
-    </button>`;
+      <span class="attempt-stage">${stageIndicator(a.params?.draft ? { ...av, state: { ...(av.state || {}), draft: true } } : av, a.id, true)}</span>
+    </div>`;
   }).join('');
   return `<div class="attempts"><div class="attempts-head"><span>${g.attempts.length} attempt${g.attempts.length === 1 ? '' : 's'}</span><button class="btn sm" id="add-attempt" ${g.committedAttemptId ? 'disabled title="An attempt has entered Merge"' : ''}>＋ New attempt</button></div>${rows}</div>`;
 }
@@ -3784,8 +3803,47 @@ function wireAttempts(v) {
       openTaskForm(draft.workflow, draft);
     } catch (e) { toast(e.message, true); }
   });
-  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', () => {
+  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('click', (event) => {
+    if (event?.target?.closest?.('[data-stage-move]')) return;
     if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+  }));
+  document.querySelectorAll('[data-attempt-select]').forEach((button) => button.addEventListener('keydown', (event) => {
+    if ((event.key === 'Enter' || event.key === ' ') && !event.target.closest('[data-stage-move]')) {
+      event.preventDefault();
+      if (button.dataset.attemptSelect !== v.taskId) openTask(button.dataset.attemptSelect, S.taskTab, true);
+    }
+  }));
+}
+
+function wireStageTransitions(v) {
+  document.querySelectorAll('[data-stage-move]').forEach((select) => select.addEventListener('change', async (event) => {
+    event.stopPropagation();
+    const target = select.value;
+    if (!target) return;
+    const taskId = select.dataset.stageMove;
+    const attempt = S.attemptGroup?.attempts?.find((candidate) => candidate.id === taskId);
+    const sourceView = taskId === v.taskId ? v : attempt?.lastView || {};
+    const move = (sourceView.stageTransitions || []).find((candidate) => candidate.target === target);
+    const destructive = move?.danger;
+    if (destructive && !confirm(`${move.label} will permanently discard this attempt's existing execution progress. Continue?`)) {
+      select.value = '';
+      return;
+    }
+    select.disabled = true;
+    try {
+      await api(`/api/tasks/${taskId}/stage`, { method: 'POST', body: JSON.stringify({ target }) });
+      toast(`Moved to ${move?.label || target}`);
+      await refreshTasks();
+      if (taskId === v.taskId) await refreshTask();
+      else {
+        S.attemptGroup = await api(`/api/tasks/${v.taskId}/attempts`);
+        renderTaskPage();
+      }
+    } catch (error) {
+      select.disabled = false;
+      select.value = '';
+      toast(error.message, true);
+    }
   }));
 }
 
@@ -4105,7 +4163,7 @@ function renderTaskPage() {
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
           ${currentAttempt ? `<span class="chip attempt-current">Attempt ${currentAttempt.attemptNumber || 1} of ${S.attemptGroup.attempts.length}</span>` : ''}
-          <span class="chip ${v.status}">${esc(stageLabel(v))}</span>
+          ${stageIndicator(v, v.taskId)}
         </div>
         <div class="meta">
           <span>${v.workflowOptions?.length > 1
@@ -4138,6 +4196,7 @@ function renderTaskPage() {
     }),
   );
   wireAttempts(v);
+  wireStageTransitions(v);
   wireWorkflowMode(v);
   wireActions(v); // the footer action bar lives on every tab
   wireTaskOrg(v); // priority/tags editor lives in the header now — present on every tab
