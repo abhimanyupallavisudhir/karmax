@@ -326,8 +326,11 @@ A scarce shared resource is owned by a **singleton coordinator workflow** with a
 - One host-wide singleton, `agent-queue`, leases capacity only around model subprocesses; workflows waiting at Review, on accounts, timers, or I/O do not consume it.
 - Capacity defaults to 3 and is persisted as **Organization settings → Host capacity → Concurrent agent turns**, explicitly labeled installation-wide. `KARMAX_MAX_ACT` remains a distinct worker-throughput limit for all activities, and per-login concurrency remains an account-pool limit.
 - Waiting turns and active leases are explicit coordinator state. The coordinator contributes the reorderable **Agent queue** to the host-owned **Queues** page alongside the merge queue.
+- Admission is a non-blocking durable handshake: the coordinator immediately acknowledges enqueue/position, then signals the owning task when capacity is granted. A queued turn never holds a long-running Workflow Update open.
+- Before enqueue acknowledgement the task says **Starting agent**. Only an acknowledged queue wait says **Waiting for host capacity**; post-grant memory/load backpressure names that live host condition separately.
 - The worker applies live free-memory/load gates after lease grant. Those adaptive safety checks are separate from the configured counting-semaphore capacity because only an activity can inspect live host resources.
-- Current turns enroll by stable turn ID at the existing activity boundary, preserving replay compatibility for workflow histories recorded before this coordinator existed. Dead-task leases are reclaimed after a liveness check.
+- Current task-workflow versions own the stable turn-ID lease across activity retries. Historical versions retain activity-boundary enrollment for replay compatibility. Dead-task leases are reclaimed after a liveness check.
+- The coordinator follows Temporal's continue-as-new recommendation (with a low admission-count fallback), carrying queued and active leases into the new run. Active model turns therefore cannot pin an oversized coordinator history.
 
 ### 6.2 Token / account coordinator
 

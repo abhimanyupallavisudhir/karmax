@@ -310,6 +310,10 @@ export interface RunAgentTurnArgs {
   accountApiKeyHandle?: string;
   /** Workflow-generated id used to correlate live admission/running signals. */
   agentTurnId?: string;
+  /** Current workflow versions acquire/release the durable queue lease themselves. */
+  agentSlotGranted?: boolean;
+  /** Current workflow versions own admission, including the remote-rail exemption. */
+  agentAdmissionManaged?: boolean;
 }
 
 export interface PrepareChildArgs {
@@ -611,6 +615,38 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async resolveProvider(args: { role: AgentRole; task: TaskInput }): Promise<string> {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
       return applyAgentSpec(baseProfile, args.task.agents?.[args.role]).provider;
+    },
+
+    /** Whether this turn consumes host model-process capacity. Remote subscription
+     * CLIs run inside their provider world; local turns and API rails run here. */
+    async agentUsesHostCapacity(args: {
+      role: AgentRole;
+      task: TaskInput;
+      worldHandle: WorldHandle;
+      accountConfigHome?: string;
+      accountApiKeyHandle?: string;
+    }): Promise<boolean> {
+      if (!isRemote(args.worldHandle.kind)) return true;
+      const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
+      const profile = applyAgentSpec(baseProfile, args.task.agents?.[args.role]);
+      const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
+      const effAuth = organizationId === 'org_personal'
+        ? profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider, credentialProvider(profile))
+        : undefined;
+      const explicitApiKey =
+        (!!args.accountApiKeyHandle && !!deps.broker)
+        || (!args.accountConfigHome && effAuth?.kind === 'apiKeyHandle' && !!effAuth.handle && !!deps.broker);
+      const hasConfigHome =
+        !!args.accountConfigHome
+        || (!args.accountApiKeyHandle && effAuth?.kind === 'configHome');
+      const ambientApiKey =
+        !explicitApiKey
+        && !hasConfigHome
+        && (
+          (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
+          || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+        );
+      return explicitApiKey || ambientApiKey;
     },
 
     /** The ordered, enabled credential keys for a turn's provider, per the credential
@@ -1105,8 +1141,36 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // call ONLY — the setup above is cheap — and released in `finally` below.
       let releaseSlot: () => void | Promise<void> = () => {};
       let lastEmit: string | undefined;
+      let lastPressureDetail: string | undefined;
       let result;
       try {
+        const signalTurnState = async (
+          state: 'running' | 'waiting-host',
+          detail?: string,
+        ): Promise<void> => {
+          if (!deps.client || !args.agentTurnId) return;
+          await deps.client.workflow
+            .getHandle(args.taskId)
+            .signal(SIG_AGENT_TURN_STATE, {
+              turnId: args.agentTurnId,
+              role: args.role,
+              provider: profile.provider,
+              state,
+              ...(detail ? { detail } : {}),
+            })
+            .catch(() => undefined);
+        };
+        const publishPressure = async (state: { memoryTight: boolean; loadHigh: boolean }) => {
+          const detail =
+            state.memoryTight && state.loadHigh
+              ? 'Waiting for host memory and load to start agent'
+              : state.memoryTight
+                ? 'Waiting for host memory to start agent'
+                : 'Waiting for host load to start agent';
+          if (detail === lastPressureDetail) return;
+          lastPressureDetail = detail;
+          await signalTurnState('waiting-host', detail);
+        };
         // Remote subscription CLIs consume provider-world CPU/RAM, not host
         // capacity. API rails and local subprocesses retain the host admission
         // queue; account-level concurrency is enforced separately for every rail.
@@ -1115,7 +1179,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Current workflows carry a stable turn id, so the activity enrolls that
           // turn in the durable/reorderable coordinator before starting the model.
           // Historical executions lack the id and retain the replay-safe file gate.
-          if (args.agentTurnId && deps.client && deps.taskQueue) {
+          if (args.agentAdmissionManaged) {
+            if (!args.agentSlotGranted)
+              throw new AgentAdmissionInfrastructureError('host-running turn started without its durable agent-slot grant');
+            await awaitAgentResources(heartbeat, signal, publishPressure);
+          } else if (args.agentTurnId && deps.client && deps.taskQueue) {
             releaseSlot = await acquireWorkflowAgentSlot({
               client: deps.client,
               taskQueue: deps.taskQueue,
@@ -1130,7 +1198,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               signal,
             });
             try {
-              await awaitAgentResources(heartbeat, signal);
+              await awaitAgentResources(heartbeat, signal, publishPressure);
             } catch (e) {
               await releaseSlot();
               releaseSlot = () => {};
@@ -1140,12 +1208,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         // The workflow publishes `waiting-slot` immediately after the account grant;
         // only admission itself can truthfully report that the model is now running.
-        if (deps.client && args.agentTurnId) {
-          await deps.client.workflow
-            .getHandle(args.taskId)
-            .signal(SIG_AGENT_TURN_STATE, { turnId: args.agentTurnId, role: args.role, provider: profile.provider, state: 'running' })
-            .catch(() => undefined);
-        }
+        await signalTurnState('running');
         publishLegacyAgentState('running');
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,

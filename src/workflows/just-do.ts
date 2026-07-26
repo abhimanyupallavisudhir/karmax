@@ -44,12 +44,21 @@ export async function justDo(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, true);
 }
 
+/** Durable non-blocking host admission. */
+export async function justDoV1_2(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, true, true);
+}
+
 /** Immutable replay entry for executions pinned to justDo@1.0.0. */
 export async function justDoV1(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, false);
 }
 
-async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ stage: Stage }> {
+async function justDoImpl(
+  input: TaskInput,
+  managedTurns: boolean,
+  durableAdmission = false,
+): Promise<{ stage: Stage }> {
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -93,13 +102,14 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
         taskId,
         projectId: input.projectId,
         task: () => input,
+        world: () => world,
         status: () => status,
         setStatus: (next) => { status = next; },
         setWaitingFor: (next) => { waitingFor = next; },
         setAgentTurn: (next) => { agentTurn = next; },
         cancelled: () => cancelled,
         publish,
-      })
+      }, durableAdmission)
     : undefined;
 
   /** Run one Confirm-agent turn (SPEC §5.2): review the work, return a verdict, or
@@ -112,7 +122,13 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
       const task = layerSpec.provider ? { ...input, agents: { ...(input.agents ?? {}), confirm: { ...layerSpec, provider: layerSpec.provider } } } : input;
       // A fresh turn each Review so the reviewer judges the current work (up-to-date
       // system prompt); a mid-turn retry still resumes via runAgentTurn heartbeat details.
-      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+      const invoke = (lease?: {
+        accountConfigHome?: string;
+        accountApiKeyHandle?: string;
+        agentTurnId: string;
+        agentAdmissionManaged?: true;
+        agentSlotGranted?: true;
+      }) =>
         turns.runAgentTurn({
           taskId,
           role: 'confirm',
@@ -174,7 +190,13 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     try {
       // On resume the session already holds the first `seen` messages, so send only
       // the delta after them (a follow-up), not the whole conversation again.
-      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+      const invoke = (lease?: {
+        accountConfigHome?: string;
+        accountApiKeyHandle?: string;
+        agentTurnId: string;
+        agentAdmissionManaged?: true;
+        agentSlotGranted?: true;
+      }) =>
         turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input, ...(lease ? lease : {}) });
       turn = leaser ? await leaser.run('do', invoke) : await invoke();
     } catch (err) {
