@@ -9,6 +9,8 @@ import type { World, WorldHandle, WorldKind, WorldRepo } from './types.js';
 import { worldRepos, worldRepoSource } from './types.js';
 import type { WorldRegistry } from './registry.js';
 import { newId } from '../util/id.js';
+import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
+import { destroyWorldServices } from './services.js';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -21,7 +23,8 @@ interface PortableDelta { version: 1; files: DeltaFile[] }
  * fast path; this encrypted delta plus the broker-pushed branch is portable. */
 export class WorldCheckpointService {
   constructor(private store: Store, private worlds: WorldRegistry, private objects: ObjectStore,
-    private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService) {
+    private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
+    private resources?: import('./resources.js').ProjectResourceService) {
     if (!broker.hasHandle(CHECKPOINT_KEY_HANDLE))
       broker.registerHandle(CHECKPOINT_KEY_HANDLE, crypto.randomBytes(32).toString('base64'));
   }
@@ -36,12 +39,21 @@ export class WorldCheckpointService {
     const linked = this.store.listProjectRepositories(projectId);
     const files: DeltaFile[] = [];
     const repos: WorldCheckpoint['repos'] = [];
+    const resourceRefs = await this.resources?.checkpoint(handle) ?? [];
+    const resourcePaths = Object.values((handle.meta?.resourceProjections ?? {}) as Record<string, { target?: string }>)
+      .map((projection) => projection.target).filter((value): value is string => Boolean(value));
+    const ephemeralPaths = new Set(Array.isArray(handle.meta?.ephemeralPaths)
+      ? handle.meta.ephemeralPaths.filter((value): value is string => typeof value === 'string')
+      : []);
     for (const repo of worldRepos(world.handle)) {
       const status = await world.exec('git', ['status', '--porcelain=v1', '-z'], { cwd: repo.root });
       if (status.code !== 0) throw new Error(`could not inspect ${repo.name}: ${status.stderr || status.stdout}`);
       for (const change of parseStatus(status.stdout)) {
-        if (change.path === '.env' || change.path.startsWith('.karmax-injection/')) continue;
         const relative = worldRepos(world.handle).length > 1 ? `${repo.name}/${change.path}` : change.path;
+        // Legacy copyGlobs and broker materializations are inputs, never project
+        // data. Do not make them portable merely because they are untracked.
+        if (change.path === '.env' || change.path.startsWith('.karmax-injection/') || ephemeralPaths.has(relative)
+          || resourcePaths.some((target) => relative === target || relative.startsWith(`${target}/`))) continue;
         if (change.deleted) files.push({ repo: repo.name, path: change.path, deleted: true });
         else {
           const data = await world.readFileBuffer(relative);
@@ -64,7 +76,10 @@ export class WorldCheckpointService {
     const checkpoint: WorldCheckpoint = {
       id: checkpointId, worldId: handle.id, generation: handle.generation ?? 1, projectId,
       runnerPoolId: handle.runnerPoolId ?? 'local', environmentDigest: handle.environmentDigest ?? 'karmax-local',
-      repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length }, createdAt: Date.now(),
+      repos, filesystemDelta: { objectKey, sha256: sha256(encrypted), bytes: encrypted.length },
+      ...(resourceRefs.length ? { resources: resourceRefs } : {}),
+      ...snapshotProjectRuntime(this.store, projectId),
+      createdAt: Date.now(),
     };
     this.store.saveWorldCheckpoint(checkpoint);
     this.store.attachWorldCheckpoint(handle, checkpoint.id);
@@ -72,6 +87,7 @@ export class WorldCheckpointService {
       provider: handle.kind, kind: 'checkpoint.storage', quantity: encrypted.length, unit: 'byte-second', costMicros: 0,
       startedAt: checkpoint.createdAt, endedAt: checkpoint.createdAt,
       metadata: { checkpointId, generation: checkpoint.generation } });
+    await this.resources?.scrubSecrets(handle);
     return checkpoint;
   }
 
@@ -89,6 +105,8 @@ export class WorldCheckpointService {
     const sources = checkpoint.repos.map((repo, index) => repositories[index]?.sshUrl ?? project.config.repos?.[index]);
     if (sources.some((source) => !source)) throw new Error('checkpoint repository enrollment is missing');
     const selected = provider ?? executionConfig.worldProvider ?? 'worktree';
+    const environment = selectProjectEnvironment(this.store, checkpoint.projectId, selected,
+      executionConfig.environment, checkpoint.environment);
     const primary = checkpoint.repos[0];
     const linked = this.store.listProjectRepositories(checkpoint.projectId);
     const repositoryBranches = Object.fromEntries(linked.map((candidate) => {
@@ -101,26 +119,39 @@ export class WorldCheckpointService {
       repos: sources as string[], base: project.config.defaultBase ?? 'main', target: project.config.defaultTarget,
       branch: primary?.branch, ...(cloneCredentials ? { gitCredentials: { repositories: cloneCredentials } } : {}),
       ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
-      network: executionConfig.network, environment: executionConfig.environment, resources: executionConfig.resources });
-    for (const file of delta.files) {
-      const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
-      if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
-      else {
-        const content = Buffer.from(file.data ?? '', 'base64');
-        if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
-        else await world.writeFile(relative, content.toString('utf8'));
-      }
-    }
-    let registered: WorldHandle;
+      network: executionConfig.network, environment: environment.environment, resources: executionConfig.resources });
     try {
-      registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
-        { runnerPoolId: checkpoint.runnerPoolId, environmentDigest: checkpoint.environmentDigest }) as WorldHandle;
+      if (this.resources) {
+        const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
+        world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
+          checkpoint.generation + 1, revisions);
+      }
+      for (const file of delta.files) {
+        const relative = checkpoint.repos.length > 1 ? `${file.repo}/${file.path}` : file.path;
+        if (file.deleted) await world.exec('rm', ['-f', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
+        else {
+          const content = Buffer.from(file.data ?? '', 'base64');
+          if (world.writeFileBuffer) await world.writeFileBuffer(relative, content);
+          else await world.writeFile(relative, content.toString('utf8'));
+        }
+      }
+      const runtime = await activateProjectRuntime({ world, store: this.store, projectId: checkpoint.projectId,
+        taskId: checkpoint.worldId, selection: environment, resources: this.resources,
+        services: checkpoint.services, runSetupIfUnbuilt: true });
+      world.handle = runtime.handle;
+      if (runtime.warnings.length)
+        world.handle.warnings = [...(world.handle.warnings ?? []), ...runtime.warnings];
+      const registered = this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
+        { runnerPoolId: checkpoint.runnerPoolId,
+          environmentDigest: environment.digest ?? checkpoint.environmentDigest }) as WorldHandle;
+      world.handle = registered;
+      return registered;
     } catch (error) {
+      await this.resources?.release(world.handle).catch(() => undefined);
+      await destroyWorldServices(checkpoint.worldId).catch(() => undefined);
       await world.destroy().catch(() => undefined);
       throw error;
     }
-    world.handle = registered;
-    return registered;
   }
 
   private key(): Buffer {

@@ -58,6 +58,11 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.payments).toContain('GET|POST /api/cards');
     expect(catalog.cloud).toContain('GET /api/organizations/:organizationId/world-providers');
     expect(catalog.cloud).toContain('GET|PUT /api/organizations/:organizationId/execution-policy');
+    expect(catalog.sourceControl).toContain('GET|PUT /api/projects/:projectId/repository-sources');
+    expect(catalog.sourceControl).toContain('GET|POST /api/projects/:projectId/repositories');
+    expect(catalog.projects).toContain('GET|POST /api/projects/:projectId/secrets');
+    expect(catalog.projects).toContain('GET|POST|DELETE /api/projects/:projectId/services');
+    expect(catalog.projects).toContain('GET|PUT /api/projects/:projectId/environment');
   });
 
   it('does not expose direct cross-world filesystem inspection', async () => {

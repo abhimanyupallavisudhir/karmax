@@ -4,7 +4,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
-import { worldRepos } from './types.js';
+import { worldRepos, worldRepoTarget } from './types.js';
 import { ensureIdentity, git, isGitRepo } from './git.js';
 import { finalizeMergeRepo, type MergeResult } from './merge.js';
 
@@ -296,7 +296,7 @@ export async function brokerFinalizeMerge(
   const landedFiles: string[] = [];
   let sha: string | undefined;
   for (const repo of repos) {
-    const repoTarget = repo.target ?? target;
+    const repoTarget = worldRepoTarget(repo, target);
     const dirty = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
     if (dirty.code !== 0) return { merged: false, landedFiles, note: `repo "${repo.name}": could not inspect worktree: ${dirty.stderr || dirty.stdout}` };
     if (dirty.stdout.trim()) {
@@ -367,7 +367,7 @@ export async function brokerOpenGithubPr(
   const repos = worldRepos(world.handle);
   const primary = repos[0];
   if (!primary) return null;
-  const primaryTarget = primary.target ?? target;
+  const primaryTarget = worldRepoTarget(primary, target);
   // Remote policy 'pr' explicitly sanctions the remote op, so the branch is
   // pushed to origin even for repos whose merges land in a local checkout.
   const published: string[] = [];

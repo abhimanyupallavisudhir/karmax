@@ -61,6 +61,14 @@ describe('remote subscription agents', () => {
       CLAUDE_CODE_OAUTH_TOKEN: 'subscription', KARMAX_TOKEN: 'turn-token',
       CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDE_AGENT_SDK_VERSION: '0.3.191',
     });
+    expect(remoteAgentEnv('claude', '/workspace/.karmax-injection/agent/claude', {
+      KARMAX_TOKEN: 'turn-token', DATABASE_URL: 'postgres://task-db',
+      HOST_ONLY: 'must-not-cross', CLAUDE_CONFIG_DIR: '/host/escape',
+    }, ['DATABASE_URL', 'CLAUDE_CONFIG_DIR'])).toEqual({
+      CLAUDE_CONFIG_DIR: '/workspace/.karmax-injection/agent/claude',
+      KARMAX_TOKEN: 'turn-token',
+      DATABASE_URL: 'postgres://task-db',
+    });
     expect(installedClaudeCodeVersion()).toBe('2.1.191');
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
       .toEqual(expect.arrayContaining(['@anthropic-ai/claude-code@2.1.191', '--print', '--resume', 's']));

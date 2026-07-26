@@ -59,6 +59,19 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(sdkState.options.mcpServers.karmax_control).toMatchObject({ type: 'sdk', name: 'karmax_control' });
   });
 
+  it('injects project secrets into the local agent subprocess without letting them shadow control env', async () => {
+    sdkState.messages = [{ type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' }];
+    await new ClaudeAdapter().runTurn({
+      ...input,
+      secretEnv: { DATABASE_URL: 'postgres://task-db', KARMAX_TOKEN: 'resource-value' },
+      extraEnv: { KARMAX_TOKEN: 'scoped-turn-token' },
+    }, ctx);
+    expect(sdkState.options.env).toMatchObject({
+      DATABASE_URL: 'postgres://task-db',
+      KARMAX_TOKEN: 'scoped-turn-token',
+    });
+  });
+
   it('stamps locally spawned Claude processes with inherited custody', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-claude-custody-'));
     const output = path.join(home, 'custody.txt');

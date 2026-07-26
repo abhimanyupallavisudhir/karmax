@@ -39,6 +39,8 @@ import { E2BWorldProvider } from './world/e2b.js';
 import { DaytonaWorldProvider } from './world/daytona.js';
 import { WorldHandoffService } from './world/handoff.js';
 import { WorldAccessService } from './world/access.js';
+import { ObjectSnapshotEngine, ProjectResourceService } from './world/resources.js';
+import { sweepOrphanedServiceContainers } from './world/services.js';
 
 const VERSION = '1.0.0';
 
@@ -139,10 +141,12 @@ async function main() {
         secretAccessKey: requiredEnv('KARMAX_S3_SECRET_ACCESS_KEY'), sessionToken: process.env.KARMAX_S3_SESSION_TOKEN,
       })
     : new LocalObjectStore(p.objects);
-  const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp);
+  const snapshotEngine = new ObjectSnapshotEngine(objectStore, broker);
+  const resources = new ProjectResourceService(store, worlds, snapshotEngine, broker, { client, taskQueue: TASK_QUEUE });
+  const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, resources);
   const runners = new RunnerPoolService(store);
-  const worldAccess = new WorldAccessService(store, worlds, runners);
-  const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess);
+  const worldAccess = new WorldAccessService(store, worlds, runners, resources);
+  const handoffs = new WorldHandoffService(store, worlds, githubApp, runners, worldAccess, p.localCheckouts, resources);
   const worldLifecycle = new WorldLifecycleManager(store, worlds, checkpoints, 60_000, objectStore, runners, worldAccess);
   const delivery = new DeliveryDispatcher(store, {
     browser: new BrowserDeliveryAdapter(),
@@ -192,6 +196,7 @@ async function main() {
     runners,
     payments,
     configHomes,
+    resources,
     contentDir: p.content,
     taskQueue: TASK_QUEUE,
   });
@@ -210,6 +215,8 @@ async function main() {
   const orphans = reapOrphans();
   if (orphans.reaped) console.log(`  • Reaped ${orphans.reaped} orphaned agent process tree(s) from a prior run`);
   if (orphans.skipped) console.log(`  • Left ${orphans.skipped} agent(s) owned by another live karmax instance untouched`);
+  const serviceOrphans = await sweepOrphanedServiceContainers((taskId) => store.worldState(taskId)).catch(() => 0);
+  if (serviceOrphans) console.log(`  • Reaped ${serviceOrphans} orphaned per-world service container(s)`);
   // A concurrently running dogfooding instance can die after this app has
   // already booted. Sweep periodically so its detached agent/tool descendants
   // do not wait until the next host restart to be reaped.
@@ -384,6 +391,7 @@ async function main() {
     runners,
     worldAccess,
     objects: objectStore,
+    resources,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
     remoteAccess,

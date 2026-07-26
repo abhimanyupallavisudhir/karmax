@@ -451,6 +451,21 @@ export class GitHubAppService {
       });
   }
 
+  /** Small tracked-file inspection path used by hosted onboarding proposals. */
+  async fileContents(repository: Repository, filePath: string): Promise<string | undefined> {
+    try {
+      if (!repository.gitConnectionId) return undefined;
+      const connection = this.store.getGitConnection(repository.gitConnectionId);
+      if (!connection) return undefined;
+      const token = await this.installationToken(connection);
+      const value = await this.request<{ content?: string; encoding?: string }>(
+        `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/contents/`
+        + filePath.split('/').map(encodeURIComponent).join('/'), token);
+      if (!value.content) return undefined;
+      return Buffer.from(value.content, (value.encoding as BufferEncoding) ?? 'base64').toString('utf8');
+    } catch { return undefined; }
+  }
+
   private appJwt(): string {
     if (!this.configured()) throw new Error('GitHub App is not configured');
     const now = Math.floor(Date.now() / 1000);

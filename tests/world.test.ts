@@ -158,6 +158,7 @@ describe('WorktreeProvider (real git)', () => {
     const provider = new WorktreeProvider(home);
     const world = await provider.create({ taskId: 'copy1', repo, base: 'main', copyGlobs: ['.env'] });
     expect(await world.readFile('.env')).toContain('SECRET=1');
+    expect(world.handle.meta?.ephemeralPaths).toEqual(['.env']);
     await world.destroy();
   });
 });

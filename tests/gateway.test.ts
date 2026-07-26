@@ -534,6 +534,121 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(typeof login.loggedIn).toBe('boolean');
   });
 
+  it('attaches redacted resources and completes a resumable binary upload', async () => {
+    const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Resource API' }) }).then((response) => response.json());
+    const secretResponse = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Token', driver: 'secret@1', target: { kind: 'environment', name: 'MODEL_TOKEN' },
+        access: 'read', isolation: 'fork', publish: 'discard', secret: 'never-return-this' }) });
+    expect(secretResponse.status).toBe(200);
+    const secret: any = await secretResponse.json();
+    expect(secret.credentialConfigured).toBe(true);
+    expect(JSON.stringify(secret)).not.toContain('never-return-this');
+    expect(secret.credentialHandles).toBeUndefined();
+
+    const volume: any = await fetch(`${base}/api/projects/${project.id}/resources`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Model', driver: 'volume@1', target: { kind: 'path', path: 'resources/model' },
+        access: 'write', isolation: 'fork', publish: 'review' }) }).then((response) => response.json());
+    const upload: any = await fetch(`${base}/api/projects/${project.id}/resources/${volume.id}/uploads`,
+      { method: 'POST', headers: auth() }).then((response) => response.json());
+    const bytes = Buffer.from('fine-tuned-model-weights');
+    const part = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}&path=model.bin&part=0`,
+      { method: 'PUT', headers: { ...auth(), 'content-type': 'application/octet-stream' }, body: bytes });
+    expect(part.status).toBe(200);
+    const complete = await fetch(`${base}/api/resource-uploads/${upload.id}?projectId=${project.id}`,
+      { method: 'POST', headers: auth() });
+    expect(complete.status).toBe(200);
+    const revision: any = await complete.json();
+    expect(revision.bytes).toBe(bytes.length);
+    expect(revision.sealedRef).toBeUndefined();
+    const listed = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() }).then((response) => response.json()) as any[];
+    expect(listed.find((resource) => resource.id === volume.id).revision.bytes).toBe(bytes.length);
+    expect(JSON.stringify(listed)).not.toContain('sealedRef');
+  });
+
+  it('offers proposal-driven secrets, environment, and per-world services over typed resources', async () => {
+    const repo = await h.makeRepo('project-onboarding');
+    fs.mkdirSync(`${repo}/.devcontainer`);
+    fs.writeFileSync(`${repo}/.env.example`, 'DATABASE_URL=\nMODEL_TOKEN=\n');
+    fs.writeFileSync(`${repo}/package-lock.json`, '{}');
+    fs.writeFileSync(`${repo}/.devcontainer/devcontainer.json`, JSON.stringify({
+      image: 'node:22-slim',
+      postCreateCommand: 'npm run setup',
+      dockerComposeFile: '../compose.yaml',
+    }));
+    fs.writeFileSync(`${repo}/compose.yaml`, `services:
+  database:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: local
+      POSTGRES_DB: app
+`);
+    await git(repo, ['add', '.']);
+    await git(repo, ['commit', '-m', 'add project declarations']);
+
+    const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Onboarding API', config: { repos: [repo], worldProvider: 'container' } }) })
+      .then((response) => response.json());
+
+    const suggested: any = await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })
+      .then((response) => response.json());
+    expect(suggested.suggestions).toEqual(['DATABASE_URL', 'MODEL_TOKEN']);
+    const imported = await fetch(`${base}/api/projects/${project.id}/secrets`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ env: 'MODEL_TOKEN=private-value\nDATABASE_URL=postgres://external' }) });
+    expect(imported.status).toBe(200);
+    expect(JSON.stringify(await imported.json())).not.toContain('private-value');
+
+    const proposal: any = await fetch(`${base}/api/projects/${project.id}/environment/proposal`, { headers: auth() })
+      .then((response) => response.json());
+    expect(proposal.spec).toMatchObject({ image: 'node:22-slim', setup: ['npm run setup', 'npm ci'] });
+    const savedEnvironment = await fetch(`${base}/api/projects/${project.id}/environment`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify(proposal.spec),
+    });
+    expect(savedEnvironment.status).toBe(200);
+
+    const compose: any = await fetch(`${base}/api/projects/${project.id}/services/compose-import`, { headers: auth() })
+      .then((response) => response.json());
+    expect(compose.proposals[0]).toMatchObject({
+      name: 'database', kind: 'per-world', image: 'postgres:16', containerPort: 5432,
+      urlEnv: 'DATABASE_URL',
+    });
+    const service = await fetch(`${base}/api/projects/${project.id}/services`, {
+      method: 'POST', headers: auth(), body: JSON.stringify(compose.proposals[0]),
+    });
+    expect(service.status).toBe(200);
+
+    const secrets: any = await fetch(`${base}/api/projects/${project.id}/secrets`, { headers: auth() })
+      .then((response) => response.json());
+    expect(secrets.suggestions).toEqual([]);
+    expect(secrets.secrets.every((secret: any) => secret.credentialConfigured)).toBe(true);
+    expect(JSON.stringify(secrets)).not.toContain('postgres://external');
+  });
+
+  it('migrates copyGlobs through the typed resource API and returns no secret values', async () => {
+    const repo = await h.makeRepo('copyglobs-api');
+    fs.writeFileSync(`${repo}/.env.local`, 'LEGACY_TOKEN=private-legacy-value\n');
+    fs.writeFileSync(`${repo}/model.bin`, Buffer.from([0, 1, 2, 255]));
+    const project: any = await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'copyGlobs migration', config: {
+        repos: [repo], copyGlobs: ['.env*', '*.bin'],
+      } }) }).then((response) => response.json());
+    const migrated = await fetch(`${base}/api/projects/${project.id}/resources/import-copyglobs`, {
+      method: 'POST', headers: auth(), body: '{}',
+    });
+    expect(migrated.status).toBe(200);
+    const result: any = await migrated.json();
+    expect(result).toMatchObject({ environmentSecrets: ['LEGACY_TOKEN'], data: ['model.bin'], skipped: [] });
+    expect(JSON.stringify(result)).not.toContain('private-legacy-value');
+    expect(h.store.getProject(project.id)?.config.copyGlobs).toEqual([]);
+    const attachments = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() })
+      .then((response) => response.json()) as any[];
+    expect(attachments.some((attachment) => attachment.target?.name === 'LEGACY_TOKEN')).toBe(true);
+    expect(attachments.some((attachment) => attachment.target?.path === 'model.bin'
+      && attachment.revision?.bytes === 4)).toBe(true);
+    expect(JSON.stringify(attachments)).not.toContain('private-legacy-value');
+  });
+
   it('seeds a brand-new project with the karmax-ready prep task', async () => {
     // A new project's tasks default to software-dev, so creation spawns that
     // workflow's current onActivate Goal prep task automatically (SPEC §4.6) —

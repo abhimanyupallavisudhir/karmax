@@ -107,12 +107,15 @@ export async function syncRemoteAgentHome(world: World, provider: Provider, remo
 }
 
 /** Minimal environment passed across the trust boundary. Authentication lives in
- * the seeded home; only explicit turn-scoped values and provider tuning cross. */
-export function remoteAgentEnv(provider: Provider, home: string, source: Record<string, string | undefined>): Record<string, string> {
+ * the seeded home; only explicit turn-scoped values and provider tuning cross.
+ * `forward` is the caller-vouched allowlist of project secret/service names. */
+export function remoteAgentEnv(provider: Provider, home: string, source: Record<string, string | undefined>,
+  forward: readonly string[] = []): Record<string, string> {
   const out: Record<string, string> = {
     ...(provider === 'claude' ? { CLAUDE_CONFIG_DIR: home } : { CODEX_HOME: home }),
   };
-  for (const key of [
+  const homeKey = provider === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME';
+  for (const key of new Set([
     'KARMAX_TOKEN', 'KARMAX_GATEWAY_URL', 'CLAUDE_CODE_OAUTH_TOKEN',
     // Agent SDK ↔ Claude Code protocol negotiation. Dropping ENTRYPOINT makes
     // the CLI reject stream-json input unless --print; the remaining flags are
@@ -121,7 +124,9 @@ export function remoteAgentEnv(provider: Provider, home: string, source: Record<
     'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING', 'CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH',
     'CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH', 'CLAUDE_CODE_QUESTION_PREVIEW_FORMAT',
     'ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
-  ]) {
+    ...forward.filter((name) => /^[A-Z_][A-Z0-9_]*$/.test(name)),
+  ])) {
+    if (key === homeKey) continue;
     const value = source[key];
     if (value) out[key] = value;
   }

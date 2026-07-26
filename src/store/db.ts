@@ -45,7 +45,11 @@ import {
   ExecutionFrame,
   PreviewLease,
   WorldHandleRef,
+  ResourceAttachment,
+  ResourceRevision,
+  ResourceLease,
 } from '../domain/types.js';
+import { resourceDriver } from '../domain/resource-drivers.js';
 import { newId } from '../util/id.js';
 
 export type CollaborationRequestStatus = 'pending' | 'completed' | 'failed';
@@ -263,6 +267,34 @@ export class Store {
         id TEXT PRIMARY KEY, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
         projectId TEXT NOT NULL, manifest TEXT NOT NULL, createdAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS resource_attachments (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
+        name TEXT NOT NULL, driver TEXT NOT NULL, target TEXT NOT NULL,
+        access TEXT NOT NULL, isolation TEXT NOT NULL, source TEXT NOT NULL,
+        credentialHandles TEXT NOT NULL, currentRevisionId TEXT, publish TEXT NOT NULL,
+        enabled INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        UNIQUE(projectId, name)
+      );
+      CREATE TABLE IF NOT EXISTS resource_revisions (
+        id TEXT PRIMARY KEY, attachmentId TEXT NOT NULL, parentRevisionId TEXT,
+        engine TEXT NOT NULL, sealedRef TEXT NOT NULL, rootDigest TEXT NOT NULL,
+        bytes INTEGER NOT NULL, files INTEGER, metadata TEXT, createdByTaskId TEXT,
+        createdAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resource_leases (
+        id TEXT PRIMARY KEY, attachmentId TEXT NOT NULL, revisionId TEXT,
+        taskId TEXT NOT NULL, worldId TEXT NOT NULL, worldGeneration INTEGER NOT NULL,
+        access TEXT NOT NULL, state TEXT NOT NULL, sealedDriverRef TEXT,
+        createdAt INTEGER NOT NULL, expiresAt INTEGER, releasedAt INTEGER,
+        UNIQUE(attachmentId, taskId, worldGeneration)
+      );
+      CREATE TABLE IF NOT EXISTS resource_snapshot_chunks (
+        organizationId TEXT NOT NULL,
+        chunkId TEXT NOT NULL,
+        refs INTEGER NOT NULL,
+        bytes INTEGER NOT NULL,
+        PRIMARY KEY(organizationId, chunkId)
+      );
       CREATE TABLE IF NOT EXISTS runner_pools (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL,
         provider TEXT NOT NULL, region TEXT, mode TEXT NOT NULL, capacity TEXT NOT NULL,
@@ -414,6 +446,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_scoped_tokens_expiry ON scoped_tokens(expiresAt);
       CREATE INDEX IF NOT EXISTS idx_world_instances_current ON world_instances(worldId, generation DESC);
       CREATE INDEX IF NOT EXISTS idx_checkpoints_world ON world_checkpoints(worldId, createdAt DESC);
+      CREATE INDEX IF NOT EXISTS idx_resource_attachments_project ON resource_attachments(projectId, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_resource_revisions_attachment ON resource_revisions(attachmentId, createdAt DESC);
+      CREATE INDEX IF NOT EXISTS idx_resource_leases_world ON resource_leases(worldId, worldGeneration);
       CREATE INDEX IF NOT EXISTS idx_runner_pools_org ON runner_pools(organizationId, enabled);
       CREATE INDEX IF NOT EXISTS idx_world_provider_connections_org ON world_provider_connections(organizationId, enabled);
       CREATE INDEX IF NOT EXISTS idx_world_leases_pool ON world_leases(runnerPoolId, state, priority DESC, createdAt);
@@ -708,6 +743,11 @@ export class Store {
       this.db.prepare('DELETE FROM principal_grants WHERE scopeKey=?').run(scopeKey);
       this.db.prepare('DELETE FROM audit_log WHERE scopeKey=?').run(scopeKey);
       this.db.prepare('DELETE FROM attachment_scopes WHERE projectId=?').run(id);
+      const resourceIds = (this.db.prepare('SELECT id FROM resource_attachments WHERE projectId=?').all(id) as any[])
+        .map((row) => String(row.id));
+      deleteRows(this.db, 'resource_leases', 'attachmentId', resourceIds);
+      deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds);
+      this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id);
       this.deleteProjectKv([id], taskIds);
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id);
@@ -775,6 +815,13 @@ export class Store {
       team_memberships: rowsFor(this.db, 'team_memberships', 'teamId', teamIds),
       team_aliases: rowsFor(this.db, 'team_aliases', 'teamId', teamIds),
       projects: rowsFor(this.db, 'projects', 'id', projectIds),
+      resource_attachments: rowsFor(this.db, 'resource_attachments', 'projectId', projectIds)
+        .map(({ credentialHandles: _handles, ...row }) => ({ ...row, credentialHandles: '[]' })),
+      resource_revisions: rowsFor(this.db, 'resource_revisions', 'attachmentId',
+        rowsFor(this.db, 'resource_attachments', 'projectId', projectIds).map((row) => String(row.id)))
+        .map(({ sealedRef: _sealedRef, ...row }) => row),
+      resource_leases: rowsFor(this.db, 'resource_leases', 'taskId', taskIds)
+        .map(({ sealedDriverRef: _sealed, ...row }) => row),
       project_memberships: rowsFor(this.db, 'project_memberships', 'projectId', projectIds),
       task_lists: rowsFor(this.db, 'task_lists', 'projectId', projectIds),
       tasks: rowsFor(this.db, 'tasks', 'projectId', projectIds),
@@ -2762,6 +2809,152 @@ export class Store {
       .run(scopeKey, workflow, JSON.stringify(values));
   }
 
+  // ─── Project resources ──────────────────────────────────────────────────
+
+  createResourceAttachment(input: Omit<ResourceAttachment, 'id' | 'createdAt' | 'updatedAt' | 'enabled'>
+    & Partial<Pick<ResourceAttachment, 'id' | 'createdAt' | 'updatedAt' | 'enabled'>>): ResourceAttachment {
+    if (!this.getProject(input.projectId)) throw new Error('resource project not found');
+    const now = input.createdAt ?? Date.now();
+    const value: ResourceAttachment = { ...input, id: input.id ?? newId('resource'), enabled: input.enabled ?? true,
+      createdAt: now, updatedAt: input.updatedAt ?? now };
+    validateResourceAttachment(value);
+    this.db.prepare(`INSERT INTO resource_attachments (id, organizationId, projectId, name, driver, target,
+      access, isolation, source, credentialHandles, currentRevisionId, publish, enabled, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId, value.projectId,
+        value.name, value.driver, JSON.stringify(value.target), value.access, value.isolation, JSON.stringify(value.source),
+        JSON.stringify(value.credentialHandles), value.currentRevisionId ?? null, value.publish, value.enabled ? 1 : 0,
+        value.createdAt, value.updatedAt);
+    return value;
+  }
+
+  getResourceAttachment(id: string): ResourceAttachment | undefined {
+    const row = this.db.prepare('SELECT * FROM resource_attachments WHERE id=?').get(id) as any;
+    return row ? resourceAttachmentRow(row) : undefined;
+  }
+
+  listResourceAttachments(projectId: string, includeDisabled = false): ResourceAttachment[] {
+    const rows = includeDisabled
+      ? this.db.prepare('SELECT * FROM resource_attachments WHERE projectId=? ORDER BY createdAt').all(projectId)
+      : this.db.prepare('SELECT * FROM resource_attachments WHERE projectId=? AND enabled=1 ORDER BY createdAt').all(projectId);
+    return (rows as any[]).map(resourceAttachmentRow);
+  }
+
+  updateResourceAttachment(id: string, patch: Partial<Pick<ResourceAttachment,
+    'name' | 'target' | 'access' | 'isolation' | 'source' | 'credentialHandles' | 'publish' | 'enabled'>>): ResourceAttachment {
+    const current = this.getResourceAttachment(id);
+    if (!current) throw new Error('resource attachment not found');
+    const next = { ...current, ...patch, updatedAt: Date.now() };
+    validateResourceAttachment(next);
+    this.db.prepare(`UPDATE resource_attachments SET name=?, target=?, access=?, isolation=?, source=?,
+      credentialHandles=?, publish=?, enabled=?, updatedAt=? WHERE id=?`).run(next.name, JSON.stringify(next.target),
+        next.access, next.isolation, JSON.stringify(next.source), JSON.stringify(next.credentialHandles), next.publish,
+        next.enabled ? 1 : 0, next.updatedAt, id);
+    return next;
+  }
+
+  deleteResourceAttachment(id: string): ResourceAttachment | undefined {
+    const value = this.getResourceAttachment(id);
+    if (!value) return undefined;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM resource_leases WHERE attachmentId=?').run(id);
+      this.db.prepare('DELETE FROM resource_revisions WHERE attachmentId=?').run(id);
+      this.db.prepare('DELETE FROM resource_attachments WHERE id=?').run(id);
+      this.db.exec('COMMIT');
+      return value;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  saveResourceRevision(input: Omit<ResourceRevision, 'id' | 'createdAt'>
+    & Partial<Pick<ResourceRevision, 'id' | 'createdAt'>>): ResourceRevision {
+    const value: ResourceRevision = { ...input, id: input.id ?? newId('revision'), createdAt: input.createdAt ?? Date.now() };
+    if (!this.getResourceAttachment(value.attachmentId)) throw new Error('resource attachment not found');
+    this.db.prepare(`INSERT INTO resource_revisions (id, attachmentId, parentRevisionId, engine, sealedRef,
+      rootDigest, bytes, files, metadata, createdByTaskId, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        value.id, value.attachmentId, value.parentRevisionId ?? null, value.engine, value.sealedRef, value.rootDigest,
+        value.bytes, value.files ?? null, jsonOrNull(value.metadata), value.createdByTaskId ?? null, value.createdAt);
+    return value;
+  }
+
+  getResourceRevision(id: string): ResourceRevision | undefined {
+    const row = this.db.prepare('SELECT * FROM resource_revisions WHERE id=?').get(id) as any;
+    return row ? resourceRevisionRow(row) : undefined;
+  }
+
+  listResourceRevisions(attachmentId: string): ResourceRevision[] {
+    return (this.db.prepare('SELECT * FROM resource_revisions WHERE attachmentId=? ORDER BY createdAt DESC').all(attachmentId) as any[])
+      .map(resourceRevisionRow);
+  }
+
+  promoteResourceRevision(attachmentId: string, revisionId: string, expectedRevisionId?: string): ResourceAttachment {
+    const revision = this.getResourceRevision(revisionId);
+    if (!revision || revision.attachmentId !== attachmentId) throw new Error('resource revision does not belong to attachment');
+    const now = Date.now();
+    const result = expectedRevisionId === undefined
+      ? this.db.prepare('UPDATE resource_attachments SET currentRevisionId=?, updatedAt=? WHERE id=? AND currentRevisionId IS NULL')
+        .run(revisionId, now, attachmentId)
+      : this.db.prepare('UPDATE resource_attachments SET currentRevisionId=?, updatedAt=? WHERE id=? AND currentRevisionId=?')
+        .run(revisionId, now, attachmentId, expectedRevisionId);
+    if (!Number(result.changes)) throw new Error('resource baseline changed before publish; review the newer revision and retry');
+    return this.getResourceAttachment(attachmentId)!;
+  }
+
+  createResourceLease(input: Omit<ResourceLease, 'id' | 'createdAt' | 'state'>
+    & Partial<Pick<ResourceLease, 'id' | 'createdAt' | 'state'>>): ResourceLease {
+    const value: ResourceLease = { ...input, id: input.id ?? newId('resource-lease'), state: input.state ?? 'preparing',
+      createdAt: input.createdAt ?? Date.now() };
+    this.db.prepare(`INSERT INTO resource_leases (id, attachmentId, revisionId, taskId, worldId, worldGeneration,
+      access, state, sealedDriverRef, createdAt, expiresAt, releasedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(attachmentId, taskId, worldGeneration) DO UPDATE SET revisionId=excluded.revisionId,
+      access=excluded.access, state=excluded.state, sealedDriverRef=excluded.sealedDriverRef,
+      expiresAt=excluded.expiresAt, releasedAt=NULL`).run(value.id, value.attachmentId, value.revisionId ?? null,
+        value.taskId, value.worldId, value.worldGeneration, value.access, value.state, value.sealedDriverRef ?? null,
+        value.createdAt, value.expiresAt ?? null, value.releasedAt ?? null);
+    return this.listResourceLeases(value.worldId, value.worldGeneration).find((lease) => lease.attachmentId === value.attachmentId)!;
+  }
+
+  listResourceLeases(worldId: string, generation?: number): ResourceLease[] {
+    const rows = generation == null
+      ? this.db.prepare('SELECT * FROM resource_leases WHERE worldId=? ORDER BY createdAt').all(worldId)
+      : this.db.prepare('SELECT * FROM resource_leases WHERE worldId=? AND worldGeneration=? ORDER BY createdAt').all(worldId, generation);
+    return (rows as any[]).map(resourceLeaseRow);
+  }
+
+  updateResourceLease(id: string, state: ResourceLease['state'], sealedDriverRef?: string): void {
+    this.db.prepare('UPDATE resource_leases SET state=?, sealedDriverRef=COALESCE(?, sealedDriverRef), releasedAt=? WHERE id=?')
+      .run(state, sealedDriverRef ?? null, state === 'released' ? Date.now() : null, id);
+  }
+
+  retainResourceChunks(organizationId: string, chunks: Array<{ id: string; bytes: number }>): void {
+    const insert = this.db.prepare(`INSERT INTO resource_snapshot_chunks (organizationId, chunkId, refs, bytes)
+      VALUES (?, ?, 1, ?) ON CONFLICT(organizationId, chunkId) DO UPDATE SET refs=refs+1`);
+    this.db.exec('BEGIN IMMEDIATE');
+    try { for (const chunk of chunks) insert.run(organizationId, chunk.id, chunk.bytes); this.db.exec('COMMIT'); }
+    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  releaseResourceChunks(organizationId: string, chunkIds: string[]): string[] {
+    const zero: string[] = [];
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const id of chunkIds) {
+        const row = this.db.prepare('SELECT refs FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?')
+          .get(organizationId, id) as { refs: number } | undefined;
+        if (!row) continue;
+        if (Number(row.refs) <= 1) {
+          this.db.prepare('DELETE FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').run(organizationId, id);
+          zero.push(id);
+        } else this.db.prepare('UPDATE resource_snapshot_chunks SET refs=refs-1 WHERE organizationId=? AND chunkId=?')
+          .run(organizationId, id);
+      }
+      this.db.exec('COMMIT');
+      return zero;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
   // ─── Worlds, checkpoints, runner leases, usage, and promoted artifacts ───
 
   registerWorld(handle: WorldHandleRef, projectId: string, defaults: { runnerPoolId?: string; environmentDigest?: string } = {}): WorldHandleRef {
@@ -3266,6 +3459,8 @@ export class Store {
       .run(k, v);
   }
 
+  kvDelete(k: string): void { this.db.prepare('DELETE FROM kv WHERE k=?').run(k); }
+
   close() {
     this.db.close();
   }
@@ -3283,6 +3478,29 @@ function cardRow(r: any) {
     merchantLock: r.merchantLock ? JSON.parse(r.merchantLock) : undefined,
     createdAt: r.createdAt,
   };
+}
+
+function resourceAttachmentRow(row: any): ResourceAttachment {
+  return { id: row.id, organizationId: row.organizationId, projectId: row.projectId, name: row.name,
+    driver: row.driver, target: JSON.parse(row.target), access: row.access, isolation: row.isolation,
+    source: JSON.parse(row.source), credentialHandles: JSON.parse(row.credentialHandles),
+    currentRevisionId: row.currentRevisionId ?? undefined, publish: row.publish, enabled: Boolean(row.enabled),
+    createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt) };
+}
+
+function resourceRevisionRow(row: any): ResourceRevision {
+  return { id: row.id, attachmentId: row.attachmentId, parentRevisionId: row.parentRevisionId ?? undefined,
+    engine: row.engine, sealedRef: row.sealedRef, rootDigest: row.rootDigest, bytes: Number(row.bytes),
+    files: row.files == null ? undefined : Number(row.files), metadata: parseJsonOptional(row.metadata),
+    createdByTaskId: row.createdByTaskId ?? undefined, createdAt: Number(row.createdAt) };
+}
+
+function resourceLeaseRow(row: any): ResourceLease {
+  return { id: row.id, attachmentId: row.attachmentId, revisionId: row.revisionId ?? undefined,
+    taskId: row.taskId, worldId: row.worldId, worldGeneration: Number(row.worldGeneration), access: row.access,
+    state: row.state, sealedDriverRef: row.sealedDriverRef ?? undefined, createdAt: Number(row.createdAt),
+    expiresAt: row.expiresAt == null ? undefined : Number(row.expiresAt),
+    releasedAt: row.releasedAt == null ? undefined : Number(row.releasedAt) };
 }
 
 function selectRows(db: DatabaseSyncType, table: string, where: string, args: any[]): any[] {
@@ -3381,6 +3599,33 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
     if (extra.length || !family || !/^\d{1,3}$/.test(prefix ?? '') || bits < 0 || bits > (family === 4 ? 32 : 128))
       throw new Error(`invalid outbound CIDR: ${String(cidr)}`);
   }
+}
+
+function validateResourceAttachment(value: ResourceAttachment): void {
+  if (!value.name.trim() || value.name.length > 120) throw new Error('resource name is required and must be at most 120 characters');
+  if (!/^[a-z][a-z0-9._-]*@\d+$/i.test(value.driver)) throw new Error('resource driver must be a versioned registry id');
+  if (!['read', 'write'].includes(value.access)) throw new Error('resource access must be read or write');
+  if (!['fork', 'shared'].includes(value.isolation)) throw new Error('resource isolation must be fork or shared');
+  if (!['discard', 'review'].includes(value.publish)) throw new Error('resource publish policy must be discard or review');
+  const driver = resourceDriver(value.driver);
+  if (!driver) throw new Error(`resource driver ${value.driver} is not installed`);
+  const snapshot = driver.dataPlane === 'snapshot';
+  if (value.isolation === 'shared' && value.access === 'write' && value.publish !== 'discard')
+    throw new Error('shared writable resources record side effects directly and cannot be promoted');
+  if (!driver.isolations.includes(value.isolation)) throw new Error(`${value.driver} does not support ${value.isolation} isolation`);
+  if (!driver.targets.includes(value.target.kind)) throw new Error(`${value.driver} does not support ${value.target.kind} targets`);
+  if (driver.credentialRequired && !value.credentialHandles.length) throw new Error('credential-backed resources require a credential handle');
+  if (value.publish === 'review' && (!snapshot || value.access !== 'write' || value.isolation !== 'fork'))
+    throw new Error('reviewed promotion requires a writable, forked snapshot resource');
+  if (value.target.kind === 'path') {
+    const normalized = value.target.path.replace(/\\/g, '/');
+    if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..'))
+      throw new Error('resource path target must be world-relative');
+  } else if (value.target.kind === 'environment' || value.target.kind === 'service') {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(value.target.name)) throw new Error('resource environment target must be an uppercase variable name');
+  } else throw new Error('unknown resource target');
+  if (!Array.isArray(value.credentialHandles) || value.credentialHandles.some((handle) => typeof handle !== 'string' || !handle))
+    throw new Error('resource credential handles must be non-empty strings');
 }
 
 function sha256(value: string): string {
