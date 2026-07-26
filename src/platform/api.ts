@@ -1424,12 +1424,12 @@ export class KarmaxApi {
     return this.deps.store.listTags(projectId);
   }
 
-  async createTag(token: string, input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Promise<Tag> {
+  async createTag(token: string, input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Promise<Tag> {
     this.require(token, 'manage_tag');
     return this.deps.store.createTag(input);
   }
 
-  async updateTag(token: string, id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null }): Promise<Tag | undefined> {
+  async updateTag(token: string, id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null; description?: string | null }): Promise<Tag | undefined> {
     this.require(token, 'manage_tag');
     return this.deps.store.updateTag(id, patch);
   }

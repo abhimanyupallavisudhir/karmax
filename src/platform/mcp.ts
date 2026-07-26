@@ -18,7 +18,7 @@ export interface PlatformOps {
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
-  listTags(projectId: string): Promise<{ path: string; kind?: string }[]>;
+  listTags(projectId: string): Promise<{ path: string; kind?: string; description?: string }[]>;
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string): Promise<void>;
@@ -90,10 +90,10 @@ function compactSearch(result: any, tags: any[]): { total: number; tasks: Compac
   });
   return { total: result?.total ?? 0, tasks: (result?.tasks ?? []).map(one) };
 }
-function compactTags(tags: any[]): { path: string; kind?: string }[] {
+function compactTags(tags: any[]): { path: string; kind?: string; description?: string }[] {
   const byId = tagsById(tags);
   return (tags ?? [])
-    .map((t) => ({ path: tagPathOf(t.id, byId), kind: t.kind }))
+    .map((t) => ({ path: tagPathOf(t.id, byId), kind: t.kind, description: t.description }))
     .sort((a, b) => a.path.localeCompare(b.path));
 }
 
@@ -455,7 +455,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     },
     async (a) => wrap(() => ops.searchTasks(a.projectId, a.query ?? '')),
   );
-  server.registerTool('list_tags', { description: 'List a project\'s tag catalogue as `a/b/c` paths (with kind: type|topic).', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTags(a.projectId)));
+  server.registerTool('list_tags', { description: 'List a project\'s tag catalogue as `a/b/c` paths, with kind and optional section description.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTags(a.projectId)));
   server.registerTool(
     'tag_task',
     {

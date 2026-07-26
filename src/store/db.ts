@@ -371,7 +371,7 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS tags (
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
-        parentId TEXT, color TEXT, kind TEXT, createdAt INTEGER NOT NULL
+        parentId TEXT, color TEXT, kind TEXT, description TEXT, createdAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS task_tags (
         taskId TEXT NOT NULL, tagId TEXT NOT NULL, PRIMARY KEY (taskId, tagId)
@@ -467,6 +467,8 @@ export class Store {
     if (!cols.some((c) => c.name === 'assignee')) this.db.exec('ALTER TABLE tasks ADD COLUMN assignee TEXT');
     if (!cols.some((c) => c.name === 'delegate')) this.db.exec('ALTER TABLE tasks ADD COLUMN delegate TEXT');
     if (!cols.some((c) => c.name === 'confirmationPolicy')) this.db.exec('ALTER TABLE tasks ADD COLUMN confirmationPolicy TEXT');
+    const tagCols = this.db.prepare('PRAGMA table_info(tags)').all() as { name: string }[];
+    if (!tagCols.some((c) => c.name === 'description')) this.db.exec('ALTER TABLE tags ADD COLUMN description TEXT');
 
     // Existing installs become one personal organization. The fixed id makes the
     // migration idempotent and gives bootstrapping code a stable tenant to claim.
@@ -2284,7 +2286,7 @@ export class Store {
     return r ? rowToTag(r) : undefined;
   }
 
-  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Tag {
+  createTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Tag {
     const raw = input.name.trim();
     if (!raw) throw new Error('tag name required');
     // A slash-separated name is a hierarchy path (`frontend/web`): find-or-create each
@@ -2300,7 +2302,7 @@ export class Store {
           projectId: input.projectId,
           name: segments[i]!,
           parentId,
-          ...(isLeaf ? { color: input.color, kind: input.kind } : {}),
+          ...(isLeaf ? { color: input.color, kind: input.kind, description: input.description } : {}),
         });
         parentId = leaf.id;
       }
@@ -2310,15 +2312,26 @@ export class Store {
   }
 
   /** Create-or-reuse a single tag under an explicit parent (no path parsing). */
-  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic' }): Tag {
+  private createOneTag(input: { projectId: string; name: string; parentId?: string; color?: string; kind?: 'type' | 'topic'; description?: string }): Tag {
     const name = input.name.trim();
     if (!name) throw new Error('tag name required');
+    if (input.parentId) {
+      const parent = this.getTag(input.parentId);
+      if (!parent || parent.projectId !== input.projectId) throw new Error('tag parent must belong to the same project');
+    }
     // Reuse an existing sibling with the same (case-insensitive) name rather than
     // minting a duplicate — tag catalogues should stay small and canonical.
     const existing = this.db
       .prepare("SELECT * FROM tags WHERE projectId = ? AND lower(name) = lower(?) AND IFNULL(parentId, '') = IFNULL(?, '')")
       .get(input.projectId, name, input.parentId ?? null) as any;
-    if (existing) return rowToTag(existing);
+    if (existing) {
+      const patch = {
+        ...(input.color !== undefined ? { color: input.color } : {}),
+        ...(input.kind !== undefined ? { kind: input.kind } : {}),
+        ...(input.description?.trim() ? { description: input.description } : {}),
+      };
+      return Object.keys(patch).length ? this.updateTag(existing.id, patch)! : rowToTag(existing);
+    }
     const t: Tag = {
       id: newId('tag'),
       projectId: input.projectId,
@@ -2326,22 +2339,28 @@ export class Store {
       parentId: input.parentId,
       color: input.color,
       kind: input.kind,
+      description: input.description?.trim() || undefined,
       createdAt: Date.now(),
     };
     this.db
-      .prepare('INSERT INTO tags (id, projectId, name, parentId, color, kind, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(t.id, t.projectId, t.name, t.parentId ?? null, t.color ?? null, t.kind ?? null, t.createdAt);
+      .prepare('INSERT INTO tags (id, projectId, name, parentId, color, kind, description, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(t.id, t.projectId, t.name, t.parentId ?? null, t.color ?? null, t.kind ?? null, t.description ?? null, t.createdAt);
     return t;
   }
 
-  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null }): Tag | undefined {
+  updateTag(id: string, patch: { name?: string; parentId?: string | null; color?: string | null; kind?: 'type' | 'topic' | null; description?: string | null }): Tag | undefined {
     const cur = this.getTag(id);
     if (!cur) return undefined;
+    const nextParentId = patch.parentId === null ? undefined : patch.parentId ?? cur.parentId;
+    if (nextParentId) {
+      const parent = this.getTag(nextParentId);
+      if (!parent || parent.projectId !== cur.projectId) throw new Error('tag parent must belong to the same project');
+    }
     // Guard against a cycle: a tag can't be reparented under itself or a descendant.
-    if (patch.parentId) {
+    if (nextParentId) {
       const all = this.listTags(cur.projectId);
       const byId = new Map(all.map((t) => [t.id, t]));
-      let p: string | undefined = patch.parentId;
+      let p: string | undefined = nextParentId;
       const seen = new Set<string>();
       while (p) {
         if (p === id || seen.has(p)) throw new Error('tag cannot be its own ancestor');
@@ -2349,16 +2368,22 @@ export class Store {
         p = byId.get(p)?.parentId;
       }
     }
+    const nextName = patch.name?.trim() || cur.name;
+    const duplicate = this.db
+      .prepare("SELECT id FROM tags WHERE projectId = ? AND id <> ? AND lower(name) = lower(?) AND IFNULL(parentId, '') = IFNULL(?, '')")
+      .get(cur.projectId, id, nextName, nextParentId ?? null) as { id: string } | undefined;
+    if (duplicate) throw new Error('a sibling tag with that name already exists');
     const next: Tag = {
       ...cur,
-      name: patch.name?.trim() || cur.name,
-      parentId: patch.parentId === null ? undefined : patch.parentId ?? cur.parentId,
+      name: nextName,
+      parentId: nextParentId,
       color: patch.color === null ? undefined : patch.color ?? cur.color,
       kind: patch.kind === null ? undefined : patch.kind ?? cur.kind,
+      description: patch.description === null ? undefined : patch.description !== undefined ? patch.description.trim() || undefined : cur.description,
     };
     this.db
-      .prepare('UPDATE tags SET name = ?, parentId = ?, color = ?, kind = ? WHERE id = ?')
-      .run(next.name, next.parentId ?? null, next.color ?? null, next.kind ?? null, id);
+      .prepare('UPDATE tags SET name = ?, parentId = ?, color = ?, kind = ?, description = ? WHERE id = ?')
+      .run(next.name, next.parentId ?? null, next.color ?? null, next.kind ?? null, next.description ?? null, id);
     return next;
   }
 
@@ -3491,6 +3516,7 @@ function rowToTag(r: any): Tag {
     parentId: r.parentId ?? undefined,
     color: r.color ?? undefined,
     kind: r.kind ?? undefined,
+    description: r.description ?? undefined,
     createdAt: r.createdAt,
   };
 }

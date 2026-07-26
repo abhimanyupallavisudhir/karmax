@@ -15,6 +15,7 @@ const ICON = {
   send: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>',
   copy: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
 };
+const DEFAULT_TASK_QUERY = 'group:tag';
 
 let installPrompt = null;
 window.addEventListener('beforeinstallprompt', (event) => {
@@ -50,7 +51,7 @@ const S = {
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
-  search: '', // the working query string (Linear-style tokens + free text)
+  search: DEFAULT_TASK_QUERY, // the working query string (Linear-style tokens + free text)
   // Task organization (PLAN-search-views): a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
@@ -267,7 +268,7 @@ async function applyRoute() {
     // new project (they'd otherwise re-run the old query against new data and
     // highlight a view/cursor that doesn't exist here).
     S.projectId = pid;
-    S.search = '';
+    S.search = DEFAULT_TASK_QUERY;
     S.activeView = null;
     S.searchResult = null;
     S.cursorId = null;
@@ -339,6 +340,18 @@ function installLinkRouter() {
     ev.preventDefault();
     spaNavigate(href);
   });
+}
+
+// Tag chips are navigation everywhere they appear. Capture before row/form click
+// handlers so a chip never opens a task or mutates its tags as a side effect.
+function installTagRouter() {
+  document.addEventListener('click', (ev) => {
+    const chip = ev.target.closest('[data-tag-link]');
+    if (!chip) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    navigateToTagSection(chip.dataset.tagLink);
+  }, true);
 }
 
 // Push a task permalink (in place), remembering where to return on close.
@@ -1599,6 +1612,7 @@ async function boot() {
   renderShell();
   bindKeys();
   installLinkRouter();
+  installTagRouter();
   // A background repaint deferred to protect an open menu / text-selection gets
   // flushed once that interaction releases (setTimeout lets focus + selection
   // settle first). selectionchange fires constantly, so it only pokes the flush
@@ -1695,6 +1709,7 @@ function tagPathStr(id) {
   while (cur && !seen.has(cur.id)) { seen.add(cur.id); parts.unshift(cur.name); cur = cur.parentId ? tagById(cur.parentId) : null; }
   return parts.join('/');
 }
+function tagSectionId(id) { return `tag-section-${id}`; }
 const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'];
 
 // Evaluate the working query on the server and stash the result. The default list
@@ -1708,7 +1723,12 @@ async function runSearch() {
     const live = new Map(S.tasks.map((t) => [t.id, t]));
     const overlay = (t) => ({ ...t, lastView: live.get(t.id)?.lastView ?? t.lastView });
     r.tasks = (r.tasks || []).map(overlay);
-    if (r.groups) r.groups = r.groups.map((g) => ({ ...g, tasks: (g.tasks || []).map(overlay) }));
+    const overlayGroups = (groups) => (groups || []).map((g) => ({
+      ...g,
+      tasks: (g.tasks || []).map(overlay),
+      ...(g.children ? { children: overlayGroups(g.children) } : {}),
+    }));
+    if (r.groups) r.groups = overlayGroups(r.groups);
     S.searchResult = r;
   } catch { S.searchResult = null; }
 }
@@ -1727,6 +1747,24 @@ async function setQuery(q) {
   if (box) box.value = S.search;
   await runSearch();
   if (S.tab === 'tasks') renderMain();
+}
+
+// Leave any detail/modal surface, restore the canonical tag-grouped list, and
+// place the requested tag section at the top of the viewport.
+async function navigateToTagSection(tagId) {
+  const tag = tagById(tagId);
+  if (!tag) return;
+  $('#modal-root').innerHTML = '';
+  S.activeView = null;
+  S.search = DEFAULT_TASK_QUERY;
+  await go(projectRoute(tag.projectId));
+  const section = document.getElementById(tagSectionId(tagId));
+  if (!section) return;
+  section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  section.classList.remove('tag-section-target');
+  requestAnimationFrame(() => section.classList.add('tag-section-target'));
+  section.querySelector('.tag-section-heading')?.focus({ preventScroll: true });
+  setTimeout(() => section.classList.remove('tag-section-target'), 1600);
 }
 
 // Replace a directive token (group:/sort:) in the query string, or remove it when
@@ -2096,7 +2134,7 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
-// The saved-views switcher — every chip is a query. "All" is the default; then the
+// The saved-views switcher — every chip is a query. "All" is the tag-grouped default; then the
 // built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
   const builtins = BUILTIN_VIEWS
@@ -2222,16 +2260,16 @@ function tasksView() {
   const count = flat.length;
   let body;
   if (groups) {
-    body = groups
-      .map((g) => {
+    body = r.hierarchical
+      ? groups.map((g) => tagGroupHtml(g, topLevel)).join('')
+      : groups.map((g) => {
         const gt = g.tasks.filter(topLevel);
         return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
-      })
-      .join('');
+      }).join('');
   } else {
     body = flat.map(taskRow).join('');
   }
-  const empty = S.search
+  const empty = S.search !== DEFAULT_TASK_QUERY
     ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
     : `<div class="empty"><div class="big">No tasks yet</div>Describe a task above, or open the full form with “More”.</div>`;
   return `
@@ -2248,22 +2286,52 @@ function tasksView() {
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
-        ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
+        ${S.search !== DEFAULT_TASK_QUERY ? `<button class="search-x" id="q-clear" title="Restore the default view (Esc)">✕</button>` : ''}
       </div>
       ${viewsBar()}
       ${queryToolbarHtml(S.search || '', 'q', `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`)}
     </div>
     <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
-      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
+      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search !== DEFAULT_TASK_QUERY ? ' · filtered' : ''}</span>
     </div>
     ${body || empty}`;
+}
+
+function tagGroupHtml(group, keep, depth = 0) {
+  const ownTasks = (group.tasks || []).filter(keep);
+  const children = (group.children || []).map((child) => tagGroupHtml(child, keep, depth + 1)).join('');
+  const count = tagGroupVisibleTasks(group, keep).size;
+  if (!count) return '';
+  const tag = tagById(group.key);
+  const level = Math.min(6, depth + 2);
+  const edit = tag
+    ? `<button class="icon-btn tag-section-edit" data-edit-tag="${esc(tag.id)}" title="Edit ${esc(group.path || group.label)}" aria-label="Edit tag">✎</button>`
+    : '';
+  const description = tag?.description
+    ? `<div class="tag-section-description">${esc(tag.description)}</div>`
+    : '';
+  return `<section class="tag-section tag-depth-${Math.min(depth, 5)}" id="${esc(tagSectionId(group.key))}" data-tag-section="${esc(group.key)}">
+    <h${level} class="tag-section-heading" tabindex="-1">
+      <span class="tag-section-name">${esc(group.label)}</span>
+      <span class="pill">${count}</span>${edit}
+    </h${level}>
+    ${description}
+    <div class="tag-section-tasks">${ownTasks.map(taskRow).join('')}</div>
+    <div class="tag-section-children">${children}</div>
+  </section>`;
+}
+
+function tagGroupVisibleTasks(group, keep, seen = new Map()) {
+  for (const task of group.tasks || []) if (keep(task)) seen.set(task.id, task);
+  for (const child of group.children || []) tagGroupVisibleTasks(child, keep, seen);
+  return seen;
 }
 
 // Small colored tag chip + priority flag shown on a task row.
 function tagChips(t) {
   if (!t.tags || !t.tags.length) return '';
   return t.tags
-    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<span class="tag-chip ${tag.kind || ''}"${c}>${esc(tagPathStr(id))}</span>`; })
+    .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : ''; return `<button type="button" class="tag-chip tag-link ${tag.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`; })
     .join('');
 }
 function priorityFlag(t) {
@@ -2463,12 +2531,12 @@ function pipelineLarge(v) {
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
 function wireOrgControls() {
   const main = $('#main');
-  // Saved-view chips: each selects a query; "All" is the default (empty) view.
+  // Saved-view chips: each selects a query; "All" is the default tag-grouped view.
   main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      if (id === '__all__') { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
       if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
@@ -2487,21 +2555,21 @@ function wireOrgControls() {
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
-        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
+        if (S.activeView === id) { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); } else renderMain();
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
   $('#manage-tags')?.addEventListener('click', openTagsManager);
-  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(DEFAULT_TASK_QUERY); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
     search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search !== DEFAULT_TASK_QUERY) { e.stopPropagation(); S.activeView = null; setQuery(DEFAULT_TASK_QUERY); } });
   }
 
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => { S.activeView = null; setQuery(q); } });
@@ -2763,47 +2831,117 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   search.focus();
 }
 
-// Project tag catalogue manager — create/rename/recolor/reparent/delete tags.
-function openTagsManager() {
+// Project tag catalogue manager — create and fully edit tag metadata/hierarchy.
+function openTagsManager(initialEditId = null) {
   const root = $('#modal-root');
+  let editingId = initialEditId;
+  const refresh = async () => {
+    await loadOrg();
+    if (S.tab === 'tasks') await runSearch();
+    draw();
+    if (S.tab === 'tasks') renderMain();
+  };
   const draw = () => {
+    const sorted = S.tags.slice().sort((a, b) => tagPathStr(a.id).localeCompare(tagPathStr(b.id)));
     const rows = S.tags.length
-      ? S.tags.map((t) => `<div class="tagm-row">
-          <span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''}>${esc(tagPathStr(t.id))}</span>
-          <span class="pal-sub">${esc(t.kind || '')}</span>
+      ? sorted.map((t) => `<div class="tagm-row ${editingId === t.id ? 'active' : ''}">
+          <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
+          <span class="tagm-summary">
+            <span class="pal-sub">${esc(t.kind || 'general')}</span>
+            ${t.description ? `<span class="tagm-description">${esc(t.description)}</span>` : ''}
+          </span>
           <span class="q-spacer"></span>
-          <button class="btn sm" data-rename="${t.id}">Rename</button>
-          <button class="btn sm danger" data-deltag="${t.id}">Delete</button>
+          <button class="btn sm" data-edittag="${esc(t.id)}">Edit</button>
+          <button class="btn sm danger" data-deltag="${esc(t.id)}">Delete</button>
         </div>`).join('')
       : `<div class="pal-empty">No tags yet.</div>`;
-    root.innerHTML = `<div class="palette-scrim" id="tagm-scrim"><div class="palette tagm">
-      <div class="fp-head">Tags</div>
+    const editing = tagById(editingId);
+    const blockedParents = new Set(editing ? [editing.id] : []);
+    if (editing) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const tag of S.tags) if (tag.parentId && blockedParents.has(tag.parentId) && !blockedParents.has(tag.id)) {
+          blockedParents.add(tag.id);
+          changed = true;
+        }
+      }
+    }
+    const parentOptions = sorted
+      .filter((tag) => !blockedParents.has(tag.id))
+      .map((tag) => `<option value="${esc(tag.id)}" ${editing?.parentId === tag.id ? 'selected' : ''}>${esc(tagPathStr(tag.id))}</option>`)
+      .join('');
+    const editForm = editing ? `<div class="tagm-form tagm-edit">
+      <div class="tagm-form-head"><div><b>Edit tag</b><span class="pal-sub">${esc(tagPathStr(editing.id))}</span></div><button class="icon-btn" id="tagm-cancel-edit" aria-label="Close editor">✕</button></div>
+      <label>Name<input id="tagm-edit-name" class="title-in" value="${esc(editing.name)}" /></label>
+      <label>Parent<select id="tagm-edit-parent" class="q-sel"><option value="">No parent (top level)</option>${parentOptions}</select></label>
+      <label>Kind<select id="tagm-edit-kind" class="q-sel"><option value="" ${!editing.kind ? 'selected' : ''}>general</option><option value="topic" ${editing.kind === 'topic' ? 'selected' : ''}>topic</option><option value="type" ${editing.kind === 'type' ? 'selected' : ''}>type</option></select></label>
+      <label class="tagm-color-field">Color <input id="tagm-edit-color" type="color" value="${esc(editing.color || '#6b7fd7')}" /><span><input id="tagm-edit-use-color" type="checkbox" ${editing.color ? 'checked' : ''} /> Use color</span></label>
+      <label class="tagm-description-field">Description<textarea id="tagm-edit-description" rows="4" placeholder="Optional context shown at the start of this tag's section.">${esc(editing.description || '')}</textarea></label>
+      <div class="tagm-actions"><button class="btn primary" id="tagm-save-edit">Save changes</button></div>
+    </div>` : '';
+    root.innerHTML = `<div class="palette-scrim" id="tagm-scrim"><div class="palette tagm" role="dialog" aria-label="Manage tags">
+      <div class="fp-head"><span>Tags</span><span class="pal-sub">Organize the task list into nested sections.</span><button class="icon-btn" id="tagm-close" aria-label="Close">✕</button></div>
       <div id="tagm-list">${rows}</div>
-      <div class="tagm-new">
-        <input id="tagm-name" class="title-in" placeholder="new tag  ·  use / for nesting (e.g. frontend/web)" />
-        <select id="tagm-kind" class="q-sel"><option value="topic">topic</option><option value="type">type</option></select>
-        <input id="tagm-color" type="color" value="#6b7fd7" title="color" />
-        <button class="btn primary" id="tagm-add">Add tag</button>
+      ${editForm}
+      <div class="tagm-form tagm-new">
+        <div class="tagm-form-head"><b>Create a tag</b><span class="pal-sub">Use / in the name to create nested parents.</span></div>
+        <label>Name or path<input id="tagm-name" class="title-in" placeholder="e.g. frontend/web" /></label>
+        <label>Kind<select id="tagm-kind" class="q-sel"><option value="">general</option><option value="topic" selected>topic</option><option value="type">type</option></select></label>
+        <label class="tagm-color-field">Color <input id="tagm-color" type="color" value="#6b7fd7" /><span><input id="tagm-use-color" type="checkbox" checked /> Use color</span></label>
+        <label class="tagm-description-field">Description<textarea id="tagm-description" rows="3" placeholder="Optional context shown at the start of this tag's section."></textarea></label>
+        <div class="tagm-actions"><button class="btn primary" id="tagm-add">Create tag</button></div>
       </div>
       <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth).</div>
     </div></div>`;
-    $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') root.innerHTML = ''; });
+    const close = () => (root.innerHTML = '');
+    $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') close(); });
+    $('#tagm-close').addEventListener('click', close);
     const addTag = async () => {
       const name = $('#tagm-name').value.trim(); if (!name) return;
       try {
-        await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({ name, kind: $('#tagm-kind').value, color: $('#tagm-color').value }) });
-        await loadOrg(); draw();
+        const kind = $('#tagm-kind').value || undefined;
+        await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({
+          name,
+          kind,
+          color: $('#tagm-use-color').checked ? $('#tagm-color').value : undefined,
+          description: $('#tagm-description').value,
+        }) });
+        await refresh();
+        toast(`Created tag “${name}”`);
       } catch (e) { toast(e.message, true); }
     };
     $('#tagm-add').addEventListener('click', addTag);
-    $('#tagm-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') addTag(); });
-    root.querySelectorAll('[data-rename]').forEach((b) => b.addEventListener('click', async () => {
-      const t = tagById(b.dataset.rename); const name = prompt('Rename tag:', t?.name); if (!name) return;
-      try { await api(`/api/tags/${b.dataset.rename}`, { method: 'PATCH', body: JSON.stringify({ name }) }); await loadOrg(); draw(); if (S.tab === 'tasks') renderMain(); } catch (e) { toast(e.message, true); }
+    $('#tagm-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addTag(); } });
+    root.querySelectorAll('[data-edittag]').forEach((button) => button.addEventListener('click', () => {
+      editingId = button.dataset.edittag;
+      draw();
     }));
+    $('#tagm-cancel-edit')?.addEventListener('click', () => { editingId = null; draw(); });
+    $('#tagm-save-edit')?.addEventListener('click', async () => {
+      const name = $('#tagm-edit-name').value.trim();
+      if (!name) return toast('Tag name is required', true);
+      try {
+        await api(`/api/tags/${editing.id}`, { method: 'PATCH', body: JSON.stringify({
+          name,
+          parentId: $('#tagm-edit-parent').value || null,
+          kind: $('#tagm-edit-kind').value || null,
+          color: $('#tagm-edit-use-color').checked ? $('#tagm-edit-color').value : null,
+          description: $('#tagm-edit-description').value,
+        }) });
+        await refresh();
+        toast('Tag updated');
+      } catch (e) { toast(e.message, true); }
+    });
     root.querySelectorAll('[data-deltag]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm('Delete this tag? Its children are promoted to its parent and it is removed from all tasks.')) return;
-      try { await api(`/api/tags/${b.dataset.deltag}`, { method: 'DELETE' }); await loadOrg(); draw(); if (S.tab === 'tasks') { await runSearch(); renderMain(); } } catch (e) { toast(e.message, true); }
+      const tag = tagById(b.dataset.deltag);
+      if (!confirm(`Delete “${tagPathStr(tag?.id)}”? Its children are promoted to its parent and it is removed from every task.`)) return;
+      try {
+        await api(`/api/tags/${b.dataset.deltag}`, { method: 'DELETE' });
+        if (editingId === b.dataset.deltag) editingId = null;
+        await refresh();
+        toast('Tag deleted');
+      } catch (e) { toast(e.message, true); }
     }));
   };
   draw();
@@ -2811,6 +2949,12 @@ function openTagsManager() {
 
 function wireTasksView() {
   wireOrgControls();
+  $('#main').querySelectorAll('[data-edit-tag]').forEach((button) =>
+    button.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openTagsManager(button.dataset.editTag);
+    }),
+  );
   $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => wireTaskNav(e, () => e.dataset.id));
   $('#main').querySelectorAll('[data-draft]').forEach((e) =>
     e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, S.tasks.find((t) => t.id === e.dataset.draft)); }),
@@ -3767,7 +3911,14 @@ function closeTaskDom() {
 // page's Parameters tab (running tasks) and the task form (drafts).
 function orgEditorHtml(rec) {
   const prio = Number(rec?.params?.priority || 0);
-  const tags = (rec?.tags || []).map((id) => { const t = tagById(id); if (!t) return ''; return `<span class="tag-chip ${t.kind || ''}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} data-untag="${id}" title="Remove">${esc(tagPathStr(id))} ✕</span>`; }).join('');
+  const tags = (rec?.tags || []).map((id) => {
+    const t = tagById(id); if (!t) return '';
+    const color = t.color ? `style="--tag:${esc(t.color)}"` : '';
+    return `<span class="tag-assignment" ${color}>
+      <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
+      <button type="button" class="tag-remove" data-untag="${esc(id)}" title="Remove ${esc(tagPathStr(id))} from this task" aria-label="Remove tag">×</button>
+    </span>`;
+  }).join('');
   const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? '▲ ' : ''}${n[0].toUpperCase() + n.slice(1)}</option>`).join('');
   return `<div class="org-editor">
     <label class="org-prio">Priority
@@ -3809,7 +3960,8 @@ function wireOrgEditor(rootEl, rec, opts) {
     if (S.tab === 'tasks') await runSearch();
     afterChange();
   };
-  box.querySelectorAll('[data-untag]').forEach((el) => el.addEventListener('click', () => {
+  box.querySelectorAll('[data-untag]').forEach((el) => el.addEventListener('click', (ev) => {
+    ev.stopPropagation();
     setTags((rec.tags || []).filter((id) => id !== el.dataset.untag)).catch((e) => toast(e.message, true));
   }));
   box.querySelector('.org-add-tag')?.addEventListener('click', () => openTagPicker(rec, setTags));
@@ -3835,6 +3987,15 @@ function openTagPicker(rec, setTags) {
   root.innerHTML = `<div class="palette-scrim" id="tp-scrim"><div class="palette fp">
     <input id="tp-in" placeholder="Type a tag…  use / for nesting (e.g. frontend/web)" autocomplete="off" spellcheck="false" />
     <div id="tp-list"></div>
+    <div id="tp-create-meta" class="tp-create-meta" hidden>
+      <div class="pal-sub">Optional details for the new tag</div>
+      <div class="tp-create-row">
+        <select id="tp-create-kind" class="q-sel"><option value="">general</option><option value="topic" selected>topic</option><option value="type">type</option></select>
+        <input id="tp-create-color" type="color" value="#6b7fd7" title="Tag color" />
+        <label><input id="tp-create-use-color" type="checkbox" checked /> Use color</label>
+      </div>
+      <textarea id="tp-create-description" rows="3" placeholder="Description shown at the start of this tag's section (optional)"></textarea>
+    </div>
   </div></div>`;
   const input = $('#tp-in');
   const list = $('#tp-list');
@@ -3844,7 +4005,12 @@ function openTagPicker(rec, setTags) {
     try {
       let id = item.id;
       if (item.create) {
-        const t = await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({ name: item.name }) });
+        const t = await api(`/api/projects/${S.projectId}/tags`, { method: 'POST', body: JSON.stringify({
+          name: item.name,
+          kind: $('#tp-create-kind').value || undefined,
+          color: $('#tp-create-use-color').checked ? $('#tp-create-color').value : undefined,
+          description: $('#tp-create-description').value,
+        }) });
         await loadOrg();
         id = t.id;
       }
@@ -3863,6 +4029,7 @@ function openTagPicker(rec, setTags) {
     // Offer creation when the typed text doesn't already exist verbatim as a path.
     const exists = q && S.tags.some((t) => tagPathStr(t.id).toLowerCase() === ql);
     if (q && !exists) items.unshift({ create: true, name: q, path: q });
+    $('#tp-create-meta').hidden = !q || !!exists;
     active = 0;
     draw();
   };

@@ -1699,7 +1699,7 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, await api.listTags(token, projectId));
         if (method === 'POST') {
           const b = await this.body(req);
-          return this.json(res, 200, await api.createTag(token, { projectId, name: b.name, parentId: b.parentId, color: b.color, kind: b.kind }));
+          return this.json(res, 200, await api.createTag(token, { projectId, name: b.name, parentId: b.parentId, color: b.color, kind: b.kind, description: b.description }));
         }
       }
       const tagMatch = p.match(/^\/api\/tags\/([^/]+)$/);

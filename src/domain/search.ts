@@ -477,8 +477,15 @@ function matchText(t: SearchTask, q: string): boolean {
 export interface TaskGroup {
   key: string;
   label: string;
+  /** Full label path for hierarchical tag groups. */
+  path?: string;
+  /** Tag description, rendered before this section's tasks. */
+  description?: string;
   count: number;
+  /** Tasks assigned directly to this group (children own their own direct tasks). */
   tasks: SearchTask[];
+  /** Present for tag grouping: a hierarchy rather than a flat bucket list. */
+  children?: TaskGroup[];
 }
 
 export interface EvalResult {
@@ -486,6 +493,8 @@ export interface EvalResult {
   tasks: SearchTask[];
   /** When the query groups, the tasks bucketed (a task may appear in several tag groups). */
   groups?: TaskGroup[];
+  /** Tells clients that `groups` is a tag forest with nested `children`. */
+  hierarchical?: boolean;
   total: number;
 }
 
@@ -518,9 +527,10 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
   out = sortTasks(out, sort, ectx);
 
   let groups: TaskGroup[] | undefined;
+  const groupField = query.group ? fieldByKey(query.group) : undefined;
   if (query.group) groups = groupTasks(out, query.group, ectx);
 
-  return { tasks: out, groups, total: out.length };
+  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), total: out.length };
 }
 
 function sortTasks(tasks: SearchTask[], sort: SortClause[], ctx: FieldContext): SearchTask[] {
@@ -543,7 +553,7 @@ function sortTasks(tasks: SearchTask[], sort: SortClause[], ctx: FieldContext): 
 function groupTasks(tasks: SearchTask[], groupKey: string, ctx: FieldContext): TaskGroup[] {
   const field = fieldByKey(groupKey);
   if (!field) return [{ key: '', label: 'All', count: tasks.length, tasks }];
-  const byId = new Map((ctx.tags ?? []).map((t) => [t.id, t]));
+  if (field.type === 'tag') return groupTasksByTagHierarchy(tasks, field, ctx);
   const buckets = new Map<string, SearchTask[]>();
   const order: string[] = [];
   const push = (key: string, t: SearchTask) => {
@@ -551,19 +561,11 @@ function groupTasks(tasks: SearchTask[], groupKey: string, ctx: FieldContext): T
     buckets.get(key)!.push(t);
   };
   for (const t of tasks) {
-    if (field.type === 'tag') {
-      const ids = (field.get(t, ctx) as string[]) ?? [];
-      if (!ids.length) push('__untagged__', t);
-      else for (const id of ids) push(id, t);
-    } else {
-      const v = field.get(t, ctx);
-      push(v === undefined || v === '' ? '__none__' : String(v), t);
-    }
+    const v = field.get(t, ctx);
+    push(v === undefined || v === '' ? '__none__' : String(v), t);
   }
   const labelFor = (key: string): string => {
-    if (key === '__untagged__') return 'Untagged';
     if (key === '__none__') return 'None';
-    if (field.type === 'tag') return byId.get(key) ? tagPath(byId.get(key)!, byId) : key;
     if (field.options) return field.options.find((o) => o.value === key)?.label ?? key;
     return key;
   };
@@ -575,6 +577,79 @@ function groupTasks(tasks: SearchTask[], groupKey: string, ctx: FieldContext): T
   } else {
     groups.sort((a, b) => a.label.localeCompare(b.label));
   }
+  return groups;
+}
+
+/**
+ * Build a pruned tag forest. A task belongs to the section(s) for its explicitly
+ * assigned tags; ancestor tags become structural headings, even when no task is
+ * assigned directly to them. Counts cover each whole subtree (deduplicated), so a
+ * parent heading accurately summarizes all work nested below it.
+ */
+function groupTasksByTagHierarchy(tasks: SearchTask[], field: FieldDef, ctx: FieldContext): TaskGroup[] {
+  const tags = ctx.tags ?? [];
+  const byId = new Map(tags.map((t) => [t.id, t]));
+  const taskById = new Map(tasks.map((t) => [t.id, t]));
+  const direct = new Map<string, SearchTask[]>();
+  const untagged: SearchTask[] = [];
+  const unknown = new Set<string>();
+  for (const task of tasks) {
+    const ids = (field.get(task, ctx) as string[]) ?? [];
+    if (!ids.length) {
+      untagged.push(task);
+      continue;
+    }
+    for (const id of ids) {
+      (direct.get(id) ?? direct.set(id, []).get(id)!).push(task);
+      if (!byId.has(id)) unknown.add(id);
+    }
+  }
+
+  const children = new Map<string | undefined, Tag[]>();
+  for (const tag of tags) {
+    const parent = tag.parentId && byId.has(tag.parentId) ? tag.parentId : undefined;
+    (children.get(parent) ?? children.set(parent, []).get(parent)!).push(tag);
+  }
+  for (const siblings of children.values()) siblings.sort((a, b) => a.name.localeCompare(b.name));
+
+  const build = (tag: Tag): { group?: TaskGroup; ids: Set<string> } => {
+    const childGroups: TaskGroup[] = [];
+    const subtreeTasks = new Map<string, SearchTask>();
+    for (const task of direct.get(tag.id) ?? []) subtreeTasks.set(task.id, task);
+    for (const child of children.get(tag.id) ?? []) {
+      const built = build(child);
+      if (built.group) childGroups.push(built.group);
+      for (const id of built.ids) {
+        const task = taskById.get(id);
+        if (task) subtreeTasks.set(id, task);
+      }
+    }
+    if (!subtreeTasks.size) return { ids: new Set() };
+    return {
+      ids: new Set(subtreeTasks.keys()),
+      group: {
+        key: tag.id,
+        label: tag.name,
+        path: tagPath(tag, byId),
+        description: tag.description,
+        count: subtreeTasks.size,
+        tasks: direct.get(tag.id) ?? [],
+        children: childGroups,
+      },
+    };
+  };
+
+  const groups = (children.get(undefined) ?? []).flatMap((tag) => {
+    const group = build(tag).group;
+    return group ? [group] : [];
+  });
+  // Preserve assignments to stale/unknown ids as visible root sections rather
+  // than silently dropping their tasks from a grouped result.
+  for (const id of [...unknown].sort()) {
+    const groupTasks = direct.get(id) ?? [];
+    groups.push({ key: id, label: id, path: id, count: groupTasks.length, tasks: groupTasks, children: [] });
+  }
+  if (untagged.length) groups.push({ key: '__untagged__', label: 'Untagged', count: untagged.length, tasks: untagged, children: [] });
   return groups;
 }
 
