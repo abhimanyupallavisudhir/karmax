@@ -326,6 +326,43 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await wf.terminate('test done');
   });
 
+  it('acknowledges queued turns without a blocking Update and rotates with an active lease', async () => {
+    const { agentQueueId } = await import('../src/coordinators/names.js');
+    const receiver = await h.client.workflow.start('mergeQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: 'agent-v2-receiver',
+      args: [{ domain: 'agent-v2-receiver' }],
+    });
+    const held = { taskId: 'already-running', turnId: 'already-running#0', role: 'do' };
+    const waiting = { taskId: 'agent-v2-receiver', turnId: 'agent-v2-receiver#0', role: 'merge' };
+    const wf = await h.client.workflow.start('agentQueue', {
+      taskQueue: TASK_QUEUE,
+      workflowId: `${agentQueueId()}:v2-test`,
+      args: [{
+        capacity: 1,
+        state: { capacity: 1, current: [held], queue: [], processed: 49, modern: true },
+      }],
+    });
+    const initialRunId = (await wf.describe()).runId;
+
+    await wf.signal('requestAgentSlotV2', waiting);
+    await expect(wf.executeUpdate('requestAgentSlotV2', { args: [waiting] })).resolves.toEqual({
+      granted: false,
+      position: 1,
+      capacity: 1,
+    });
+    expect((await wf.query('agentQueue') as any).queue.map((x: any) => x.turnId)).toEqual([waiting.turnId]);
+
+    await wf.signal('releaseAgentSlot', { taskId: held.taskId, turnId: held.turnId });
+    await expect.poll(async () => (await wf.query('agentQueue') as any).current.map((x: any) => x.turnId))
+      .toEqual([waiting.turnId]);
+    await expect.poll(async () => (await wf.describe()).runId).not.toBe(initialRunId);
+    expect((await wf.query('agentQueue') as any).current.map((x: any) => x.turnId)).toEqual([waiting.turnId]);
+
+    await wf.terminate('test done');
+    await receiver.terminate('test done');
+  });
+
   it('admits a burst through one blocking update per waiter', async () => {
     const { agentQueueId } = await import('../src/coordinators/names.js');
     const wf = await h.client.workflow.start('agentQueue', {

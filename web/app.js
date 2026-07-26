@@ -4970,7 +4970,7 @@ function conversationPresence(v, t) {
   if (v.agentTurn?.role === t.role) {
     return v.agentTurn.state === 'running'
       ? { label: 'Working now', tone: 'working' }
-      : { label: 'Waiting for an agent slot', tone: 'waiting' };
+      : { label: v.waitingFor?.detail || 'Starting agent', tone: 'waiting' };
   }
   if (t.role === liveRoleFor(v) && v.waitingFor) return { label: v.waitingFor.detail || `Waiting for ${v.waitingFor.kind}`, tone: 'waiting' };
   if (v.status === 'failed') return { label: 'Failed', tone: 'failed' };
@@ -5155,6 +5155,7 @@ function waitingLabel(w) {
 // for …" for agent-slot and collaboration waits.
 function waitingText(w) {
   const label = waitingLabel(w);
+  if (/^starting\b/i.test(label)) return label.replace(/^starting/i, 'Starting');
   if (/^waiting\s+(?:for|to)\b/i.test(label)) return label.replace(/^waiting/i, 'Waiting');
   return `Waiting for ${label}`;
 }

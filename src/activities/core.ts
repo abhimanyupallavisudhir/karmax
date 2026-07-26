@@ -299,6 +299,10 @@ export interface RunAgentTurnArgs {
   accountApiKeyHandle?: string;
   /** Workflow-generated id used to correlate live admission/running signals. */
   agentTurnId?: string;
+  /** Current workflow versions acquire/release the durable queue lease themselves. */
+  agentSlotGranted?: boolean;
+  /** Current workflow versions own admission, including the remote-rail exemption. */
+  agentAdmissionManaged?: boolean;
 }
 
 export interface PrepareChildArgs {
@@ -504,10 +508,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (linkedRepositories.length || wikiRepository) {
         if (!deps.githubApp && remote) throw new Error('hosted repositories require the configured GitHub App');
         const credentials: Record<string, string> = {};
-        for (const source of worldSources) {
+        for (const [index, source] of worldSources.entries()) {
           const linked = linkedRepositories.find((candidate) => candidate.repository.sshUrl === source);
           const repository = linked?.repository ?? (wikiRepository?.sshUrl === source ? wikiRepository : undefined);
           if (!repository) {
+            // A configured host checkout is already the authority for this
+            // repository. cloudGitSource resolved its origin only as the cloud
+            // transport and copySources seeds the sandbox from the exact local
+            // commit, so it neither needs nor implies a GitHub catalog
+            // attachment. Requiring enrollment here discarded that provenance
+            // and made a correctly auto-detected local origin fail as soon as
+            // any other source (normally the project wiki) was enrolled.
+            if (cloudSources[index]?.localPath) continue;
             if (remote) throw new Error(`repository ${source} is not enrolled in this project`);
             continue;
           }
@@ -594,9 +606,43 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return applyAgentSpec(baseProfile, args.task.agents?.[args.role]).provider;
     },
 
+    /** Whether this turn consumes host model-process capacity. Remote subscription
+     * CLIs run inside their provider world; local turns and API rails run here. */
+    async agentUsesHostCapacity(args: {
+      role: AgentRole;
+      task: TaskInput;
+      worldHandle: WorldHandle;
+      accountConfigHome?: string;
+      accountApiKeyHandle?: string;
+      accountCredentialKind?: 'login' | 'ambient' | 'key';
+      accountCredentialProvider?: string;
+    }): Promise<boolean> {
+      if (!isRemote(args.worldHandle.kind)) return true;
+      if (args.accountCredentialKind === 'key') return true;
+      if (args.accountCredentialKind === 'login' || args.accountCredentialKind === 'ambient') return false;
+
+      // Replay compatibility for workflow histories recorded before credential
+      // metadata accompanied the lease. A broker handle is an API rail; a config
+      // home is a provider-hosted subscription rail.
+      if (args.accountApiKeyHandle && deps.broker) return true;
+      if (args.accountConfigHome) return false;
+
+      const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
+      const profile = applyAgentSpec(baseProfile, args.task.agents?.[args.role]);
+      const modelProvider = args.accountCredentialProvider
+        ? canonicalModelProvider(args.accountCredentialProvider)
+        : credentialProvider(profile);
+      return (
+        (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
+        || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+        || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(modelProvider)])
+      );
+    },
+
     /** The ordered, enabled credential keys for a turn's provider, per the credential
      *  policy resolved global→project→task (SPEC §7/§9). The coordinator leases the
-     *  first available one from this list. Empty ⇒ passthrough to the profile default. */
+     *  first available one from this list. An empty compatible set resolves to a
+     *  denied marker so explicit policy cannot fall through to profile defaults. */
     async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: string; role?: AgentRole; task?: TaskInput }): Promise<string[]> {
       const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
       const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
@@ -1099,8 +1145,36 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // call ONLY — the setup above is cheap — and released in `finally` below.
       let releaseSlot: () => void | Promise<void> = () => {};
       let lastEmit: string | undefined;
+      let lastPressureDetail: string | undefined;
       let result;
       try {
+        const signalTurnState = async (
+          state: 'running' | 'waiting-host',
+          detail?: string,
+        ): Promise<void> => {
+          if (!deps.client || !args.agentTurnId) return;
+          await deps.client.workflow
+            .getHandle(args.taskId)
+            .signal(SIG_AGENT_TURN_STATE, {
+              turnId: args.agentTurnId,
+              role: args.role,
+              provider: profile.provider,
+              state,
+              ...(detail ? { detail } : {}),
+            })
+            .catch(() => undefined);
+        };
+        const publishPressure = async (state: { memoryTight: boolean; loadHigh: boolean }) => {
+          const detail =
+            state.memoryTight && state.loadHigh
+              ? 'Waiting for host memory and load to start agent'
+              : state.memoryTight
+                ? 'Waiting for host memory to start agent'
+                : 'Waiting for host load to start agent';
+          if (detail === lastPressureDetail) return;
+          lastPressureDetail = detail;
+          await signalTurnState('waiting-host', detail);
+        };
         // Remote subscription CLIs consume provider-world CPU/RAM, not host
         // capacity. API rails and local subprocesses retain the host admission
         // queue; account-level concurrency is enforced separately for every rail.
@@ -1109,7 +1183,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // Current workflows carry a stable turn id, so the activity enrolls that
           // turn in the durable/reorderable coordinator before starting the model.
           // Historical executions lack the id and retain the replay-safe file gate.
-          if (args.agentTurnId && deps.client && deps.taskQueue) {
+          if (args.agentAdmissionManaged) {
+            if (!args.agentSlotGranted)
+              throw new AgentAdmissionInfrastructureError('host-running turn started without its durable agent-slot grant');
+            await awaitAgentResources(heartbeat, signal, publishPressure);
+          } else if (args.agentTurnId && deps.client && deps.taskQueue) {
             releaseSlot = await acquireWorkflowAgentSlot({
               client: deps.client,
               taskQueue: deps.taskQueue,
@@ -1124,7 +1202,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               signal,
             });
             try {
-              await awaitAgentResources(heartbeat, signal);
+              await awaitAgentResources(heartbeat, signal, publishPressure);
             } catch (e) {
               await releaseSlot();
               releaseSlot = () => {};
@@ -1134,12 +1212,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         // The workflow publishes `waiting-slot` immediately after the account grant;
         // only admission itself can truthfully report that the model is now running.
-        if (deps.client && args.agentTurnId) {
-          await deps.client.workflow
-            .getHandle(args.taskId)
-            .signal(SIG_AGENT_TURN_STATE, { turnId: args.agentTurnId, role: args.role, provider: profile.provider, state: 'running' })
-            .catch(() => undefined);
-        }
+        await signalTurnState('running');
         publishLegacyAgentState('running');
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,

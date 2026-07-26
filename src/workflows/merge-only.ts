@@ -57,12 +57,21 @@ export async function mergeOnly(input: MergeOnlyInput): Promise<{ stage: Stage; 
   return mergeOnlyImpl(input, true);
 }
 
+/** Durable non-blocking host admission. */
+export async function mergeOnlyV1_2(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true);
+}
+
 /** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
 export async function mergeOnlyV1(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
   return mergeOnlyImpl(input, false);
 }
 
-async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Promise<{ stage: Stage; sha?: string }> {
+async function mergeOnlyImpl(
+  input: MergeOnlyInput,
+  managedTurns: boolean,
+  durableAdmission = false,
+): Promise<{ stage: Stage; sha?: string }> {
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -127,13 +136,14 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
         taskId,
         projectId: input.projectId,
         task: () => input,
+        world: () => world,
         status: () => status,
         setStatus: (next) => { status = next; },
         setWaitingFor: (next) => { waitingFor = next; },
         setAgentTurn: (next) => { agentTurn = next; },
         cancelled: () => cancelled,
         publish,
-      })
+      }, durableAdmission)
     : undefined;
 
   /** Run one Confirm-agent turn (SPEC §5.2): review the branch, return a verdict, or
@@ -156,7 +166,15 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
         changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
         transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
       });
-      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; accountCredentialKind?: 'login' | 'ambient' | 'key'; accountCredentialProvider?: string; agentTurnId: string }) =>
+      const invoke = (lease?: {
+        accountConfigHome?: string;
+        accountApiKeyHandle?: string;
+        accountCredentialKind?: 'login' | 'ambient' | 'key';
+        accountCredentialProvider?: string;
+        agentTurnId: string;
+        agentAdmissionManaged?: true;
+        agentSlotGranted?: true;
+      }) =>
         turns.runAgentTurn({
           taskId,
           role: 'confirm',

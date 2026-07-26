@@ -20,6 +20,7 @@ function extractFunction(name: string): string {
 const context = vm.createContext({
   esc: (value: unknown) => String(value),
   pipeline: () => '',
+  liveRoleFor: () => 'do',
 });
 vm.runInContext(
   [
@@ -29,6 +30,7 @@ vm.runInContext(
     extractFunction('stageLabel'),
     extractFunction('runSubRow'),
     extractFunction('runPageRow'),
+    extractFunction('conversationPresence'),
   ].join('\n'),
   context,
 );
@@ -37,6 +39,10 @@ const stageLabel = context.stageLabel as (view: Record<string, any>) => string;
 const waitingText = context.waitingText as (wait: Record<string, any>) => string;
 const runSubRow = context.runSubRow as (run: Record<string, any>) => string;
 const runPageRow = context.runPageRow as (run: Record<string, any>) => string;
+const conversationPresence = context.conversationPresence as (
+  view: Record<string, any>,
+  turn: Record<string, any>,
+) => { label: string; tone: string };
 
 describe('waiting labels in task summaries', () => {
   it('shows the wait reason instead of the pipeline stage', () => {
@@ -49,6 +55,10 @@ describe('waiting labels in task summaries', () => {
   });
 
   it('normalizes both complete wait details and noun-phrase details', () => {
+    expect(waitingText({
+      kind: 'agentSlot',
+      detail: 'Starting agent',
+    })).toBe('Starting agent');
     expect(waitingText({
       kind: 'agentSlot',
       detail: 'Waiting for host capacity to run the agent',
@@ -83,5 +93,19 @@ describe('waiting labels in task summaries', () => {
     };
     expect(runSubRow(run)).toContain('Waiting for the parent task to respond');
     expect(runPageRow(run)).toContain('Waiting for the parent task to respond');
+  });
+
+  it('uses the truthful startup state in agent conversations', () => {
+    expect(conversationPresence(
+      { agentTurn: { role: 'do', state: 'waiting-slot' } },
+      { role: 'do' },
+    ).label).toBe('Starting agent');
+    expect(conversationPresence(
+      {
+        agentTurn: { role: 'do', state: 'waiting-slot' },
+        waitingFor: { detail: 'Waiting for host capacity to start agent' },
+      },
+      { role: 'do' },
+    ).label).toBe('Waiting for host capacity to start agent');
   });
 });
