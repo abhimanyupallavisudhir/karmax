@@ -28,6 +28,7 @@ const view = (h: any) => h.query('view') as Promise<any>;
 
 describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   let h: Harness;
+  let cancellationCleanupFinishedAt = 0;
   beforeAll(async () => {
     const mock = new MockAdapter();
     const restartSession = 'restart-regression-session';
@@ -37,6 +38,20 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     const adapter: AgentAdapter = {
       provider: 'mock',
       async runTurn(input, ctx) {
+        if (input.messages.some((m) => m.text.includes('@cancel-cleanup-regression'))) {
+          const pulse = setInterval(() => {
+            try { ctx.heartbeat?.(); } catch { /* cancellation is delivered through the signal */ }
+          }, 50);
+          await new Promise<void>((resolve) => {
+            if (ctx.signal?.aborted) return resolve();
+            ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+          clearInterval(pulse);
+          // Model provider cleanup/reaping that continues after it observes abort.
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          cancellationCleanupFinishedAt = Date.now();
+          return { termination: { kind: 'success', status: 'mock.completed' }, output: 'cancelled partial output' };
+        }
         const restartCase = input.session === restartSession || input.messages.some((m) => m.text.includes('@restart-regression'));
         if (!restartCase) return mock.runTurn(input, ctx);
         if (input.session === restartSession) {
@@ -429,7 +444,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   it('cancels mid-turn: a long-running Do turn aborts on cancel without finishing (SPEC §5.6)', async () => {
     const repo = await h.makeRepo('app-cancel');
     const taskId = newId('task');
-    const handle = await h.client.workflow.start('softwareDev', {
+    const handle = await h.client.workflow.start('softwareDev@1.5.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       // the Do turn sleeps ~30s; a naive cancel would wait it out
@@ -444,6 +459,31 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
     expect(result.stage).toBe('cancelled');
     // it aborted mid-turn — did NOT wait out the ~30s sleep
     expect(Date.now() - t0).toBeLessThan(15_000);
+  });
+
+  it('does not settle cancellation until the provider turn has actually stopped', async () => {
+    const repo = await h.makeRepo('app-cancel-acknowledged');
+    const taskId = newId('task');
+    cancellationCleanupFinishedAt = 0;
+    const handle = await h.client.workflow.start('softwareDev@1.5.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId,
+        repo,
+        title: 'Wait for provider cancellation',
+        prompt: '@cancel-cleanup-regression',
+      })],
+    });
+
+    await expect.poll(async () => (await view(handle)).agentTurn?.state, { timeout: 15_000 }).toBe('running');
+    await handle.signal('cancel');
+    const result = await handle.result();
+
+    expect(result.stage).toBe('cancelled');
+    expect(cancellationCleanupFinishedAt).toBeGreaterThan(0);
+    expect(h.store.eventsSince(taskId, 0).findLast((event) => event.type === 'view.updated')?.payload)
+      .toMatchObject({ stage: 'cancelled', status: 'cancelled' });
   });
 
   it('routes an unhandled error directly to human escalation when Resolve is disabled', async () => {
@@ -967,7 +1007,7 @@ describe('software-dev pipeline (real Temporal + git, mock agent)', () => {
   it('cancels running sub-task agents when the parent is cancelled (SPEC §5.6)', async () => {
     const repo = await h.makeRepo('app-sub-cancel');
     const taskId = newId('task');
-    const handle = await h.client.workflow.start('softwareDev', {
+    const handle = await h.client.workflow.start('softwareDev@1.5.0', {
       taskQueue: TASK_QUEUE,
       workflowId: taskId,
       // The child's Do turn sleeps ~30s and never reaches Review, so the parent

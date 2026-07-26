@@ -7,6 +7,7 @@ import {
   isCancellation,
   workflowInfo,
 } from '@temporalio/workflow';
+import { ActivityCancellationType } from '@temporalio/common';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
@@ -16,13 +17,19 @@ import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldH
 import { AgentTurnCancelled, createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
-// Agent turns heartbeat every ~10s; a 2-minute gap = dead/slept worker → Temporal
+// Agent turns heartbeat every ~1s; a 2-minute gap = dead/slept worker → Temporal
 // retries the turn and the next attempt resumes the interrupted session (see
 // software-dev.ts / failures.ts for the full taxonomy).
 const turns = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes',
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
+});
+const cancellationAwareTurns = proxyActivities<coreActivities>({
+  startToCloseTimeout: '45 minutes',
+  heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
+  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
@@ -49,6 +56,11 @@ export async function justDoV1_2(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, true, true);
 }
 
+/** Cancellation waits for the live provider turn to stop. */
+export async function justDoV1_3(input: TaskInput): Promise<{ stage: Stage }> {
+  return justDoImpl(input, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to justDo@1.0.0. */
 export async function justDoV1(input: TaskInput): Promise<{ stage: Stage }> {
   return justDoImpl(input, false);
@@ -58,7 +70,9 @@ async function justDoImpl(
   input: TaskInput,
   managedTurns: boolean,
   durableAdmission = false,
+  awaitTurnCancellation = false,
 ): Promise<{ stage: Stage }> {
+  const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -131,7 +145,7 @@ async function justDoImpl(
         agentAdmissionManaged?: true;
         agentSlotGranted?: true;
       }) =>
-        turns.runAgentTurn({
+        agentTurns.runAgentTurn({
           taskId,
           role: 'confirm',
           worldHandle: world as any,
@@ -201,7 +215,7 @@ async function justDoImpl(
         agentAdmissionManaged?: true;
         agentSlotGranted?: true;
       }) =>
-        turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input, ...(lease ? lease : {}) });
+        agentTurns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input, ...(lease ? lease : {}) });
       turn = leaser ? await leaser.run('do', invoke) : await invoke();
     } catch (err) {
       if (managedTurns && cancelled && (err instanceof AgentTurnCancelled || isCancellation(err))) break;
