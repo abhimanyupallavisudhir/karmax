@@ -112,7 +112,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
       const task = layerSpec.provider ? { ...input, agents: { ...(input.agents ?? {}), confirm: { ...layerSpec, provider: layerSpec.provider } } } : input;
       // A fresh turn each Review so the reviewer judges the current work (up-to-date
       // system prompt); a mid-turn retry still resumes via runAgentTurn heartbeat details.
-      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; accountCredentialKind?: 'login' | 'ambient' | 'key'; accountCredentialProvider?: string; agentTurnId: string }) =>
         turns.runAgentTurn({
           taskId,
           role: 'confirm',
@@ -174,7 +174,7 @@ async function justDoImpl(input: TaskInput, managedTurns: boolean): Promise<{ st
     try {
       // On resume the session already holds the first `seen` messages, so send only
       // the delta after them (a follow-up), not the whole conversation again.
-      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; accountCredentialKind?: 'login' | 'ambient' | 'key'; accountCredentialProvider?: string; agentTurnId: string }) =>
         turns.runAgentTurn({ taskId, role: 'do', worldHandle: world as any, messages: msgs, session, deliveredMessages: session ? seen : 0, task: input, ...(lease ? lease : {}) });
       turn = leaser ? await leaser.run('do', invoke) : await invoke();
     } catch (err) {

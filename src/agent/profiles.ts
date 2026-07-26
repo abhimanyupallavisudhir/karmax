@@ -40,32 +40,25 @@ export function defaultEffort(provider: Provider): string | undefined {
 }
 
 /** Apply a per-task agent spec without carrying provider-scoped settings across
- * providers. A profile's model/auth/account allow-list belongs to its provider:
- * changing Claude → Codex (or vice versa) must not leave the old provider's
- * model or credentials attached to the new adapter. */
+ * providers. A model belongs to its harness; credential routing is stripped
+ * here and resolved independently by the scoped Credentials policy. */
 export function applyAgentSpec(base: AgentProfile, spec?: AgentSpec): AgentProfile {
-  if (!spec) return base;
+  // `modelProvider` used to be independently editable. It duplicated the
+  // ordered Credentials policy and could disagree with it. Keep the wire/storage
+  // member for replay compatibility, but never let persisted task/profile input
+  // route a turn; core stamps the provider of the credential actually leased.
+  const { modelProvider: _legacyModelProvider, ...cleanBase } = base;
+  if (!spec) return cleanBase;
   const provider = spec.provider ?? base.provider;
   const sameProvider = provider === base.provider;
-  const modelProvider = spec.modelProvider ?? (sameProvider ? base.modelProvider : undefined);
   const model = spec.model ?? (sameProvider ? base.model : defaultModel(provider));
   const effort = spec.effort ?? (sameProvider ? base.effort : undefined);
-  const {
-    model: _model,
-    modelProvider: _modelProvider,
-    effort: _effort,
-    auth: _auth,
-    allowedAccounts: _allowedAccounts,
-    ...common
-  } = base;
+  const { model: _model, effort: _effort, auth: _auth, allowedAccounts: _allowedAccounts, ...common } = cleanBase;
   return {
     ...common,
     provider,
-    ...(modelProvider ? { modelProvider } : {}),
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
-    ...(sameProvider && base.auth ? { auth: base.auth } : {}),
-    ...(sameProvider && base.allowedAccounts ? { allowedAccounts: base.allowedAccounts } : {}),
   };
 }
 

@@ -22,6 +22,8 @@ export interface Credential {
   configHome?: string;
   /** For a broker-backed API key — the handle to resolve JIT. */
   apiKeyHandle?: string;
+  /** Model vendor carried by a model-agnostic harness login (for example xAI). */
+  modelProvider?: string;
   /** For a login — the account name. */
   account?: string;
 }
@@ -38,11 +40,13 @@ export interface CredentialSources {
   /** Tenant that owns every source in this set. */
   organizationId?: string;
   /** ConfigHomeManager.list() output. */
-  logins: { provider: string; account: string; path: string; loggedIn: boolean }[];
+  logins: { provider: string; account: string; path: string; loggedIn: boolean; modelProvider?: string }[];
   /** Ambient (~/.claude / ~/.codex) login present? */
   ambient: Record<string, boolean>;
   /** Resolved ambient homes. Optional keeps pure callers/tests backwards compatible. */
   ambientHomes?: Record<string, string | undefined>;
+  /** Model vendor represented by a model-agnostic ambient login, when detectable. */
+  ambientModelProviders?: Record<string, string | undefined>;
   /** ANTHROPIC_API_KEY / OPENAI_API_KEY present in the environment? */
   envKeys: Record<string, boolean>;
   /** Broker-registered API-key handles (e.g. "claude:work"). */
@@ -58,11 +62,26 @@ export function enumerateCredentials(s: CredentialSources): Credential[] {
     const key = organizationId === 'org_personal'
       ? `login:${l.provider}:${l.account}`
       : `login:${organizationId}:${l.provider}:${l.account}`;
-    out.push({ key, provider: l.provider, kind: 'login', label: `${l.provider}:${l.account}`, configHome: l.path, account: l.account });
+    out.push({
+      key,
+      provider: l.provider,
+      kind: 'login',
+      label: `${l.provider}:${l.account}${l.modelProvider ? ` (${l.modelProvider})` : ''}`,
+      configHome: l.path,
+      account: l.account,
+      ...(l.modelProvider ? { modelProvider: l.modelProvider } : {}),
+    });
   }
   for (const [provider, present] of Object.entries(s.ambient)) {
-    if (present) out.push({ key: `ambient:${provider}`, provider, kind: 'ambient',
-      label: `${provider} (ambient login)`, configHome: s.ambientHomes?.[provider] });
+    const modelProvider = s.ambientModelProviders?.[provider];
+    if (present) out.push({
+      key: `ambient:${provider}`,
+      provider,
+      kind: 'ambient',
+      label: `${provider} (ambient login${modelProvider ? ` · ${modelProvider}` : ''})`,
+      configHome: s.ambientHomes?.[provider],
+      ...(modelProvider ? { modelProvider } : {}),
+    });
   }
   for (const [provider, present] of Object.entries(s.envKeys)) {
     if (present) out.push({ key: `key:${provider}`, provider, kind: 'key', label: `${provider} API key (environment)` });

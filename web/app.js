@@ -595,7 +595,6 @@ function renderAgentField(f, spec, inherited) {
       </div>
       ${effortSelectHtml('af-effort', provider, e.model, e.effort || '')}
     </div>
-    <input class="af-model-provider" placeholder="credential provider (auto from model, e.g. kimi)" value="${esc(e.modelProvider || '')}" title="Optional. Separates the coding harness from the API-key/subscription pool; OpenCode normally derives this from the model prefix." style="width:100%;margin-top:6px;padding:7px 10px" />
     <label class="af-resume-toggle"><input type="checkbox" class="af-resume-enabled" ${resumeEnabled ? 'checked' : ''}> ${role === 'unified' ? 'Fork Do agent from a previous agent' : 'Fork a previous agent'}</label>
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
@@ -689,12 +688,12 @@ function renderConfirmerField(f, own, inherited, alt) {
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-const normSpec = (s) => (s ? { provider: s.provider, modelProvider: s.modelProvider || '', model: s.model || '', effort: s.effort || '' } : null);
+const normSpec = (s) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '' } : null);
 // Canonical shape of a confirm layer for changed-vs-inherited comparison.
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', provider: l.provider || '', modelProvider: l.modelProvider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
+      ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: l.prompt || '', resume: l.resumeFrom || null }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
@@ -708,11 +707,9 @@ function readConfirmerLayers(box) {
     }
     const ab = row.querySelector('.agent-field');
     const spec = { kind: 'agent', provider: ab.querySelector('.af-provider').value };
-    const modelProvider = ab.querySelector('.af-model-provider')?.value.trim();
     const model = ab.querySelector('.af-model').value.trim();
     const effort = ab.querySelector('.af-effort').value;
     if (model) spec.model = model;
-    if (modelProvider) spec.modelProvider = modelProvider;
     if (effort) spec.effort = effort;
     const resumeFrom = readResume(ab);
     if (resumeFrom) spec.resumeFrom = resumeFrom;
@@ -745,11 +742,9 @@ function collectForm(root, fields) {
       if (!box) continue;
       const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
       const spec = { provider: box.querySelector('.af-provider').value };
-      const modelProvider = box.querySelector('.af-model-provider')?.value.trim();
       const model = box.querySelector('.af-model').value.trim();
       const effort = box.querySelector('.af-effort').value;
       if (model) spec.model = model;
-      if (modelProvider) spec.modelProvider = modelProvider;
       if (effort) spec.effort = effort;
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
@@ -931,11 +926,9 @@ function wireAgentFields(root) {
       const sync = () => {
         const inh = JSON.parse(unifiedBox.getAttribute('data-inherit') || 'null');
         const cur = { provider: unifiedBox.querySelector('.af-provider').value };
-        const modelProvider = unifiedBox.querySelector('.af-model-provider')?.value.trim();
         const model = unifiedBox.querySelector('.af-model').value.trim();
         const effort = unifiedBox.querySelector('.af-effort').value;
         if (model) cur.model = model;
-        if (modelProvider) cur.modelProvider = modelProvider;
         if (effort) cur.effort = effort;
         reset.hidden = sameJson(normSpec(cur), normSpec(inh));
       };
@@ -1062,11 +1055,9 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     if (!box) return false;
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
     const spec = { provider: box.querySelector('.af-provider').value };
-    const modelProvider = box.querySelector('.af-model-provider')?.value.trim();
     const model = box.querySelector('.af-model').value.trim();
     const effort = box.querySelector('.af-effort').value;
     if (model) spec.model = model;
-    if (modelProvider) spec.modelProvider = modelProvider;
     if (effort) spec.effort = effort;
     return !sameJson(normSpec(spec), normSpec(inh));
   }
@@ -1102,7 +1093,6 @@ function resetAgentField(box, attr = 'data-inherit') {
   const prov = box.querySelector('.af-provider');
   prov.value = inh.provider || 'claude';
   box.querySelector('.af-model').value = inh.model || '';
-  if (box.querySelector('.af-model-provider')) box.querySelector('.af-model-provider').value = inh.modelProvider || '';
   refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
   const eff = box.querySelector('.af-effort');
   if (eff && inh.effort) eff.value = inh.effort;
@@ -5526,11 +5516,9 @@ function collectParamEdits(root, fields) {
       const box = root.querySelector(`.agent-field[data-agent="${CSS.escape(f.role || f.name)}"]`);
       if (!box) continue;
       const spec = { provider: box.querySelector('.af-provider').value };
-      const modelProvider = box.querySelector('.af-model-provider')?.value.trim();
       const model = box.querySelector('.af-model').value.trim();
       const effort = box.querySelector('.af-effort')?.value;
       if (model) spec.model = model;
-      if (modelProvider) spec.modelProvider = modelProvider;
       if (effort) spec.effort = effort;
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
@@ -7797,26 +7785,7 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
-// Which accounts an agent may use (SPEC §7.3/§6.2) — a checkbox pool, all checked
-// by default. The checked set becomes the agent's credential + lease-rotation pool.
-function accountChecks(p, handles, logins, organizationId) {
-  if (organizationId !== 'org_personal') {
-    return '<span style="color:var(--ink-3);font-size:12px">Use the organization credential manager above to control this pool and its precedence.</span>';
-  }
-  const refs = [...logins.map((l) => `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
-  if (!refs.length) return `<span style="color:var(--ink-3);font-size:12px">No accounts connected — the agent uses the ambient login.</span>`;
-  const all = !p.allowedAccounts || !p.allowedAccounts.length; // unset ⇒ all allowed
-  const on = (ref) => all || p.allowedAccounts.includes(ref);
-  const box = (ref, label, warn) =>
-    `<label style="display:inline-flex;gap:5px;align-items:center;font-size:12px;margin:2px 10px 2px 0">
-      <input type="checkbox" class="pf-acct" value="${esc(ref)}" ${on(ref) ? 'checked' : ''} /> ${esc(label)}${warn ? ' <span style="color:var(--warn,#e0b15a)">(not signed in)</span>' : ''}</label>`;
-  return (
-    logins.map((l) => box(`login:${l.provider}:${l.account}`, `${l.provider}:${l.account}`, !l.loggedIn)).join('') +
-    handles.map((h) => box(`key:${h}`, `key · ${h}`, false)).join('')
-  );
-}
-
-function profileRow(p, handles, logins, scope, organizationId) {
+function profileRow(p, scope) {
   const inherited = scope === 'project' && p.scope === 'inherited';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
   return `<div class="card" data-profile="${esc(p.id)}" data-role="${esc(p.role)}" style="background:var(--surface-2)">
@@ -7832,9 +7801,7 @@ function profileRow(p, handles, logins, scope, organizationId) {
       ${effortSelectHtml('pf-effort', p.provider, p.model, p.effort || '')}
       <input class="pf-maxturns" type="number" min="1" placeholder="turns: ∞" title="Max tool iterations per turn. Blank = unlimited." value="${p.maxTurns ?? ''}" style="width:90px" />
     </div>
-    <div class="form-row" style="margin-top:8px"><label>Credential provider (optional)</label><input class="pf-model-provider" placeholder="auto from harness/model; e.g. kimi, google, xai" value="${esc(p.modelProvider || '')}" /></div>
     <div class="form-row" style="margin-top:8px"><label>Capabilities (comma-separated)</label><input class="pf-caps" value="${esc((p.capabilities || []).join(', '))}" /></div>
-    <div class="form-row"><label>Accounts this agent may use (all by default)</label><div class="pf-accts">${accountChecks(p, handles, logins, organizationId)}</div></div>
     <div style="display:flex;gap:8px">
       <button class="btn primary sm" data-saveprofile="${esc(p.id)}">${p.id === '__unified__' ? 'Save agent' : 'Save profile'}</button>
       ${scope === 'project' && p.scope === 'project' ? `<button class="btn sm" data-resetprofile="${esc(p.id)}">Reset to inherited</button>` : ''}
@@ -7848,12 +7815,6 @@ function profileRow(p, handles, logins, scope, organizationId) {
 // The standing Confirm-agent profile is not shown: review agents are configured
 // per layer in the Review route, right below the agents they gate.
 async function hydrateProfiles(scope, projectId, organizationId) {
-  let handles = [], logins = [];
-  const accountOrganizationId = organizationId || projectById(projectId)?.organizationId || S.organizationId || 'org_personal';
-  try {
-    const a = await api(`/api/organizations/${encodeURIComponent(accountOrganizationId)}/accounts`);
-    handles = a.handles || []; logins = a.logins || [];
-  } catch {}
   let profiles = [];
   try { profiles = await api(`/api/profiles${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`); } catch {}
   profiles = profiles.filter((p) => p.role !== 'confirm');
@@ -7862,10 +7823,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   const doP = profiles.find((p) => p.role === 'do');
   const mergeP = profiles.find((p) => p.role === 'merge');
   const rest = profiles.filter((p) => p !== doP && p !== mergeP);
-  const allRefs = [...logins.map((l) => l.key || `login:${l.provider}:${l.account}`), ...handles.map((h) => `key:${h}`)];
-  // unset/empty allowedAccounts ⇒ all allowed — normalize before comparing roles
-  const normAllowed = (p) => (p.allowedAccounts?.length ? [...p.allowedAccounts].sort() : [...allRefs].sort());
-  const essence = (p) => JSON.stringify({ provider: p.provider, model: p.model || '', effort: p.effort || '', maxTurns: p.maxTurns ?? null, accounts: normAllowed(p) });
+  const essence = (p) => JSON.stringify({ provider: p.provider, model: p.model || '', effort: p.effort || '', maxTurns: p.maxTurns ?? null });
   const separate = !!(doP && mergeP && essence(doP) !== essence(mergeP));
   const unified = doP && mergeP
     ? { ...doP, id: '__unified__', name: 'Agent', role: 'do + merge', scope: doP.scope === 'project' || mergeP.scope === 'project' ? 'project' : doP.scope }
@@ -7873,11 +7831,11 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   list.innerHTML = !profiles.length ? '<span style="color:var(--ink-3)">No profiles.</span>'
     : unified
       ? `<div class="profiles-group">
-          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, handles, logins, scope, accountOrganizationId)}</div>
+          <div class="profiles-unified" ${separate ? 'hidden' : ''}>${profileRow(unified, scope)}</div>
           <label class="agent-separate-toggle"><input type="checkbox" class="profiles-separate" ${separate ? 'checked' : ''}> Separate Do and Merge agent configurations</label>
-          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, handles, logins, scope, accountOrganizationId)).join('')}</div>
-        </div>${rest.map((p) => profileRow(p, handles, logins, scope, accountOrganizationId)).join('')}`
-      : profiles.map((p) => profileRow(p, handles, logins, scope, accountOrganizationId)).join('');
+          <div class="profiles-separated" ${separate ? '' : 'hidden'}>${[doP, mergeP].map((p) => profileRow(p, scope)).join('')}</div>
+        </div>${rest.map((p) => profileRow(p, scope)).join('')}`
+      : profiles.map((p) => profileRow(p, scope)).join('');
   list.querySelector('.profiles-separate')?.addEventListener('change', (e) => {
     list.querySelector('.profiles-unified').hidden = e.target.checked;
     list.querySelector('.profiles-separated').hidden = !e.target.checked;
@@ -7893,18 +7851,11 @@ async function hydrateProfiles(scope, projectId, organizationId) {
   });
   list.querySelectorAll('[data-saveprofile]').forEach((b) => b.addEventListener('click', async () => {
     const card = b.closest('[data-profile]');
-    const checked = [...card.querySelectorAll('.pf-acct:checked')].map((c) => c.value);
-    // all checked ⇒ store nothing (means "all", stays correct as accounts are added)
-    const allowedAccounts = accountOrganizationId === 'org_personal'
-      ? allRefs.length && checked.length < allRefs.length ? checked : undefined
-      : undefined;
     const knobs = {
       provider: card.querySelector('.pf-provider').value,
-      modelProvider: card.querySelector('.pf-model-provider').value.trim() || undefined,
       model: card.querySelector('.pf-model').value.trim() || undefined,
       effort: card.querySelector('.pf-effort').value || undefined,
       maxTurns: card.querySelector('.pf-maxturns').value ? Number(card.querySelector('.pf-maxturns').value) : undefined,
-      allowedAccounts,
     };
     // The unified row IS the Do and Merge defaults: one Save writes both roles.
     const targets = b.dataset.saveprofile === '__unified__' ? [doP, mergeP] : [profiles.find((p) => p.id === b.dataset.saveprofile)].filter(Boolean);
@@ -7914,7 +7865,6 @@ async function hydrateProfiles(scope, projectId, organizationId) {
           role: orig.role, name: orig.name, id: scope === 'global' ? orig.id : undefined,
           projectId: scope === 'project' ? projectId : undefined, capabilities: orig.capabilities,
           ...knobs,
-          ...(accountOrganizationId !== 'org_personal' && orig.allowedAccounts ? { allowedAccounts: orig.allowedAccounts } : {}),
         }) });
       }
       await hydrateProfiles(scope, projectId, organizationId);

@@ -74,6 +74,9 @@ export class LoginManager {
   /** Start (or report) a login for an account. Returns the device URL to open. */
   async connect(provider: Provider, account: string, opts: LoginOptions = {}, organizationId = 'org_personal'): Promise<LoginResult> {
     const configHome = this.homes.ensure(provider, account, organizationId);
+    if (provider === 'opencode' && opts.modelProvider) {
+      this.homes.setModelProvider(configHome, opts.modelProvider);
+    }
     // Skip only if fully authed with a native credential. A setup-token-only home
     // re-runs login here to UPGRADE to a full, usage-pollable credential (#6).
     if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };

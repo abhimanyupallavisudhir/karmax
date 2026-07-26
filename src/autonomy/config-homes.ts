@@ -42,7 +42,7 @@ export class ConfigHomeManager {
     return dst;
   }
 
-  list(organizationId = 'org_personal'): { provider: string; account: string; path: string; loggedIn: boolean }[] {
+  list(organizationId = 'org_personal'): { provider: string; account: string; path: string; loggedIn: boolean; modelProvider?: string }[] {
     const root = this.organizationRoot(organizationId);
     if (!fs.existsSync(root)) return [];
     return fs.readdirSync(root, { withFileTypes: true })
@@ -50,14 +50,37 @@ export class ConfigHomeManager {
       .map(({ name }) => {
       const [provider, ...rest] = name.split('-');
       const dir = path.join(root, name);
-      return { provider: provider ?? '', account: rest.join('-'), path: dir, loggedIn: isLoggedIn(provider ?? '', dir) };
+      const modelProvider = provider === 'opencode' ? this.modelProvider(dir) : undefined;
+      return {
+        provider: provider ?? '',
+        account: rest.join('-'),
+        path: dir,
+        loggedIn: isLoggedIn(provider ?? '', dir),
+        ...(modelProvider ? { modelProvider } : {}),
+      };
       });
+  }
+
+  /** Persist the vendor selected by an OpenCode subscription login. */
+  setModelProvider(home: string, modelProvider: string): void {
+    fs.writeFileSync(path.join(home, KARMAX_LOGIN_META_FILE), JSON.stringify({ modelProvider }), { mode: 0o600 });
+  }
+
+  /** Read Karmax metadata, falling back to a single provider in old auth.json files. */
+  modelProvider(home: string): string | undefined {
+    try {
+      const value = JSON.parse(fs.readFileSync(path.join(home, KARMAX_LOGIN_META_FILE), 'utf8')).modelProvider;
+      if (typeof value === 'string' && value) return value;
+    } catch {
+      /* historical login without Karmax metadata */
+    }
+    return openCodeAuthProvider(path.join(home, 'data', 'opencode', 'auth.json'));
   }
 
   /** Every managed login, for the host-wide lease coordinator. Ambient homes and
    * environment keys are intentionally not included here: those legacy host
    * credentials belong only to org_personal. */
-  listAll(organizationIds: string[]): Array<{ organizationId: string; provider: string; account: string; path: string; loggedIn: boolean }> {
+  listAll(organizationIds: string[]): Array<{ organizationId: string; provider: string; account: string; path: string; loggedIn: boolean; modelProvider?: string }> {
     return organizationIds.flatMap((organizationId) =>
       this.list(organizationId).map((login) => ({ organizationId, ...login })),
     );
@@ -250,6 +273,19 @@ export function isLoggedIn(provider: string, home: string): boolean {
 
 /** Where we persist a captured OAuth/setup token for a home. */
 export const KARMAX_TOKEN_FILE = 'karmax-oauth.json';
+export const KARMAX_LOGIN_META_FILE = 'karmax-login.json';
+
+/** Infer a single model vendor from OpenCode's documented auth.json map. */
+export function openCodeAuthProvider(authFile: string): string | undefined {
+  try {
+    const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+    const known = new Set<string>([...MODEL_PROVIDERS, 'claude', 'codex', 'grok']);
+    const providers = Object.keys(auth).filter((key) => known.has(key));
+    return providers.length === 1 ? providers[0] : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Read a captured token for a home (used to inject into the agent env). */
 export function capturedToken(home: string): string | undefined {

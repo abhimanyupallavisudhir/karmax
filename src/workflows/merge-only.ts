@@ -156,7 +156,7 @@ async function mergeOnlyImpl(input: MergeOnlyInput, managedTurns: boolean): Prom
         changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
         transcript: msgs.slice(-6).map((m) => `${m.role}: ${m.text}`).join('\n'),
       });
-      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) =>
+      const invoke = (lease?: { accountConfigHome?: string; accountApiKeyHandle?: string; accountCredentialKind?: 'login' | 'ambient' | 'key'; accountCredentialProvider?: string; agentTurnId: string }) =>
         turns.runAgentTurn({
           taskId,
           role: 'confirm',

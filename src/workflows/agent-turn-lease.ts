@@ -13,9 +13,10 @@ import { SIG_AGENT_TURN_STATE } from './names.js';
 import type { AgentRole, TaskInput, TaskView } from './contract.js';
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
-type Grant = { accountId: string; configHome?: string; apiKeyHandle?: string };
+type CredentialKind = 'login' | 'ambient' | 'key';
+type Grant = { accountId: string; configHome?: string; apiKeyHandle?: string; credentialKind?: CredentialKind; credentialProvider?: string };
 
-const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
+const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string; credentialKind?: CredentialKind; credentialProvider?: string }]>(SIG_ACCOUNT_GRANTED);
 const agentTurnStateSignal = defineSignal<[{ turnId: string; role: AgentRole; provider?: Provider; state: 'running' }]>(SIG_AGENT_TURN_STATE);
 
 export class AgentTurnCancelled extends Error {}
@@ -49,7 +50,13 @@ export function createAgentTurnLeaser(
   const grants = new Map<string, Grant>();
 
   setHandler(accountGrantedSignal, (g) => {
-    grants.set(g.turnId, { accountId: g.accountId, configHome: g.configHome, apiKeyHandle: g.apiKeyHandle });
+    grants.set(g.turnId, {
+      accountId: g.accountId,
+      configHome: g.configHome,
+      apiKeyHandle: g.apiKeyHandle,
+      credentialKind: g.credentialKind,
+      credentialProvider: g.credentialProvider,
+    });
   });
   setHandler(agentTurnStateSignal, async (next) => {
     if (!currentTurn || currentTurn.turnId !== next.turnId) return;
@@ -64,9 +71,11 @@ export function createAgentTurnLeaser(
     turnId: string,
     role: AgentRole,
     provider: Provider | undefined,
-    fn: (ctx: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) => Promise<T>,
+    fn: (ctx: { accountConfigHome?: string; accountApiKeyHandle?: string; accountCredentialKind?: CredentialKind; accountCredentialProvider?: string; agentTurnId: string }) => Promise<T>,
     home?: string,
     key?: string,
+    credentialKind?: CredentialKind,
+    credentialProvider?: string,
   ): Promise<T> => {
     resumeStatus = host.status() === 'waiting' ? 'active' : host.status();
     currentTurn = { turnId, role, provider, state: 'waiting-slot' };
@@ -77,7 +86,13 @@ export function createAgentTurnLeaser(
     const scope = new CancellationScope({ cancellable: true });
     activeScope = scope;
     try {
-      return await scope.run(() => fn({ accountConfigHome: home, accountApiKeyHandle: key, agentTurnId: turnId }));
+      return await scope.run(() => fn({
+        accountConfigHome: home,
+        accountApiKeyHandle: key,
+        accountCredentialKind: credentialKind,
+        accountCredentialProvider: credentialProvider,
+        agentTurnId: turnId,
+      }));
     } finally {
       if (activeScope === scope) activeScope = undefined;
       if (currentTurn?.turnId === turnId) {
@@ -101,7 +116,7 @@ export function createAgentTurnLeaser(
 
     async run<T>(
       role: AgentRole,
-      fn: (ctx: { accountConfigHome?: string; accountApiKeyHandle?: string; agentTurnId: string }) => Promise<T>,
+      fn: (ctx: { accountConfigHome?: string; accountApiKeyHandle?: string; accountCredentialKind?: CredentialKind; accountCredentialProvider?: string; agentTurnId: string }) => Promise<T>,
     ): Promise<T> {
       const turnId = `${host.taskId}#${turnSeq++}`;
       if (accountPool <= 0) return admitted(turnId, role, undefined, fn);
@@ -144,8 +159,10 @@ export function createAgentTurnLeaser(
       const passthrough = !grant || grant.accountId === '(passthrough)';
       const home = passthrough ? undefined : grant?.configHome;
       const key = passthrough ? undefined : grant?.apiKeyHandle;
+      const credentialKind = passthrough ? undefined : grant?.credentialKind;
+      const modelProvider = passthrough ? undefined : grant?.credentialProvider;
       try {
-        return await admitted(turnId, role, provider, fn, home, key);
+        return await admitted(turnId, role, provider, fn, home, key, credentialKind, modelProvider);
       } catch (err) {
         if (grant && !passthrough && !host.cancelled()) {
           const cls = limitFailureClassification(err);

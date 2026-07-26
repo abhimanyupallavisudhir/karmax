@@ -73,7 +73,8 @@ export const confirmSignal = defineSignal('confirm');
 export const cancelSignal = defineSignal('cancel');
 export const retrySignal = defineSignal('retry');
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
-export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
+type CredentialKind = 'login' | 'ambient' | 'key';
+export const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string; credentialKind?: CredentialKind; credentialProvider?: string }]>(SIG_ACCOUNT_GRANTED);
 export const agentTurnStateSignal = defineSignal<[{ turnId: string; role: AgentRole; provider?: 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock'; state: 'running' }]>(SIG_AGENT_TURN_STATE);
 /** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
@@ -277,7 +278,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
   // layers separately means switching back restores the task's original gate.
   const softwareDevConfirmLayers = confirmLayersOf(input.confirm, modeSwitching ? false : !!input.autoConfirm);
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
-  const accountGrants = new Map<string, { accountId: string; configHome?: string; apiKeyHandle?: string }>();
+  const accountGrants = new Map<string, { accountId: string; configHome?: string; apiKeyHandle?: string; credentialKind?: CredentialKind; credentialProvider?: string }>();
   let turnSeq = 0;
   let accountPool = 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
@@ -575,7 +576,13 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     mergeGranted = true;
   });
   setHandler(accountGrantedSignal, (g) => {
-    accountGrants.set(g.turnId, { accountId: g.accountId, configHome: g.configHome, apiKeyHandle: g.apiKeyHandle });
+    accountGrants.set(g.turnId, {
+      accountId: g.accountId,
+      configHome: g.configHome,
+      apiKeyHandle: g.apiKeyHandle,
+      credentialKind: g.credentialKind,
+      credentialProvider: g.credentialProvider,
+    });
   });
   setHandler(setTargetUpdate, (b) => {
     // Back-compat shim over the same window as updateParams({ target }), but
@@ -710,7 +717,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
             resolveMsgs.push(rin);
             let r;
             try {
-              r = await leasedTurn('resolve', (accountConfigHome, accountApiKeyHandle, agentTurnId) =>
+              r = await leasedTurn('resolve', (accountConfigHome, accountApiKeyHandle, agentTurnId, accountCredentialKind, accountCredentialProvider) =>
                 turns.runAgentTurn({
                   taskId,
                   role: 'resolve',
@@ -722,6 +729,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
                   bindings: { stage: stageName, error: error ?? '', transcript: lastOutputs(msgs), skills: '' },
                   accountConfigHome,
                   accountApiKeyHandle,
+                  accountCredentialKind,
+                  accountCredentialProvider,
                   ...(agentTurnId ? { agentTurnId } : {}),
                 }),
               );
@@ -810,7 +819,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
    */
   async function leasedTurn<T>(
     role: AgentRole,
-    fn: (accountConfigHome?: string, accountApiKeyHandle?: string, agentTurnId?: string) => Promise<T>,
+    fn: (accountConfigHome?: string, accountApiKeyHandle?: string, agentTurnId?: string, accountCredentialKind?: CredentialKind, accountCredentialProvider?: string) => Promise<T>,
   ): Promise<T> {
     /** v1.1 publishes the host-admission state before scheduling the turn. The
      * activity changes it to `running` only after it actually acquires a slot. */
@@ -820,6 +829,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
       resumeStatus: TaskView['status'],
       home?: string,
       key?: string,
+      credentialKind?: CredentialKind,
+      modelProvider?: string,
     ): Promise<T> => {
       if (liveAgentStates) {
         agentTurnResumeStatus = resumeStatus === 'waiting' ? 'active' : resumeStatus;
@@ -829,7 +840,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
         await publish();
       }
       try {
-        return await runCancellable(() => fn(home, key, liveAgentStates ? turnId : undefined));
+        return await runCancellable(() => fn(home, key, liveAgentStates ? turnId : undefined, credentialKind, modelProvider));
       } finally {
         if (liveAgentStates && agentTurn?.turnId === turnId) {
           agentTurn = undefined;
@@ -902,10 +913,12 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     const passthrough = !grant || grant.accountId === '(passthrough)';
     const leasedHome = passthrough ? undefined : grant?.configHome;
     const leasedKey = passthrough ? undefined : grant?.apiKeyHandle;
+    const leasedCredentialKind = passthrough ? undefined : grant?.credentialKind;
+    const leasedModelProvider = passthrough ? undefined : grant?.credentialProvider;
     try {
       // This publish happens immediately after the lease grant and replaces the
       // stale account-wait view with the distinct host-slot state.
-      return await admittedTurn(turnId, displayProvider, priorStatus, leasedHome, leasedKey);
+      return await admittedTurn(turnId, displayProvider, priorStatus, leasedHome, leasedKey, leasedCredentialKind, leasedModelProvider);
     } catch (err) {
       // Limit failure → update the coordinator so it re-leases the next allowed
       // credential: a transient window arms a refresh timer; a HARD billing/auth
@@ -951,7 +964,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     // never reached the agent (SPEC §5.6 — a queued follow-up must reach the agent).
     let deliveredNow = seen;
     const turn = await withResolve('do', () =>
-      leasedTurn('do', (accountConfigHome, accountApiKeyHandle, agentTurnId) => {
+      leasedTurn('do', (accountConfigHome, accountApiKeyHandle, agentTurnId, accountCredentialKind, accountCredentialProvider) => {
         doHome = accountConfigHome ?? '(profile)';
         // Resume only when the leased login matches the one that minted the session
         // (§2.5). When we do, the session already holds the first `seen` messages
@@ -969,6 +982,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
           task: liveInput,
           accountConfigHome,
           accountApiKeyHandle,
+          accountCredentialKind,
+          accountCredentialProvider,
           ...(agentTurnId ? { agentTurnId } : {}),
         });
       }),
@@ -1023,7 +1038,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     });
     confirmMsgs.push({ id: `c-in-${confirmMsgs.length}`, role: 'user', text: request, ts: confirmMsgs.length });
     const ct = await withResolve('confirm', () =>
-      leasedTurn('confirm', (accountConfigHome, accountApiKeyHandle, agentTurnId) =>
+      leasedTurn('confirm', (accountConfigHome, accountApiKeyHandle, agentTurnId, accountCredentialKind, accountCredentialProvider) =>
         // Each Review runs a FRESH confirm turn (session left unset) so the reviewer
         // always gets an up-to-date system prompt (fresh reviewInfo / changed files);
         // continuity comes from `confirmMsgs`, replayed to the fresh session — prior
@@ -1042,6 +1057,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
           },
           accountConfigHome,
           accountApiKeyHandle,
+          accountCredentialKind,
+          accountCredentialProvider,
           ...(agentTurnId ? { agentTurnId } : {}),
         }),
       ),
@@ -1577,7 +1594,7 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
     let result;
     try {
       // Best-effort merge agent turn (resolve conflicts / ensure tests pass)…
-      const mt = await leasedTurn('merge', (accountConfigHome, accountApiKeyHandle, agentTurnId) =>
+      const mt = await leasedTurn('merge', (accountConfigHome, accountApiKeyHandle, agentTurnId, accountCredentialKind, accountCredentialProvider) =>
         turns.runAgentTurn({
           taskId,
           role: 'merge',
@@ -1590,6 +1607,8 @@ async function softwareDevImpl(input: SoftwareDevInput, behaviorVersion: '1.0.0'
           bindings: { reviewInfo: reviewInfo?.summary ?? '' },
           accountConfigHome,
           accountApiKeyHandle,
+          accountCredentialKind,
+          accountCredentialProvider,
           ...(agentTurnId ? { agentTurnId } : {}),
         }),
       ).catch((e) => {

@@ -114,7 +114,14 @@ describe('generic ACP agent adapter', () => {
     dir = undefined;
   });
 
-  async function run(opts: { session?: string; fork?: boolean; image?: boolean; provider?: 'opencode' | 'kimi' | 'grok' } = {}) {
+  async function run(opts: {
+    session?: string;
+    fork?: boolean;
+    image?: boolean;
+    provider?: 'opencode' | 'kimi' | 'grok';
+    model?: string;
+    modelProvider?: string;
+  } = {}) {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-acp-'));
     const stub = path.join(dir, 'agent.cjs');
     const requests = path.join(dir, 'requests.jsonl');
@@ -128,8 +135,8 @@ describe('generic ACP agent adapter', () => {
     const output: string[] = [];
     const activities: any[] = [];
     const provider = opts.provider ?? 'opencode';
-    const modelProvider = provider === 'grok' ? 'xai' : 'kimi';
-    const model = provider === 'grok' ? 'grok-build' : 'kimi/k3';
+    const modelProvider = opts.modelProvider ?? (provider === 'grok' ? 'xai' : 'kimi');
+    const model = opts.model ?? (provider === 'grok' ? 'grok-build' : 'kimi/k3');
     const image = opts.image ? new AttachmentStore().put(PNG, 'image/png') : undefined;
     const turn = await new AcpAdapter(provider).runTurn({
       profile: {
@@ -204,6 +211,14 @@ describe('generic ACP agent adapter', () => {
     const forked = await run({ session: 'session-old', fork: true });
     expect(forked.records.some((r) => r.method === 'session/fork' && r.params.sessionId === 'session-old')).toBe(true);
     expect(forked.turn.session).toBe('session-forked');
+  });
+
+  it('binds an unprefixed custom model to the provider selected by Credentials', async () => {
+    const { records } = await run({ model: 'custom-design-model', modelProvider: 'google' });
+    expect(JSON.parse(records[0].env.OPENCODE_CONFIG_CONTENT)).toMatchObject({
+      model: 'google/custom-design-model',
+      provider: { google: { options: { apiKey: '{env:GEMINI_API_KEY}' } } },
+    });
   });
 
   it('uses Kimi Code’s documented ephemeral model channel for vault API keys', async () => {

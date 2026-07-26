@@ -1,7 +1,7 @@
 import { ClaudeAdapter } from '../agent/claude.js';
 import { CodexAdapter } from '../agent/codex.js';
 import { apiKeyEnv, hasAcpAmbientLogin, LOGIN_PROVIDERS, MODEL_PROVIDERS } from '../agent/provider-registry.js';
-import type { ConfigHomeManager } from '../autonomy/config-homes.js';
+import { openCodeAuthProvider, type ConfigHomeManager } from '../autonomy/config-homes.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { CredentialSources, CredPolicy } from './credentials.js';
 import os from 'node:os';
@@ -22,6 +22,7 @@ export function gatherCredentialSources(deps: {
   const hostCredentials = organizationId === 'org_personal';
   const claudeHome = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
   const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+  const openCodeDataHome = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), '.local', 'share');
   return {
     organizationId,
     logins: deps.configHomes?.list(organizationId) ?? [],
@@ -31,6 +32,9 @@ export function gatherCredentialSources(deps: {
       opencode: hostCredentials && hasAcpAmbientLogin('opencode'),
     },
     ambientHomes: { claude: claudeHome, codex: codexHome },
+    ambientModelProviders: {
+      opencode: openCodeAuthProvider(path.join(openCodeDataHome, 'opencode', 'auth.json')),
+    },
     envKeys: {
       // Keep the historical harness namespaces for existing policies/profiles,
       // and expose model-provider namespaces for model-agnostic harnesses.
