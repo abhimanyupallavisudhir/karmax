@@ -494,6 +494,8 @@ a { color: var(--accent); text-decoration: none; }
 .tf-side .tf-inline input { width: 68px; }
 /* The credential chips wrap fine at sidebar width; just keep them off the hairline. */
 .tf-side #cred-editor-newtask { margin-top: 2px; }
+.tf-vault-button { width: 100%; justify-content: space-between; }
+.tf-vault-count { color: var(--ink-3); font-size: 11px; font-weight: 500; }
 .tf-foot { border-top: 1px solid var(--line); background: var(--surface); padding: 12px 0; }
 .tf-foot-inner { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
 .tf-foot .tf-hint { margin-right: auto; color: var(--ink-3); font-size: 12px; }
@@ -1354,6 +1356,24 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 /* Credential import modal + inline info dots (Passwords settings) */
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 60; }
 .modal-card { background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--r); padding: 18px; box-shadow: 0 12px 40px rgba(0,0,0,.35); }
+.vault-grant-modal { width: min(600px, 92vw); }
+.vault-grant-modal > .section-h { margin-bottom: 4px; }
+.vault-grant-help { margin: 0 0 12px; color: var(--ink-2); font-size: 12px; }
+.vault-grant-box { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
+.vault-grant-head {
+  display: flex; gap: 8px; align-items: center; padding: 9px 11px;
+  border-bottom: 1px solid var(--line); background: var(--surface-2);
+  color: var(--ink-2); font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.vault-grant-selected { color: var(--ink-3); font-weight: 400; }
+.vault-grant-tree { max-height: 44vh; overflow-y: auto; padding: 8px 10px; }
+.vault-grant-item { display: flex; gap: 8px; align-items: flex-start; padding: 6px 4px; cursor: pointer; }
+.vault-grant-item:hover { background: var(--surface-2); border-radius: 6px; }
+.vault-grant-item > input { margin-top: 2px; }
+.vault-grant-item-text { min-width: 0; display: flex; flex-direction: column; gap: 1px; font-size: 12px; }
+.vault-grant-meta { color: var(--ink-3); font-size: 11px; overflow-wrap: anywhere; }
+.vault-grant-empty { display: block; padding: 18px 4px; color: var(--ink-3); font-size: 12px; text-align: center; }
+.vault-grant-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .info-dot { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 999px; background: var(--surface-2); color: var(--ink-3); font-size: 10px; cursor: pointer; user-select: none; }
 .info-dot:hover { color: var(--accent); }
 .vault-custom summary { color: var(--ink-2); font-size: 13px; }
