@@ -10,6 +10,8 @@ export interface RemoteAccessStatus {
   method: RemoteMethod;
   state: RemoteState;
   url?: string;
+  helpUrl?: string;
+  setupCommand?: string;
   detail: string;
   canEnable: boolean;
   canDisable: boolean;
@@ -56,6 +58,34 @@ function noServeConfig(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function serveError(error: unknown): Pick<RemoteAccessStatus, 'detail' | 'helpUrl' | 'setupCommand'> {
+  const result = commandError(error);
+  const raw = (result.stderr || result.stdout || 'Tailscale could not enable Serve.').trim();
+  const needsPermission = /serve config denied|use ['"]?sudo tailscale serve|set --operator/i.test(raw);
+  const needsApproval = /serve is not enabled/i.test(raw);
+  const helpUrl = needsApproval ? raw.match(/https:\/\/login\.tailscale\.com\/f\/serve\?[^\s]+/)?.[0] : undefined;
+  if (needsPermission && needsApproval) {
+    return {
+      detail: 'Tailscale needs two one-time setup steps: approve Serve for this tailnet and grant your Linux account permission. Complete both below, then try again.',
+      ...(helpUrl ? { helpUrl } : {}),
+      setupCommand: 'sudo tailscale set --operator=$USER',
+    };
+  }
+  if (needsPermission) {
+    return {
+      detail: 'Tailscale needs one-time permission for your Linux account. Run this command in a terminal, then try again.',
+      setupCommand: 'sudo tailscale set --operator=$USER',
+    };
+  }
+  if (needsApproval) {
+    return {
+      detail: 'Tailscale Serve must be approved once for this tailnet. Continue in Tailscale, then try again.',
+      ...(helpUrl ? { helpUrl } : {}),
+    };
+  }
+  return { detail: raw };
 }
 
 /**
@@ -172,11 +202,10 @@ export class RemoteAccessController {
     try {
       await this.run(['serve', '--bg', target]);
     } catch (error) {
-      const result = commandError(error);
       return {
         method: 'tailscale',
         state: 'error',
-        detail: (result.stderr || result.stdout || 'Tailscale could not enable Serve.').trim(),
+        ...serveError(error),
         canEnable: true,
         canDisable: false,
       };

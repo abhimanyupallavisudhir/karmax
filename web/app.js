@@ -8058,13 +8058,31 @@ function renderPhoneAccess(status) {
     : '';
   const setup = hosted
     ? '<li>Open this same HTTPS address on your phone.</li>'
-    : `<li>Install <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Tailscale</a> on your phone and sign in to the same tailnet.</li>
-       <li>Open the private Karmax address shown here. Keep Tailscale connected.</li>`;
+    : `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
+       <li>Open the private Karmax address shown here in your phone’s browser.</li>`;
+  const recovery = ready && !hosted
+    ? `<details class="phone-troubleshooting">
+        <summary>Address won’t open?</summary>
+        <ol>
+          <li>Disconnect Mullvad or any other VPN on both devices, then reconnect Tailscale. Android and iOS allow only one active VPN.</li>
+          <li>On Android, check Tailscale → Settings → App-based split tunneling. Your browser must not bypass Tailscale.</li>
+          <li>If the error mentions DNS or “name not found,” set Android Private DNS to Automatic, turn off browser Secure DNS temporarily, and reconnect Tailscale.</li>
+          <li>Keep this computer awake with Karmax running, then retry the exact <code>https://…ts.net</code> address above.</li>
+        </ol>
+       </details>`
+    : '';
+  const setupFix = status.setupCommand
+    ? `<div class="phone-setup-command"><code>${esc(status.setupCommand)}</code><button class="btn sm" id="remote-copy-command">Copy command</button></div>`
+    : '';
+  const helpLink = status.helpUrl
+    ? `<a class="btn sm primary" href="${esc(status.helpUrl)}" target="_blank" rel="noopener noreferrer">Continue in Tailscale</a>`
+    : '';
   box.innerHTML = `<div class="phone-access-head"><span class="remote-state ${ready ? 'ready' : ''}">${esc(label)}</span>${link}</div>
     <p>${esc(status.detail)}</p>
     ${ready ? `<ol class="phone-steps">${setup}<li>Use Karmax in the browser, or add it to your Home Screen for an app-like window.</li></ol>
-      <div class="phone-access-actions">${phoneInstallHelp()}${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}</div>`
-      : `<div class="phone-access-actions">
+      <div class="phone-access-actions">${phoneInstallHelp()}${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}</div>${recovery}`
+      : `${setupFix}<div class="phone-access-actions">
+          ${helpLink}
           ${status.canEnable ? '<button class="btn sm primary" id="remote-enable">Turn on private access</button>' : ''}
           ${status.method === 'none' ? '<a class="btn sm" href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Install Tailscale</a>' : ''}
           <button class="btn sm" id="remote-refresh">Check again</button>
@@ -8084,6 +8102,15 @@ function renderPhoneAccess(status) {
   $('#remote-enable')?.addEventListener('click', (event) => act('enable', event.currentTarget));
   $('#remote-disable')?.addEventListener('click', (event) => act('disable', event.currentTarget));
   $('#remote-refresh')?.addEventListener('click', hydratePhoneAccess);
+  $('#remote-copy-command')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    try {
+      await navigator.clipboard.writeText(status.setupCommand);
+      button.textContent = 'Copied';
+    } catch {
+      toast('Copy failed—select the command and copy it manually.', true);
+    }
+  });
   $('#install-karmax')?.addEventListener('click', async () => {
     const note = $('#phone-install-note');
     if (installPrompt) {

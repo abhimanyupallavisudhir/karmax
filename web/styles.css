@@ -723,6 +723,12 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .phone-steps { margin:10px 0 14px; padding-left:22px; color:var(--ink-2); }
 .phone-steps li + li { margin-top:5px; }
 .phone-access-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.phone-setup-command { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:10px 0; padding:9px 10px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface-2); }
+.phone-setup-command code { flex:1; min-width:220px; overflow-wrap:anywhere; font-family:var(--font-mono); font-size:12px; }
+.phone-troubleshooting { margin-top:14px; padding-top:12px; border-top:1px solid var(--line); color:var(--ink-2); font-size:12px; }
+.phone-troubleshooting summary { width:max-content; cursor:pointer; color:var(--ink-2); font-weight:650; }
+.phone-troubleshooting ol { margin:9px 0 0; padding-left:22px; }
+.phone-troubleshooting li + li { margin-top:5px; }
 .phone-security { margin:14px 0 0; padding-top:12px; border-top:1px solid var(--line); color:var(--ink-3); font-size:11px; }
 .phone-installed { color:var(--merged); font-weight:650; font-size:12px; }
 .queue-item { display: flex; align-items: center; gap: 12px; padding: 11px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); margin-bottom: 8px; }

@@ -328,6 +328,77 @@ describe('remote access plan (SPEC §12)', () => {
     });
     expect(await controller.enable()).toMatchObject({ state: 'conflict', canEnable: false, canDisable: false });
   });
+  it('turns Linux Serve permission errors into a one-time setup action', async () => {
+    const denied = Object.assign(new Error('command failed'), {
+      stderr: 'Access denied: serve config denied\nUse sudo tailscale serve.\nTo not require root, use sudo tailscale set --operator=$USER once.',
+    });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }),
+          stderr: '',
+        };
+        if (args.join(' ') === 'serve status --json') return { stdout: 'No serve config', stderr: '' };
+        throw denied;
+      },
+    });
+    expect(await controller.enable()).toMatchObject({
+      state: 'error',
+      detail: expect.stringMatching(/one-time permission/i),
+      setupCommand: 'sudo tailscale set --operator=$USER',
+      canEnable: true,
+    });
+  });
+  it('links the per-device Serve approval when the tailnet has not enabled it', async () => {
+    const approval = Object.assign(new Error('command failed'), {
+      stderr: 'Serve is not enabled on your tailnet. To enable, visit:\nhttps://login.tailscale.com/f/serve?node=abc123',
+    });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }),
+          stderr: '',
+        };
+        if (args.join(' ') === 'serve status --json') return { stdout: 'No serve config', stderr: '' };
+        throw approval;
+      },
+    });
+    expect(await controller.enable()).toMatchObject({
+      state: 'error',
+      helpUrl: 'https://login.tailscale.com/f/serve?node=abc123',
+      canEnable: true,
+    });
+  });
+  it('shows both one-time actions when Tailscale reports approval and permission together', async () => {
+    const combined = Object.assign(new Error('command failed'), {
+      stderr: [
+        'Serve is not enabled on your tailnet.',
+        'https://login.tailscale.com/f/serve?node=abc123',
+        'Access denied: serve config denied',
+        'Use sudo tailscale set --operator=$USER once.',
+      ].join('\n'),
+    });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }),
+          stderr: '',
+        };
+        if (args.join(' ') === 'serve status --json') return { stdout: 'No serve config', stderr: '' };
+        throw combined;
+      },
+    });
+    expect(await controller.enable()).toMatchObject({
+      state: 'error',
+      detail: expect.stringMatching(/two one-time setup steps/i),
+      helpUrl: 'https://login.tailscale.com/f/serve?node=abc123',
+      setupCommand: 'sudo tailscale set --operator=$USER',
+      canEnable: true,
+    });
+  });
   it('reports a hosted HTTPS installation as ready without invoking Tailscale', async () => {
     const controller = new RemoteAccessController({
       port: () => 4505,
