@@ -3257,6 +3257,70 @@ function wireDepPicker(values, selfId) {
   paint(existing?.tasks || []);
 }
 
+// Full vault-item chooser used by the compact task-form button. This deliberately
+// mirrors the password-manager import panel: mass selection at the top, a bounded
+// scrolling list, a live selected count, and explicit Cancel/Apply actions.
+function openVaultGrantPicker(items, selectedIds, onApply) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card vault-grant-modal" role="dialog" aria-modal="true" aria-labelledby="vault-grant-title">
+    <div class="section-h" id="vault-grant-title">Vault credentials</div>
+    <p class="vault-grant-help">Choose which credentials agents working on this task may use.</p>
+    <div class="vault-grant-box">
+      <label class="vault-grant-head">
+        <input type="checkbox" class="vault-grant-all" ${items.length ? '' : 'disabled'} />
+        <span>Select all</span>
+        <span class="vault-grant-selected"></span>
+      </label>
+      <div class="vault-grant-tree">${
+        items.length
+          ? items.map((item) => `<label class="vault-grant-item">
+              <input type="checkbox" class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
+              <span class="vault-grant-item-text">
+                <span>${esc(item.label)}</span>
+                <span class="vault-grant-meta mono">${esc(item.type)}${item.domains?.length ? ` · ${esc(item.domains.join(', '))}` : ''}</span>
+              </span>
+            </label>`).join('')
+          : '<span class="vault-grant-empty">No vault credentials are available.</span>'
+      }</div>
+    </div>
+    <div class="vault-grant-actions">
+      <button type="button" class="btn sm" data-vault-cancel>Cancel</button>
+      <button type="button" class="btn sm primary" data-vault-apply>Apply</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const all = overlay.querySelector('.vault-grant-all');
+  const picks = [...overlay.querySelectorAll('.vault-grant-pick')];
+  const selectedCount = overlay.querySelector('.vault-grant-selected');
+  const opener = document.activeElement;
+  const close = () => { overlay.remove(); opener?.focus?.(); };
+  const refreshCount = () => {
+    const n = picks.filter((pick) => pick.checked).length;
+    selectedCount.textContent = `· ${n} selected`;
+    all.checked = !!picks.length && n === picks.length;
+    all.indeterminate = n > 0 && n < picks.length;
+  };
+  refreshCount();
+  all.addEventListener('change', () => {
+    picks.forEach((pick) => { pick.checked = all.checked; });
+    refreshCount();
+  });
+  overlay.querySelector('.vault-grant-tree').addEventListener('change', (e) => {
+    if (e.target.classList.contains('vault-grant-pick')) refreshCount();
+  });
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+  });
+  overlay.querySelector('[data-vault-cancel]').addEventListener('click', close);
+  overlay.querySelector('[data-vault-apply]').addEventListener('click', () => {
+    onApply(new Set(picks.filter((pick) => pick.checked).map((pick) => pick.value)));
+    close();
+  });
+  (picks[0] || all || overlay.querySelector('[data-vault-apply]')).focus();
+}
+
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
 // Identity of the task form currently mounted in the overlay. Opening a new form
 // bumps this, so a still-pending debounced auto-save from a PRIOR form instance can
@@ -3344,8 +3408,11 @@ async function openTaskForm(workflow, draft, seedText) {
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
             </div>` : ''}
             <div class="form-row" data-row="__vault">
-              <div class="label-row"><label title="Which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Agents can request more mid-task; you approve each request.">Vault credentials</label></div>
-              <div id="tf-vault-grants" style="font-size:12px">Loading…</div>
+              <button type="button" class="btn tf-vault-button" id="tf-vault-open" disabled
+                title="Choose which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Agents can request more mid-task; you approve each request.">
+                <span>Vault credentials</span>
+                <span class="tf-vault-count" id="tf-vault-count">Loading…</span>
+              </button>
             </div>
             <div class="form-row" data-row="__creds">
               <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Credentials</label></div>
@@ -3439,24 +3506,33 @@ async function openTaskForm(workflow, draft, seedText) {
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
   // The vault credential picker (PLAN-passwords.md §6): item grants layered onto
-  // the authorization package. Checkbox changes ride the #tf-body change
-  // listener into auto-save; grants persist via createTask/PATCH authorization.
+  // the authorization package. Keep selection in form-local state so the task
+  // sidebar stays one compact button; the full checkbox list lives in a modal.
+  // Applying a selection dispatches a change event into the form's auto-save
+  // listener; grants persist via createTask/PATCH authorization.
+  const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities || [])
+    .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
   (async () => {
-    const box = $('#tf-vault-grants');
-    if (!box) return;
+    const button = $('#tf-vault-open');
+    const count = $('#tf-vault-count');
+    if (!button || !count) return;
     // Vault items are organization-scoped — read the project's org's vault.
     const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
     let items = [];
-    try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); } catch { box.closest('[data-row="__vault"]')?.remove(); return; }
-    if (!items.length) {
-      box.closest('[data-row="__vault"]')?.remove();
-      return;
-    }
-    const granted = new Set((draft?.params?._authorization?.capabilities || [])
-      .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
-    box.innerHTML = items.map((i) => `<label style="display:flex;gap:6px;align-items:center;margin:2px 0;cursor:pointer">
-      <input type="checkbox" class="tf-vault-grant" value="use-credential:item:${esc(i.id)}" ${granted.has(i.id) ? 'checked' : ''} />
-      <span>${esc(i.label)}</span> <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(', ')) : ''}</span></label>`).join('');
+    try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); }
+    catch { button.closest('[data-row="__vault"]')?.remove(); return; }
+    const refreshCount = () => {
+      const selected = items.filter((i) => vaultGrantIds.has(i.id)).length;
+      count.textContent = `${selected} selected`;
+    };
+    refreshCount();
+    button.disabled = false;
+    button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, (selected) => {
+      vaultGrantIds.clear();
+      selected.forEach((id) => vaultGrantIds.add(id));
+      refreshCount();
+      button.dispatchEvent(new Event('change', { bubbles: true }));
+    }));
   })();
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
@@ -3490,7 +3566,7 @@ async function openTaskForm(workflow, draft, seedText) {
       body, notes: $('#tf-notes')?.value ?? '',
       authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization,
       // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
-      credentialGrants: [...document.querySelectorAll('.tf-vault-grant:checked')].map((b) => b.value),
+      credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
     };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
