@@ -1361,7 +1361,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       } catch (err) {
         if (token) deps.tokens?.revoke(token);
-        if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
+        // Providers often surface their own generic AbortError after the activity
+        // cancellation signal fires. Throw Temporal's cancellation reason instead
+        // so WAIT_CANCELLATION_COMPLETED records an acknowledged cancellation,
+        // rather than turning a user cancel into an ordinary workflow failure.
+        if (signal?.aborted) {
+          throw signal.reason instanceof Error ? signal.reason : err;
+        }
         throw classifyTurnError(err, profile.provider);
       } finally {
         await releaseSlot();
