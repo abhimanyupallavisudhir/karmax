@@ -2134,10 +2134,11 @@ function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
   return s;
 }
 
-// Built-in starter views that make the new task shapes (schedules, dependency-blocked,
-// repeatable series) first-class instead of buried. Each is just a query string; they
+// Built-in starter views that make useful organization modes and new task shapes
+// first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
 const BUILTIN_VIEWS = [
+  { id: 'builtin:sectioned', name: 'Sectioned', icon: '§', query: TAG_SECTION_QUERY },
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
   { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
