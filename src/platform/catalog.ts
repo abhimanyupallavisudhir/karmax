@@ -99,7 +99,8 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/projects/:projectId/wiki/search?q=',
     'GET /api/projects/:projectId/wiki/refs (filterable branch/task views; pass taskId= or branch= to reads)',
   ],
-  payments: ['GET /api/payments/providers', 'POST /api/payments/connect', 'GET|POST /api/cards', 'POST /api/cards/:id/fund'],
+  payments: ['GET /api/organizations/:organizationId/payments/providers', 'POST /api/organizations/:organizationId/payments/connect',
+    'GET|POST /api/cards', 'POST /api/cards/:id/fund'],
   administration: [
     'GET|POST /api/users', 'DELETE /api/users/:id',
     'GET|PUT /api/authorization/profiles?projectId=', 'PUT /api/authorization/default',

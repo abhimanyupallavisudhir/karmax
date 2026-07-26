@@ -35,8 +35,14 @@ export interface ProviderInfo {
   label: string;
   /** 'local' = no external account (mock); 'oauth' = connect a provider account. */
   kind: 'local' | 'oauth';
+  /** Whether this deployment has a complete, usable connection flow. */
+  available: boolean;
   connected: boolean;
   help?: string;
+}
+export interface PaymentConnectionContext {
+  /** The tenant that owns the funding connection. */
+  organizationId: string;
 }
 export interface ConnectResult {
   status: 'connected' | 'awaiting_oauth' | 'unavailable';
@@ -53,9 +59,9 @@ export interface PaymentProvider {
   /** Attempt a charge; the rail enforces the hard cap + merchant lock + funds. */
   authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult>;
   /** Provider metadata for the connect surface. */
-  describe(): ProviderInfo;
+  describe(ctx?: PaymentConnectionContext): ProviderInfo;
   /** Start (or report) connecting funding to this provider. */
-  connect(): Promise<ConnectResult>;
+  connect(ctx?: PaymentConnectionContext): Promise<ConnectResult>;
 }
 
 /** Mock rail: card state lives in the karmax store. Real rails (Stripe) keep it provider-side. */
@@ -64,6 +70,7 @@ export class MockPaymentProvider implements PaymentProvider {
   constructor(private store: Store) {}
 
   async provisionCard(spec: { scope: 'project' | 'organization' | 'global'; scopeId?: string; label: string; cap: number; merchantLock?: string[] }): Promise<Card> {
+    if (!Number.isSafeInteger(spec.cap) || spec.cap <= 0) throw new Error('card cap must be a positive number of cents');
     const card: Card = {
       id: newId('card'),
       provider: this.name,
@@ -82,20 +89,24 @@ export class MockPaymentProvider implements PaymentProvider {
     return this.store.getCard(cardId);
   }
   async fund(cardId: string, amount: number): Promise<void> {
+    if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('funding amount must be a positive number of cents');
     const c = this.store.getCard(cardId);
-    if (c) this.store.updateCard(cardId, { available: c.available + amount });
+    if (!c) throw new Error('no such card');
+    this.store.updateCard(cardId, { available: c.available + amount });
   }
   async authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult> {
     const c = this.store.getCard(cardId);
     if (!c) return { ok: false, reason: 'no such card' };
-    if (c.merchantLock?.length && merchant && !c.merchantLock.includes(merchant)) return { ok: false, reason: 'merchant not allowed' };
+    if (!Number.isSafeInteger(amount) || amount <= 0) return { ok: false, reason: 'amount must be a positive number of cents' };
+    if (c.merchantLock?.length && (!merchant || !c.merchantLock.includes(merchant))) return { ok: false, reason: 'merchant not allowed' };
     if (amount > c.cap) return { ok: false, reason: 'exceeds card cap' };
     if (amount > c.available) return { ok: false, reason: 'insufficient funds' };
     this.store.updateCard(cardId, { available: c.available - amount });
     return { ok: true, transactionId: newId('txn') };
   }
   describe(): ProviderInfo {
-    return { name: this.name, label: 'Local (no external account)', kind: 'local', connected: true, help: 'Cards are local test funds — fully usable, no real money. Great for trying karmax.' };
+    return { name: this.name, label: 'Local test funds', kind: 'local', available: true, connected: true,
+      help: 'Simulated funds for testing payment policy. No real money moves.' };
   }
   async connect(): Promise<ConnectResult> {
     return { status: 'connected', detail: 'Local provider needs no connection — add and fund cards below.' };
@@ -112,31 +123,23 @@ export class MockPaymentProvider implements PaymentProvider {
 export class StripeIssuingProvider implements PaymentProvider {
   readonly name = 'stripe';
   private notConfigured(): never {
-    throw new Error('Stripe Issuing is not configured yet — set STRIPE_SECRET_KEY and connect your account first.');
+    throw new Error('Stripe Issuing is not implemented yet; use Local test funds.');
   }
-  describe(): ProviderInfo {
-    const connected = !!process.env.STRIPE_SECRET_KEY;
+  describe(_ctx?: PaymentConnectionContext): ProviderInfo {
     return {
       name: this.name,
       label: 'Stripe Issuing',
       kind: 'oauth',
-      connected,
-      help: connected
-        ? 'Connected. You authorize karmax to your Stripe account; Stripe issues the cards and holds the card data — karmax never sees the card number.'
-        : 'Connect your Stripe account with one click (OAuth) — you authorize, karmax stores only the account handle. Enabled by the karmax operator; you never enter keys or card numbers.',
+      available: false,
+      connected: false,
+      help: 'Not implemented yet. The finished rail will connect and fund a separate Stripe account owned by this organization; the deployment Stripe app only identifies Karmax to Stripe.',
     };
   }
-  async connect(): Promise<ConnectResult> {
-    // STRIPE_CLIENT_ID is the *platform operator's* Stripe Connect app id — set once
-    // for the whole deployment, NOT per user. Each user just authorizes via OAuth and
-    // their connected-account id is stored per-account (multi-tenant safe).
-    const clientId = process.env.STRIPE_CLIENT_ID;
-    if (!clientId) {
-      return { status: 'unavailable', detail: 'Stripe Issuing is not enabled on this karmax deployment yet — the operator configures the platform Stripe Connect app once. Until then, use Local funds.' };
-    }
-    // Standard Stripe Connect OAuth — the user authorizes; karmax never types creds.
-    const url = `https://connect.stripe.com/oauth/authorize?response_type=code&scope=read_write&client_id=${encodeURIComponent(clientId)}`;
-    return { status: 'awaiting_oauth', url, detail: 'Authorize karmax in Stripe; you complete it — karmax never sees your Stripe password or card numbers.' };
+  async connect(_ctx?: PaymentConnectionContext): Promise<ConnectResult> {
+    return {
+      status: 'unavailable',
+      detail: 'Stripe Issuing is not implemented yet. The deployment Connect app is shared application identity, not shared money; each organization will connect and fund its own Stripe account. Until the callback, card rail, and webhook enforcement exist, use Local test funds.',
+    };
   }
   // Card operations require the live rail (c-2).
   async provisionCard(): Promise<Card> { this.notConfigured(); }
@@ -155,8 +158,8 @@ export class PaymentRegistry {
     if (!p) throw new Error(`no payment provider "${name}"`);
     return p;
   }
-  list(): ProviderInfo[] {
-    return [...this.providers.values()].map((p) => p.describe());
+  list(ctx?: PaymentConnectionContext): ProviderInfo[] {
+    return [...this.providers.values()].map((p) => p.describe(ctx));
   }
 }
 
@@ -192,8 +195,10 @@ export interface SpendInputs {
  */
 export function evaluateSpend(i: SpendInputs): SpendDecision {
   if (i.amount <= 0) return { status: 'denied', reason: 'amount must be positive' };
-  if (i.merchantLock?.length && i.merchant && !i.merchantLock.includes(i.merchant)) {
-    return { status: 'denied', reason: `merchant "${i.merchant}" not allowed on this card` };
+  if (i.merchantLock?.length && (!i.merchant || !i.merchantLock.includes(i.merchant))) {
+    return { status: 'denied', reason: i.merchant
+      ? `merchant "${i.merchant}" not allowed on this card`
+      : 'merchant is required for a merchant-locked card' };
   }
   if (i.amount > i.hardCap) return { status: 'denied', reason: 'exceeds the card hard cap' };
   if (i.allowance !== undefined && i.spent + i.amount > i.allowance) {
@@ -234,9 +239,12 @@ export class BudgetService {
     private provider: PaymentProvider,
   ) {}
 
-  /** allowance/threshold resolve project → global (cents). */
-  private policy(projectId: string): { allowance?: number; threshold?: number } {
-    const g = (this.store.getSettings('global', 'payments') ?? {}) as any;
+  /** allowance/threshold resolve project → organization (cents). */
+  private policy(projectId: string, organizationId?: string): { allowance?: number; threshold?: number } {
+    const org = organizationId ?? this.store.getProject(projectId)?.organizationId ?? 'org_personal';
+    const g = (this.store.getSettings(`organization:${org}`, 'payments')
+      ?? (org === 'org_personal' ? this.store.getSettings('global', 'payments') : undefined)
+      ?? {}) as any;
     const p = (this.store.getSettings(projectId, 'payments') ?? {}) as any;
     return { allowance: p.allowance ?? g.allowance, threshold: p.threshold ?? g.threshold };
   }
@@ -247,11 +255,18 @@ export class BudgetService {
 
   /** Decide a spend; on `granted`, authorize the charge and record it. */
   async request(ctx: SpendCtx, args: SpendArgs): Promise<SpendResult> {
-    const card = args.cardId ? await this.provider.getCard(args.cardId) : this.store.listCards(ctx.projectId, ctx.organizationId)[0];
+    const visibleCards = this.store.listCards(ctx.projectId, ctx.organizationId);
+    const card = args.cardId
+      ? visibleCards.find((candidate) => candidate.id === args.cardId)
+      : visibleCards[0];
     if (!card) {
-      return { status: 'needs_funding', reason: 'no card is configured for this project — add and fund one', shortfall: args.amount };
+      return { status: 'needs_funding',
+        reason: args.cardId
+          ? 'the requested card is not available to this project'
+          : 'no card is configured for this project — add and fund one',
+        shortfall: args.amount };
     }
-    const { allowance, threshold } = this.policy(ctx.projectId);
+    const { allowance, threshold } = this.policy(ctx.projectId, ctx.organizationId);
     const decision = evaluateSpend({
       amount: args.amount,
       allowance,
@@ -274,7 +289,10 @@ export class BudgetService {
 
   /** After a human approves/funds, charge the held request (used by the review gate). */
   async settleApproved(ctx: SpendCtx, args: SpendArgs): Promise<SpendResult> {
-    const card = args.cardId ? await this.provider.getCard(args.cardId) : this.store.listCards(ctx.projectId, ctx.organizationId)[0];
+    const visibleCards = this.store.listCards(ctx.projectId, ctx.organizationId);
+    const card = args.cardId
+      ? visibleCards.find((candidate) => candidate.id === args.cardId)
+      : visibleCards[0];
     if (!card) return { status: 'denied', reason: 'no card' };
     const auth = await this.provider.authorize(card.id, args.amount, args.merchant);
     if (!auth.ok) return { status: 'needs_funding', reason: auth.reason, shortfall: args.amount, cardId: card.id };

@@ -865,7 +865,7 @@ export class Store {
       delivery_preferences: selectRows(this.db, 'delivery_preferences', 'organizationId=?', [organizationId]),
       delivery_outbox: rowsFor(this.db, 'delivery_outbox', 'inboxId', inboxIds),
       settings: rowsFor(this.db, 'settings', 'scopeKey', projectSettingKeys),
-      cards: rowsFor(this.db, 'cards', 'scopeId', projectIds),
+      cards: rowsFor(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]),
       authorization_profiles: rowsFor(this.db, 'authorization_profiles', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       principal_grants: rowsFor(this.db, 'principal_grants', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       audit_log: rowsFor(this.db, 'audit_log', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
@@ -953,7 +953,7 @@ export class Store {
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
       deleteRows(this.db, 'settings', 'scopeKey', projectSettingKeys);
-      deleteRows(this.db, 'cards', 'scopeId', projectIds);
+      deleteRows(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]);
       deleteRows(this.db, 'authorization_profiles', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys);

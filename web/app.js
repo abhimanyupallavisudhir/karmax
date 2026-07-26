@@ -8162,8 +8162,8 @@ function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
     <div class="section-h">Payments — budget & cards</div>
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
-      <div style="font-weight:600;margin-bottom:4px">Funding source</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this installation pays. Projects can have narrower cards and policies; karmax never stores card numbers.</p>
+      <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
+      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
       <div class="pay-providers-list">Loading…</div>
     </div>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
@@ -8180,24 +8180,27 @@ function paymentsCard(scope) {
   </div>`;
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-async function wirePaymentProviders(box) {
+async function wirePaymentProviders(box, organizationId) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
-  try { data = await api('/api/payments/providers'); } catch {}
+  const paymentsBase = organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
+    : '/api/payments';
+  try { data = await api(`${paymentsBase}/providers`); } catch {}
   list.innerHTML = data.providers.length
     ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
-        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : ''}
+        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : !p.available ? '<span class="chip">not implemented</span>' : ''}
           <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
-        ${p.kind === 'oauth' && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}</div>`).join('')
+        ${p.kind === 'oauth' && p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}</div>`).join('')
     : '<span style="color:var(--ink-3)">No payment providers.</span>';
   list.querySelectorAll('[data-connectpay]').forEach((b) => b.addEventListener('click', async () => {
     try {
-      const r = await api('/api/payments/connect', { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
+      const r = await api(`${paymentsBase}/connect`, { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
       const row = b.closest('[data-prov]');
       if (r.status === 'awaiting_oauth' && r.url) {
         row.insertAdjacentHTML('beforeend', `<div style="font-size:12px;margin-top:6px;flex-basis:100%">Open to authorize (karmax never sees your card data):<br><a href="${esc(r.url)}" target="_blank" rel="noopener" class="mono">${esc(r.url)}</a></div>`);
-      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box); }
+      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box, organizationId); }
       else { toast(r.detail || 'Not available', true); }
     } catch (e) { toast(e.message, true); }
   }));
@@ -8208,8 +8211,10 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   // Non-project cards belong to the organization (tenant boundary), not the
   // whole installation. `scope==='global'` here is the org-settings surface.
   const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
-  if (scope === 'global') await wirePaymentProviders(box);
-  const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
+  if (scope === 'global') await wirePaymentProviders(box, organizationId);
+  const sUrl = scope === 'global' && organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/settings/payments`
+    : scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
   try { policy = await api(sUrl); } catch {}
   if (policy.allowance != null) box.querySelector('.pay-allow').value = (policy.allowance / 100).toFixed(2);
@@ -8237,7 +8242,7 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
       const amt = b.closest('.queue-item').querySelector('.fund-amt').value;
       if (!amt) return;
-      try { await api(`/api/cards/${b.dataset.fund}/fund`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
   };
   await renderCards();

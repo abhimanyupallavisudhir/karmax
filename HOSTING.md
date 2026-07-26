@@ -22,7 +22,7 @@ only migrate the ones that are actually per-tenant.
 | `KARMAX_CONTAINER_IMAGE`, `KARMAX_AGENT_PROVIDER`, `KARMAX_*_MODEL`, `KARMAX_*_BASE_URL` | operator default | ✅ fine as platform defaults; already overridable per-tenant via profiles |
 | `KARMAX_CLAUDE_LOGIN_ARGS`, `KARMAX_CODEX_LOGIN_ARGS` | operator/test | ✅ fine — how the login CLI is invoked |
 | `KARMAX_TOKEN`, `CLAUDE_CONFIG_DIR` | runtime | ✅ not user config — injected per agent spawn |
-| `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY` | **operator** | ✅ **correct as-is** — these are the *platform's* Stripe Connect app, set once. Each tenant connects **their own** Stripe account via OAuth; the connected-account id is stored per-tenant. (Messaging fixed to say so.) |
+| `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY` | **operator** | ✅ correct ownership boundary, but the rail is not implemented — these identify the platform's Stripe Connect app and are not a funding source. The completed integration must store each organization's connected-account id separately; current code deliberately reports Stripe unavailable. |
 | `KARMAX_SAFE_MODE` | operator/global | ✅ fine (also a UI toggle); becomes per-workspace when workspaces exist |
 | `KARMAX_PASSWORD` | operator (single-tenant) | ⚠️ becomes **per-user auth** in hosted — replace with a real accounts/auth system |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` (+ the ambient `~/.claude` login) | **per-tenant** | ⚠️ **the real hazard** — see below |
@@ -58,8 +58,10 @@ single-user ambient-login setup).
    workspace.
 2. **Per-tenant credential isolation** — the fallback gate above; config homes and
    vault entries already key by account, so extend that to workspace.
-3. **Per-tenant Stripe** — already the model: platform Connect app (operator) +
-   per-tenant connected accounts (stored per workspace).
+3. **Per-tenant Stripe** — the intended model is platform Connect app (operator) +
+   organization-owned connected accounts and Issuing balances. The tenant
+   connection/callback, card rail, webhooks, and reconciliation remain to be
+   implemented; an operator key must never be treated as a tenant connection.
 4. **Resource isolation** — worktrees/containers, token/budget coordinators, and
    task queues partitioned or fair-shared per workspace.
 

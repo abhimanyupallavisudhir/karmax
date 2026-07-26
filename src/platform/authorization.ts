@@ -41,8 +41,9 @@ const operator = [
 
 // A project grant can never turn into authority over unrelated projects or the
 // host. Even selecting Administrator at project scope narrows to this ceiling.
-// Global grants remain the explicit trust root for users, credentials/payments
-// writes, processes, safe mode, and global settings.
+// Global grants remain the explicit trust root for users, host processes, safe
+// mode, and installation settings. Organization grants can manage tenant-owned
+// credentials and payments but cannot cross that organization boundary.
 const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
@@ -55,7 +56,7 @@ const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:settings:*',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'workflow:install', 'profile:*',
-  'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:read',
+  'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*',
 ];
 
 /**

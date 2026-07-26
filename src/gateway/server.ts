@@ -109,6 +109,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
+  if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
+  if (/^\/api\/organizations\/[^/]+\/settings\/payments$/.test(p)) return read ? 'payment:read' : 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/repositories/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/github\/(?:app|app-manifest|authorize|install-url|refresh)/.test(p)) return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/organizations\/[^/]+\/git-connections/.test(p)) return read ? 'repository:read' : 'repository:write';
@@ -2890,17 +2892,22 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
-      // payment providers (SPEC §7.6): how a user connects funding. Local (mock)
-      // needs nothing; Stripe Issuing connects via OAuth (karmax never sees card data).
-      if (p === '/api/payments/providers' && method === 'GET') {
-        const list = this.deps.paymentRegistry?.list() ?? (this.deps.payments ? [this.deps.payments.describe()] : []);
+      // Payment rails (SPEC §7.6), resolved in the caller's organization. Local
+      // needs no connection; incomplete external rails are reported honestly.
+      const organizationPayments = p.match(/^\/api\/organizations\/([^/]+)\/payments\/(providers|connect)$/);
+      if ((p === '/api/payments/providers' || organizationPayments?.[2] === 'providers') && method === 'GET') {
+        const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const context = { organizationId };
+        const list = this.deps.paymentRegistry?.list(context)
+          ?? (this.deps.payments ? [this.deps.payments.describe(context)] : []);
         return this.json(res, 200, { providers: list, active: this.deps.payments?.name ?? null });
       }
-      if (p === '/api/payments/connect' && method === 'POST') {
+      if ((p === '/api/payments/connect' || organizationPayments?.[2] === 'connect') && method === 'POST') {
         const b = await this.body(req);
         const prov = this.deps.paymentRegistry?.get(b.provider) ?? this.deps.payments;
         if (!prov) return this.json(res, 400, { error: 'no payment provider configured' });
-        return this.json(res, 200, await prov.connect());
+        const organizationId = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        return this.json(res, 200, await prov.connect({ organizationId }));
       }
 
       // ── vault items + credential access requests (PLAN-passwords.md §§4–7) ──
@@ -3238,6 +3245,8 @@ export class Gateway {
       if (p === '/api/cards' && method === 'GET') {
         const pid = url.searchParams.get('projectId') ?? undefined;
         const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId;
+        if (pid && cardOrg && store.getProject(pid)?.organizationId !== cardOrg)
+          return this.json(res, 404, { error: 'project not found in this organization' });
         return this.json(res, 200, store.listCards(pid, cardOrg));
       }
       if (p === '/api/cards' && method === 'POST') {
@@ -3247,6 +3256,8 @@ export class Gateway {
         // installation-wide "global" card is gone in the multi-tenant model).
         const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId
           ?? (b.projectId ? store.getProject(String(b.projectId))?.organizationId : undefined) ?? 'org_personal';
+        if (b.scope === 'project' && (!b.projectId || store.getProject(String(b.projectId))?.organizationId !== cardOrg))
+          return this.json(res, 400, { error: 'project does not belong to this organization' });
         const card = await this.deps.payments.provisionCard({
           scope: b.scope === 'project' ? 'project' : 'organization',
           scopeId: b.scope === 'project' ? b.projectId : cardOrg,
@@ -3259,9 +3270,22 @@ export class Gateway {
       const fundMatch = p.match(/^\/api\/cards\/([^/]+)\/fund$/);
       if (fundMatch && method === 'POST') {
         if (!this.deps.payments) return this.json(res, 400, { error: 'no payment provider configured' });
+        const cardOrg = authRecord?.organizationId ?? requestedScope.organizationId ?? 'org_personal';
+        const card = store.getCard(fundMatch[1]!);
+        const belongs = card?.scope === 'organization'
+          ? card.scopeId === cardOrg
+          : card?.scope === 'project'
+            ? store.getProject(card.scopeId)?.organizationId === cardOrg
+            : card?.scope === 'global' && cardOrg === 'org_personal';
+        if (!belongs || card?.provider !== this.deps.payments.name)
+          return this.json(res, 404, { error: 'card not found in this organization' });
         const b = await this.body(req);
-        await this.deps.payments.fund(fundMatch[1]!, Number(b.amount ?? 0));
-        return this.json(res, 200, store.getCard(fundMatch[1]!) ?? null);
+        try {
+          await this.deps.payments.fund(fundMatch[1]!, Number(b.amount ?? 0));
+          return this.json(res, 200, store.getCard(fundMatch[1]!) ?? null);
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
 
       // accounts: API-key handles (broker; secrets write-only) + config-home

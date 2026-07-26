@@ -59,15 +59,16 @@ input — one model, not two.
 
 ## Build order
 
-> **Status:** Phases A–E ✅. Phase F done: **(a)** profile/account UI, **(b)**
-> declarative widget tier, **(c)-1** payments lease, **(d)** connect-accounts/
+> **Status:** Phases A–E ✅. Phase F mostly done: **(a)** profile/account UI, **(b)**
+> declarative widget tier, **(c)-1a** payment policy + local simulation, **(d)** connect-accounts/
 > multi-login, **(e)** per-profile MCP baseline, **22** account-coordinator-into-
 > turn-loop, **21** dynamic workflow packages, **23** GitHub App/webhook/PR
 > delivery, and **24** lifecycle deletion, pagination, and observability. Mid-turn
 > cancellation and draft hard-delete are implemented and covered by integration
-> tests. The remaining payment/automation expansion is **(c)-2** completing the
-> external Stripe Issuing rail and **(c)-3** agent registration/MFA through browser
-> automation; neither is required by the hosted project-management baseline.
+> tests. Payments still need **(c)-1b** durable approval/funding requests and
+> card-capability enforcement, **(c)-2** the external Stripe Issuing rail, and
+> **(c)-3** agent registration/MFA through browser automation; none is required
+> by the hosted project-management baseline.
 
 **Phase A ✅ — the parameter foundation (unblocks 1, 2, 3 + several gaps)**
 1. `FieldSpec` type; generalize `ActionArg`. Manifest `params` for each workflow.
@@ -174,9 +175,22 @@ input — one model, not two.
       auth-time decline) or Privacy.com for individuals. The rail implementation
       lives in an editable layer (workflow-repo/skill) so agents can PR changes
       when a provider's API shifts — runtime self-healing depends on (21).
-    - **Layering for build:** (c)-1 ✅ = request_spend + four-outcome lease + review-
-      packet funding + MockPaymentProvider (done; cards-as-resources, BudgetService,
-      Cards/budget UI, 12 tests); (c)-2 = real card rail (Stripe Issuing, external);
+    - **Layering for build:** (c)-1a ✅ = the four-outcome decision,
+      request_spend, MockPaymentProvider, organization/project
+      cards-as-resources, BudgetService, Cards/budget UI, and tenant-boundary
+      tests. **(c)-1b remains:** `use-card:<id>` enforcement and card selection;
+      a durable pending-spend record; Approve/deny/top-up review actions; resuming
+      and settling the exact held request; and one authoritative coordinator
+      (the old Temporal budget coordinator is not wired to BudgetService).
+      Today a non-granted request only writes Review summary text, and
+      `settleApproved` has no production caller.
+      **(c)-2** = real card rail (Stripe Issuing, external). Specifically:
+      operator-owned Connect application setup; CSRF-safe callback/deauthorization;
+      organization-owned connected-account metadata; Issuing eligibility and
+      cardholder/card provisioning; secure checkout-time card delivery; Issuing
+      balance/funding status; authorization/reversal/refund/dispute webhooks;
+      provider routing per card; and ledger reconciliation. Until all of those
+      exist, Stripe is shown as unavailable rather than offering a dead OAuth link.
       (c)-3 = agent account registration + MFA via broker + browser MCP (large).
 
 28. **(d) ✅ Connect accounts + multiple logins + switching** (SPEC §7.3, §6.2).
@@ -220,8 +234,8 @@ triaged below the three explicit demands + the trust pass (Phase E), not cut.
 
 ## Current state
 
-The core and hosted baselines are implemented. Remaining roadmap work is
-explicitly optional provider expansion: finish a production Stripe Issuing rail,
+The core and hosted baselines are implemented. Remaining roadmap work includes
+finishing the payment approval lifecycle and a production Stripe Issuing rail,
 agent-driven third-party registration/MFA, native customer runners, and a
 workflow distribution marketplace.
 
