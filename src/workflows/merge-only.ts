@@ -9,6 +9,7 @@ import {
   ApplicationFailure,
   log,
 } from '@temporalio/workflow';
+import { ActivityCancellationType } from '@temporalio/common';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED } from '../coordinators/names.js';
@@ -21,11 +22,17 @@ import { createAgentTurnLeaser } from './agent-turn-lease.js';
 
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
 const long = proxyActivities<coreActivities>({ startToCloseTimeout: '45 minutes', retry: { maximumAttempts: 1 } });
-// Agent turns heartbeat (~10s); a 2-minute gap = dead worker → Temporal retries.
+// Agent turns heartbeat (~1s); a 2-minute gap = dead worker → Temporal retries.
 const turns = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes',
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
+});
+const cancellationAwareTurns = proxyActivities<coreActivities>({
+  startToCloseTimeout: '45 minutes',
+  heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
+  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
@@ -62,6 +69,11 @@ export async function mergeOnlyV1_2(input: MergeOnlyInput): Promise<{ stage: Sta
   return mergeOnlyImpl(input, true, true);
 }
 
+/** Cancellation waits for the live provider turn to stop. */
+export async function mergeOnlyV1_3(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
+  return mergeOnlyImpl(input, true, true, true);
+}
+
 /** Immutable replay entry for executions pinned to mergeOnly@1.0.0. */
 export async function mergeOnlyV1(input: MergeOnlyInput): Promise<{ stage: Stage; sha?: string }> {
   return mergeOnlyImpl(input, false);
@@ -71,7 +83,9 @@ async function mergeOnlyImpl(
   input: MergeOnlyInput,
   managedTurns: boolean,
   durableAdmission = false,
+  awaitTurnCancellation = false,
 ): Promise<{ stage: Stage; sha?: string }> {
+  const agentTurns = awaitTurnCancellation ? cancellationAwareTurns : turns;
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
@@ -175,7 +189,7 @@ async function mergeOnlyImpl(
         agentAdmissionManaged?: true;
         agentSlotGranted?: true;
       }) =>
-        turns.runAgentTurn({
+        agentTurns.runAgentTurn({
           taskId,
           role: 'confirm',
           worldHandle: world as any,

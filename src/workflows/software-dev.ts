@@ -14,6 +14,7 @@ import {
   log,
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
+import { ActivityCancellationType } from '@temporalio/common';
 import type { coreActivities } from '../activities/core.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED } from '../coordinators/names.js';
@@ -48,7 +49,7 @@ const long = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes',
   retry: { maximumAttempts: 1 },
 });
-// Agent turns heartbeat every ~10s (runtime.ts), so a 2-minute gap means the
+// Agent turns heartbeat every ~1s (runtime.ts), so a 2-minute gap means the
 // worker/host died or slept. Temporal then retries the turn, and the next
 // attempt RESUMES the interrupted session from heartbeat details (runAgentTurn)
 // — a retry is "continue where you left off", not a full re-run. Only
@@ -59,6 +60,16 @@ const turns = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes',
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
+});
+// A cancelled task is not settled until its activity has acknowledged cancellation.
+// TRY_CANCEL/unspecified behavior lets the workflow destroy the world and complete
+// while the provider subprocess is still running — exactly the task-296 failure.
+// Keep the old proxy for replay-pinned histories; v1.5+ schedules turns with this one.
+const cancellationAwareTurns = proxyActivities<coreActivities>({
+  startToCloseTimeout: '45 minutes',
+  heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
+  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 
@@ -214,6 +225,11 @@ export async function softwareDevV1_4(input: SoftwareDevInput): Promise<{ stage:
   return softwareDevImpl(input, '1.4.0');
 }
 
+/** Cancellation is complete only after the live provider turn has stopped. */
+export async function softwareDevV1_5(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.5.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
@@ -222,13 +238,14 @@ export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: S
 
 async function softwareDevImpl(
   input: SoftwareDevInput,
-  behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0',
+  behaviorVersion: '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0',
 ): Promise<{ stage: Stage; sha?: string }> {
   const liveAgentStates = behaviorVersion !== '1.0.0';
   const providerTerminalCompletion =
-    behaviorVersion === '1.2.0' || behaviorVersion === '1.3.0' || behaviorVersion === '1.4.0';
-  const modeSwitching = behaviorVersion === '1.3.0' || behaviorVersion === '1.4.0';
-  const durableAgentAdmission = behaviorVersion === '1.4.0';
+    behaviorVersion === '1.2.0' || behaviorVersion === '1.3.0' || behaviorVersion === '1.4.0' || behaviorVersion === '1.5.0';
+  const modeSwitching = behaviorVersion === '1.3.0' || behaviorVersion === '1.4.0' || behaviorVersion === '1.5.0';
+  const durableAgentAdmission = behaviorVersion === '1.4.0' || behaviorVersion === '1.5.0';
+  const agentTurns = behaviorVersion === '1.5.0' ? cancellationAwareTurns : turns;
   const taskId = input.taskId;
   const recovery = input.recovery;
   let stage: Stage = recovery ? 'do' : 'setup';
@@ -770,7 +787,7 @@ async function softwareDevImpl(
                 accountCredentialProvider,
                 admission,
               ) =>
-                turns.runAgentTurn({
+                agentTurns.runAgentTurn({
                   taskId,
                   role: 'resolve',
                   worldHandle: world as any,
@@ -1101,7 +1118,7 @@ async function softwareDevImpl(
         // a follow-up reaches the agent as a follow-up, not the whole conversation.
         const resume = sessionMatchesHome(accountConfigHome) ? session : undefined;
         deliveredNow = msgs.length; // everything queued up to this instant is delivered
-        return turns.runAgentTurn({
+        return agentTurns.runAgentTurn({
           taskId,
           role: 'do',
           worldHandle: world as any,
@@ -1181,7 +1198,7 @@ async function softwareDevImpl(
         // continuity comes from `confirmMsgs`, replayed to the fresh session — prior
         // requests and verdicts included. A mid-turn activity retry still resumes via
         // heartbeat details inside runAgentTurn.
-        turns.runAgentTurn({
+        agentTurns.runAgentTurn({
           taskId,
           role: 'confirm',
           worldHandle: world as any,
@@ -1256,10 +1273,16 @@ async function softwareDevImpl(
       });
       subTaskIds.push(childInput.taskId);
       outstanding.add(childInput.taskId);
-      const child = await startChild(softwareDev, {
-        workflowId: childInput.taskId,
-        args: [childInput as SoftwareDevInput],
-      });
+      // Current children inherit the parent's cancellation semantics. Historical
+      // versions keep the bare v1.1 child type so their recorded command stays
+      // replay-compatible.
+      const child = await startChild<typeof softwareDev>(
+        behaviorVersion === '1.5.0' ? 'softwareDev@1.5.0' : 'softwareDev',
+        {
+          workflowId: childInput.taskId,
+          args: [childInput as SoftwareDevInput],
+        },
+      );
       childHandles.set(childInput.taskId, child);
       trackChild(childInput.taskId, child);
     }
@@ -1740,7 +1763,7 @@ async function softwareDevImpl(
         accountCredentialProvider,
         admission,
       ) =>
-        turns.runAgentTurn({
+        agentTurns.runAgentTurn({
           taskId,
           role: 'merge',
           worldHandle: world as any,
