@@ -15,6 +15,45 @@ describe('quota park → resume (software-dev task, mock agent)', () => {
   beforeAll(async () => { h = await bootHarness('mock'); }, 60_000);
   afterAll(async () => { await h?.stop(); });
 
+  it('does not publish a login wait when an account is granted immediately', async () => {
+    const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
+    const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
+    await coord.registerAccounts([{ id: 'mock:ready', configHome: '/tmp/mockready', provider: 'mock', maxConcurrent: 1 }]);
+    const cw = h.client.workflow.getHandle(accountCoordinatorId());
+    await expect.poll(async () => ((await cw.query('accounts')) as any).accounts.length, { timeout: 10_000 }).toBe(1);
+
+    const repo = await h.makeRepo('ready-now');
+    const taskId = newId('task');
+    const transitions: any[] = [];
+    const stopListening = h.bus.onTask(taskId, (ev) => {
+      if (ev.type === 'view.updated') transitions.push(ev.payload);
+    });
+    const handle = await h.client.workflow.start('softwareDev@1.5.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [
+        {
+          taskId,
+          projectId: 'p1',
+          title: 'Start without a false login wait',
+          prompt: 'Do the work.\n@sleep 500\n@review done',
+          base: 'main',
+          target: 'main',
+          project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+        },
+      ],
+    });
+
+    await expect.poll(async () => (await handle.query('view') as any).stage, { timeout: 30_000 }).toBe('review');
+    expect(transitions.some((p) => p.waitingFor === 'agentSlot')).toBe(true);
+    expect(transitions.some((p) => p.waitingFor === 'account')).toBe(false);
+    stopListening();
+
+    await handle.signal('confirm');
+    await handle.result();
+    await cw.terminate('done').catch(() => {});
+  });
+
   it('parks a task on an exhausted login and resumes it when the login is freed', async () => {
     const { makeCoordinatorActivities } = await import('../src/activities/coordinator.js');
     const coord = makeCoordinatorActivities({ client: h.client, taskQueue: TASK_QUEUE });
