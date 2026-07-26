@@ -484,7 +484,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : undefined;
       if (project && !store.projectWiki(project.id)) store.setProjectWikiRepository(project.id);
       const wikiRepository = project ? store.projectWiki(project.id)?.repository : undefined;
-      if (remote && project && !wikiRepository)
+      if (remote && project && (!wikiRepository || !wikiRepository.private))
         throw new Error('the project wiki needs a private GitHub remote before a cloud world can be created');
       const developmentSources = args.repos?.length ? args.repos : args.repo ? [args.repo] : [];
       const requestedSources = [
