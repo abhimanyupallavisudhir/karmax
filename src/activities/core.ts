@@ -47,6 +47,8 @@ import { allows, attenuate } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
+import { destroyWorldServices } from '../world/services.js';
+import { activateProjectRuntime, selectProjectEnvironment } from '../world/project-runtime.js';
 import {
   AGENT_QUEUE_WORKFLOW,
   SIG_CANCEL_AGENT,
@@ -180,6 +182,7 @@ export interface CoreActivityDeps {
   runners?: import('../world/runners.js').RunnerPoolService;
   payments?: PaymentProvider;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
+  resources?: import('../world/resources.js').ProjectResourceService;
   contentDir?: string;
 }
 
@@ -400,7 +403,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   async function openWorld(handle: WorldHandle, taskId = handle.id): Promise<World> {
-    return worlds.open(await ensureRunnerLease(handle, taskId));
+    const world = await worlds.open(await ensureRunnerLease(handle, taskId));
+    return deps.resources ? await deps.resources.prepare(world) : world;
   }
 
   /** Make the task's live project-wiki checkout host-readable for prompt
@@ -531,6 +535,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (Object.keys(credentials).length) gitCredentials = { ...gitCredentials, repositories: credentials };
       }
       const executionConfig = project ? store.effectiveProjectConfig(project) : undefined;
+      const environmentSelection = projectId
+        ? selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment)
+        : { built: false, environment: executionConfig?.environment };
       let acquired: { leaseId: string; runnerPoolId: string } | undefined;
       if (remote && project && deps.runners) {
         const ctx = activityContext.current();
@@ -555,7 +562,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           gitCredentials,
           ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
           network: executionConfig?.network,
-          environment: executionConfig?.environment,
+          environment: environmentSelection.environment,
           resources: executionConfig?.resources,
         });
       } catch (error) {
@@ -563,6 +570,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw error;
       }
       try {
+        if (projectId && deps.resources) {
+          const generation = ((store.currentWorld(args.taskId)?.generation ?? 0) + 1);
+          world.handle = await deps.resources.materialize(projectId, args.taskId, world, generation);
+        }
+        if (projectId) {
+          const runtime = await activateProjectRuntime({ world, store, projectId, taskId: args.taskId,
+            selection: environmentSelection, resources: deps.resources, runSetupIfUnbuilt: true });
+          world.handle = runtime.handle;
+          for (const warning of runtime.warnings) record(args.taskId, 'world.warning', { warning });
+        }
         if (profile) world.handle.meta = { ...world.handle.meta, gitProfile: profile.name };
         if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
           const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
@@ -583,15 +600,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (projectId) {
           world.handle = store.registerWorld(world.handle, projectId, {
             runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${args.kind}` : 'local'),
-            environmentDigest: remote
-              ? String(world.handle.meta?.environmentArtifact ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`)
-              : 'karmax-local',
+            environmentDigest: environmentSelection.digest
+              ?? (remote ? String(world.handle.meta?.environmentArtifact
+                ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`) : 'karmax-local'),
           }) as WorldHandle;
         }
         record(args.taskId, 'world.created', { handle: world.handle });
         record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 });
         for (const warning of world.handle.warnings ?? []) record(args.taskId, 'world.warning', { warning });
       } catch (error) {
+        await destroyWorldServices(args.taskId).catch(() => undefined);
         await world.destroy().catch(() => undefined);
         if (acquired) deps.runners?.release(acquired.leaseId, args.kind);
         throw error;
@@ -1244,7 +1262,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // token. The gateway accepts it directly and enforces its project +
             // capability grant; no full-power browser session is ever acquired.
             const extraEnv = { ...vaultEnv, ...gitEnv, ...(token ? { KARMAX_TOKEN: token } : {}) };
-            return Object.keys(extraEnv).length ? { extraEnv } : {};
+            // Values are resolved from resource leases and broker handles only
+            // now, at the activity/subprocess boundary. Keep them separate so a
+            // remote adapter can explicitly allowlist only these names.
+            const secretEnv = deps.resources?.environmentFor(world.handle) ?? {};
+            return {
+              ...(Object.keys(extraEnv).length ? { extraEnv } : {}),
+              ...(Object.keys(secretEnv).length ? { secretEnv } : {}),
+            };
           })(),
           // MCP servers the workflow gives its agents (SPEC §7.5).
           ...(args.task.workflow ? { agentMcp: manifest(args.task.workflow)?.agentMcp } : {}),
@@ -1529,6 +1554,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const current = (store.currentWorld(handle.id) ?? handle) as WorldHandle;
       const leaseId = typeof current.meta?.worldLeaseId === 'string' ? current.meta.worldLeaseId : undefined;
       try {
+        await deps.resources?.release(current);
         const world = await worlds.open(handle);
         await world.destroy();
         store.setWorldState((store.currentWorld(handle.id) ?? current) as WorldHandle, 'released');
@@ -1540,6 +1566,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         store.setWorldState((store.currentWorld(handle.id) ?? current) as WorldHandle, 'degraded');
         record(handle.id, 'world.destroy_failed', { error: error instanceof Error ? error.message : String(error) });
       } finally {
+        await destroyWorldServices(handle.id).catch(() => undefined);
         if (leaseId) deps.runners?.release(leaseId, current.kind);
       }
     },
@@ -1614,7 +1641,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return { pushed, skipped };
       }
       for (const r of worldRepos(handle)) {
-        const repoTarget = r.target ?? target;
+        const repoTarget = r.targetPinned === false ? target : (r.target ?? target);
         const hasOrigin = await world.exec('git', ['remote', 'get-url', 'origin'], { cwd: r.repo, env });
         if (hasOrigin.code !== 0) {
           skipped.push(r.name);

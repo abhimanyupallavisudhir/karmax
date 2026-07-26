@@ -64,6 +64,26 @@ describe('shared cloud world git provisioning', () => {
     expect(commands).toHaveLength(0);
   });
 
+  it('reports copied compatibility files as ephemeral world paths', async () => {
+    const source = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-copy-globs-'));
+    fs.writeFileSync(path.join(source, '.env.local'), 'SECRET=1\n');
+    const writes: string[] = [];
+    const { target } = fakeTarget((command) => command.includes('rev-parse')
+      ? { stdout: `${'a'.repeat(40)}\n` }
+      : undefined);
+    target.writeFile = async (file) => { writes.push(file); };
+    try {
+      const provisioned = await provisionGitRepos(target, {
+        taskId: 't1', base: 'main', repo: 'git@github.com:acme/app.git',
+        copyGlobs: ['.env*'], copySources: [source],
+      }, OPTIONS);
+      expect(provisioned.ephemeralPaths).toEqual(['.env.local']);
+      expect(writes).toContain('/w/.env.local');
+    } finally {
+      fs.rmSync(source, { recursive: true, force: true });
+    }
+  });
+
   it('keeps a scratch workspace beside a companion repository', async () => {
     const { target, commands } = fakeTarget((command) => {
       if (command.includes('rev-parse')) return { stdout: `${'a'.repeat(40)}\n` };

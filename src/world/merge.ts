@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { World, WorldRepo, WorldGitIdentity, worldRepos } from './types.js';
+import { World, WorldRepo, WorldGitIdentity, worldRepos, worldRepoTarget } from './types.js';
 import { git, gitOrThrow, isDirty, ensureIdentity, headSha } from './git.js';
 
 /** Per-invocation `-c` config for the profile identity (PLAN-git-config.md §4A):
@@ -36,23 +36,12 @@ export interface MergeResult {
 export async function finalizeMerge(world: World, target: string, identity?: WorldGitIdentity): Promise<MergeResult> {
   const repos = worldRepos(world.handle);
   if (!repos.length) return { merged: false, landedFiles: [], note: 'no source repo (non-git world)' };
-  // The workflow argument is the current effective target and may have been
-  // edited after provisioning; the handle's repository target is a snapshot.
-  if (repos.length === 1) return finalizeMergeRepo(repos[0]!, target, world.handle.id, identity);
+  if (repos.length === 1) return finalizeMergeRepo(repos[0]!, worldRepoTarget(repos[0]!, target), world.handle.id, identity);
 
-  const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
-  const targetFor = (repo: WorldRepo) =>
-    repo.role === 'project-wiki'
-      ? repo.target ?? target
-      // A workflow-level in-flight target edit applies to the sole development
-      // repository even when its companion wiki makes the world multi-repo.
-      : developmentRepos.length === 1
-        ? target
-        : repo.target ?? target;
   const landedFiles: string[] = [];
   let sha: string | undefined;
   for (const r of repos) {
-    const res = await finalizeMergeRepo(r, targetFor(r), world.handle.id, identity);
+    const res = await finalizeMergeRepo(r, worldRepoTarget(r, target), world.handle.id, identity);
     landedFiles.push(...res.landedFiles.map((f) => `${r.name}/${f}`));
     if (!res.merged) {
       const label = r.role === 'project-wiki' ? `project wiki "${r.name}"` : `repo "${r.name}"`;
@@ -66,7 +55,7 @@ export async function finalizeMerge(world: World, target: string, identity?: Wor
     }
     sha = res.sha;
   }
-  const targets = [...new Set(repos.map(targetFor))];
+  const targets = [...new Set(repos.map((repo) => worldRepoTarget(repo, target)))];
   return { merged: true, sha, landedFiles,
     note: targets.length === 1 ? `merged ${repos.length} repos into ${targets[0]}` : `merged ${repos.length} repos into their configured targets` };
 }

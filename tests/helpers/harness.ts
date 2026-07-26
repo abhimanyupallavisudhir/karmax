@@ -23,6 +23,8 @@ import { Vault } from '../../src/autonomy/vault.js';
 import { MockPaymentProvider, StripeIssuingProvider, PaymentRegistry } from '../../src/autonomy/payments.js';
 import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
 import { LoginManager } from '../../src/autonomy/login.js';
+import { LocalObjectStore } from '../../src/store/objects.js';
+import { ObjectSnapshotEngine, ProjectResourceService } from '../../src/world/resources.js';
 
 export interface Harness {
   server: DevServer;
@@ -33,6 +35,7 @@ export interface Harness {
   worldsHome: string;
   tokens: TokenAuthority;
   api: KarmaxApi;
+  resources: ProjectResourceService;
   restartWorker(): Promise<void>;
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
@@ -64,6 +67,12 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   const profiles = new ProfileResolver(store, provider);
   const bus = new KarmaxBus();
   const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
+  const vaultHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-'));
+  const objectHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-objects-'));
+  const broker = new CredentialBroker(new Vault(vaultHome));
+  const objects = new LocalObjectStore(objectHome);
+  const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(objects, broker), broker,
+    { client, taskQueue: TASK_QUEUE });
 
   const tokens = new TokenAuthority(store);
   const payments = new MockPaymentProvider(store);
@@ -81,6 +90,8 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
     payments,
     contentDir,
     taskQueue: TASK_QUEUE,
+    broker,
+    resources,
   };
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);
   let runPromise = worker.run();
@@ -97,6 +108,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
     worldsHome,
     tokens,
     api,
+    resources,
     async restartWorker() {
       worker.shutdown();
       await runPromise.catch(() => {});
@@ -122,13 +134,15 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
         taskQueue: TASK_QUEUE,
         staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-static-')),
         agentInfo: { provider: 'mock', reason: 'test' },
-        broker: new CredentialBroker(new Vault(fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-')))),
+        broker,
         payments,
         paymentRegistry,
         configHomes,
         login,
         password: opts?.password,
         worlds,
+        objects,
+        resources,
       });
       const started = await gw.listen();
       gateways.push(started.close);
@@ -141,6 +155,8 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
       await c.close();
       await server.stop();
       fs.rmSync(worldsHome, { recursive: true, force: true });
+      fs.rmSync(vaultHome, { recursive: true, force: true });
+      fs.rmSync(objectHome, { recursive: true, force: true });
       fs.rmSync(contentDir, { recursive: true, force: true });
     },
     async makeRepo(name: string) {

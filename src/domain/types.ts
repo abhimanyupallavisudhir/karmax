@@ -169,6 +169,11 @@ export interface WorldCheckpoint {
     headSha?: string;
   }>;
   filesystemDelta?: { objectKey: string; sha256: string; bytes: number };
+  resources?: Array<{ attachmentId: string; revisionId: string }>;
+  /** Accepted provider-neutral runtime declarations pinned at checkpoint time.
+   * Provider snapshots remain accelerators; generated endpoints are excluded. */
+  environment?: ProjectEnvironmentSpec;
+  services?: ProjectService[];
   createdAt: number;
 }
 
@@ -223,9 +228,9 @@ export interface UsageEvent {
   taskId?: string;
   worldId?: string;
   provider: string;
-  kind: 'world.active' | 'checkpoint.storage' | 'preview.active' | 'agent.tokens';
+  kind: 'world.active' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.tokens';
   quantity: number;
-  unit: 'second' | 'byte-second' | 'token';
+  unit: 'second' | 'byte' | 'byte-second' | 'token';
   costMicros: number;
   startedAt: number;
   endedAt: number;
@@ -322,7 +327,10 @@ export interface WorldHandleRef {
   base: string;
   repo?: string;
   target?: string;
-  repos?: { name: string; role?: 'project-wiki'; repo: string; root: string; branch: string; base: string; target?: string; baseSha?: string; localPath?: string }[];
+  repos?: { name: string; role?: 'project-wiki'; repo: string; root: string; branch: string; base: string; target?: string;
+    /** True only when a repository attachment pins its own target. False means
+     * `target` is the task's initial value and live task updates take precedence. */
+    targetPinned?: boolean; baseSha?: string; localPath?: string }[];
   meta?: Record<string, unknown>;
   warnings?: string[];
 }
@@ -347,7 +355,8 @@ export interface ProjectConfig {
   defaultBase?: string;
   /** Default branch merges land on. */
   defaultTarget?: string;
-  /** Gitignored files copied into each world at setup (e.g. .env). */
+  /** @deprecated Self-hosted compatibility/import path. Project resources and
+   * credential injection are the durable/hosted model (SPEC §11.4). */
   copyGlobs?: string[];
   /** @deprecated Superseded by `remote: 'pr'` (PLAN-git-config.md §5); still honored. */
   openGithubPr?: boolean;
@@ -383,6 +392,117 @@ export interface ProjectConfig {
   monthlyBudgetMicros?: number;
   /** Parked-world retention before portable hibernation (default seven days). */
   hibernateAfterMs?: number;
+}
+
+// ─── Project resources (SPEC §11.4) ────────────────────────────────────────
+
+export type ResourceAccess = 'read' | 'write';
+export type ResourceIsolation = 'fork' | 'shared';
+export type ResourcePublishPolicy = 'discard' | 'review';
+export type ResourceTarget =
+  | { kind: 'path'; path: string }
+  | { kind: 'environment'; name: string }
+  | { kind: 'service'; name: string };
+
+/** Durable, secret-free project attachment. Driver configuration may contain
+ * locators and policy only; credentials are write-only vault handles. */
+export interface ResourceAttachment {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  name: string;
+  driver: string;
+  target: ResourceTarget;
+  access: ResourceAccess;
+  isolation: ResourceIsolation;
+  source: Record<string, unknown>;
+  credentialHandles: string[];
+  currentRevisionId?: string;
+  publish: ResourcePublishPolicy;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Immutable revision envelope. `sealedRef` is meaningful only to the selected
+ * snapshot/resource driver and never enters workflow history. */
+export interface ResourceRevision {
+  id: string;
+  attachmentId: string;
+  parentRevisionId?: string;
+  engine: string;
+  sealedRef: string;
+  rootDigest: string;
+  bytes: number;
+  files?: number;
+  metadata?: Record<string, unknown>;
+  createdByTaskId?: string;
+  createdAt: number;
+}
+
+export type ResourceLeaseState = 'preparing' | 'active' | 'released' | 'failed';
+export interface ResourceLease {
+  id: string;
+  attachmentId: string;
+  revisionId?: string;
+  taskId: string;
+  worldId: string;
+  worldGeneration: number;
+  access: ResourceAccess;
+  state: ResourceLeaseState;
+  sealedDriverRef?: string;
+  createdAt: number;
+  expiresAt?: number;
+  releasedAt?: number;
+}
+
+export interface ResourceChangeSummary {
+  attachmentId: string;
+  baseRevisionId?: string;
+  added: number;
+  modified: number;
+  deleted: number;
+  bytes: number;
+  changedPaths: string[];
+}
+
+// ─── Project environments and per-world services ───────────────────────────
+
+/** A user-approved derivation recipe. Setup is baked into immutable provider
+ * artifacts; boot commands run for each world. The proposal UI derives this
+ * from lockfiles/devcontainers instead of requiring hand-authored config. */
+export interface ProjectEnvironmentSpec {
+  image?: string;
+  setup?: string[];
+  boot?: string[];
+  includeDocker?: boolean;
+}
+
+export interface EnvironmentBuildRecord {
+  provider: string;
+  digest: string;
+  status: 'building' | 'ready' | 'failed';
+  ref?: string;
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Services are recipes/access declarations, not a second data store. A
+ * per-world seed references a typed resource attachment already materialized
+ * in the world; external services name a secret attachment. */
+export interface ProjectService {
+  name: string;
+  kind: 'external' | 'per-world';
+  connectionResourceId?: string;
+  image?: string;
+  command?: string[];
+  env?: Record<string, string>;
+  containerPort?: number;
+  urlEnv?: string;
+  urlTemplate?: string;
+  seedResourceId?: string;
+  seedContainerPath?: string;
 }
 
 /** Organization-owned defaults for task execution. Projects may select another

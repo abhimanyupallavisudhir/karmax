@@ -2,8 +2,13 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { ContainerWorldProvider, dockerAvailable } from '../src/world/container.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
+import { buildEnvironment } from '../src/world/environment-build.js';
+
+const pexec = promisify(execFile);
 
 let DOCKER = false;
 beforeAll(async () => {
@@ -51,4 +56,29 @@ describe.skipIf(process.env.KARMAX_SKIP_DOCKER === '1')('container world (Docker
       expect(exists).toBe('');
     }
   }, 120_000);
+
+  it('builds an immutable environment image and uses it for new worlds', async () => {
+    if (!DOCKER) return;
+    const built = await buildEnvironment({
+      provider: 'container',
+      projectId: 'container-test',
+      digest: 'recipe-test',
+      spec: { image: 'node:22-slim', setup: ['printf karmax-ready >/karmax-environment-built'] },
+    });
+    try {
+      const provider = new ContainerWorldProvider(home);
+      const world = await provider.create({
+        taskId: 'cw-environment',
+        repo,
+        base: 'main',
+        environment: { image: built.ref },
+      });
+      try {
+        expect(world.handle.meta?.image).toBe(built.ref);
+        expect((await world.exec('cat', ['/karmax-environment-built'])).stdout).toBe('karmax-ready');
+      } finally { await world.destroy(); }
+    } finally {
+      await pexec('docker', ['image', 'rm', '-f', built.ref]).catch(() => undefined);
+    }
+  }, 10 * 60_000);
 });

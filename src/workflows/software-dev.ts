@@ -173,7 +173,8 @@ function mergeDomains(world: WorldHandleLike | undefined, target: string, projec
   // checkout (`localPath`) lands its merge in that checkout, so it must
   // serialize with worktree worlds of the same repo — not under its SSH URL.
   const domains = world?.repos?.length
-    ? world.repos.map((repo) => `${repo.localPath ?? repo.repo}:${repo.target ?? target}`)
+    ? world.repos.map((repo) =>
+      `${repo.localPath ?? repo.repo}:${repo.targetPinned === false ? target : (repo.target ?? target)}`)
     : [`${world?.repo ?? projectId}:${target}`];
   return [...new Set(domains)].sort();
 }

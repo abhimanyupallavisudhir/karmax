@@ -61,7 +61,8 @@ export class ReviewActionRunner {
   private commandPoll: NodeJS.Timeout;
 
   constructor(private worlds: WorldRegistry, private store: Store, private runners?: RunnerPoolService,
-    private access?: import('../world/access.js').WorldAccessService) {
+    private access?: import('../world/access.js').WorldAccessService,
+    private resources?: import('../world/resources.js').ProjectResourceService) {
     this.commandPoll = setInterval(() => {
       for (const rec of this.procs.values()) {
         this.store.heartbeatExecution(rec.procId);
@@ -107,7 +108,8 @@ export class ReviewActionRunner {
     }
     let process: WorldProcess;
     try {
-      const world = await this.worlds.open(opts.world);
+      const opened = await this.worlds.open(opts.world);
+      const world = this.resources ? await this.resources.prepare(opened) : opened;
       process = await world.startProcess({ command: opts.command });
     } catch (error) {
       this.store.appendExecutionFrame(procId, `${error instanceof Error ? error.message : String(error)}\n`, 'system');

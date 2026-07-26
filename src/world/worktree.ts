@@ -61,15 +61,17 @@ export class WorktreeProvider implements WorldProvider {
 
     const repos: WorldRepo[] = [];
     const warnings: string[] = [];
+    const ephemeralPaths: string[] = [];
     if (resolvedSources.length === 0) {
       // No repo configured — a scratch sandbox (the world itself is the deliverable).
       const scratch = await this.makeScratchRepo(spec.taskId, spec.base);
-      repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings));
+      repos.push(await this.addWorktree(scratch, root, 'scratch', branch, spec, warnings, undefined, ephemeralPaths));
     } else if (resolvedSources.length === 1) {
       // Single repo: the worktree IS the world root (unchanged layout).
       const resolved = resolvedSources[0]!;
       repos.push(await this.addWorktree(resolved.repo, root, repoName(resolved.source), branch,
-        this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined));
+        this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined, ephemeralPaths,
+        '', Boolean(spec.repositoryBranches?.[resolved.source]?.target)));
     } else {
       // Multi-repo: the world root is a parent dir holding one worktree per repo,
       // each in a subdirectory named after the repo (deduped on collision).
@@ -80,7 +82,8 @@ export class WorktreeProvider implements WorldProvider {
         const name = names[i]!;
         const resolved = resolvedSources[i]!;
         repos.push(await this.addWorktree(resolved.repo, path.join(root, name), name, branch,
-          this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined));
+          this.repoSpec(spec, resolved.source), warnings, resolved.managed ? resolved.source : undefined,
+          ephemeralPaths, name, Boolean(spec.repositoryBranches?.[resolved.source]?.target)));
       }
     }
 
@@ -93,6 +96,7 @@ export class WorktreeProvider implements WorldProvider {
       repo: repos[0]!.repo,
       target: spec.target,
       repos,
+      ...(ephemeralPaths.length ? { meta: { ephemeralPaths } } : {}),
       ...(warnings.length ? { warnings } : {}),
     };
     return new WorktreeWorld(handle);
@@ -103,7 +107,7 @@ export class WorktreeProvider implements WorldProvider {
    * (falling back to HEAD if that ref is absent). Returns the `WorldRepo` record.
    */
   private async addWorktree(repo: string, wt: string, name: string, branch: string, spec: WorldSpec,
-    warnings?: string[], source?: string): Promise<WorldRepo> {
+    warnings?: string[], source?: string, ephemeralPaths?: string[], worldPrefix = '', pinnedTarget = false): Promise<WorldRepo> {
     // Resolve a real base ref per repo; fall back to HEAD if the named base is absent.
     let baseRef = spec.base;
     const verify = await git(repo, ['rev-parse', '--verify', `${spec.base}`]);
@@ -138,9 +142,13 @@ export class WorktreeProvider implements WorldProvider {
     await this.linkNodeModules(repo, wt);
 
     // Copy gitignored files the project names (e.g. .env) into this repo's worktree.
-    if (spec.copyGlobs?.length) await this.copyGlobs(repo, wt, spec.copyGlobs);
+    if (spec.copyGlobs?.length) {
+      const copied = await this.copyGlobs(repo, wt, spec.copyGlobs);
+      ephemeralPaths?.push(...copied.map((file) => worldPrefix ? `${worldPrefix}/${file}` : file));
+    }
 
-    return { name, repo, ...(source ? { source } : {}), root: wt, branch, base: spec.base, target: spec.target };
+    return { name, repo, ...(source ? { source } : {}), root: wt, branch, base: spec.base,
+      ...(spec.target ? { target: spec.target } : {}), targetPinned: pinnedTarget };
   }
 
   /** Apply a first-class repository attachment's per-repo branch policy. */
@@ -154,10 +162,8 @@ export class WorktreeProvider implements WorldProvider {
    * configured remote for optional push/PR policy. Concurrent first tasks share
    * one in-process clone promise so they cannot race a partially-created repo. */
   private async managedClone(source: string, spec: WorldSpec): Promise<string> {
-    const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
-    const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
-    const parent = path.join(this.home, '.repositories');
-    const destination = path.join(parent, `${name}-${hash}`);
+    const destination = managedRepoPath(source, this.home);
+    const parent = path.dirname(destination);
     const existing = managedRepoClones.get(destination);
     if (existing) return existing;
     const clone = this.cloneManagedRepo(source, destination, parent, spec);
@@ -275,7 +281,8 @@ export class WorktreeProvider implements WorldProvider {
     fs.appendFileSync(excludePath, `${cur && !cur.endsWith('\n') ? '\n' : ''}${pattern}\n`);
   }
 
-  private async copyGlobs(repo: string, root: string, globs: string[]) {
+  private async copyGlobs(repo: string, root: string, globs: string[]): Promise<string[]> {
+    const copied = new Set<string>();
     for (const g of globs) {
       // Simple top-level glob support; copy matching files from repo root.
       const entries = fs.existsSync(repo) ? fs.readdirSync(repo) : [];
@@ -284,10 +291,14 @@ export class WorktreeProvider implements WorldProvider {
         if (re.test(e)) {
           const src = path.join(repo, e);
           const dst = path.join(root, e);
-          if (fs.statSync(src).isFile()) fs.copyFileSync(src, dst);
+          if (fs.statSync(src).isFile()) {
+            fs.copyFileSync(src, dst);
+            copied.add(e);
+          }
         }
       }
     }
+    return [...copied];
   }
 }
 
@@ -372,6 +383,14 @@ class WorktreeWorld implements World {
     if (safe === '.') throw new Error('path is a directory');
     return path.join(this.handle.root, ...safe.split('/'));
   }
+}
+
+/** Stable host-side checkout location for network repositories. Onboarding can
+ * inspect it without imposing any repository layout on the user. */
+export function managedRepoPath(source: string, home = paths().worlds): string {
+  const hash = crypto.createHash('sha256').update(source).digest('hex').slice(0, 20);
+  const name = repoName(source).replace(/[^a-zA-Z0-9_.-]/g, '-') || 'repo';
+  return path.join(home, '.repositories', `${name}-${hash}`);
 }
 
 /** The repo's basename (its worktree subdirectory name in a multi-repo world). */
