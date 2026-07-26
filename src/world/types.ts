@@ -109,6 +109,8 @@ export interface WorldSpec {
   target?: string;
   /** Check out this existing branch instead of creating karmax/<taskId> (merge-only). */
   branch?: string;
+  /** Delete an existing task branch before provisioning it from `base`. */
+  resetBranch?: boolean;
   /** Gitignored files (globs) to copy into the world (SPEC §5.2). */
   copyGlobs?: string[];
   /** Host checkouts corresponding to `repos`, used only by the trusted

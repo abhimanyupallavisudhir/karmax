@@ -132,6 +132,35 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(onMain.stdout).toContain('achieved');
   });
 
+  it('software-dev v1.5: parks a replacement at its originating stage and resumes on request', async () => {
+    const repo = await h.makeRepo('stage-human-hold');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.5.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [baseInput(taskId, repo, {
+        title: 'Paused task',
+        recovery: {
+          messages: [{ id: 'm0', role: 'user', text: '@write resumed.txt :: resumed', ts: 0 }],
+          seen: 0,
+          target: 'main',
+          resumeStage: 'do',
+          pausedForHuman: true,
+        },
+      })],
+    });
+
+    await expect.poll(async () => `${(await view(handle)).stage}/${(await view(handle)).waitingFor?.kind}`, { timeout: 15_000 })
+      .toBe('do/human');
+    expect((await view(handle)).state.humanPauseOrigin).toBe('do');
+
+    await handle.signal('retry');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    expect((await view(handle)).state.humanPauseOrigin).toBeUndefined();
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
+  });
+
   it('goal: a clean partial return triggers another turn until explicit completion', async () => {
     const repo = await h.makeRepo('goal-persist');
     const taskId = newId('task');

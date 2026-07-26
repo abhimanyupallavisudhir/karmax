@@ -85,7 +85,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   let worker: WorkerHandle = await makeWorker(conn, activityDeps);
   let runPromise = worker.run();
 
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus });
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus, worlds });
   const gateways: Array<() => Promise<void>> = [];
 
   return {

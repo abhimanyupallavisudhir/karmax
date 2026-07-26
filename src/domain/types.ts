@@ -649,6 +649,15 @@ export type Stage =
 
 export type TaskStatus = 'active' | 'waiting' | 'blocked' | 'done' | 'failed' | 'cancelled';
 
+/** A lifecycle destination exposed by the platform. Workflow stages remain the
+ * pipeline positions above; `draft` and `human` are cross-cutting platform states. */
+export interface StageTransition {
+  target: Stage | 'draft' | 'human';
+  label: string;
+  description?: string;
+  danger?: boolean;
+}
+
 /**
  * A reference to a user-attached image, stored content-addressed on disk under
  * `$KARMAX_HOME/attachments/<id>` (SPEC — image prompts; PLAN_IMAGE_PROMPTS.md).
@@ -949,6 +958,10 @@ export interface TaskView {
   /** Live model-turn admission/execution state, separate from account leasing. */
   agentTurn?: { turnId: string; role: AgentRole; provider?: Provider; state: 'waiting-slot' | 'running' };
   pointOfNoReturnPassed?: boolean;
+  /** Authoritative lifecycle moves currently accepted by the platform. This is
+   * enriched at the API edge because attempt commitment and terminal execution
+   * state live outside an individual workflow's deterministic history. */
+  stageTransitions?: StageTransition[];
   /**
    * Task-scope param field names the workflow will accept live edits for right
    * now (SPEC §5.5). Derived from each field's `mutable` window and the current
@@ -1047,12 +1060,15 @@ export interface TaskInput {
    * generic input for serialization; only software-dev consumes it.
    */
   recovery?: TaskRecoveryCheckpoint;
+  /** Platform-internal one-shot reset used when a progressed task is moved back
+   * to Draft. The next Setup recreates its branch from base. */
+  discardProgress?: boolean;
 }
 
 /** Plain serializable world handle + conversation state needed to resume a failed
  * software-dev task. Mirrors world/types without importing Node-facing world code. */
 export interface TaskRecoveryCheckpoint {
-  world: WorldHandleRef;
+  world?: WorldHandleRef;
   messages: Message[];
   transcripts?: { role: string; label: string; messages: Message[] }[];
   reviewInfo?: ReviewInfo;
@@ -1060,6 +1076,10 @@ export interface TaskRecoveryCheckpoint {
   sessionHome?: string;
   seen?: number;
   target?: string;
+  /** Public pipeline position at which a replacement execution should resume. */
+  resumeStage?: Stage;
+  /** Start parked for a human, retaining `resumeStage` as the return route. */
+  pausedForHuman?: boolean;
 }
 
 // ─── Events (SPEC §5 — typed, namespaced, schema-declared) ───────────────────
