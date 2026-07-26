@@ -25,6 +25,7 @@ export interface PrincipalGrant {
 
 const developer = [
   'project:read', 'task:*', 'queue:read', 'workflow:read', 'profile:read', 'credential:read', 'vault:store', 'skill:write',
+  'use-card:*',
   'organization:read', 'organization:member:read', 'team:read', 'repository:read', 'inbox:*',
   // Workflow-internal decisions and merges are still narrowed by the role
   // profile and the workflow's exact branch target at execution time.
@@ -48,6 +49,7 @@ const PROJECT_GRANT_CEILING: Capability[] = [
   'project:read', 'project:edit', 'project:delete', 'project:settings:*',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'profile:*',
   'credential:read', 'vault:store', 'use-credential:*', 'skill:write',
+  'use-card:*',
   'resolve-decision', 'confirm-decision', 'merge-into:*',
   'organization:read', 'organization:member:read', 'team:*', 'repository:*', 'inbox:*',
 ];
@@ -56,7 +58,7 @@ const ORGANIZATION_GRANT_CEILING: Capability[] = [
   'organization:*', 'team:*', 'repository:*', 'inbox:*',
   'project:read', 'project:create', 'project:edit', 'project:settings:*',
   'task:*', 'queue:*', 'workflow:read', 'workflow:edit', 'workflow:install', 'profile:*',
-  'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*',
+  'credential:*', 'vault:store', 'use-credential:*', 'skill:write', 'payment:*', 'use-card:*',
 ];
 
 /**

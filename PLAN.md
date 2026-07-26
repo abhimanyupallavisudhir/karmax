@@ -65,9 +65,9 @@ input — one model, not two.
 > turn-loop, **21** dynamic workflow packages, **23** GitHub App/webhook/PR
 > delivery, and **24** lifecycle deletion, pagination, and observability. Mid-turn
 > cancellation and draft hard-delete are implemented and covered by integration
-> tests. Payments still need **(c)-1b** durable approval/funding requests and
-> card-capability enforcement, **(c)-2** the external Stripe Issuing rail, and
-> **(c)-3** agent registration/MFA through browser automation; none is required
+> tests. Payments **(c)-1b** durable approval/funding requests and card-capability
+> enforcement plus **(c)-2** the external Stripe Issuing rail are complete.
+> Payments still need **(c)-3** agent registration/MFA through browser automation; it is not required
 > by the hosted project-management baseline.
 
 **Phase A ✅ — the parameter foundation (unblocks 1, 2, 3 + several gaps)**
@@ -178,19 +178,21 @@ input — one model, not two.
     - **Layering for build:** (c)-1a ✅ = the four-outcome decision,
       request_spend, MockPaymentProvider, organization/project
       cards-as-resources, BudgetService, Cards/budget UI, and tenant-boundary
-      tests. **(c)-1b remains:** `use-card:<id>` enforcement and card selection;
-      a durable pending-spend record; Approve/deny/top-up review actions; resuming
-      and settling the exact held request; and one authoritative coordinator
-      (the old Temporal budget coordinator is not wired to BudgetService).
-      Today a non-granted request only writes Review summary text, and
-      `settleApproved` has no production caller.
-      **(c)-2** = real card rail (Stripe Issuing, external). Specifically:
+      tests. **(c)-1b ✅:** `use-card:<id>` enforcement and explicit card
+      selection; durable pending-spend records; approve/deny/top-up review
+      actions; exact held-request resumption and idempotent settlement; and a
+      durable organization/task ledger used as the authoritative spend total.
+      **(c)-2 ✅** = real card rail (Stripe Issuing, external). Specifically:
       operator-owned Connect application setup; CSRF-safe callback/deauthorization;
       organization-owned connected-account metadata; Issuing eligibility and
       cardholder/card provisioning; secure checkout-time card delivery; Issuing
       balance/funding status; authorization/reversal/refund/dispute webhooks;
-      provider routing per card; and ledger reconciliation. Until all of those
-      exist, Stripe is shown as unavailable rather than offering a dead OAuth link.
+      provider routing per card; signed direct real-time authorization decisions;
+      and ledger reconciliation. Secure checkout fill resolves PAN/CVC only in
+      the trusted activity and types them over origin-checked loopback CDP, never
+      through model context or SQLite. Stripe appears connectable only when the
+      deployment app keys are configured; active cards additionally require the
+      webhook signing secret.
       (c)-3 = agent account registration + MFA via broker + browser MCP (large).
 
 28. **(d) ✅ Connect accounts + multiple logins + switching** (SPEC §7.3, §6.2).
@@ -234,10 +236,10 @@ triaged below the three explicit demands + the trust pass (Phase E), not cut.
 
 ## Current state
 
-The core and hosted baselines are implemented. Remaining roadmap work includes
-finishing the payment approval lifecycle and a production Stripe Issuing rail,
-agent-driven third-party registration/MFA, native customer runners, and a
-workflow distribution marketplace.
+The core and hosted baselines, durable payment approval lifecycle, and production
+Stripe Issuing rail are implemented. Remaining roadmap work includes agent-driven
+third-party registration/MFA, native customer runners, and a workflow
+distribution marketplace.
 
 ## Hosted evolution
 

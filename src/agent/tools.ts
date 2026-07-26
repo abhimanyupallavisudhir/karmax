@@ -167,15 +167,34 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'request_spend',
     description:
-      'Request to pay for something with the project card. Amount in cents. Returns granted (charged), needs_approval, needs_funding, or denied. If not granted, stop and report — the human will fund/approve, then you can retry.',
+      'Reserve authorization to pay with a permitted project/organization card. Amount in cents. Returns granted (settled for Local funds; reserved for Stripe), needs_approval, needs_funding, or denied. If not granted, stop and report — the human will fund/approve, then you can retry.',
     parameters: {
       type: 'object',
       properties: {
         amount: { type: 'number', description: 'Amount in cents.' },
+        card_id: { type: 'string', description: 'Optional card id. Required when the task can use more than one card and a specific rail is intended.' },
         merchant: { type: 'string' },
         why: { type: 'string', description: 'Why this purchase is needed (shown to the human).' },
       },
       required: ['amount', 'why'],
+    },
+  },
+  {
+    name: 'fill_payment_card',
+    description:
+      'After request_spend returns granted for a Stripe card, securely fill that reserved virtual card into checkout inputs over loopback Chrome DevTools. Card number and CVC never enter your context. Use the returned request_id; merchant in request_spend must be the checkout domain.',
+    parameters: {
+      type: 'object',
+      properties: {
+        request_id: { type: 'string' },
+        cdp_url: { type: 'string', description: 'Loopback Chrome DevTools endpoint, e.g. http://127.0.0.1:9222.' },
+        number_selector: { type: 'string', description: 'CSS selector, or @focused after you focus an iframe field with the browser tool.' },
+        cvc_selector: { type: 'string', description: 'CSS selector; @tab advances once from the prior field before typing.' },
+        expiry_selector: { type: 'string', description: 'Combined MM/YY field. Use this or both month/year selectors. @tab advances once from the prior field.' },
+        exp_month_selector: { type: 'string' },
+        exp_year_selector: { type: 'string' },
+      },
+      required: ['request_id', 'cdp_url', 'number_selector', 'cvc_selector'],
     },
   },
   {
@@ -427,6 +446,7 @@ export const SDK_CONTROL_TOOL_NAMES = new Set([
   'raise_to_parent',
   'wait_for_subtasks',
   'request_spend',
+  'fill_payment_card',
   'signal_completion',
   'resolve_decision',
   'confirm_decision',
@@ -530,10 +550,25 @@ export function platformToolHandlers(
     async request_spend(args) {
       const r = await ctx.requestSpend({
         amount: Number(args?.amount ?? 0),
+        cardId: args?.card_id ? String(args.card_id) : undefined,
         merchant: args?.merchant ? String(args.merchant) : undefined,
         why: args?.why ? String(args.why) : undefined,
       });
       return JSON.stringify(r);
+    },
+    async fill_payment_card(args) {
+      if (!ctx.fillPaymentCard) throw new Error('secure payment-card fill is unavailable');
+      return JSON.stringify(await ctx.fillPaymentCard({
+        requestId: String(args?.request_id ?? ''),
+        cdpUrl: String(args?.cdp_url ?? ''),
+        selectors: {
+          number: String(args?.number_selector ?? ''),
+          cvc: String(args?.cvc_selector ?? ''),
+          expiry: args?.expiry_selector ? String(args.expiry_selector) : undefined,
+          expMonth: args?.exp_month_selector ? String(args.exp_month_selector) : undefined,
+          expYear: args?.exp_year_selector ? String(args.exp_year_selector) : undefined,
+        },
+      }));
     },
     async request_credential(args) {
       const r: any = await platformRequest('POST', '/api/vault/requests', {

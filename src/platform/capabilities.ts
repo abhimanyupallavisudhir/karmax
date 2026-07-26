@@ -29,7 +29,7 @@ export const CAPABILITIES = [
   'queue:read', 'queue:write', 'workflow:read', 'workflow:install', 'workflow:edit',
   'profile:read', 'profile:write', 'skill:write',
   'diagnostic:read', 'process:read', 'process:kill',
-  'credential:read', 'credential:write', 'vault:store', 'payment:read', 'payment:write',
+  'credential:read', 'credential:write', 'vault:store', 'payment:read', 'payment:write', 'use-card:*',
   'settings:read', 'settings:write', 'safe-mode:write',
   'authorization:read', 'authorization:write', 'user:read', 'user:write',
   // Workflow-internal decisions are ordinary capabilities too. They are kept
@@ -135,6 +135,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['vault:store', 'Store new credentials', 'Write newly created credentials (accounts an agent registered) back into the vault as items.'],
       ['payment:read', 'View payments', 'Inspect payment methods, limits, and transactions.'],
       ['payment:write', 'Manage payments', 'Create payment resources and authorize spending within policy.'],
+      ['use-card:*', 'Use payment cards', 'Allow tasks to request spending. Narrow this wildcard to use-card:<card-id> in advanced target-scoped capabilities.'],
     ].map((entry) => definition(entry as [KnownCapability, string, string])),
   },
   {

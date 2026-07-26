@@ -37,13 +37,24 @@ export interface PlatformToolContext {
    *  revise (back to Do with a comment) / reject (cancel). Ends the confirm turn. */
   confirmDecision(d: ConfirmDecision): void;
   /** Request a payment against the budget lease (SPEC §7.6). Returns the outcome:
-   *  granted (charged) | needs_approval | needs_funding | denied. */
+   *  granted (settled or authorization reserved) | needs_approval |
+   *  needs_funding | denied. */
   requestSpend(args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
     status: 'granted' | 'needs_approval' | 'needs_funding' | 'denied';
     reason?: string;
     transactionId?: string;
     shortfall?: number;
+    requestId?: string;
+    cardId?: string;
+    fundingUrl?: string;
   }>;
+  /** Fill a reserved Stripe virtual card into checkout fields over loopback CDP.
+   * Card details remain in the trusted activity process and never enter model IO. */
+  fillPaymentCard?(args: {
+    requestId: string;
+    cdpUrl: string;
+    selectors: { number: string; cvc: string; expiry?: string; expMonth?: string; expYear?: string };
+  }): Promise<{ filled: true; origin: string }>;
   /** Call the capability-checked karmax gateway under this turn's scoped token. */
   platformRequest?(method: string, path: string, body?: unknown): Promise<unknown>;
   /** Stream incremental output to the task's live event log. */

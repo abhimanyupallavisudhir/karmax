@@ -1,5 +1,6 @@
 import { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
+import crypto from 'node:crypto';
 
 /**
  * Payments (SPEC §7.6). Cards are project/global RESOURCES; an agent never owns a
@@ -20,7 +21,40 @@ export interface Card {
   cap: number; // hard ceiling enforced at authorization (cents)
   available: number; // funds available to spend (cents)
   merchantLock?: string[]; // allowed merchants (empty/undefined = any)
+  externalId?: string;
+  currency?: string;
+  status?: string;
+  cardholderId?: string;
+  last4?: string;
   createdAt: number;
+}
+
+export interface CardSpec {
+  scope: 'project' | 'organization' | 'global';
+  scopeId?: string;
+  label: string;
+  cap: number;
+  merchantLock?: string[];
+  organizationId?: string;
+  currency?: string;
+  cardholderId?: string;
+}
+
+export interface PaymentBalance {
+  available: number;
+  currency: string;
+  fundingUrl?: string;
+}
+
+export interface PaymentCardholderInput {
+  type: 'individual' | 'company';
+  name: string;
+  email?: string;
+  phone?: string;
+  address: { line1: string; line2?: string; city: string; state?: string; postalCode: string; country: string };
+  firstName?: string;
+  lastName?: string;
+  dob?: { day: number; month: number; year: number };
 }
 
 export interface AuthorizeResult {
@@ -38,11 +72,14 @@ export interface ProviderInfo {
   /** Whether this deployment has a complete, usable connection flow. */
   available: boolean;
   connected: boolean;
+  connectionStatus?: string;
   help?: string;
 }
 export interface PaymentConnectionContext {
   /** The tenant that owns the funding connection. */
   organizationId: string;
+  userId?: string;
+  redirectUri?: string;
 }
 export interface ConnectResult {
   status: 'connected' | 'awaiting_oauth' | 'unavailable';
@@ -53,7 +90,9 @@ export interface ConnectResult {
 
 export interface PaymentProvider {
   readonly name: string;
-  provisionCard(spec: { scope: 'project' | 'organization' | 'global'; scopeId?: string; label: string; cap: number; merchantLock?: string[] }): Promise<Card>;
+  /** Immediate providers settle at request time; webhook providers reserve first. */
+  readonly authorizationMode: 'immediate' | 'webhook';
+  provisionCard(spec: CardSpec): Promise<Card>;
   getCard(cardId: string): Promise<Card | undefined>;
   fund(cardId: string, amount: number): Promise<void>;
   /** Attempt a charge; the rail enforces the hard cap + merchant lock + funds. */
@@ -62,11 +101,16 @@ export interface PaymentProvider {
   describe(ctx?: PaymentConnectionContext): ProviderInfo;
   /** Start (or report) connecting funding to this provider. */
   connect(ctx?: PaymentConnectionContext): Promise<ConnectResult>;
+  balance(organizationId: string): Promise<PaymentBalance>;
+  revoke(cardId: string): Promise<void>;
+  listCardholders(organizationId: string): Promise<any[]>;
+  createCardholder(organizationId: string, input: PaymentCardholderInput): Promise<any>;
 }
 
 /** Mock rail: card state lives in the karmax store. Real rails (Stripe) keep it provider-side. */
 export class MockPaymentProvider implements PaymentProvider {
   readonly name = 'mock';
+  readonly authorizationMode = 'immediate';
   constructor(private store: Store) {}
 
   async provisionCard(spec: { scope: 'project' | 'organization' | 'global'; scopeId?: string; label: string; cap: number; merchantLock?: string[] }): Promise<Card> {
@@ -99,7 +143,7 @@ export class MockPaymentProvider implements PaymentProvider {
     if (!c) return { ok: false, reason: 'no such card' };
     if (!Number.isSafeInteger(amount) || amount <= 0) return { ok: false, reason: 'amount must be a positive number of cents' };
     if (c.merchantLock?.length && (!merchant || !c.merchantLock.includes(merchant))) return { ok: false, reason: 'merchant not allowed' };
-    if (amount > c.cap) return { ok: false, reason: 'exceeds card cap' };
+    if (this.store.cardPaymentSpent(cardId) + amount > c.cap) return { ok: false, reason: 'exceeds card cap' };
     if (amount > c.available) return { ok: false, reason: 'insufficient funds' };
     this.store.updateCard(cardId, { available: c.available - amount });
     return { ok: true, transactionId: newId('txn') };
@@ -111,45 +155,392 @@ export class MockPaymentProvider implements PaymentProvider {
   async connect(): Promise<ConnectResult> {
     return { status: 'connected', detail: 'Local provider needs no connection — add and fund cards below.' };
   }
+  async balance(organizationId: string): Promise<PaymentBalance> {
+    return { available: this.store.listOrganizationCards(organizationId)
+      .filter((card) => card.provider === this.name).reduce((sum, card) => sum + card.available, 0), currency: 'usd' };
+  }
+  async revoke(cardId: string): Promise<void> {
+    if (!this.store.getCard(cardId)) throw new Error('no such card');
+    this.store.updateCard(cardId, { status: 'canceled', available: 0 });
+  }
+  async listCardholders(): Promise<any[]> { return []; }
+  async createCardholder(): Promise<any> { throw new Error('Local test funds do not need a cardholder'); }
 }
 
-/**
- * Stripe Issuing rail (SPEC §7.6, layer c-2). You connect your Stripe account via
- * OAuth — Stripe holds the card data / PCI; karmax stores only the account handle
- * and references the Stripe-issued virtual card ids. Card provisioning + auth-time
- * decline are enforced by Stripe. The rail itself (API calls) is the c-2 work; this
- * implements the *connect* surface so the model is real and pluggable now.
- */
+const STRIPE_API_VERSION = '2025-03-31.basil';
+type FetchLike = typeof fetch;
+
+/** Production Stripe Issuing rail. The deployment owns only the Connect
+ * application credentials; every account id, balance, card, and ledger entry is
+ * keyed to the organization that completed OAuth. */
 export class StripeIssuingProvider implements PaymentProvider {
   readonly name = 'stripe';
-  private notConfigured(): never {
-    throw new Error('Stripe Issuing is not implemented yet; use Local test funds.');
+  readonly authorizationMode = 'webhook';
+  constructor(private store?: Store, private fetcher: FetchLike = fetch,
+    private env: NodeJS.ProcessEnv = process.env) {}
+
+  private configured(): boolean {
+    return Boolean(this.store && this.env.STRIPE_CLIENT_ID && this.env.STRIPE_SECRET_KEY);
   }
-  describe(_ctx?: PaymentConnectionContext): ProviderInfo {
+  private requireStore(): Store {
+    if (!this.store) throw new Error('Stripe Issuing store is unavailable');
+    return this.store;
+  }
+  private connection(organizationId: string): any {
+    const value = this.requireStore().getPaymentConnection(organizationId, this.name);
+    if (!value || value.status !== 'ready') throw new Error('Stripe is not connected for this organization');
+    return value;
+  }
+  private organizationForCard(card: Card): string {
+    if (card.scope === 'organization') return card.scopeId!;
+    if (card.scope === 'project') return this.requireStore().getProject(card.scopeId!)?.organizationId
+      ?? (() => { throw new Error('card project no longer exists'); })();
+    return 'org_personal';
+  }
+  private async request(method: string, path: string, accountId?: string,
+    params?: Record<string, unknown>, idempotencyKey?: string): Promise<any> {
+    const key = this.env.STRIPE_SECRET_KEY;
+    if (!key) throw new Error('Stripe platform secret is not configured');
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${key}`,
+      'stripe-version': this.env.STRIPE_API_VERSION || STRIPE_API_VERSION,
+    };
+    if (accountId) headers['stripe-account'] = accountId;
+    if (idempotencyKey) headers['idempotency-key'] = idempotencyKey;
+    let body: string | undefined;
+    if (params) {
+      const form = new URLSearchParams();
+      for (const [name, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null) form.set(name, String(value));
+      }
+      body = form.toString();
+      headers['content-type'] = 'application/x-www-form-urlencoded';
+    }
+    const response = await this.fetcher(`https://api.stripe.com${path}`, { method, headers, ...(body ? { body } : {}) });
+    const value = await response.json().catch(() => ({})) as any;
+    if (!response.ok) throw new Error(value?.error?.message ?? value?.error_description ?? `Stripe API returned ${response.status}`);
+    return value;
+  }
+  describe(ctx?: PaymentConnectionContext): ProviderInfo {
+    const connection = ctx && this.store?.getPaymentConnection(ctx.organizationId, this.name);
+    const available = this.configured();
     return {
       name: this.name,
       label: 'Stripe Issuing',
       kind: 'oauth',
-      available: false,
-      connected: false,
-      help: 'Not implemented yet. The finished rail will connect and fund a separate Stripe account owned by this organization; the deployment Stripe app only identifies Karmax to Stripe.',
+      available,
+      connected: Boolean(connection?.status === 'ready'),
+      connectionStatus: connection?.status,
+      help: connection?.status === 'ready'
+        ? `Connected to ${connection.accountId}${connection.livemode ? ' (live)' : ' (test)'}. Funds come from this organization's Stripe Issuing balance.${this.env.STRIPE_WEBHOOK_SECRET ? '' : ' Configure STRIPE_WEBHOOK_SECRET before issuing active cards.'}`
+        : connection?.status === 'attention'
+          ? `Connected account ${connection.accountId} needs Stripe card_issuing capability activation before Karmax can issue cards.`
+        : available
+          ? 'Connect this organization’s Stripe account. The deployment Connect app identifies Karmax; it does not fund cards.'
+          : 'The deployment administrator must configure STRIPE_CLIENT_ID and STRIPE_SECRET_KEY before organizations can connect.',
     };
   }
-  async connect(_ctx?: PaymentConnectionContext): Promise<ConnectResult> {
-    return {
-      status: 'unavailable',
-      detail: 'Stripe Issuing is not implemented yet. The deployment Connect app is shared application identity, not shared money; each organization will connect and fund its own Stripe account. Until the callback, card rail, and webhook enforcement exist, use Local test funds.',
-    };
+  async connect(ctx?: PaymentConnectionContext): Promise<ConnectResult> {
+    if (!ctx || !this.configured() || !ctx.redirectUri) return { status: 'unavailable',
+      detail: 'Stripe Connect needs deployment client/secret configuration and a public callback URL before each organization can connect its own account.' };
+    const existing = this.store!.getPaymentConnection(ctx.organizationId, this.name);
+    if (existing?.status === 'ready') return { status: 'connected', detail: `Connected to ${existing.accountId}.` };
+    const state = this.store!.createPaymentOAuthState({
+      organizationId: ctx.organizationId, userId: ctx.userId, redirectUri: ctx.redirectUri,
+    });
+    const url = new URL('https://connect.stripe.com/oauth/authorize');
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('scope', 'read_write');
+    url.searchParams.set('client_id', this.env.STRIPE_CLIENT_ID!);
+    url.searchParams.set('redirect_uri', ctx.redirectUri);
+    url.searchParams.set('state', state);
+    return { status: 'awaiting_oauth', url: url.toString(),
+      detail: 'Authorize this organization’s Stripe account. Its Issuing balance remains separate from every other organization.' };
   }
-  // Card operations require the live rail (c-2).
-  async provisionCard(): Promise<Card> { this.notConfigured(); }
-  async getCard(): Promise<Card | undefined> { return undefined; }
-  async fund(): Promise<void> { this.notConfigured(); }
-  async authorize(): Promise<AuthorizeResult> { return { ok: false, reason: 'Stripe rail not configured' }; }
+  async completeOAuth(state: string, code: string): Promise<any> {
+    if (!this.configured()) throw new Error('Stripe Connect is not configured');
+    const pending = this.store!.consumePaymentOAuthState(state);
+    if (!pending) throw new Error('Stripe connection state is invalid, expired, or already used');
+    const form = new URLSearchParams({
+      client_secret: this.env.STRIPE_SECRET_KEY!,
+      code,
+      grant_type: 'authorization_code',
+    });
+    const response = await this.fetcher('https://connect.stripe.com/oauth/token', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form.toString(),
+    });
+    const token = await response.json().catch(() => ({})) as any;
+    if (!response.ok || !token.stripe_user_id)
+      throw new Error(token.error_description ?? token.error ?? `Stripe OAuth returned ${response.status}`);
+    const account = await this.request('GET', '/v1/account', token.stripe_user_id);
+    const capability = account.capabilities?.card_issuing;
+    const saved = this.store!.upsertPaymentConnection({
+      organizationId: pending.organizationId,
+      provider: this.name,
+      accountId: token.stripe_user_id,
+      status: capability === 'active' ? 'ready' : 'attention',
+      livemode: Boolean(token.livemode),
+      details: { businessName: account.business_profile?.name ?? account.settings?.dashboard?.display_name,
+        country: account.country, cardIssuing: capability ?? 'unknown' },
+    });
+    const settings = this.store!.getSettings(`organization:${pending.organizationId}`, 'payments') ?? {};
+    this.store!.setSettings(`organization:${pending.organizationId}`, 'payments', { ...settings, provider: this.name });
+    return saved;
+  }
+  async disconnect(organizationId: string): Promise<void> {
+    const connection = this.requireStore().getPaymentConnection(organizationId, this.name);
+    if (!connection) throw new Error('Stripe is not connected for this organization');
+    for (const card of this.requireStore().listOrganizationCards(organizationId)
+      .filter((candidate) => candidate.provider === this.name && candidate.status !== 'canceled')) {
+      if (card.externalId) await this.request('POST',
+        `/v1/issuing/cards/${encodeURIComponent(card.externalId)}`, connection.accountId,
+        { status: 'canceled', cancellation_reason: 'lost' }, `karmax-disconnect-revoke-${card.id}`);
+      this.requireStore().updateCard(card.id, { status: 'canceled', available: 0 });
+    }
+    const form = new URLSearchParams({
+      client_id: this.env.STRIPE_CLIENT_ID!,
+      stripe_user_id: connection.accountId,
+    });
+    const response = await this.fetcher('https://connect.stripe.com/oauth/deauthorize', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${this.env.STRIPE_SECRET_KEY!}`,
+        'content-type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+    });
+    const value = await response.json().catch(() => ({})) as any;
+    if (!response.ok) throw new Error(value.error_description ?? value.error ?? `Stripe deauthorization returned ${response.status}`);
+    this.store!.deletePaymentConnection(organizationId, this.name);
+  }
+  async provisionCard(spec: CardSpec): Promise<Card> {
+    if (!spec.cardholderId) throw new Error('Stripe Issuing cardholder is required');
+    if (!Number.isSafeInteger(spec.cap) || spec.cap <= 0) throw new Error('card cap must be a positive number of cents');
+    if (!this.env.STRIPE_WEBHOOK_SECRET) throw new Error('STRIPE_WEBHOOK_SECRET is required before issuing active cards');
+    const organizationId = spec.organizationId
+      ?? (spec.scope === 'organization' ? spec.scopeId : spec.scope === 'project'
+        ? this.requireStore().getProject(spec.scopeId!)?.organizationId : 'org_personal');
+    if (!organizationId) throw new Error('card organization is required');
+    const connection = this.connection(organizationId);
+    const id = newId('card');
+    const currency = (spec.currency ?? 'usd').toLowerCase();
+    const remote = await this.request('POST', '/v1/issuing/cards', connection.accountId, {
+      cardholder: spec.cardholderId,
+      currency,
+      type: 'virtual',
+      status: 'active',
+      'spending_controls[spending_limits][0][amount]': spec.cap,
+      'spending_controls[spending_limits][0][interval]': 'all_time',
+      'spending_controls[spending_limits_currency]': currency,
+      'metadata[karmax_card_id]': id,
+      'metadata[karmax_organization_id]': organizationId,
+    }, `karmax-card-${id}`);
+    const balance = await this.balance(organizationId);
+    const card: Card = {
+      id, provider: this.name, scope: spec.scope, scopeId: spec.scopeId, label: spec.label,
+      cap: spec.cap, available: balance.available, merchantLock: spec.merchantLock,
+      externalId: remote.id, currency, status: remote.status, cardholderId: spec.cardholderId,
+      last4: remote.last4, createdAt: Date.now(),
+    };
+    this.requireStore().createCard(card);
+    return card;
+  }
+  async getCard(cardId: string): Promise<Card | undefined> {
+    const card = this.store?.getCard(cardId) as Card | undefined;
+    if (!card || card.provider !== this.name || !card.externalId) return undefined;
+    const connection = this.connection(this.organizationForCard(card));
+    const remote = await this.request('GET', `/v1/issuing/cards/${encodeURIComponent(card.externalId)}`, connection.accountId);
+    const balance = await this.balance(this.organizationForCard(card));
+    this.store!.updateCard(card.id, { status: remote.status, last4: remote.last4, available: balance.available });
+    return this.store!.getCard(card.id);
+  }
+  async fund(): Promise<void> {
+    throw new Error('Stripe cards draw from the organization Issuing balance; fund it in Stripe');
+  }
+  async authorize(): Promise<AuthorizeResult> {
+    return { ok: true, reason: 'reserved for Stripe real-time authorization' };
+  }
+  async balance(organizationId: string): Promise<PaymentBalance> {
+    const connection = this.connection(organizationId);
+    const value = await this.request('GET', '/v1/balance', connection.accountId);
+    const currency = String((this.store!.getSettings(`organization:${organizationId}`, 'payments') as any)?.currency ?? 'usd');
+    const amount = Number(value.issuing?.available?.find((entry: any) => entry.currency === currency)?.amount ?? 0);
+    return { available: amount, currency,
+      fundingUrl: `https://dashboard.stripe.com${connection.livemode ? '' : '/test'}/connect/accounts/${connection.accountId}/issuing/balance` };
+  }
+  async revoke(cardId: string): Promise<void> {
+    const card = this.store?.getCard(cardId) as Card | undefined;
+    if (!card?.externalId || card.provider !== this.name) throw new Error('no such Stripe card');
+    const connection = this.connection(this.organizationForCard(card));
+    await this.request('POST', `/v1/issuing/cards/${encodeURIComponent(card.externalId)}`,
+      connection.accountId, { status: 'canceled', cancellation_reason: 'lost' }, `karmax-revoke-${card.id}`);
+    this.store!.updateCard(card.id, { status: 'canceled', available: 0 });
+  }
+  async listCardholders(organizationId: string): Promise<any[]> {
+    const connection = this.connection(organizationId);
+    const value = await this.request('GET', '/v1/issuing/cardholders?limit=100', connection.accountId);
+    return (value.data ?? []).map((holder: any) => ({
+      id: holder.id, name: holder.name, type: holder.type, status: holder.status,
+      requirements: holder.requirements,
+    }));
+  }
+  async createCardholder(organizationId: string, input: PaymentCardholderInput): Promise<any> {
+    const connection = this.connection(organizationId);
+    const p: Record<string, unknown> = {
+      type: input.type, name: input.name, status: 'active', email: input.email,
+      phone_number: input.phone,
+      'billing[address][line1]': input.address.line1,
+      'billing[address][line2]': input.address.line2,
+      'billing[address][city]': input.address.city,
+      'billing[address][state]': input.address.state,
+      'billing[address][postal_code]': input.address.postalCode,
+      'billing[address][country]': input.address.country.toUpperCase(),
+      'metadata[karmax_organization_id]': organizationId,
+    };
+    if (input.type === 'individual') {
+      p['individual[first_name]'] = input.firstName;
+      p['individual[last_name]'] = input.lastName;
+      p['individual[dob][day]'] = input.dob?.day;
+      p['individual[dob][month]'] = input.dob?.month;
+      p['individual[dob][year]'] = input.dob?.year;
+    }
+    return this.request('POST', '/v1/issuing/cardholders', connection.accountId, p,
+      `karmax-cardholder-${organizationId}-${crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex').slice(0, 24)}`);
+  }
+  async retrieveCardDetails(cardId: string): Promise<{ number: string; cvc: string; expMonth: number; expYear: number }> {
+    const card = this.store?.getCard(cardId) as Card | undefined;
+    if (!card?.externalId || card.provider !== this.name) throw new Error('no such Stripe card');
+    const connection = this.connection(this.organizationForCard(card));
+    const remote = await this.request('GET',
+      `/v1/issuing/cards/${encodeURIComponent(card.externalId)}?expand[]=number&expand[]=cvc`, connection.accountId);
+    if (!remote.number || !remote.cvc) throw new Error('Stripe did not return virtual card details');
+    return { number: remote.number, cvc: remote.cvc, expMonth: remote.exp_month, expYear: remote.exp_year };
+  }
+  webhookSignatureValid(raw: Buffer, signature: string | undefined, now = Date.now()): boolean {
+    const secret = this.env.STRIPE_WEBHOOK_SECRET;
+    if (!secret || !signature) return false;
+    const parts = signature.split(',').map((part) => part.split('=', 2));
+    const timestamp = Number(parts.find(([key]) => key === 't')?.[1]);
+    const signatures = parts.filter(([key]) => key === 'v1').map(([, value]) => value);
+    if (!Number.isFinite(timestamp) || Math.abs(now / 1000 - timestamp) > 300) return false;
+    const expected = crypto.createHmac('sha256', secret).update(`${timestamp}.${raw.toString('utf8')}`).digest('hex');
+    return signatures.some((value) => value?.length === expected.length
+      && crypto.timingSafeEqual(Buffer.from(value), Buffer.from(expected)));
+  }
+  handleWebhook(raw: Buffer, signature?: string): { status: number; body: any; stripeVersion?: string } {
+    if (!this.webhookSignatureValid(raw, signature)) return { status: 400, body: { error: 'invalid Stripe signature' } };
+    const event = JSON.parse(raw.toString('utf8')) as any;
+    const previous = this.store!.getPaymentEvent(this.name, event.id);
+    if (previous?.decision) return { status: 200, body: previous.decision, stripeVersion: STRIPE_API_VERSION };
+    const connection = event.account ? this.store!.getPaymentConnectionByAccount(this.name, event.account) : undefined;
+    if (!connection) return { status: 200, body: { received: true } };
+    const object = event.data?.object ?? {};
+    if (event.type === 'issuing_authorization.request') {
+      const externalCardId = typeof object.card === 'string' ? object.card : object.card?.id;
+      const card = externalCardId ? this.store!.getCardByExternalId(this.name, externalCardId) : undefined;
+      const amount = Number(object.pending_request?.amount ?? object.amount ?? 0);
+      const merchant = object.merchant_data?.name ?? object.merchant_data?.url;
+      let decision: { approved: boolean } = { approved: false };
+      if (card && card.status === 'active' && this.organizationForCard(card) === connection.organizationId
+        && String(object.currency ?? card.currency ?? 'usd').toLowerCase() === String(card.currency ?? 'usd').toLowerCase()) {
+        const request = this.store!.findPaymentAuthorization(card.id, amount, merchant);
+        if (request && this.store!.consumePaymentAuthorization(request.id, object.id)) {
+          decision = { approved: true };
+          this.store!.upsertPaymentTransaction({
+            organizationId: connection.organizationId, projectId: request.projectId, taskId: request.taskId,
+            cardId: card.id, spendRequestId: request.id, provider: this.name, providerId: object.id,
+            kind: 'authorization', status: 'approved', amount, currency: object.currency,
+            merchant, raw: object, createdAt: Number(object.created ?? Date.now() / 1000) * 1000,
+          });
+        }
+      }
+      this.store!.recordPaymentEvent({ provider: this.name, eventId: event.id,
+        organizationId: connection.organizationId, type: event.type, decision });
+      return { status: 200, body: decision, stripeVersion: this.env.STRIPE_API_VERSION || STRIPE_API_VERSION };
+    }
+    this.reconcileEvent(connection.organizationId, event);
+    this.store!.recordPaymentEvent({ provider: this.name, eventId: event.id,
+      organizationId: connection.organizationId, type: event.type });
+    return { status: 200, body: { received: true } };
+  }
+  private reconcileEvent(organizationId: string, event: any): void {
+    const object = event.data?.object ?? {};
+    const externalCardId = typeof object.card === 'string' ? object.card : object.card?.id;
+    const card = externalCardId ? this.store!.getCardByExternalId(this.name, externalCardId) : undefined;
+    if (card && this.organizationForCard(card) !== organizationId) return;
+    if (event.type === 'issuing_card.updated' && card) {
+      this.store!.updateCard(card.id, { status: object.status, last4: object.last4 });
+      return;
+    }
+    if (event.type === 'account.application.deauthorized') {
+      for (const candidate of this.store!.listOrganizationCards(organizationId)
+        .filter((value) => value.provider === this.name))
+        this.store!.updateCard(candidate.id, { status: 'canceled', available: 0 });
+      this.store!.deletePaymentConnection(organizationId, this.name);
+      return;
+    }
+    if (event.type.startsWith('issuing_dispute.')) {
+      const transactionId = typeof object.transaction === 'string'
+        ? object.transaction : object.transaction?.id;
+      const transaction = transactionId
+        ? this.store!.getPaymentTransactionByProviderId(this.name, transactionId)
+        : undefined;
+      this.store!.upsertPaymentTransaction({
+        organizationId,
+        projectId: transaction?.projectId,
+        taskId: transaction?.taskId,
+        cardId: transaction?.cardId,
+        spendRequestId: transaction?.spendRequestId,
+        provider: this.name,
+        providerId: object.id,
+        kind: 'dispute',
+        status: object.status ?? event.type.slice('issuing_dispute.'.length),
+        amount: Number(object.amount ?? transaction?.amount ?? 0),
+        currency: object.currency ?? transaction?.currency ?? 'usd',
+        merchant: transaction?.merchant,
+        raw: object,
+        createdAt: Number(object.created ?? Date.now() / 1000) * 1000,
+      });
+      return;
+    }
+    if (!card || (!event.type.startsWith('issuing_authorization.') && !event.type.startsWith('issuing_transaction.'))) return;
+    const authorizationId = event.type.startsWith('issuing_authorization.')
+      ? object.id : typeof object.authorization === 'string' ? object.authorization : object.authorization?.id;
+    const request = authorizationId
+      ? this.store!.listPaymentSpendRequests({ organizationId }).find((value) => value.providerAuthorizationId === authorizationId)
+      : undefined;
+    this.store!.upsertPaymentTransaction({
+      organizationId, projectId: request?.projectId, taskId: request?.taskId, cardId: card.id,
+      spendRequestId: request?.id, provider: this.name, providerId: object.id,
+      kind: event.type.startsWith('issuing_transaction.') ? 'transaction' : 'authorization',
+      status: object.status ?? (object.approved ? 'approved' : 'declined'),
+      amount: Number(object.amount ?? 0), currency: object.currency ?? card.currency ?? 'usd',
+      merchant: object.merchant_data?.name, raw: object,
+      createdAt: Number(object.created ?? Date.now() / 1000) * 1000,
+    });
+    if (request && event.type.startsWith('issuing_authorization.')) {
+      if (object.status === 'reversed')
+        this.store!.updatePaymentSpendRequest(request.id, { status: 'reversed', reason: 'authorization reversed' });
+      else if (object.approved === false)
+        this.store!.updatePaymentSpendRequest(request.id, { status: 'denied', reason: 'authorization declined by Stripe' });
+    }
+    if (request && event.type.startsWith('issuing_transaction.')) {
+      const transactionType = String(object.type ?? '').toLowerCase();
+      const transactionStatus = String(object.status ?? '').toLowerCase();
+      const terminalStatus = transactionType === 'refund' || transactionStatus === 'reversed'
+        ? 'reversed'
+        : transactionType === 'capture' || transactionStatus === 'complete'
+          ? 'settled'
+          : undefined;
+      if (!terminalStatus) return;
+      this.store!.updatePaymentSpendRequest(request.id, {
+        status: terminalStatus,
+      });
+    }
+  }
 }
 
 export class PaymentRegistry {
   private providers = new Map<string, PaymentProvider>();
+  constructor(private store?: Store) {}
   register(p: PaymentProvider) {
     this.providers.set(p.name, p);
   }
@@ -160,6 +551,16 @@ export class PaymentRegistry {
   }
   list(ctx?: PaymentConnectionContext): ProviderInfo[] {
     return [...this.providers.values()].map((p) => p.describe(ctx));
+  }
+  forCard(card: Pick<Card, 'provider'>): PaymentProvider {
+    return this.get(card.provider);
+  }
+  active(organizationId: string): PaymentProvider {
+    const selected = (this.providers.values().next().value as PaymentProvider | undefined)?.name ?? 'mock';
+    const name = (this.store?.getSettings(`organization:${organizationId}`, 'payments') as any)?.provider
+      ?? selected;
+    const provider = this.providers.get(name);
+    return provider?.describe({ organizationId }).connected ? provider : this.get('mock');
   }
 }
 
@@ -221,6 +622,9 @@ export interface SpendCtx {
   /** Owning organization; cards are org-scoped so a task only spends from its
    *  own tenant's cards. Falls back to the project's org when omitted. */
   organizationId?: string;
+  /** Optional explicit card attenuation. No use-card capability means all cards
+   * visible to the project; once present, only matching cards are eligible. */
+  capabilities?: string[];
 }
 export interface SpendArgs {
   amount: number;
@@ -231,13 +635,19 @@ export interface SpendArgs {
 export interface SpendResult extends SpendDecision {
   cardId?: string;
   transactionId?: string;
+  requestId?: string;
+  fundingUrl?: string;
 }
 
 export class BudgetService {
   constructor(
     private store: Store,
-    private provider: PaymentProvider,
+    private rails: PaymentProvider | PaymentRegistry,
   ) {}
+
+  private provider(card: Card): PaymentProvider {
+    return this.rails instanceof PaymentRegistry ? this.rails.forCard(card) : this.rails;
+  }
 
   /** allowance/threshold resolve project → organization (cents). */
   private policy(projectId: string, organizationId?: string): { allowance?: number; threshold?: number } {
@@ -250,53 +660,154 @@ export class BudgetService {
   }
 
   private spent(taskId: string): number {
-    return Number(this.store.kvGet(`spent:${taskId}`) ?? 0);
+    return this.store.paymentSpent(taskId);
   }
 
-  /** Decide a spend; on `granted`, authorize the charge and record it. */
+  private cards(ctx: SpendCtx): Card[] {
+    const visible = this.store.listCards(ctx.projectId, ctx.organizationId)
+      .filter((card) => card.status !== 'canceled') as Card[];
+    const scoped = (ctx.capabilities ?? []).filter((capability) => capability.startsWith('use-card:'));
+    if (!scoped.length) return visible;
+    return visible.filter((card) => scoped.includes('use-card:*') || scoped.includes(`use-card:${card.id}`));
+  }
+
+  private existing(ctx: SpendCtx, args: SpendArgs): any {
+    return this.store.listPaymentSpendRequests({ taskId: ctx.taskId }).find((request) =>
+      ['pending_approval', 'needs_funding', 'authorized', 'consumed', 'settled'].includes(request.status)
+      && request.expiresAt > Date.now() && request.amount === args.amount
+      && (!args.cardId || request.cardId === args.cardId)
+      && (request.merchant ?? undefined) === args.merchant
+      && (request.why ?? undefined) === args.why);
+  }
+
+  private result(request: any): SpendResult {
+    const status: SpendStatus = request.status === 'pending_approval' ? 'needs_approval'
+      : ['authorized', 'consumed', 'settled'].includes(request.status) ? 'granted'
+        : request.status === 'needs_funding' ? 'needs_funding' : 'denied';
+    return { status, reason: request.reason ?? undefined, shortfall: request.shortfall ?? undefined,
+      cardId: request.cardId ?? undefined, requestId: request.id,
+      transactionId: request.providerAuthorizationId ?? undefined };
+  }
+
+  /** Decide and durably record a spend. Stripe grants are short-lived
+   * authorization reservations consumed by its real-time webhook; local grants
+   * settle immediately. */
   async request(ctx: SpendCtx, args: SpendArgs): Promise<SpendResult> {
-    const visibleCards = this.store.listCards(ctx.projectId, ctx.organizationId);
+    if (!Number.isSafeInteger(args.amount) || args.amount <= 0)
+      return { status: 'denied', reason: 'amount must be a positive number of cents' };
+    const duplicate = this.existing(ctx, args);
+    if (duplicate) return this.result(duplicate);
+    const organizationId = ctx.organizationId ?? this.store.getProject(ctx.projectId)?.organizationId ?? 'org_personal';
+    const visibleCards = this.cards(ctx);
     const card = args.cardId
       ? visibleCards.find((candidate) => candidate.id === args.cardId)
       : visibleCards[0];
     if (!card) {
-      return { status: 'needs_funding',
-        reason: args.cardId
+      const reason = args.cardId
           ? 'the requested card is not available to this project'
-          : 'no card is configured for this project — add and fund one',
-        shortfall: args.amount };
+          : 'no permitted card is configured for this project — add one or grant use-card access';
+      const pending = this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
+        taskId: ctx.taskId, amount: args.amount, merchant: args.merchant, why: args.why,
+        status: 'needs_funding', reason, shortfall: args.amount });
+      return this.result(pending);
     }
+    const provider = this.provider(card);
+    const refreshed = await provider.getCard(card.id) ?? card;
     const { allowance, threshold } = this.policy(ctx.projectId, ctx.organizationId);
     const decision = evaluateSpend({
       amount: args.amount,
       allowance,
       spent: this.spent(ctx.taskId),
       threshold,
-      available: card.available,
-      hardCap: card.cap,
+      available: refreshed.available,
+      hardCap: Math.max(0, refreshed.cap - this.store.cardPaymentSpent(refreshed.id)),
       merchant: args.merchant,
-      merchantLock: card.merchantLock,
+      merchantLock: refreshed.merchantLock,
     });
-    if (decision.status !== 'granted') return { ...decision, cardId: card.id };
-    const auth = await this.provider.authorize(card.id, args.amount, args.merchant);
-    if (!auth.ok) {
-      // rail declined despite policy ok (e.g. funds raced) → surface as funding
-      return { status: 'needs_funding', reason: auth.reason ?? 'authorization declined', shortfall: args.amount, cardId: card.id };
+    if (decision.status !== 'granted') {
+      const status = decision.status === 'needs_approval' ? 'pending_approval' : decision.status;
+      const pending = this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
+        taskId: ctx.taskId, cardId: card.id, amount: args.amount, currency: card.currency,
+        merchant: args.merchant, why: args.why, status, reason: decision.reason,
+        shortfall: decision.shortfall });
+      let fundingUrl: string | undefined;
+      if (decision.status === 'needs_funding') fundingUrl = (await provider.balance(organizationId)).fundingUrl;
+      return { ...this.result(pending), fundingUrl };
     }
-    this.store.kvSet(`spent:${ctx.taskId}`, String(this.spent(ctx.taskId) + args.amount));
-    return { status: 'granted', cardId: card.id, transactionId: auth.transactionId };
+    const pending = this.store.createPaymentSpendRequest({ organizationId, projectId: ctx.projectId,
+      taskId: ctx.taskId, cardId: card.id, amount: args.amount, currency: card.currency,
+      merchant: args.merchant, why: args.why,
+      status: provider.authorizationMode === 'webhook' ? 'authorized' : 'authorizing' });
+    if (provider.authorizationMode === 'webhook') return this.result(pending);
+    const auth = await provider.authorize(card.id, args.amount, args.merchant);
+    if (!auth.ok) {
+      return this.result(this.store.updatePaymentSpendRequest(pending.id, {
+        status: 'needs_funding', reason: auth.reason ?? 'authorization declined', shortfall: args.amount,
+      }));
+    }
+    this.store.upsertPaymentTransaction({ organizationId, projectId: ctx.projectId, taskId: ctx.taskId,
+      cardId: card.id, spendRequestId: pending.id, provider: provider.name,
+      providerId: auth.transactionId!, kind: 'transaction', status: 'settled',
+      amount: args.amount, currency: card.currency, merchant: args.merchant });
+    return this.result(this.store.updatePaymentSpendRequest(pending.id, {
+      status: 'settled', providerAuthorizationId: auth.transactionId,
+    }));
   }
 
-  /** After a human approves/funds, charge the held request (used by the review gate). */
+  async approve(requestId: string, resolvedBy: string): Promise<SpendResult> {
+    const request = this.store.getPaymentSpendRequest(requestId);
+    if (!request) return { status: 'denied', reason: 'spend request not found' };
+    if (!['pending_approval', 'needs_funding'].includes(request.status)) return this.result(request);
+    const card = request.cardId
+      ? this.store.getCard(request.cardId) as Card | undefined
+      : this.cards({
+        projectId: request.projectId,
+        taskId: request.taskId,
+        organizationId: request.organizationId,
+      })[0];
+    if (!card) return this.result(this.store.updatePaymentSpendRequest(request.id,
+      { status: 'denied', reason: 'card no longer exists', resolvedBy }));
+    if (!request.cardId) this.store.setPaymentSpendRequestCard(request.id, card.id);
+    const provider = this.provider(card);
+    const refreshed = await provider.getCard(card.id) ?? card;
+    if (refreshed.status === 'canceled' || refreshed.status === 'inactive')
+      return this.result(this.store.updatePaymentSpendRequest(request.id,
+        { status: 'denied', reason: 'card is not active', resolvedBy }));
+    if (refreshed.available < request.amount) {
+      return this.result(this.store.updatePaymentSpendRequest(request.id, {
+        status: 'needs_funding', reason: 'insufficient funds on the card',
+        shortfall: request.amount - refreshed.available, resolvedBy,
+      }));
+    }
+    if (provider.authorizationMode === 'webhook') {
+      return this.result(this.store.updatePaymentSpendRequest(request.id,
+        { status: 'authorized', reason: 'approved', shortfall: 0, resolvedBy, expiresAt: Date.now() + 30 * 60_000 }));
+    }
+    const auth = await provider.authorize(card.id, request.amount, request.merchant ?? undefined);
+    if (!auth.ok) return this.result(this.store.updatePaymentSpendRequest(request.id,
+      { status: 'needs_funding', reason: auth.reason, shortfall: request.amount, resolvedBy }));
+    this.store.upsertPaymentTransaction({ organizationId: request.organizationId, projectId: request.projectId,
+      taskId: request.taskId, cardId: card.id, spendRequestId: request.id, provider: provider.name,
+      providerId: auth.transactionId!, kind: 'transaction', status: 'settled',
+      amount: request.amount, currency: request.currency, merchant: request.merchant });
+    return this.result(this.store.updatePaymentSpendRequest(request.id,
+      { status: 'settled', providerAuthorizationId: auth.transactionId, reason: 'approved', resolvedBy }));
+  }
+
+  deny(requestId: string, resolvedBy: string): SpendResult {
+    const request = this.store.getPaymentSpendRequest(requestId);
+    if (!request) return { status: 'denied', reason: 'spend request not found' };
+    return this.result(this.store.updatePaymentSpendRequest(request.id,
+      { status: 'denied', reason: 'denied by reviewer', resolvedBy }));
+  }
+
+  /** Back-compatible test/helper entry point. */
   async settleApproved(ctx: SpendCtx, args: SpendArgs): Promise<SpendResult> {
-    const visibleCards = this.store.listCards(ctx.projectId, ctx.organizationId);
-    const card = args.cardId
-      ? visibleCards.find((candidate) => candidate.id === args.cardId)
-      : visibleCards[0];
-    if (!card) return { status: 'denied', reason: 'no card' };
-    const auth = await this.provider.authorize(card.id, args.amount, args.merchant);
-    if (!auth.ok) return { status: 'needs_funding', reason: auth.reason, shortfall: args.amount, cardId: card.id };
-    this.store.kvSet(`spent:${ctx.taskId}`, String(this.spent(ctx.taskId) + args.amount));
-    return { status: 'granted', cardId: card.id, transactionId: auth.transactionId };
+    const existing = this.store.listPaymentSpendRequests({ taskId: ctx.taskId })
+      .find((request) => request.amount === args.amount && (!args.cardId || request.cardId === args.cardId)
+        && ['pending_approval', 'needs_funding'].includes(request.status));
+    if (existing) return this.approve(existing.id, 'system:settle');
+    const first = await this.request(ctx, args);
+    return first.requestId ? this.approve(first.requestId, 'system:settle') : first;
   }
 }

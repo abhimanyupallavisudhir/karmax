@@ -90,6 +90,9 @@ describe('BudgetService over the mock rail', () => {
     r = await budget.settleApproved({ projectId, taskId: 't2' }, { amount: 4000, cardId: card.id });
     expect(r.status).toBe('granted');
     expect((await provider.getCard(card.id))!.available).toBe(0);
+    const retry = await budget.request({ projectId, taskId: 't2' }, { amount: 4000, cardId: card.id });
+    expect(retry).toMatchObject({ status: 'granted', requestId: r.requestId, transactionId: r.transactionId });
+    expect((await provider.getCard(card.id))!.available).toBe(0);
   });
 
   it('needs_approval over the configured allowance', async () => {
@@ -120,6 +123,31 @@ describe('BudgetService over the mock rail', () => {
     store.setSettings(`organization:${other.id}`, 'payments', { allowance: 1000 });
     const r = await budget.request({ projectId: otherProject.id, organizationId: other.id, taskId: 't5' }, { amount: 100 });
     expect(r.status).toBe('granted');
+  });
+
+  it('selects only cards attenuated by use-card capabilities', async () => {
+    const first = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'First', cap: 100000 });
+    const permitted = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Permitted', cap: 100000 });
+    await provider.fund(first.id, 1000);
+    await provider.fund(permitted.id, 1000);
+    const r = await budget.request(
+      { projectId, taskId: 'card-cap', capabilities: [`use-card:${permitted.id}`] },
+      { amount: 250, why: 'capability routing' },
+    );
+    expect(r).toMatchObject({ status: 'granted', cardId: permitted.id });
+    expect((await provider.getCard(first.id))!.available).toBe(1000);
+    expect((await provider.getCard(permitted.id))!.available).toBe(750);
+  });
+
+  it('enforces the card hard cap cumulatively, not once per purchase', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Capped', cap: 500 });
+    await provider.fund(card.id, 2000);
+    expect((await budget.request({ projectId, taskId: 'cap-a' },
+      { amount: 300, cardId: card.id, why: 'first' })).status).toBe('granted');
+    const second = await budget.request({ projectId, taskId: 'cap-b' },
+      { amount: 300, cardId: card.id, why: 'second' });
+    expect(second).toMatchObject({ status: 'denied', reason: 'exceeds the card hard cap' });
+    expect((await provider.getCard(card.id))!.available).toBe(1700);
   });
 
   it('exports and deletes both organization and project cards with their tenant', async () => {
