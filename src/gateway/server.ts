@@ -2578,63 +2578,56 @@ export class Gateway {
         }
       }
 
-      // ── mailbox provider: connected once per installation (operator), which
-      // gives every organization a working address automatically (§8). ──
-      if (p === '/api/agent-mail/providers' && method === 'GET') {
-        const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
-        const { ingestSecret, cloudflareWorkerScript } = await import('../autonomy/agent-mail.js');
-        const registry = defaultMailboxRegistry();
-        const config = this.mailboxConfig();
-        // Everything the operator pastes elsewhere, ready-made: the complete
-        // webhook URL (secret included) and the Cloudflare Email Worker.
-        const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
-        const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store)}`;
-        return this.json(res, 200, { providers: registry.list(config), active: config.provider, domain: registry.activeDomain(config),
-          webhookUrl, cloudflareWorker: cloudflareWorkerScript(webhookUrl) });
-      }
-      if (p === '/api/agent-mail/connect' && method === 'POST') {
-        const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
-        const registry = defaultMailboxRegistry();
-        const b = await this.body(req);
-        const provider = registry.get(String(b.provider ?? ''));
-        if (!provider) return this.json(res, 400, { error: `unknown mailbox provider "${b.provider}"` });
-        const result = provider.connect({
-          domain: b.domain ? String(b.domain) : undefined,
-          apiKey: b.apiKey ? String(b.apiKey) : undefined,
-          address: b.address ? String(b.address) : undefined,
-          imapHost: b.imapHost ? String(b.imapHost) : undefined,
-          imapPort: b.imapPort ? Number(b.imapPort) : undefined,
-          imapUser: b.imapUser ? String(b.imapUser) : undefined,
-          imapSecure: b.imapSecure === undefined ? undefined : b.imapSecure !== false,
-        });
-        if (result.status === 'connected' && result.config) {
-          // Secrets (IMAP password / AgentMail or hosted key) go to the vault by
-          // handle, never echoed or stored raw. The handle name is provider-fixed
-          // so the poller can resolve it.
-          let apiKeyHandle: string | undefined;
-          if (b.apiKey && this.deps.broker) {
-            apiKeyHandle = b.provider === 'imap' ? 'mailbox:imap:pass' : b.provider === 'agentmail' ? 'mailbox:agentmail:auth' : 'mailbox:hosted:auth';
-            this.deps.broker.registerHandle(apiKeyHandle, String(b.apiKey));
-          }
-          // REPLACE (not merge): each provider fully specifies its own config, so
-          // switching providers can't leave a stale field shadowing the new one.
-          this.setMailboxConfig({ ...result.config, ...(apiKeyHandle && b.provider !== 'imap' ? { apiKeyHandle } : {}) });
-        }
-        return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
-      }
-
-      // ── agent mailbox: per-organization address + inbox reads (§8; the
-      // inbound webhook is an unauthenticated shared-secret route handled
-      // before the session gate). The org in the path is what requestScope +
-      // the token check enforce, so one tenant's agents can never read
-      // another's confirmation mails.
-      const mailMatch = p.match(/^\/api\/organizations\/([^/]+)\/agent-mail$/);
-      if (mailMatch && method === 'GET') {
+      // ── agent mailbox (§8): ORGANIZATION-scoped — each org connects its own
+      // email backend (like world providers / payment cards). The org in the
+      // path is enforced by requestScope + the token check, so one tenant can
+      // neither configure nor read another's mail. (The inbound webhook is a
+      // separate unauthenticated shared-secret route before the session gate.)
+      const orgMail = p.match(/^\/api\/organizations\/([^/]+)\/agent-mail(?:\/(providers|connect))?$/);
+      if (orgMail) {
+        const organizationId = orgMail[1]!;
+        const sub = orgMail[2];
         const { AgentMail } = await import('../autonomy/agent-mail.js');
-        const mail = new AgentMail(store, this.mailboxDomain(), this.mailboxFixedLocal());
-        const organizationId = mailMatch[1]!;
-        return this.json(res, 200, { organizationId, address: mail.address(organizationId), configured: mail.configured(),
-          messages: mail.recent(organizationId, { since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
+        if (!sub && method === 'GET') {
+          const config = this.mailboxConfig(organizationId);
+          const mail = new AgentMail(store, this.mailboxDomain(organizationId), this.mailboxFixedLocal(organizationId));
+          return this.json(res, 200, { organizationId, address: mail.address(organizationId), configured: mail.configured(),
+            provider: config.provider, domain: this.mailboxDomain(organizationId),
+            messages: mail.recent(organizationId, { since: url.searchParams.get('since') ? Number(url.searchParams.get('since')) : undefined, match: url.searchParams.get('match') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }) });
+        }
+        if (sub === 'providers' && method === 'GET') {
+          const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+          const { ingestSecret, cloudflareWorkerScript } = await import('../autonomy/agent-mail.js');
+          const config = this.mailboxConfig(organizationId);
+          // The push webhook URL (secret included) + Cloudflare worker are still
+          // returned for the operator who wants them; the UI hides them for now.
+          const base = process.env.KARMAX_GATEWAY_URL || `http://${req.headers.host ?? '127.0.0.1'}`;
+          const webhookUrl = `${base}/api/agent-mail/ingest?secret=${ingestSecret(this.deps.store)}`;
+          return this.json(res, 200, { providers: defaultMailboxRegistry().list(config), active: config.provider, webhookUrl, cloudflareWorker: cloudflareWorkerScript(webhookUrl) });
+        }
+        if (sub === 'connect' && method === 'POST') {
+          const { defaultMailboxRegistry } = await import('../autonomy/mailbox.js');
+          const b = await this.body(req);
+          const provider = defaultMailboxRegistry().get(String(b.provider ?? ''));
+          if (!provider) return this.json(res, 400, { error: `unknown mailbox provider "${b.provider}"` });
+          const result = provider.connect({
+            domain: b.domain ? String(b.domain) : undefined,
+            apiKey: b.apiKey ? String(b.apiKey) : undefined,
+            address: b.address ? String(b.address) : undefined,
+            imapHost: b.imapHost ? String(b.imapHost) : undefined,
+            imapPort: b.imapPort ? Number(b.imapPort) : undefined,
+            imapUser: b.imapUser ? String(b.imapUser) : undefined,
+            imapSecure: b.imapSecure === undefined ? undefined : b.imapSecure !== false,
+          });
+          if (result.status === 'connected' && result.config) {
+            // The provider secret (AgentMail key / IMAP password) → the vault under
+            // an org-scoped handle the poller resolves; never echoed or stored raw.
+            if (b.apiKey && this.deps.broker) this.deps.broker.registerHandle(this.mailboxSecretHandle(organizationId, String(b.provider)), String(b.apiKey));
+            // REPLACE (not merge) so switching providers can't leave a stale field.
+            this.setMailboxConfig(organizationId, result.config);
+          }
+          return this.json(res, result.status === 'unavailable' ? 400 : 200, result);
+        }
       }
 
       // cards (payment resources; SPEC §7.6) — organization-scoped so a tenant
@@ -3642,21 +3635,21 @@ export class Gateway {
   }
   /** Installation-wide mailbox provider config (agent-mail §8), set once by the
    *  operator; every organization's address is minted on its resolved domain. */
-  private mailboxConfig(): import('../autonomy/mailbox.js').MailboxConfig {
+  private mailboxConfig(organizationId: string): import('../autonomy/mailbox.js').MailboxConfig {
     try {
-      return JSON.parse(this.deps.store.kvGet('agent-mail:provider') ?? '{}');
+      return JSON.parse(this.deps.store.kvGet(`agent-mail:provider:${organizationId}`) ?? '{}');
     } catch {
       return {};
     }
   }
-  private setMailboxConfig(config: import('../autonomy/mailbox.js').MailboxConfig): void {
-    this.deps.store.kvSet('agent-mail:provider', JSON.stringify(config));
+  private setMailboxConfig(organizationId: string, config: import('../autonomy/mailbox.js').MailboxConfig): void {
+    this.deps.store.kvSet(`agent-mail:provider:${organizationId}`, JSON.stringify(config));
   }
-  private mailboxDomain(): string | undefined {
+  private mailboxDomain(organizationId: string): string | undefined {
     // The mint domain, resolved by the ACTIVE provider so a leftover field from a
     // previous provider can't win: imap/hosted-fixed use the address host,
     // agentmail its domain, hosted its domain, self-managed its domain.
-    const c = this.mailboxConfig();
+    const c = this.mailboxConfig(organizationId);
     if (c.provider === 'imap') return c.fixedAddress?.split('@')[1] || undefined;
     if (c.provider === 'agentmail') return c.agentmailDomain || undefined;
     if (c.provider === 'hosted') return c.hostedDomain || undefined;
@@ -3665,8 +3658,12 @@ export class Gateway {
   }
   /** The single-inbox base local part when addresses ride +tags on one mailbox
    *  (hosted fixed-address / IMAP); undefined for domain and AgentMail providers. */
-  private mailboxFixedLocal(): string | undefined {
-    return this.mailboxConfig().fixedAddress?.split('@')[0] || undefined;
+  private mailboxFixedLocal(organizationId: string): string | undefined {
+    return this.mailboxConfig(organizationId).fixedAddress?.split('@')[0] || undefined;
+  }
+  /** The org-scoped vault handle a provider's secret is stored under. */
+  private mailboxSecretHandle(organizationId: string, provider: string): string {
+    return `mailbox:${provider}:${organizationId}:auth`;
   }
 
   private requestScope(pathname: string, url: URL): { projectId?: string; taskId?: string; organizationId?: string } {

@@ -225,9 +225,13 @@ export class AgentMailboxProvider implements MailboxProvider {
   }
   connect(input: ConnectInput): ConnectResult {
     if (!input.apiKey?.trim()) return { status: 'unavailable', detail: 'paste your AgentMail API key' };
-    const domain = input.domain?.trim().replace(/^@/, '').toLowerCase();
-    if (!domain || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain)) return { status: 'unavailable', detail: 'enter your AgentMail domain, e.g. yourhandle.agentmail.to' };
-    return { status: 'connected', detail: 'Connected. Every organization now gets its own AgentMail inbox automatically.', config: { provider: this.name, agentmailDomain: domain } };
+    // The domain is optional: default to AgentMail's shared domain, and accept a
+    // full address (e.g. you@agentmail.to) — we just want the domain part.
+    let domain = input.domain?.trim().replace(/^@/, '').toLowerCase() || '';
+    if (domain.includes('@')) domain = domain.split('@')[1] ?? '';
+    if (!domain) domain = 'agentmail.to';
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain)) return { status: 'unavailable', detail: 'that does not look like a valid AgentMail domain' };
+    return { status: 'connected', detail: 'Connected. This organization now gets its own AgentMail inbox.', config: { provider: this.name, agentmailDomain: domain } };
   }
   domainFor(config: MailboxConfig): string | undefined {
     return config.agentmailDomain || undefined;
