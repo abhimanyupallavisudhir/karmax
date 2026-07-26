@@ -147,6 +147,16 @@ export class RemoteAccessController {
         canDisable: false,
       };
     }
+    if (node.Self?.Online === false) {
+      return {
+        method: 'tailscale',
+        state: 'error',
+        detail: 'Tailscale is running, but this computer is offline in the tailnet. Restart Tailscale on this computer, then check again.',
+        setupCommand: 'sudo systemctl restart tailscaled && sudo tailscale up',
+        canEnable: false,
+        canDisable: false,
+      };
+    }
 
     const dnsName = cleanDnsName(node.Self?.DNSName);
     let serve: CommandResult;

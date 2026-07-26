@@ -292,6 +292,28 @@ describe('remote access plan (SPEC §12)', () => {
       canEnable: false,
     });
   });
+  it('does not report ready when the local daemon is running but the node is offline', async () => {
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({
+            BackendState: 'Running',
+            Self: { DNSName: 'host.example.ts.net.', Online: false },
+          }),
+          stderr: '',
+        };
+        throw new Error('Serve status must not mask an offline node');
+      },
+    });
+    expect(await controller.status()).toMatchObject({
+      method: 'tailscale',
+      state: 'error',
+      detail: expect.stringMatching(/computer is offline/i),
+      setupCommand: 'sudo systemctl restart tailscaled && sudo tailscale up',
+      canEnable: false,
+    });
+  });
   it('detects and enables the private Tailscale route without touching an existing Serve app', async () => {
     let serve = 'No serve config';
     const calls: string[][] = [];
