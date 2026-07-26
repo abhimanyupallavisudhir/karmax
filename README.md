@@ -22,10 +22,12 @@ nothing is hardcoded).
 
 For a local installation, install [Tailscale](https://tailscale.com/download) on
 the Karmax computer and your phone, then sign in to the same tailnet. In Karmax,
-open **Organization settings → Access** and choose **Turn on
-private access**. Karmax shows the private `https://….ts.net` address to open on
+open **Organization settings → Phone Access** and choose **Set up Tailscale**.
+Karmax guides you through system authorization, Tailscale login, and private
+HTTPS approval, then shows the private `https://….ts.net` address to open on
 your phone. It stays bound to localhost; Tailscale Serve supplies private HTTPS
-and never exposes it to the public internet.
+and never exposes it to the public internet. Exact terminal commands remain
+available as a fallback.
 
 For hosted Karmax, open its normal `https://karmax.example.com` address on the
 phone and sign in. In either case, choose **Add Karmax to this phone** in the
