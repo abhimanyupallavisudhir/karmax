@@ -2422,7 +2422,24 @@ export class Gateway {
         // Annotate each profile with the workflow(s) that declare its role, so the
         // UI can show a role belongs to (e.g.) software-dev + merge-only (SPEC §7.1).
         const { roleDef } = await import('../contrib/manifests.js');
-        const withRole = (pr: any) => ({ ...pr, roleWorkflows: roleDef(pr.role)?.workflows ?? [] });
+        const withRole = (pr: any) => {
+          const {
+            modelProvider: _legacyModelProvider,
+            allowedAccounts: _legacyAllowedAccounts,
+            auth: _legacyAuth,
+            ...visibleProfile
+          } = pr;
+          if (visibleProfile.inherited) {
+            const {
+              modelProvider: _legacyInheritedProvider,
+              allowedAccounts: _legacyInheritedAllowedAccounts,
+              auth: _legacyInheritedAuth,
+              ...visibleInherited
+            } = visibleProfile.inherited;
+            visibleProfile.inherited = visibleInherited;
+          }
+          return { ...visibleProfile, roleWorkflows: roleDef(pr.role)?.workflows ?? [] };
+        };
         const visible = (pr: { role: string }) => !!roleDef(pr.role);
         const pid = url.searchParams.get('projectId') ?? undefined;
         if (!pid) return this.json(res, 200, store.listProfiles().filter((pr) => !pr.id.includes('::') && visible(pr)).map(withRole));
@@ -2453,7 +2470,15 @@ export class Gateway {
         if (!roleDef(String(b.role))) return this.json(res, 400, { error: `unknown or disabled agent role "${String(b.role)}"` });
         const id = b.projectId ? `${b.projectId}::${b.role}-default` : b.id;
         if (!id) return this.json(res, 400, { error: 'profile needs id or projectId' });
-        const { projectId: _pid, scope: _s, inherited: _i, ...rest } = b;
+        const {
+          projectId: _pid,
+          scope: _s,
+          inherited: _i,
+          modelProvider: _legacyModelProvider,
+          allowedAccounts: _legacyAllowedAccounts,
+          auth: _legacyAuth,
+          ...rest
+        } = b;
         store.upsertProfile({ provider: 'claude', capabilities: [], ...rest, id });
         return this.json(res, 200, store.getProfile(id) ?? null);
       }
@@ -3438,7 +3463,16 @@ export class Gateway {
     );
     const pool = creds.map((c) => {
       const maxConcurrent = concurrencyFor((k) => this.deps.store.kvGet(k), c.key);
-      return { id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}), ...(maxConcurrent != null ? { maxConcurrent } : {}) };
+      const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
+      return {
+        id: c.key,
+        configHome: c.configHome ?? '',
+        provider: c.provider,
+        kind: c.kind,
+        ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}),
+        ...(credentialProvider ? { credentialProvider } : {}),
+        ...(maxConcurrent != null ? { maxConcurrent } : {}),
+      };
     });
     if (!pool.length) return;
     const { makeCoordinatorActivities } = await import('../activities/coordinator.js');

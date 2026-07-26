@@ -237,7 +237,16 @@ async function main() {
   );
   const pool = creds.map((c) => {
     const maxConcurrent = concurrencyFor((k) => store.kvGet(k), c.key);
-    return { id: c.key, configHome: c.configHome ?? '', provider: c.provider, kind: c.kind, ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}), ...(maxConcurrent != null ? { maxConcurrent } : {}) };
+    const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
+    return {
+      id: c.key,
+      configHome: c.configHome ?? '',
+      provider: c.provider,
+      kind: c.kind,
+      ...(c.apiKeyHandle ? { apiKeyHandle: c.apiKeyHandle } : {}),
+      ...(credentialProvider ? { credentialProvider } : {}),
+      ...(maxConcurrent != null ? { maxConcurrent } : {}),
+    };
   });
   if (pool.length) {
     await coordClient.registerAccounts(pool).catch((e) => console.warn('  • credential pool register failed', String(e)));

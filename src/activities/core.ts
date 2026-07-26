@@ -8,7 +8,15 @@ import { WorldRegistry } from '../world/registry.js';
 import { World, WorldHandle, WorldKind, worldWorkingDirectory } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
-import { credentialAliases, credentialMatchesProfile, credentialProvider, isAgentProvider } from '../agent/provider-registry.js';
+import {
+  apiKeyEnv,
+  canonicalModelProvider,
+  credentialAliases,
+  credentialMatchesProfile,
+  credentialProvider,
+  MODEL_PROVIDERS,
+  modelProviderFromModel,
+} from '../agent/provider-registry.js';
 import { AgentAdapter } from '../agent/types.js';
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { acquireAgentSlot, awaitAgentResources } from './agent-slots.js';
@@ -36,7 +44,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest } from '../contrib/manifests.js';
 import { allows, attenuate } from '../platform/capabilities.js';
-import { Provider, Message, TaskInput, TaskView, AgentRole, AuthSource } from '../domain/types.js';
+import { Provider, Message, TaskInput, TaskView, AgentRole } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import {
@@ -154,28 +162,6 @@ function signalKillMessage(raw: string): string {
     : `host memory is healthy (${mem}), so this is NOT an OOM kill — most likely a karmax ` +
       `restart/reload/redeploy tearing down in-flight turns (orphan-sweep or shutdown escalation) or an external kill.`;
   return `agent turn interrupted by SIGKILL: ${diagnosis} Retrying with session resume. [signal: ${raw.slice(0, 200)}]`;
-}
-
-/** Split an account ref that may be "<provider>:<name>" or just "<name>". */
-function splitAccountRef(ref: string, fallback: Provider): { provider: Provider; name: string } {
-  const [maybeProv, ...rest] = ref.split(':');
-  const isProv = rest.length > 0 && isAgentProvider(maybeProv);
-  return { provider: (isProv ? maybeProv : fallback) as Provider, name: isProv ? rest.join(':') : ref };
-}
-
-/** Derive a single AuthSource from the first usable entry of allowedAccounts
- *  (`login:<provider>:<account>` → configHome; `key:<handle>` → apiKeyHandle). */
-function firstAllowedToAuth(allowed: string[] | undefined, provider: Provider, modelProvider: string = provider): AuthSource | undefined {
-  if (!allowed?.length) return undefined;
-  // Subscription homes are harness-specific: a Kimi OAuth home cannot be handed
-  // to OpenCode merely because OpenCode is running a Kimi model.
-  const logins = allowed.filter((a) => a.startsWith('login:'));
-  const preferred = logins.find((a) => a.slice('login:'.length).startsWith(`${provider}:`));
-  if (preferred) return { kind: 'configHome', account: preferred.slice('login:'.length) };
-  const aliases = credentialAliases(modelProvider);
-  const key = allowed.find((a) => a.startsWith('key:') && aliases.some((p) => a.slice('key:'.length).startsWith(`${p}:`)));
-  if (key) return { kind: 'apiKeyHandle', handle: key.slice('key:'.length) };
-  return undefined;
 }
 
 export interface CoreActivityDeps {
@@ -301,9 +287,12 @@ export interface RunAgentTurnArgs {
   task: TaskInput;
   bindings?: Record<string, string>;
   explicitProfileId?: string;
-  /** Config home leased by the account coordinator for this turn (SPEC §6.2);
-   * overrides the profile's own auth home so turns rotate across logins. */
+  /** Config home leased by the account coordinator for this turn (SPEC §6.2). */
   accountConfigHome?: string;
+  /** Kind of credential leased; distinguishes an environment key/ambient login. */
+  accountCredentialKind?: 'login' | 'ambient' | 'key';
+  /** Model/API provider of the exact credential leased by the coordinator. */
+  accountCredentialProvider?: string;
   /** Broker API-key handle leased by the coordinator for this turn (a `key:handle:*`
    * credential); resolved JIT and overrides the auth. Env keys carry no handle —
    * they fall through to the adapter's env credential. */
@@ -625,33 +614,35 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       worldHandle: WorldHandle;
       accountConfigHome?: string;
       accountApiKeyHandle?: string;
+      accountCredentialKind?: 'login' | 'ambient' | 'key';
+      accountCredentialProvider?: string;
     }): Promise<boolean> {
       if (!isRemote(args.worldHandle.kind)) return true;
+      if (args.accountCredentialKind === 'key') return true;
+      if (args.accountCredentialKind === 'login' || args.accountCredentialKind === 'ambient') return false;
+
+      // Replay compatibility for workflow histories recorded before credential
+      // metadata accompanied the lease. A broker handle is an API rail; a config
+      // home is a provider-hosted subscription rail.
+      if (args.accountApiKeyHandle && deps.broker) return true;
+      if (args.accountConfigHome) return false;
+
       const baseProfile = profiles.resolve(args.role, args.task.profiles, undefined, args.task.projectId);
       const profile = applyAgentSpec(baseProfile, args.task.agents?.[args.role]);
-      const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
-      const effAuth = organizationId === 'org_personal'
-        ? profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider, credentialProvider(profile))
-        : undefined;
-      const explicitApiKey =
-        (!!args.accountApiKeyHandle && !!deps.broker)
-        || (!args.accountConfigHome && effAuth?.kind === 'apiKeyHandle' && !!effAuth.handle && !!deps.broker);
-      const hasConfigHome =
-        !!args.accountConfigHome
-        || (!args.accountApiKeyHandle && effAuth?.kind === 'configHome');
-      const ambientApiKey =
-        !explicitApiKey
-        && !hasConfigHome
-        && (
-          (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
-          || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
-        );
-      return explicitApiKey || ambientApiKey;
+      const modelProvider = args.accountCredentialProvider
+        ? canonicalModelProvider(args.accountCredentialProvider)
+        : credentialProvider(profile);
+      return (
+        (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY)
+        || (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+        || (profile.provider === 'opencode' && !!process.env[apiKeyEnv(modelProvider)])
+      );
     },
 
     /** The ordered, enabled credential keys for a turn's provider, per the credential
      *  policy resolved global→project→task (SPEC §7/§9). The coordinator leases the
-     *  first available one from this list. Empty ⇒ passthrough to the profile default. */
+     *  first available one from this list. An empty compatible set resolves to a
+     *  denied marker so explicit policy cannot fall through to profile defaults. */
     async resolveCredentialOrder(args: { taskId: string; projectId: string; provider: string; role?: AgentRole; task?: TaskInput }): Promise<string[]> {
       const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
       const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
@@ -665,18 +656,38 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           args.task.agents?.[args.role],
         )
         : undefined;
-      const modelProvider = profile ? credentialProvider(profile) : args.provider;
-      const keyNamespaces = new Set(credentialAliases(modelProvider));
-      const profileAllows = (key: string, handle?: string) =>
-        organizationId !== 'org_personal'
-        || !profile?.allowedAccounts?.length
-        || profile.allowedAccounts.includes(key)
-        || (!!handle && profile.allowedAccounts.includes(`key:${handle}`));
-      const ordered = resolveCredentials(all, layers)
-        .filter((c) =>
-          (profile ? credentialMatchesProfile(profile, c) : keyNamespaces.has(c.provider))
-          && profileAllows(c.key, c.apiKeyHandle),
-        );
+      const enabled = resolveCredentials(all, layers);
+      let missingNamespace = args.provider;
+      const openCodePrefix = profile?.provider === 'opencode' ? modelProviderFromModel(profile.model) : undefined;
+      const recognizedOpenCodePrefix = !!openCodePrefix && (
+        (MODEL_PROVIDERS as readonly string[]).includes(openCodePrefix)
+        || all.some((candidate) =>
+          candidate.kind === 'key' && credentialAliases(openCodePrefix).includes(candidate.provider),
+        )
+      );
+      if (profile?.provider === 'opencode') {
+        missingNamespace = recognizedOpenCodePrefix ? openCodePrefix! : 'opencode-compatible';
+      }
+      const ordered = enabled.filter((credential) => {
+        if (!profile) return credentialAliases(args.provider).includes(credential.provider);
+        if (profile.provider !== 'opencode') {
+          missingNamespace = credentialProvider(profile);
+          return credentialMatchesProfile(profile, credential);
+        }
+
+        // An OpenCode subscription is harness-native and may carry credentials
+        // for multiple model vendors. API keys are narrowed only when the model
+        // has a recognizable `provider/model` prefix. With an unprefixed or
+        // custom id, the user's general Credentials ordering is authoritative.
+        if (credential.kind !== 'key') {
+          if (credential.provider !== 'opencode') return false;
+          if (!credential.modelProvider) return recognizedOpenCodePrefix;
+          return !recognizedOpenCodePrefix
+            || credentialAliases(openCodePrefix!).includes(credential.modelProvider);
+        }
+        if (!recognizedOpenCodePrefix) return true;
+        return credentialAliases(openCodePrefix!).includes(credential.provider);
+      });
       // A native OpenCode fork is stored in the source XDG home. Lease that
       // exact login first so account concurrency, quota failures, and policy
       // attribution remain honest; never reopen one account after leasing
@@ -697,7 +708,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               // the coordinator waits for this home instead of skipping to a
               // different account.
               if (index >= 0) return [ordered[index]!.key];
-              return [];
+              return [`missing:${organizationId}:opencode-fork`];
             }
           } catch {
             /* malformed historical metadata — adapter will report the missing session */
@@ -705,20 +716,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const keys = ordered.map((c) => c.key);
-      // Empty historically means "use the host's ambient/default credential".
-      // That migration fallback belongs only to the personal organization. A
-      // non-personal tenant must wait/escalate instead of borrowing another
-      // tenant's host login, so return a non-existent explicit allow-list entry.
-      return keys.length || organizationId === 'org_personal' || profile?.provider === 'mock'
+      // An empty compatible set must not fall through to an ambient/profile
+      // credential and bypass an explicit disable. A non-existent allow-list
+      // entry makes the coordinator deny the turn with a credential action.
+      return keys.length || profile?.provider === 'mock'
         ? keys
-        : [`missing:${organizationId}:${modelProvider}`];
+        : [`missing:${organizationId}:${missingNamespace}`];
     },
 
     async runAgentTurn(args: RunAgentTurnArgs) {
       const baseProfile = profiles.resolve(args.role, args.task.profiles, args.explicitProfileId, args.task.projectId);
       // Apply the per-role agent override from the task form (SPEC §10.5).
       const spec = args.task.agents?.[args.role];
-      const profile = applyAgentSpec(baseProfile, spec);
+      let profile = applyAgentSpec(baseProfile, spec);
+      const leasedCredentialProvider = args.accountCredentialProvider
+        ? canonicalModelProvider(args.accountCredentialProvider)
+        : undefined;
+      if (profile.provider === 'opencode' && leasedCredentialProvider) {
+        // Internal, per-turn resolution only. Persisted/task modelProvider values
+        // are stripped by applyAgentSpec; the credential actually leased by the
+        // general policy is the sole authority for custom/unprefixed model ids.
+        profile = { ...profile, modelProvider: leasedCredentialProvider };
+      }
       const organizationId = store.getProject(args.task.projectId)?.organizationId ?? 'org_personal';
       const world = await openWorld(args.worldHandle, args.taskId);
 
@@ -816,34 +835,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt });
       }
 
-      // JIT-resolve credentials via the broker (never journaled). The account to
-      // use comes from the profile's allowedAccounts set (SPEC §7.3/§6.2) — first
-      // matching entry — falling back to the legacy single `auth` field.
+      // JIT-resolve credentials via the broker (never journaled). Every current
+      // turn receives its selection from the general Credentials policy.
       let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
-      const effAuth = organizationId === 'org_personal'
-        ? profile.auth ?? firstAllowedToAuth(profile.allowedAccounts, profile.provider, credentialProvider(profile))
-        : undefined;
-      if (effAuth?.kind === 'apiKeyHandle' && effAuth.handle && deps.broker) {
-        const apiKey = deps.broker.resolve(effAuth.handle, { taskId: args.taskId, profileId: profile.id, caps: effective });
-        resolvedAuth = { apiKey };
-      } else if (effAuth?.kind === 'configHome') {
-        // Either an explicit path, or an account ref resolved to its minted home.
-        // `account` may be "<provider>:<name>" (from the login picker) or just "<name>".
-        let home = effAuth.configHome;
-        if (!home && effAuth.account && deps.configHomes) {
-          const { provider: prov, name } = splitAccountRef(effAuth.account, profile.provider);
-          home = deps.configHomes.ensure(prov, name, organizationId);
-        }
-        if (home) resolvedAuth = { configHome: home, ...(tokenToInject(home) ? { oauthToken: tokenToInject(home) } : {}) };
-      }
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {
         const tok = tokenToInject(args.accountConfigHome);
         resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome, ...(tok ? { oauthToken: tok } : {}) };
       }
-      // A coordinator-leased broker API-key handle wins over both (SPEC §6.2/§7): a
-      // policy that ordered an API key ahead of (or instead of) logins.
+      // A coordinator-leased API key wins over both (SPEC §6.2/§7). Vault handles
+      // resolve JIT; reserved environment-key references carry only the provider
+      // identity and let the adapter read that provider's process environment.
       if (args.accountApiKeyHandle && deps.broker) {
         const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: effective });
         resolvedAuth = { apiKey };
@@ -860,7 +863,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // sandbox; a requested cross-world session is materialized explicitly below.
       const apiRail = !!resolvedAuth?.apiKey || (!resolvedAuth && (
         (profile.provider === 'claude' && !!process.env.ANTHROPIC_API_KEY) ||
-        (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY)
+        (profile.provider === 'codex' && !!process.env.OPENAI_API_KEY) ||
+        (profile.provider === 'opencode' && !!process.env[apiKeyEnv(credentialProvider(profile))])
       ));
       const remoteSubscriptionRail = isRemote(args.worldHandle.kind) && !apiRail;
       // ── Fork a prior agent (SPEC §10.5) ──────────────────────────────────────

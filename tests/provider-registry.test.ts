@@ -4,12 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   acpHomeEnv,
+  canonicalModelProvider,
   credentialAliases,
   credentialMatchesProfile,
   credentialProvider,
   hasAcpHomeLogin,
   isAgentProvider,
   isLoginProvider,
+  modelProviderFromModel,
 } from '../src/agent/provider-registry.js';
 
 describe('agent/model provider separation', () => {
@@ -20,9 +22,11 @@ describe('agent/model provider separation', () => {
     expect(isAgentProvider('grok')).toBe(false);
   });
 
-  it('infers OpenCode credentials from the model prefix and accepts an explicit override', () => {
+  it('infers OpenCode credentials only from canonical provider/model ids', () => {
     expect(credentialProvider({ provider: 'opencode', model: 'kimi/k3' })).toBe('kimi');
-    expect(credentialProvider({ provider: 'opencode', model: 'custom/model', modelProvider: 'google' })).toBe('google');
+    expect(modelProviderFromModel('google/gemini-2.5-pro')).toBe('google');
+    expect(modelProviderFromModel('gemini-2.5-pro')).toBeUndefined();
+    expect(credentialProvider({ provider: 'opencode', model: 'gemini-2.5-pro' })).toBe('opencode');
     expect(credentialProvider({ provider: 'kimi', model: 'k3' })).toBe('kimi');
   });
 
@@ -30,6 +34,9 @@ describe('agent/model provider separation', () => {
     expect(credentialAliases('anthropic')).toEqual(['claude', 'anthropic']);
     expect(credentialAliases('openai')).toEqual(['codex', 'openai']);
     expect(credentialAliases('xai')).toEqual(['grok', 'xai']);
+    expect(canonicalModelProvider('claude')).toBe('anthropic');
+    expect(canonicalModelProvider('codex')).toBe('openai');
+    expect(canonicalModelProvider('xai')).toBe('xai');
   });
 
   it('accepts model-vendor keys but only harness-native subscription homes', () => {

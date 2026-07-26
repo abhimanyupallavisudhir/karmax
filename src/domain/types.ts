@@ -804,7 +804,7 @@ export interface FieldSpec {
 /** A per-use agent override collected by the `agent` field (SPEC §10.5). */
 export interface AgentSpec {
   provider: Provider;
-  /** Model/API vendor when `provider` is a model-agnostic harness. */
+  /** @deprecated Replay-only. Routing comes from the model id + Credentials policy. */
   modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -973,11 +973,7 @@ export interface AgentProfile {
   id: string;
   name: string;
   provider: Provider;
-  /**
-   * Model/API credential provider used by a model-agnostic harness (for example
-   * `kimi`, `google`, or `xai`). For OpenCode this is inferred from the
-   * `provider/model` model id when omitted.
-   */
+  /** @internal Resolved leased provider; persisted values are ignored. */
   modelProvider?: string;
   model?: string;
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -987,14 +983,9 @@ export interface AgentProfile {
   /** Capability ceiling this profile may ever attempt (SPEC §8.2). */
   capabilities: string[];
   maxTurns?: number;
+  /** @deprecated Credentials policy is authoritative; persisted values are ignored. */
   auth?: AuthSource;
-  /**
-   * Which accounts this agent may use (SPEC §7.3/§6.2). Each ref is
-   * `login:<provider>:<account>` (a connected config-home login) or
-   * `key:<handle>` (a stored API key). Empty/undefined = all connected accounts.
-   * This set is the agent's credential/lease pool — the coordinator rotates
-   * across exactly these logins.
-   */
+  /** @deprecated Credentials policy is authoritative; persisted values are ignored. */
   allowedAccounts?: string[];
 }
 

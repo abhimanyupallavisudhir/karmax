@@ -306,8 +306,8 @@ describe('remote policy (PLAN-git-config §5)', () => {
         role: 'do',
         provider: 'claude',
         capabilities: [],
-        // A historical installation-wide restriction must not suppress this
-        // organization's disjoint credential pool.
+        // A historical profile restriction is ignored; the scoped Credentials
+        // policy is the only routing authority.
         allowedAccounts: ['key:claude:personal-key'],
       });
       expect(await core.resolveCredentialOrder({

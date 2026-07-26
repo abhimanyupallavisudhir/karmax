@@ -125,6 +125,8 @@ async function justDoImpl(
       const invoke = (lease?: {
         accountConfigHome?: string;
         accountApiKeyHandle?: string;
+        accountCredentialKind?: 'login' | 'ambient' | 'key';
+        accountCredentialProvider?: string;
         agentTurnId: string;
         agentAdmissionManaged?: true;
         agentSlotGranted?: true;
@@ -193,6 +195,8 @@ async function justDoImpl(
       const invoke = (lease?: {
         accountConfigHome?: string;
         accountApiKeyHandle?: string;
+        accountCredentialKind?: 'login' | 'ambient' | 'key';
+        accountCredentialProvider?: string;
         agentTurnId: string;
         agentAdmissionManaged?: true;
         agentSlotGranted?: true;

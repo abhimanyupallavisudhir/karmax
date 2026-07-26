@@ -21,11 +21,18 @@ export const MODEL_PROVIDERS = [
   'deepseek',
 ] as const;
 
+/** Provider prefix from OpenCode's canonical `provider/model` model id. */
+export function modelProviderFromModel(model: string | undefined): string | undefined {
+  const slash = model?.indexOf('/') ?? -1;
+  if (slash <= 0) return undefined;
+  return model!.slice(0, slash).trim() || undefined;
+}
+
 /** Credential-pool namespace for a profile, distinct from its coding harness. */
 export function credentialProvider(profile: Pick<AgentProfile, 'provider' | 'modelProvider' | 'model'>): string {
   if (profile.modelProvider?.trim()) return profile.modelProvider.trim();
   if (profile.provider === 'opencode') {
-    const prefix = profile.model?.split('/', 1)[0]?.trim();
+    const prefix = modelProviderFromModel(profile.model);
     if (prefix) return prefix;
   }
   return profile.provider;
@@ -37,6 +44,14 @@ export function credentialAliases(provider: string): string[] {
   if (provider === 'codex' || provider === 'openai') return ['codex', 'openai'];
   if (provider === 'grok' || provider === 'xai') return ['grok', 'xai'];
   return [provider];
+}
+
+/** Canonical model-provider id expected by a general-model harness. */
+export function canonicalModelProvider(provider: string): string {
+  if (provider === 'claude') return 'anthropic';
+  if (provider === 'codex') return 'openai';
+  if (provider === 'grok') return 'xai';
+  return provider;
 }
 
 /** Subscription homes belong to a harness; API keys belong to a model vendor. */

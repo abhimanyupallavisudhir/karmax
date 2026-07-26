@@ -118,6 +118,11 @@ Karmax does not represent a Google consumer subscription as portable model API
 access.
 
 For Gemini or Grok models through OpenCode, use a `google/...` or `xai/...` model
-id and the matching `google` or `xai` API-key namespace. The profile's optional
-“Credential provider” field handles custom model ids that do not carry a useful
-prefix.
+id and the matching `google` or `xai` API-key credential. Model credentials are
+enabled and ordered only in the general Credentials list at organization,
+project, or task scope. A recognized model prefix narrows that ordered list to
+matching keys (while OpenCode subscription homes remain eligible). For an
+unprefixed or custom model id, Karmax leases the highest-priority compatible
+credential and uses that credential's provider namespace when configuring
+OpenCode. Profiles and task parameters do not have a second “Credential
+provider” setting.

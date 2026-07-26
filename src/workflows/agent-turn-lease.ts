@@ -13,9 +13,23 @@ import { SIG_AGENT_TURN_STATE } from './names.js';
 import type { AgentRole, TaskInput, TaskView, WorldHandleLike } from './contract.js';
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'kimi' | 'grok' | 'mock';
-type Grant = { accountId: string; configHome?: string; apiKeyHandle?: string };
+type CredentialKind = 'login' | 'ambient' | 'key';
+type Grant = {
+  accountId: string;
+  configHome?: string;
+  apiKeyHandle?: string;
+  credentialKind?: CredentialKind;
+  credentialProvider?: string;
+};
 
-const accountGrantedSignal = defineSignal<[{ turnId: string; accountId: string; configHome?: string; apiKeyHandle?: string }]>(SIG_ACCOUNT_GRANTED);
+const accountGrantedSignal = defineSignal<[{
+  turnId: string;
+  accountId: string;
+  configHome?: string;
+  apiKeyHandle?: string;
+  credentialKind?: CredentialKind;
+  credentialProvider?: string;
+}]>(SIG_ACCOUNT_GRANTED);
 const agentSlotGrantedSignal = defineSignal<[{ turnId: string }]>(SIG_AGENT_SLOT_GRANTED);
 const agentTurnStateSignal = defineSignal<[{
   turnId: string;
@@ -28,6 +42,8 @@ const agentTurnStateSignal = defineSignal<[{
 type AgentTurnContext = {
   accountConfigHome?: string;
   accountApiKeyHandle?: string;
+  accountCredentialKind?: CredentialKind;
+  accountCredentialProvider?: string;
   agentTurnId: string;
   agentAdmissionManaged?: true;
   /** The owning workflow already holds the durable coordinator lease. */
@@ -68,7 +84,13 @@ export function createAgentTurnLeaser(
   const slotGrants = new Set<string>();
 
   setHandler(accountGrantedSignal, (g) => {
-    grants.set(g.turnId, { accountId: g.accountId, configHome: g.configHome, apiKeyHandle: g.apiKeyHandle });
+    grants.set(g.turnId, {
+      accountId: g.accountId,
+      configHome: g.configHome,
+      apiKeyHandle: g.apiKeyHandle,
+      credentialKind: g.credentialKind,
+      credentialProvider: g.credentialProvider,
+    });
   });
   setHandler(agentSlotGrantedSignal, ({ turnId }) => {
     slotGrants.add(turnId);
@@ -97,6 +119,8 @@ export function createAgentTurnLeaser(
     fn: (ctx: AgentTurnContext) => Promise<T>,
     home?: string,
     key?: string,
+    credentialKind?: CredentialKind,
+    credentialProvider?: string,
   ): Promise<T> => {
     resumeStatus = host.status() === 'waiting' ? 'active' : host.status();
     currentTurn = { turnId, role, provider, state: 'waiting-slot' };
@@ -123,6 +147,8 @@ export function createAgentTurnLeaser(
             worldHandle: world as any,
             accountConfigHome: home,
             accountApiKeyHandle: key,
+            accountCredentialKind: credentialKind,
+            accountCredentialProvider: credentialProvider,
           });
           if (usesHostCapacity) {
             slotRequested = true;
@@ -153,6 +179,8 @@ export function createAgentTurnLeaser(
         return await fn({
           accountConfigHome: home,
           accountApiKeyHandle: key,
+          accountCredentialKind: credentialKind,
+          accountCredentialProvider: credentialProvider,
           agentTurnId: turnId,
           ...(durableAdmission ? { agentAdmissionManaged: true as const } : {}),
           ...(slotHeld ? { agentSlotGranted: true as const } : {}),
@@ -232,8 +260,10 @@ export function createAgentTurnLeaser(
       const passthrough = !grant || grant.accountId === '(passthrough)';
       const home = passthrough ? undefined : grant?.configHome;
       const key = passthrough ? undefined : grant?.apiKeyHandle;
+      const credentialKind = passthrough ? undefined : grant?.credentialKind;
+      const leasedCredentialProvider = passthrough ? undefined : grant?.credentialProvider;
       try {
-        return await admitted(turnId, role, provider, fn, home, key);
+        return await admitted(turnId, role, provider, fn, home, key, credentialKind, leasedCredentialProvider);
       } catch (err) {
         if (grant && !passthrough && !host.cancelled()) {
           const cls = limitFailureClassification(err);

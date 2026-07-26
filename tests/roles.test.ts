@@ -69,6 +69,23 @@ describe('workflow-owned agent roles (SPEC §7.1 / PLAN-dynamic-repos §2b)', ()
 
     expect(applyAgentSpec(profile({ model: 'claude-opus-4-8' }), { provider: 'codex', model: 'gpt-5.6-sol' }).model).toBe('gpt-5.6-sol');
   });
+
+  it('ignores the retired task/profile model-provider override', () => {
+    const resolved = applyAgentSpec(
+      profile({
+        provider: 'opencode',
+        model: 'custom-model',
+        modelProvider: 'xai',
+        auth: { kind: 'configHome', configHome: '/tmp/legacy' },
+        allowedAccounts: ['login:opencode:legacy'],
+      }),
+      { provider: 'opencode', modelProvider: 'google' } as any,
+    );
+    expect(resolved.model).toBe('custom-model');
+    expect(resolved.modelProvider).toBeUndefined();
+    expect(resolved.auth).toBeUndefined();
+    expect(resolved.allowedAccounts).toBeUndefined();
+  });
 });
 
 describe('prompt assembly derives from the declared role (not a hardcoded map)', () => {

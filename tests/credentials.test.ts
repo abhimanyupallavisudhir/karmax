@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { enumerateCredentials, resolveCredentials, credentialsForProvider, defaultEnabled, isEnabled } from '../src/platform/credentials.js';
+import {
+  enumerateCredentials,
+  resolveCredentials,
+  credentialsForProvider,
+  defaultEnabled,
+  isEnabled,
+} from '../src/platform/credentials.js';
 import { agentAccountHandles, credPolicyKey, readPolicyLayers } from '../src/platform/credential-sources.js';
 
 const sources = {
@@ -54,6 +60,42 @@ describe('credential enumeration', () => {
       'claude:org_acme:metered',
       'claude:org_beta:metered',
     ], 'org_acme')).toEqual(['claude:org_acme:metered']);
+  });
+
+  it('keeps a model vendor on model-agnostic subscription credentials', () => {
+    const credentials = enumerateCredentials({
+      logins: [{
+        provider: 'opencode',
+        account: 'grok-subscription',
+        path: '/h/oc',
+        loggedIn: true,
+        modelProvider: 'xai',
+      }],
+      ambient: {},
+      envKeys: {},
+      handles: [],
+    });
+    expect(credentials).toEqual([expect.objectContaining({
+      key: 'login:opencode:grok-subscription',
+      provider: 'opencode',
+      modelProvider: 'xai',
+      label: 'opencode:grok-subscription (xai)',
+    })]);
+  });
+
+  it('keeps a detected model vendor on an ambient OpenCode credential', () => {
+    const credentials = enumerateCredentials({
+      logins: [],
+      ambient: { opencode: true },
+      ambientModelProviders: { opencode: 'xai' },
+      envKeys: {},
+      handles: [],
+    });
+    expect(credentials).toEqual([expect.objectContaining({
+      key: 'ambient:opencode',
+      modelProvider: 'xai',
+      label: 'opencode (ambient login · xai)',
+    })]);
   });
 });
 

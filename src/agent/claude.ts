@@ -53,11 +53,10 @@ export class ClaudeAdapter implements AgentAdapter {
     // before structured timeline events were introduced.
     ctx.emitActivity ??= () => {};
     const auth = input.resolvedAuth;
-    // Route on the PROFILE's resolved auth first, so each profile picks its rail:
+    // Route on the turn's coordinator-resolved auth first:
     // an API key → the Messages API (metered); a config home → the subscription
-    // login (Agent SDK). Only with NO explicit profile auth do we fall back to the
-    // ambient environment — so a stray ANTHROPIC_API_KEY can no longer silently
-    // force a subscription profile onto the metered path.
+    // login (Agent SDK). Only with no explicit lease material do we fall back to
+    // the ambient environment.
     if (auth?.apiKey) return this.runMessagesApi(input, ctx);
     if (auth?.configHome) return this.runAgentSdk(input, ctx);
     if (ClaudeAdapter.hasApiKey()) return this.runMessagesApi(input, ctx);

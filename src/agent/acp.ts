@@ -17,7 +17,15 @@ import {
 } from '@agentclientprotocol/sdk';
 import type { AgentProfile, Provider } from '../domain/types.js';
 import { platformMcpSpec } from '../autonomy/config-homes.js';
-import { apiKeyEnv, acpHomeEnv, credentialProvider, isAcpProvider, type AcpProvider } from './provider-registry.js';
+import {
+  apiKeyEnv,
+  acpHomeEnv,
+  credentialAliases,
+  credentialProvider,
+  isAcpProvider,
+  modelProviderFromModel,
+  type AcpProvider,
+} from './provider-registry.js';
 import { messagesToDeliver, conversationToPromptText } from './history.js';
 import { collectAcpImageBlocks } from './images.js';
 import { activityDetail } from './activity.js';
@@ -78,8 +86,14 @@ function appendTerminalOutput(terminal: AcpTerminal, chunk: Buffer): void {
 
 function openCodeModel(profile: AgentProfile): string | undefined {
   if (!profile.model) return undefined;
-  if (profile.model.includes('/')) return profile.model;
-  return `${credentialProvider(profile)}/${profile.model}`;
+  const provider = credentialProvider(profile);
+  const prefix = modelProviderFromModel(profile.model);
+  if (!prefix) return `${provider}/${profile.model}`;
+  // A standard provider/model id is already complete. When the prefix is custom
+  // or ambiguous and core resolved a different API-key provider from Credentials,
+  // preserve the full model id as the provider-specific model suffix.
+  if (credentialAliases(provider).includes(prefix) || credentialAliases(prefix).includes(provider)) return profile.model;
+  return profile.modelProvider ? `${provider}/${profile.model}` : profile.model;
 }
 
 function openCodeConfig(profile: AgentProfile, hasApiKey: boolean, systemPrompt: string): Record<string, unknown> {
