@@ -145,6 +145,10 @@ const DO_ROLE: WorkflowRole = {
     'create-sub-task', 'create-review-info', 'signal-completion', 'save-skill',
     'task:read', 'task:event:read', 'task:git:publish', 'task:git:import',
     'task:conversation:read', 'task:conversation:fork', 'task:conversation:message',
+    // Vault access (PLAN-passwords.md): the ceiling admits the task grant's
+    // use-credential item caps; which items the task actually got remains the
+    // grant's decision, and item policy can still demand per-use approval.
+    'credential:read', 'vault:store', 'use-credential:*',
   ],
   promptTemplate: `{{toolsPreamble}}
 

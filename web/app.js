@@ -3178,6 +3178,10 @@ async function openTaskForm(workflow, draft, seedText) {
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
             </div>` : ''}
+            <div class="form-row" data-row="__vault">
+              <div class="label-row"><label title="Which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Agents can request more mid-task; you approve each request.">Vault credentials</label></div>
+              <div id="tf-vault-grants" style="font-size:12px">Loading…</div>
+            </div>
             <div class="form-row" data-row="__creds">
               <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Credentials</label></div>
               <div id="cred-editor-newtask">Loading…</div>
@@ -3269,6 +3273,26 @@ async function openTaskForm(workflow, draft, seedText) {
   const localCred = !draft;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
   else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+  // The vault credential picker (PLAN-passwords.md §6): item grants layered onto
+  // the authorization package. Checkbox changes ride the #tf-body change
+  // listener into auto-save; grants persist via createTask/PATCH authorization.
+  (async () => {
+    const box = $('#tf-vault-grants');
+    if (!box) return;
+    // Vault items are organization-scoped — read the project's org's vault.
+    const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
+    let items = [];
+    try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); } catch { box.closest('[data-row="__vault"]')?.remove(); return; }
+    if (!items.length) {
+      box.closest('[data-row="__vault"]')?.remove();
+      return;
+    }
+    const granted = new Set((draft?.params?._authorization?.capabilities || [])
+      .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
+    box.innerHTML = items.map((i) => `<label style="display:flex;gap:6px;align-items:center;margin:2px 0;cursor:pointer">
+      <input type="checkbox" class="tf-vault-grant" value="use-credential:item:${esc(i.id)}" ${granted.has(i.id) ? 'checked' : ''} />
+      <span>${esc(i.label)}</span> <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(', ')) : ''}</span></label>`).join('');
+  })();
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
 
@@ -3297,7 +3321,12 @@ async function openTaskForm(workflow, draft, seedText) {
     // the replace:true auto-save preserves the user's choice.
     const ctx = $('#tf-context');
     if (ctx) body.wikiContext = String(ctx.value).split(/\s+/).map((t) => t.trim()).filter((t) => /^@(proj|org):\S/i.test(t));
-    return { body, notes: $('#tf-notes')?.value ?? '', authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization };
+    return {
+      body, notes: $('#tf-notes')?.value ?? '',
+      authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization,
+      // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
+      credentialGrants: [...document.querySelectorAll('.tf-vault-grant:checked')].map((b) => b.value),
+    };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
   // guards against spawning empty drafts just from opening the form.
@@ -3340,12 +3369,12 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
+          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
         }
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
@@ -3381,7 +3410,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, credentialGrants: state.credentialGrants, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -3417,12 +3446,12 @@ async function openTaskForm(workflow, draft, seedText) {
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
         await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
+        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile }) });
+        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
@@ -3432,13 +3461,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -7073,7 +7102,7 @@ function wireSettingsView(proj) {
       } catch (e) { toast(e.message, true); }
     }),
   );
-  wirePaymentsCard('project', proj.id);
+  wirePaymentsCard('project', proj.id, proj.organizationId);
   $('#git-preflight-run')?.addEventListener('click', async () => {
     const out = $('#git-preflight-result');
     const btn = $('#git-preflight-run');
@@ -7169,7 +7198,10 @@ function globalSettingsView(embedded = false) {
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
     ${authorizationCard('global')}
-    <div class="settings-section-title" id="settings-payments"><div>Payments<small>What tasks may spend, and the cards they spend from</small></div></div>
+    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
+    ${passwordsCard()}
+    ${vaultRequestsCard()}
+    ${agentMailCard()}
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agent logins<small>The Claude and Codex accounts that do the work</small></div></div>
     <div class="card" id="accounts-card">
@@ -7424,9 +7456,12 @@ async function wirePaymentProviders(box) {
     } catch (e) { toast(e.message, true); }
   }));
 }
-async function wirePaymentsCard(scope, projectId) {
+async function wirePaymentsCard(scope, projectId, organizationId) {
   const box = $(`[data-payments="${scope}"]`);
   if (!box) return;
+  // Non-project cards belong to the organization (tenant boundary), not the
+  // whole installation. `scope==='global'` here is the org-settings surface.
+  const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
   if (scope === 'global') await wirePaymentProviders(box);
   const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
@@ -7443,8 +7478,11 @@ async function wirePaymentsCard(scope, projectId) {
   });
   const renderCards = async () => {
     let cards = [];
-    try { cards = await api(`/api/cards${projectId ? `?projectId=${projectId}` : ''}`); } catch {}
-    if (scope === 'global') cards = cards.filter((c) => c.scope === 'global');
+    const q = [projectId ? `projectId=${projectId}` : '', orgQ].filter(Boolean).join('&');
+    try { cards = await api(`/api/cards${q ? `?${q}` : ''}`); } catch {}
+    // The org-settings surface shows the org's own cards (+ legacy global);
+    // the project surface shows project cards (its org's cards appear too).
+    if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
       ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope}</span><div class="task-sub">available ${usd(c.available)} / cap ${usd(c.cap)}</div></div>
@@ -7461,12 +7499,301 @@ async function wirePaymentsCard(scope, projectId) {
     const label = box.querySelector('.card-label').value.trim() || 'Card';
     const cap = box.querySelector('.card-cap').value;
     try {
-      await api('/api/cards', { method: 'POST', body: JSON.stringify({ scope, projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
+      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ scope: scope === 'project' ? 'project' : 'organization', projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
       box.querySelector('.card-label').value = '';
       box.querySelector('.card-cap').value = '';
       toast('Card added');
       renderCards();
     } catch (e) { toast(e.message, true); }
+  });
+}
+
+// ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
+const VAULT_SECRET_LABELS = {
+  login: [['password', 'password'], ['totp', 'TOTP seed (base32 or otpauth:// URI)']],
+  'api-key': [['secret', 'API key']],
+  'ssh-key': [['privateKey', 'private key (PEM)']],
+  env: [['env', '.env contents (KEY=VALUE per line)']],
+  note: [['note', 'note']],
+};
+// Short label + click-to-expand explanation for the two per-item policies.
+const POL_USE_TIP = 'Blind use = the agent fills this into a login form or gets it as an environment variable, but never sees the secret text itself. “ask” makes it request your approval each time.';
+const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). “never” forbids that entirely; “ask” requires your approval each time.';
+function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" onclick="alert(this.getAttribute('title'))">ⓘ</span>`; }
+
+function passwordsCard() {
+  return `<div class="card" id="vault-card">
+    <div class="section-h">Passwords <span class="chip">organization resource</span></div>
+    <div class="vault-items-list" style="margin-bottom:14px">Loading…</div>
+
+    <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
+      ${policyTip('karmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
+    <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
+
+    <details class="vault-custom"><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
+      <div style="margin-top:8px">
+      <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap">
+        <select class="vi-type">${Object.keys(VAULT_SECRET_LABELS).map((t) => `<option>${t}</option>`).join('')}</select>
+        <input class="vi-label" placeholder="label (e.g. GitHub — alice)" style="flex:1;min-width:140px" />
+        <input class="vi-domains" placeholder="domains (e.g. github.com)" style="flex:1;min-width:140px" />
+        <input class="vi-username" placeholder="username" style="min-width:120px" />
+        <input class="vi-envvar" placeholder="env var (api/ssh keys)" style="min-width:140px;display:none" />
+      </div></div>
+      <div class="vault-secret-rows"></div>
+      <div class="form-row"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="vi-use"><option>auto</option><option>ask</option></select></label>
+        <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="vi-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+        <button class="btn primary vi-add">Add</button>
+      </div></div>
+      </div>
+    </details>
+  </div>`;
+}
+function vaultRequestsCard() {
+  return `<div class="card" id="vault-requests-card">
+    <div class="section-h">Credential access requests</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Agents escalate here when a task needs a credential it wasn't granted (or one that isn't in the vault yet — add it above, then approve, or tell the agent to create the account itself). <b>Once</b> allows a single use; <b>this task</b> extends the task's grant; <b>always</b> also flips the item's policy to auto.</p>
+    <div class="vault-requests-list">Loading…</div>
+  </div>`;
+}
+async function wireVaultCards(organizationId) {
+  const box = $('#vault-card');
+  if (!box) return;
+  // Vault items + requests are organization-scoped; every call carries the org.
+  const oq = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+  const secretRows = () => {
+    const type = box.querySelector('.vi-type').value;
+    box.querySelector('.vi-envvar').style.display = type === 'api-key' || type === 'ssh-key' ? '' : 'none';
+    box.querySelector('.vault-secret-rows').innerHTML = VAULT_SECRET_LABELS[type].map(([field, label]) =>
+      `<div class="form-row"><label>${esc(label)}</label>${field === 'env' || field === 'privateKey' || field === 'note'
+        ? `<textarea class="vi-secret" data-field="${field}" rows="3" style="width:100%"></textarea>`
+        : `<input class="vi-secret" data-field="${field}" type="password" autocomplete="off" />`}</div>`).join('');
+  };
+  secretRows();
+  box.querySelector('.vi-type').addEventListener('change', secretRows);
+  const renderItems = async () => {
+    let items = [];
+    try { items = await api(`/api/vault/items${oq}`); } catch {}
+    const list = box.querySelector('.vault-items-list');
+    const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
+      : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
+    list.innerHTML = items.length
+      ? items.map((i) => `<div class="queue-item" data-vi="${esc(i.id)}">
+          <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
+            ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
+            <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
+          <label style="font-size:11px" title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <label style="font-size:11px" title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
+          <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button></div>`).join('')
+      : '<span style="color:var(--ink-3)">No passwords yet — sync from a password manager below, or add one by hand.</span>';
+    list.querySelectorAll('[data-vi]').forEach((row) => {
+      const item = items.find((x) => x.id === row.dataset.vi);
+      const savePolicy = async () => {
+        try {
+          await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
+          toast('Policy saved');
+        } catch (e) { toast(e.message, true); }
+      };
+      row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
+      row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+    });
+    list.querySelectorAll('[data-vi-rotate]').forEach((b) => b.addEventListener('click', async () => {
+      const item = items.find((x) => x.id === b.dataset.viRotate);
+      const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
+      const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
+      if (!value) return;
+      try {
+        const r = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
+        toast(r.propagated?.connector ? `Secret updated (also pushed to ${r.propagated.connector})` : 'Secret updated');
+      } catch (e) { toast(e.message, true); }
+    }));
+    list.querySelectorAll('[data-vi-del]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Delete this vault item (and its secrets)?')) return;
+      try { await api(`/api/vault/items/${b.dataset.viDel}${oq}`, { method: 'DELETE' }); renderItems(); } catch (e) { toast(e.message, true); }
+    }));
+    return items;
+  };
+  // ── connectors row: connect a store, then open the full import panel ──
+  const renderConnectors = async () => {
+    const list = box.querySelector('.connectors-list');
+    if (!list) return;
+    let conns = [];
+    try { conns = await api(`/api/vault/connectors${oq}`); } catch { list.innerHTML = '<span style="color:var(--ink-3);font-size:12px">Connectors need a credential broker.</span>'; return; }
+    list.innerHTML = conns.map((c) => `<div class="queue-item" data-conn="${esc(c.name)}">
+      <div style="flex:1"><b>${esc(c.label)}</b> ${c.available ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready</span>' : '<span class="chip">not connected</span>'}
+        <div class="task-sub" style="color:var(--ink-3)">${esc(c.detail)}${c.config?.lastSync ? ` · ${c.config.lastSync.count} imported` : ''}</div></div>
+      ${c.available ? '' : (c.name === 'pass' ? '' : `<input class="conn-secret" type="password" placeholder="${c.name === 'bitwarden' ? 'bw session key' : 'op service-account token'}" style="min-width:150px" /><button class="btn sm" data-conn-connect>Connect</button>`)}
+      <button class="btn sm primary" data-conn-import ${c.available ? '' : 'disabled'}>Import…</button></div>`).join('')
+      || '<span style="color:var(--ink-3);font-size:12px">No connectors.</span>';
+    list.querySelectorAll('[data-conn]').forEach((row) => {
+      const name = row.dataset.conn;
+      row.querySelector('[data-conn-connect]')?.addEventListener('click', async () => {
+        try { await api(`/api/vault/connectors/${name}/connect${oq}`, { method: 'POST', body: JSON.stringify({ secret: row.querySelector('.conn-secret').value }) }); toast('Connected'); renderConnectors(); } catch (e) { toast(e.message, true); }
+      });
+      row.querySelector('[data-conn-import]')?.addEventListener('click', () => openImportPanel(name, conns.find((c) => c.name === name)));
+    });
+  };
+  // The full-fledged import interface (mass select by folder / all, choose the
+  // import policy + write-back once for everything selected).
+  const openImportPanel = async (name, conn) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal-card" style="max-width:600px;width:92%">
+      <div class="section-h" style="margin-bottom:8px">Import from ${esc(conn?.label || name)}</div>
+      <div style="border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:12px">
+        <label class="imp-head" style="display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line);background:var(--surface-2);font-size:12px;font-weight:600;cursor:pointer">
+          <input type="checkbox" class="imp-all"/> Select all <span class="imp-count" style="color:var(--ink-3);font-weight:400"></span></label>
+        <div class="import-tree" style="max-height:44vh;overflow:auto;padding:8px 10px">Loading…</div>
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="imp-use"><option>auto</option><option>ask</option></select></label>
+          <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="imp-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
+          ${conn?.canPush ? `<label style="font-size:12px;display:inline-flex;align-items:center;gap:4px" title="When an agent changes a password, also update this store"><input type="checkbox" class="imp-wb" ${conn?.config?.writeBack ? 'checked' : ''}/> write changes back</label>` : ''}
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn sm" data-imp-cancel>Cancel</button>
+          <button class="btn sm primary" data-imp-go>Import</button>
+        </div>
+      </div></div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('[data-imp-cancel]').addEventListener('click', close);
+    const tree = overlay.querySelector('.import-tree');
+    const countEl = overlay.querySelector('.imp-count');
+    const refreshCount = () => { const n = tree.querySelectorAll('.imp-pick:checked').length; countEl.textContent = n ? `· ${n} selected` : ''; };
+    let ext = [];
+    try { ext = await api(`/api/vault/connectors/${name}/list${oq}`, { method: 'POST', body: '{}' }); }
+    catch (e) { tree.innerHTML = `<span style="color:var(--warn,#e0b15a)">${esc(e.message)}</span>`; return; }
+    if (!ext.length) { tree.innerHTML = '<span style="color:var(--ink-3)">Nothing to import.</span>'; return; }
+    const folders = {};
+    ext.forEach((i) => { (folders[i.folder || ''] = folders[i.folder || ''] || []).push(i); });
+    tree.innerHTML = Object.keys(folders).sort().map((f) => `<div class="imp-folder" style="margin-bottom:4px">
+      ${f ? `<label style="display:flex;gap:6px;align-items:center;font-weight:600;font-size:12px;margin:2px 0"><input type="checkbox" class="imp-folder-all"/> 📁 ${esc(f)}</label>` : ''}
+      <div style="margin-left:${f ? '18px' : '0'}">${folders[f].map((i) => `<label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:1px 0">
+        <input type="checkbox" class="imp-pick" value="${esc(i.externalId)}"/> ${esc(i.label)}
+        <span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.type)}${i.domains?.length ? ' · ' + esc(i.domains.join(',')) : ''}</span></label>`).join('')}</div></div>`).join('');
+    overlay.querySelector('.imp-all').addEventListener('change', (e) => { tree.querySelectorAll('.imp-pick,.imp-folder-all').forEach((c) => (c.checked = e.target.checked)); refreshCount(); });
+    tree.querySelectorAll('.imp-folder').forEach((fb) => fb.querySelector('.imp-folder-all')?.addEventListener('change', (e) => { fb.querySelectorAll('.imp-pick').forEach((c) => (c.checked = e.target.checked)); refreshCount(); }));
+    tree.addEventListener('change', (e) => { if (e.target.classList.contains('imp-pick')) refreshCount(); });
+    overlay.querySelector('[data-imp-go]').addEventListener('click', async () => {
+      const externalIds = [...tree.querySelectorAll('.imp-pick:checked')].map((c) => c.value);
+      if (!externalIds.length) { toast('Select at least one', true); return; }
+      try {
+        const r = await api(`/api/vault/connectors/${name}/sync${oq}`, { method: 'POST', body: JSON.stringify({
+          externalIds,
+          policy: { use: overlay.querySelector('.imp-use').value, reveal: overlay.querySelector('.imp-reveal').value },
+          ...(overlay.querySelector('.imp-wb') ? { writeBack: overlay.querySelector('.imp-wb').checked } : {}),
+        }) });
+        toast(`Imported ${r.count} item(s)`);
+        close();
+        renderItems();
+        renderConnectors();
+      } catch (e) { toast(e.message, true); }
+    });
+  };
+  box.querySelector('.vi-add').addEventListener('click', async () => {
+    const secrets = {};
+    box.querySelectorAll('.vi-secret').forEach((el) => { if (el.value) secrets[el.dataset.field] = el.value; });
+    try {
+      await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({
+        type: box.querySelector('.vi-type').value,
+        label: box.querySelector('.vi-label').value,
+        domains: box.querySelector('.vi-domains').value,
+        username: box.querySelector('.vi-username').value || undefined,
+        envVar: box.querySelector('.vi-envvar').value || undefined,
+        policy: { use: box.querySelector('.vi-use').value, reveal: box.querySelector('.vi-reveal').value },
+        secrets,
+      }) });
+      box.querySelectorAll('.vi-label,.vi-domains,.vi-username,.vi-envvar,.vi-secret').forEach((el) => (el.value = ''));
+      toast('Added');
+      await renderItems();
+      renderRequests();
+    } catch (e) { toast(e.message, true); }
+  });
+  const renderRequests = async () => {
+    const rbox = $('#vault-requests-card .vault-requests-list');
+    if (!rbox) return;
+    let requests = [];
+    let items = [];
+    try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
+    const pending = requests.filter((r) => r.status === 'pending');
+    const recent = requests.filter((r) => r.status !== 'pending').slice(-5).reverse();
+    const itemLabel = (id) => items.find((i) => i.id === id)?.label || id;
+    rbox.innerHTML = (pending.length
+      ? pending.map((r) => `<div class="queue-item" data-vreq="${esc(r.id)}">
+          <div style="flex:1"><b>${r.itemId ? esc(itemLabel(r.itemId)) : `${esc(r.domain || '?')} <span class="chip" style="color:var(--warn,#e0b15a)">not in vault</span>`}</b>
+            ${r.kind === 'reset' ? '<span class="chip" style="color:var(--warn,#e0b15a)">reported invalid</span>' : `<span class="chip">${esc(r.mode)}</span>`}
+            <div class="task-sub" style="color:var(--ink-3)">task <a data-spa href="#" onclick="return false">${esc(r.taskId)}</a>${r.why ? ` — ${esc(r.why)}` : ''}${r.kind === 'reset' ? '<br>The stored secret failed. Fix it (Update secret in the vault above, or send the task a follow-up with the reset code), then grant to let the agent retry.' : ''}</div></div>
+          ${r.itemId ? '' : `<select class="vreq-bind"><option value="">bind to item…</option>${items.map((i) => `<option value="${esc(i.id)}">${esc(i.label)}</option>`).join('')}</select>`}
+          <button class="btn sm" data-vreq-act="once">Once</button>
+          <button class="btn sm" data-vreq-act="task">This task</button>
+          <button class="btn sm" data-vreq-act="always">Always</button>
+          <button class="btn sm" data-vreq-act="deny">Deny</button></div>`).join('')
+      : '<span style="color:var(--ink-3)">No pending requests.</span>')
+      + (recent.length ? `<div class="task-sub" style="color:var(--ink-3);margin-top:8px">${recent.map((r) => `${r.status} · ${r.itemId ? esc(itemLabel(r.itemId)) : esc(r.domain || '?')} (${esc(r.resolution?.action || '')})`).join('<br>')}</div>` : '');
+    rbox.querySelectorAll('[data-vreq]').forEach((row) => row.querySelectorAll('[data-vreq-act]').forEach((b) => b.addEventListener('click', async () => {
+      const itemId = row.querySelector('.vreq-bind')?.value || undefined;
+      try {
+        await api(`/api/vault/requests/${row.dataset.vreq}/resolve${oq}`, { method: 'POST', body: JSON.stringify({ action: b.dataset.vreqAct, itemId }) });
+        toast(b.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted — tell the task to retry (or it will pick it up next turn)');
+        renderRequests();
+      } catch (e) { toast(e.message, true); }
+    })));
+  };
+  await renderItems();
+  await renderConnectors();
+  await renderRequests();
+}
+
+// ── organization AgentMail inbox ──────────────────────────────────────────────
+function agentMailCard() {
+  return `<div class="card" id="agent-mail-card">
+    <div class="section-h">Agent email</div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Email for agents to receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Create an AgentMail account here.</a></p>
+    <div class="inline-form">
+      <input id="agentmail-address" type="email" placeholder="AgentMail address" />
+      <input id="agentmail-key" type="password" placeholder="AgentMail API key" />
+      <button class="btn sm" id="agentmail-connect">Set up</button>
+    </div>
+    <div id="agentmail-result" class="task-sub"></div>
+  </div>`;
+}
+async function wireAgentMailCard(organizationId) {
+  const box = $('#agent-mail-card');
+  if (!box) return;
+  const org = encodeURIComponent(organizationId || 'org_personal');
+  const address = $('#agentmail-address');
+  const result = $('#agentmail-result');
+  try {
+    const data = await api(`/api/organizations/${org}/agent-mail`);
+    if (data.configured) {
+      address.value = data.address;
+      result.textContent = 'Connected';
+    }
+  } catch {}
+  $('#agentmail-connect')?.addEventListener('click', async () => {
+    const apiKey = $('#agentmail-key').value.trim();
+    const domain = address.value.trim();
+    if (!domain || !apiKey) return toast('AgentMail address and API key required', true);
+    const button = $('#agentmail-connect');
+    button.disabled = true;
+    try {
+      await api(`/api/organizations/${org}/agent-mail/connect`, {
+        method: 'POST',
+        body: JSON.stringify({ provider: 'agentmail', domain, apiKey }),
+      });
+      $('#agentmail-key').value = '';
+      result.textContent = 'Connected';
+      toast('Agent email connected');
+    } catch (e) {
+      result.textContent = e.message;
+      toast(e.message, true);
+    } finally {
+      button.disabled = false;
+    }
   });
 }
 
@@ -7770,7 +8097,9 @@ function wireGlobalSettings(organizationId) {
   hydrateAuthorization('global');
   hydrateWorkflows(organizationId);
   hydrateGitProfiles(organizationId);
-  wirePaymentsCard('global');
+  wireVaultCards(organizationId);
+  wirePaymentsCard('global', undefined, organizationId);
+  wireAgentMailCard(organizationId);
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
     const userName = $('#gitp-username').value.trim();
@@ -8080,7 +8409,7 @@ function organizationView() {
     <p class="settings-intro">${esc(org?.name || 'Organization')}</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-code">Git &amp; GitHub</a><a href="#settings-compute">Compute</a><a href="#settings-access">Access</a><a href="#settings-agents">Agent logins</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced">Advanced</a></nav>
     <div class="settings-content">
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>

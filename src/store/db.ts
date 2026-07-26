@@ -3157,7 +3157,7 @@ export class Store {
 
   // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────
 
-  createCard(c: { id: string; provider: string; scope: 'project' | 'global'; scopeId?: string; label: string; cap: number; available: number; merchantLock?: string[]; createdAt: number }) {
+  createCard(c: { id: string; provider: string; scope: 'project' | 'organization' | 'global'; scopeId?: string; label: string; cap: number; available: number; merchantLock?: string[]; createdAt: number }) {
     this.db
       .prepare('INSERT INTO cards (id, provider, scope, scopeId, label, cap, available, merchantLock, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(c.id, c.provider, c.scope, c.scopeId ?? null, c.label, c.cap, c.available, c.merchantLock ? JSON.stringify(c.merchantLock) : null, c.createdAt);
@@ -3166,11 +3166,19 @@ export class Store {
     const r = this.db.prepare('SELECT * FROM cards WHERE id = ?').get(id) as any;
     return r ? cardRow(r) : undefined;
   }
-  /** Cards visible to a project: its own project-scope cards plus all global cards. */
-  listCards(projectId?: string): any[] {
+  /**
+   * Cards visible in a scope: a project sees its own project cards plus its
+   * organization's cards; an organization view sees its own cards. Legacy
+   * `scope='global'` cards (created before cards were org-scoped) remain visible
+   * to the personal organization only, so a hosted tenant never spends from
+   * another tenant's — or the installation's — card.
+   */
+  listCards(projectId?: string, organizationId?: string): any[] {
+    const org = organizationId ?? (projectId ? this.getProject(projectId)?.organizationId : undefined) ?? 'org_personal';
+    const legacyGlobal = org === 'org_personal' ? " OR scope='global'" : '';
     const rows = projectId
-      ? (this.db.prepare("SELECT * FROM cards WHERE scope='global' OR (scope='project' AND scopeId=?) ORDER BY createdAt").all(projectId) as any[])
-      : (this.db.prepare('SELECT * FROM cards ORDER BY createdAt').all() as any[]);
+      ? (this.db.prepare(`SELECT * FROM cards WHERE (scope='organization' AND scopeId=?) OR (scope='project' AND scopeId=?)${legacyGlobal} ORDER BY createdAt`).all(org, projectId) as any[])
+      : (this.db.prepare(`SELECT * FROM cards WHERE (scope='organization' AND scopeId=?)${legacyGlobal} ORDER BY createdAt`).all(org) as any[]);
     return rows.map(cardRow);
   }
   updateCard(id: string, patch: { available?: number; cap?: number }) {
