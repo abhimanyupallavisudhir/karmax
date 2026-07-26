@@ -579,6 +579,8 @@ export interface Tag {
   color?: string;
   /** Which conceptual axis this tag belongs to. */
   kind?: 'type' | 'topic';
+  /** Optional guidance shown at the start of this tag's task-list section. */
+  description?: string;
   createdAt: number;
 }
 

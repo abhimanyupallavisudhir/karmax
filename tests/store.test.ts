@@ -56,6 +56,24 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('adds tag descriptions to an existing tag catalogue', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-tag-description-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = new Store(dbPath);
+    const project = legacy.createProject('Legacy tags');
+    const tag = legacy.createTag({ projectId: project.id, name: 'frontend' });
+    // Recreate the pre-description schema while preserving its catalogue rows.
+    legacy.db.exec('ALTER TABLE tags DROP COLUMN description');
+    legacy.close();
+
+    const migrated = new Store(dbPath);
+    expect((migrated.db.prepare('PRAGMA table_info(tags)').all() as any[]).map((column) => column.name)).toContain('description');
+    expect(migrated.getTag(tag.id)).toMatchObject({ name: 'frontend' });
+    expect(migrated.updateTag(tag.id, { description: 'Client-facing work.' })?.description).toBe('Client-facing work.');
+    migrated.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('creates a project with a default task list', () => {
     const p = store.createProject('Acme', { defaultBase: 'main' });
     expect(p.id).toMatch(/^proj_/);

@@ -563,8 +563,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(fields.find((f: any) => f.key === 'tag')).toBeTruthy();
 
     // Hierarchical tags: frontend/web + a bug label.
-    const front: any = await post(`/api/projects/${project.id}/tags`, { name: 'frontend', kind: 'topic' });
-    const web: any = await post(`/api/projects/${project.id}/tags`, { name: 'web', parentId: front.id, kind: 'topic' });
+    const front: any = await post(`/api/projects/${project.id}/tags`, { name: 'frontend', kind: 'topic', description: 'All client work.' });
+    const web: any = await post(`/api/projects/${project.id}/tags`, { name: 'web', parentId: front.id, kind: 'topic', description: 'Browser client work.' });
     const bug: any = await post(`/api/projects/${project.id}/tags`, { name: 'bug', kind: 'type' });
     expect(web.parentId).toBe(front.id);
 
@@ -586,6 +586,11 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const byBug: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('tag:bug priority:>=3 group:tag')}`);
     expect(byBug.total).toBe(1);
     expect(byBug.groups.some((g: any) => g.key === bug.id)).toBe(true);
+    const byHierarchy: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('group:tag')}`);
+    const frontendGroup = byHierarchy.groups.find((g: any) => g.key === front.id);
+    expect(byHierarchy.hierarchical).toBe(true);
+    expect(frontendGroup).toMatchObject({ label: 'frontend', description: 'All client work.', count: 1 });
+    expect(frontendGroup.children[0]).toMatchObject({ key: web.id, label: 'web', description: 'Browser client work.', count: 1 });
 
     // A negated/free-text query finds the other task.
     const docs: any = await get(`/api/projects/${project.id}/search?q=${encodeURIComponent('docs -tag:bug')}`);

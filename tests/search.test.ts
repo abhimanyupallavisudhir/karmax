@@ -249,8 +249,8 @@ describe('evaluateQuery — per-role agent/model params (agent_<role>.<sub>)', (
 describe('evaluateQuery — hierarchical tags', () => {
   // frontend/ web, mobile ; a task tagged with a child matches a parent-tag filter.
   const catalog: Tag[] = [
-    { id: 'front', projectId: 'p1', name: 'frontend', kind: 'topic', createdAt: NOW },
-    { id: 'web', projectId: 'p1', name: 'web', parentId: 'front', kind: 'topic', createdAt: NOW },
+    { id: 'front', projectId: 'p1', name: 'frontend', kind: 'topic', description: 'Browser and mobile client work.', createdAt: NOW },
+    { id: 'web', projectId: 'p1', name: 'web', parentId: 'front', kind: 'topic', description: 'The browser application.', createdAt: NOW },
     { id: 'mobile', projectId: 'p1', name: 'mobile', parentId: 'front', kind: 'topic', createdAt: NOW },
     { id: 'bug', projectId: 'p1', name: 'bug', kind: 'type', createdAt: NOW },
   ];
@@ -271,6 +271,27 @@ describe('evaluateQuery — hierarchical tags', () => {
 
   it('resolves a slash path (frontend/web)', () => {
     expect(evaluateQuery(tasks, parseQuery('tag:frontend/web'), ctx).tasks.map((t) => t.num)).toEqual([1]);
+  });
+
+  it('groups tags as a pruned hierarchy with structural parents and descriptions', () => {
+    const result = evaluateQuery(tasks, parseQuery('group:tag'), ctx);
+    expect(result.hierarchical).toBe(true);
+    expect(result.groups?.map((group) => group.key)).toEqual(['bug', 'front']);
+    const frontend = result.groups?.find((group) => group.key === 'front')!;
+    expect(frontend).toMatchObject({
+      label: 'frontend',
+      path: 'frontend',
+      description: 'Browser and mobile client work.',
+      count: 2,
+      tasks: [],
+    });
+    expect(frontend.children?.map((group) => group.key)).toEqual(['mobile', 'web']);
+    expect(frontend.children?.find((group) => group.key === 'web')).toMatchObject({
+      label: 'web',
+      path: 'frontend/web',
+      description: 'The browser application.',
+      count: 1,
+    });
   });
 });
 
@@ -440,10 +461,10 @@ describe('Store — tags', () => {
     store.createTask({ projectId: pid, title, workflow: 'softwareDev', workflowVersion: '1.0.0', params: { prompt: title } });
 
   it('creates, dedups by name, and lists tags', () => {
-    const a = store.createTag({ projectId: pid, name: 'bug', kind: 'type' });
+    const a = store.createTag({ projectId: pid, name: 'bug', kind: 'type', description: 'Defects to fix.' });
     const b = store.createTag({ projectId: pid, name: 'BUG', kind: 'type' }); // case-insensitive dup
     expect(b.id).toBe(a.id);
-    expect(store.listTags(pid).map((t) => t.name)).toEqual(['bug']);
+    expect(store.listTags(pid)).toMatchObject([{ name: 'bug', description: 'Defects to fix.' }]);
   });
 
   it('creates a hierarchy from a slash path, reusing existing ancestors', () => {
@@ -491,6 +512,28 @@ describe('Store — tags', () => {
     const a = store.createTag({ projectId: pid, name: 'a' });
     const b = store.createTag({ projectId: pid, name: 'b', parentId: a.id });
     expect(() => store.updateTag(a.id, { parentId: b.id })).toThrow(/ancestor/);
+  });
+
+  it('edits all tag metadata and prevents duplicate siblings', () => {
+    const parent = store.createTag({ projectId: pid, name: 'product' });
+    const tag = store.createTag({ projectId: pid, name: 'web' });
+    const updated = store.updateTag(tag.id, {
+      name: 'browser',
+      parentId: parent.id,
+      kind: 'topic',
+      color: '#123456',
+      description: 'Customer-facing browser work.',
+    });
+    expect(updated).toMatchObject({
+      name: 'browser',
+      parentId: parent.id,
+      kind: 'topic',
+      color: '#123456',
+      description: 'Customer-facing browser work.',
+    });
+    store.createTag({ projectId: pid, name: 'mobile', parentId: parent.id });
+    expect(() => store.updateTag(tag.id, { name: 'mobile' })).toThrow(/sibling tag/);
+    expect(store.updateTag(tag.id, { description: null })?.description).toBeUndefined();
   });
 });
 
