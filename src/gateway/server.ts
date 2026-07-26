@@ -2334,6 +2334,15 @@ export class Gateway {
         const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
+      const stageMatch = p.match(/^\/api\/tasks\/([^/]+)\/stage$/);
+      if (stageMatch && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.moveTaskStage(token, stageMatch[1]!, String(b.target ?? '')));
+        } catch (e) {
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const targetMatch = p.match(/^\/api\/tasks\/([^/]+)\/target$/);
       if (targetMatch && method === 'POST') {
         const b = await this.body(req);

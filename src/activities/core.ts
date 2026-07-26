@@ -195,6 +195,7 @@ export interface CreateWorldArgs {
   base: string;
   target?: string;
   branch?: string;
+  resetBranch?: boolean;
   copyGlobs?: string[];
   kind: WorldKind;
   /** The project's git profile selection (PLAN-git-config.md §3); the activity
@@ -556,6 +557,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           base: args.base,
           target: args.target,
           branch: args.branch,
+          resetBranch: args.resetBranch,
           copyGlobs: args.copyGlobs,
           ...(remote ? { copySources: cloudSources.map((source) => source.localPath) } : {}),
           gitIdentity,
