@@ -2272,13 +2272,16 @@ function tasksView() {
   let body;
   if (groups) {
     body = r.hierarchical
-      ? groups.map((g) => tagGroupHtml(g, topLevel)).join('')
+      ? [
+        ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => taskRow(t, { showTags: false })),
+        ...groups.filter((g) => g.key !== '__untagged__').map((g) => tagGroupHtml(g, topLevel)),
+      ].join('')
       : groups.map((g) => {
         const gt = g.tasks.filter(topLevel);
-        return `<div class="group-h">${esc(g.label)} <span class="pill">${gt.length}</span></div>${gt.map(taskRow).join('')}`;
+        return `<h2 class="task-group-heading">${esc(g.label)} <span class="task-group-count">${gt.length} task${gt.length === 1 ? '' : 's'}</span></h2>${gt.map((t) => taskRow(t)).join('')}`;
       }).join('');
   } else {
-    body = flat.map(taskRow).join('');
+    body = flat.map((t) => taskRow(t)).join('');
   }
   const empty = S.search !== DEFAULT_TASK_QUERY
     ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
@@ -2316,18 +2319,18 @@ function tagGroupHtml(group, keep, depth = 0) {
   const tag = tagById(group.key);
   const level = Math.min(6, depth + 2);
   const edit = tag
-    ? `<button class="icon-btn tag-section-edit" data-edit-tag="${esc(tag.id)}" title="Edit ${esc(group.path || group.label)}" aria-label="Edit tag">✎</button>`
+    ? `<button class="tag-section-edit" data-edit-tag="${esc(tag.id)}" title="Edit ${esc(group.path || group.label)}" aria-label="Edit tag">Edit</button>`
     : '';
   const description = tag?.description
-    ? `<div class="tag-section-description">${esc(tag.description)}</div>`
+    ? `<p class="tag-section-description">${esc(tag.description)}</p>`
     : '';
   return `<section class="tag-section tag-depth-${Math.min(depth, 5)}" id="${esc(tagSectionId(group.key))}" data-tag-section="${esc(group.key)}">
     <h${level} class="tag-section-heading" tabindex="-1">
       <span class="tag-section-name">${esc(group.label)}</span>
-      <span class="pill">${count}</span>${edit}
+      <span class="tag-section-count">${count} task${count === 1 ? '' : 's'}</span>${edit}
     </h${level}>
     ${description}
-    <div class="tag-section-tasks">${ownTasks.map(taskRow).join('')}</div>
+    <div class="tag-section-tasks">${ownTasks.map((t) => taskRow(t, { showTags: false })).join('')}</div>
     <div class="tag-section-children">${children}</div>
   </section>`;
 }
@@ -2408,7 +2411,7 @@ function runSubRow(r) {
     </div>`;
 }
 
-function taskRow(t) {
+function taskRow(t, { showTags = true } = {}) {
   const isDraft = t.params?.draft;
   if (t.params?.repeatable) return seriesRow(t);
   if (t.params?.triggerState === 'armed') {
@@ -2431,7 +2434,7 @@ function taskRow(t) {
       <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${tagChips(t)}</div>
+        <div class="task-sub"><span class="wf">${esc(t.workflow)}</span><span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-queue="${t.id}">Queue</button>
@@ -2457,7 +2460,7 @@ function taskRow(t) {
           <span class="wf">${esc(t.workflow)}</span>
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
           <span class="chip ${status}">${esc(stageLabel(v))}</span>
-          ${priorityFlag(t)}${tagChips(t)}
+          ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
       <div class="task-right">${pipeline(v)}${archiveBtn}</div>

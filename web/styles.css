@@ -1173,26 +1173,47 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 }
 .group-h .pill { font-family: var(--font-mono); font-weight: 400; }
 
-/* Hierarchical group:tag sections. Nesting supplies the semantic heading level;
-   the inset/guide makes the same hierarchy legible without oversized typography. */
-.tag-section { scroll-margin-top: 18px; border-radius: 9px; transition: background .25s, box-shadow .25s; }
-.tag-section-children { margin-left: 14px; padding-left: 12px; border-left: 1px solid var(--line); }
-.tag-section-heading {
-  display: flex; align-items: center; gap: 8px; min-height: 28px; margin: 14px 0 4px;
-  color: var(--ink-2); font-size: 13px; font-weight: 650; letter-spacing: -.01em;
-  outline: none;
+/* Flat groupings (status, priority, workflow, …) use the same top-level document
+   heading treatment as root tag sections. Compact pickers retain `.group-h`. */
+.task-group-heading {
+  display: flex; align-items: baseline; gap: 9px; margin: 30px 0 8px;
+  padding: 0 0 6px; border-bottom: 1px solid var(--line); color: var(--ink);
+  font-size: 20px; font-weight: 650; line-height: 1.3; letter-spacing: -.015em;
 }
-.tag-depth-0 > .tag-section-heading { margin-top: 20px; font-size: 15px; color: var(--ink); }
-.tag-section-heading .pill { color: var(--ink-3); font-family: var(--font-mono); font-size: 10px; font-weight: 400; }
-.tag-section-edit { opacity: 0; margin-left: 1px; width: 24px; height: 24px; }
+.task-group-count { color: var(--ink-3); font-size: 11px; font-weight: 400; letter-spacing: 0; }
+
+/* Hierarchical group:tag sections read like a Markdown document: aligned headings
+   establish the hierarchy through type scale alone, followed by an ordinary intro
+   paragraph and the section's tasks. */
+.tag-section { scroll-margin-top: 18px; }
+.tag-section-children { margin: 0; padding: 0; border: 0; }
+.tag-section-heading {
+  display: flex; align-items: baseline; gap: 9px; margin: 22px 0 8px; padding: 0;
+  color: var(--ink); font-size: 14px; font-weight: 650; line-height: 1.3;
+  letter-spacing: -.015em; outline: none;
+}
+.tag-depth-0 > .tag-section-heading {
+  margin-top: 30px; padding-bottom: 6px; border-bottom: 1px solid var(--line);
+  font-size: 20px; font-weight: 650;
+}
+.tag-depth-1 > .tag-section-heading { margin-top: 25px; font-size: 16px; }
+.tag-depth-2 > .tag-section-heading { margin-top: 21px; font-size: 14px; }
+.tag-depth-3 > .tag-section-heading,
+.tag-depth-4 > .tag-section-heading,
+.tag-depth-5 > .tag-section-heading { margin-top: 18px; font-size: 13px; }
+.tag-section-count { color: var(--ink-3); font-size: 11px; font-weight: 400; letter-spacing: 0; }
+.tag-section-edit {
+  opacity: 0; padding: 0; border: 0; background: none; color: var(--ink-3);
+  font: inherit; font-size: 11px; font-weight: 400; cursor: pointer;
+}
 .tag-section-heading:hover .tag-section-edit,
 .tag-section-heading:focus-within .tag-section-edit { opacity: 1; }
+.tag-section-edit:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .tag-section-description {
-  max-width: 74ch; margin: 2px 0 8px; padding: 7px 10px;
-  border-left: 2px solid var(--line-strong); color: var(--ink-3);
-  font-size: 12px; line-height: 1.5; white-space: pre-wrap;
+  max-width: 74ch; margin: -1px 0 12px; padding: 0; color: var(--ink-2);
+  font-size: 13px; line-height: 1.55; white-space: pre-wrap;
 }
-.tag-section-target { background: var(--accent-weak); box-shadow: 0 0 0 4px var(--accent-weak); }
+.tag-section-target > .tag-section-heading { color: var(--accent); }
 
 /* Tag chips + priority flag on task rows and on the task page. */
 .tag-chip {
