@@ -772,7 +772,13 @@ export class ClaudeAdapter implements AgentAdapter {
 }
 
 /** Convert one JSON-schema property into a zod validator (the shapes used by
- *  PLATFORM_TOOL_SCHEMAS: string, enum, number, boolean, object, array). */
+ *  PLATFORM_TOOL_SCHEMAS: string, enum, number, boolean, object, array).
+ *
+ *  Nested `items` / `properties` are converted **recursively**. Collapsing them to
+ *  `any` erased the member field names from the schema the model is shown — e.g.
+ *  `create_review_info.actions` surfaced as `items: {}` even though its source
+ *  schema fully specifies `kind`/`label`/`command`/`server`/`openUrls` — so the
+ *  model had to guess the shape and its actions were silently discarded. */
 function jsonPropToZod(zod: any, prop: any): any {
   let base: any;
   if (Array.isArray(prop?.enum) && prop.enum.length) base = zod.enum(prop.enum as [string, ...string[]]);
@@ -786,13 +792,22 @@ function jsonPropToZod(zod: any, prop: any): any {
         base = zod.boolean();
         break;
       case 'array':
-        base = zod.array(zod.any());
+        base = zod.array(prop.items ? jsonPropToZod(zod, prop.items) : zod.unknown());
         break;
       case 'object':
-        base = zod.any();
+        // Unknown keys are preserved rather than stripped: a tool boundary should
+        // not silently discard arguments it failed to describe.
+        base = prop.properties
+          ? zod.looseObject(jsonSchemaToZodShape(zod, prop))
+          : zod.record(zod.string(), zod.unknown());
+        break;
+      case 'string':
+        base = zod.string();
         break;
       default:
-        base = zod.string();
+        // No declared type is an empty schema — "anything goes". Coercing it to
+        // `string()` rejected structured arguments outright.
+        base = zod.unknown();
     }
   // JSON Schema measures maxLength in Unicode code points, while Zod's `.max()`
   // currently uses JavaScript UTF-16 code units. Refine explicitly so the SDK

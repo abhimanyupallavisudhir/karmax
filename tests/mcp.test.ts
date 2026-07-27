@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { KarmaxApi } from '../src/platform/api.js';
-import { createPlatformMcpServer, apiOps, httpOps } from '../src/platform/mcp.js';
+import { createPlatformMcpServer, apiOps, httpOps, normalizeRequestBody } from '../src/platform/mcp.js';
 import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
@@ -63,6 +63,31 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.projects).toContain('GET|POST /api/projects/:projectId/secrets');
     expect(catalog.projects).toContain('GET|POST|DELETE /api/projects/:projectId/services');
     expect(catalog.projects).toContain('GET|PUT /api/projects/:projectId/environment');
+  });
+
+  /**
+   * Regression: `platform_request.body` was declared `z.unknown()`, which serializes to
+   * an *empty* JSON Schema (`{}`). Clients dropped the argument before it left the
+   * caller, so every write reached the gateway with an empty body and silently became a
+   * no-op — a POST arrived at createTag as `{}` and threw on `name.trim()`. The advertised
+   * schema must describe a concrete shape.
+   */
+  it('advertises a concrete body schema for platform_request so writes carry a payload', async () => {
+    const { tools } = await client.listTools();
+    const body = (tools.find((t) => t.name === 'platform_request')!.inputSchema as any).properties.body;
+    expect(body).toBeDefined();
+    expect(Object.keys(body)).not.toHaveLength(0);
+    // An object payload must be expressible (that is the overwhelmingly common case).
+    expect(JSON.stringify(body)).toMatch(/"type":"object"/);
+  });
+
+  it('accepts a platform_request body as a structured value or a JSON string', () => {
+    expect(normalizeRequestBody({ name: 'bug' })).toEqual({ name: 'bug' });
+    expect(normalizeRequestBody('{"name":"bug"}')).toEqual({ name: 'bug' });
+    expect(normalizeRequestBody([1, 2])).toEqual([1, 2]);
+    expect(normalizeRequestBody(undefined)).toBeUndefined();
+    // A string that is not JSON is forwarded verbatim rather than mangled.
+    expect(normalizeRequestBody('plain text')).toBe('plain text');
   });
 
   it('does not expose direct cross-world filesystem inspection', async () => {
