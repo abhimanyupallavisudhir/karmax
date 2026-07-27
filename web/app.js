@@ -2405,10 +2405,13 @@ const BUILTIN_VIEWS = [
 // there is no separate "selected view" to keep in sync, and a pasted or reloaded
 // ?q= URL lights the right chip for free. Comparison is on the canonical form, so
 // a view still matches when its query was re-spelled by the toolbar or round-tripped
-// through the saved (structured) form. The empty query is the built-in "All".
+// through the saved (structured) form. The empty query is the "All" chip; a query
+// that matches no view lights nothing — "no filter" and "a filter I haven't saved"
+// are different states, and only the first of them is All.
+const ALL_VIEW = '__all__'; // the chip standing for the empty (unfiltered) query
 function viewIdForQuery(q) {
   const s = normalizeQuery(q);
-  if (!s) return null;
+  if (!s) return ALL_VIEW;
   return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
     || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
     || null;
@@ -2427,7 +2430,7 @@ function viewsBar() {
     )
     .join('');
   return `<div class="views-bar">
-    <div class="view-chip ${!active ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
+    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" tabindex="0">≡ All</div>
     ${builtins}
     ${saved}
     <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
@@ -2837,7 +2840,7 @@ function wireOrgControls() {
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === '__all__') { setQuery(''); return; }
+      if (id === ALL_VIEW) { setQuery(''); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
       if (builtin) { setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
@@ -3010,7 +3013,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   const paintControls = () => {
     const activeView = viewIdForQuery(q);
     $('#pk-views', host).innerHTML = [
-      `<div class="view-chip ${!activeView ? 'active' : ''}" data-pkview="__all__">≡ All</div>`,
+      `<div class="view-chip ${activeView === ALL_VIEW ? 'active' : ''}" data-pkview="${ALL_VIEW}">≡ All</div>`,
       ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`),
       ...S.views.map((v) => `<div class="view-chip ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}</div>`),
     ].join('');
@@ -3019,7 +3022,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
         const id = el.dataset.pkview;
         const bv = BUILTIN_VIEWS.find((x) => x.id === id);
         const sv = S.views.find((x) => x.id === id);
-        setQ(id === '__all__' ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
+        setQ(id === ALL_VIEW ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
       }),
     );
     $('#pk-toolbar', host).innerHTML = queryToolbarHtml(q, 'pk');
