@@ -842,6 +842,72 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(third.status).toBe('needs_approval');
   });
 
+  it('projects credential approvals onto the task, notifies its human, and resumes it after resolution', async () => {
+    const repo = await h.makeRepo('gw-credential-approval');
+    const project: any = await (await fetch(`${base}/api/projects`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        name: 'Credential approval lifecycle',
+        config: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false },
+      }),
+    })).json();
+    const task: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        workflow: 'software-dev', title: 'Use an approval-gated credential',
+        prompt: '@review waiting for a credential decision',
+      }),
+    })).json();
+    await expect.poll(async () => {
+      const view: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+      return view?.stage;
+    }, { timeout: 15_000 }).toBe('review');
+
+    const item: any = await (await fetch(`${base}/api/vault/items`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        type: 'login', label: 'Approval lifecycle login', domains: 'approval.example.com',
+        policy: { use: 'auto', reveal: 'auto' }, secrets: { password: 'secret' },
+      }),
+    })).json();
+    const minted = h.tokens.mint({ taskId: task.id, profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read'] });
+    const agentAuth = { authorization: `Bearer ${minted.token}`, 'content-type': 'application/json' };
+    const requested: any = await (await fetch(`${base}/api/vault/requests`, {
+      method: 'POST', headers: agentAuth,
+      body: JSON.stringify({ itemId: item.id, mode: 'reveal', why: 'verify the approval lifecycle' }),
+    })).json();
+    expect(requested).toMatchObject({ status: 'needs_approval', itemId: item.id });
+
+    const requests: any = await (await fetch(
+      `${base}/api/vault/requests?taskId=${task.id}&organizationId=org_personal`,
+      { headers: auth() },
+    )).json();
+    expect(requests.find((request: any) => request.id === requested.requestId)).toMatchObject({
+      task: { id: task.id, num: task.num, title: 'Use an approval-gated credential', projectId: project.id },
+    });
+    const taskView: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+    expect(taskView.approvalRequests).toBe(1);
+    const listed: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() })).json();
+    expect(listed.find((candidate: any) => candidate.id === task.id).lastView.approvalRequests).toBe(1);
+    const inbox = h.store.listOrganizationMemberships(project.organizationId)
+      .flatMap((membership) => h.store.listInbox(membership.userId, project.organizationId));
+    expect(inbox).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: task.id, kind: 'approval-requested', actionable: true, unread: true }),
+    ]));
+
+    const resolved: any = await (await fetch(`${base}/api/vault/requests/${requested.requestId}/resolve`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ action: 'task' }),
+    })).json();
+    expect(resolved).toMatchObject({ status: 'granted', resume: { resumed: true } });
+    expect(h.store.eventsSince(task.id, 0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'conversation.message',
+        payload: expect.objectContaining({ message: expect.objectContaining({ text: expect.stringContaining('Retry the blocked reveal operation now') }) }),
+      }),
+      expect.objectContaining({ type: 'credential.approval-resolved', payload: expect.objectContaining({ resumed: true }) }),
+    ]));
+    const after: any = await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json();
+    expect(after.approvalRequests).toBeUndefined();
+  });
+
   it('rotation rides the use-grant: a granted task updates a foreign item\'s secret, nothing else', async () => {
     const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
       type: 'login', label: 'Rotatable', domains: 'rot.example.com', policy: { use: 'auto', reveal: 'auto' }, secrets: { password: 'old' },

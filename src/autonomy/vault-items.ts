@@ -92,6 +92,9 @@ export interface CredentialAccessRequest {
   status: 'pending' | 'granted' | 'denied';
   resolution?: { action: 'once' | 'task' | 'always' | 'deny'; by: string; at: number };
   createdAt: number;
+  /** Human-facing task metadata added by the gateway; never persisted in the
+   * organization-scoped request record. */
+  task?: { id: string; num?: number; title: string; projectId: string };
 }
 
 export interface VaultItemStore {
@@ -402,6 +405,10 @@ export class VaultItems {
   // ── access decision (§5/§7): capability coverage, then item policy ──
 
   covered(caps: Capability[], taskId: string | undefined, item: VaultItem): boolean {
+    // A task owns credentials it creates. This is deliberately only grant
+    // coverage: the item's use/reveal policy still applies, so a same-task
+    // credential with reveal=ask remains approval-gated for plaintext access.
+    if (taskId && item.provenance.taskId === taskId) return true;
     const all = taskId ? [...caps, ...this.extensionCaps(taskId)] : caps;
     return itemCaps(item).some((c) => allows(all, c));
   }

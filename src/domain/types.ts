@@ -129,7 +129,7 @@ export interface InboxItem {
   userId: string;
   eventSeq: number;
   taskId: string;
-  kind: 'assigned' | 'mentioned' | 'review-requested' | 'escalated' | 'update';
+  kind: 'assigned' | 'mentioned' | 'review-requested' | 'approval-requested' | 'escalated' | 'update';
   unread: boolean;
   actionable: boolean;
   createdAt: number;
@@ -1031,6 +1031,9 @@ export interface TaskView {
   workflowSwitchable?: boolean;
   stage: Stage;
   status: TaskStatus;
+  /** Pending credential decisions projected by the gateway. The vault remains
+   * the source of truth; workflows do not persist or replay this host state. */
+  approvalRequests?: number;
   /**
    * Free-form human notes (cosmetic, UI-only — never sent to any agent). Mirrored
    * onto the view from the task record so the UI can show/edit them at any stage,

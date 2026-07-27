@@ -295,6 +295,27 @@ export class KarmaxApi {
     return message;
   }
 
+  /**
+   * Resume a task after a credential decision without requiring the approver to
+   * send a mechanical follow-up. The decision is already authorization-checked
+   * by the gateway; this method only delivers the durable workflow message that
+   * makes the blocked agent retry (or continue after a denial).
+   */
+  async resumeAfterCredentialDecision(taskId: string, text: string): Promise<
+    { resumed: true; messageId: string } | { resumed: false; reason: string }
+  > {
+    const task = this.deps.store.getTask(taskId);
+    if (!task) return { resumed: false, reason: 'task no longer exists' };
+    if (['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''))
+      return { resumed: false, reason: `task is already ${task.lastView!.status}` };
+    try {
+      const message = await this.deliverWorkflowMessage(taskId, text, 'do');
+      return { resumed: true, messageId: message.id };
+    } catch (error) {
+      return { resumed: false, reason: `could not resume the task: ${unwrapCause(error)}` };
+    }
+  }
+
   async publishTaskBranch(token: string): Promise<{ branch: string; pushed: string[] }> {
     const { task, handle } = this.collaborationTask(token, 'publish_task_branch');
     const access = await this.openCollaborationWorld(task.id, handle);
