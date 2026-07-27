@@ -273,7 +273,18 @@ lease:
 - **Waiting for human input** is a resumable hold, not a pipeline stage. Moving
   there stops the current agent/activity, withdraws agent/account/merge-queue
   requests, preserves the world and conversation, and records the originating
-  stage. Resume returns to that exact stage.
+  stage. Resume returns to that exact stage. The hold is released by the action
+  that supplies the requested input; enabled controls must never be inert:
+  - **Resume** continues the recorded stage without adding input.
+  - A **follow-up** resumes the interrupted agent. Feedback on a Review-origin
+    hold has the normal Review meaning and returns to Do; Merge feedback is
+    accepted only in the Merge conversation and resumes that stage.
+  - **Confirm** is available only for a Review-origin hold and approves that
+    preserved Review once (it does not restore a second Review gate).
+  - Switching a held Do/Review task to **Goal** is an autonomous continuation
+    instruction, so it resumes Do. Parameter edits alone do not release a hold.
+  - **Cancel**, manual **Done**, and destructive **Draft** retain their terminal
+    or reset meanings rather than implicitly resuming work.
 - **Done (manual)** performs the same stop/drain, records that it was manually
   completed, and is reversible to its recorded origin. A naturally completed task
   is immutable: it has no synthetic undo route.

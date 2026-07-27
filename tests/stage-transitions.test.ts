@@ -3,6 +3,7 @@ import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import type { TaskView } from '../src/domain/types.js';
+import { QRY_ACCOUNT_TASK_LEASES, QRY_AGENT_QUEUE } from '../src/coordinators/names.js';
 
 function fixture() {
   const store = new Store(':memory:');
@@ -13,13 +14,22 @@ function fixture() {
   const starts: Array<{ type: string; options: any }> = [];
   const terminated: string[] = [];
   const signalled: Array<{ id: string; signal: string; args: unknown[] }> = [];
+  const hiddenTurnIds = ['hidden-account-turn'];
   const client = {
     workflow: {
       getHandle(id: string) {
         return {
           async terminate(reason: string) { terminated.push(`${id}:${reason}`); },
           async signal(signal: string, ...args: unknown[]) { signalled.push({ id, signal, args }); },
-          async query() { throw new Error('no live query'); },
+          async executeUpdate(_name: string, options: { args: [string] }) {
+            return { workflow: options.args[0] };
+          },
+          async query(name: string) {
+            if (name === QRY_AGENT_QUEUE)
+              return { queue: [{ taskId: task.id, turnId: 'hidden-agent-turn' }], current: [] };
+            if (name === QRY_ACCOUNT_TASK_LEASES) return hiddenTurnIds;
+            throw new Error('no live query');
+          },
         };
       },
       async signalWithStart(_type: string, options: any) {
@@ -80,7 +90,7 @@ describe('task stage transitions', () => {
 
     const restored = await f.api.moveTaskStage(f.token, f.task.id, 'do');
     expect(f.starts).toHaveLength(1);
-    expect(f.starts[0]!.type).toBe('softwareDev@1.6.0');
+    expect(f.starts[0]!.type).toBe('softwareDev@1.7.0');
     expect(f.starts[0]!.options.args[0].recovery).toMatchObject({ resumeStage: 'do', messages: f.view.messages });
     expect(restored).toMatchObject({ stage: 'do', status: 'active' });
   });
@@ -115,6 +125,96 @@ describe('task stage transitions', () => {
     const restoredHold = await f.api.moveTaskStage(f.token, f.task.id, 'human');
     expect(restoredHold).toMatchObject({ stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } });
     expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'review', pausedForHuman: true });
+  });
+
+  it('treats follow-up and Confirm as input that releases a human hold', async () => {
+    const follow = fixture();
+    follow.store.saveView(follow.task.id, {
+      ...follow.view,
+      status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }],
+      state: { ...follow.view.state, humanPauseOrigin: 'review' },
+      stage: 'review',
+    });
+
+    const message = await follow.api.signalTask(follow.token, follow.task.id, 'followUp', 'Please revise this.', 'do');
+    expect(message?.text).toBe('Please revise this.');
+    expect(follow.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'do' });
+    expect(follow.starts.at(-1)!.options.args[0].recovery.messages.at(-1)).toMatchObject({ text: 'Please revise this.' });
+    expect(follow.signalled).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: expect.stringContaining('agent-queue'), signal: 'cancelAgentSlot', args: [{ taskId: follow.task.id, turnId: 'hidden-agent-turn' }] }),
+      expect.objectContaining({ id: expect.stringContaining('account-coordinator'), signal: 'cancelAccountLease', args: [{ taskId: follow.task.id, turnId: 'hidden-account-turn' }] }),
+    ]));
+
+    const confirm = fixture();
+    confirm.store.saveView(confirm.task.id, {
+      ...confirm.view,
+      status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      actions: [{ name: 'confirm', kind: 'signal', label: 'Confirm', enabled: true }],
+      state: { ...confirm.view.state, humanPauseOrigin: 'review' },
+      stage: 'review',
+    });
+    await confirm.api.signalTask(confirm.token, confirm.task.id, 'confirm');
+    expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
+  });
+
+  it('resumes a held Do task when Goal mode supplies autonomous direction', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      workflowOptions: ['software-dev', 'goal'],
+      workflowSwitchable: true,
+      state: { ...f.view.state, humanPauseOrigin: 'do' },
+    });
+
+    await f.api.changeWorkflow(f.token, f.task.id, 'goal');
+
+    expect(f.starts.at(-1)!.type).toBe('goal@1.7.0');
+    expect(f.starts.at(-1)!.options.args[0]).toMatchObject({ recovery: { resumeStage: 'do' } });
+    expect(f.starts.at(-1)!.options.args[0].recovery.messages.at(-1).text).toMatch(/continue autonomously/i);
+    expect(f.store.getTask(f.task.id)?.workflow).toBe('goal');
+  });
+
+  it('offers held Merge input only on the Merge conversation', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'merge',
+      status: 'waiting',
+      waitingFor: { kind: 'human', audience: ['@creator'] },
+      transcripts: [
+        { role: 'do', label: 'Do agent', messages: f.view.messages },
+        { role: 'merge', label: 'Merge agent', messages: [{ id: 'merge-1', role: 'agent', text: 'conflict', ts: 1 }] },
+      ],
+      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true }],
+      state: { ...f.view.state, humanPauseOrigin: 'merge' },
+    });
+
+    const held = await f.api.getTaskView(f.token, f.task.id);
+    expect(held?.actions.map((action) => action.name)).toEqual(['followUp', 'cancel']);
+    expect(held?.actions[0]?.roles).toEqual(['merge']);
+    await expect(f.api.signalTask(f.token, f.task.id, 'followUp', 'wrong agent', 'do'))
+      .rejects.toThrow(/waiting on the merge agent/i);
+  });
+
+  it('does not advertise a lossy human hold from the internal Resolve frame', async () => {
+    const f = fixture();
+    f.store.saveView(f.task.id, {
+      ...f.view,
+      stage: 'resolve',
+      status: 'active',
+      transcripts: [
+        { role: 'do', label: 'Do agent', messages: f.view.messages },
+        { role: 'resolve', label: 'Resolve agent', messages: [{ id: 'resolve-1', role: 'agent', text: 'repairing', ts: 1 }] },
+      ],
+    });
+
+    const resolving = await f.api.getTaskView(f.token, f.task.id);
+    expect(resolving?.stageTransitions?.map((move) => move.target)).toEqual(['draft', 'done']);
   });
 
   it('moves a draft to Done and back without starting an execution', async () => {

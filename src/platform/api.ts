@@ -18,10 +18,11 @@ import {
   SIG_REORDER,
   SIG_SET_AGENT_CAPACITY,
   QRY_AGENT_QUEUE,
+  QRY_ACCOUNT_TASK_LEASES,
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint } from '../domain/types.js';
+import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, mergeQueueDomains } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -131,6 +132,18 @@ const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
   },
   { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true },
 ];
+
+const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
+  name: 'followUp',
+  kind: 'signal',
+  label: 'Send follow-up',
+  enabled: true,
+  args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
+  ...(role ? { roles: [role] } : {}),
+});
+
+const GOAL_RESUME_MESSAGE =
+  'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.';
 
 export interface KarmaxApiDeps {
   store: Store;
@@ -1341,7 +1354,7 @@ export class KarmaxApi {
         ...(task ? { stageTransitions: this.availableStageTransitions(task, view) } : {}),
         ...(view.status === 'failed' && view.workflow === 'software-dev' && !view.pointOfNoReturnPassed
           ? { actions: FAILED_RECOVERY_ACTIONS() }
-          : {}),
+          : { actions: this.lifecycleActions(view) }),
       };
     };
     // Snapshot-first (the default). The workflow persists `lastView` to the store on
@@ -1463,10 +1476,52 @@ export class KarmaxApi {
         : attempt.lastView
           ? { ...attempt, lastView: {
               ...attempt.lastView,
+              actions: this.lifecycleActions(attempt.lastView),
               stageTransitions: this.availableStageTransitions(attempt, attempt.lastView, group),
             } }
           : attempt),
     };
+  }
+
+  /** The agent conversation that can supply input to a cross-cutting hold. */
+  private humanHoldRole(view: TaskView): AgentRole | undefined {
+    if (
+      view.status !== 'waiting'
+      || view.waitingFor?.kind !== 'human'
+      || !view.state?.humanPauseOrigin
+    ) return undefined;
+    const origin = view.state.humanPauseOrigin as Stage;
+    if (origin === 'do' || origin === 'review') return 'do';
+    if (origin === 'merge' && view.transcripts?.some((transcript) => transcript.role === 'merge')) return 'merge';
+    return undefined;
+  }
+
+  /**
+   * Back-compatible action projection for holds created by pre-1.7 workflows.
+   * A displayed action must either release the hold or be a deliberate non-waking
+   * edit; roles prevents an unrelated, stale conversation from accepting input.
+   */
+  private lifecycleActions(view: TaskView): TaskView['actions'] {
+    const origin = view.state?.humanPauseOrigin as Stage | undefined;
+    if (view.status !== 'waiting' || view.waitingFor?.kind !== 'human' || !origin)
+      return view.actions;
+    const role = this.humanHoldRole(view);
+    const actions = view.actions
+      .filter((action) => action.name !== 'followUp' && (action.name !== 'confirm' || origin === 'review'));
+    if (role) actions.splice(origin === 'review' ? 1 : 0, 0, FOLLOW_UP_ACTION(role));
+    return actions;
+  }
+
+  /** Honest action set for the short replacement-start window before first publish. */
+  private resumedActions(actions: TaskView['actions'], stage: Stage): TaskView['actions'] {
+    const allowed = stage === 'do'
+      ? new Set(['followUp', 'setTarget', 'cancel'])
+      : stage === 'review'
+        ? new Set(['confirm', 'followUp', 'setTarget', 'cancel'])
+        : stage === 'escalated'
+          ? new Set(['retry', 'followUp', 'cancel'])
+          : new Set(['cancel']);
+    return actions.filter((action) => allowed.has(action.name));
   }
 
   /** The single transition policy shared by the selected task header, every
@@ -1521,7 +1576,11 @@ export class KarmaxApi {
 
     if (origin) {
       add({ target: origin, label: `Resume ${stageName(origin)}`, description: 'Leave the human hold and resume the originating stage.' });
-    } else if (resumable && view.stage !== 'escalated' && view.waitingFor?.kind !== 'human') {
+    // Resolve is an internal recovery frame rather than a resumable public
+    // pipeline position: restarting merely at "resolve" loses the failed
+    // operation it was repairing. Do not advertise a transition we cannot
+    // restore faithfully.
+    } else if (resumable && view.stage !== 'escalated' && view.stage !== 'resolve' && view.waitingFor?.kind !== 'human') {
       add({ target: 'human', label: 'Waiting for human input', description: 'Stop current activity and hold this attempt for a person.' });
     }
     if (resumable && view.stage === 'review' && !origin)
@@ -1556,6 +1615,29 @@ export class KarmaxApi {
     };
   }
 
+  /** Clone a view and append one accepted message to exactly one agent transcript. */
+  private withConversationMessage(view: TaskView, role: AgentRole, message: Message): TaskView {
+    const messages = view.messages.map((candidate) => ({ ...candidate }));
+    if (role === 'do' && !messages.some((candidate) => candidate.id === message.id))
+      messages.push({ ...message });
+    const transcripts = view.transcripts?.map((transcript) => ({
+      ...transcript,
+      messages: transcript.messages.map((candidate) => ({ ...candidate })),
+    })) ?? [];
+    let transcript = transcripts.find((candidate) => candidate.role === role);
+    if (!transcript) {
+      transcript = {
+        role,
+        label: role === 'do' ? 'Do agent' : role === 'merge' ? 'Merge agent' : role === 'resolve' ? 'Resolve agent' : 'Confirm agent',
+        messages: [],
+      };
+      transcripts.push(transcript);
+    }
+    if (!transcript.messages.some((candidate) => candidate.id === message.id))
+      transcript.messages.push({ ...message });
+    return { ...view, messages, transcripts };
+  }
+
   /** Stop every execution-owned source of activity before replacing or
    * terminalizing a run. Coordinator cancellation is explicit because workflow
    * termination cannot run deterministic finally blocks. */
@@ -1565,18 +1647,38 @@ export class KarmaxApi {
       if (!(error instanceof WorkflowNotFoundError)) throw error;
     });
 
-    const turnId = view.agentTurn?.turnId;
+    // Do not trust only the projected turn: pre-1.7 account waits did not expose
+    // their turnId, and a stale snapshot can lag a just-enqueued agent request.
+    // Query both coordinators and withdraw every request owned by this task.
+    const turnIds = new Set<string>(view.agentTurn?.turnId ? [view.agentTurn.turnId] : []);
+    await Promise.all([
+      this.deps.client.workflow.getHandle(agentQueueId()).query(QRY_AGENT_QUEUE)
+        .then((queue: any) => {
+          for (const item of [...(queue?.queue ?? []), ...(queue?.current ?? [])])
+            if (item?.taskId === task.id && item?.turnId) turnIds.add(String(item.turnId));
+        })
+        .catch(() => undefined),
+      this.deps.client.workflow.getHandle(accountCoordinatorId()).query(QRY_ACCOUNT_TASK_LEASES, task.id)
+        .then((ids: unknown) => {
+          if (Array.isArray(ids)) for (const id of ids) if (id) turnIds.add(String(id));
+        })
+        .catch(() => undefined),
+    ]);
+
     const signals: Promise<unknown>[] = [];
-    if (turnId) {
+    for (const turnId of turnIds) {
       signals.push(this.deps.client.workflow.getHandle(agentQueueId()).signal(SIG_CANCEL_AGENT, { taskId: task.id, turnId }));
       signals.push(this.deps.client.workflow.getHandle(accountCoordinatorId()).signal(SIG_CANCEL_ACCOUNT, { taskId: task.id, turnId }));
     }
     const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
-    const domains = world?.repos?.length
-      ? world.repos.map((repo) => `${repo.localPath ?? repo.repo}:${repo.target ?? view.targetBranch ?? 'main'}`)
+    const rememberedDomain = typeof view.state?.mergeDomain === 'string' ? view.state.mergeDomain : undefined;
+    const domains = world
+      ? mergeQueueDomains(world, view.targetBranch ?? world.target ?? 'main', task.projectId)
       : view.stage === 'merge'
-        ? [`${world?.repo ?? task.projectId}:${view.targetBranch ?? 'main'}`]
-        : [];
+        ? [rememberedDomain ?? mergeQueueDomains(undefined, view.targetBranch ?? 'main', task.projectId)[0]!]
+        : rememberedDomain
+          ? [rememberedDomain]
+          : [];
     for (const domain of [...new Set(domains)]) {
       signals.push(this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
         workflowId: mergeQueueId(domain),
@@ -1613,6 +1715,7 @@ export class KarmaxApi {
       ...view,
       stage: resumeStage,
       status: pausedForHuman ? 'waiting' : 'active',
+      actions: pausedForHuman ? this.lifecycleActions(view) : this.resumedActions(view.actions, resumeStage),
       waitingFor: pausedForHuman ? { kind: 'human', audience: ['@creator'], detail: `Paused during ${resumeStage}` } : undefined,
       agentTurn: undefined,
       error: undefined,
@@ -1625,7 +1728,11 @@ export class KarmaxApi {
       updatedAt: Date.now(),
     };
     this.deps.store.saveView(task.id, starting);
-    return { ...starting, stageTransitions: this.availableStageTransitions(this.deps.store.getTask(task.id)!, starting) };
+    return {
+      ...starting,
+      actions: this.lifecycleActions(starting),
+      stageTransitions: this.availableStageTransitions(this.deps.store.getTask(task.id)!, starting),
+    };
   }
 
   /** Move one attempt to an explicitly advertised lifecycle destination. */
@@ -2016,6 +2123,15 @@ export class KarmaxApi {
   async signalTask(token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[]): Promise<Message | undefined> {
     const scopedTask = this.deps.store.getTask(taskId);
     const caller = this.require(token, 'signal_task', { projectId: scopedTask?.projectId, taskId });
+    const heldView = scopedTask?.lastView;
+    const heldOrigin =
+      heldView?.status === 'waiting'
+      && heldView.waitingFor?.kind === 'human'
+      && heldView.state?.humanPauseOrigin
+        ? heldView.state.humanPauseOrigin as Stage
+        : undefined;
+    if (signal === SIG.confirm && heldOrigin && heldOrigin !== 'review')
+      throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a Review decision; resume it or send the relevant agent a follow-up`);
     if (signal === SIG.confirm && scopedTask?.lastView?.waitingFor?.kind === 'human') {
       const userId = caller.principal.startsWith('user:') ? caller.principal.slice(5) : undefined;
       if (!userId) throw new CapabilityError('only a human selected by this workflow step can confirm');
@@ -2061,6 +2177,42 @@ export class KarmaxApi {
         return;
       }
     }
+
+    // A cross-cutting human hold is not a second decision gate. Supplying agent
+    // input releases it immediately. Replacing from the persisted checkpoint
+    // also repairs already-parked v1.5/v1.6 executions whose hold condition only
+    // listened for Retry.
+    if (signal === SIG.followUp && scopedTask && heldView && heldOrigin) {
+      const holdRole = this.humanHoldRole(heldView);
+      if (!holdRole)
+        throw new Error(`the ${stageName(heldOrigin)} hold has no agent conversation to follow up; use Resume ${stageName(heldOrigin)}`);
+      if (role && role !== holdRole)
+        throw new Error(`this hold is waiting on the ${holdRole} agent, not ${role}; send the follow-up to ${holdRole} or resume ${stageName(heldOrigin)}`);
+      const now = Date.now();
+      const followUp: Message = {
+        id: `u${now}`,
+        role: 'user',
+        text: text ?? '',
+        ts: now,
+        ...(images?.length ? { images } : {}),
+      };
+      const nextView = this.withConversationMessage(heldView, holdRole, followUp);
+      await this.stopTaskActivity(scopedTask, heldView, `Human supplied input for the ${stageName(heldOrigin)} hold`);
+      // Review feedback has its normal meaning: return the task to Do. At other
+      // origins the addressed agent resumes the interrupted stage.
+      await this.startTransitionReplacement(scopedTask, nextView, heldOrigin === 'review' ? 'do' : heldOrigin);
+      this.publishConversationMessage(taskId, holdRole, followUp);
+      return followUp;
+    }
+
+    // Confirming a Review-origin hold approves that preserved Review exactly
+    // once. Resume at PR rather than briefly restoring a second Review gate.
+    if (signal === SIG.confirm && scopedTask && heldView && heldOrigin === 'review') {
+      await this.stopTaskActivity(scopedTask, heldView, 'Human confirmed the Review held for input');
+      await this.startTransitionReplacement(scopedTask, heldView, 'pr');
+      return;
+    }
+
     const handle = this.deps.client.workflow.getHandle(taskId);
     let followUp: Message | undefined;
     try {
@@ -2275,11 +2427,29 @@ export class KarmaxApi {
     if (workflow !== 'software-dev' && workflow !== 'goal') {
       throw new Error('only Software Dev and Goal are compatible in-flight');
     }
+    const heldView = task.lastView;
+    const heldOrigin =
+      heldView?.status === 'waiting'
+      && heldView.waitingFor?.kind === 'human'
+      && heldView.state?.humanPauseOrigin
+        ? heldView.state.humanPauseOrigin as Stage
+        : undefined;
     try {
       const result = (await this.deps.client.workflow
         .getHandle(taskId)
         .executeUpdate('changeWorkflow', { args: [workflow] })) as { workflow: 'software-dev' | 'goal' };
       this.deps.store.setTaskWorkflow(taskId, result.workflow);
+      // "Goal" is itself an instruction to continue autonomously. If the task
+      // was held in Do/Review, release the hold and carry that instruction into a
+      // fresh latest-version execution. This also repairs pre-1.7 held histories.
+      if (result.workflow === 'goal' && heldView && (heldOrigin === 'do' || heldOrigin === 'review')) {
+        const now = Date.now();
+        const message: Message = { id: `mode-${now}`, role: 'user', text: GOAL_RESUME_MESSAGE, ts: now };
+        const resumedView = this.withConversationMessage(heldView, 'do', message);
+        await this.stopTaskActivity(task, heldView, 'Goal mode supplied autonomous direction for a human hold');
+        const updatedTask = this.deps.store.getTask(taskId)!;
+        await this.startTransitionReplacement(updatedTask, resumedView, 'do');
+      }
       return result;
     } catch (e) {
       throw new Error(unwrapCause(e));

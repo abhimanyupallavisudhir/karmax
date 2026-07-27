@@ -33,7 +33,7 @@ export type {
 } from '../domain/types.js';
 
 // Pure, deterministic helper (no Node imports) — safe inside the workflow sandbox.
-export { remotePolicyOf } from '../domain/types.js';
+export { mergeQueueDomains, remotePolicyOf } from '../domain/types.js';
 
 /** Pure provider classification, safe in Temporal's deterministic sandbox. */
 export function remoteWorldProvider(provider: string | undefined): boolean {

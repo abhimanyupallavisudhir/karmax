@@ -335,6 +335,23 @@ export interface WorldHandleRef {
   warnings?: string[];
 }
 
+/**
+ * Every durable merge-queue lease a task world can own. Kept in the pure domain
+ * contract so deterministic workflows and the platform's out-of-band lifecycle
+ * controls use exactly the same keys when acquiring and withdrawing work.
+ */
+export function mergeQueueDomains(
+  world: WorldHandleRef | undefined,
+  target: string,
+  projectId: string,
+): string[] {
+  const domains = world?.repos?.length
+    ? world.repos.map((repo) =>
+      `${repo.localPath ?? repo.repo}:${repo.targetPinned === false ? target : (repo.target ?? target)}`)
+    : [`${world?.repo ?? projectId}:${target}`];
+  return [...new Set(domains)].sort();
+}
+
 // ─── Project / list / task records (the metadata index) ──────────────────────
 
 export interface Project {
@@ -1011,6 +1028,8 @@ export interface DeclaredAction {
   enabled: boolean;
   danger?: boolean;
   args?: ActionArg[];
+  /** Conversations this action may address. Omitted means every agent role. */
+  roles?: AgentRole[];
 }
 
 /** The typed projection of a task's state + allowed actions the UI renders. */
