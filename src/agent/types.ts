@@ -53,7 +53,7 @@ export interface PlatformToolContext {
   fillPaymentCard?(args: {
     requestId: string;
     cdpUrl: string;
-    selectors: { number: string; cvc: string; expiry?: string; expMonth?: string; expYear?: string };
+    selectors: import('../autonomy/card-fill.js').CardFillSelectors;
   }): Promise<{ filled: true; origin: string }>;
   /** Call the capability-checked karmax gateway under this turn's scoped token. */
   platformRequest?(method: string, path: string, body?: unknown): Promise<unknown>;

@@ -8746,49 +8746,71 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
-    <div class="section-h">Payments — budget & cards</div>
-    ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
-      <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
-      <div class="pay-stripe-platform" style="margin-bottom:10px"></div>
-      <div class="pay-providers-list">Loading…</div>
-      <div class="pay-balance" style="margin-top:8px"></div>
+    <div class="section-h">Payments</div>
+    <p class="task-sub" style="margin-top:0">Agents can make payments with a virtual card.</p>
+    <div class="cards-list" style="margin-bottom:10px"></div>
+    <div class="settings-grid">
+      <label class="form-row">Name<input class="card-label" placeholder="e.g. Household" /></label>
+      <label class="form-row">Limit (USD)<input class="card-cap" type="number" step="0.01" placeholder="250.00" /></label>
+      <label class="form-row">Card number<input class="card-number" autocomplete="off" inputmode="numeric" placeholder="4242 4242 4242 4242" /></label>
+      <label class="form-row">Expiry<input class="card-expiry" autocomplete="off" placeholder="MM/YY" /></label>
+      <label class="form-row">CVC<input class="card-cvc" autocomplete="off" inputmode="numeric" placeholder="123" /></label>
+      <label class="form-row">Billing address<input class="card-line1" placeholder="Street address" /></label>
+      <label class="form-row">City<input class="card-city" /></label>
+      <label class="form-row">Postal code<input class="card-postal" /></label>
+      <label class="form-row">Country<input class="card-country" placeholder="GB" maxlength="2" /></label>
+      <label class="form-row">Restrict to merchants<input class="card-merchants" placeholder="optional, comma-separated domains" /></label>
     </div>
-    <details class="pay-cardholder hidden" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Stripe cardholder — required before issuing a card</summary>
-      <p class="task-sub">This is Stripe’s compliance record for the real person or company legally authorized to use the card. It is not a Karmax user, a label, or a funding source. Use accurate identity and billing details; Stripe may require verification.</p>
-      <div class="settings-grid">
-        <label class="form-row">Cardholder type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
-        <label class="form-row">Name shown in Stripe<input class="holder-name" placeholder="Full legal or company name" /></label>
-        <label class="form-row">First name (individual)<input class="holder-first" /></label>
-        <label class="form-row">Last name (individual)<input class="holder-last" /></label>
-        <label class="form-row">Date of birth (individual)<input class="holder-dob" type="date" /></label>
-        <label class="form-row">Email<input class="holder-email" type="email" /></label>
-        <label class="form-row">Phone<input class="holder-phone" /></label>
-        <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
-        <label class="form-row">City<input class="holder-city" /></label>
-        <label class="form-row">State or region<input class="holder-state" /></label>
-        <label class="form-row">Postal code<input class="holder-postal" /></label>
-        <label class="form-row">Country code<input class="holder-country" placeholder="US" maxlength="2" /></label>
+    <button class="btn primary" data-addcard="${scope}">Add card</button>
+    <details class="pay-stripe" style="margin-top:16px">
+      <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
+      <p class="task-sub">For registered businesses. Lets Karmax issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
+      ${scope === 'global' ? `<div class="pay-stripe-platform" style="margin-bottom:10px"></div>
+      <div class="pay-providers-list"></div>
+      <div class="pay-balance" style="margin:8px 0"></div>
+      <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
+        <p class="task-sub">Stripe’s compliance record for the person or company legally authorized to use the card. Stripe may require verification.</p>
+        <div class="settings-grid">
+          <label class="form-row">Type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
+          <label class="form-row">Name<input class="holder-name" placeholder="Full legal or company name" /></label>
+          <label class="form-row">First name<input class="holder-first" /></label>
+          <label class="form-row">Last name<input class="holder-last" /></label>
+          <label class="form-row">Date of birth<input class="holder-dob" type="date" /></label>
+          <label class="form-row">Email<input class="holder-email" type="email" /></label>
+          <label class="form-row">Phone<input class="holder-phone" /></label>
+          <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
+          <label class="form-row">City<input class="holder-city" /></label>
+          <label class="form-row">State or region<input class="holder-state" /></label>
+          <label class="form-row">Postal code<input class="holder-postal" /></label>
+          <label class="form-row">Country<input class="holder-country" placeholder="US" maxlength="2" /></label>
+        </div>
+        <button class="btn sm" data-addholder>Create cardholder</button>
+      </details>` : '<p class="task-sub">Set up Stripe Issuing in organization settings.</p>'}
+      <div class="stripe-issue hidden" style="margin-top:10px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input class="sc-label" placeholder="Name" />
+          <input class="sc-cap" type="number" step="0.01" placeholder="cap USD" style="width:120px" />
+          <select class="card-cardholder"><option value="">Choose cardholder</option></select>
+          <button class="btn sm" data-issuecard="${scope}">Issue card</button>
+        </div>
       </div>
-      <button class="btn sm" data-addholder>Create required Stripe record</button>
-    </details>` : ''}
-    <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
-    <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
-    <button class="btn sm primary" data-savepolicy="${scope}">Save budget policy</button>
-    <div class="section-h" style="margin-top:14px">Cards</div>
-    <div class="cards-list" style="margin-bottom:8px"></div>
-    <div class="form-row"><label>Add ${scope === 'global' ? 'an organization' : 'a project'} card</label>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <input class="card-label" placeholder="label (e.g. Ops)" />
-        <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
-        <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
-        <select class="card-provider"><option value="mock">Local test funds</option></select>
-        <select class="card-cardholder hidden"><option value="">Choose required Stripe cardholder</option></select>
-        <button class="btn" data-addcard="${scope}">Add card</button>
-      </div></div>
-    ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
-      <div class="section-h" style="margin-top:14px">Payment activity</div><div class="pay-transactions"></div>` : ''}
+    </details>
+    <div class="section-h" style="margin-top:16px">Spend limits</div>
+    <div class="settings-grid">
+      <label class="form-row">Allowance per task (USD)<input class="pay-allow" type="number" step="0.01" placeholder="unlimited" /></label>
+      <label class="form-row">Approval threshold (USD)<input class="pay-thresh" type="number" step="0.01" placeholder="never" /></label>
+    </div>
+    <button class="btn sm" data-savepolicy="${scope}">Save spend limits</button>
+    ${scope === 'global' ? `<div class="section-h" style="margin-top:16px">Pending spend requests</div><div class="pay-requests"></div>
+      <div class="section-h" style="margin-top:16px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
+}
+/** "MM/YY", "MM/YYYY", or "MMYY" → {expMonth, expYear}; null when unparseable. */
+function parseExpiry(raw) {
+  const m = String(raw || '').trim().match(/^(\d{1,2})\s*[/\-\s]?\s*(\d{2}|\d{4})$/);
+  if (!m) return null;
+  const year = Number(m[2]);
+  return { expMonth: Number(m[1]), expYear: year < 100 ? 2000 + year : year };
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
 async function wirePaymentProviders(box, organizationId) {
@@ -8837,13 +8859,14 @@ async function wirePaymentProviders(box, organizationId) {
       } catch (e) { toast(e.message, true); }
     });
   }
-  list.innerHTML = data.providers.length
-    ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
-        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
-          <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
-        ${p.kind === 'oauth' && p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
-        ${p.kind === 'oauth' && (p.connected || p.connectionStatus) ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('')
-    : '<span style="color:var(--ink-3)">No payment providers.</span>';
+  // Only OAuth rails need a connect surface; the vault-card rail needs nothing
+  // and the mock rail is a development fixture, not a user-facing choice.
+  const connectable = data.providers.filter((p) => p.kind === 'oauth');
+  list.innerHTML = connectable.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
+      <div style="flex:1">${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : '<span class="chip">not connected</span>'}
+        <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
+      ${p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
+      ${p.connected || p.connectionStatus ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('');
   list.querySelectorAll('[data-connectpay]').forEach((b) => b.addEventListener('click', async () => {
     try {
       const r = await api(`${paymentsBase}/connect`, { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
@@ -8861,11 +8884,13 @@ async function wirePaymentProviders(box, organizationId) {
       wirePaymentProviders(box, organizationId);
     } catch (e) { toast(e.message, true); }
   }));
-  if (organizationId && data.active) {
+  // Only a rail with a balance karmax can read has one worth showing.
+  const el = box.querySelector('.pay-balance');
+  if (el) el.innerHTML = '';
+  if (organizationId && connectable.some((p) => p.name === 'stripe' && p.connected)) {
     try {
-      const balance = await api(`${paymentsBase}/balance?provider=${encodeURIComponent(data.active)}`);
-      const el = box.querySelector('.pay-balance');
-      if (el) el.innerHTML = `<b>Available balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
+      const balance = await api(`${paymentsBase}/balance?provider=stripe`);
+      if (el) el.innerHTML = `<b>Issuing balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
     } catch {}
   }
   return data;
@@ -8884,20 +8909,15 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   else {
     try { providerData = await api(`${paymentsBase}/providers`); } catch { providerData = { providers: [], active: 'mock' }; }
   }
-  const providerSelect = box.querySelector('.card-provider');
   const holderSelect = box.querySelector('.card-cardholder');
-  const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
-  const stripeConnected = usableProviders.some((p) => p.name === 'stripe');
+  const stripeConnected = (providerData?.providers || []).some((p) => p.name === 'stripe' && p.connected);
   box.querySelector('.pay-cardholder')?.classList.toggle('hidden', !stripeConnected);
-  providerSelect.innerHTML = usableProviders.map((p) =>
-    `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
+  box.querySelector('.stripe-issue')?.classList.toggle('hidden', !stripeConnected);
   const loadCardholders = async () => {
-    const stripe = providerSelect.value === 'stripe';
-    holderSelect.classList.toggle('hidden', !stripe);
-    if (!stripe) return;
+    if (!stripeConnected || !holderSelect) return;
     try {
       const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
-      holderSelect.innerHTML = `<option value="">Choose required Stripe cardholder</option>${holders.map((h) => {
+      holderSelect.innerHTML = `<option value="">Choose cardholder</option>${holders.map((h) => {
         const requirements = h.requirements?.past_due || [];
         const ready = h.status === 'active' && requirements.length === 0;
         return `<option value="${ready ? esc(h.id) : ''}" ${ready ? '' : 'disabled'}>${esc(h.name)} · ${esc(h.type)}${ready ? '' : ` · needs Stripe verification (${esc(requirements.join(', ') || h.status)})`}</option>`;
@@ -8906,7 +8926,6 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
       holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
     }
   };
-  providerSelect.addEventListener('change', loadCardholders);
   await loadCardholders();
   box.querySelector('[data-addholder]')?.addEventListener('click', async () => {
     const dobValue = box.querySelector('.holder-dob').value;
@@ -8957,14 +8976,15 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
-      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="chip">${esc(c.provider)}</span> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope} · ${esc(c.id)}</span><div class="task-sub">${esc(c.status || 'active')} · available ${usd(c.available)} / cap ${usd(c.cap)}${c.merchantLock?.length ? ` · merchants ${c.merchantLock.map(esc).join(', ')}` : ''}</div></div>
-        ${c.provider === 'mock' && c.status !== 'canceled' ? `<input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button>` : ''}
+      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''}${c.status && c.status !== 'active' ? ` <span class="chip">${esc(c.status)}</span>` : ''}
+          <div class="task-sub">${usd(c.available)} of ${usd(c.cap)} left${c.merchantLock?.length ? ` · ${c.merchantLock.map(esc).join(', ')} only` : ''}</div></div>
+        ${c.provider === 'vault-card' && c.status !== 'canceled' ? `<button class="btn sm" data-fund="${c.id}" title="Match the limit you set with your bank">Raise limit</button>` : ''}
         ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
-      : '<span style="color:var(--ink-3)">No cards.</span>';
+      : '<span style="color:var(--ink-3)">No cards yet.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
-      const amt = b.closest('.queue-item').querySelector('.fund-amt').value;
-      if (!amt) return;
-      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+      const amt = prompt('Raise this card’s limit by how much (USD)? Raise it with your bank first — Karmax only mirrors the figure.');
+      if (!amt || !Number(amt)) return;
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Limit raised'); renderCards(); } catch (e) { toast(e.message, true); }
     }));
     list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm('Revoke this card? This cannot be undone.')) return;
@@ -8976,23 +8996,48 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     }));
   };
   await renderCards();
-  box.querySelector(`[data-addcard]`).addEventListener('click', async () => {
-    const label = box.querySelector('.card-label').value.trim() || 'Card';
-    const cap = box.querySelector('.card-cap').value;
+  const field = (name) => box.querySelector(name).value.trim();
+  const addCard = (body) => api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
+    scope: scope === 'project' ? 'project' : 'organization',
+    projectId: scope === 'project' ? projectId : undefined,
+    ...body,
+  }) });
+  box.querySelector('[data-addcard]').addEventListener('click', async () => {
+    const expiry = parseExpiry(field('.card-expiry'));
+    if (!expiry) return toast('Expiry must look like MM/YY', true);
     try {
-      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
-        scope: scope === 'project' ? 'project' : 'organization',
-        projectId: scope === 'project' ? projectId : undefined,
-        label,
-        cap: Math.round(Number(cap || 0) * 100),
-        merchantLock: box.querySelector('.card-merchants').value.split(',').map((value) => value.trim()).filter(Boolean),
-        provider: providerSelect.value,
-        cardholderId: providerSelect.value === 'stripe' ? holderSelect.value : undefined,
-      }) });
-      box.querySelector('.card-label').value = '';
-      box.querySelector('.card-cap').value = '';
-      box.querySelector('.card-merchants').value = '';
+      await addCard({
+        provider: 'vault-card',
+        label: field('.card-label') || 'Card',
+        cap: Math.round(Number(field('.card-cap') || 0) * 100),
+        merchantLock: field('.card-merchants').split(',').map((value) => value.trim()).filter(Boolean),
+        details: {
+          number: field('.card-number'),
+          cvc: field('.card-cvc'),
+          ...expiry,
+          billing: { line1: field('.card-line1'), city: field('.card-city'),
+            postalCode: field('.card-postal'), country: field('.card-country') },
+        },
+      });
+      // Clear the secret half from the DOM as soon as it has been vaulted.
+      for (const name of ['.card-label', '.card-cap', '.card-merchants', '.card-number', '.card-expiry',
+        '.card-cvc', '.card-line1', '.card-city', '.card-postal', '.card-country'])
+        box.querySelector(name).value = '';
       toast('Card added');
+      renderCards();
+    } catch (e) { toast(e.message, true); }
+  });
+  box.querySelector('[data-issuecard]')?.addEventListener('click', async () => {
+    try {
+      await addCard({
+        provider: 'stripe',
+        label: field('.sc-label') || 'Card',
+        cap: Math.round(Number(field('.sc-cap') || 0) * 100),
+        cardholderId: holderSelect.value,
+      });
+      box.querySelector('.sc-label').value = '';
+      box.querySelector('.sc-cap').value = '';
+      toast('Card issued');
       renderCards();
     } catch (e) { toast(e.message, true); }
   });

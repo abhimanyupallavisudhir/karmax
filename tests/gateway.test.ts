@@ -1166,4 +1166,32 @@ esac
     });
     expect(invalidFund.status).toBe(400);
   });
+
+  it('registers a vault card without ever handing the number back out', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const register = (details: unknown) => fetch(`${base}/api/cards?organizationId=${orgId}`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        scope: 'organization', label: 'Household', cap: 50_000, provider: 'vault-card', details }),
+    });
+    const bad = await register({ number: '4242424242424241', cvc: '123', expMonth: 12, expYear: 2031 });
+    expect(bad.status).toBe(400);
+    expect((await bad.json() as any).error).toMatch(/card number/i);
+
+    const response = await register({ number: '4242424242424242', cvc: '123', expMonth: 12, expYear: 2031,
+      billing: { line1: '1 High St', city: 'London', postalCode: 'SW1A 1AA', country: 'GB' } });
+    expect(response.status).toBe(200);
+    const card: any = await response.json();
+    expect(card).toMatchObject({ provider: 'vault-card', last4: '4242', available: 50_000 });
+    // The secret half lives only in the vault — not the response, not the index.
+    expect(JSON.stringify(card)).not.toContain('4242424242424242');
+    const listed = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { headers: auth() })).text();
+    expect(listed).not.toContain('4242424242424242');
+    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(true);
+
+    // Revoking destroys the secret rather than merely hiding the row.
+    expect((await fetch(`${base}/api/cards/${card.id}?organizationId=${orgId}`,
+      { method: 'DELETE', headers: auth() })).status).toBe(200);
+    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(false);
+  });
 });

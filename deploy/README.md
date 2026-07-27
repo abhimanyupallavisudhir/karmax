@@ -48,11 +48,12 @@ to:
    writes are performed by Karmax's trusted Git broker.
 5. Add an Anthropic/OpenAI API key under agent credentials if the deployment
    does not use another connected login.
-6. In Payments, an installation administrator configures the shared Stripe
-   Connect application in the UI. Each organization then connects its own Stripe
-   account, creates the required Stripe compliance Cardholder record, and issues
-   project or organization cards. Funds always come from that organization's
-   connected-account Issuing balance.
+6. In Payments, register a card. The default rail takes a virtual card the user
+   already holds: create one with a spending limit in your own banking app and
+   paste it in — no signup, no Stripe account, works in any country. The issuer
+   enforces the limit and declines when it runs out. Organizations that are
+   registered businesses can instead connect Stripe Issuing (see `HOSTING.md`)
+   to have Karmax mint capped, merchant-locked cards per agent or per task.
 
 That same HTTPS URL works from a phone—no VPN and no Karmax-specific native app
 are required. **Organization settings → Phone Access** offers an

@@ -3157,12 +3157,16 @@ export class Gateway {
       if (paymentCardholders && method === 'GET') {
         const provider = this.deps.paymentRegistry?.get(url.searchParams.get('provider') ?? 'stripe');
         if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
+        // Only issuing rails mint cards against a compliance record.
+        if (!provider.listCardholders) return this.json(res, 200, []);
         return this.json(res, 200, await provider.listCardholders(paymentCardholders[1]!));
       }
       if (paymentCardholders && method === 'POST') {
         const b = await this.body(req);
         const provider = this.deps.paymentRegistry?.get(String(b.provider ?? 'stripe'));
         if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
+        if (!provider.createCardholder)
+          return this.json(res, 400, { error: `the ${provider.name} rail does not use cardholders` });
         try {
           return this.json(res, 200, await provider.createCardholder(paymentCardholders[1]!, {
             type: b.type === 'company' ? 'company' : 'individual',
@@ -3647,17 +3651,30 @@ export class Gateway {
           ? this.deps.paymentRegistry?.get(String(b.provider))
           : this.deps.paymentRegistry?.active(cardOrg) ?? this.deps.payments;
         if (!provider) return this.json(res, 400, { error: 'payment provider not found' });
-        const card = await provider.provisionCard({
-          scope: b.scope === 'project' ? 'project' : 'organization',
-          scopeId: b.scope === 'project' ? b.projectId : cardOrg,
-          label: b.label ?? 'Card',
-          cap: Number(b.cap ?? 0),
-          merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
-          organizationId: cardOrg,
-          currency: b.currency ? String(b.currency) : 'usd',
-          cardholderId: b.cardholderId ? String(b.cardholderId) : undefined,
-        });
-        return this.json(res, 200, card);
+        try {
+          const card = await provider.provisionCard({
+            scope: b.scope === 'project' ? 'project' : 'organization',
+            scopeId: b.scope === 'project' ? b.projectId : cardOrg,
+            label: b.label ?? 'Card',
+            cap: Number(b.cap ?? 0),
+            merchantLock: Array.isArray(b.merchantLock) ? b.merchantLock : undefined,
+            organizationId: cardOrg,
+            currency: b.currency ? String(b.currency) : 'usd',
+            cardholderId: b.cardholderId ? String(b.cardholderId) : undefined,
+            // Only the vault-card rail consumes these; the secret half goes
+            // straight into the vault and is never echoed back in the response.
+            details: b.details ? {
+              number: String(b.details.number ?? ''),
+              cvc: String(b.details.cvc ?? ''),
+              expMonth: Number(b.details.expMonth),
+              expYear: Number(b.details.expYear),
+              billing: b.details.billing,
+            } : undefined,
+          });
+          return this.json(res, 200, card);
+        } catch (error) {
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
       }
       const fundMatch = p.match(/^\/api\/cards\/([^/]+)\/fund$/);
       if (fundMatch && method === 'POST') {
