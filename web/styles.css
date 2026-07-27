@@ -720,6 +720,7 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 .phone-access-address > span { color:var(--ink-3); font-size:11px; font-weight:650; letter-spacing:.04em; text-transform:uppercase; }
 .phone-access-address > b { color:var(--ink-2); font-size:16px; }
 .phone-access-address.missing > b { color:var(--working); }
+.phone-access-address.conflict > b { color:var(--working); }
 .phone-access-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
 .phone-access-head > span:last-child { color:var(--ink-2); font-size:12px; }
 .remote-state { display:inline-flex; padding:3px 9px; border-radius:999px; background:var(--working-weak); color:var(--working); font-size:11px; font-weight:700; }

@@ -8044,15 +8044,23 @@ function phoneInstallHelp() {
     <span class="task-sub" id="phone-install-note">No native Karmax app is needed.</span>`;
 }
 
+function isFetchInterruption(error) {
+  return !error?.status && /failed to fetch|fetch failed|networkerror|load failed/i.test(error?.message || '');
+}
+
 function renderPhoneAccess(status) {
   const box = $('#phone-access-status');
   if (!box) return;
   const ready = status.state === 'ready';
   const hosted = status.method === 'hosted';
-  const label = ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
+  const label = status.setupInProgress ? 'Setting up…' : ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
     : status.state === 'needs-login' ? 'Sign-in needed'
-      : status.state === 'conflict' ? 'Already in use' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
-  const address = status.url
+      : status.state === 'conflict' ? 'Another service is connected' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
+  const address = status.state === 'conflict' && status.url
+    ? `<div class="phone-access-address conflict"><span>Tailscale is already serving</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
+    : status.state === 'conflict'
+      ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
+      : status.url
     ? `<div class="phone-access-address"><span>Access your Karmax at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
     : `<div class="phone-access-address missing"><span>Access your Karmax at</span><b>${hosted ? 'Hosted URL not configured' : 'Tailscale not set up'}</b></div>`;
   const phoneSteps = hosted
@@ -8073,9 +8081,16 @@ function renderPhoneAccess(status) {
   const helpLink = status.helpUrl
     ? `<a class="btn sm primary" href="${esc(status.helpUrl)}" target="_blank" rel="noopener noreferrer">Continue in Tailscale</a>`
     : '';
-  const setupLabel = status.helpUrl ? 'Continue setup'
+  const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
     : status.setupStage === 'serve' ? 'Finish setup'
       : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
+  const setupSummary = status.state === 'conflict' ? 'Why this Karmax is not being served' : 'Set up instructions';
+  const setupIntro = status.state === 'conflict'
+    ? '<p>Tailscale is already configured on this computer; its address currently belongs to another local service or Karmax instance.</p>'
+    : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
+        (<a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn" target="_blank" rel="noopener noreferrer">Android Play Store</a>
+        or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
+        Sign in to the same Tailscale account on both.</p>`;
   const fallbackCommands = status.fallbackCommands || [];
   const fallback = !hosted && fallbackCommands.length
     ? `<details class="phone-terminal-fallback">
@@ -8086,12 +8101,9 @@ function renderPhoneAccess(status) {
     : '';
   const setupPanel = !hosted
     ? `<details class="phone-setup" ${ready ? '' : 'open'}>
-        <summary>Set up instructions</summary>
+        <summary>${setupSummary}</summary>
         <div class="phone-setup-body">
-          <p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
-            (<a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn" target="_blank" rel="noopener noreferrer">Android Play Store</a>
-            or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
-            Sign in to the same Tailscale account on both.</p>
+          ${setupIntro}
           <div class="phone-access-head"><span class="remote-state ${ready ? 'ready' : ''}">${esc(label)}</span><span>${esc(status.detail)}</span></div>
           ${status.setupCommand ? `<div class="phone-setup-command"><code>${esc(status.setupCommand)}</code><button class="btn sm" id="remote-copy-command">Copy command</button></div>` : ''}
           <div class="phone-access-actions">
@@ -8120,15 +8132,73 @@ function renderPhoneAccess(status) {
     }
     button.disabled = true;
     button.textContent = action === 'setup' ? 'Starting…' : action === 'enable' ? 'Turning on…' : 'Turning off…';
-    try {
-      const next = await api('/api/remote-access', { method: 'POST', body: JSON.stringify({ action }) });
+    const pollingStatus = (detail) => ({
+      ...status,
+      state: 'available',
+      setupStage: 'authorize',
+      setupInProgress: true,
+      detail,
+      canSetup: false,
+      canEnable: false,
+      canDisable: false,
+    });
+    const finishSetup = async (initial) => {
+      let next = initial;
+      let missedChecks = 0;
+      for (let attempt = 0; next.setupInProgress && attempt < 150; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        try {
+          next = await api('/api/remote-access');
+          missedChecks = 0;
+          renderPhoneAccess(next);
+        } catch {
+          missedChecks++;
+          if (missedChecks === 1) {
+            renderPhoneAccess(pollingStatus(
+              'Tailscale is reconnecting this computer. A brief interruption is normal; Karmax will keep checking.',
+            ));
+          }
+        }
+      }
+      if (next.setupInProgress) {
+        approvalTab?.close();
+        renderPhoneAccess({
+          ...status,
+          state: 'error',
+          setupStage: 'connect',
+          detail: 'Setup is taking longer than expected. Check the system prompt on this computer, then choose Check again.',
+          canSetup: true,
+          canEnable: false,
+          canDisable: false,
+        });
+        return;
+      }
       if (next.helpUrl && approvalTab) approvalTab.location.href = next.helpUrl;
       else approvalTab?.close();
       renderPhoneAccess(next);
+    };
+    try {
+      const next = await api('/api/remote-access', { method: 'POST', body: JSON.stringify({ action }) });
+      if (action === 'setup' && next.setupInProgress) {
+        renderPhoneAccess(next);
+        await finishSetup(next);
+      } else {
+        if (next.helpUrl && approvalTab) approvalTab.location.href = next.helpUrl;
+        else approvalTab?.close();
+        renderPhoneAccess(next);
+      }
     } catch (error) {
-      approvalTab?.close();
-      toast(error.message, true);
-      hydratePhoneAccess();
+      if (action === 'setup' && isFetchInterruption(error)) {
+        const reconnecting = pollingStatus(
+          'The connection changed while Tailscale started. This can be normal; Karmax will reconnect and keep checking.',
+        );
+        renderPhoneAccess(reconnecting);
+        await finishSetup(reconnecting);
+      } else {
+        approvalTab?.close();
+        toast(error.message, true);
+        hydratePhoneAccess();
+      }
     }
   };
   $('#remote-setup')?.addEventListener('click', (event) => act('setup', event.currentTarget));
@@ -8175,7 +8245,20 @@ async function hydratePhoneAccess() {
   try {
     renderPhoneAccess(await api('/api/remote-access'));
   } catch (error) {
-    box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`;
+    const disconnected = isFetchInterruption(error);
+    box.innerHTML = `<div class="phone-access-address missing">
+        <span>Access your Karmax at</span>
+        <b>${disconnected ? 'Could not reach Karmax' : 'Could not check Phone Access'}</b>
+      </div>
+      <div class="phone-setup-body">
+        <div class="phone-access-head"><span class="remote-state">Needs attention</span><span>${
+          disconnected
+            ? 'The connection was interrupted. If Tailscale setup just ran, wait a moment for it to reconnect.'
+            : esc(error?.message || 'Karmax could not check Tailscale.')
+        }</span></div>
+        <div class="phone-access-actions"><button class="btn sm" id="remote-retry">Check again</button></div>
+      </div>`;
+    $('#remote-retry')?.addEventListener('click', hydratePhoneAccess);
   }
 }
 

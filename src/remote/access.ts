@@ -12,6 +12,7 @@ export interface RemoteAccessStatus {
   method: RemoteMethod;
   state: RemoteState;
   setupStage?: RemoteSetupStage;
+  setupInProgress?: boolean;
   url?: string;
   helpUrl?: string;
   setupCommand?: string;
@@ -50,6 +51,13 @@ function cleanDnsName(value: unknown): string | undefined {
 
 function urlFromText(value: string): string | undefined {
   return value.match(/https:\/\/[a-z0-9.-]+\.ts\.net(?::\d+)?/i)?.[0];
+}
+
+function localProxyPort(value: string): number | undefined {
+  const raw = value.match(/https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)/i)?.[1];
+  if (!raw) return undefined;
+  const port = Number(raw);
+  return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : undefined;
 }
 
 function loginUrlFromText(value: string): string | undefined {
@@ -116,6 +124,7 @@ export class RemoteAccessController {
   private readonly platform: NodeJS.Platform;
   private readonly username: string;
   private setupInFlight?: Promise<RemoteAccessStatus>;
+  private setupOutcome?: RemoteAccessStatus;
 
   constructor(private readonly options: {
     port: () => number;
@@ -139,6 +148,10 @@ export class RemoteAccessController {
   }
 
   private local(status: RemoteAccessStatus): RemoteAccessStatus {
+    // A conflicting route belongs to another local service. Suggesting the
+    // normal fallback `serve` command here would invite the user to overwrite
+    // that service, contradicting the controller's non-destructive behavior.
+    if (status.state === 'conflict') return status;
     const target = `http://127.0.0.1:${this.options.port()}`;
     const restart = status.setupStage === 'connect' ? ['sudo systemctl restart tailscaled'] : [];
     return {
@@ -251,11 +264,15 @@ export class RemoteAccessController {
       });
     }
     if (!noServeConfig(text)) {
+      const servedPort = localProxyPort(text);
       return this.local({
         method: 'tailscale',
         state: 'conflict',
         setupStage: 'serve',
-        detail: 'Tailscale Serve is already routing this device to another app. Karmax left that configuration untouched.',
+        ...(url ? { url } : {}),
+        detail: servedPort
+          ? `Tailscale already routes this phone address to another local service on port ${servedPort}. If that is your main Karmax, keep using the address above. To expose this Karmax instead, turn off Phone Access in the other instance first.`
+          : 'Tailscale already routes this phone address to another local service. Karmax left that configuration untouched.',
         canSetup: false,
         canEnable: false,
         canDisable: false,
@@ -278,14 +295,66 @@ export class RemoteAccessController {
    * Tailscale password. Login and Serve consent remain Tailscale-owned pages.
    */
   async setup(): Promise<RemoteAccessStatus> {
+    return this.startSetup();
+  }
+
+  /**
+   * Start setup without tying its lifetime to an HTTP request. `tailscale up`
+   * may briefly replace the route carrying that request, and native
+   * authorization may take a while. The gateway acknowledges the operation
+   * immediately and polls `setupStatus()` for its outcome.
+   */
+  startSetup(): Promise<RemoteAccessStatus> {
     if (this.setupInFlight) return this.setupInFlight;
+    this.setupOutcome = undefined;
     const pending = this.advanceSetup();
     this.setupInFlight = pending;
-    try {
-      return await pending;
-    } finally {
+    void pending.then(
+      (outcome) => { this.setupOutcome = outcome; },
+      (error) => {
+        const raw = commandText(error);
+        this.setupOutcome = this.local({
+          method: 'tailscale',
+          state: 'error',
+          setupStage: 'authorize',
+          detail: raw || 'Karmax could not finish Tailscale setup.',
+          canSetup: true,
+          canEnable: false,
+          canDisable: false,
+        });
+      },
+    ).finally(() => {
       if (this.setupInFlight === pending) this.setupInFlight = undefined;
+    });
+    return pending;
+  }
+
+  beginSetup(): RemoteAccessStatus {
+    void this.startSetup();
+    return this.setupProgress();
+  }
+
+  async setupStatus(): Promise<RemoteAccessStatus> {
+    if (this.setupInFlight) return this.setupProgress();
+    if (this.setupOutcome) {
+      const outcome = this.setupOutcome;
+      this.setupOutcome = undefined;
+      return outcome;
     }
+    return this.status();
+  }
+
+  private setupProgress(): RemoteAccessStatus {
+    return this.local({
+      method: 'tailscale',
+      state: 'available',
+      setupStage: 'authorize',
+      setupInProgress: true,
+      detail: 'Setting up Tailscale on this computer. Approve the system prompt if one appears; this page will continue automatically.',
+      canSetup: false,
+      canEnable: false,
+      canDisable: false,
+    });
   }
 
   private async advanceSetup(): Promise<RemoteAccessStatus> {
@@ -309,15 +378,6 @@ export class RemoteAccessController {
         canEnable: false,
         canDisable: false,
       });
-    }
-
-    if (current.setupStage === 'connect') {
-      try {
-        await this.run(['down']);
-      } catch {
-        // `up` below is authoritative; some clients reject `down` while their
-        // control connection is already recovering.
-      }
     }
 
     if (current.setupStage === 'login' || current.setupStage === 'connect') {

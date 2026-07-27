@@ -354,7 +354,14 @@ describe('remote access plan (SPEC §12)', () => {
         ? { stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }), stderr: '' }
         : { stdout: 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:9000', stderr: '' },
     });
-    expect(await controller.enable()).toMatchObject({ state: 'conflict', canEnable: false, canDisable: false });
+    expect(await controller.enable()).toMatchObject({
+      state: 'conflict',
+      url: 'https://host.example.ts.net',
+      detail: expect.stringMatching(/another local service on port 9000/i),
+      canEnable: false,
+      canDisable: false,
+    });
+    expect((await controller.status()).fallbackCommands).toBeUndefined();
   });
   it('turns Linux Serve permission errors into a one-time setup action', async () => {
     const denied = Object.assign(new Error('command failed'), {
@@ -586,6 +593,51 @@ describe('remote access plan (SPEC §12)', () => {
       expect.objectContaining({ state: 'ready' }),
     ]);
     expect(serveCalls).toBe(1);
+  });
+  it('runs setup in the background without taking an offline Tailscale node down', async () => {
+    let online = false;
+    let serve = 'No serve config';
+    let releaseUp!: () => void;
+    const upGate = new Promise<void>((resolve) => { releaseUp = resolve; });
+    const calls: string[][] = [];
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      platform: 'linux',
+      username: 'alice',
+      run: async (args) => {
+        calls.push(args);
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({
+            BackendState: 'Running',
+            Self: { DNSName: 'host.example.ts.net.', Online: online },
+          }),
+          stderr: '',
+        };
+        if (args[0] === 'set') return { stdout: '', stderr: '' };
+        if (args[0] === 'up') {
+          await upGate;
+          online = true;
+          return { stdout: '', stderr: '' };
+        }
+        if (args.join(' ') === 'serve status --json') return { stdout: serve, stderr: '' };
+        if (args[0] === 'serve' && args[1] === '--bg') {
+          serve = 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:4173';
+          return { stdout: 'Serve started', stderr: '' };
+        }
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+    });
+
+    expect(controller.beginSetup()).toMatchObject({
+      setupInProgress: true,
+      canSetup: false,
+      detail: expect.stringMatching(/continue automatically/i),
+    });
+    await expect.poll(() => calls.some((args) => args[0] === 'up')).toBe(true);
+    await expect(controller.setupStatus()).resolves.toMatchObject({ setupInProgress: true });
+    releaseUp();
+    await expect.poll(async () => (await controller.setupStatus()).state).toBe('ready');
+    expect(calls.some((args) => args[0] === 'down')).toBe(false);
   });
   it('reports a hosted HTTPS installation as ready without invoking Tailscale', async () => {
     const controller = new RemoteAccessController({

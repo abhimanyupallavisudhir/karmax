@@ -966,12 +966,12 @@ export class Gateway {
       if (p === '/api/resource-drivers' && method === 'GET') return this.json(res, 200, resourceDriverCatalog());
       if (p === '/api/remote-access' && method === 'GET') {
         if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
-        return this.json(res, 200, await this.deps.remoteAccess.status());
+        return this.json(res, 200, await this.deps.remoteAccess.setupStatus());
       }
       if (p === '/api/remote-access' && method === 'POST') {
         if (!this.deps.remoteAccess) return this.json(res, 503, { error: 'remote access is unavailable' });
         const b = await this.body(req);
-        if (b.action === 'setup') return this.json(res, 200, await this.deps.remoteAccess.setup());
+        if (b.action === 'setup') return this.json(res, 202, this.deps.remoteAccess.beginSetup());
         if (b.action === 'enable') return this.json(res, 200, await this.deps.remoteAccess.enable());
         if (b.action === 'disable') return this.json(res, 200, await this.deps.remoteAccess.disable());
         return this.json(res, 400, { error: 'action must be setup, enable, or disable' });
