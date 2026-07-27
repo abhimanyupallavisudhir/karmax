@@ -51,7 +51,8 @@ ok(open.includes('/events?since=0&limit=300'), 'initial task history is bounded'
 ok(open.indexOf('renderTaskPage();') < open.indexOf('await details'), 'the compact task view paints before secondary resources finish');
 
 const refresh = extractFn('refreshTasks');
-ok(refresh.includes('if (taskRefreshPromise) return taskRefreshPromise'), 'full task refreshes are single-flight');
+ok(refresh.includes('if (taskRefreshPromise)') && refresh.includes('taskRefreshQueued = true'),
+  'full task refreshes are single-flight and queue a post-mutation follow-up pass');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
