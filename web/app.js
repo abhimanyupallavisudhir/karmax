@@ -1908,8 +1908,21 @@ function patchTaskListFromEvent(ev) {
   if (!task) return false;
   const payload = ev.payload || {};
   const previous = task.lastView || {};
+  const waitingField = (payloadName, viewName) => {
+    const value = Object.prototype.hasOwnProperty.call(payload, payloadName)
+      ? payload[payloadName]
+      : previous.waitingFor?.kind === payload.waitingFor
+        ? previous.waitingFor?.[viewName]
+        : undefined;
+    return value == null ? {} : { [viewName]: value };
+  };
   const waitingFor = payload.waitingFor
-    ? { ...(previous.waitingFor || {}), kind: payload.waitingFor }
+    ? {
+        kind: payload.waitingFor,
+        ...waitingField('waitingDetail', 'detail'),
+        ...waitingField('waitingProvider', 'provider'),
+        ...waitingField('waitingResetAt', 'earliestResetAt'),
+      }
     : undefined;
   const agentTurn = payload.agentTurn
     ? {
@@ -5834,7 +5847,9 @@ function waitingLabel(w) {
     // grant latency, where asserting a quota cause sends the user to check a
     // dashboard that rightly shows nothing wrong.
     case 'account': return `a ${waitingProviderLabel(w.provider)} login${w.earliestResetAt ? ' (quota refresh)' : ' to become available'}`;
-    case 'agentSlot': return w.detail || 'a host agent slot';
+    // An acknowledged capacity wait always carries a specific detail. With no
+    // detail, the only truthful claim is that startup is still in progress.
+    case 'agentSlot': return w.detail || 'Starting agent';
     case 'mergeSlot': return w.detail || 'a merge slot';
     case 'human': return w.detail ? `human input (${w.detail})` : 'human input';
     case 'subtask': return 'its sub-tasks to finish (or raise)';
