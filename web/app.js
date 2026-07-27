@@ -3724,7 +3724,7 @@ async function openTaskForm(workflow, draft, seedText) {
     const row = confirmer && $('#tf-body')?.querySelector(`[data-row="${CSS.escape(confirmer.name)}"]`);
     if (row) {
       row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
-      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt and frozen once one is queued.</span>');
+      row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt — change it on the running attempt\'s page, which re-routes them all.</span>');
     }
   }
   // Image attachments for the full task form: pasting/dropping an image into any
@@ -6306,6 +6306,9 @@ function paramCurrentValue(f, v, rec) {
       return shared;
     }
   }
+  // The Review route belongs to the logical task: the intent's shared snapshot is
+  // the route actually in play, even when this attempt stored no override of its own.
+  if (f.type === 'confirmer' && S.attemptGroup?.confirmer !== undefined) return S.attemptGroup.confirmer;
   return own[f.name];
 }
 function displayParam(f, val) {
@@ -6338,6 +6341,14 @@ function collectParamEdits(root, fields) {
       const resumeFrom = readResume(box);
       if (resumeFrom) spec.resumeFrom = resumeFrom;
       out[f.name] = spec;
+      continue;
+    }
+    if (f.type === 'confirmer') {
+      // The Review route is sent whole (layers are atomic), not inherit-diffed —
+      // an in-flight edit is a concrete live value, not an overlay override.
+      const box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
+      if (!box) continue;
+      out[f.name] = { layers: readConfirmerLayers(box) };
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);

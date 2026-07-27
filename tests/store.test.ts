@@ -169,7 +169,14 @@ describe('Store', () => {
     expect(store.getTaskByNum(p.id, first.num!)!.id).toBe(second.id); // permalink follows principal
     expect(store.attemptGroup(second.id)!.confirmer).toEqual({ mode: 'agent' });
     expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'agent' })).not.toThrow();
-    expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'human' })).toThrow(/freezes/);
+    // The task FORM can't tell whether a live attempt's gate has already played, so it
+    // still refuses to diverge the shared route once an attempt is queued...
+    expect(() => store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'human' })).toThrow(/shared/);
+    // ...but the route is `untilUsed`, not `queue`: KarmaxApi.updateParams passes
+    // `inFlight` once the live workflow itself has accepted the re-route (SPEC §4.5/§5.5).
+    store.setIntentConfirmer(first.intentId!, 'confirm', { mode: 'human' }, { inFlight: true });
+    expect(store.attemptGroup(second.id)!.confirmer).toEqual({ mode: 'human' });
+    expect(store.getTask(second.id)!.params.confirm).toEqual({ mode: 'human' }); // mirrored onto every attempt
   });
 
   it('does not turn persisted attempts into top-level tasks on restart', () => {
