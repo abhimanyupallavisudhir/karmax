@@ -3,8 +3,11 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
+
+const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
 describe('gateway HTTP API (real server end-to-end)', () => {
   let h: Harness;
@@ -80,6 +83,61 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       method: 'PUT', headers: auth(), body: JSON.stringify({ values: { capacity: 0 } }),
     });
     expect(invalid.status).toBe(400);
+  });
+
+  it('serves brand assets resolved against the instance-wide icon setting', async () => {
+    const asset = (p: string) => fetch(`${base}${p}`); // deliberately unauthenticated: the sign-in screen needs these
+    const bytes = async (p: string) => Buffer.from(await (await asset(p)).arrayBuffer());
+    const variant = (icon: string) =>
+      fs.readFileSync(path.join(webDir, 'brand', icon, 'icon-192.png'));
+
+    // Unset → the diamond, and its vector art is available.
+    expect(await bytes('/brand/icon-192.png')).toEqual(variant('diamond'));
+    const svg = await asset('/brand/icon.svg');
+    expect(svg.status).toBe(200);
+    expect(svg.headers.get('content-type')).toBe('image/svg+xml');
+
+    const saved = await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'knot' } }),
+    });
+    expect(saved.status).toBe(200);
+    expect(await (await fetch(`${base}/api/settings/global/appearance`, { headers: auth() })).json()).toEqual({ icon: 'knot' });
+
+    // The same URLs now serve the new artwork — that is what reskins the favicon.
+    const png = await asset('/brand/icon-192.png');
+    expect(png.headers.get('content-type')).toBe('image/png');
+    expect(png.headers.get('cache-control')).toBe('no-cache');
+    expect(Buffer.from(await png.arrayBuffer())).toEqual(variant('knot'));
+    expect(await bytes('/brand/apple-touch-icon.png'))
+      .toEqual(fs.readFileSync(path.join(webDir, 'brand', 'knot', 'apple-touch-icon.png')));
+    // The knot ships no SVG, so the browser falls through to the PNG <link>.
+    expect((await asset('/brand/icon.svg')).status).toBe(404);
+
+    // Per-variant paths stay addressable, so the settings picker can preview them.
+    expect(await bytes('/brand/diamond/icon-192.png')).toEqual(variant('diamond'));
+
+    const invalid = await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: '../diamond' } }),
+    });
+    expect(invalid.status).toBe(400);
+    // A rejected write leaves the previous choice intact.
+    expect(await bytes('/brand/icon-192.png')).toEqual(variant('knot'));
+
+    // The mark is instance-wide, so changing it is the operator's alone: a
+    // developer holds neither settings:read nor settings:write, which is also
+    // what makes the settings card hide itself below that level.
+    const dev = h.tokens.mintPrincipal('user:dev', ['task:*', 'project:read']).token;
+    const devAuth = { authorization: `Bearer ${dev}`, 'content-type': 'application/json' };
+    expect((await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: devAuth, body: JSON.stringify({ values: { icon: 'clover' } }),
+    })).status).toBe(403);
+    expect((await fetch(`${base}/api/settings/global/appearance`, { headers: devAuth })).status).toBe(403);
+    // …and the unauthorized attempt changed nothing.
+    expect(await bytes('/brand/icon-192.png')).toEqual(variant('knot'));
+
+    await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'diamond' } }),
+    });
   });
 
   it('omits the disabled Resolve agent from schemas and profiles', async () => {
@@ -786,6 +844,50 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(revealed).toMatchObject({ status: 'granted', value: 'task-secret' });
   });
 
+  it('changes a running task authorization + vault grants in-flight, freezes once terminal', async () => {
+    const repo = await h.makeRepo('auth-inflight-gw');
+    const project: any = await (await fetch(`${base}/api/projects`, {
+      method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'In-flight auth', config: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } }),
+    })).json();
+    const item: any = await (await fetch(`${base}/api/vault/items`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        type: 'login', label: 'In-flight grant', domains: 'inflight.example.com',
+        policy: { use: 'ask', reveal: 'ask' }, secrets: { password: 'inflight-secret' },
+      }),
+    })).json();
+    const cap = `use-credential:item:${item.id}`;
+    // A running task (paused at Review) — no longer a draft, so previously frozen.
+    const task: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        title: 'in-flight authorization', prompt: '@write auth.txt :: ok\n@review authorization edit', workflow: 'software-dev',
+      }),
+    })).json();
+    await expect.poll(async () => ((await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json()) as any)?.stage,
+      { timeout: 15_000 }).toBe('review');
+
+    // Attach a vault credential + raise the policy in-flight — the same PATCH the
+    // task form uses, now accepted while the task runs.
+    const patched: any = await (await fetch(`${base}/api/tasks/${task.id}/authorization`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({
+        profileId: 'developer', credentialGrants: [cap],
+        credentialPolicies: { [item.id]: { use: 'auto', reveal: 'auto' } },
+      }),
+    })).json();
+    expect(patched.params._authorization.profileId).toBe('developer');
+    expect(patched.params._authorization.capabilities).toContain(cap);
+    expect(patched.params._authorization.credentialPolicies[item.id].reveal).toBe('auto');
+
+    // Drive to terminal, then the same edit is frozen (no live grant to re-point).
+    await fetch(`${base}/api/tasks/${task.id}/signal`, { method: 'POST', headers: auth(), body: JSON.stringify({ signal: 'confirm' }) });
+    await expect.poll(async () => ((await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json()) as any)?.stage,
+      { timeout: 15_000 }).toBe('done');
+    const frozen = await fetch(`${base}/api/tasks/${task.id}/authorization`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({ profileId: 'reader', credentialGrants: [] }),
+    });
+    expect(frozen.status).toBe(409);
+  });
+
   it('vault item lifecycle: add, list without secrets, policy-gated reveal, delete', async () => {
     const created: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
       type: 'login', label: 'GitHub (test)', domains: 'github.com', username: 'octo',
@@ -828,9 +930,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
 
     const first: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }) })).json();
     expect(first.status).toBe('needs_approval');
+    // The blocked reveal auto-raises the request — no separate request_credential
+    // call is needed for it to surface to the human.
+    expect(first.requestId).toBeTruthy();
+    // An explicit request_credential dedupes onto that same pending request.
     const req: any = await (await fetch(`${base}/api/vault/requests`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id, mode: 'reveal', why: 'need the key' }) })).json();
     expect(req.status).toBe('needs_approval');
-    expect(req.requestId).toBeTruthy();
+    expect(req.requestId).toBe(first.requestId);
     // the human resolves it for the whole task (durable grant extension)
     const resolved: any = await (await fetch(`${base}/api/vault/requests/${req.requestId}/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ action: 'task' }) })).json();
     expect(resolved.status).toBe('granted');

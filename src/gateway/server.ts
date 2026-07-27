@@ -7,6 +7,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
 import type { TaskView } from '../domain/types.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -35,6 +36,8 @@ import { credentialAliases, isAgentProvider, isLoginProvider } from '../agent/pr
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import type { ObjectStore } from '../store/objects.js';
+import type { AccessMode, AccessStatus, VaultFieldName } from '../autonomy/vault-items.js';
+import { defaultCdpUrl } from '../autonomy/cdp-endpoint.js';
 import { newId } from '../util/id.js';
 import { DurableEventFanout } from './fanout.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
@@ -709,6 +712,7 @@ export class Gateway {
       return void res.end();
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
+    if (p.startsWith('/brand/')) return this.brand(p, res);
     if (p.startsWith('/api/')) return this.api(req, res, url);
     if (p === '/ws') return; // handled by ws
     return this.static(p, res);
@@ -2456,10 +2460,16 @@ export class Gateway {
       const taskAuthMatch = p.match(/^\/api\/tasks\/([^/]+)\/authorization$/);
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
-        return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
-          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
-          b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
-            ? b.credentialPolicies as any : undefined));
+        try {
+          return this.json(res, 200, await api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
+            Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
+            b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
+              ? b.credentialPolicies as any : undefined));
+        } catch (e) {
+          // Frozen in-flight (cancelled / past the point of no return / finished),
+          // or a stale draft edit — the workflow validator's reason is authoritative.
+          return this.json(res, 409, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {
@@ -3344,7 +3354,8 @@ export class Gateway {
           const item = findItem(b);
           if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
           const decision = vault.access(caps, callerTaskId, item, 'reveal', { consume: true });
-          if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+          if (decision.status !== 'granted')
+            return this.json(res, 200, this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'reveal', why: b.why }));
           const field = (b.field as any) ?? defaultField(item.type);
           if (!ITEM_FIELDS[item.type].includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
           const value = field === 'totp'
@@ -3360,23 +3371,21 @@ export class Gateway {
           const item = findItem(b);
           if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
           const decision = vault.access(caps, callerTaskId, item, 'use', { consume: true });
-          if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
+          if (decision.status !== 'granted')
+            return this.json(res, 200, this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why }));
           const field = String(b.field ?? 'password');
           if (field === 'username' && !item.username) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           if (field !== 'username' && !item.fields.includes(field as any)) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
+          const resolveText = () => field === 'username'
+            ? item.username!
+            : field === 'totp'
+              ? vault.totp(item, { taskId: callerTaskId, principal })
+              : vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' });
           try {
-            const { fillViaCdp } = await import('../autonomy/fill.js');
-            const filled = await fillViaCdp({
-              cdpUrl: String(b.cdpUrl ?? 'http://127.0.0.1:9222'),
-              selector: String(b.selector ?? ''),
-              resolveText: () => field === 'username'
-                ? item.username!
-                : field === 'totp'
-                  ? vault.totp(item, { taskId: callerTaskId, principal })
-                  : vault.resolveField(item, field as any, { taskId: callerTaskId, principal, mode: 'use' }),
-              expectDomains: item.domains,
+            const origin = await this.fillCredential(callerTaskId, {
+              selector: String(b.selector ?? ''), cdpUrl: b.cdpUrl, expectDomains: item.domains, resolveText,
             });
-            return this.json(res, 200, { status: 'granted', itemId: item.id, filled: true, origin: filled.origin });
+            return this.json(res, 200, { status: 'granted', itemId: item.id, filled: true, origin });
           } catch (e) {
             return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
           }
@@ -3487,7 +3496,7 @@ export class Gateway {
           try {
             if (p === '/api/vault/passkey/enroll' && method === 'POST') {
               const domains = Array.isArray(b.domains) ? b.domains.map(String) : b.domain ? [String(b.domain)] : undefined;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? 'http://127.0.0.1:9222'), { expectDomains: domains, mode: 'enroll' });
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'enroll' });
               return this.json(res, 200, { ...started, next: 'trigger the site\'s "create a passkey" button in the browser, then POST /api/vault/passkey/save with this authenticatorId' });
             }
             if (p === '/api/vault/passkey/save' && method === 'POST') {
@@ -3509,7 +3518,7 @@ export class Gateway {
               if (decision.status !== 'granted') return this.json(res, 200, { ...decision, itemId: item.id });
               const creds = JSON.parse(vault.resolveField(item, 'passkey', { taskId: callerTaskId, principal, mode: 'use' })) as any[];
               const domains = item.domains;
-              const started = await this.passkeys.begin(String(b.cdpUrl ?? 'http://127.0.0.1:9222'), { expectDomains: domains, mode: 'login', credential: creds[0] });
+              const started = await this.passkeys.begin(String(b.cdpUrl ?? defaultCdpUrl()), { expectDomains: domains, mode: 'login', credential: creds[0] });
               return this.json(res, 200, { status: 'granted', ...started, next: 'trigger "sign in with a passkey" in the browser, then POST /api/vault/passkey/release with this authenticatorId' });
             }
             if (p === '/api/vault/passkey/release' && method === 'POST') {
@@ -4087,6 +4096,9 @@ export class Gateway {
           if (wf === 'agent-queue' && (!Number.isFinite(Number(b.values?.capacity)) || Number(b.values.capacity) < 1)) {
             return this.json(res, 400, { error: 'Concurrent agent turns must be at least 1' });
           }
+          if (wf === 'appearance' && !isBrandIcon(b.values?.icon)) {
+            return this.json(res, 400, { error: 'Unknown brand icon' });
+          }
           store.setSettings('global', wf, b.values ?? {});
           if (wf === 'agent-queue') await api.setAgentCapacity(Number(b.values?.capacity));
           return this.json(res, 200, { ok: true });
@@ -4228,6 +4240,29 @@ export class Gateway {
     if (!this.deps.githubApp) return;
     if ((this.wikiRemoteRetryAfter.get(project.id) ?? 0) > Date.now()) return;
     const githubApp = this.deps.githubApp;
+    // Already provisioned in a previous run: the durable repository record and
+    // its isolated deploy keys exist. Wiring (and re-pushing) the local remote
+    // needs only the repository's write deploy key — never the operator's user
+    // OAuth token. Re-running GitHub provisioning on every boot re-hit the REST
+    // API with a possibly-expired operator token, producing a recurring "Bad
+    // credentials" 401 for wikis that were already fully set up.
+    if (current?.private && this.deps.store.repositoryDeployKeys(current.id)) {
+      if (this.wikiRemotesProvisioning.has(project.id)) return;
+      this.wikiRemotesProvisioning.add(project.id);
+      void (async () => {
+        try {
+          await setProjectWikiRemote(root, current.sshUrl, githubApp.repositorySshKey(current.id, 'write'));
+          this.wikiRemotesReady.add(project.id);
+          this.wikiRemoteRetryAfter.delete(project.id);
+        } catch (error) {
+          this.wikiRemoteRetryAfter.set(project.id, Date.now() + 5 * 60_000);
+          console.warn(`[karmax] could not sync wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
+        } finally {
+          this.wikiRemotesProvisioning.delete(project.id);
+        }
+      })();
+      return;
+    }
     const organizationId = project.organizationId ?? 'org_personal';
     const candidates = [...new Set([
       ...(userId ? [userId] : []),
@@ -4459,6 +4494,28 @@ export class Gateway {
       byStage[stage] = (byStage[stage] ?? 0) + 1;
     }
     return { accounts, projects: projects.length, tasks: allTasks.length, byStage };
+  }
+
+  /** Brand assets, resolved per request against the instance-wide icon setting.
+   * Serving them from one stable path is what lets the favicon, the installed
+   * app icon and the pre-auth login mark all follow the setting with no client
+   * knowledge of it — and no build step over `web/`. */
+  private async brand(p: string, res: http.ServerResponse) {
+    const name = p.slice('/brand/'.length);
+    // `/brand/<file>` follows the setting; `/brand/<variant>/<file>` addresses one
+    // variant directly, which is how the settings picker previews the choices.
+    if (!BRAND_FILES.includes(name as (typeof BRAND_FILES)[number])) return this.static(p, res);
+    const icon = brandIconOf(this.deps.store.getSettings('global', 'appearance'));
+    try {
+      const data = await fs.promises.readFile(path.join(this.deps.staticDir, 'brand', icon, name));
+      // Favicons are cached hard by default; revalidating keeps a switch instant.
+      res.writeHead(200, { 'content-type': MIME[path.extname(name)]!, 'cache-control': 'no-cache' });
+      res.end(data);
+    } catch {
+      // A variant need not ship every format (only the diamond has an SVG); the
+      // browser falls through to the next <link rel="icon"> on a miss.
+      res.writeHead(404).end('not found');
+    }
   }
 
   // ── static SPA ──
@@ -4836,6 +4893,61 @@ export class Gateway {
       return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
         && requested.port === base.port;
     } catch { return false; }
+  }
+
+  /**
+   * A blocked fill/reveal attempt (§5B/§5C) auto-raises the access request (§7)
+   * so it surfaces to the human immediately — the agent no longer has to make a
+   * separate `request_credential` call after being told `needs_approval`. Only
+   * `needs_approval` from a task-agent parks; `denied` is a hard no and never
+   * parks, and human callers (no taskId) just get the status back. `park()`
+   * dedupes, so repeated attempts collapse onto the one pending request.
+   */
+  private autoRaiseCredential(
+    vault: VaultItems,
+    decision: { status: AccessStatus; reason?: string },
+    ctx: { caps: string[]; taskId?: string; projectId?: string; item: { id: string }; field?: unknown; mode: AccessMode; why?: unknown },
+  ): Record<string, unknown> {
+    const base: Record<string, unknown> = { ...decision, itemId: ctx.item.id };
+    if (decision.status !== 'needs_approval' || !ctx.taskId) return base;
+    const raised = vault.request({
+      taskId: ctx.taskId, projectId: ctx.projectId, caps: ctx.caps,
+      itemId: ctx.item.id, field: ctx.field as VaultFieldName | undefined, mode: ctx.mode,
+      why: ctx.why != null ? String(ctx.why) : undefined,
+    });
+    return raised.requestId ? { ...base, requestId: raised.requestId } : base;
+  }
+
+  /**
+   * Type a resolved secret into the agent's browser (§5B). For a LOCAL world the
+   * gateway drives CDP directly (agent + gateway share the host). For a REMOTE
+   * world the browser lives in the sandbox with no private path from the host,
+   * so the fill runs INSIDE the world via `world.exec`, the secret handed over
+   * stdin (never argv/env/a file the co-resident agent could read). Either way
+   * the live page origin is re-verified against the item's domains before typing.
+   */
+  private async fillCredential(callerTaskId: string | undefined, args: {
+    selector: string; cdpUrl?: unknown; expectDomains?: string[]; resolveText: () => string;
+  }): Promise<string> {
+    const cdpUrl = String(args.cdpUrl ?? defaultCdpUrl());
+    const task = callerTaskId ? this.deps.store.getTask(callerTaskId) : undefined;
+    const handle = task
+      ? worldHandleForView(task.lastView, callerTaskId!, this.deps.store.effectiveProjectConfig(task.projectId))
+      : undefined;
+    const remote = !!handle && (worldHandleIsRemote(handle) || !!this.deps.worlds.get(handle.kind)?.capabilities?.remote);
+    if (handle && remote) {
+      let access: Awaited<ReturnType<NonNullable<GatewayDeps['worldAccess']>['open']>> | undefined;
+      try {
+        access = this.deps.worldAccess ? await this.deps.worldAccess.open(callerTaskId!, handle) : undefined;
+        const world = access?.world ?? await this.deps.worlds.open(handle);
+        const { fillInWorld } = await import('../autonomy/world-fill.js');
+        return (await fillInWorld(world, { selector: args.selector, expectDomains: args.expectDomains, cdpUrl, resolveText: args.resolveText })).origin;
+      } finally {
+        await access?.release();
+      }
+    }
+    const { fillViaCdp } = await import('../autonomy/fill.js');
+    return (await fillViaCdp({ cdpUrl, selector: args.selector, resolveText: args.resolveText, expectDomains: args.expectDomains })).origin;
   }
 
   private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {

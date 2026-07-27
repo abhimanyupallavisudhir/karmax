@@ -2064,12 +2064,37 @@ function wireVerificationBanner() {
   $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
 }
 
+// Mirrors BRAND_ICONS in src/domain/brand.ts — each id is a directory under web/brand/.
+const BRAND_ICON_CHOICES = [
+  { id: 'diamond', label: 'Diamond' },
+  { id: 'knot', label: 'Knot' },
+  { id: 'check', label: 'Check' },
+  { id: 'clover', label: 'Clover' },
+];
+
+// The gateway resolves /brand/* against the instance-wide icon setting, so the
+// mark carries no client state — which is also what lets it render on the
+// pre-auth login screens. The counter only busts the HTTP cache after a switch.
+let brandVersion = 0;
+function brandMark() {
+  return `<img class="mark" src="/brand/icon-192.png${brandVersion ? `?v=${brandVersion}` : ''}" alt="" />`;
+}
+
+/** Re-point the favicon and every on-screen mark so a switch shows up at once,
+ * without a reload — the URLs are unchanged, so only the cache needs busting. */
+function refreshBrandAssets() {
+  brandVersion++;
+  const bust = (el, attr) => { el[attr] = `${String(el[attr]).split('?')[0]}?v=${brandVersion}`; };
+  document.querySelectorAll('link[rel="icon"], link[rel="apple-touch-icon"]').forEach((l) => bust(l, 'href'));
+  document.querySelectorAll('.brand .mark').forEach((m) => bust(m, 'src'));
+}
+
 function renderShell() {
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false">☰</button>
-      <div class="brand"><span class="mark">◇</span> karmax</div>
+      <div class="brand">${brandMark()} karmax</div>
       <select class="org-switcher" id="org-switcher" title="Organization">
         ${S.organizations.map((o) => `<option value="${esc(o.id)}" ${o.id === S.organizationId ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}
         <option value="__new">＋ New organization</option>
@@ -3680,7 +3705,7 @@ async function openTaskForm(workflow, draft, seedText) {
               </button>
             </div>
             <div class="form-row" data-row="__creds">
-              <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Credentials</label></div>
+              <div class="label-row"><label title="Precedence + enable/disable for this task, overriding the organization/project order. Drag to reorder; toggle On/Off.">Agent logins</label></div>
               <div id="cred-editor-newtask">Loading…</div>
             </div>
             <div class="form-row" data-row="__notes">
@@ -4070,7 +4095,7 @@ async function renderSeriesPage(rec) {
             <textarea id="tf-notes" rows="3" placeholder="Only you see this — never sent to the agent" style="width:100%">${esc(rec.notes || '')}</textarea>
           </div>
           <details class="advanced" style="margin-top:10px">
-            <summary>Credentials — precedence &amp; enable/disable</summary>
+            <summary>Agent logins — precedence &amp; enable/disable</summary>
             <div id="cred-editor-newtask">Loading…</div>
           </details>
           ${triggersSection(values, rec.id)}
@@ -4592,6 +4617,7 @@ function renderTaskPage() {
     wireTaskApprovalRequests(v);
   } else if (tab === 'parameters') {
     wireParams(v);
+    wireTaskAuthorization(v);
     renderCredentialEditor($('#cred-editor-task'), 'task', { projectId: rec?.projectId || S.projectId, taskId: v.taskId });
   } else if (tab === 'advanced') {
     renderTaskEvents();
@@ -5820,9 +5846,87 @@ function parametersTab(v) {
   // tabs, so they're visible/editable on every tab — not just here (see renderTaskPage).
   return `
     ${paramsSection(v)}
-    <div class="section-h">Credentials</div>
+    ${authorizationSection(v)}
+    <div class="section-h">Agent logins</div>
     <p class="task-sub" style="color:var(--ink-3);margin-top:0">Precedence + enable/disable, just for this task — overrides the organization/project order. Drag to reorder; toggle On/Off. (The new-task form has the same control.)</p>
     <div id="cred-editor-task">Loading…</div>`;
+}
+
+// Agent authorization + per-task vault grants — the same controls the task form
+// offers, editable in-flight (SPEC §5.5). The change re-points the task's live
+// grant, so it takes effect at the next agent turn. Hidden for drafts (they edit
+// in the full form) and once frozen (terminal, or past the point of no return).
+function authorizationSection(v) {
+  const rec = taskRecord(v.taskId);
+  if (rec?.params?.draft) return '';
+  if (TERMINAL_STAGES.includes(v.stage) || v.pointOfNoReturnPassed) return '';
+  return `<div class="section-h">Authorization</div>
+    <div id="tp-auth" class="parameter-fields">
+      <div class="form-row" data-row="__authorization">
+        <div class="label-row"><label title="Applies to every agent and retry in this workflow, capped by your own permissions. Takes effect at the next agent turn.">Agent authorization</label></div>
+        <select id="tp-authorization"><option>Loading…</option></select>
+      </div>
+      <div class="form-row" data-row="__vault">
+        <button type="button" class="btn tf-vault-button" id="tp-vault-open" disabled
+          title="Choose which vault credentials (site logins, API keys, SSH keys, .env bags) this task's agents may use. Takes effect at the next agent turn.">
+          <span>Vault credentials</span>
+          <span class="tf-vault-count" id="tp-vault-count">Loading…</span>
+        </button>
+      </div>
+      <button class="btn sm primary" id="tp-auth-save">Save authorization</button>
+    </div>`;
+}
+
+// Fill + wire the in-flight authorization controls (profiles + vault items load
+// async, like the task form). Reuses the shared vault-grant picker.
+async function wireTaskAuthorization(v) {
+  const select = document.getElementById('tp-authorization');
+  const saveBtn = document.getElementById('tp-auth-save');
+  if (!select || !saveBtn) return;
+  const rec = taskRecord(v.taskId);
+  const projectId = rec?.projectId || S.projectId;
+  const auth0 = rec?.params?._authorization || {};
+  let authorization = { profiles: [], defaultProfile: 'developer' };
+  try { authorization = await api(`/api/authorization/profiles?projectId=${encodeURIComponent(projectId)}`); } catch {}
+  const selected = auth0.profileId || authorization.defaultProfile;
+  select.innerHTML = (authorization.profiles || []).map((p) =>
+    `<option value="${esc(p.id)}" ${p.id === selected ? 'selected' : ''}>${esc(p.name)}</option>`).join('')
+    || `<option value="${esc(selected)}" selected>${esc(selected)}</option>`;
+  // Per-task vault grants (PLAN-passwords.md §6): prefill from the stored grant.
+  const vaultGrantIds = new Set((auth0.capabilities || [])
+    .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
+  let vaultCredentialPolicies = JSON.parse(JSON.stringify(auth0.credentialPolicies || {}));
+  const button = document.getElementById('tp-vault-open');
+  const count = document.getElementById('tp-vault-count');
+  const vaultOrg = S.projects.find((p) => p.id === projectId)?.organizationId;
+  let items = [];
+  try { items = await api(`/api/vault/items${vaultOrg ? `?organizationId=${encodeURIComponent(vaultOrg)}` : ''}`); }
+  catch { button?.closest('[data-row="__vault"]')?.remove(); }
+  if (button && count) {
+    const refreshCount = () => { count.textContent = `${items.filter((i) => vaultGrantIds.has(i.id)).length} selected`; };
+    refreshCount();
+    button.disabled = false;
+    button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, vaultCredentialPolicies, (picked, policies) => {
+      vaultGrantIds.clear();
+      picked.forEach((id) => vaultGrantIds.add(id));
+      vaultCredentialPolicies = policies;
+      refreshCount();
+    }));
+  }
+  saveBtn.addEventListener('click', async () => {
+    try {
+      await api(`/api/tasks/${v.taskId}/authorization`, { method: 'PATCH', body: JSON.stringify({
+        profileId: select.value,
+        credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
+        credentialPolicies: vaultCredentialPolicies,
+      }) });
+      toast('Authorization updated — applies at the next agent turn');
+      setTimeout(refreshTask, 250);
+      setTimeout(refreshTasks, 400);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
 }
 
 // Advanced: the raw feeds — the live event stream and the structured view-model.
@@ -8357,10 +8461,54 @@ async function hydrateExecutionProviders(proj) {
 }
 
 // ── organization defaults (legacy APIs still call this global scope) ─────────
+/** The brand icon is instance-wide, like host capacity: it is the same mark for
+ * everyone, including on the sign-in screen before any organization is known. */
+function appearanceCard() {
+  return `<div class="card" id="appearance-card">
+      <div class="section-h">Icon <span class="chip">whole instance</span></div>
+      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The mark in the top bar and on the sign-in screen, the browser favicon, and the installed app icon.</p>
+      <div class="brand-picker" id="brand-picker">
+        ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
+          <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
+        </button>`).join('')}
+      </div>
+    </div>`;
+}
+
+async function wireAppearanceCard() {
+  const picker = $('#brand-picker');
+  if (!picker) return;
+  const mark = (id) => picker.querySelectorAll('.brand-option').forEach((b) =>
+    b.setAttribute('aria-pressed', String(b.dataset.icon === id)));
+  let current = 'diamond';
+  // The mark is instance-wide, so only the operator (settings:*) may change it —
+  // below that the read fails and the card hides entirely, as outbound email does.
+  try { current = (await api('/api/settings/global/appearance')).icon || 'diamond'; }
+  catch { $('#appearance-card').style.display = 'none'; return; }
+  mark(current);
+  picker.querySelectorAll('.brand-option').forEach((b) =>
+    b.addEventListener('click', async () => {
+      const icon = b.dataset.icon;
+      if (icon === current) return;
+      const previous = current;
+      current = icon;
+      mark(icon);
+      try {
+        await api('/api/settings/global/appearance', { method: 'PUT', body: JSON.stringify({ values: { icon } }) });
+        refreshBrandAssets();
+      } catch (e) {
+        current = previous;
+        mark(previous);
+        toast(e.message, true);
+      }
+    }));
+}
+
 function globalSettingsView(embedded = false) {
   return `
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
+    ${appearanceCard()}
     ${profilesCard('global')}
     ${quickDefaultsHeader(`Applied to tasks added straight from the quick-task box (not the full “⋯ More” form). Each field inherits from the organization's general defaults above until you set it here.`)}
     ${quickSettingsForms('global')}
@@ -9794,6 +9942,7 @@ async function hydrateAuthorization(scope, projectId) {
 
 function wireGlobalSettings(organizationId) {
   hydratePhoneAccess();
+  wireAppearanceCard();
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateQuickSettingsForms('global', undefined, organizationId);
   wireQuickSettingsSave('global', undefined, organizationId);
@@ -10167,7 +10316,9 @@ async function hydrateOrganizationView() {
   if (gitAccounts && $('#org-git-accounts-slot')) $('#org-git-accounts-slot').append(gitAccounts);
   const authorization = $('#authorization-card-global');
   if (authorization && $('#org-authorization-slot')) $('#org-authorization-slot').append(authorization);
-  for (const card of [$('#main [data-wf="agent-queue"]'), $('#resilience-card')])
+  // Instance-wide cards render inside globalSettingsView but belong under
+  // Advanced, not among the task defaults. Moving the node keeps its listeners.
+  for (const card of [$('#appearance-card'), $('#main [data-wf="agent-queue"]'), $('#resilience-card')])
     if (card && $('#org-misc-slot')) $('#org-misc-slot').append(card);
   wireSettingsNavigation();
   await loadCollaboration().catch(() => {});
@@ -10970,7 +11121,7 @@ function openHelp() {
 // ── login ────────────────────────────────────────────────────────────────────
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:18px"><span class="mark">◇</span> karmax</div>
+    <div class="brand" style="margin-bottom:18px">${brandMark()} karmax</div>
     ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
     ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a karmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
@@ -11006,7 +11157,7 @@ function renderLogin() {
 // whether an address has an account.
 function renderForgotPassword() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Reset password</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Reset password</div>
     <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
     <div class="form-row"><label>Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
     <button class="btn primary" id="forgot-btn" style="width:100%">Send reset link</button>
@@ -11034,7 +11185,7 @@ function renderForgotPassword() {
 // password via Better Auth, then returns to sign in.
 function renderResetPassword(token) {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Choose a new password</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Choose a new password</div>
     ${token ? `<div class="form-row"><label>New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="reset-btn" style="width:100%">Set new password</button>`
       : `<p class="task-sub">This reset link is missing its token or has expired. Request a new one from the sign-in page.</p>`}
@@ -11067,7 +11218,7 @@ function renderResetPassword(token) {
 
 function renderSignup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Create account</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Create account</div>
     ${S.pendingInvite
       ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
       : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
@@ -11102,7 +11253,7 @@ function renderSignup() {
 
 function renderAccessPending() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Account created</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Account created</div>
     ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
     <p>Your account is active, but you don't have access to any project yet.</p>
     <p class="task-sub">Ask a karmax admin to add you to a project, or create your own workspace below. Sign in again and any new access shows up right away.</p>
@@ -11128,7 +11279,7 @@ function renderAccessPending() {
 
 function renderSetup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
-    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Set up karmax</div>
+    <div class="brand" style="margin-bottom:12px">${brandMark()} Set up karmax</div>
     <p class="task-sub">Create the first administrator. Additional accounts are managed from Organization settings.</p>
     <div class="form-row"><label>Name</label><input id="setup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="setup-email" autocomplete="username" /></div>
