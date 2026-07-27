@@ -8646,25 +8646,27 @@ function paymentsCard(scope) {
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
       <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
       <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
+      <div class="pay-stripe-platform" style="margin-bottom:10px"></div>
       <div class="pay-providers-list">Loading…</div>
       <div class="pay-balance" style="margin-top:8px"></div>
     </div>
-    <details class="pay-cardholder" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Create Stripe Issuing cardholder</summary>
-      <div class="form-row" style="margin-top:8px"><div style="display:flex;gap:8px;flex-wrap:wrap">
-        <select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select>
-        <input class="holder-name" placeholder="full or company name" />
-        <input class="holder-first" placeholder="first name (individual)" />
-        <input class="holder-last" placeholder="last name (individual)" />
-        <input class="holder-dob" type="date" title="date of birth (individual)" />
-        <input class="holder-email" type="email" placeholder="email" />
-        <input class="holder-phone" placeholder="phone" />
-        <input class="holder-line1" placeholder="address line 1" />
-        <input class="holder-city" placeholder="city" />
-        <input class="holder-state" placeholder="state/region" />
-        <input class="holder-postal" placeholder="postal code" />
-        <input class="holder-country" placeholder="country (US)" style="width:100px" />
-        <button class="btn sm" data-addholder>Create cardholder</button>
-      </div></div>
+    <details class="pay-cardholder hidden" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Stripe cardholder — required before issuing a card</summary>
+      <p class="task-sub">This is Stripe’s compliance record for the real person or company legally authorized to use the card. It is not a Karmax user, a label, or a funding source. Use accurate identity and billing details; Stripe may require verification.</p>
+      <div class="settings-grid">
+        <label class="form-row">Cardholder type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
+        <label class="form-row">Name shown in Stripe<input class="holder-name" placeholder="Full legal or company name" /></label>
+        <label class="form-row">First name (individual)<input class="holder-first" /></label>
+        <label class="form-row">Last name (individual)<input class="holder-last" /></label>
+        <label class="form-row">Date of birth (individual)<input class="holder-dob" type="date" /></label>
+        <label class="form-row">Email<input class="holder-email" type="email" /></label>
+        <label class="form-row">Phone<input class="holder-phone" /></label>
+        <label class="form-row">Billing address<input class="holder-line1" placeholder="Address line 1" /></label>
+        <label class="form-row">City<input class="holder-city" /></label>
+        <label class="form-row">State or region<input class="holder-state" /></label>
+        <label class="form-row">Postal code<input class="holder-postal" /></label>
+        <label class="form-row">Country code<input class="holder-country" placeholder="US" maxlength="2" /></label>
+      </div>
+      <button class="btn sm" data-addholder>Create required Stripe record</button>
     </details>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
     <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
@@ -8677,7 +8679,7 @@ function paymentsCard(scope) {
         <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
         <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
         <select class="card-provider"><option value="mock">Local test funds</option></select>
-        <select class="card-cardholder hidden"><option value="">Choose Stripe cardholder</option></select>
+        <select class="card-cardholder hidden"><option value="">Choose required Stripe cardholder</option></select>
         <button class="btn" data-addcard="${scope}">Add card</button>
       </div></div>
     ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
@@ -8689,10 +8691,48 @@ async function wirePaymentProviders(box, organizationId) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
+  let platform;
   const paymentsBase = organizationId
     ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
     : '/api/payments';
   try { data = await api(`${paymentsBase}/providers`); } catch {}
+  if (organizationId) {
+    try { platform = await api(`${paymentsBase}/stripe/platform`); } catch {}
+  }
+  const platformBox = box.querySelector('.pay-stripe-platform');
+  if (platformBox && platform) {
+    const status = platform.configured
+      ? `<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>`
+      : '<span class="chip">setup required</span>';
+    const webhook = platform.webhookConfigured
+      ? '<span class="chip" style="color:var(--ok,#4ec9a3)">webhook ready</span>'
+      : '<span class="chip">webhook secret missing</span>';
+    platformBox.innerHTML = `<details ${platform.configured && platform.webhookConfigured ? '' : 'open'}>
+      <summary style="cursor:pointer;font-weight:600">Stripe platform setup ${status} ${webhook}</summary>
+      <p class="task-sub">One Stripe Connect application identifies this Karmax installation and receives callbacks. It does not supply money. Every organization still connects its own Stripe account and uses only that account’s Issuing balance.</p>
+      <p class="task-sub">Create or open the Connect application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>. Register the callback URL and add the webhook destination below for Issuing authorization, transaction, dispute, and account events.</p>
+      <div class="settings-grid">
+        <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" ${platform.canManage ? '' : 'disabled'} /></label>
+        <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
+        <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
+      </div>
+      ${platform.canManage ? '<button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>' : '<p class="task-sub">An installation administrator must manage these shared application credentials.</p>'}
+      ${platform.source === 'environment' ? '<p class="task-sub">Currently bootstrapped from environment variables. Entering replacement secrets here stores them in Karmax’s encrypted vault and makes them take precedence.</p>' : ''}
+    </details>`;
+    platformBox.querySelector('.stripe-platform-save')?.addEventListener('click', async () => {
+      try {
+        await api(`${paymentsBase}/stripe/platform`, { method: 'PUT', body: JSON.stringify({
+          clientId: platformBox.querySelector('.stripe-platform-client').value,
+          secretKey: platformBox.querySelector('.stripe-platform-secret').value || undefined,
+          webhookSecret: platformBox.querySelector('.stripe-platform-webhook-secret').value || undefined,
+        }) });
+        toast('Stripe platform setup saved securely');
+        await wirePaymentProviders(box, organizationId);
+      } catch (e) { toast(e.message, true); }
+    });
+  }
   list.innerHTML = data.providers.length
     ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
         <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
@@ -8743,6 +8783,8 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   const providerSelect = box.querySelector('.card-provider');
   const holderSelect = box.querySelector('.card-cardholder');
   const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
+  const stripeConnected = usableProviders.some((p) => p.name === 'stripe');
+  box.querySelector('.pay-cardholder')?.classList.toggle('hidden', !stripeConnected);
   providerSelect.innerHTML = usableProviders.map((p) =>
     `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
   const loadCardholders = async () => {
@@ -8751,8 +8793,11 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (!stripe) return;
     try {
       const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
-      holderSelect.innerHTML = `<option value="">Choose Stripe cardholder</option>${holders
-        .filter((h) => h.status === 'active').map((h) => `<option value="${esc(h.id)}">${esc(h.name)} · ${esc(h.type)}</option>`).join('')}`;
+      holderSelect.innerHTML = `<option value="">Choose required Stripe cardholder</option>${holders.map((h) => {
+        const requirements = h.requirements?.past_due || [];
+        const ready = h.status === 'active' && requirements.length === 0;
+        return `<option value="${ready ? esc(h.id) : ''}" ${ready ? '' : 'disabled'}>${esc(h.name)} · ${esc(h.type)}${ready ? '' : ` · needs Stripe verification (${esc(requirements.join(', ') || h.status)})`}</option>`;
+      }).join('')}`;
     } catch (e) {
       holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
     }
