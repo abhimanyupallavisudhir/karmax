@@ -32,9 +32,9 @@ import { worldRepos, worldRepoSource } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
-import { PaymentProvider, PaymentRegistry, BudgetService, StripeIssuingProvider } from '../autonomy/payments.js';
+import { PaymentProvider, PaymentRegistry, BudgetService } from '../autonomy/payments.js';
 import { fillViaCdp } from '../autonomy/fill.js';
-import { fillCardInWorld } from '../autonomy/card-fill.js';
+import { fillCardInWorld, BILLING_FIELDS } from '../autonomy/card-fill.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
@@ -1373,15 +1373,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 fillPaymentCard: async (fill: {
                   requestId: string;
                   cdpUrl: string;
-                  selectors: { number: string; cvc: string; expiry?: string; expMonth?: string; expYear?: string };
+                  selectors: import('../autonomy/card-fill.js').CardFillSelectors;
                 }) => {
                   const request = store.getPaymentSpendRequest(fill.requestId);
-                  if (!request || request.taskId !== args.taskId || request.status !== 'authorized')
+                  // A webhook rail reserves ('authorized'); an immediate rail has
+                  // already drawn the spend down ('settled'). Both are fillable.
+                  if (!request || request.taskId !== args.taskId
+                    || !['authorized', 'settled'].includes(request.status))
                     throw new Error('payment request is not an active reservation for this task');
                   const card = request.cardId ? store.getCard(request.cardId) : undefined;
-                  if (!card || card.provider !== 'stripe') throw new Error('secure fill requires a reserved Stripe card');
+                  if (!card) throw new Error('secure fill requires a reserved card');
+                  // Any rail that can resolve a card's secret half is fillable; the
+                  // mock rail deliberately cannot, because it moves no real money.
                   const provider = deps.paymentRegistry?.forCard(card as any);
-                  if (!(provider instanceof StripeIssuingProvider)) throw new Error('Stripe Issuing is unavailable');
+                  if (!provider?.retrieveCardDetails)
+                    throw new Error(`the ${card.provider} rail has no card that can be filled into a checkout`);
                   const rawMerchant = String(request.merchant ?? '').trim();
                   let domain = '';
                   try {
@@ -1414,6 +1420,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                     }
                     origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.cvc,
                       text: details.cvc, expectDomains: expected })).origin;
+                    // Billing fields, where the card carries one and the form asks.
+                    for (const field of BILLING_FIELDS) {
+                      const selector = fill.selectors[field];
+                      const value = details.billing?.[field];
+                      if (selector && value) origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl,
+                        selector, text: value, expectDomains: expected })).origin;
+                    }
                   }
                   store.appendAudit({ principalId: `task:${args.taskId}`, action: 'payment.card.filled',
                     detail: { taskId: args.taskId, requestId: request.id, cardId: card.id, origin } });

@@ -3,8 +3,11 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
+
+const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
 describe('gateway HTTP API (real server end-to-end)', () => {
   let h: Harness;
@@ -80,6 +83,61 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       method: 'PUT', headers: auth(), body: JSON.stringify({ values: { capacity: 0 } }),
     });
     expect(invalid.status).toBe(400);
+  });
+
+  it('serves brand assets resolved against the instance-wide icon setting', async () => {
+    const asset = (p: string) => fetch(`${base}${p}`); // deliberately unauthenticated: the sign-in screen needs these
+    const bytes = async (p: string) => Buffer.from(await (await asset(p)).arrayBuffer());
+    const variant = (icon: string) =>
+      fs.readFileSync(path.join(webDir, 'brand', icon, 'icon-192.png'));
+
+    // Unset → the diamond, and its vector art is available.
+    expect(await bytes('/brand/icon-192.png')).toEqual(variant('diamond'));
+    const svg = await asset('/brand/icon.svg');
+    expect(svg.status).toBe(200);
+    expect(svg.headers.get('content-type')).toBe('image/svg+xml');
+
+    const saved = await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'knot' } }),
+    });
+    expect(saved.status).toBe(200);
+    expect(await (await fetch(`${base}/api/settings/global/appearance`, { headers: auth() })).json()).toEqual({ icon: 'knot' });
+
+    // The same URLs now serve the new artwork — that is what reskins the favicon.
+    const png = await asset('/brand/icon-192.png');
+    expect(png.headers.get('content-type')).toBe('image/png');
+    expect(png.headers.get('cache-control')).toBe('no-cache');
+    expect(Buffer.from(await png.arrayBuffer())).toEqual(variant('knot'));
+    expect(await bytes('/brand/apple-touch-icon.png'))
+      .toEqual(fs.readFileSync(path.join(webDir, 'brand', 'knot', 'apple-touch-icon.png')));
+    // The knot ships no SVG, so the browser falls through to the PNG <link>.
+    expect((await asset('/brand/icon.svg')).status).toBe(404);
+
+    // Per-variant paths stay addressable, so the settings picker can preview them.
+    expect(await bytes('/brand/diamond/icon-192.png')).toEqual(variant('diamond'));
+
+    const invalid = await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: '../diamond' } }),
+    });
+    expect(invalid.status).toBe(400);
+    // A rejected write leaves the previous choice intact.
+    expect(await bytes('/brand/icon-192.png')).toEqual(variant('knot'));
+
+    // The mark is instance-wide, so changing it is the operator's alone: a
+    // developer holds neither settings:read nor settings:write, which is also
+    // what makes the settings card hide itself below that level.
+    const dev = h.tokens.mintPrincipal('user:dev', ['task:*', 'project:read']).token;
+    const devAuth = { authorization: `Bearer ${dev}`, 'content-type': 'application/json' };
+    expect((await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: devAuth, body: JSON.stringify({ values: { icon: 'clover' } }),
+    })).status).toBe(403);
+    expect((await fetch(`${base}/api/settings/global/appearance`, { headers: devAuth })).status).toBe(403);
+    // …and the unauthorized attempt changed nothing.
+    expect(await bytes('/brand/icon-192.png')).toEqual(variant('knot'));
+
+    await fetch(`${base}/api/settings/global/appearance`, {
+      method: 'PUT', headers: auth(), body: JSON.stringify({ values: { icon: 'diamond' } }),
+    });
   });
 
   it('omits the disabled Resolve agent from schemas and profiles', async () => {
@@ -1213,5 +1271,33 @@ esac
       method: 'POST', headers: auth(), body: JSON.stringify({ amount: -100 }),
     });
     expect(invalidFund.status).toBe(400);
+  });
+
+  it('registers a vault card without ever handing the number back out', async () => {
+    const orgs: any = await (await fetch(`${base}/api/organizations`, { headers: auth() })).json();
+    const orgId = orgs[0]?.id;
+    const register = (details: unknown) => fetch(`${base}/api/cards?organizationId=${orgId}`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        scope: 'organization', label: 'Household', cap: 50_000, provider: 'vault-card', details }),
+    });
+    const bad = await register({ number: '4242424242424241', cvc: '123', expMonth: 12, expYear: 2031 });
+    expect(bad.status).toBe(400);
+    expect((await bad.json() as any).error).toMatch(/card number/i);
+
+    const response = await register({ number: '4242424242424242', cvc: '123', expMonth: 12, expYear: 2031,
+      billing: { line1: '1 High St', city: 'London', postalCode: 'SW1A 1AA', country: 'GB' } });
+    expect(response.status).toBe(200);
+    const card: any = await response.json();
+    expect(card).toMatchObject({ provider: 'vault-card', last4: '4242', available: 50_000 });
+    // The secret half lives only in the vault — not the response, not the index.
+    expect(JSON.stringify(card)).not.toContain('4242424242424242');
+    const listed = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { headers: auth() })).text();
+    expect(listed).not.toContain('4242424242424242');
+    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(true);
+
+    // Revoking destroys the secret rather than merely hiding the row.
+    expect((await fetch(`${base}/api/cards/${card.id}?organizationId=${orgId}`,
+      { method: 'DELETE', headers: auth() })).status).toBe(200);
+    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(false);
   });
 });
