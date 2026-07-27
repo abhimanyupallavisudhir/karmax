@@ -1822,7 +1822,8 @@ async function navigateToTagSection(tagId) {
   if (!tag) return;
   $('#modal-root').innerHTML = '';
   S.activeView = null;
-  S.search = TAG_SECTION_QUERY;
+  // Section by the tag's own kind so the target section is present in the grouping.
+  S.search = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
   await go(projectRoute(tag.projectId));
   const section = document.getElementById(tagSectionId(tagId));
   if (!section) return;
@@ -2273,11 +2274,10 @@ function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
 // first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
 const BUILTIN_VIEWS = [
-  { id: 'builtin:sectioned', name: 'Sectioned', icon: '§', query: TAG_SECTION_QUERY },
+  { id: 'builtin:sectioned-type', name: 'Sectioned (type)', icon: '§', query: 'group:tag-type' },
+  { id: 'builtin:sectioned-topic', name: 'Sectioned (topic)', icon: '§', query: 'group:tag-topic' },
   { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
-  { id: 'builtin:blocked', name: 'Blocked on deps', icon: '⛔', query: 'is:blocked-on-deps' },
   { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
-  { id: 'builtin:subtasks', name: 'Sub-tasks', icon: '↳', query: 'is:subtask' },
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
@@ -2349,7 +2349,7 @@ function queryToolbarHtml(q, prefix, trailing = '') {
   const params = paramMenuFields();
   // Filter menu: everything with discrete-ish values (skip free-text title/notes),
   // but always include param fields even though they're text-typed.
-  const filterFields = fields.filter((f) => f.type !== 'text' && !f.param);
+  const filterFields = fields.filter((f) => f.type !== 'text' && !f.param && !f.groupOnly);
   const grpFields = fields.filter((f) => f.groupable || f.param);
   const sortFields = fields.filter((f) => f.sortable || f.param);
   const curGroup = (q.match(/(?:^|\s)group:(\S+)/) || [])[1] || '';
@@ -3014,7 +3014,7 @@ function openTagsManager(initialEditId = null) {
       ? sorted.map((t) => `<div class="tagm-row ${editingId === t.id ? 'active' : ''}">
           <button type="button" class="tag-chip tag-link ${t.kind || ''}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
           <span class="tagm-summary">
-            <span class="pal-sub">${esc(t.kind || 'general')}</span>
+            <span class="pal-sub">${esc(t.kind || '—')}</span>
             ${t.description ? `<span class="tagm-description">${esc(t.description)}</span>` : ''}
           </span>
           <span class="q-spacer"></span>
@@ -3042,7 +3042,7 @@ function openTagsManager(initialEditId = null) {
       <div class="tagm-form-head"><div><b>Edit tag</b><span class="pal-sub">${esc(tagPathStr(editing.id))}</span></div><button class="icon-btn" id="tagm-cancel-edit" aria-label="Close editor">✕</button></div>
       <label>Name<input id="tagm-edit-name" class="title-in" value="${esc(editing.name)}" /></label>
       <label>Parent<select id="tagm-edit-parent" class="q-sel"><option value="">No parent (top level)</option>${parentOptions}</select></label>
-      <label>Kind<select id="tagm-edit-kind" class="q-sel"><option value="" ${!editing.kind ? 'selected' : ''}>general</option><option value="topic" ${editing.kind === 'topic' ? 'selected' : ''}>topic</option><option value="type" ${editing.kind === 'type' ? 'selected' : ''}>type</option></select></label>
+      <label>Kind<select id="tagm-edit-kind" class="q-sel"><option value="topic" ${!editing.kind || editing.kind === 'topic' ? 'selected' : ''}>topic</option><option value="type" ${editing.kind === 'type' ? 'selected' : ''}>type</option><option value="flag" ${editing.kind === 'flag' ? 'selected' : ''}>flag</option></select></label>
       <label class="tagm-color-field">Color <input id="tagm-edit-color" type="color" value="${esc(editing.color || '#6b7fd7')}" /><span><input id="tagm-edit-use-color" type="checkbox" ${editing.color ? 'checked' : ''} /> Use color</span></label>
       <label class="tagm-description-field">Description<textarea id="tagm-edit-description" rows="4" placeholder="Optional context shown at the start of this tag's section.">${esc(editing.description || '')}</textarea></label>
       <div class="tagm-actions"><button class="btn primary" id="tagm-save-edit">Save changes</button></div>
@@ -3054,12 +3054,12 @@ function openTagsManager(initialEditId = null) {
       <div class="tagm-form tagm-new">
         <div class="tagm-form-head"><b>Create a tag</b><span class="pal-sub">Use / in the name to create nested parents.</span></div>
         <label>Name or path<input id="tagm-name" class="title-in" placeholder="e.g. frontend/web" /></label>
-        <label>Kind<select id="tagm-kind" class="q-sel"><option value="">general</option><option value="topic" selected>topic</option><option value="type">type</option></select></label>
+        <label>Kind<select id="tagm-kind" class="q-sel"><option value="topic" selected>topic</option><option value="type">type</option><option value="flag">flag</option></select></label>
         <label class="tagm-color-field">Color <input id="tagm-color" type="color" value="#6b7fd7" /><span><input id="tagm-use-color" type="checkbox" checked /> Use color</span></label>
         <label class="tagm-description-field">Description<textarea id="tagm-description" rows="3" placeholder="Optional context shown at the start of this tag's section."></textarea></label>
         <div class="tagm-actions"><button class="btn primary" id="tagm-add">Create tag</button></div>
       </div>
-      <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth).</div>
+      <div class="tagm-hint">Type a <b>/</b>-separated path to nest — missing parents are created automatically. <b>type</b> = kind of work (bug, feature); <b>topic</b> = area (frontend, auth); <b>flag</b> = an operational marker (no-merge).</div>
     </div></div>`;
     const close = () => (root.innerHTML = '');
     $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') close(); });
@@ -4364,7 +4364,7 @@ function openTagPicker(rec, setTags) {
     <div id="tp-create-meta" class="tp-create-meta" hidden>
       <div class="pal-sub">Optional details for the new tag</div>
       <div class="tp-create-row">
-        <select id="tp-create-kind" class="q-sel"><option value="">general</option><option value="topic" selected>topic</option><option value="type">type</option></select>
+        <select id="tp-create-kind" class="q-sel"><option value="topic" selected>topic</option><option value="type">type</option><option value="flag">flag</option></select>
         <input id="tp-create-color" type="color" value="#6b7fd7" title="Tag color" />
         <label><input id="tp-create-use-color" type="checkbox" checked /> Use color</label>
       </div>

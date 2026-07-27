@@ -702,8 +702,9 @@ export type PriorityName = (typeof PRIORITIES)[number];
 /**
  * A tag: a label ("bug", "feature-request") or a topic ("frontend", "auth"), scoped to
  * a project. Tags are hierarchical via `parentId` — selecting a parent in search matches
- * every descendant (Linear label-groups). `kind` separates the two conceptual axes so the
- * UI can present them differently: `type` = what-kind-of-work, `topic` = what-area.
+ * every descendant (Linear label-groups). `kind` separates the conceptual axes so the
+ * UI can present them differently: `type` = what-kind-of-work, `topic` = what-area,
+ * `flag` = an operational marker (e.g. no-merge).
  */
 export interface Tag {
   id: string;
@@ -715,7 +716,7 @@ export interface Tag {
   /** Presentation colour (hex or a named swatch key); optional. */
   color?: string;
   /** Which conceptual axis this tag belongs to. */
-  kind?: 'type' | 'topic';
+  kind?: 'type' | 'topic' | 'flag';
   /** Optional guidance shown at the start of this tag's task-list section. */
   description?: string;
   createdAt: number;

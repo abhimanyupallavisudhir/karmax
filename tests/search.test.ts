@@ -293,6 +293,24 @@ describe('evaluateQuery — hierarchical tags', () => {
       count: 1,
     });
   });
+
+  it('group:tag-type sections by only the type tags', () => {
+    const result = evaluateQuery(tasks, parseQuery('group:tag-type'), ctx);
+    expect(result.hierarchical).toBe(true);
+    // only the `bug` (type) section, plus the topic-tagged tasks pooled as Untagged.
+    expect(result.groups?.map((group) => group.key)).toEqual(['bug', '__untagged__']);
+    expect(result.groups?.find((g) => g.key === 'bug')).toMatchObject({ label: 'bug', count: 1 });
+    expect(result.groups?.find((g) => g.key === '__untagged__')?.count).toBe(2);
+  });
+
+  it('group:tag-topic sections by only the topic tags', () => {
+    const result = evaluateQuery(tasks, parseQuery('group:tag-topic'), ctx);
+    expect(result.hierarchical).toBe(true);
+    // the topic hierarchy (frontend/…), plus the bug-tagged task pooled as Untagged.
+    expect(result.groups?.map((group) => group.key)).toEqual(['front', '__untagged__']);
+    expect(result.groups?.find((g) => g.key === 'front')?.count).toBe(2);
+    expect(result.groups?.find((g) => g.key === '__untagged__')?.count).toBe(1);
+  });
 });
 
 describe('evaluateQuery — dates', () => {
