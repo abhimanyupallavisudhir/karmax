@@ -424,14 +424,17 @@ const NODES = [
 // Provider → model choices for the agent field (free-text also allowed).
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 const MODELS = {
-  claude: ['claude-sonnet-5', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-fable-5'],
+  claude: ['default', 'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku'],
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
   mock: ['mock'],
 };
 function modelOptions(provider) {
   const live = S.modelCatalog?.[provider];
-  return live?.length ? live.map((m) => m.id) : (MODELS[provider] || MODELS.claude);
+  // Keep the provider metadata intact: Claude's stable selectable id can be an
+  // alias such as `opus[1m]`, while its description is what identifies the
+  // concrete model currently behind that alias (for example Opus 5).
+  return live?.length ? live : (MODELS[provider] || MODELS.claude);
 }
 // Which reasoning-effort levels a given model actually accepts (mirrors the
 // server's src/agent/effort.ts gating). Empty = the model has no effort control.
@@ -806,6 +809,16 @@ function collectForm(root, fields) {
 // A lightweight combobox: a real dropdown that opens on focus and on the caret,
 // filters as you type, and still accepts free text. Replaces <datalist>, whose
 // popup is unreliable (won't open on the caret, flaky while typing).
+function normalizeComboOption(option) {
+  if (typeof option === 'string') return { value: option, label: option, description: '' };
+  const value = String(option?.value ?? option?.id ?? '');
+  return {
+    value,
+    label: String(option?.label ?? option?.displayName ?? value),
+    description: String(option?.description ?? ''),
+  };
+}
+
 function wireCombo(combo, getOptions, onChange) {
   const input = combo.querySelector('input');
   const menu = combo.querySelector('.combo-menu');
@@ -824,9 +837,14 @@ function wireCombo(combo, getOptions, onChange) {
   };
   const draw = () => {
     const q = input.value.trim().toLowerCase();
-    const opts = (getOptions() || []).filter((o) => !q || o.toLowerCase().includes(q));
+    const opts = (getOptions() || [])
+      .map(normalizeComboOption)
+      .filter((o) => o.value && (!q || `${o.value} ${o.label} ${o.description}`.toLowerCase().includes(q)));
     menu.innerHTML = opts.length
-      ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o)}">${esc(o)}</div>`).join('')
+      ? opts.map((o) => `<div class="combo-opt" data-v="${esc(o.value)}">
+          <div class="combo-opt-head"><span>${esc(o.label)}</span>${o.label !== o.value ? `<code>${esc(o.value)}</code>` : ''}</div>
+          ${o.description ? `<div class="combo-opt-description">${esc(o.description)}</div>` : ''}
+        </div>`).join('')
       : `<div class="combo-empty">No matching presets — free text is allowed</div>`;
     active = -1; // filtering changes the list; start with nothing highlighted
   };

@@ -4143,7 +4143,7 @@ export class Gateway {
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
       claude: claude.length ? claude : [
-        { id: 'claude-sonnet-5' }, { id: 'claude-opus-4-8' }, { id: 'claude-haiku-4-5' }, { id: 'claude-fable-5' },
+        { id: 'default' }, { id: 'opus[1m]' }, { id: 'claude-fable-5[1m]' }, { id: 'sonnet' }, { id: 'haiku' },
       ],
       codex: codex.length ? codex : [{ id: 'gpt-5.5' }, { id: 'gpt-5.4-mini' }],
       opencode: opencode.length ? opencode : [
