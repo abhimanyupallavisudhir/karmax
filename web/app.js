@@ -64,12 +64,11 @@ const S = {
   liveOutput: '',
   followupDrafts: {}, // (taskId/role) -> half-typed follow-up text, so it survives re-renders and pane switches
   activity: [],
-  search: '', // the working query string (Linear-style tokens + free text)
+  search: '', // the working query string (Linear-style tokens + free text); mirrored in the URL as ?q=
   // Task organization (PLAN-search-views): a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
-  activeView: null, // id of the selected saved view, or null for the ad-hoc/default view
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
   schema: [],
@@ -149,7 +148,13 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { dashboard: 'dashboard', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki', profile: 'profile' };
 
-function parseRoute(pathname) {
+// Parse an in-app URL — a path, optionally with its `?…` query string — into the
+// page it names. The tasks list's whole search state (free text, filters, group,
+// sort) is the one query string in `?q=`, so it rides along as `q` on every
+// project route: a search is just a URL.
+function parseRoute(url) {
+  const [pathname, search = ''] = String(url).split('?');
+  const q = new URLSearchParams(search).get('q') || '';
   const seg = decodeURI(pathname).replace(/\/+$/, '').split('/').filter(Boolean);
   if (!seg.length) return { name: 'home' };
   if (seg[0] === 'invite') return { name: 'invite' };
@@ -161,7 +166,7 @@ function parseRoute(pathname) {
     const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
     const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
     const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, legacy: true };
+    return { name: 'project', slug: seg[1], tab, taskKey, taskTab, q, legacy: true };
   }
   // New scheme: /<org>/… — everything is namespaced under the organization slug.
   const org = seg[0];
@@ -170,16 +175,33 @@ function parseRoute(pathname) {
   const tab = ['tasks', 'queue', 'activity', 'wiki', 'settings'].includes(seg[2]) ? seg[2] : 'tasks';
   const taskKey = seg[2] === 'tasks' && seg[3] ? seg[3] : null;
   const taskTab = taskKey && TASK_TABS.some((t) => t.key === seg[4]) ? seg[4] : null;
-  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab };
+  return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q };
+}
+
+// The `/<org>/<project>` prefix every project URL builds on ('' when unknown).
+function projectBase(pid) {
+  const p = projectById(pid);
+  return p ? `${orgBase(organizationById(p.organizationId)) || orgBase()}/${projectSlug(p)}` : '';
 }
 
 // The list/tab route for a project (by id): /<org>/<project> for the default
-// tasks tab, with the tab appended for the others.
-function projectRoute(pid, tab = 'tasks') {
-  const p = projectById(pid);
-  if (!p) return globalRoute('dashboard');
-  const base = `${orgBase(organizationById(p.organizationId)) || orgBase()}/${projectSlug(p)}`;
-  return tab === 'tasks' ? base : `${base}/${tab}`;
+// tasks tab, with the tab appended for the others. The tasks list additionally
+// carries the working query in `?q=`, so its links are the durable, shareable
+// form of a search — and so moving between tabs (or back from a task) restores
+// the exact filtered/grouped/sorted view. It defaults to the query in hand,
+// which belongs to the project currently on screen and to no other.
+function projectRoute(pid, tab = 'tasks', q = pid === S.projectId ? S.search : '') {
+  const base = projectBase(pid);
+  if (!base) return globalRoute('dashboard');
+  if (tab !== 'tasks') return `${base}/${tab}`;
+  return q ? `${base}?q=${encodeQuery(q)}` : base;
+}
+
+// Query strings are meant to be read and hand-edited in the address bar, so we
+// keep the characters that are legal there legal-looking: ':' and ',' survive
+// unescaped and a space rides as '+' (which URLSearchParams decodes back).
+function encodeQuery(q) {
+  return encodeURIComponent(q).replace(/%3A/g, ':').replace(/%2C/g, ',').replace(/%20/g, '+');
 }
 
 // An organization-level route (dashboard / settings / inbox) under the current
@@ -189,11 +211,15 @@ function globalRoute(tab, org = currentOrg()) {
   return `${orgBase(org)}/${seg}`;
 }
 
+// The URL we are on, query string included — the full identity of the current
+// view, since a search lives in `?q=`.
+function currentPath() { return location.pathname + location.search; }
+
 // Navigate: update the URL then reconcile app state to it. `replace` swaps the
 // current history entry instead of pushing a new one.
 function go(path, opts = {}) {
   closeTaskFormPage();
-  if (path !== location.pathname) {
+  if (path !== currentPath()) {
     history[opts.replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', path);
   }
   return applyRoute();
@@ -222,7 +248,7 @@ async function applyRoute() {
   const routeEpoch = S.routeEpoch = (S.routeEpoch || 0) + 1;
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
-  const r = parseRoute(location.pathname);
+  const r = parseRoute(currentPath());
   if (r.name === 'home') {
     const pid = S.projectId || S.projects[0]?.id;
     return go(pid ? projectRoute(pid) : globalRoute('dashboard'), { replace: true });
@@ -247,7 +273,7 @@ async function applyRoute() {
     if (!r.tab) {
       const pid = S.projectId || S.projects.find((p) => p.organizationId === S.organizationId)?.id;
       const dest = pid ? projectRoute(pid) : globalRoute('dashboard');
-      if (dest !== location.pathname) return go(dest, { replace: true });
+      if (dest !== currentPath()) return go(dest, { replace: true });
       r.tab = 'dashboard'; // fall through to a real page
     }
     if (r.legacy) {
@@ -275,8 +301,8 @@ async function applyRoute() {
   // Pre-organization /projects/:name/… → rewrite to the org-prefixed permalink.
   if (r.legacy) {
     const dest = r.taskKey
-      ? `${projectRoute(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
-      : projectRoute(proj.id, r.tab);
+      ? `${projectBase(proj.id)}/tasks/${r.taskKey}${r.taskTab ? `/${r.taskTab}` : ''}`
+      : projectRoute(proj.id, r.tab, r.q);
     return go(dest, { replace: true });
   }
   const pid = proj.id;
@@ -286,12 +312,12 @@ async function applyRoute() {
   const tab = r.tab || 'tasks';
   if (pid !== S.projectId) {
     // Switching projects: drop the previous project's per-project view state so
-    // its query/selected-view/roving-cursor/search-result can't bleed into the
-    // new project (they'd otherwise re-run the old query against new data and
-    // highlight a view/cursor that doesn't exist here).
+    // its query/roving-cursor/search-result can't bleed into the new project
+    // (they'd otherwise re-run the old query against new data and highlight a
+    // view/cursor that doesn't exist here). The incoming URL's own ?q= is applied
+    // below, so a link into another project's search still lands filtered.
     S.projectId = pid;
     S.search = '';
-    S.activeView = null;
     S.searchResult = null;
     S.cursorId = null;
     await loadTasks().catch(() => {});
@@ -314,6 +340,9 @@ async function applyRoute() {
   S.tab = tab;
   if (!taskId) closeTaskDom();
   if (tab === 'tasks' && !taskId) {
+    // The list is query-driven and the URL owns the query: a pasted, bookmarked,
+    // reloaded or Back-navigated link paints the same filtered/grouped/sorted view.
+    S.search = r.q || '';
     await runSearch().catch(() => {});
     if (!routeIsCurrent()) return;
   }
@@ -330,12 +359,14 @@ async function applyRoute() {
 }
 
 // The permalink for a task (/<org>/<project>/tasks/:num) — used for in-place
-// navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click).
+// navigation and for "open in a new tab" (Ctrl/⌘-click, middle-click). It stays
+// free of the list's ?q=: a task link is about the task, and the query you came
+// from is remembered in S.returnRoute (and in the history entry behind you).
 function taskUrl(id) {
   const rec = taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
   const keyPart = rec && rec.num != null ? String(rec.num) : id;
-  return p ? `${projectRoute(p.id)}/tasks/${keyPart}` : location.pathname;
+  return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
 // True when a click means "open in a new tab/window" by browser convention: any
@@ -350,7 +381,7 @@ function isNewTabClick(ev) {
 // previous task). Generalises the old goToTask logic to any SPA link.
 function spaNavigate(href) {
   const to = parseRoute(href);
-  if (to && to.taskKey && !parseRoute(location.pathname).taskKey) S.returnRoute = location.pathname;
+  if (to && to.taskKey && !parseRoute(currentPath()).taskKey) S.returnRoute = currentPath();
   return go(href);
 }
 
@@ -1830,18 +1861,31 @@ async function runSearch() {
   }
 }
 
+// Mirror the working query into the address bar, so every search — text, filters,
+// grouping, sorting — is a link you can copy, bookmark, reload or reach with Back.
+// replaceState, not push: editing a query refines the view you are on rather than
+// opening a new page, so a typed search doesn't bury the previous page under a
+// history entry per keystroke.
+function syncQueryUrl() {
+  if (S.tab !== 'tasks' || S.selected || !S.projectId) return; // only the list is query-driven
+  const path = projectRoute(S.projectId);
+  if (path !== currentPath()) history.replaceState({ kx: 1 }, '', path);
+}
+
 let searchDebounce = null;
 function scheduleSearch() {
   clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(async () => { await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
+  searchDebounce = setTimeout(async () => { syncQueryUrl(); await runSearch(); if (S.tab === 'tasks') renderMain(); }, 180);
 }
 
 // Programmatically set the working query (view selection, filter/sort/group menus).
-// Updates the topbar box (which renderMain doesn't own), re-evaluates, re-renders.
+// Updates the topbar box (which renderMain doesn't own) and the URL, re-evaluates,
+// re-renders.
 async function setQuery(q) {
   S.search = q || '';
   const box = $('#task-search');
   if (box) box.value = S.search;
+  syncQueryUrl();
   await runSearch();
   if (S.tab === 'tasks') renderMain();
 }
@@ -1852,10 +1896,9 @@ async function navigateToTagSection(tagId) {
   const tag = tagById(tagId);
   if (!tag) return;
   $('#modal-root').innerHTML = '';
-  S.activeView = null;
   // Section by the tag's own kind so the target section is present in the grouping.
-  S.search = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
-  await go(projectRoute(tag.projectId));
+  const q = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
+  await go(projectRoute(tag.projectId, 'tasks', q));
   const section = document.getElementById(tagSectionId(tagId));
   if (!section) return;
   section.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1894,6 +1937,10 @@ function stringifyQuery(q) {
   if (q.text) parts.push(String(q.text).includes(' ') ? `"${q.text}"` : q.text);
   return parts.join(' ');
 }
+
+// A query string's canonical form (parse → stringify), so two spellings of the
+// same search — token order, spacing, quoting — compare equal.
+function normalizeQuery(q) { return stringifyQuery(parseQueryClient(q || '')); }
 
 // ── websocket live stream ──────────────────────────────────────────────────
 let refreshTimer = null;
@@ -2354,19 +2401,33 @@ const BUILTIN_VIEWS = [
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
+// Which view chip a query lights up. A view IS a query, so the query decides —
+// there is no separate "selected view" to keep in sync, and a pasted or reloaded
+// ?q= URL lights the right chip for free. Comparison is on the canonical form, so
+// a view still matches when its query was re-spelled by the toolbar or round-tripped
+// through the saved (structured) form. The empty query is the built-in "All".
+function viewIdForQuery(q) {
+  const s = normalizeQuery(q);
+  if (!s) return null;
+  return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
+    || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
+    || null;
+}
+
 // The saved-views switcher — every chip is a query. "All" is the default; then the
 // built-in starter views, then the user's saved views (each with a ✕ to delete).
 function viewsBar() {
+  const active = viewIdForQuery(S.search);
   const builtins = BUILTIN_VIEWS
-    .map((v) => `<div class="view-chip builtin ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
+    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
     .join('');
   const saved = S.views
     .map(
-      (v) => `<div class="view-chip ${S.activeView === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
+      (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
     )
     .join('');
   return `<div class="views-bar">
-    <div class="view-chip ${!S.activeView ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
+    <div class="view-chip ${!active ? 'active' : ''}" data-view="__all__" tabindex="0">≡ All</div>
     ${builtins}
     ${saved}
     <div class="view-chip add" id="save-view" tabindex="0" title="Save the current query as a view">＋ Save view</div>
@@ -2776,12 +2837,11 @@ function wireOrgControls() {
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === '__all__') { S.activeView = null; setQuery(''); return; }
+      if (id === '__all__') { setQuery(''); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
-      if (builtin) { S.activeView = id; setQuery(builtin.query); return; }
+      if (builtin) { setQuery(builtin.query); return; }
       const v = S.views.find((x) => x.id === id);
       if (!v) return;
-      S.activeView = id;
       setQuery(stringifyQuery(v.query || {}));
     }),
   );
@@ -2795,24 +2855,24 @@ function wireOrgControls() {
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
-        if (S.activeView === id) { S.activeView = null; setQuery(''); } else renderMain();
+        renderMain(); // the query stays in hand (and in the URL); only the chip is gone
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
   $('#manage-tags')?.addEventListener('click', openTagsManager);
-  $('#q-clear')?.addEventListener('click', () => { S.activeView = null; setQuery(''); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { setQuery(''); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
-    search.addEventListener('input', (e) => { S.search = e.target.value; S.activeView = null; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); S.activeView = null; setQuery(''); } });
+    search.addEventListener('input', (e) => { S.search = e.target.value; scheduleSearch(); });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.search) { e.stopPropagation(); setQuery(''); } });
   }
 
-  wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => { S.activeView = null; setQuery(q); } });
+  wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => setQuery(q) });
 }
 
 // Persist the current working query as a named view (Save-view button).
@@ -2827,8 +2887,7 @@ async function saveCurrentView() {
       body: JSON.stringify({ name, query: parseQueryClient(S.search) }),
     });
     S.views.push(v);
-    S.activeView = v.id;
-    renderMain();
+    renderMain(); // the new chip lights up on its own — it is the query already in the box
     toast(`Saved view “${name}”`);
   } catch (err) { toast(err.message, true); }
 }
@@ -2941,7 +3000,6 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   const list = $('#pk-list', host);
   const close = () => host.remove();
   let q = '';
-  let activeView = null;
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
   const sessions = new Map(); // taskId → role→session (agent mode, fetched on expand)
@@ -2950,6 +3008,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   // View chips (All + built-ins + saved) and the toolbar re-render on every query
   // change so their selected state tracks the picker's own query, not the list's.
   const paintControls = () => {
+    const activeView = viewIdForQuery(q);
     $('#pk-views', host).innerHTML = [
       `<div class="view-chip ${!activeView ? 'active' : ''}" data-pkview="__all__">≡ All</div>`,
       ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`),
@@ -2958,14 +3017,13 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     host.querySelectorAll('[data-pkview]').forEach((el) =>
       el.addEventListener('click', () => {
         const id = el.dataset.pkview;
-        activeView = id === '__all__' ? null : id;
         const bv = BUILTIN_VIEWS.find((x) => x.id === id);
         const sv = S.views.find((x) => x.id === id);
         setQ(id === '__all__' ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
       }),
     );
     $('#pk-toolbar', host).innerHTML = queryToolbarHtml(q, 'pk');
-    wireQueryToolbar(host, 'pk', { get: () => q, set: (nq) => { activeView = null; setQ(nq); } });
+    wireQueryToolbar(host, 'pk', { get: () => q, set: (nq) => setQ(nq) });
   };
 
   let deb = null;
@@ -3056,7 +3114,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     paintList();
   };
 
-  search.addEventListener('input', () => { activeView = null; setQ(search.value, true); });
+  search.addEventListener('input', () => setQ(search.value, true));
   search.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(hi + 1, navRows().length - 1); paintHi(); }
@@ -9123,7 +9181,7 @@ function credentialRequestTaskLink(request) {
   const key = task.num != null ? task.num : task.id;
   const label = `${task.num != null ? `#${task.num} · ` : ''}${task.title}`;
   return project
-    ? `<a data-spa href="${projectRoute(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
+    ? `<a data-spa href="${projectBase(project.id)}/tasks/${encodeURIComponent(key)}/approvals">${esc(label)}</a>`
     : `<span>${esc(label)}</span>`;
 }
 
@@ -10005,7 +10063,7 @@ async function openInboxItem(item) {
   S.projectId = project.id; S.organizationId = project.organizationId || S.organizationId;
   await loadTasks().catch(() => {});
   const tab = item.kind === 'approval-requested' ? '/approvals' : '';
-  return go(`${projectRoute(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
+  return go(`${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
 }
 
 // The signed-in person's display name for the topbar/rail. The legacy single-user
@@ -10889,7 +10947,7 @@ function openGlobalSearch() {
       ...found.taskHits.map(({ project, task }) => {
         const stateLabel = task.params?.draft ? 'draft' : task.params?.archived ? 'archived' : task.lastView?.stage || task.lastView?.status || task.workflow;
         const number = task.num != null ? `#${task.num} · ` : '';
-        const href = `${projectRoute(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
+        const href = `${projectBase(project.id)}/tasks/${task.num != null ? task.num : encodeURIComponent(task.id)}`;
         return {
           group: 'Tasks', title: task.title,
           sub: `${number}${project.name} · ${stateLabel}`,
