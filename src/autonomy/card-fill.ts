@@ -1,19 +1,24 @@
 import type { World } from '../world/types.js';
 
+/** Billing fields a checkout may ask for alongside the card itself. */
+export const BILLING_FIELDS = ['line1', 'city', 'postalCode', 'country'] as const;
+export type BillingField = (typeof BILLING_FIELDS)[number];
+
 export interface CardFillDetails {
   number: string;
   cvc: string;
   expMonth: number;
   expYear: number;
+  billing?: Partial<Record<BillingField, string>>;
 }
 
-export interface CardFillSelectors {
+export type CardFillSelectors = {
   number: string;
   cvc: string;
   expiry?: string;
   expMonth?: string;
   expYear?: string;
-}
+} & Partial<Record<BillingField, string>>;
 
 /**
  * Fill a card inside a container/remote world's own loopback browser. Secrets
@@ -35,6 +40,7 @@ export async function fillCardInWorld(world: World, args: {
       KARMAX_CARD_CVC: args.details.cvc,
       KARMAX_CARD_MONTH: String(args.details.expMonth).padStart(2, '0'),
       KARMAX_CARD_YEAR: String(args.details.expYear),
+      KARMAX_CARD_BILLING: JSON.stringify(args.details.billing ?? {}),
     },
   });
   if (result.code !== 0) throw new Error(`secure card fill failed in the task world: ${result.stderr.trim().slice(0, 500)}`);
@@ -106,6 +112,9 @@ else {
   await type(selectors.expYear, process.env.KARMAX_CARD_YEAR);
 }
 await type(selectors.cvc, process.env.KARMAX_CARD_CVC);
+const billing = JSON.parse(process.env.KARMAX_CARD_BILLING || '{}');
+for (const field of ['line1', 'city', 'postalCode', 'country'])
+  if (selectors[field] && billing[field]) await type(selectors[field], billing[field]);
 ws.close();
 process.stdout.write(JSON.stringify({ origin }));
 `;

@@ -21,7 +21,7 @@ import { Overlays } from '../../src/store/overlays.js';
 import { Gateway } from '../../src/gateway/server.js';
 import { CredentialBroker } from '../../src/autonomy/broker.js';
 import { Vault } from '../../src/autonomy/vault.js';
-import { MockPaymentProvider, StripeIssuingProvider, PaymentRegistry } from '../../src/autonomy/payments.js';
+import { MockPaymentProvider, VaultCardProvider, StripeIssuingProvider, PaymentRegistry } from '../../src/autonomy/payments.js';
 import { ConfigHomeManager } from '../../src/autonomy/config-homes.js';
 import { LoginManager } from '../../src/autonomy/login.js';
 import { LocalObjectStore } from '../../src/store/objects.js';
@@ -37,6 +37,7 @@ export interface Harness {
   tokens: TokenAuthority;
   api: KarmaxApi;
   resources: ProjectResourceService;
+  broker: CredentialBroker;
   restartWorker(): Promise<void>;
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
@@ -79,6 +80,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
   const payments = new MockPaymentProvider(store);
   const paymentRegistry = new PaymentRegistry(store);
   paymentRegistry.register(payments);
+  paymentRegistry.register(new VaultCardProvider(store, broker));
   paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
   const activityDeps = {
     store,
@@ -111,6 +113,7 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
     tokens,
     api,
     resources,
+    broker,
     async restartWorker() {
       worker.shutdown();
       await runPromise.catch(() => {});
