@@ -252,12 +252,26 @@ class E2BWorld implements World {
   constructor(public handle: WorldHandle, private sandbox: E2BSandboxLike, private idleMs: number) {}
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
+    const line = [cmd, ...args].map(shellQuote).join(' ');
+    const runOpts = { cwd: this.cwd(opts.cwd), envs: this.remoteEnv(opts.env), timeoutMs: opts.timeoutMs ?? 120_000 };
+    // STDIN path (a secret fed to an in-world helper, kept out of argv/env/files
+    // where the co-resident agent could read it): start in the background with
+    // stdin open, push the input, signal EOF, then await completion.
+    if (opts.input !== undefined) {
+      try {
+        const handle: any = await (this.sandbox.commands.run as any)(line, { ...runOpts, background: true, stdin: true });
+        await handle.sendStdin(opts.input);
+        await handle.closeStdin();
+        const result: any = await handle.wait();
+        return { stdout: String(result?.stdout ?? ''), stderr: String(result?.stderr ?? ''),
+          code: Number(result?.exitCode ?? 0) };
+      } catch (error: any) {
+        return { stdout: String(error?.stdout ?? ''), stderr: String(error?.stderr ?? error?.message ?? error),
+          code: Number(error?.exitCode ?? error?.code ?? 1) };
+      }
+    }
     try {
-      const result = await this.sandbox.commands.run([cmd, ...args].map(shellQuote).join(' '), {
-        cwd: this.cwd(opts.cwd),
-        envs: this.remoteEnv(opts.env),
-        timeoutMs: opts.timeoutMs ?? 120_000,
-      });
+      const result = await this.sandbox.commands.run(line, runOpts);
       return {
         stdout: String(result?.stdout ?? ''),
         stderr: String(result?.stderr ?? ''),

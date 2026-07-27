@@ -8,6 +8,7 @@ import { isIP } from 'node:net';
 // node:sqlite is a newer builtin that bundlers (vite/vitest) cannot statically
 // resolve, so load it through createRequire at runtime.
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+import { passEntryMetadata } from '../autonomy/pass-path.js';
 import {
   Project,
   ProjectConfig,
@@ -157,6 +158,33 @@ export class Store {
         delete p.maxTurns;
       }
       this.db.prepare('UPDATE profiles SET json = ? WHERE id = ?').run(JSON.stringify(p), r.id);
+    }
+
+    // Older `pass`-connector mirrors stored `domains` as the entry's TOP FOLDER
+    // (e.g. ['.wifi'] or ['services']) and no username — the pass-path metadata
+    // parser landed after those items were first imported, and a plain re-sync
+    // does not touch items the user has not re-selected. A folder name can never
+    // match a page origin, so origin-checked blind fill (§5B) and domain grants
+    // were impossible for every pre-existing mirrored login. Re-derive the real
+    // domain/username from each item's pass path (its externalId) — deterministic,
+    // secret-free (no `pass show`/GPG), and idempotent: a re-run derives the same
+    // values already present and writes nothing. Conservative: an item that
+    // already carries a real-looking domain is left untouched.
+    const vaultRows = this.db.prepare("SELECT k, v FROM kv WHERE k LIKE 'vault:items:%'").all() as Array<{ k: string; v: string }>;
+    for (const vrow of vaultRows) {
+      let items: any[];
+      try { items = JSON.parse(vrow.v); } catch { continue; }
+      if (!Array.isArray(items)) continue;
+      let changed = false;
+      for (const item of items) {
+        if (item?.provenance?.source !== 'connector:pass') continue;
+        const { domain, username } = passEntryMetadata(String(item.provenance.externalId ?? item.label ?? ''));
+        const hasRealDomain = Array.isArray(item.domains)
+          && item.domains.some((d: unknown) => typeof d === 'string' && d.includes('.') && !d.startsWith('.'));
+        if (domain && !hasRealDomain) { item.domains = [domain]; changed = true; }
+        if (username && !item.username) { item.username = username; changed = true; }
+      }
+      if (changed) this.db.prepare('UPDATE kv SET v=? WHERE k=?').run(JSON.stringify(items), vrow.k);
     }
   }
 

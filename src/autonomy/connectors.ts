@@ -4,6 +4,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { CredentialBroker } from './broker.js';
 import { VaultItems, VaultItemType, VaultFieldName, VaultItemPolicy } from './vault-items.js';
+import { hostOf, passEntryMetadata } from './pass-path.js';
 
 const pexec = promisify(execFile);
 
@@ -350,37 +351,6 @@ export function parsePassFiles(raw: string, storeDir: string): string[] {
     return [relative.slice(0, -'.gpg'.length).split(path.sep).join('/')];
   });
   return entries.sort();
-}
-
-function hostOf(value?: string): string {
-  if (!value) return '';
-  try {
-    return new URL(value.includes('://') ? value : `https://${value}`).hostname;
-  } catch {
-    return '';
-  }
-}
-
-/**
- * `pass` has no schema: folders are commonly followed by a hostname and then
- * a username (`software/www.overleaf.com/alice@example.com`). Treating the
- * whole store path as a URL makes the first folder look like the host, which
- * produces unusable and unsafe domain metadata. Find the first DNS-looking
- * path component instead and use the final component as the username when it
- * follows that host.
- */
-function passEntryMetadata(entry: string): { domain?: string; username?: string } {
-  const parts = entry.split('/').map((part) => part.trim()).filter(Boolean);
-  const domainIndex = parts.findIndex((part) => {
-    if (part.includes('@') || part.startsWith('.') || !part.includes('.')) return false;
-    const host = hostOf(part);
-    return host === part.toLowerCase()
-      && host.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
-  });
-  if (domainIndex < 0) return {};
-  const domain = hostOf(parts[domainIndex]);
-  const username = domainIndex < parts.length - 1 ? parts.at(-1) : undefined;
-  return { domain, ...(username ? { username } : {}) };
 }
 
 // ── the registry + sync service (state in the store kv) ───────────────────────

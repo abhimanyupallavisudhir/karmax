@@ -28,6 +28,40 @@ describe('Store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('backfills folder-as-domain metadata on legacy pass-connector vault items', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-vault-domain-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const s1 = new Store(dbPath);
+    const org = 'org_personal';
+    const item = (o: any) => ({ type: 'login', fields: ['password'], policy: { use: 'auto', reveal: 'ask' }, ...o });
+    s1.kvSet(`vault:items:${org}`, JSON.stringify([
+      // legacy mirror: domain is the top folder, username missing → repaired
+      item({ id: 'vi_a', label: '.wifi/bbm.glidestudent.co.uk/abhimanyu0', domains: ['.wifi'],
+        provenance: { source: 'connector:pass', externalId: '.wifi/bbm.glidestudent.co.uk/abhimanyu0', at: 1 } }),
+      // already-correct mirror: left untouched (idempotent)
+      item({ id: 'vi_b', label: 'services/github.com/alice', domains: ['github.com'], username: 'alice',
+        provenance: { source: 'connector:pass', externalId: 'services/github.com/alice', at: 1 } }),
+      // no DNS-looking segment: nothing to derive, stays as-is
+      item({ id: 'vi_c', label: 'secrets/rootpw', domains: ['secrets'],
+        provenance: { source: 'connector:pass', externalId: 'secrets/rootpw', at: 1 } }),
+      // task-created item (not a connector mirror): never touched
+      item({ id: 'vi_d', label: 'Conduit', domains: ['demo.realworld.show'],
+        provenance: { source: 'task:task_x', taskId: 'task_x', at: 1 } }),
+    ]));
+    // reopening runs migrateData
+    const s2 = new Store(dbPath);
+    const byId: Record<string, any> = Object.fromEntries(
+      (JSON.parse(s2.kvGet(`vault:items:${org}`)!) as any[]).map((i) => [i.id, i]));
+    expect(byId.vi_a.domains).toEqual(['bbm.glidestudent.co.uk']);
+    expect(byId.vi_a.username).toBe('abhimanyu0');
+    expect(byId.vi_b.domains).toEqual(['github.com']); // already correct
+    expect(byId.vi_b.username).toBe('alice');
+    expect(byId.vi_c.domains).toEqual(['secrets']); // nothing derivable
+    expect(byId.vi_c.username).toBeUndefined();
+    expect(byId.vi_d.domains).toEqual(['demo.realworld.show']); // task item untouched
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('migrates expanded legacy project infrastructure defaults back to organization inheritance', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-project-policy-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
