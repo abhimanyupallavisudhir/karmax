@@ -54,7 +54,7 @@ to:
    connected-account Issuing balance.
 
 That same HTTPS URL works from a phone—no VPN and no Karmax-specific native app
-are required. **Organization settings → Access** offers an
+are required. **Organization settings → Phone Access** offers an
 **Add Karmax to this phone** action; the browser installs the responsive web app
 to the Home Screen. Tailscale is for reaching a Karmax process that lives on a
 private laptop or workstation, not for this hosted stack.

@@ -22,10 +22,12 @@ nothing is hardcoded).
 
 For a local installation, install [Tailscale](https://tailscale.com/download) on
 the Karmax computer and your phone, then sign in to the same tailnet. In Karmax,
-open **Organization settings → Access** and choose **Turn on
-private access**. Karmax shows the private `https://….ts.net` address to open on
+open **Organization settings → Phone Access** and choose **Set up Tailscale**.
+Karmax guides you through system authorization, Tailscale login, and private
+HTTPS approval, then shows the private `https://….ts.net` address to open on
 your phone. It stays bound to localhost; Tailscale Serve supplies private HTTPS
-and never exposes it to the public internet.
+and never exposes it to the public internet. Exact terminal commands remain
+available as a fallback.
 
 For hosted Karmax, open its normal `https://karmax.example.com` address on the
 phone and sign in. In either case, choose **Add Karmax to this phone** in the
@@ -33,6 +35,14 @@ same Access card (or use the browser's **Add to Home Screen**) for a standalone
 app-like window. A Karmax-specific iOS or Android app is not required; the
 responsive installable web app provides the full task, review, and check-in UI.
 The Tailscale mobile app is only needed for a private local installation.
+
+If the private address does not open, first disconnect any other VPN on the
+computer and phone, reconnect Tailscale, and retry. Android and iOS allow only
+one active VPN. On Android, also make sure the browser is not excluded under
+Tailscale's **App-based split tunneling** settings. A browser reporting DNS or
+“name not found” may be bypassing Tailscale's private DNS; set Android Private
+DNS to **Automatic**, temporarily disable the browser's Secure DNS setting, and
+reconnect Tailscale. Keep the Karmax computer awake with Karmax running.
 
 To host the complete HTTPS control plane on a VPS, install Docker and run:
 

@@ -329,6 +329,34 @@ describe('remote access plan (SPEC §12)', () => {
       canEnable: false,
     });
   });
+  it('does not report ready when the local daemon is running but the node is offline', async () => {
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({
+            BackendState: 'Running',
+            Self: { DNSName: 'host.example.ts.net.', Online: false },
+          }),
+          stderr: '',
+        };
+        throw new Error('Serve status must not mask an offline node');
+      },
+    });
+    expect(await controller.status()).toMatchObject({
+      method: 'tailscale',
+      state: 'error',
+      detail: expect.stringMatching(/computer is offline/i),
+      setupStage: 'connect',
+      canSetup: true,
+      fallbackCommands: [
+        'sudo systemctl restart tailscaled',
+        'sudo tailscale up',
+        'sudo tailscale serve --bg --yes http://127.0.0.1:4173',
+      ],
+      canEnable: false,
+    });
+  });
   it('detects and enables the private Tailscale route without touching an existing Serve app', async () => {
     let serve = 'No serve config';
     const calls: string[][] = [];
@@ -363,7 +391,290 @@ describe('remote access plan (SPEC §12)', () => {
         ? { stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }), stderr: '' }
         : { stdout: 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:9000', stderr: '' },
     });
-    expect(await controller.enable()).toMatchObject({ state: 'conflict', canEnable: false, canDisable: false });
+    expect(await controller.enable()).toMatchObject({
+      state: 'conflict',
+      url: 'https://host.example.ts.net',
+      detail: expect.stringMatching(/another local service on port 9000/i),
+      canEnable: false,
+      canDisable: false,
+    });
+    expect((await controller.status()).fallbackCommands).toBeUndefined();
+  });
+  it('turns Linux Serve permission errors into a one-time setup action', async () => {
+    const denied = Object.assign(new Error('command failed'), {
+      stderr: 'Access denied: serve config denied\nUse sudo tailscale serve.\nTo not require root, use sudo tailscale set --operator=$USER once.',
+    });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }),
+          stderr: '',
+        };
+        if (args.join(' ') === 'serve status --json') return { stdout: 'No serve config', stderr: '' };
+        throw denied;
+      },
+    });
+    expect(await controller.enable()).toMatchObject({
+      state: 'error',
+      detail: expect.stringMatching(/one-time permission/i),
+      setupCommand: 'sudo tailscale set --operator=$USER',
+      canEnable: true,
+    });
+  });
+  it('links the per-device Serve approval when the tailnet has not enabled it', async () => {
+    const approval = Object.assign(new Error('command failed'), {
+      stderr: 'Serve is not enabled on your tailnet. To enable, visit:\nhttps://login.tailscale.com/f/serve?node=abc123',
+    });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }),
+          stderr: '',
+        };
+        if (args.join(' ') === 'serve status --json') return { stdout: 'No serve config', stderr: '' };
+        throw approval;
+      },
+    });
+    expect(await controller.enable()).toMatchObject({
+      state: 'error',
+      helpUrl: 'https://login.tailscale.com/f/serve?node=abc123',
+      canEnable: true,
+    });
+  });
+  it('shows both one-time actions when Tailscale reports approval and permission together', async () => {
+    const combined = Object.assign(new Error('command failed'), {
+      stderr: [
+        'Serve is not enabled on your tailnet.',
+        'https://login.tailscale.com/f/serve?node=abc123',
+        'Access denied: serve config denied',
+        'Use sudo tailscale set --operator=$USER once.',
+      ].join('\n'),
+    });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'host.example.ts.net.' } }),
+          stderr: '',
+        };
+        if (args.join(' ') === 'serve status --json') return { stdout: 'No serve config', stderr: '' };
+        throw combined;
+      },
+    });
+    expect(await controller.enable()).toMatchObject({
+      state: 'error',
+      detail: expect.stringMatching(/two one-time setup steps/i),
+      helpUrl: 'https://login.tailscale.com/f/serve?node=abc123',
+      setupCommand: 'sudo tailscale set --operator=$USER',
+      canEnable: true,
+    });
+  });
+  it('uses native Linux authorization and returns the Tailscale login step', async () => {
+    const calls: string[][] = [];
+    const elevated: string[][] = [];
+    const denied = Object.assign(new Error('Access denied'), { stderr: 'Access denied; use sudo' });
+    const login = Object.assign(new Error('timed out'), {
+      stdout: 'To authenticate, visit:\nhttps://login.tailscale.com/a/login123',
+      stderr: 'timed out waiting for Running state',
+    });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      platform: 'linux',
+      username: 'alice',
+      run: async (args) => {
+        calls.push(args);
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({ BackendState: 'NeedsLogin', Self: {} }),
+          stderr: '',
+        };
+        if (args[0] === 'set') throw denied;
+        if (args[0] === 'up') throw login;
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+      elevate: async (args) => {
+        elevated.push(args);
+        return { stdout: '', stderr: '' };
+      },
+    });
+    expect(await controller.setup()).toMatchObject({
+      state: 'needs-login',
+      setupStage: 'login',
+      helpUrl: 'https://login.tailscale.com/a/login123',
+      detail: expect.stringMatching(/finish signing in/i),
+      canSetup: true,
+    });
+    expect(calls).toContainEqual(['set', '--operator=alice']);
+    expect(elevated).toEqual([['set', '--operator=alice']]);
+  });
+  it('finishes a connected setup by enabling private Serve noninteractively', async () => {
+    let serve = 'No serve config';
+    const calls: string[][] = [];
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      platform: 'linux',
+      username: 'alice',
+      run: async (args) => {
+        calls.push(args);
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({
+            BackendState: 'Running',
+            Self: { DNSName: 'host.example.ts.net.', Online: true },
+          }),
+          stderr: '',
+        };
+        if (args[0] === 'set') return { stdout: '', stderr: '' };
+        if (args.join(' ') === 'serve status --json') return { stdout: serve, stderr: '' };
+        if (args.join(' ') === 'serve --bg --yes http://127.0.0.1:4173') {
+          serve = 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:4173';
+          return { stdout: 'Serve started', stderr: '' };
+        }
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+    });
+    expect(await controller.setup()).toMatchObject({
+      state: 'ready',
+      setupStage: 'ready',
+      url: 'https://host.example.ts.net',
+      canSetup: false,
+    });
+    expect(calls).toContainEqual(['serve', '--bg', '--yes', 'http://127.0.0.1:4173']);
+  });
+  it('returns the Tailscale Serve approval page as the next guided step', async () => {
+    const approval = Object.assign(new Error('Serve is not enabled'), {
+      stderr: 'Serve is not enabled on your tailnet.\nhttps://login.tailscale.com/f/serve?node=abc123',
+    });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      platform: 'linux',
+      username: 'alice',
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({
+            BackendState: 'Running',
+            Self: { DNSName: 'host.example.ts.net.', Online: true },
+          }),
+          stderr: '',
+        };
+        if (args[0] === 'set') return { stdout: '', stderr: '' };
+        if (args.join(' ') === 'serve status --json') return { stdout: 'No serve config', stderr: '' };
+        if (args[0] === 'serve' && args[1] === '--bg') throw approval;
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+    });
+    expect(await controller.setup()).toMatchObject({
+      state: 'error',
+      setupStage: 'serve',
+      helpUrl: 'https://login.tailscale.com/f/serve?node=abc123',
+      detail: expect.stringMatching(/approve private HTTPS/i),
+      canSetup: true,
+    });
+  });
+  it('falls back cleanly when native system authorization is declined', async () => {
+    const denied = Object.assign(new Error('Access denied'), { stderr: 'Access denied; use sudo' });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      platform: 'linux',
+      username: 'alice',
+      run: async (args) => args[0] === 'status'
+        ? { stdout: JSON.stringify({ BackendState: 'NeedsLogin', Self: {} }), stderr: '' }
+        : Promise.reject(denied),
+      elevate: async () => { throw Object.assign(new Error('Not authorized'), { stderr: 'Not authorized' }); },
+    });
+    expect(await controller.setup()).toMatchObject({
+      state: 'error',
+      setupStage: 'authorize',
+      detail: expect.stringMatching(/authorization was not completed/i),
+      fallbackCommands: [
+        'sudo tailscale up',
+        'sudo tailscale serve --bg --yes http://127.0.0.1:4173',
+      ],
+      canSetup: true,
+    });
+  });
+  it('coalesces concurrent setup requests so only one OS or Serve action runs', async () => {
+    let serve = 'No serve config';
+    let serveCalls = 0;
+    let releaseServe!: () => void;
+    const serveGate = new Promise<void>((resolve) => { releaseServe = resolve; });
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      platform: 'linux',
+      username: 'alice',
+      run: async (args) => {
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({
+            BackendState: 'Running',
+            Self: { DNSName: 'host.example.ts.net.', Online: true },
+          }),
+          stderr: '',
+        };
+        if (args[0] === 'set') return { stdout: '', stderr: '' };
+        if (args.join(' ') === 'serve status --json') return { stdout: serve, stderr: '' };
+        if (args[0] === 'serve' && args[1] === '--bg') {
+          serveCalls++;
+          await serveGate;
+          serve = 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:4173';
+          return { stdout: 'Serve started', stderr: '' };
+        }
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+    });
+    const first = controller.setup();
+    await expect.poll(() => serveCalls).toBe(1);
+    const second = controller.setup();
+    releaseServe();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.objectContaining({ state: 'ready' }),
+      expect.objectContaining({ state: 'ready' }),
+    ]);
+    expect(serveCalls).toBe(1);
+  });
+  it('runs setup in the background without taking an offline Tailscale node down', async () => {
+    let online = false;
+    let serve = 'No serve config';
+    let releaseUp!: () => void;
+    const upGate = new Promise<void>((resolve) => { releaseUp = resolve; });
+    const calls: string[][] = [];
+    const controller = new RemoteAccessController({
+      port: () => 4173,
+      platform: 'linux',
+      username: 'alice',
+      run: async (args) => {
+        calls.push(args);
+        if (args[0] === 'status') return {
+          stdout: JSON.stringify({
+            BackendState: 'Running',
+            Self: { DNSName: 'host.example.ts.net.', Online: online },
+          }),
+          stderr: '',
+        };
+        if (args[0] === 'set') return { stdout: '', stderr: '' };
+        if (args[0] === 'up') {
+          await upGate;
+          online = true;
+          return { stdout: '', stderr: '' };
+        }
+        if (args.join(' ') === 'serve status --json') return { stdout: serve, stderr: '' };
+        if (args[0] === 'serve' && args[1] === '--bg') {
+          serve = 'https://host.example.ts.net\n|-- / proxy http://127.0.0.1:4173';
+          return { stdout: 'Serve started', stderr: '' };
+        }
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+    });
+
+    expect(controller.beginSetup()).toMatchObject({
+      setupInProgress: true,
+      canSetup: false,
+      detail: expect.stringMatching(/continue automatically/i),
+    });
+    await expect.poll(() => calls.some((args) => args[0] === 'up')).toBe(true);
+    await expect(controller.setupStatus()).resolves.toMatchObject({ setupInProgress: true });
+    releaseUp();
+    await expect.poll(async () => (await controller.setupStatus()).state).toBe('ready');
+    expect(calls.some((args) => args[0] === 'down')).toBe(false);
   });
   it('reports a hosted HTTPS installation as ready without invoking Tailscale', async () => {
     const controller = new RemoteAccessController({
@@ -375,8 +686,10 @@ describe('remote access plan (SPEC §12)', () => {
     expect(await controller.status()).toEqual({
       method: 'hosted',
       state: 'ready',
+      setupStage: 'ready',
       url: 'https://karmax.example.com',
       detail: 'This hosted installation already uses authenticated HTTPS.',
+      canSetup: false,
       canEnable: false,
       canDisable: false,
     });
