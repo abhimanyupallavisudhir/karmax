@@ -7,6 +7,7 @@ import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError } from '../platform/api.js';
 import type { TaskView } from '../domain/types.js';
+import { BRAND_FILES, brandIconOf, isBrandIcon } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { AttachmentStore, AttachmentError, MAX_IMAGE_BYTES } from '../store/attachments.js';
 import { KarmaxBus } from '../contrib/bus.js';
@@ -711,6 +712,7 @@ export class Gateway {
       return void res.end();
     }
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
+    if (p.startsWith('/brand/')) return this.brand(p, res);
     if (p.startsWith('/api/')) return this.api(req, res, url);
     if (p === '/ws') return; // handled by ws
     return this.static(p, res);
@@ -4077,6 +4079,9 @@ export class Gateway {
           if (wf === 'agent-queue' && (!Number.isFinite(Number(b.values?.capacity)) || Number(b.values.capacity) < 1)) {
             return this.json(res, 400, { error: 'Concurrent agent turns must be at least 1' });
           }
+          if (wf === 'appearance' && !isBrandIcon(b.values?.icon)) {
+            return this.json(res, 400, { error: 'Unknown brand icon' });
+          }
           store.setSettings('global', wf, b.values ?? {});
           if (wf === 'agent-queue') await api.setAgentCapacity(Number(b.values?.capacity));
           return this.json(res, 200, { ok: true });
@@ -4472,6 +4477,28 @@ export class Gateway {
       byStage[stage] = (byStage[stage] ?? 0) + 1;
     }
     return { accounts, projects: projects.length, tasks: allTasks.length, byStage };
+  }
+
+  /** Brand assets, resolved per request against the instance-wide icon setting.
+   * Serving them from one stable path is what lets the favicon, the installed
+   * app icon and the pre-auth login mark all follow the setting with no client
+   * knowledge of it — and no build step over `web/`. */
+  private async brand(p: string, res: http.ServerResponse) {
+    const name = p.slice('/brand/'.length);
+    // `/brand/<file>` follows the setting; `/brand/<variant>/<file>` addresses one
+    // variant directly, which is how the settings picker previews the choices.
+    if (!BRAND_FILES.includes(name as (typeof BRAND_FILES)[number])) return this.static(p, res);
+    const icon = brandIconOf(this.deps.store.getSettings('global', 'appearance'));
+    try {
+      const data = await fs.promises.readFile(path.join(this.deps.staticDir, 'brand', icon, name));
+      // Favicons are cached hard by default; revalidating keeps a switch instant.
+      res.writeHead(200, { 'content-type': MIME[path.extname(name)]!, 'cache-control': 'no-cache' });
+      res.end(data);
+    } catch {
+      // A variant need not ship every format (only the diamond has an SVG); the
+      // browser falls through to the next <link rel="icon"> on a miss.
+      res.writeHead(404).end('not found');
+    }
   }
 
   // ── static SPA ──
