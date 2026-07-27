@@ -736,6 +736,35 @@ describe('budget coordinator (virtual-card lease, SPEC §7.6)', () => {
     await ping.result();
     await coord.terminate('done');
   });
+
+  it('re-checks the hard cap at approval time so stacked approvals cannot overspend', async () => {
+    const grantee = newId('task');
+    const ping = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: grantee, args: ['x'] });
+    const coord = await h.client.workflow.start('budgetCoordinator', {
+      taskQueue: TASK_QUEUE,
+      workflowId: newId('budget-coord'),
+      args: [{ state: { scopes: {}, defaultCap: 1000, threshold: 300, pending: [], processed: 0 } }],
+    });
+    const budget = () => coord.query('budget') as Promise<any>;
+
+    // Two over-threshold requests both pass the request-time cap check (spent is
+    // still 0 when each arrives), so both are parked pending.
+    await coord.signal('requestSpend', { reqId: 'a', taskId: grantee, scope: 'profA', amount: 600 });
+    await coord.signal('requestSpend', { reqId: 'b', taskId: grantee, scope: 'profA', amount: 600 });
+    await expect.poll(async () => (await budget()).pending.length, { timeout: 8000 }).toBe(2);
+
+    // Approving both would total 1200 > 1000. The first commits; the second must
+    // be declined at approval rather than pushing spent past the cap.
+    await coord.signal('approveSpend', { reqId: 'a' });
+    await expect.poll(async () => (await budget()).scopes.profA.spent, { timeout: 8000 }).toBe(600);
+    await coord.signal('approveSpend', { reqId: 'b' });
+    await new Promise((r) => setTimeout(r, 800));
+    expect((await budget()).scopes.profA.spent).toBe(600); // NOT 1200
+
+    await ping.signal('finish');
+    await ping.result();
+    await coord.terminate('done');
+  });
 });
 
 describe('PTY terminal check-in (SPEC §5.5)', () => {

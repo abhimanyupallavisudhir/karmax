@@ -326,6 +326,7 @@ export class AcpAdapter implements AgentAdapter {
     let sessionId: string | undefined;
     let finalText = '';
     let delivered = input.messages.length;
+    let steered = false; // a mid-turn follow-up cancelled this prompt to hand it to the next turn
     let clientContext: any;
     const tools = new Map<string, ToolCall>();
     const terminals = new Map<string, AcpTerminal>();
@@ -532,17 +533,54 @@ export class AcpAdapter implements AgentAdapter {
           throw new Error(`${this.provider} ACP agent does not advertise image prompt support`);
         }
         promptBlocks.push(...images);
-        const result = await agent.request(methods.agent.session.prompt, {
-          sessionId,
-          prompt: promptBlocks,
-        }, { cancellationSignal: ctx.signal });
+        // Cancel-to-boundary steering (SPEC §7.1). ACP v1 has no in-turn steer, so
+        // while the turn runs we watch for a queued follow-up; on a new one we send
+        // session/cancel (the agent then returns stopReason 'cancelled') and return
+        // cleanly. `delivered` is left unchanged, so the workflow loops back to Do
+        // and delivers the follow-up on the next turn.
+        const followPoll = ctx.pullFollowUps
+          ? setInterval(() => void (async () => {
+              if (steered) return;
+              try {
+                if ((await ctx.pullFollowUps!(delivered)).length) {
+                  steered = true;
+                  if (sessionId) void agent.notify(methods.agent.session.cancel, { sessionId }).catch(() => undefined);
+                }
+              } catch { /* a failed poll must not break the turn */ }
+            })(), 1200)
+          : undefined;
+        let result;
+        try {
+          result = await agent.request(methods.agent.session.prompt, {
+            sessionId,
+            prompt: promptBlocks,
+          }, { cancellationSignal: ctx.signal });
+        } finally {
+          if (followPoll) clearInterval(followPoll);
+        }
         // The SDK dispatches notifications independently from request responses.
         // Let already-buffered updates ahead of the terminal response finish their
         // handlers before connectWith closes the stream.
         await new Promise<void>((resolve) => setImmediate(resolve));
         return result;
       });
-      if (ctx.signal?.aborted || response.stopReason === 'cancelled') throw new Error(`${this.provider} ACP turn cancelled`);
+      if (ctx.signal?.aborted) throw new Error(`${this.provider} ACP turn cancelled`);
+      if (response.stopReason === 'cancelled') {
+        if (steered) {
+          // Cancelled to hand a mid-turn follow-up to the next turn — a clean
+          // boundary, not a failure. `delivered` is unchanged, so the workflow
+          // loops back to Do and delivers the follow-up (software-dev §5.6).
+          return { termination: { kind: 'success', status: 'end_turn' }, session: sessionId, output: finalText, delivered };
+        }
+        throw new Error(`${this.provider} ACP turn cancelled`);
+      }
+      if (response.stopReason === 'max_tokens' || response.stopReason === 'max_turn_requests') {
+        // The model produced valid work but hit an output/turn-count boundary.
+        // Treat it as an interruption that resumes the session on retry (parity
+        // with the Claude SDK's max_output_tokens handling), not a hard failure
+        // that escalates to a human.
+        throw new Error(`turn interrupted before completion: ${this.provider} reached ${response.stopReason}`);
+      }
       if (response.stopReason !== 'end_turn') {
         throw new Error(`${this.provider} ACP turn did not complete successfully (${response.stopReason})`);
       }

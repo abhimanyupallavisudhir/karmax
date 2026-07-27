@@ -17,6 +17,7 @@ import { KarmaxBus } from './contrib/bus.js';
 import { TokenAuthority } from './platform/tokens.js';
 import { CredentialBroker } from './autonomy/broker.js';
 import { Vault } from './autonomy/vault.js';
+import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
 import { GitProfiles } from './autonomy/git-profiles.js';
 import { KarmaxApi } from './platform/api.js';
 import { ContributionRegistry } from './contrib/registry.js';
@@ -91,13 +92,30 @@ async function main() {
   const authorization = new AuthorizationService(store);
   const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '');
   const publicHost = (() => { try { return publicUrl ? new URL(publicUrl).hostname : undefined; } catch { return undefined; } })();
+  const configuredAuthHosts = [
+    ...(process.env.KARMAX_AUTH_HOSTS ?? '127.0.0.1,localhost,*.ts.net').split(',').map((x) => x.trim()).filter(Boolean),
+    ...(publicHost ? [publicHost] : []),
+  ];
+  // Better Auth matches the request's Host header WITH its port against each
+  // allowedHosts pattern, so a bare host (`localhost`) never matches a dev server
+  // on a non-standard port (`localhost:4506`) — it silently fell back to the
+  // hardcoded fallback URL, which made verification/reset links point at the
+  // wrong port and made the password-reset origin check reject the redirect. Add
+  // a scheme-qualified port-wildcard per host: Better Auth trusts those origins
+  // verbatim AND (after stripping the scheme) matches them for base-URL
+  // resolution, so links and origin checks track whatever host:port the user is
+  // actually on. Loopback hosts get http; everything else https.
+  const isLoopbackHost = (h: string) => /^(localhost|127\.|\[?::1\]?)/.test(h) || h.endsWith('.localhost');
+  const authHosts = [...new Set([
+    ...configuredAuthHosts,
+    ...configuredAuthHosts
+      .filter((h) => !h.includes('://') && !/:\d/.test(h))
+      .map((h) => `${isLoopbackHost(h) ? 'http' : 'https'}://${h}:*`),
+  ])];
   const identity = await IdentityService.open(path.join(p.state, 'auth.db'), {
     secret: process.env.KARMAX_AUTH_SECRET,
     baseURL: {
-      allowedHosts: [
-        ...(process.env.KARMAX_AUTH_HOSTS ?? '127.0.0.1,localhost,*.ts.net').split(',').map((x) => x.trim()).filter(Boolean),
-        ...(publicHost ? [publicHost] : []),
-      ],
+      allowedHosts: authHosts,
       fallback: publicUrl ?? `http://127.0.0.1:${process.env.KARMAX_PORT ?? 4505}`,
     },
     ...(process.env.KARMAX_OIDC_DISCOVERY_URL && process.env.KARMAX_OIDC_CLIENT_ID && process.env.KARMAX_OIDC_CLIENT_SECRET
@@ -117,6 +135,16 @@ async function main() {
   const bus = new KarmaxBus();
   const tokens = new TokenAuthority(store);
   const broker = new CredentialBroker(new Vault(p.vault));
+  // Installation-wide outbound email (account confirmation, password reset, org
+  // invites). Reads its live config + vaulted secret on each send, so connecting
+  // a provider in Settings takes effect without a restart. Handed to identity so
+  // Better Auth's reset/verify hooks can send.
+  const emailConfig = (): OutboundEmailConfig => {
+    try { return JSON.parse(store.kvGet('email:outbound') ?? '{}'); } catch { return {}; }
+  };
+  const emailService = new EmailService(emailConfig,
+    (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined));
+  identity.mailer = emailService;
   const providerConnections = new WorldProviderConnectionService(store, broker);
   providerConnections.importEnvironment();
   worlds.register(new E2BWorldProvider(undefined, undefined, undefined,
@@ -376,6 +404,7 @@ async function main() {
     staticDir,
     agentInfo: { provider, reason },
     broker,
+    email: emailService,
     payments,
     paymentRegistry,
     login,

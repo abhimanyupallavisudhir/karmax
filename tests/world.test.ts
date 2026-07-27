@@ -159,6 +159,10 @@ describe('WorktreeProvider (real git)', () => {
     const world = await provider.create({ taskId: 'copy1', repo, base: 'main', copyGlobs: ['.env'] });
     expect(await world.readFile('.env')).toContain('SECRET=1');
     expect(world.handle.meta?.ephemeralPaths).toEqual(['.env']);
+    // The copied secret must be git-excluded so an agent's `git add -A` can't
+    // stage and commit it (the .gitignore that hid it in the origin isn't copied).
+    const others = await git(world.handle.root, ['ls-files', '--others', '--exclude-standard']);
+    expect(others.stdout).not.toContain('.env');
     await world.destroy();
   });
 });

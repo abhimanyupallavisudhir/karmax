@@ -257,9 +257,12 @@ async function applyRoute() {
     closeTaskDom();
     S.tab = r.tab;
     renderRail();
+    // renderMain() already dispatches per-tab hydration (renderDashboard,
+    // hydrateOrganizationView, …). Calling them again here double-ran hydration
+    // on the same DOM, stacking a second click listener on static buttons like
+    // "Invite" — which sent every invitation (and its email) twice and rendered
+    // the pending list twice. One dispatch only.
     renderMain();
-    if (r.tab === 'dashboard') renderDashboard();
-    if (r.tab === 'organization') hydrateOrganizationView();
     return;
   }
   // project / task routes → resolve the org + project (by name-slug) + optional open task
@@ -437,11 +440,13 @@ const NODES = [
 ];
 
 // Provider → model choices for the agent field (free-text also allowed).
-const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
+const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok', 'mock'];
 const MODELS = {
   claude: ['default', 'opus[1m]', 'claude-fable-5[1m]', 'sonnet', 'haiku'],
   codex: ['gpt-5.5', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
+  kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
+  grok: ['grok-build', 'grok-code-fast-1'],
   mock: ['mock'],
 };
 function modelOptions(provider) {
@@ -1612,9 +1617,27 @@ function toast(msg, err = false, action) {
 
 // ── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
+  // The emailed password-reset link lands here unauthenticated; handle it before
+  // any session/setup gating so a signed-out user can actually reset.
+  if (location.pathname === '/reset-password') {
+    return renderResetPassword(new URLSearchParams(location.search).get('token') || '');
+  }
+  // Better Auth redirects the confirmation link back here with ?verified=1 after
+  // marking the address verified. Note it, strip it from the URL, and surface it
+  // (a toast in-app, or a line on the sign-in card if the link was opened while
+  // signed out).
+  if (new URLSearchParams(location.search).get('verified') === '1') {
+    S.justVerified = true;
+    history.replaceState({ kx: 1 }, '', location.pathname);
+  }
   const session = await (await fetch('/api/session')).json();
   S.sso = session.sso || null;
   if (session.setupRequired) return renderSetup();
+  // An invite link opened while signed out: keep the token in the URL (boot
+  // re-runs and accepts it once authenticated) and tell the sign-in / sign-up
+  // card that a pending invitation is waiting, so a brand-new invitee knows to
+  // create an account — with the address the invite was sent to.
+  S.pendingInvite = location.pathname === '/invite' && !!new URLSearchParams(location.search).get('token');
   if (session.authRequired && !session.authenticated && !session.token) return renderLogin();
   S.token = session.token || null; // Better Auth uses an HttpOnly same-origin cookie.
   S.user = session.user || null;
@@ -1656,6 +1679,7 @@ async function boot() {
   } catch {}
   connectWs();
   renderShell();
+  if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
   bindKeys();
   installLinkRouter();
   installTagRouter();
@@ -1993,6 +2017,33 @@ async function refreshTasks() {
 }
 
 // ── shell ────────────────────────────────────────────────────────────────────
+// A dismissible banner while the signed-in user's email is unconfirmed. Better
+// Auth exposes `emailVerified` on the session user; only shown for real identity
+// accounts (not legacy single-user 'me') that have an address and outbound email
+// to actually resend through.
+function verificationBanner() {
+  const u = S.user && typeof S.user === 'object' ? S.user : null;
+  if (!u || u.emailVerified !== false || !u.email || S.verifyBannerDismissed) return '';
+  return `<div class="verify-banner" id="verify-banner">
+    <span>Confirm your email <b>${esc(u.email)}</b> to finish securing your account.</span>
+    <button class="btn sm" id="verify-resend">Resend link</button>
+    <button class="verify-dismiss" id="verify-dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
+  </div>`;
+}
+
+function wireVerificationBanner() {
+  $('#verify-resend')?.addEventListener('click', async () => {
+    const btn = $('#verify-resend'); btn.disabled = true;
+    try {
+      const res = await fetch('/api/auth/send-verification-email', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: S.user.email, callbackURL: `${location.origin}/?verified=1` }) });
+      toast(res.ok ? 'Confirmation email sent — check your inbox.' : 'Could not send — ask an operator to set up outbound email.', !res.ok);
+    } catch { toast('Could not send confirmation email', true); }
+    btn.disabled = false;
+  });
+  $('#verify-dismiss')?.addEventListener('click', () => { S.verifyBannerDismissed = true; $('#verify-banner')?.remove(); });
+}
+
 function renderShell() {
   const app = $('#app');
   app.innerHTML = `
@@ -2012,6 +2063,7 @@ function renderShell() {
       <a class="topbar-user" id="topbar-user" data-spa href="${globalRoute('profile')}" title="Your profile">${esc(userDisplayName())}</a>
       <a class="icon-btn has-badge" id="bell" data-spa href="${globalRoute('inbox')}" title="Inbox" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
+    ${verificationBanner()}
     <div class="body">
       <div class="rail" id="rail"></div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
@@ -2022,6 +2074,7 @@ function renderShell() {
   $('#topbar-search').addEventListener('click', openGlobalSearch);
   $('#topbar-palette').addEventListener('click', openPalette);
   $('#topbar-help').addEventListener('click', openHelp);
+  wireVerificationBanner();
   const closeMobileNav = () => {
     $('#rail')?.classList.remove('mobile-open');
     $('#rail-scrim')?.classList.remove('visible');
@@ -4967,7 +5020,7 @@ function syncTermButton() {
     btn.disabled = false;
   } else {
     btn.classList.remove('danger');
-    btn.textContent = hasWorld ? 'Open terminal' : 'No world yet';
+    btn.textContent = hasWorld ? 'Open terminal' : 'No workspace yet';
     btn.disabled = !hasWorld;
   }
 }
@@ -5321,8 +5374,8 @@ function checkinTab(v) {
       ${items}
       <div class="ck-side-h">Shell</div>
       <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
-        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? 'Open a terminal in this task world' : 'No world yet'}">
-          <span class="ck-name">${hasWorld ? 'Open terminal' : 'No world yet'}</span>
+        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? 'Open a terminal in this task's workspace' : 'No workspace yet'}">
+          <span class="ck-name">${hasWorld ? 'Open terminal' : 'No workspace yet'}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
         ${v.worldPath ? `<button class="ck-terminal-copy copy-cmd" data-cmd="${esc(`cd ${v.worldPath} && $SHELL`)}" data-copy-icon="1" title="Copy terminal command" aria-label="Copy terminal command">${ICON.copy}</button>` : ''}
@@ -5640,11 +5693,11 @@ function terminalPane(v) {
       ${v.worldAvailable && !v.worldPath ? '<button class="btn sm" id="terminal-native">Copy attach cmd</button>' : ''}
       ${v.worldProvider && !['worktree', 'container', 'memory'].includes(v.worldProvider) ? '<button class="btn sm" id="local-checkout">Work locally</button>' : ''}
       ${v.worldDesktop ? '<button class="btn sm" id="desktop-open">Open desktop</button>' : ''}
-      <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No world yet'}</button>
+      <button class="btn sm" id="term-open" ${hasWorld ? '' : 'disabled'}>${hasWorld ? 'Open terminal' : 'No workspace yet'}</button>
     </div>
     <div class="ck-term">
       <pre class="raw ${open ? '' : 'hidden'} term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell"></pre>
-      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? '“Open terminal” starts one in the task\'s world.' : 'This task has no world yet.'}</div>`}
+      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? '“Open terminal” starts one in the task\'s world.' : 'This task hasn't started its workspace yet.'}</div>`}
     </div>`;
 }
 
@@ -6241,7 +6294,7 @@ function taskActions(v) {
   // The follow-up box lives inside each agent's conversation on the Check-in tab,
   // so a human can address any agent (SPEC §5.6).
   html += `</div>`;
-  if (!acts.length) html = `<div style="color:var(--ink-3)">No actions available — task is ${esc(v.stage)}.</div>`;
+  if (!acts.length) html = `<div style="color:var(--ink-3)">Nothing to do here right now.</div>`;
   return html;
 }
 
@@ -6251,7 +6304,10 @@ function wireActions(v) {
       const act = btn.dataset.act;
       try {
         await api(`/api/tasks/${v.taskId}/signal`, { method: 'POST', body: JSON.stringify({ signal: act }) });
-        toast(`${act} sent`);
+        // Button → toast vocabulary must match (Confirm → Confirmed). Fall back to
+        // the button's own label so custom actions read naturally.
+        const done = { confirm: 'Confirmed', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+        toast(done[act] || `${(btn.textContent || act).trim()} done`);
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
@@ -6388,7 +6444,7 @@ function queueRank(t) {
 
 function mergeQueuePanel() {
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage));
-  if (!inMerge.length) return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks appear here when they reach the merge stage.</div></div>`;
+  if (!inMerge.length) return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks show up here when they're ready to merge.</div></div>`;
   // Group by merge domain — reordering is only meaningful within a single serialization
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
@@ -6441,7 +6497,7 @@ function agentQueuePanel() {
     }).join('');
   return rows
     ? `<div class="queue-list agent-queue-list">${rows}</div>`
-    : `<div class="card"><div class="empty"><div class="big">Agent queue is empty</div>Agent turns appear here while running or waiting for host capacity.</div></div>`;
+    : `<div class="card"><div class="empty"><div class="big">Agent queue is empty</div>Agents show up here while they're running or waiting for a free slot.</div></div>`;
 }
 
 function queuesView() {
@@ -6765,13 +6821,19 @@ async function renderDashboard() {
   try {
     const organizationId = S.organizationId || 'org_personal';
     const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
+    // The dashboard is org-scoped (counts for THIS organization). Host panels
+    // (diagnostics, processes, agent-account leasing) are operator-only; a
+    // non-operator's /api/diagnostics returns null and those panels are hidden,
+    // so a regular member — e.g. a fresh personal workspace — sees a clean
+    // overview instead of a "missing capability diagnostic:read" error.
     const [d, u, credentialData, diag] = await Promise.all([
-      api('/api/dashboard'),
+      api(`/api/dashboard?organizationId=${encodeURIComponent(organizationId)}`),
       api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
       api(`${accountBase}/credentials`).catch(() => ({ credentials: [] })),
       api('/api/diagnostics').catch(() => null),
     ]);
     if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
+    const isOperator = !!diag; // /api/diagnostics needs diagnostic:read
     const organizationCredentialKeys = new Set((credentialData.credentials || []).map((credential) => credential.key));
     const accounts = (d.accounts?.accounts || []).filter((account) => organizationCredentialKeys.has(account.id));
     const usage = u.usage || {};
@@ -6783,6 +6845,8 @@ async function renderDashboard() {
         <div class="stat"><div class="n">${d.tasks}</div><div class="l">Tasks</div></div>
         ${Object.entries(d.byStage || {}).map(([s, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${esc(s)}</div></div>`).join('')}
       </div>
+      ${d.projects === 0 ? `<div class="card" style="color:var(--ink-2)">No projects yet. Use <b>＋ New project</b> in the sidebar to create your first one.</div>` : ''}
+      ${!isOperator ? '' : `
       <div class="section-h">Host &amp; admission control</div>
       <div id="host-diag">${hostDiagHtml(diag)}</div>
       <div class="section-h">Processes — everything karmax is running</div>
@@ -6818,7 +6882,7 @@ async function renderDashboard() {
               </div>
             </div>`;
           }).join('')
-        : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`;
+        : `<div class="card" style="color:var(--ink-3)">No account coordinator running. Per-turn account leasing activates when accounts are configured.</div>`}`}`;
     const recheck = async (btn, body) => {
       const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
       try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
@@ -6863,9 +6927,12 @@ async function renderDashboard() {
     }));
     // Keep the host panel live without re-rendering (and disrupting focus on) the
     // accounts section; single pending timer (cleared here and inside the loop).
+    // Operator-only panels — skip the polling entirely for members who can't see them.
     clearTimeout(S.hostDiagTimer);
-    S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
-    refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
+    if (isOperator) {
+      S.hostDiagTimer = setTimeout(refreshHostDiag, 5000);
+      refreshProcPanel(); // fetches, renders, and self-schedules while the tab is open
+    }
   } catch (e) {
     if (renderIsCurrent()) box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
@@ -9308,6 +9375,82 @@ async function wireAgentMailCard(organizationId) {
   });
 }
 
+// ── installation-wide OUTBOUND email (operator-only; server enforces settings:write)
+function outboundEmailCard() {
+  return `<div class="card" id="outbound-email-card">
+    <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
+    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let karmax email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
+    <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
+    <div class="form-row"><label>Provider</label><select id="oe-provider">
+      <option value="resend">Resend — one API key (simplest)</option>
+      <option value="smtp">SMTP server — any provider or relay</option>
+    </select></div>
+    <div id="oe-help" style="color:var(--ink-3);font-size:12px;margin:0 0 8px"></div>
+    <div class="form-row"><label>From address</label><input id="oe-from" placeholder="karmax &lt;noreply@yourdomain.com&gt;"></div>
+    <div id="oe-smtp" style="display:none">
+      <div class="form-row"><label>SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
+      <div class="inline-form" style="align-items:center">
+        <input id="oe-port" placeholder="port (587, or 465 for TLS)" style="max-width:220px">
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2)"><input type="checkbox" id="oe-secure"> Implicit TLS (port 465)</label>
+      </div>
+      <div class="form-row"><label>Username</label><input id="oe-user" placeholder="defaults to the From address"></div>
+    </div>
+    <div class="form-row"><label id="oe-secret-label">API key</label><input type="password" id="oe-secret" placeholder="Resend API key (re_…)"></div>
+    <div class="inline-form"><button class="btn sm" id="oe-connect">Connect</button><button class="btn sm" id="oe-test">Send test email</button></div>
+    <div id="oe-result" class="task-sub" style="margin-top:6px"></div>
+  </div>`;
+}
+async function wireOutboundEmailCard() {
+  const card = $('#outbound-email-card');
+  if (!card) return;
+  let data;
+  try { data = await api('/api/email'); }
+  catch { card.style.display = 'none'; return; } // no settings:write → hide entirely
+  const providerSel = $('#oe-provider');
+  const helpEl = $('#oe-help');
+  const applyProvider = () => {
+    const name = providerSel.value;
+    const info = (data.providers || []).find((p) => p.name === name);
+    $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
+    $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
+    $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
+    const links = (info?.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
+    helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
+  };
+  if (data.provider) providerSel.value = data.provider;
+  if (data.from) $('#oe-from').value = data.from;
+  $('#oe-status').innerHTML = data.configured
+    ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
+    : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
+  applyProvider();
+  providerSel.addEventListener('change', applyProvider);
+  $('#oe-connect').addEventListener('click', async () => {
+    const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
+    if (providerSel.value === 'smtp') {
+      body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
+      body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
+    }
+    const btn = $('#oe-connect'); btn.disabled = true;
+    try {
+      const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
+      $('#oe-secret').value = '';
+      $('#oe-result').style.color = 'var(--ink-2)';
+      $('#oe-result').textContent = result.detail || 'Connected';
+      toast('Outbound email connected');
+      await wireOutboundEmailCard();
+    } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
+    finally { btn.disabled = false; }
+  });
+  $('#oe-test').addEventListener('click', async () => {
+    const to = prompt('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
+    if (!to) return;
+    const btn = $('#oe-test'); btn.disabled = true;
+    try { await api('/api/email/test', { method: 'POST', body: JSON.stringify({ to }) }); toast(`Test email sent to ${to}`); }
+    catch (e) { toast(e.message, true); }
+    finally { btn.disabled = false; }
+  });
+}
+
 function profileRow(p, scope) {
   const inherited = scope === 'project' && p.scope === 'inherited';
   const usedBy = (p.roleWorkflows || []).length ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="This role's profile is shared across these workflows">· used by ${p.roleWorkflows.map(esc).join(', ')}</span>` : '';
@@ -9581,6 +9724,7 @@ function wireGlobalSettings(organizationId) {
   wireVaultCards(organizationId);
   wirePaymentsCard('global', undefined, organizationId);
   wireAgentMailCard(organizationId);
+  wireOutboundEmailCard();
   $('#gitp-save')?.addEventListener('click', async () => {
     const name = $('#gitp-name').value.trim();
     const userName = $('#gitp-username').value.trim();
@@ -9763,10 +9907,19 @@ function profileView() {
   const name = userDisplayName();
   const email = u?.email || '';
   const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
-  const orgCount = (S.organizations || []).length;
+  const orgs = S.organizations || [];
   const row = (label, value) => value
     ? `<div class="profile-row"><span class="profile-row-label">${esc(label)}</span><span class="profile-row-value">${esc(value)}</span></div>`
     : '';
+  // Every organization the user belongs to (owns or was added to), each linking
+  // to its dashboard. Role comes from the membership loaded alongside the org.
+  const orgList = orgs.length
+    ? orgs.map((o) => `<a class="profile-org" data-spa href="${globalRoute('dashboard', o)}">
+        <span class="profile-org-mark">◇</span>
+        <span class="profile-org-name">${esc(o.name)}</span>
+        ${o.kind === 'personal' ? '<span class="chip">personal</span>' : ''}
+      </a>`).join('')
+    : '<p class="task-sub">You are not a member of any organization yet.</p>';
   return `<div class="profile-page">
     <h1 class="page-title">Profile</h1>
     <div class="card profile-card">
@@ -9781,8 +9934,12 @@ function profileView() {
         ${row('Name', u?.name || '')}
         ${row('Email', email)}
         ${row('Account', u?.id || '')}
-        ${row('Organizations', orgCount ? String(orgCount) : '')}
       </div>
+    </div>
+    <div class="card">
+      <div class="section-h">Organizations</div>
+      <p class="task-sub">Workspaces you own or have been added to. Select one to switch to it.</p>
+      <div class="profile-orgs">${orgList}</div>
     </div>
     <div class="card">
       <div class="section-h">Appearance</div>
@@ -9901,6 +10058,7 @@ function organizationView() {
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="inline-form"><input id="invite-email" placeholder="teammate@company.com"><select id="invite-profile"><option value="developer">Developer</option><option value="maintainer">Project maintainer</option><option value="operator">Automation operator</option><option value="administrator">Administrator</option></select><button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
       <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div><div id="org-authorization-slot"></div></div>
+    ${outboundEmailCard()}
 
     <div class="settings-section-title" id="settings-code"><div>Git &amp; GitHub<small>The GitHub connection and commit identities your projects share</small></div></div>
     <div class="card"><div class="section-h">GitHub connection</div><div id="org-github">Loading…</div><div id="org-git-accounts-slot"></div></div>
@@ -10008,7 +10166,7 @@ async function hydrateOrganizationView() {
     <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
     <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
     <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
-  $('#invite-member')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email: $('#invite-email').value, profileId: $('#invite-profile').value }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
+  $('#invite-member')?.addEventListener('click', async () => { try { const email = $('#invite-email').value; const result = await api(`/api/organizations/${S.organizationId}/invitations`, { method: 'POST', body: JSON.stringify({ email, profileId: $('#invite-profile').value }) }); const link = `${location.origin}/invite?token=${encodeURIComponent(result.token)}`; $('#invite-result').innerHTML = result.emailed ? `Invitation emailed to <b>${esc(email)}</b>. <span class="task-sub">You can also share this link:</span><br><span class="mono">${esc(link)}</span>` : `Copy this one-time invitation link:<br><span class="mono">${esc(link)}</span>`; } catch (e) { toast(e.message, true); } });
   $('#create-team')?.addEventListener('click', async () => { try { await api(`/api/organizations/${S.organizationId}/teams`, { method: 'POST', body: JSON.stringify({ name: $('#team-name').value }) }); await hydrateOrganizationView(); } catch (e) { toast(e.message, true); } });
   $('#setup-github-app')?.addEventListener('click', async () => {
     try {
@@ -10731,11 +10889,14 @@ function openHelp() {
 function renderLogin() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:18px"><span class="mark">◇</span> karmax</div>
+    ${S.justVerified ? '<p class="task-sub" style="color:var(--merged)">✓ Email confirmed. Sign in to continue.</p>' : ''}
+    ${S.pendingInvite ? '<p class="task-sub">You\'ve been invited to a karmax organization. Sign in — or <b>create an account</b> — to accept it.</p>' : ''}
     <div class="form-row"><label>Email</label><input type="email" id="email" autocomplete="username" /></div>
     <div class="form-row"><label>Password</label><input type="password" id="pw" /></div>
     <button class="btn primary" id="login-btn" style="width:100%">Sign in</button>
     ${S.sso ? '<button class="btn" id="sso-btn" style="width:100%;margin-top:8px">Continue with company SSO</button>' : ''}
     <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
+    <div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
   const go = async () => {
@@ -10754,13 +10915,80 @@ function renderLogin() {
     } catch (error) { $('#login-err').textContent = error.message; }
   });
   $('#signup-open').addEventListener('click', renderSignup);
+  $('#forgot-open').addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+// Request a password-reset email. Better Auth mails a link back to /reset-password
+// (renderResetPassword); the response is intentionally uniform so we never reveal
+// whether an address has an account.
+function renderForgotPassword() {
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Reset password</div>
+    <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
+    <div class="form-row"><label>Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
+    <button class="btn primary" id="forgot-btn" style="width:100%">Send reset link</button>
+    <button class="btn" id="forgot-back" style="width:100%;margin-top:8px">Back to sign in</button>
+    <div id="forgot-msg" style="font-size:12px;margin-top:8px"></div>
+  </div></div>`;
+  const go = async () => {
+    const email = $('#forgot-email').value.trim();
+    if (!email) return;
+    $('#forgot-btn').disabled = true;
+    try {
+      await fetch('/api/auth/request-password-reset', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email, redirectTo: `${location.origin}/reset-password` }) });
+    } catch {}
+    $('#forgot-msg').style.color = 'var(--ink-2)';
+    $('#forgot-msg').textContent = 'If an account exists for that address, a reset link is on its way. Check your email.';
+    $('#forgot-btn').disabled = false;
+  };
+  $('#forgot-btn').addEventListener('click', go);
+  $('#forgot-back').addEventListener('click', renderLogin);
+  $('#forgot-email').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+
+// Landing page for the emailed reset link (/reset-password?token=…). Sets a new
+// password via Better Auth, then returns to sign in.
+function renderResetPassword(token) {
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
+    <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Choose a new password</div>
+    ${token ? `<div class="form-row"><label>New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
+    <button class="btn primary" id="reset-btn" style="width:100%">Set new password</button>`
+      : `<p class="task-sub">This reset link is missing its token or has expired. Request a new one from the sign-in page.</p>`}
+    <button class="btn" id="reset-back" style="width:100%;margin-top:8px">Back to sign in</button>
+    <div id="reset-msg" style="font-size:12px;margin-top:8px"></div>
+  </div></div>`;
+  const go = async () => {
+    const newPassword = $('#reset-pw').value;
+    if (!newPassword || newPassword.length < 10) { $('#reset-msg').style.color = 'var(--danger)'; $('#reset-msg').textContent = 'Password must be at least 10 characters.'; return; }
+    $('#reset-btn').disabled = true;
+    try {
+      const res = await fetch('/api/auth/reset-password', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ newPassword, token }) });
+      if (res.ok) {
+        $('#reset-msg').style.color = 'var(--ink-2)';
+        $('#reset-msg').textContent = 'Password updated. Redirecting to sign in…';
+        setTimeout(() => { history.replaceState({ kx: 1 }, '', '/'); renderLogin(); }, 1200);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        $('#reset-msg').style.color = 'var(--danger)';
+        $('#reset-msg').textContent = err.message || err.error || 'Could not reset password. The link may have expired.';
+        $('#reset-btn').disabled = false;
+      }
+    } catch { $('#reset-msg').style.color = 'var(--danger)'; $('#reset-msg').textContent = 'Could not reset password.'; $('#reset-btn').disabled = false; }
+  };
+  $('#reset-btn')?.addEventListener('click', go);
+  $('#reset-back').addEventListener('click', () => { history.replaceState({ kx: 1 }, '', '/'); renderLogin(); });
+  $('#reset-pw')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
 function renderSignup() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Create account</div>
-    <p class="task-sub">Your account starts with no project access. An administrator can grant the right profile after you join.</p>
+    ${S.pendingInvite
+      ? '<p class="task-sub">Accepting an invitation — <b>use the email address it was sent to</b>, or the invite won\'t match.</p>'
+      : '<p class="task-sub">You\'ll start in your own personal workspace, ready to create a project. You can be invited into other organizations too.</p>'}
     <div class="form-row"><label>Name</label><input id="signup-name" autocomplete="name" /></div>
     <div class="form-row"><label>Email</label><input type="email" id="signup-email" autocomplete="username" /></div>
     <div class="form-row"><label>Password (10+ characters)</label><input type="password" id="signup-pw" autocomplete="new-password" /></div>
@@ -10772,8 +11000,18 @@ function renderSignup() {
     const res = await fetch('/api/signup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
       name: $('#signup-name').value, email: $('#signup-email').value, password: $('#signup-pw').value,
     }) });
-    if (res.ok) boot();
-    else $('#signup-err').textContent = (await res.json().catch(() => ({}))).error || 'Could not create account';
+    if (res.ok) return boot();
+    const body = await res.json().catch(() => ({}));
+    // Surface the real reason (Better Auth returns `.message`, e.g. "User already
+    // exists") rather than a blanket "Could not create account".
+    const reason = body.error || body.message || 'Could not create account';
+    const el = $('#signup-err');
+    if (/already exists/i.test(reason)) {
+      el.innerHTML = `An account with that email already exists. <a href="#" id="signup-to-login" style="color:var(--accent)">Sign in instead</a> — or reset your password.`;
+      $('#signup-to-login')?.addEventListener('click', (e) => { e.preventDefault(); renderLogin(); });
+    } else {
+      el.textContent = reason;
+    }
   };
   $('#signup-btn').addEventListener('click', go);
   $('#signup-back').addEventListener('click', renderLogin);
@@ -10784,8 +11022,8 @@ function renderAccessPending() {
   $('#app').innerHTML = `<div class="login-wrap"><div class="login-card">
     <div class="brand" style="margin-bottom:12px"><span class="mark">◇</span> Account created</div>
     ${S.inviteNotice ? `<p><b>${esc(S.inviteNotice)}</b></p>` : ''}
-    <p>Your identity is active, but it does not have access to a project yet.</p>
-    <p class="task-sub">Ask a karmax administrator to grant this account a global or project authorization profile. Signing in again will pick up the grant immediately.</p>
+    <p>Your account is active, but you don't have access to any project yet.</p>
+    <p class="task-sub">Ask a karmax admin to add you to a project, or create your own workspace below. Sign in again and any new access shows up right away.</p>
     <button class="btn primary" id="pending-retry" style="width:100%">Check again</button>
     <button class="btn" id="pending-workspace" style="width:100%;margin-top:8px">Create my own organization</button>
     <button class="btn" id="pending-logout" style="width:100%;margin-top:8px">Sign out</button>

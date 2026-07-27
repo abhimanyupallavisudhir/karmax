@@ -6,7 +6,7 @@ by a durable **workflow**, carried out by a human or an agent. Built on
 [Temporal](https://temporal.io) for crash-proof orchestration, end-to-end
 TypeScript.
 
-This is a faithful v1 implementation of [`SPEC.md`](./SPEC.md).
+This is a faithful v1 implementation of the karmax spec, which lives in the project wiki as the `SPEC` page (open the **Wiki** tab in the console, or fetch it with `read_wiki`).
 
 ## Quick start
 
