@@ -380,6 +380,8 @@ export class Gateway {
   /** Remotes verified during this gateway process. Persisted links are retried
    * once after every restart so interrupted first pushes self-heal. */
   private wikiRemotesReady = new Set<string>();
+  private wikiRemotesProvisioning = new Set<string>();
+  private wikiRemoteRetryAfter = new Map<string, number>();
   /** Holds CDP sessions across a passkey enroll/login click (PLAN-passwords §8). */
   private passkeys?: import('../autonomy/passkey.js').PasskeyManager;
 
@@ -459,10 +461,9 @@ export class Gateway {
       void this.previewWebSocket(ws, req).catch(() => { try { ws.close(1011, 'preview unavailable'); } catch {} });
     });
 
-    // Deployment migration for projects that predate companion wiki repos.
-    // Complete this before binding the listener so scheduled/immediate task
-    // starts cannot race the backfill, and a local migration error cannot leave
-    // a half-started HTTP server behind.
+    // Initialize local canonical repos before binding so task starts cannot race
+    // that invariant. Remote provisioning is scheduled best-effort by
+    // ensureProjectWiki and deliberately does not gate the control plane.
     for (const project of this.deps.store.listProjects()) await this.ensureProjectWiki(project);
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
@@ -2079,7 +2080,7 @@ export class Gateway {
       if (tasksMatch) {
         const projectId = tasksMatch[1]!;
         if (method === 'GET') {
-          const all = await api.listTasks(token, projectId);
+          const all = await api.listTaskSummaries(token, projectId);
           // Archived tasks are hidden from the default list (SPEC §11 housekeeping).
           const includeArchived = url.searchParams.get('includeArchived') === '1';
           const filtered = includeArchived ? all : all.filter((t) => !t.params?.archived);
@@ -2099,15 +2100,14 @@ export class Gateway {
             const { messages: _m, transcripts: _t, reviewInfo: _r, ...rest } = v;
             return rest;
           };
-          // enrich with the freshest live view where possible
-          const enriched = await Promise.all(
-            page.map(async (t) => {
-              const view = await api.getTaskView(token, t.id).catch(() => t.lastView);
-              return { ...t, lastView: trimListView(view ?? t.lastView) };
-            }),
-          );
-          if (limit > 0) return this.json(res, 200, { tasks: enriched, total: filtered.length, offset });
-          return this.json(res, 200, enriched);
+          // listTasks already returns the durable lastView snapshot written by
+          // publishView. Never call getTaskView once per row here: enriching 300+
+          // rows computed attempt/stage metadata independently and turned one list
+          // request into thousands of synchronous SQLite reads. Drawer-only fields
+          // (including stageTransitions) are resolved by the single-task endpoint.
+          const listed = page.map((t) => ({ ...t, lastView: trimListView(t.lastView) }));
+          if (limit > 0) return this.json(res, 200, { tasks: listed, total: filtered.length, offset });
+          return this.json(res, 200, listed);
         }
         if (method === 'POST') {
           const b = await this.body(req);
@@ -2351,7 +2351,9 @@ export class Gateway {
       if (taskAuthMatch && method === 'PATCH') {
         const b = await this.body(req);
         return this.json(res, 200, api.setTaskAuthorization(token, taskAuthMatch[1]!, String(b.profileId ?? ''),
-          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined));
+          Array.isArray(b.credentialGrants) ? b.credentialGrants.map(String) : undefined,
+          b.credentialPolicies && typeof b.credentialPolicies === 'object' && !Array.isArray(b.credentialPolicies)
+            ? b.credentialPolicies as any : undefined));
       }
       const archiveMatch = p.match(/^\/api\/tasks\/([^/]+)\/archive$/);
       if (archiveMatch && method === 'POST') {
@@ -2720,7 +2722,9 @@ export class Gateway {
       const eventsMatch = p.match(/^\/api\/tasks\/([^/]+)\/events$/);
       if (eventsMatch && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
-        return this.json(res, 200, await api.taskEvents(token, eventsMatch[1]!, since));
+        const rawLimit = Number(url.searchParams.get('limit') ?? '0');
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 1_000) : undefined;
+        return this.json(res, 200, await api.taskEvents(token, eventsMatch[1]!, since, limit));
       }
       const agentsMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents$/);
       if (agentsMatch && method === 'GET') return this.json(res, 200, await api.listTaskAgents(token, agentsMatch[1]!));
@@ -3919,7 +3923,7 @@ export class Gateway {
       // activity feed (all events)
       if (p === '/api/activity' && method === 'GET') {
         const since = Number(url.searchParams.get('since') ?? '0');
-        let events = store.allEventsSince(since).slice(-300);
+        let events = store.allEventsSince(since, 300);
         if (authRecord?.projectId) events = events.filter((e) => store.getTask(e.taskId)?.projectId === authRecord?.projectId);
         return this.json(res, 200, events);
       }
@@ -3979,6 +3983,8 @@ export class Gateway {
     const current = this.deps.store.projectWiki(project.id)?.repository;
     if (current && this.wikiRemotesReady.has(project.id)) return;
     if (!this.deps.githubApp) return;
+    if ((this.wikiRemoteRetryAfter.get(project.id) ?? 0) > Date.now()) return;
+    const githubApp = this.deps.githubApp;
     const organizationId = project.organizationId ?? 'org_personal';
     const candidates = [...new Set([
       ...(userId ? [userId] : []),
@@ -3997,23 +4003,33 @@ export class Gateway {
       ? connections.find((candidate) => candidate.id === attachedConnectionIds[0])
       : connections.length === 1 ? connections[0] : undefined;
     if (!connection) return;
-    try {
-      const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
-      // Preserve the remote identity across project renames. The deterministic
-      // name is only for the first provisioning attempt.
-      const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
-      const repository = await this.deps.githubApp.ensureRepository(connection.id, actor, {
-        name, description: `Karmax project wiki for ${project.name}`,
-        private: true, defaultBranch: 'main', autoInit: false,
-      });
-      // Link before the push so even a transient network failure keeps this
-      // platform-owned repository out of the ordinary project repo picker.
-      this.deps.store.setProjectWikiRepository(project.id, repository.id);
-      setProjectWikiRemote(root, repository.sshUrl, this.deps.githubApp.repositorySshKey(repository.id, 'write'));
-      this.wikiRemotesReady.add(project.id);
-    } catch (error) {
-      console.warn(`[karmax] could not create wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
-    }
+    if (this.wikiRemotesProvisioning.has(project.id)) return;
+    this.wikiRemotesProvisioning.add(project.id);
+    void (async () => {
+      try {
+        const base = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'project';
+        // Preserve the remote identity across project renames. The deterministic
+        // name is only for the first provisioning attempt.
+        const name = current?.name ?? `${base}-wiki-${project.id.slice(-8)}`;
+        const repository = await githubApp.ensureRepository(connection.id, actor, {
+          name, description: `Karmax project wiki for ${project.name}`,
+          private: true, defaultBranch: 'main', autoInit: false,
+        });
+        // Link before the push so even a transient network failure keeps this
+        // platform-owned repository out of the ordinary project repo picker.
+        this.deps.store.setProjectWikiRepository(project.id, repository.id);
+        await setProjectWikiRemote(root, repository.sshUrl, githubApp.repositorySshKey(repository.id, 'write'));
+        this.wikiRemotesReady.add(project.id);
+        this.wikiRemoteRetryAfter.delete(project.id);
+      } catch (error) {
+        // An offline SSH endpoint should produce one bounded warning, not a retry
+        // storm every time an old browser tab reloads project metadata.
+        this.wikiRemoteRetryAfter.set(project.id, Date.now() + 5 * 60_000);
+        console.warn(`[karmax] could not create wiki remote for ${project.id}:`, error instanceof Error ? error.message : error);
+      } finally {
+        this.wikiRemotesProvisioning.delete(project.id);
+      }
+    })();
   }
 
   private async availableModels(refresh = false, organizationId = 'org_personal'): Promise<{ providers: ModelCatalog; refreshedAt: number }> {

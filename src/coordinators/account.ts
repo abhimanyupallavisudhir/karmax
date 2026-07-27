@@ -8,6 +8,8 @@ import {
   getExternalWorkflowHandle,
   sleep,
   log,
+  workflowInfo,
+  patched,
 } from '@temporalio/workflow';
 import {
   SIG_LEASE_ACCOUNT,
@@ -294,11 +296,26 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
 
   for (;;) {
     refreshDue();
-    await condition(() => queue.length > 0 || processed >= CONTINUE_AFTER);
-    // Recycle history only when idle and nothing is cooling down (so no pending
-    // refresh instant is stranded across the reset of `processed`).
-    if (processed >= CONTINUE_AFTER && queue.length === 0 && !accounts.some((a) => a.status === 'exhausted')) {
-      await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, processed: 0 } });
+    // Keep the legacy branch byte-for-byte for histories created before this fix.
+    // `patched` is deliberately evaluated on every loop: it remains false while
+    // replaying marker-less history, then flips true at the live edge. That lets a
+    // coordinator already trapped in the legacy immediate-condition spin escape.
+    if (!patched('account-coordinator-rotation-v2')) {
+      await condition(() => queue.length > 0 || processed >= CONTINUE_AFTER);
+      if (processed >= CONTINUE_AFTER && queue.length === 0 && !accounts.some((a) => a.status === 'exhausted')) {
+        await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, processed: 0 } });
+      }
+    } else {
+      // Account reset instants are carried into the new run as ordinary state, so
+      // cooling-down credentials do not need to pin an ever-growing history. Honor
+      // Temporal's own size/event-count recommendation as well as our cheap counter.
+      const shouldRotate = () =>
+        queue.length === 0
+        && (processed >= CONTINUE_AFTER || workflowInfo().continueAsNewSuggested);
+      await condition(() => queue.length > 0 || shouldRotate());
+      if (shouldRotate()) {
+        await continueAsNew<typeof accountCoordinator>({ state: { accounts, queue, processed: 0 } });
+      }
     }
 
     while (queue.length > 0) {

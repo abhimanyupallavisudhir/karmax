@@ -45,6 +45,7 @@ import type { WorldHandle } from '../world/types.js';
 import { worldRepos } from '../world/types.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import type { WorldAccessService } from '../world/access.js';
+import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 
 export class CapabilityError extends Error {
   code = 'capability_denied';
@@ -493,6 +494,9 @@ export class KarmaxApi {
       /** Per-task vault item grants (PLAN-passwords.md §6): `use-credential:item:…`
        *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
       credentialGrants?: string[];
+      /** Sparse blind-use/plaintext policy overrides for the credentials this
+       * task was granted. Missing values inherit organization defaults. */
+      credentialPolicies?: VaultTaskPolicyOverrides;
       /** Total mutually-exclusive attempts to create and queue up front. */
       attempts?: number;
       assignee?: PrincipalRef;
@@ -513,6 +517,9 @@ export class KarmaxApi {
       ? this.deps.authorization.taskGrant(caller.principal, args.projectId, args.authorizationProfile, caller.caps)
       : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
     this.applyCredentialGrants(authorization, args.credentialGrants, caller.caps);
+    const credentialPolicies = this.credentialPolicyOverrides(
+      project.organizationId ?? 'org_personal', args.credentialPolicies, caller.caps, authorization,
+    );
 
     // Task-scope overrides: the form's `params` plus the legacy flat fields.
     const taskOverrides: ValueMap = { ...(args.params ?? {}) };
@@ -560,7 +567,7 @@ export class KarmaxApi {
         prompt: String(taskOverrides.prompt ?? resolved.prompt ?? ''),
         profiles: args.profiles,
         draft: !!args.draft,
-        _authorization: { ...authorization, principal: caller.principal },
+        _authorization: { ...authorization, principal: caller.principal, credentialPolicies },
         ...(repeatable ? { repeatable: true } : {}),
       },
       confirmer: (() => {
@@ -572,6 +579,7 @@ export class KarmaxApi {
       delegate: args.delegate,
       confirmationPolicy,
     });
+    this.persistTaskCredentialPolicies(task);
     if (!args.draft) {
       try { this.assertHumanRoutes(task, manifest, resolved); }
       catch (error) { this.deps.store.deleteTask(task.id); throw error; }
@@ -601,6 +609,7 @@ export class KarmaxApi {
           workflow: task.workflow, workflowVersion: task.workflowVersion, params: { ...copied, draft: true, archived: false },
           parentTaskId: task.parentTaskId, intentId: task.intentId, createdBy: task.createdBy,
           assignee: task.assignee, delegate: task.delegate, confirmationPolicy: task.confirmationPolicy });
+        this.persistTaskCredentialPolicies(alt);
         if (task.notes) this.deps.store.setTaskNotes(alt.id, task.notes);
         createdAlternates.push(alt);
       }
@@ -1044,10 +1053,54 @@ export class KarmaxApi {
     }
   }
 
+  private credentialPolicyOverrides(
+    organizationId: string,
+    requested: VaultTaskPolicyOverrides | undefined,
+    callerCaps: Capability[],
+    authorization: { attenuated: boolean },
+  ): VaultTaskPolicyOverrides {
+    const vault = new VaultItems(this.deps.store, undefined, undefined, organizationId);
+    const out: VaultTaskPolicyOverrides = {};
+    const canAdminister = allows(callerCaps, 'credential:write');
+    const useRank: Record<VaultItemPolicy['use'], number> = { auto: 0, ask: 1 };
+    const revealRank: Record<VaultItemPolicy['reveal'], number> = { auto: 0, ask: 1, never: 2 };
+    for (const [itemId, raw] of Object.entries(requested ?? {})) {
+      const item = vault.get(itemId);
+      if (!item || (!canAdminister && !allows(callerCaps, `use-credential:item:${itemId}`))) {
+        authorization.attenuated = true;
+        continue;
+      }
+      const policy: Partial<VaultItemPolicy> = {};
+      if (raw?.use === 'auto' || raw?.use === 'ask') {
+        if (canAdminister || useRank[raw.use] >= useRank[item.policy.use]) policy.use = raw.use;
+        else authorization.attenuated = true;
+      }
+      if (raw?.reveal === 'auto' || raw?.reveal === 'ask' || raw?.reveal === 'never') {
+        if (canAdminister || revealRank[raw.reveal] >= revealRank[item.policy.reveal]) policy.reveal = raw.reveal;
+        else authorization.attenuated = true;
+      }
+      if (Object.keys(policy).length) out[itemId] = policy;
+    }
+    return out;
+  }
+
+  private persistTaskCredentialPolicies(task: TaskRecord): void {
+    const organizationId = this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal';
+    const authorization = task.params?._authorization as { credentialPolicies?: VaultTaskPolicyOverrides } | undefined;
+    new VaultItems(this.deps.store, undefined, undefined, organizationId)
+      .setTaskPolicies(task.id, authorization?.credentialPolicies ?? {});
+  }
+
   /** Change the job-shaped grant on work that has not started yet. The selected
    * profile is always re-attenuated against the immediate bearer, so an agent
    * cannot use a human principal recorded on the draft as a confused deputy. */
-  setTaskAuthorization(token: string, taskId: string, profileId: string, credentialGrants?: string[]): TaskRecord {
+  setTaskAuthorization(
+    token: string,
+    taskId: string,
+    profileId: string,
+    credentialGrants?: string[],
+    credentialPolicies?: VaultTaskPolicyOverrides,
+  ): TaskRecord {
     const task = this.deps.store.getTask(taskId);
     if (!task) throw new Error(`no task ${taskId}`);
     if (!task.params?.draft && task.params?.triggerState !== 'armed' && !task.params?.repeatable)
@@ -1057,11 +1110,23 @@ export class KarmaxApi {
       ? this.deps.authorization.taskGrant(caller.principal, task.projectId, profileId, caller.caps)
       : { profileId, capabilities: caller.caps, attenuated: false };
     this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
+    const priorPolicies = (task.params?._authorization as { credentialPolicies?: VaultTaskPolicyOverrides } | undefined)
+      ?.credentialPolicies;
+    const policies = credentialPolicies === undefined
+      ? (priorPolicies ?? {})
+      : this.credentialPolicyOverrides(
+        this.deps.store.getProject(task.projectId)?.organizationId ?? 'org_personal',
+        credentialPolicies,
+        caller.caps,
+        authorization,
+      );
     this.deps.store.updateTaskParams(taskId, {
       ...task.params,
-      _authorization: { ...authorization, principal: caller.principal },
+      _authorization: { ...authorization, principal: caller.principal, credentialPolicies: policies },
     });
-    return this.deps.store.getTask(taskId)!;
+    const updated = this.deps.store.getTask(taskId)!;
+    this.persistTaskCredentialPolicies(updated);
+    return updated;
   }
 
   /**
@@ -1087,6 +1152,7 @@ export class KarmaxApi {
       delegate: series.delegate,
       confirmationPolicy: series.confirmationPolicy,
     });
+    this.persistTaskCredentialPolicies(run);
     const { startType, input } = await this.buildStart(run);
     try {
       await withTimeout(
@@ -1292,7 +1358,11 @@ export class KarmaxApi {
   }
 
   /** Drawer-only projection for an unqueued attempt, which has no workflow view. */
-  getDraftView(token: string, taskId: string): TaskView | undefined {
+  getDraftView(
+    token: string,
+    taskId: string,
+    group?: { committedAttemptId?: string },
+  ): TaskView | undefined {
     this.require(token, 'get_task');
     const record = this.deps.store.getTask(taskId);
     if (!record?.params?.draft) return undefined;
@@ -1310,13 +1380,18 @@ export class KarmaxApi {
       state: { draft: true },
       updatedAt: record.createdAt,
     };
-    view.stageTransitions = this.availableStageTransitions(record, view);
+    view.stageTransitions = this.availableStageTransitions(record, view, group);
     return view;
   }
 
   async listTasks(token: string, projectId: string): Promise<TaskRecord[]> {
     this.require(token, 'list_tasks', { projectId });
     return this.deps.store.listTasks(projectId);
+  }
+
+  async listTaskSummaries(token: string, projectId: string): Promise<TaskRecord[]> {
+    this.require(token, 'list_tasks', { projectId });
+    return this.deps.store.listTaskSummaries(projectId);
   }
 
   /** Create an editable, unqueued alternate by cloning an existing attempt. */
@@ -1347,6 +1422,7 @@ export class KarmaxApi {
       delegate: source.delegate,
       confirmationPolicy: source.confirmationPolicy,
     });
+    this.persistTaskCredentialPolicies(attempt);
     if (source.notes) this.deps.store.setTaskNotes(attempt.id, source.notes);
     if (source.tags?.length) this.deps.store.setTaskTags(attempt.id, source.tags);
     // If the former principal is cancelled/failed, the new draft naturally takes over.
@@ -1362,17 +1438,24 @@ export class KarmaxApi {
     return {
       ...group,
       attempts: group.attempts.map((attempt) => attempt.params.draft
-        ? { ...attempt, lastView: this.getDraftView(token, attempt.id) }
+        ? { ...attempt, lastView: this.getDraftView(token, attempt.id, group) }
         : attempt.lastView
-          ? { ...attempt, lastView: { ...attempt.lastView, stageTransitions: this.availableStageTransitions(attempt, attempt.lastView) } }
+          ? { ...attempt, lastView: {
+              ...attempt.lastView,
+              stageTransitions: this.availableStageTransitions(attempt, attempt.lastView, group),
+            } }
           : attempt),
     };
   }
 
   /** The single transition policy shared by the selected task header, every
    * attempt row, and the mutation endpoint. */
-  private availableStageTransitions(task: TaskRecord, view: TaskView): StageTransition[] {
-    const group = this.deps.store.attemptGroup(task.id);
+  private availableStageTransitions(
+    task: TaskRecord,
+    view: TaskView,
+    knownGroup?: { committedAttemptId?: string },
+  ): StageTransition[] {
+    const group = knownGroup ?? this.deps.store.attemptGroup(task.id);
     const jayadratha = !!group?.committedAttemptId;
     const resumable = task.workflow === 'software-dev' || task.workflow === 'goal';
     const origin = view.state?.humanPauseOrigin as Stage | undefined;
@@ -1663,10 +1746,10 @@ export class KarmaxApi {
     });
   }
 
-  async taskEvents(token: string, taskId: string, since = 0) {
+  async taskEvents(token: string, taskId: string, since = 0, limit?: number) {
     const task = this.deps.store.getTask(taskId);
     this.require(token, 'list_events', { projectId: task?.projectId, taskId });
-    return this.deps.store.eventsSince(taskId, since);
+    return this.deps.store.eventsSince(taskId, since, limit);
   }
 
   // ─── Search & organization (task search / views — PLAN-search-views) ─────────
@@ -1684,7 +1767,13 @@ export class KarmaxApi {
   async searchTasks(token: string, projectId: string, query: string | TaskQuery, now = Date.now()): Promise<EvalResult> {
     const caller = this.require(token, 'search_tasks', { projectId });
     const q: TaskQuery = typeof query === 'string' ? parseQuery(query) : query ?? {};
-    const tasks = this.deps.store.listTasks(projectId);
+    // Conversation search is intentionally explicit. Every other query uses the
+    // compact projection so routine list filtering never parses all transcripts.
+    const needsConversation = q.filters?.some((clause) =>
+      clause.field === 'conversation' || clause.field === 'says') ?? false;
+    const tasks = needsConversation
+      ? this.deps.store.listTasks(projectId)
+      : this.deps.store.listTaskSummaries(projectId);
     const tags = this.deps.store.listTags(projectId);
     const principal = principalRefOf(caller.principal);
     return evaluateQuery(tasks, q, { now, tags, userId: principal?.kind === 'user' ? principal.userId : undefined });

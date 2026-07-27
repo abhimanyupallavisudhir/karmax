@@ -46,6 +46,11 @@ export interface VaultItemPolicy {
   reveal: 'auto' | 'ask' | 'never';
 }
 
+/** A task may override either policy dimension for each credential it was
+ * explicitly granted. Missing dimensions inherit the item's organization-wide
+ * default, so later global changes still flow through to the task. */
+export type VaultTaskPolicyOverrides = Record<string, Partial<VaultItemPolicy>>;
+
 export interface VaultItem {
   id: string;
   type: VaultItemType;
@@ -103,6 +108,7 @@ const kvItems = (org: string) => `vault:items:${org}`;
 const kvRequests = (org: string) => `vault:requests:${org}`;
 const kvGrant = (taskId: string) => `vault:grant:${taskId}`;
 const kvPasses = (taskId: string) => `vault:pass:${taskId}`;
+const kvTaskPolicies = (taskId: string) => `vault:task-policy:${taskId}`;
 
 export function itemHandle(itemId: string, field: VaultFieldName): string {
   return `item:${itemId}:${field}`;
@@ -354,6 +360,45 @@ export class VaultItems {
     return true;
   }
 
+  /** Sparse task-local policy overrides. Invalid persisted values are ignored so
+   * a damaged/migrated KV entry cannot accidentally weaken a credential policy. */
+  taskPolicies(taskId: string): VaultTaskPolicyOverrides {
+    const raw = this.store.kvGet(kvTaskPolicies(taskId));
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const out: VaultTaskPolicyOverrides = {};
+      for (const [itemId, value] of Object.entries(parsed ?? {})) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+        const policy = value as Partial<VaultItemPolicy>;
+        const clean: Partial<VaultItemPolicy> = {};
+        if (policy.use === 'auto' || policy.use === 'ask') clean.use = policy.use;
+        if (policy.reveal === 'auto' || policy.reveal === 'ask' || policy.reveal === 'never') clean.reveal = policy.reveal;
+        if (Object.keys(clean).length) out[itemId] = clean;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  setTaskPolicies(taskId: string, policies: VaultTaskPolicyOverrides): VaultTaskPolicyOverrides {
+    const clean: VaultTaskPolicyOverrides = {};
+    for (const [itemId, policy] of Object.entries(policies ?? {})) {
+      const next: Partial<VaultItemPolicy> = {};
+      if (policy?.use === 'auto' || policy?.use === 'ask') next.use = policy.use;
+      if (policy?.reveal === 'auto' || policy?.reveal === 'ask' || policy?.reveal === 'never') next.reveal = policy.reveal;
+      if (Object.keys(next).length) clean[itemId] = next;
+    }
+    this.store.kvSet(kvTaskPolicies(taskId), JSON.stringify(clean));
+    return clean;
+  }
+
+  effectivePolicy(taskId: string | undefined, item: VaultItem): VaultItemPolicy {
+    const override = taskId ? this.taskPolicies(taskId)[item.id] : undefined;
+    return { ...item.policy, ...override };
+  }
+
   // ── access decision (§5/§7): capability coverage, then item policy ──
 
   covered(caps: Capability[], taskId: string | undefined, item: VaultItem): boolean {
@@ -368,10 +413,11 @@ export class VaultItems {
    */
   access(caps: Capability[], taskId: string | undefined, item: VaultItem, mode: AccessMode, opts: { consume?: boolean } = {}): { status: AccessStatus; reason?: string } {
     if (taskId && this.takePass(taskId, item.id, mode, opts.consume ?? false)) return { status: 'granted' };
-    if (mode === 'reveal' && item.policy.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (item policy)` };
+    const policyForTask = this.effectivePolicy(taskId, item);
+    if (mode === 'reveal' && policyForTask.reveal === 'never') return { status: 'denied', reason: `"${item.label}" is never revealed in plaintext (${taskId ? 'task' : 'item'} policy)` };
     if (!this.covered(caps, taskId, item)) return { status: 'needs_approval', reason: 'this task was not granted this credential' };
-    const policy = mode === 'reveal' ? item.policy.reveal : item.policy.use;
-    if (policy !== 'auto') return { status: 'needs_approval', reason: `"${item.label}" requires per-${mode} approval (item policy)` };
+    const policy = mode === 'reveal' ? policyForTask.reveal : policyForTask.use;
+    if (policy !== 'auto') return { status: 'needs_approval', reason: `"${item.label}" requires per-${mode} approval (${taskId ? 'task' : 'item'} policy)` };
     return { status: 'granted' };
   }
 

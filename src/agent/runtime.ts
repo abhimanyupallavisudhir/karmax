@@ -153,10 +153,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     pullFollowUps: deps.pullFollowUps,
   };
 
-  // Liveness: beat every 10s for the turn's whole duration. Adapters also beat on
-  // activity (to pick up pending cancellations quickly), but only this interval
+  // Liveness + cancellation delivery: beat every second for the turn's whole
+  // duration. Adapters also heartbeat on activity, but only this interval
   // guarantees a long silent stretch — a big tool run, a slow first token — can't
-  // trip the activity's heartbeat timeout.
+  // delay cancellation. The Worker caps heartbeat throttling at the same interval.
   const hb = deps.heartbeat
     ? setInterval(() => {
         try {
@@ -164,7 +164,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
         } catch {
           /* never let a heartbeat failure kill the turn */
         }
-      }, 10_000)
+      }, 1_000)
     : undefined;
   let turn;
   deps.onActivity?.({ id: 'turn', kind: 'turn', phase: 'started', title: 'Agent started working' });

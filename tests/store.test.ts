@@ -382,8 +382,41 @@ describe('Store', () => {
     });
     store.appendEvent({ type: 'do.output', taskId: t.id, ts: 1, payload: { text: 'a' } });
     const s2 = store.appendEvent({ type: 'do.output', taskId: t.id, ts: 2, payload: { text: 'b' } });
-    expect(store.eventsSince(t.id, 0)).toHaveLength(2);
-    expect(store.eventsSince(t.id, s2 - 1).map((e) => e.payload.text)).toEqual(['b']);
+    const s3 = store.appendEvent({ type: 'do.output', taskId: t.id, ts: 3, payload: { text: 'c' } });
+    expect(store.eventsSince(t.id, 0)).toHaveLength(3);
+    expect(store.eventsSince(t.id, s2 - 1).map((e) => e.payload.text)).toEqual(['b', 'c']);
+    expect(store.eventsSince(t.id, 0, 2).map((e) => e.payload.text)).toEqual(['b', 'c']);
+    expect(store.latestEventSeq()).toBe(s3);
+    expect(store.nextEventsSince(0, 2).map((e) => e.payload.text)).toEqual(['a', 'b']);
+  });
+
+  it('reads list summaries without materializing conversation history', () => {
+    const project = store.createProject('Acme');
+    const task = store.createTask({
+      projectId: project.id,
+      title: 'X',
+      workflow: 'software-dev',
+      workflowVersion: '1.0.0',
+      params: { prompt: 'x' },
+    });
+    store.saveView(task.id, {
+      taskId: task.id,
+      title: 'X',
+      workflow: 'software-dev',
+      stage: 'do',
+      status: 'active',
+      messages: [{ id: 'm', role: 'agent', text: 'large conversation', ts: 1 }],
+      transcripts: [{ role: 'do', label: 'Do', messages: [{ id: 'm', role: 'agent', text: 'large conversation', ts: 1 }] }],
+      actions: [],
+      state: {},
+      updatedAt: 1,
+    });
+
+    expect(store.listTasks(project.id)[0]?.lastView?.messages).toHaveLength(1);
+    const summary = store.listTaskSummaries(project.id)[0]?.lastView;
+    expect(summary).toMatchObject({ stage: 'do', status: 'active' });
+    expect(summary?.messages).toBeUndefined();
+    expect(summary?.transcripts).toBeUndefined();
   });
 
   it('round-trips profiles', () => {

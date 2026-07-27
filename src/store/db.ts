@@ -1807,6 +1807,30 @@ export class Store {
     return this.attachTags(projectId, rows.map(rowToTask));
   }
 
+  /**
+   * One compact row per logical task for list/search surfaces.
+   *
+   * Keep the projection inside SQLite. Selecting `t.*` and deleting messages after
+   * rowToTask would still allocate and JSON.parse every transcript in Node — exactly
+   * the high-water allocation that made a few hundred tasks consume >1 GiB RSS.
+   */
+  listTaskSummaries(projectId: string): TaskRecord[] {
+    const rows = this.db.prepare(`SELECT
+        t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
+        t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.ord,
+        t.parentTaskId, t.createdBy, t.assignee, t.delegate,
+        t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
+        CASE WHEN t.lastView IS NULL THEN NULL ELSE json_remove(
+          t.lastView, '$.messages', '$.transcripts', '$.reviewInfo'
+        ) END AS lastView,
+        COALESCE(t.num, root.num) AS resolvedNum
+      FROM tasks t
+      JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+      JOIN tasks root ON root.id=i.id
+      WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId) as any[];
+    return this.attachTags(projectId, rows.map(rowToTask));
+  }
+
   /** Atomically reserve the logical task at Merge entry. Returns siblings to cancel. */
   claimAttempt(taskId: string): { accepted: boolean; cancel: string[] } {
     const t = this.getTask(taskId);
@@ -2811,12 +2835,25 @@ export class Store {
     return seq;
   }
 
-  eventsSince(taskId: string, seq: number): (KarmaxEvent & { seq: number })[] {
-    return (
-      this.db
-        .prepare('SELECT * FROM events WHERE taskId = ? AND seq > ? ORDER BY seq')
-        .all(taskId, seq) as any[]
-    ).map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  eventsSince(taskId: string, seq: number, limit?: number): (KarmaxEvent & { seq: number })[] {
+    // Initial task-page loads ask for the newest bounded window. Do the bound in
+    // SQLite: materializing every historical event and slicing in JS is precisely
+    // the allocation spike this API is meant to avoid. Incremental consumers omit
+    // `limit` and retain the original "everything after cursor" contract.
+    if (limit && limit > 0) {
+      const rows = this.db
+        .prepare('SELECT * FROM events WHERE taskId = ? AND seq > ? ORDER BY seq DESC LIMIT ?')
+        .all(taskId, seq, limit) as any[];
+      rows.reverse();
+      return rows.map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+    }
+    return (this.db.prepare('SELECT * FROM events WHERE taskId = ? AND seq > ? ORDER BY seq').all(taskId, seq) as any[])
+      .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
+  }
+
+  /** Current durable event cursor without materializing or parsing the event log. */
+  latestEventSeq(): number {
+    return Number((this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as any)?.seq ?? 0);
   }
 
   allEventsSince(seq: number, limit?: number): (KarmaxEvent & { seq: number })[] {
@@ -2834,6 +2871,14 @@ export class Store {
     return (this.db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq').all(seq) as any[]).map(
       (r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }),
     );
+  }
+
+  /** Oldest bounded page after a cursor, for lossless forward consumers. */
+  nextEventsSince(seq: number, limit: number): (KarmaxEvent & { seq: number })[] {
+    return (this.db
+      .prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?')
+      .all(seq, limit) as any[])
+      .map((r) => ({ seq: r.seq, type: r.type, taskId: r.taskId, ts: r.ts, payload: JSON.parse(r.payload) }));
   }
 
   /** Retention: drop a task's high-volume live-output rows once it's done. The
