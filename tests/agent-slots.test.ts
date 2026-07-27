@@ -92,6 +92,25 @@ describe('admissionDecision (memory-gate decision — karmax#4)', () => {
     expect(noLoad.loadHigh).toBe(false);
     expect(noLoad.backpressure).toBe(false);
   });
+
+  it('tighterFreeMb uses the smaller of host and cgroup headroom (cgroup-aware)', () => {
+    expect(slots.tighterFreeMb(8000, undefined)).toBe(8000); // no cgroup limit → host figure
+    expect(slots.tighterFreeMb(8000, 200)).toBe(200); // container is tight though host looks free
+    expect(slots.tighterFreeMb(100, 500)).toBe(100); // host is the tighter constraint
+  });
+
+  it('backs off with a retryable error when memory stays tight past the wait deadline', async () => {
+    const prevMin = process.env.KARMAX_AGENT_MIN_FREE_MB;
+    const prevWait = process.env.KARMAX_AGENT_MEM_WAIT_MS;
+    process.env.KARMAX_AGENT_MIN_FREE_MB = String(1024 * 1024 * 1024); // absurd floor → always "tight"
+    process.env.KARMAX_AGENT_MEM_WAIT_MS = '40';
+    try {
+      await expect(slots.awaitAgentResources()).rejects.toBeInstanceOf(slots.AgentResourcesUnavailableError);
+    } finally {
+      if (prevMin === undefined) delete process.env.KARMAX_AGENT_MIN_FREE_MB; else process.env.KARMAX_AGENT_MIN_FREE_MB = prevMin;
+      if (prevWait === undefined) delete process.env.KARMAX_AGENT_MEM_WAIT_MS; else process.env.KARMAX_AGENT_MEM_WAIT_MS = prevWait;
+    }
+  });
 });
 
 describe('agent-slot admission semaphore', () => {

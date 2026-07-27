@@ -204,6 +204,16 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   return undefined;
 }
 
+// Constant-time string comparison for secrets, so a caller can't recover a
+// secret byte-by-byte from response timing. Length is compared first (its
+// leakage is negligible for high-entropy secrets).
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
 function capabilityForRequest(method: string, p: string, url?: URL): string | undefined {
   const explicit = routeCapability(method, p, url);
   if (explicit) return explicit === 'none' ? undefined : explicit;
@@ -812,7 +822,10 @@ export class Gateway {
       const presented = url.searchParams.get('secret')
         ?? (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : undefined);
       const legacy = process.env.KARMAX_AGENT_MAIL_SECRET;
-      if (!presented || (presented !== minted && (!legacy || presented !== legacy)))
+      // Constant-time compare so the secret can't be recovered byte-by-byte via
+      // response timing (matches the Stripe webhook check).
+      const secretOk = !!presented && (timingSafeEqualStr(presented, minted) || (!!legacy && timingSafeEqualStr(presented, legacy)));
+      if (!secretOk)
         return this.json(res, 401, { error: 'agent-mail ingest requires the webhook secret (the ?secret= in the URL karmax shows the operator)' });
       // Providers POST different shapes/encodings; parse by content-type and
       // normalize (karmax JSON, Postmark, CloudMailin, Mailgun, SendGrid, raw

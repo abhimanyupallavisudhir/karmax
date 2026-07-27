@@ -48,6 +48,14 @@ describe('cron parsing + next-fire (UTC)', () => {
     expect(new Date(next!).toISOString()).toBe('2026-01-02T09:00:00.000Z');
   });
 
+  it('treats "N/step" as "N-max/step" (standard cron), not a single value', () => {
+    // "5/15" in the minute field means 5,20,35,50 — not just minute 5.
+    const next = nextCronFire('5/15 * * * *', at('2026-01-01T10:06:00Z'));
+    expect(new Date(next!).toISOString()).toBe('2026-01-01T10:20:00.000Z');
+    const wrap = nextCronFire('5/15 * * * *', at('2026-01-01T10:55:00Z'));
+    expect(new Date(wrap!).toISOString()).toBe('2026-01-01T11:05:00.000Z');
+  });
+
   it('is strictly after the input even when the minute matches', () => {
     const next = nextCronFire('0 9 * * *', at('2026-01-01T09:00:00Z'));
     expect(new Date(next!).toISOString()).toBe('2026-01-02T09:00:00.000Z');
@@ -228,6 +236,20 @@ describe('TriggerScheduler (dispatcher)', () => {
     emitDone(dep.id, 'done');
     expect(fired).toEqual([[b.id, 'self']]);
     expect(s.size).toBe(0); // disarmed after firing
+  });
+
+  it('does not re-fire a repeatable dependency series on duplicate lifecycle events', () => {
+    const dep = store.createTask({ projectId, title: 'dep', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'd' } });
+    const series = store.createTask({ projectId, title: 'series', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'p', repeatable: true, triggers: [{ kind: 'dependency', tasks: [dep.id] }] } });
+    store.updateTaskParams(series.id, { ...series.params, triggerState: 'armed' });
+    const s = makeScheduler();
+    s.start();
+    // A finishing task emits several terminal `view.updated` events; a repeatable
+    // series never disarms, so only the first (newly-satisfied) one may fire.
+    emitDone(dep.id, 'done');
+    emitDone(dep.id, 'done');
+    emitDone(dep.id, 'done');
+    expect(fired).toEqual([[series.id, 'clone']]);
   });
 
   it('binds dependencies to the logical task, not a cancelled attempt', () => {

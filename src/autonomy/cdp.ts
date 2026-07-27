@@ -52,6 +52,13 @@ export function pickPage(pages: CdpTarget[], domains?: string[]): CdpTarget | un
 }
 
 export async function connect(wsUrl: string, timeoutMs = 15_000): Promise<CdpSession> {
+  // The ws target comes from the CDP endpoint's /json/list, which a compromised
+  // world could point anywhere. Re-pin it to loopback so we can't be steered into
+  // an outbound connection (SSRF) to an arbitrary host.
+  const parsed = new URL(wsUrl);
+  if ((parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') || !LOOPBACK.has(parsed.hostname)) {
+    throw new Error('CDP webSocketDebuggerUrl must be a loopback ws endpoint');
+  }
   const ws = new WebSocket(wsUrl);
   let nextId = 1;
   const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
