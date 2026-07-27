@@ -6,7 +6,7 @@ ARG PLAYWRIGHT_VERSION=1.61.1
 # Keep the pre-baked fast path paired with package.json's Agent SDK. Runtime
 # launch also verifies this version and falls back to the SDK-declared npx pin
 # when a user has not rebuilt an older template yet.
-ARG CLAUDE_CODE_VERSION=2.1.191
+ARG CLAUDE_CODE_VERSION=2.1.220
 ARG CODEX_VERSION=0.144.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
