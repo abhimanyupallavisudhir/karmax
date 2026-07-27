@@ -5374,7 +5374,7 @@ function checkinTab(v) {
       ${items}
       <div class="ck-side-h">Shell</div>
       <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
-        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? 'Open a terminal in this task's workspace' : 'No workspace yet'}">
+        <button class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? "Open a terminal in this task's workspace" : 'No workspace yet'}">
           <span class="ck-name">${hasWorld ? 'Open terminal' : 'No workspace yet'}</span>
           <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
         </button>
@@ -5697,7 +5697,7 @@ function terminalPane(v) {
     </div>
     <div class="ck-term">
       <pre class="raw ${open ? '' : 'hidden'} term-screen" id="term-out" tabindex="0" title="Click to focus, then type directly — keystrokes (incl. Ctrl-C) go straight to the shell"></pre>
-      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? '“Open terminal” starts one in the task\'s world.' : 'This task hasn't started its workspace yet.'}</div>`}
+      ${open ? '' : `<div class="empty" id="ck-term-hint"><div class="big">No shell running</div>${hasWorld ? "“Open terminal” starts one in the task's world." : "This task hasn't started its workspace yet."}</div>`}
     </div>`;
 }
 
