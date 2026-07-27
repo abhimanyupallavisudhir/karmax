@@ -57,6 +57,10 @@ export interface FieldDef {
   options?: FieldOption[];
   /** Can this field be grouped by? */
   groupable?: boolean;
+  /** Grouping-only pseudo-field — offered in the group menu but not the filter menu. */
+  groupOnly?: boolean;
+  /** For `tag`-typed fields: restrict the section forest to tags of this kind. */
+  tagKind?: 'type' | 'topic' | 'flag';
   /** Can this field be sorted by? */
   sortable?: boolean;
   /** Extract the comparable value(s) used for filtering + grouping. `ctx` carries `now`
@@ -226,6 +230,10 @@ export const FIELDS: FieldDef[] = [
   { key: 'stage', label: 'Stage', type: 'enum', options: STAGE_OPTIONS, get: stage, groupable: true, sortable: true, sortKey: (t) => STAGE_OPTIONS.findIndex((o) => o.value === stage(t)) },
   { key: 'priority', label: 'Priority', type: 'number', options: PRIORITY_OPTIONS, get: (t) => Number(t.params?.priority ?? 0), groupable: true, sortable: true, sortKey: (t) => Number(t.params?.priority ?? 0) },
   { key: 'tag', label: 'Tag', type: 'tag', aliases: ['label', 'tags'], get: (t) => t.tags ?? [], groupable: true },
+  // Kind-scoped tag grouping: `group:tag-type` / `group:tag-topic` build a section forest
+  // from only the type / topic tags (grouping-only — the filter menu already has `tag`).
+  { key: 'tag-type', label: 'Tag (type)', type: 'tag', tagKind: 'type', get: (t) => t.tags ?? [], groupable: true, groupOnly: true },
+  { key: 'tag-topic', label: 'Tag (topic)', type: 'tag', tagKind: 'topic', get: (t) => t.tags ?? [], groupable: true, groupOnly: true },
   { key: 'created', label: 'Created', type: 'date', get: (t) => t.createdAt, sortable: true, sortKey: (t) => t.createdAt ?? 0 },
   { key: 'updated', label: 'Updated', type: 'date', get: (t) => t.lastView?.updatedAt, sortable: true, sortKey: (t) => t.lastView?.updatedAt ?? t.createdAt ?? 0 },
   { key: 'notes', label: 'Notes', type: 'text', get: (t) => t.notes },
@@ -587,14 +595,18 @@ function groupTasks(tasks: SearchTask[], groupKey: string, ctx: FieldContext): T
  * parent heading accurately summarizes all work nested below it.
  */
 function groupTasksByTagHierarchy(tasks: SearchTask[], field: FieldDef, ctx: FieldContext): TaskGroup[] {
-  const tags = ctx.tags ?? [];
+  // A kind-scoped field (`tag-type`/`tag-topic`) sections by only that kind's tags; a
+  // task's other-kind or stale ids are then simply ignored rather than surfaced.
+  const kind = field.tagKind;
+  const tags = kind ? (ctx.tags ?? []).filter((t) => t.kind === kind) : (ctx.tags ?? []);
   const byId = new Map(tags.map((t) => [t.id, t]));
   const taskById = new Map(tasks.map((t) => [t.id, t]));
   const direct = new Map<string, SearchTask[]>();
   const untagged: SearchTask[] = [];
   const unknown = new Set<string>();
   for (const task of tasks) {
-    const ids = (field.get(task, ctx) as string[]) ?? [];
+    let ids = (field.get(task, ctx) as string[]) ?? [];
+    if (kind) ids = ids.filter((id) => byId.has(id));
     if (!ids.length) {
       untagged.push(task);
       continue;
@@ -655,5 +667,5 @@ function groupTasksByTagHierarchy(tasks: SearchTask[], field: FieldDef, ctx: Fie
 
 /** A compact descriptor of the field registry the UI consumes to build its menus. */
 export function fieldCatalogue() {
-  return FIELDS.map((f) => ({ key: f.key, label: f.label, type: f.type, aliases: f.aliases, options: f.options, groupable: !!f.groupable, sortable: !!f.sortable }));
+  return FIELDS.map((f) => ({ key: f.key, label: f.label, type: f.type, aliases: f.aliases, options: f.options, groupable: !!f.groupable, groupOnly: !!f.groupOnly, sortable: !!f.sortable }));
 }
