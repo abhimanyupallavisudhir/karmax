@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type { Client } from '@temporalio/client';
 import { startDevServer, DevServer } from '../../src/temporal/dev-server.js';
 import { makeClient } from '../../src/temporal/client.js';
@@ -133,7 +134,9 @@ export async function bootHarness(provider: Provider = 'mock', adapterOverride?:
         overlays: new Overlays(),
         client,
         taskQueue: TASK_QUEUE,
-        staticDir: fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-static-')),
+        // The real web/ directory, exactly as src/main.ts wires it, so tests see
+        // the shipped static assets (the brand icons are served from here).
+        staticDir: fileURLToPath(new URL('../../web', import.meta.url)),
         agentInfo: { provider: 'mock', reason: 'test' },
         broker,
         payments,
