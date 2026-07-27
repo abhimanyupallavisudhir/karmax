@@ -552,7 +552,7 @@ describe('project wiki git branches', () => {
 });
 
 describe('existing project wiki remote backfill', () => {
-  it('uses an authorized organization owner and completes before the gateway becomes ready', async () => {
+  it('uses an authorized organization owner without gating gateway readiness', async () => {
     const home = tmp();
     const remotes = path.join(home, 'remotes');
     fs.mkdirSync(remotes);
@@ -610,13 +610,20 @@ describe('existing project wiki remote backfill', () => {
     } as any);
     try {
       const listening = await gateway.listen(49_000);
-      await listening.close();
       expect(actors).toEqual(['owner']);
       expect(inputs).toMatchObject([{ private: true }]);
-      const linked = store.projectWiki(project.id)?.repository;
+      await expect.poll(() => store.projectWiki(project.id)?.repository, { timeout: 5_000 }).toBeTruthy();
+      const linked = store.projectWiki(project.id)!.repository;
       expect(linked).toMatchObject({ private: true, gitConnectionId: connection.id });
-      expect(execFileSync('git', ['--git-dir', path.join(remotes, `${linked!.name}.git`),
-        'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim()).toMatch(/^[0-9a-f]{40}$/);
+      await expect.poll(() => {
+        try {
+          return execFileSync('git', ['--git-dir', path.join(remotes, `${linked!.name}.git`),
+            'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim();
+        } catch {
+          return '';
+        }
+      }, { timeout: 5_000 }).toMatch(/^[0-9a-f]{40}$/);
+      await listening.close();
     } finally {
       store.close();
       if (previousHome === undefined) delete process.env.KARMAX_HOME;

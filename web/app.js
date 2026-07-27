@@ -1810,6 +1810,49 @@ function stringifyQuery(q) {
 
 // ── websocket live stream ──────────────────────────────────────────────────
 let refreshTimer = null;
+const LIST_RELOAD_EVENTS = new Set([
+  'task.created',
+  'task.deleted',
+  'task.tags-changed',
+  'task.responsibility-changed',
+]);
+
+// view.updated already contains the compact fields shown by list rows. Apply that
+// projection locally instead of refetching every task (and re-running search) for
+// every event on the global stream.
+function patchTaskListFromEvent(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
+  if (!task) return false;
+  const payload = ev.payload || {};
+  const previous = task.lastView || {};
+  const waitingFor = payload.waitingFor
+    ? { ...(previous.waitingFor || {}), kind: payload.waitingFor }
+    : undefined;
+  const agentTurn = payload.agentTurn
+    ? {
+        ...(previous.agentTurn || {}),
+        state: payload.agentTurn,
+        ...(payload.agentRole ? { role: payload.agentRole } : {}),
+      }
+    : undefined;
+  task.lastView = {
+    ...previous,
+    ...(payload.stage ? { stage: payload.stage } : {}),
+    ...(payload.status ? { status: payload.status } : {}),
+    waitingFor,
+    agentTurn,
+  };
+  return true;
+}
+
+function scheduleTaskListReload() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks();
+  }, 350);
+}
+
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws${S.token ? `?token=${encodeURIComponent(S.token)}` : ''}`);
@@ -1820,8 +1863,10 @@ function connectWs() {
     S.activity.unshift(ev);
     if (S.activity.length > 400) S.activity.pop();
     if (S.tab === 'activity') bgRenderMain();
+    const patchedList = patchTaskListFromEvent(ev);
     if (S.selected && ev.taskId === S.selected) {
       S.taskEvents.push(ev);
+      if (S.taskEvents.length > 400) S.taskEvents.shift();
       if (ev.type === 'agent.output' && ev.payload?.text) {
         // Provider adapters emit the current complete block, not a token delta.
         // Replacing avoids the old "H / He / Hello" cumulative transcript.
@@ -1838,22 +1883,45 @@ function connectWs() {
         refreshTask(); // the session id was just published mid-turn → show the live fork command
       } else renderTaskEvents();
     }
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => { if (S.tab === 'tasks' || S.tab === 'queue') refreshTasks(); }, 350);
-    if (S.organizationId && ['view.updated', 'task.responsibility-changed', 'task.mentioned'].includes(ev.type))
+    if (patchedList) {
+      // Re-evaluate only the active query: stage/status changes can alter filter
+      // membership, but they do not require the expensive all-tasks endpoint.
+      if (S.tab === 'tasks' && !S.selected) scheduleSearch();
+      if ((S.tab === 'tasks' || S.tab === 'queue') && !S.selected) bgRenderMain();
+      renderRail();
+    } else if (LIST_RELOAD_EVENTS.has(ev.type)) {
+      // True membership/metadata changes are rare and do require a durable reload.
+      scheduleTaskListReload();
+    }
+    // Collaboration state changes only for collaboration events. Reloading five
+    // organization endpoints for every workflow view transition multiplied the
+    // websocket refresh storm without changing any of that data.
+    if (S.organizationId && ['task.responsibility-changed', 'task.mentioned'].includes(ev.type))
       setTimeout(() => loadCollaboration().catch(() => {}), 450);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
 }
 
+let taskRefreshPromise = null;
 async function refreshTasks() {
+  // Navigation, mutations, and a structural websocket event can converge here.
+  // Share one in-flight refresh so slow hosts cannot accumulate duplicate list
+  // scans behind the event loop.
+  if (taskRefreshPromise) return taskRefreshPromise;
+  taskRefreshPromise = (async () => {
+    try {
+      await loadTasks();
+      if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
+      if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
+      renderRail();
+      if (S.tab === 'queue' && !S.selected) seedQueue();
+    } catch {}
+  })();
   try {
-    await loadTasks();
-    if (S.tab === 'tasks' && !S.selected) await runSearch(); // the list re-runs its query on return anyway
-    if (S.tab === 'tasks' || S.tab === 'queue') bgRenderMain();
-    renderRail();
-    if (S.tab === 'queue' && !S.selected) seedQueue();
-  } catch {}
+    await taskRefreshPromise;
+  } finally {
+    taskRefreshPromise = null;
+  }
 }
 
 // ── shell ────────────────────────────────────────────────────────────────────
@@ -3257,15 +3325,24 @@ function wireDepPicker(values, selfId) {
   paint(existing?.tasks || []);
 }
 
-// Full vault-item chooser used by the compact task-form button. This deliberately
-// mirrors the password-manager import panel: mass selection at the top, a bounded
-// scrolling list, a live selected count, and explicit Cancel/Apply actions.
-function openVaultGrantPicker(items, selectedIds, onApply) {
+function vaultItemSearchText(item) {
+  return [
+    item.label, item.type, item.username, item.envVar,
+    ...(item.domains || []), ...(item.tags || []),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+// Full vault-item chooser used by the compact task-form button. It mirrors the
+// password-manager import panel, while allowing sparse policy overrides for this
+// task. "Inherit" deliberately stays sparse so global policy edits keep flowing.
+function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply) {
+  const localPolicies = JSON.parse(JSON.stringify(policyOverrides || {}));
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `<div class="modal-card vault-grant-modal" role="dialog" aria-modal="true" aria-labelledby="vault-grant-title">
     <div class="section-h" id="vault-grant-title">Vault credentials</div>
     <p class="vault-grant-help">Choose which credentials agents working on this task may use.</p>
+    <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
     <div class="vault-grant-box">
       <label class="vault-grant-head">
         <input type="checkbox" class="vault-grant-all" ${items.length ? '' : 'disabled'} />
@@ -3274,15 +3351,30 @@ function openVaultGrantPicker(items, selectedIds, onApply) {
       </label>
       <div class="vault-grant-tree">${
         items.length
-          ? items.map((item) => `<label class="vault-grant-item">
-              <input type="checkbox" class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
-              <span class="vault-grant-item-text">
-                <span>${esc(item.label)}</span>
-                <span class="vault-grant-meta mono">${esc(item.type)}${item.domains?.length ? ` · ${esc(item.domains.join(', '))}` : ''}</span>
+          ? items.map((item) => {
+            const override = localPolicies[item.id] || {};
+            const useOptions = [
+              ['', `inherit (${item.policy?.use || 'auto'})`], ['auto', 'auto'], ['ask', 'ask'],
+            ].map(([value, label]) => `<option value="${value}" ${override.use === value || (!override.use && !value) ? 'selected' : ''}>${label}</option>`).join('');
+            const revealOptions = [
+              ['', `inherit (${item.policy?.reveal || 'ask'})`], ['auto', 'auto'], ['ask', 'ask'], ['never', 'never'],
+            ].map(([value, label]) => `<option value="${value}" ${override.reveal === value || (!override.reveal && !value) ? 'selected' : ''}>${label}</option>`).join('');
+            return `<div class="vault-grant-item" data-vault-item="${esc(item.id)}">
+              <label class="vault-grant-choice">
+                <input type="checkbox" class="vault-grant-pick" value="${esc(item.id)}" ${selectedIds.has(item.id) ? 'checked' : ''} />
+                <span class="vault-grant-item-text">
+                  <span>${esc(item.label)}</span>
+                  <span class="vault-grant-meta mono">${esc(item.type)}${item.username ? ` · ${esc(item.username)}` : ''}${item.domains?.length ? ` · ${esc(item.domains.join(', '))}` : ''}</span>
+                </span>
+              </label>
+              <span class="vault-grant-policies">
+                <label title="${esc(POL_USE_TIP)}">blind use <select class="vault-task-use" ${selectedIds.has(item.id) ? '' : 'disabled'}>${useOptions}</select></label>
+                <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vault-task-reveal" ${selectedIds.has(item.id) ? '' : 'disabled'}>${revealOptions}</select></label>
               </span>
-            </label>`).join('')
+            </div>`;
+          }).join('')
           : '<span class="vault-grant-empty">No vault credentials are available.</span>'
-      }</div>
+      }<span class="vault-grant-empty vault-search-empty" hidden>No credentials match your search.</span></div>
     </div>
     <div class="vault-grant-actions">
       <button type="button" class="btn sm" data-vault-cancel>Cancel</button>
@@ -3292,22 +3384,52 @@ function openVaultGrantPicker(items, selectedIds, onApply) {
   document.body.appendChild(overlay);
   const all = overlay.querySelector('.vault-grant-all');
   const picks = [...overlay.querySelectorAll('.vault-grant-pick')];
+  const rows = [...overlay.querySelectorAll('[data-vault-item]')];
   const selectedCount = overlay.querySelector('.vault-grant-selected');
+  const search = overlay.querySelector('.vault-search');
   const opener = document.activeElement;
   const close = () => { overlay.remove(); opener?.focus?.(); };
   const refreshCount = () => {
     const n = picks.filter((pick) => pick.checked).length;
+    const visible = picks.filter((pick) => !pick.closest('[data-vault-item]').hidden);
+    const selectedVisible = visible.filter((pick) => pick.checked).length;
     selectedCount.textContent = `· ${n} selected`;
-    all.checked = !!picks.length && n === picks.length;
-    all.indeterminate = n > 0 && n < picks.length;
+    all.disabled = !visible.length;
+    all.checked = !!visible.length && selectedVisible === visible.length;
+    all.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+    rows.forEach((row) => {
+      const enabled = row.querySelector('.vault-grant-pick').checked;
+      row.querySelectorAll('.vault-task-use,.vault-task-reveal').forEach((select) => { select.disabled = !enabled; });
+    });
   };
   refreshCount();
   all.addEventListener('change', () => {
-    picks.forEach((pick) => { pick.checked = all.checked; });
+    picks.filter((pick) => !pick.closest('[data-vault-item]').hidden)
+      .forEach((pick) => { pick.checked = all.checked; });
     refreshCount();
   });
   overlay.querySelector('.vault-grant-tree').addEventListener('change', (e) => {
     if (e.target.classList.contains('vault-grant-pick')) refreshCount();
+    const row = e.target.closest('[data-vault-item]');
+    if (row && (e.target.classList.contains('vault-task-use') || e.target.classList.contains('vault-task-reveal'))) {
+      const itemId = row.dataset.vaultItem;
+      const use = row.querySelector('.vault-task-use').value;
+      const reveal = row.querySelector('.vault-task-reveal').value;
+      const next = { ...(use ? { use } : {}), ...(reveal ? { reveal } : {}) };
+      if (Object.keys(next).length) localPolicies[itemId] = next;
+      else delete localPolicies[itemId];
+    }
+  });
+  search.addEventListener('input', () => {
+    const query = search.value.trim().toLowerCase();
+    let visible = 0;
+    rows.forEach((row) => {
+      const item = items.find((candidate) => candidate.id === row.dataset.vaultItem);
+      row.hidden = !!query && !vaultItemSearchText(item).includes(query);
+      if (!row.hidden) visible++;
+    });
+    overlay.querySelector('.vault-search-empty').hidden = visible > 0 || !items.length;
+    refreshCount();
   });
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
   overlay.addEventListener('keydown', (e) => {
@@ -3315,10 +3437,12 @@ function openVaultGrantPicker(items, selectedIds, onApply) {
   });
   overlay.querySelector('[data-vault-cancel]').addEventListener('click', close);
   overlay.querySelector('[data-vault-apply]').addEventListener('click', () => {
-    onApply(new Set(picks.filter((pick) => pick.checked).map((pick) => pick.value)));
+    const selected = new Set(picks.filter((pick) => pick.checked).map((pick) => pick.value));
+    const selectedPolicies = Object.fromEntries(Object.entries(localPolicies).filter(([itemId]) => selected.has(itemId)));
+    onApply(selected, selectedPolicies);
     close();
   });
-  (picks[0] || all || overlay.querySelector('[data-vault-apply]')).focus();
+  search.focus();
 }
 
 // ── the expanded task form (SPEC §10.4) ──────────────────────────────────────
@@ -3512,6 +3636,7 @@ async function openTaskForm(workflow, draft, seedText) {
   // listener; grants persist via createTask/PATCH authorization.
   const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities || [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
+  let vaultCredentialPolicies = JSON.parse(JSON.stringify(draft?.params?._authorization?.credentialPolicies || {}));
   (async () => {
     const button = $('#tf-vault-open');
     const count = $('#tf-vault-count');
@@ -3527,9 +3652,10 @@ async function openTaskForm(workflow, draft, seedText) {
     };
     refreshCount();
     button.disabled = false;
-    button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, (selected) => {
+    button.addEventListener('click', () => openVaultGrantPicker(items, vaultGrantIds, vaultCredentialPolicies, (selected, policies) => {
       vaultGrantIds.clear();
       selected.forEach((id) => vaultGrantIds.add(id));
+      vaultCredentialPolicies = policies;
       refreshCount();
       button.dispatchEvent(new Event('change', { bubbles: true }));
     }));
@@ -3567,6 +3693,7 @@ async function openTaskForm(workflow, draft, seedText) {
       authorizationProfile: $('#tf-authorization')?.value || selectedAuthorization,
       // Per-task vault item grants (PLAN-passwords.md §6) — the credential picker.
       credentialGrants: [...vaultGrantIds].map((id) => `use-credential:item:${id}`),
+      credentialPolicies: vaultCredentialPolicies,
     };
   };
   // Whether the user has actually put something worth keeping into a NEW task —
@@ -3610,12 +3737,12 @@ async function openTaskForm(workflow, draft, seedText) {
       if (sig === lastSaved) return; // no change since the last write landed
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true }) });
           draftId = created.id;
         } else {
           await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
           await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
+          await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
         }
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy?taskId=${encodeURIComponent(draftId)}`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         lastSaved = sig;
@@ -3651,7 +3778,7 @@ async function openTaskForm(workflow, draft, seedText) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, credentialGrants: state.credentialGrants, draft: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorizationProfile: state.authorizationProfile, credentialGrants: state.credentialGrants, credentialPolicies: state.credentialPolicies, draft: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
@@ -3687,12 +3814,12 @@ async function openTaskForm(workflow, draft, seedText) {
         // the series; "Save as draft" (draftMode) disarms it back to a draft.
         await api(`/api/tasks/${draft.id}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true, keepArmed: !draftMode }) });
         await api(`/api/tasks/${draft.id}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
+        await api(`/api/tasks/${draft.id}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
       } else if (draftId) {
         // Auto-save (or a prior edit) already materialised the draft — update it in place.
         await api(`/api/tasks/${draftId}/params`, { method: 'PATCH', body: JSON.stringify({ params: st.body, replace: true }) });
         await api(`/api/tasks/${draftId}/notes`, { method: 'PATCH', body: JSON.stringify({ notes: st.notes }) });
-        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants }) });
+        await api(`/api/tasks/${draftId}/authorization`, { method: 'PATCH', body: JSON.stringify({ profileId: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies }) });
         if (localCred && hasPolicy()) await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: draftId, policy: taskCredPolicy }) });
         // An explicitly-opened later attempt queues only itself. A draft created
         // while composing a brand-new task is queued as a group below, after all
@@ -3702,13 +3829,13 @@ async function openTaskForm(workflow, draft, seedText) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: true, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, draft: draftMode, attempts: attemptCount }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorizationProfile: st.authorizationProfile, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -3963,27 +4090,39 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.paramDefaults = {};
   S.attemptGroup = null;
   try {
-    // Fetch the four independent resources in parallel — they used to be four serial
-    // round-trips, which stacked latency (each page open paid the sum, not the max).
-    // `renderTaskPage` no-ops while `S.view` is null, so assigning them together (rather
-    // than one-at-a-time) also avoids rendering a half-populated page mid-fetch.
+    // Start secondary resources in parallel, but let the compact task projection
+    // paint as soon as it arrives. A large event history or a slow session lookup
+    // must never hold the entire task page hostage.
     const draft = !!rec?.params?.draft;
-    const [view, events, widgets, sessions, attempts] = await Promise.all([
-      api(`/api/tasks/${taskId}`),
-      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0`),
+    const details = Promise.all([
+      // The websocket keeps this window current. Older history remains durable,
+      // but opening a task should have a fixed memory and response-size budget.
+      draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/events?since=0&limit=300`).catch(() => []),
       draft ? Promise.resolve([]) : api(`/api/tasks/${taskId}/widgets`).catch(() => []),
       draft ? Promise.resolve({}) : api(`/api/tasks/${taskId}/sessions`).catch(() => ({})),
       api(`/api/tasks/${taskId}/attempts`).catch(() => null),
     ]);
+    const view = await api(`/api/tasks/${taskId}`);
+    if (S.selected !== taskId) return;
     S.view = view;
-    S.taskEvents = events;
-    S.widgets = widgets;
-    S.sessions = sessions;
-    S.attemptGroup = attempts;
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
     // read); later refreshes never switch tabs under the user.
     if (!S.taskTab) S.taskTab = defaultTaskTab(view);
+    renderTaskPage();
+
+    const [events, widgets, sessions, attempts] = await details;
+    if (S.selected !== taskId) return;
+    // Events may have arrived over the websocket while the bounded durable window
+    // was loading. Preserve those instead of replacing them with the older response.
+    const durableSeqs = new Set(events.map((event) => event.seq).filter((seq) => seq != null));
+    S.taskEvents = [
+      ...events,
+      ...S.taskEvents.filter((event) => event.seq == null || !durableSeqs.has(event.seq)),
+    ].slice(-400);
+    S.widgets = widgets;
+    S.sessions = sessions;
+    S.attemptGroup = attempts;
   } catch (e) { toast(e.message, true); }
   renderTaskPage();
   // Param defaults only feed the Parameters tab, and resolving them costs a git
@@ -4736,9 +4875,10 @@ function wireTerminal(taskId) {
 // ── review actions: click-to-verify buttons (run in the world / open artifacts) ──
 function reviewActionBtn(a, i) {
   const isRun = a.kind === 'run';
-  const icon = isRun ? (a.server ? '▶' : '⚡') : '↗';
-  const label = `${icon} ${esc(a.label || (isRun ? 'Run' : 'Open'))}`;
-  const title = isRun ? esc(a.command || '') : esc(a.target || '');
+  const isPayment = a.kind === 'payment';
+  const icon = isPayment ? (a.operation === 'deny' ? '✕' : '✓') : isRun ? (a.server ? '▶' : '⚡') : '↗';
+  const label = `${icon} ${esc(a.label || (isPayment ? 'Resolve spend' : isRun ? 'Run' : 'Open'))}`;
+  const title = isPayment ? `Payment request ${esc(a.requestId || '')}` : isRun ? esc(a.command || '') : esc(a.target || '');
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
@@ -4765,6 +4905,12 @@ function wireReviewActions(v) {
       try {
         const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
         if (kind === 'open') { openArtifact(r.url, r.external); return; }
+        if (kind === 'payment') {
+          toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
+            r.result?.status === 'denied');
+          await refreshTask(v.taskId);
+          return;
+        }
         // kind === 'run': stream output; open follow-up URLs; offer Stop.
         if (out) { out.classList.remove('hidden'); out.textContent = `$ (running "${btn.textContent.trim()}")\n`; }
         if (reviewActionWs) { try { reviewActionWs.close(); } catch {} }
@@ -8314,45 +8460,87 @@ function paymentsCard(scope) {
   return `<div class="card" data-payments="${scope}">
     <div class="section-h">Payments — budget & cards</div>
     ${scope === 'global' ? `<div class="pay-providers" style="margin-bottom:12px">
-      <div style="font-weight:600;margin-bottom:4px">Funding source</div>
-      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this installation pays. Projects can have narrower cards and policies; karmax never stores card numbers.</p>
+      <div style="font-weight:600;margin-bottom:4px">Payment rail</div>
+      <p style="color:var(--ink-2);margin:0 0 6px;font-size:12px">How this organization pays. Connections, cards, and policies are never shared with another organization.</p>
       <div class="pay-providers-list">Loading…</div>
-    </div>` : ''}
+      <div class="pay-balance" style="margin-top:8px"></div>
+    </div>
+    <details class="pay-cardholder" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">Create Stripe Issuing cardholder</summary>
+      <div class="form-row" style="margin-top:8px"><div style="display:flex;gap:8px;flex-wrap:wrap">
+        <select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select>
+        <input class="holder-name" placeholder="full or company name" />
+        <input class="holder-first" placeholder="first name (individual)" />
+        <input class="holder-last" placeholder="last name (individual)" />
+        <input class="holder-dob" type="date" title="date of birth (individual)" />
+        <input class="holder-email" type="email" placeholder="email" />
+        <input class="holder-phone" placeholder="phone" />
+        <input class="holder-line1" placeholder="address line 1" />
+        <input class="holder-city" placeholder="city" />
+        <input class="holder-state" placeholder="state/region" />
+        <input class="holder-postal" placeholder="postal code" />
+        <input class="holder-country" placeholder="country (US)" style="width:100px" />
+        <button class="btn sm" data-addholder>Create cardholder</button>
+      </div></div>
+    </details>` : ''}
     <div class="form-row"><label>Spend allowance per task (USD; blank = unlimited)</label><input class="pay-allow" type="number" step="0.01" /></div>
     <div class="form-row"><label>Review threshold (USD; a single spend above this needs approval)</label><input class="pay-thresh" type="number" step="0.01" /></div>
     <button class="btn sm primary" data-savepolicy="${scope}">Save budget policy</button>
     <div class="section-h" style="margin-top:14px">Cards</div>
     <div class="cards-list" style="margin-bottom:8px"></div>
-    <div class="form-row"><label>Add a ${scope} card</label>
+    <div class="form-row"><label>Add ${scope === 'global' ? 'an organization' : 'a project'} card</label>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <input class="card-label" placeholder="label (e.g. Ops)" />
         <input class="card-cap" type="number" step="0.01" placeholder="hard cap USD" style="width:140px" />
+        <input class="card-merchants" placeholder="merchant domains (optional, comma-separated)" style="min-width:240px" />
+        <select class="card-provider"><option value="mock">Local test funds</option></select>
+        <select class="card-cardholder hidden"><option value="">Choose Stripe cardholder</option></select>
         <button class="btn" data-addcard="${scope}">Add card</button>
       </div></div>
+    ${scope === 'global' ? `<div class="section-h" style="margin-top:14px">Pending spend requests</div><div class="pay-requests"></div>
+      <div class="section-h" style="margin-top:14px">Payment activity</div><div class="pay-transactions"></div>` : ''}
   </div>`;
 }
 const usd = (cents) => `$${((cents || 0) / 100).toFixed(2)}`;
-async function wirePaymentProviders(box) {
+async function wirePaymentProviders(box, organizationId) {
   const list = box.querySelector('.pay-providers-list');
   if (!list) return;
   let data = { providers: [], active: null };
-  try { data = await api('/api/payments/providers'); } catch {}
+  const paymentsBase = organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
+    : '/api/payments';
+  try { data = await api(`${paymentsBase}/providers`); } catch {}
   list.innerHTML = data.providers.length
     ? data.providers.map((p) => `<div class="queue-item" data-prov="${esc(p.name)}">
-        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : ''}
+        <div style="flex:1"><b>${esc(p.label)}</b> ${p.name === data.active ? '<span class="chip">active</span>' : ''} ${p.connected ? '<span class="chip" style="color:var(--ok,#4ec9a3)">connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip">needs attention</span>' : !p.available ? '<span class="chip">deployment setup needed</span>' : ''}
           <div class="task-sub" style="color:var(--ink-3)">${esc(p.help || '')}</div></div>
-        ${p.kind === 'oauth' && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}</div>`).join('')
+        ${p.kind === 'oauth' && p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
+        ${p.kind === 'oauth' && (p.connected || p.connectionStatus) ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</div>`).join('')
     : '<span style="color:var(--ink-3)">No payment providers.</span>';
   list.querySelectorAll('[data-connectpay]').forEach((b) => b.addEventListener('click', async () => {
     try {
-      const r = await api('/api/payments/connect', { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
-      const row = b.closest('[data-prov]');
+      const r = await api(`${paymentsBase}/connect`, { method: 'POST', body: JSON.stringify({ provider: b.dataset.connectpay }) });
       if (r.status === 'awaiting_oauth' && r.url) {
-        row.insertAdjacentHTML('beforeend', `<div style="font-size:12px;margin-top:6px;flex-basis:100%">Open to authorize (karmax never sees your card data):<br><a href="${esc(r.url)}" target="_blank" rel="noopener" class="mono">${esc(r.url)}</a></div>`);
-      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box); }
+        location.assign(r.url);
+      } else if (r.status === 'connected') { toast('Connected'); wirePaymentProviders(box, organizationId); }
       else { toast(r.detail || 'Not available', true); }
     } catch (e) { toast(e.message, true); }
   }));
+  list.querySelectorAll('[data-disconnectpay]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`Disconnect ${b.dataset.disconnectpay} from this organization? Existing cards will be unusable.`)) return;
+    try {
+      await api(`${paymentsBase}/connections/${encodeURIComponent(b.dataset.disconnectpay)}`, { method: 'DELETE' });
+      toast('Payment provider disconnected');
+      wirePaymentProviders(box, organizationId);
+    } catch (e) { toast(e.message, true); }
+  }));
+  if (organizationId && data.active) {
+    try {
+      const balance = await api(`${paymentsBase}/balance?provider=${encodeURIComponent(data.active)}`);
+      const el = box.querySelector('.pay-balance');
+      if (el) el.innerHTML = `<b>Available balance:</b> ${usd(balance.available)} ${esc(String(balance.currency || 'usd').toUpperCase())}${balance.fundingUrl ? ` · <a href="${esc(balance.fundingUrl)}" target="_blank" rel="noopener">Fund in Stripe</a>` : ''}`;
+    } catch {}
+  }
+  return data;
 }
 async function wirePaymentsCard(scope, projectId, organizationId) {
   const box = $(`[data-payments="${scope}"]`);
@@ -8360,8 +8548,61 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
   // Non-project cards belong to the organization (tenant boundary), not the
   // whole installation. `scope==='global'` here is the org-settings surface.
   const orgQ = organizationId ? `organizationId=${encodeURIComponent(organizationId)}` : '';
-  if (scope === 'global') await wirePaymentProviders(box);
-  const sUrl = scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
+  const paymentsBase = organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/payments`
+    : '/api/payments';
+  let providerData;
+  if (scope === 'global') providerData = await wirePaymentProviders(box, organizationId);
+  else {
+    try { providerData = await api(`${paymentsBase}/providers`); } catch { providerData = { providers: [], active: 'mock' }; }
+  }
+  const providerSelect = box.querySelector('.card-provider');
+  const holderSelect = box.querySelector('.card-cardholder');
+  const usableProviders = (providerData?.providers || []).filter((p) => p.connected);
+  providerSelect.innerHTML = usableProviders.map((p) =>
+    `<option value="${esc(p.name)}" ${p.name === providerData.active ? 'selected' : ''}>${esc(p.label)}</option>`).join('');
+  const loadCardholders = async () => {
+    const stripe = providerSelect.value === 'stripe';
+    holderSelect.classList.toggle('hidden', !stripe);
+    if (!stripe) return;
+    try {
+      const holders = await api(`${paymentsBase}/cardholders?provider=stripe`);
+      holderSelect.innerHTML = `<option value="">Choose Stripe cardholder</option>${holders
+        .filter((h) => h.status === 'active').map((h) => `<option value="${esc(h.id)}">${esc(h.name)} · ${esc(h.type)}</option>`).join('')}`;
+    } catch (e) {
+      holderSelect.innerHTML = '<option value="">Cardholders unavailable</option>';
+    }
+  };
+  providerSelect.addEventListener('change', loadCardholders);
+  await loadCardholders();
+  box.querySelector('[data-addholder]')?.addEventListener('click', async () => {
+    const dobValue = box.querySelector('.holder-dob').value;
+    const dob = dobValue ? new Date(`${dobValue}T00:00:00Z`) : undefined;
+    try {
+      await api(`${paymentsBase}/cardholders`, { method: 'POST', body: JSON.stringify({
+        provider: 'stripe',
+        type: box.querySelector('.holder-type').value,
+        name: box.querySelector('.holder-name').value.trim(),
+        firstName: box.querySelector('.holder-first').value.trim() || undefined,
+        lastName: box.querySelector('.holder-last').value.trim() || undefined,
+        dob: dob ? { day: dob.getUTCDate(), month: dob.getUTCMonth() + 1, year: dob.getUTCFullYear() } : undefined,
+        email: box.querySelector('.holder-email').value.trim() || undefined,
+        phone: box.querySelector('.holder-phone').value.trim() || undefined,
+        address: {
+          line1: box.querySelector('.holder-line1').value.trim(),
+          city: box.querySelector('.holder-city').value.trim(),
+          state: box.querySelector('.holder-state').value.trim() || undefined,
+          postalCode: box.querySelector('.holder-postal').value.trim(),
+          country: box.querySelector('.holder-country').value.trim(),
+        },
+      }) });
+      toast('Stripe cardholder created');
+      await loadCardholders();
+    } catch (e) { toast(e.message, true); }
+  });
+  const sUrl = scope === 'global' && organizationId
+    ? `/api/organizations/${encodeURIComponent(organizationId)}/settings/payments`
+    : scope === 'global' ? '/api/settings/global/payments' : `/api/settings/project/${projectId}/payments`;
   let policy = {};
   try { policy = await api(sUrl); } catch {}
   if (policy.allowance != null) box.querySelector('.pay-allow').value = (policy.allowance / 100).toFixed(2);
@@ -8383,13 +8624,22 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     if (scope === 'global') cards = cards.filter((c) => c.scope === 'organization' || c.scope === 'global');
     const list = box.querySelector('.cards-list');
     list.innerHTML = cards.length
-      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope}</span><div class="task-sub">available ${usd(c.available)} / cap ${usd(c.cap)}</div></div>
-        <input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button></div>`).join('')
+      ? cards.map((c) => `<div class="queue-item"><div style="flex:1"><b>${esc(c.label)}</b> <span class="chip">${esc(c.provider)}</span> ${c.last4 ? `<span class="mono">•••• ${esc(c.last4)}</span>` : ''} <span class="mono" style="color:var(--ink-3);font-size:11px">· ${c.scope} · ${esc(c.id)}</span><div class="task-sub">${esc(c.status || 'active')} · available ${usd(c.available)} / cap ${usd(c.cap)}${c.merchantLock?.length ? ` · merchants ${c.merchantLock.map(esc).join(', ')}` : ''}</div></div>
+        ${c.provider === 'mock' && c.status !== 'canceled' ? `<input class="fund-amt" type="number" step="0.01" placeholder="USD" style="width:90px" /><button class="btn sm" data-fund="${c.id}">Fund</button>` : ''}
+        ${c.status !== 'canceled' ? `<button class="btn sm danger" data-revoke="${c.id}">Revoke</button>` : ''}</div>`).join('')
       : '<span style="color:var(--ink-3)">No cards.</span>';
     list.querySelectorAll('[data-fund]').forEach((b) => b.addEventListener('click', async () => {
       const amt = b.closest('.queue-item').querySelector('.fund-amt').value;
       if (!amt) return;
-      try { await api(`/api/cards/${b.dataset.fund}/fund`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+      try { await api(`/api/cards/${b.dataset.fund}/fund${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ amount: Math.round(Number(amt) * 100) }) }); toast('Card funded'); renderCards(); } catch (e) { toast(e.message, true); }
+    }));
+    list.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('Revoke this card? This cannot be undone.')) return;
+      try {
+        await api(`/api/cards/${b.dataset.revoke}${orgQ ? `?${orgQ}` : ''}`, { method: 'DELETE' });
+        toast('Card revoked');
+        renderCards();
+      } catch (e) { toast(e.message, true); }
     }));
   };
   await renderCards();
@@ -8397,13 +8647,48 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
     const label = box.querySelector('.card-label').value.trim() || 'Card';
     const cap = box.querySelector('.card-cap').value;
     try {
-      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({ scope: scope === 'project' ? 'project' : 'organization', projectId: scope === 'project' ? projectId : undefined, label, cap: Math.round(Number(cap || 0) * 100) }) });
+      await api(`/api/cards${orgQ ? `?${orgQ}` : ''}`, { method: 'POST', body: JSON.stringify({
+        scope: scope === 'project' ? 'project' : 'organization',
+        projectId: scope === 'project' ? projectId : undefined,
+        label,
+        cap: Math.round(Number(cap || 0) * 100),
+        merchantLock: box.querySelector('.card-merchants').value.split(',').map((value) => value.trim()).filter(Boolean),
+        provider: providerSelect.value,
+        cardholderId: providerSelect.value === 'stripe' ? holderSelect.value : undefined,
+      }) });
       box.querySelector('.card-label').value = '';
       box.querySelector('.card-cap').value = '';
+      box.querySelector('.card-merchants').value = '';
       toast('Card added');
       renderCards();
     } catch (e) { toast(e.message, true); }
   });
+  if (scope === 'global' && organizationId) {
+    const renderLedger = async () => {
+      let requests = [], transactions = [];
+      try { [requests, transactions] = await Promise.all([
+        api(`${paymentsBase}/requests`), api(`${paymentsBase}/transactions`),
+      ]); } catch {}
+      const pending = requests.filter((r) => ['pending_approval', 'needs_funding', 'authorized', 'consumed'].includes(r.status));
+      box.querySelector('.pay-requests').innerHTML = pending.length ? pending.map((r) =>
+        `<div class="queue-item"><div style="flex:1"><b>${usd(r.amount)}</b> ${r.merchant ? `at ${esc(r.merchant)}` : ''} <span class="chip">${esc(r.status)}</span><div class="task-sub">${esc(r.why || r.reason || '')}</div></div>
+          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">Approve / retry</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`).join('')
+        : '<span style="color:var(--ink-3)">No pending requests.</span>';
+      box.querySelector('.pay-transactions').innerHTML = transactions.length ? transactions.slice(0, 50).map((t) =>
+        `<div class="queue-item"><div style="flex:1"><b>${usd(t.amount)}</b> ${t.merchant ? `at ${esc(t.merchant)}` : ''} <span class="chip">${esc(t.status)}</span><div class="task-sub">${esc(t.provider)} · ${new Date(t.createdAt).toLocaleString()}</div></div></div>`).join('')
+        : '<span style="color:var(--ink-3)">No payment activity.</span>';
+      box.querySelectorAll('[data-payapprove],[data-paydeny]').forEach((b) => b.addEventListener('click', async () => {
+        const id = b.dataset.payapprove || b.dataset.paydeny;
+        const op = b.dataset.payapprove ? 'approve' : 'deny';
+        try {
+          const r = await api(`${paymentsBase}/requests/${encodeURIComponent(id)}/${op}`, { method: 'POST' });
+          toast(r.status === 'granted' ? 'Spend approved' : r.reason || 'Request updated', r.status === 'denied');
+          renderLedger();
+        } catch (e) { toast(e.message, true); }
+      }));
+    };
+    await renderLedger();
+  }
 }
 
 // ── vault items + credential access requests (PLAN-passwords.md §§4–10) ──────
@@ -8422,7 +8707,10 @@ function policyTip(text) { return `<span class="info-dot" title="${esc(text)}" o
 function passwordsCard() {
   return `<div class="card" id="vault-card">
     <div class="section-h">Passwords <span class="chip">organization resource</span></div>
-    <div class="vault-items-list" style="margin-bottom:14px">Loading…</div>
+    <button type="button" class="btn vault-manage-button" id="vault-manage-open" disabled>
+      <span>Vault credentials</span>
+      <span class="vault-manage-count">Loading…</span>
+    </button>
 
     <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Sync from a password manager
       ${policyTip('karmax mirrors the items you pick into its own encrypted vault (a snapshot, not a live link) — so agents keep working even if the store is offline, and you choose exactly what they can touch. Connect the store CLI on this host, then Import.')}</div>
@@ -8469,49 +8757,101 @@ async function wireVaultCards(organizationId) {
   };
   secretRows();
   box.querySelector('.vi-type').addEventListener('change', secretRows);
+  let vaultItems = [];
+  const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
+    : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
   const renderItems = async () => {
-    let items = [];
-    try { items = await api(`/api/vault/items${oq}`); } catch {}
-    const list = box.querySelector('.vault-items-list');
-    const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
-      : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
-    list.innerHTML = items.length
-      ? items.map((i) => `<div class="queue-item" data-vi="${esc(i.id)}">
+    const button = box.querySelector('#vault-manage-open');
+    try {
+      vaultItems = await api(`/api/vault/items${oq}`);
+      button.disabled = false;
+      button.querySelector('.vault-manage-count').textContent = `${vaultItems.length} item${vaultItems.length === 1 ? '' : 's'}`;
+    } catch {
+      vaultItems = [];
+      button.disabled = true;
+      button.querySelector('.vault-manage-count').textContent = 'Unavailable';
+    }
+    return vaultItems;
+  };
+  const openVaultManager = () => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal-card vault-manager-modal" role="dialog" aria-modal="true" aria-labelledby="vault-manager-title">
+      <div class="vault-manager-head">
+        <div><div class="section-h" id="vault-manager-title">Vault credentials</div>
+          <p class="vault-grant-help">Manage organization defaults, rotate secrets, or remove credentials.</p></div>
+        <button type="button" class="icon-btn" data-vault-manager-close aria-label="Close">×</button>
+      </div>
+      <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
+      <div class="vault-manager-list"></div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const list = overlay.querySelector('.vault-manager-list');
+    const search = overlay.querySelector('.vault-search');
+    const filterRows = () => {
+      const query = search.value.trim().toLowerCase();
+      let visible = 0;
+      list.querySelectorAll('[data-vi]').forEach((row) => {
+        const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
+        row.hidden = !!query && !vaultItemSearchText(item).includes(query);
+        if (!row.hidden) visible++;
+      });
+      const empty = list.querySelector('.vault-search-empty');
+      if (empty) empty.hidden = visible > 0 || !vaultItems.length;
+    };
+    const paint = () => {
+      list.innerHTML = vaultItems.length
+        ? vaultItems.map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
           <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
             ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
             <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
-          <label style="font-size:11px" title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          <label style="font-size:11px" title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           <button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>
           <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button></div>`).join('')
-      : '<span style="color:var(--ink-3)">No passwords yet — sync from a password manager below, or add one by hand.</span>';
-    list.querySelectorAll('[data-vi]').forEach((row) => {
-      const item = items.find((x) => x.id === row.dataset.vi);
-      const savePolicy = async () => {
+        : '<span class="vault-grant-empty">No passwords yet — sync from a password manager or add one by hand.</span>';
+      list.insertAdjacentHTML('beforeend', '<span class="vault-grant-empty vault-search-empty" hidden>No credentials match your search.</span>');
+      list.querySelectorAll('[data-vi]').forEach((row) => {
+        const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
+        const savePolicy = async () => {
+          try {
+            const updated = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
+            Object.assign(item, updated.item || updated);
+            toast('Policy saved');
+          } catch (e) { toast(e.message, true); }
+        };
+        row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
+        row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+      });
+      list.querySelectorAll('[data-vi-rotate]').forEach((button) => button.addEventListener('click', async () => {
+        const item = vaultItems.find((candidate) => candidate.id === button.dataset.viRotate);
+        const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
+        const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
+        if (!value) return;
         try {
-          await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
-          toast('Policy saved');
+          const result = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
+          toast(result.propagated?.connector ? `Secret updated (also pushed to ${result.propagated.connector})` : 'Secret updated');
         } catch (e) { toast(e.message, true); }
-      };
-      row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
-      row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
-    });
-    list.querySelectorAll('[data-vi-rotate]').forEach((b) => b.addEventListener('click', async () => {
-      const item = items.find((x) => x.id === b.dataset.viRotate);
-      const field = { login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', note: 'note' }[item.type] || 'password';
-      const value = prompt(`New ${field} for "${item.label}" (metadata and notes are untouched; a synced source store is updated too if write-back is on):`);
-      if (!value) return;
-      try {
-        const r = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, secrets: { [field]: value } }) });
-        toast(r.propagated?.connector ? `Secret updated (also pushed to ${r.propagated.connector})` : 'Secret updated');
-      } catch (e) { toast(e.message, true); }
-    }));
-    list.querySelectorAll('[data-vi-del]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm('Delete this vault item (and its secrets)?')) return;
-      try { await api(`/api/vault/items/${b.dataset.viDel}${oq}`, { method: 'DELETE' }); renderItems(); } catch (e) { toast(e.message, true); }
-    }));
-    return items;
+      }));
+      list.querySelectorAll('[data-vi-del]').forEach((button) => button.addEventListener('click', async () => {
+        if (!confirm('Delete this vault item (and its secrets)?')) return;
+        try {
+          await api(`/api/vault/items/${button.dataset.viDel}${oq}`, { method: 'DELETE' });
+          await renderItems();
+          paint();
+        } catch (e) { toast(e.message, true); }
+      }));
+      filterRows();
+    };
+    paint();
+    const close = () => overlay.remove();
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+    overlay.querySelector('[data-vault-manager-close]').addEventListener('click', close);
+    search.addEventListener('input', filterRows);
+    search.focus();
   };
+  box.querySelector('#vault-manage-open').addEventListener('click', openVaultManager);
   // ── connectors row: connect a store, then open the full import panel ──
   const renderConnectors = async () => {
     const list = box.querySelector('.connectors-list');

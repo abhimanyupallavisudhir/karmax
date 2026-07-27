@@ -125,6 +125,37 @@ describe('grants + access policy (§§5–6)', () => {
     expect(items.access(caps, 't1', items.get(item.id)!, 'reveal').status).toBe('needs_approval');
   });
 
+  it('layers sparse policy overrides per task without changing organization defaults', () => {
+    const { items } = makeService();
+    const item = items.save({
+      type: 'login',
+      label: 'gh',
+      policy: { use: 'ask', reveal: 'never' },
+      secrets: { password: 'p' },
+    });
+    const caps = [`use-credential:item:${item.id}`];
+    items.setTaskPolicies('t1', { [item.id]: { use: 'auto', reveal: 'ask' } });
+
+    expect(items.effectivePolicy('t1', item)).toEqual({ use: 'auto', reveal: 'ask' });
+    expect(items.access(caps, 't1', item, 'use').status).toBe('granted');
+    expect(items.access(caps, 't1', item, 'reveal').status).toBe('needs_approval');
+    expect(items.access(caps, 't2', item, 'use').status).toBe('needs_approval');
+    expect(items.access(caps, 't2', item, 'reveal').status).toBe('denied');
+
+    // Missing dimensions keep inheriting the live organization default.
+    items.setTaskPolicies('t1', { [item.id]: { use: 'auto' } });
+    items.setPolicy(item.id, { reveal: 'auto' });
+    expect(items.effectivePolicy('t1', items.get(item.id)!)).toEqual({ use: 'auto', reveal: 'auto' });
+  });
+
+  it('drops malformed persisted task policy values instead of weakening access', () => {
+    const { items, store } = makeService();
+    const item = items.save({ type: 'login', label: 'gh', policy: { reveal: 'never' }, secrets: { password: 'p' } });
+    store.kvSet('vault:task-policy:t1', JSON.stringify({ [item.id]: { use: 'yes', reveal: 'always' } }));
+    expect(items.taskPolicies('t1')).toEqual({});
+    expect(items.access([`use-credential:item:${item.id}`], 't1', item, 'reveal').status).toBe('denied');
+  });
+
   it('domain matching covers subdomains but not lookalikes', () => {
     expect(domainMatches('github.com', 'github.com')).toBe(true);
     expect(domainMatches('gist.github.com', 'github.com')).toBe(true);

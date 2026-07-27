@@ -32,7 +32,9 @@ import { worldRepos, worldRepoSource } from '../world/types.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerOpenGithubPr, brokerPublishBranch, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { cloudGitSource } from '../world/cloud-source.js';
-import { PaymentProvider, BudgetService } from '../autonomy/payments.js';
+import { PaymentProvider, PaymentRegistry, BudgetService, StripeIssuingProvider } from '../autonomy/payments.js';
+import { fillViaCdp } from '../autonomy/fill.js';
+import { fillCardInWorld } from '../autonomy/card-fill.js';
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { materializeFork } from '../agent/fork.js';
 import { materializeRemoteSession } from '../agent/remote-process.js';
@@ -181,6 +183,7 @@ export interface CoreActivityDeps {
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
   runners?: import('../world/runners.js').RunnerPoolService;
   payments?: PaymentProvider;
+  paymentRegistry?: PaymentRegistry;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
   contentDir?: string;
@@ -1321,9 +1324,63 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           },
           ...(deps.payments
             ? {
-                budget: new BudgetService(store, deps.payments),
-                spendCtx: { projectId: args.task.projectId, taskId: args.taskId, organizationId: store.getProject(args.task.projectId)?.organizationId },
+                budget: new BudgetService(store, deps.paymentRegistry ?? deps.payments),
+                spendCtx: {
+                  projectId: args.task.projectId,
+                  taskId: args.taskId,
+                  organizationId: store.getProject(args.task.projectId)?.organizationId,
+                  capabilities: args.task.grant,
+                },
                 onSpend: (req: any, outcome: any) => record(args.taskId, 'spend.requested', { ...req, status: outcome.status, reason: outcome.reason }),
+                fillPaymentCard: async (fill: {
+                  requestId: string;
+                  cdpUrl: string;
+                  selectors: { number: string; cvc: string; expiry?: string; expMonth?: string; expYear?: string };
+                }) => {
+                  const request = store.getPaymentSpendRequest(fill.requestId);
+                  if (!request || request.taskId !== args.taskId || request.status !== 'authorized')
+                    throw new Error('payment request is not an active reservation for this task');
+                  const card = request.cardId ? store.getCard(request.cardId) : undefined;
+                  if (!card || card.provider !== 'stripe') throw new Error('secure fill requires a reserved Stripe card');
+                  const provider = deps.paymentRegistry?.forCard(card as any);
+                  if (!(provider instanceof StripeIssuingProvider)) throw new Error('Stripe Issuing is unavailable');
+                  const rawMerchant = String(request.merchant ?? '').trim();
+                  let domain = '';
+                  try {
+                    domain = new URL(rawMerchant.includes('://') ? rawMerchant : `https://${rawMerchant}`).hostname;
+                  } catch {}
+                  if (!domain || !domain.includes('.'))
+                    throw new Error('request_spend merchant must be the checkout domain before a card can be filled');
+                  if (!fill.selectors.number || !fill.selectors.cvc
+                    || (!fill.selectors.expiry && !(fill.selectors.expMonth && fill.selectors.expYear)))
+                    throw new Error('number, CVC, and either combined expiry or month/year selectors are required');
+                  const details = await provider.retrieveCardDetails(card.id);
+                  const expected = [domain];
+                  let origin: string;
+                  if (isRemote(world.handle.kind) || world.handle.kind === 'container') {
+                    origin = (await fillCardInWorld(world, {
+                      cdpUrl: fill.cdpUrl, domain, selectors: fill.selectors, details,
+                    })).origin;
+                  } else {
+                    origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.number,
+                      text: details.number, expectDomains: expected })).origin;
+                    const month = String(details.expMonth).padStart(2, '0');
+                    if (fill.selectors.expiry) {
+                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expiry,
+                        text: `${month}/${String(details.expYear).slice(-2)}`, expectDomains: expected })).origin;
+                    } else {
+                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expMonth!,
+                        text: month, expectDomains: expected })).origin;
+                      origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.expYear!,
+                        text: String(details.expYear), expectDomains: expected })).origin;
+                    }
+                    origin = (await fillViaCdp({ cdpUrl: fill.cdpUrl, selector: fill.selectors.cvc,
+                      text: details.cvc, expectDomains: expected })).origin;
+                  }
+                  store.appendAudit({ principalId: `task:${args.taskId}`, action: 'payment.card.filled',
+                    detail: { taskId: args.taskId, requestId: request.id, cardId: card.id, origin } });
+                  return { filled: true as const, origin };
+                },
               }
             : {}),
           ...(token
@@ -1361,7 +1418,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       } catch (err) {
         if (token) deps.tokens?.revoke(token);
-        if (signal?.aborted) throw err; // cancellation — Temporal must see it untouched
+        // Providers often surface their own generic AbortError after the activity
+        // cancellation signal fires. Throw Temporal's cancellation reason instead
+        // so WAIT_CANCELLATION_COMPLETED records an acknowledged cancellation,
+        // rather than turning a user cancel into an ordinary workflow failure.
+        if (signal?.aborted) {
+          throw signal.reason instanceof Error ? signal.reason : err;
+        }
         throw classifyTurnError(err, profile.provider);
       } finally {
         await releaseSlot();

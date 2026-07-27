@@ -32,6 +32,7 @@ global.go = () => { calls.push('go'); };
 global.toast = () => { calls.push('toast'); };
 global.loadTasks = async () => { calls.push('loadTasks'); S.tasks = [{ id: 't_new', projectId: S.projectId }]; };
 global.loadOrg = async () => { calls.push(`loadOrg:${S.projectId}`); S.orgProjectId = S.projectId; S.views = [{ id: 'vB' }]; };
+global.loadOrganizationRuntimeCatalog = async () => {};
 global.runSearch = async () => { calls.push('runSearch'); S.searchResult = { tasks: S.tasks }; };
 global.renderRail = () => { calls.push('renderRail'); };
 global.renderMain = () => { calls.push('renderMain'); };

@@ -1416,9 +1416,15 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 /* Credential import modal + inline info dots (Passwords settings) */
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 60; }
 .modal-card { background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--r); padding: 18px; box-shadow: 0 12px 40px rgba(0,0,0,.35); }
-.vault-grant-modal { width: min(600px, 92vw); }
+.vault-grant-modal { width: min(720px, 92vw); }
 .vault-grant-modal > .section-h { margin-bottom: 4px; }
 .vault-grant-help { margin: 0 0 12px; color: var(--ink-2); font-size: 12px; }
+.vault-search {
+  width: 100%; box-sizing: border-box; margin: 0 0 10px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2);
+  color: var(--ink); font: inherit;
+}
+.vault-search:focus { outline: 2px solid var(--accent-weak); border-color: var(--accent); }
 .vault-grant-box { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
 .vault-grant-head {
   display: flex; gap: 8px; align-items: center; padding: 9px 11px;
@@ -1427,13 +1433,33 @@ pre.term-screen:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(-
 }
 .vault-grant-selected { color: var(--ink-3); font-weight: 400; }
 .vault-grant-tree { max-height: 44vh; overflow-y: auto; padding: 8px 10px; }
-.vault-grant-item { display: flex; gap: 8px; align-items: flex-start; padding: 6px 4px; cursor: pointer; }
+.vault-grant-item { display: flex; gap: 12px; align-items: center; padding: 7px 5px; }
+.vault-grant-item[hidden], .vault-manager-item[hidden], .vault-grant-empty[hidden] { display: none !important; }
 .vault-grant-item:hover { background: var(--surface-2); border-radius: 6px; }
-.vault-grant-item > input { margin-top: 2px; }
+.vault-grant-choice { display: flex; flex: 1; min-width: 180px; gap: 8px; align-items: flex-start; cursor: pointer; }
+.vault-grant-choice > input { margin-top: 2px; }
 .vault-grant-item-text { min-width: 0; display: flex; flex-direction: column; gap: 1px; font-size: 12px; }
 .vault-grant-meta { color: var(--ink-3); font-size: 11px; overflow-wrap: anywhere; }
+.vault-grant-policies { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.vault-grant-policies label, .vault-manager-item > label {
+  display: inline-flex; align-items: center; gap: 4px; color: var(--ink-2); font-size: 11px; white-space: nowrap;
+}
+.vault-grant-policies select, .vault-manager-item select { max-width: 120px; font-size: 11px; }
 .vault-grant-empty { display: block; padding: 18px 4px; color: var(--ink-3); font-size: 12px; text-align: center; }
 .vault-grant-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.vault-manage-button {
+  width: 100%; justify-content: space-between; margin-bottom: 14px; padding: 10px 12px;
+}
+.vault-manage-count { color: var(--ink-3); font-size: 11px; font-weight: 500; }
+.vault-manager-modal { width: min(900px, 94vw); max-height: min(720px, 88vh); display: flex; flex-direction: column; }
+.vault-manager-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.vault-manager-list { min-height: 90px; max-height: 62vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.vault-manager-item { margin: 0; border: 0; border-radius: 0; border-bottom: 1px solid var(--line); padding: 10px; flex-wrap: wrap; }
+.vault-manager-item:last-of-type { border-bottom: 0; }
+@media (max-width: 650px) {
+  .vault-grant-item { align-items: stretch; flex-direction: column; }
+  .vault-grant-policies { padding-left: 25px; justify-content: flex-start; }
+}
 .info-dot { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 999px; background: var(--surface-2); color: var(--ink-3); font-size: 10px; cursor: pointer; user-select: none; }
 .info-dot:hover { color: var(--accent); }
 .vault-custom summary { color: var(--ink-2); font-size: 13px; }
