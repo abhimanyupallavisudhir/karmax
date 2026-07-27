@@ -786,6 +786,50 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(revealed).toMatchObject({ status: 'granted', value: 'task-secret' });
   });
 
+  it('changes a running task authorization + vault grants in-flight, freezes once terminal', async () => {
+    const repo = await h.makeRepo('auth-inflight-gw');
+    const project: any = await (await fetch(`${base}/api/projects`, {
+      method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'In-flight auth', config: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } }),
+    })).json();
+    const item: any = await (await fetch(`${base}/api/vault/items`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        type: 'login', label: 'In-flight grant', domains: 'inflight.example.com',
+        policy: { use: 'ask', reveal: 'ask' }, secrets: { password: 'inflight-secret' },
+      }),
+    })).json();
+    const cap = `use-credential:item:${item.id}`;
+    // A running task (paused at Review) — no longer a draft, so previously frozen.
+    const task: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({
+        title: 'in-flight authorization', prompt: '@write auth.txt :: ok\n@review authorization edit', workflow: 'software-dev',
+      }),
+    })).json();
+    await expect.poll(async () => ((await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json()) as any)?.stage,
+      { timeout: 15_000 }).toBe('review');
+
+    // Attach a vault credential + raise the policy in-flight — the same PATCH the
+    // task form uses, now accepted while the task runs.
+    const patched: any = await (await fetch(`${base}/api/tasks/${task.id}/authorization`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({
+        profileId: 'developer', credentialGrants: [cap],
+        credentialPolicies: { [item.id]: { use: 'auto', reveal: 'auto' } },
+      }),
+    })).json();
+    expect(patched.params._authorization.profileId).toBe('developer');
+    expect(patched.params._authorization.capabilities).toContain(cap);
+    expect(patched.params._authorization.credentialPolicies[item.id].reveal).toBe('auto');
+
+    // Drive to terminal, then the same edit is frozen (no live grant to re-point).
+    await fetch(`${base}/api/tasks/${task.id}/signal`, { method: 'POST', headers: auth(), body: JSON.stringify({ signal: 'confirm' }) });
+    await expect.poll(async () => ((await (await fetch(`${base}/api/tasks/${task.id}`, { headers: auth() })).json()) as any)?.stage,
+      { timeout: 15_000 }).toBe('done');
+    const frozen = await fetch(`${base}/api/tasks/${task.id}/authorization`, {
+      method: 'PATCH', headers: auth(), body: JSON.stringify({ profileId: 'reader', credentialGrants: [] }),
+    });
+    expect(frozen.status).toBe(409);
+  });
+
   it('vault item lifecycle: add, list without secrets, policy-gated reveal, delete', async () => {
     const created: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
       type: 'login', label: 'GitHub (test)', domains: 'github.com', username: 'octo',

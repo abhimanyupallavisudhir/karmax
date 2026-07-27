@@ -114,6 +114,18 @@ export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
  * returns what it applied. `setTarget` above is the back-compat shim for `target`.
  */
 export const updateParamsUpdate = defineUpdate<{ applied: string[] }, [Record<string, unknown>]>('updateParams');
+/**
+ * In-flight authorization edit (SPEC §5.5, PLAN-authorization). Re-points the
+ * task's live grant so later turns mint their scoped credential from the newly
+ * selected authorization profile + per-task vault-item grants. The gateway
+ * computes the attenuated capability package (it needs the authorization service
+ * and the editing principal); the workflow just swaps it into live state.
+ * Rejected once cancelled or past the point of no return, like every other edit.
+ */
+export const updateAuthorizationUpdate = defineUpdate<
+  { applied: boolean },
+  [{ grant: string[]; grantPrincipal: string; authorizationProfile: string }]
+>('updateAuthorization');
 /** Switch between the two compatible policies sharing this execution. This is a
  * mode update, not a Temporal workflow-type hot swap; the execution stays pinned. */
 export const changeWorkflowUpdate = defineUpdate<{ workflow: 'software-dev' | 'goal' }, ['software-dev' | 'goal']>('changeWorkflow');
@@ -683,6 +695,27 @@ async function softwareDevImpl(
     return true;
   });
   setHandler(updateParamsUpdate, (patch) => applyParamPatch(patch), { validator: validateParamPatch });
+  setHandler(
+    updateAuthorizationUpdate,
+    (next) => {
+      // Later turns re-read `liveInput` at turn start (runAgentTurn mints the token
+      // from `task.grant`/`grantPrincipal`), so this lands at the next turn any role
+      // runs — exactly like the model/effort retune above.
+      liveInput.grant = next.grant;
+      liveInput.grantPrincipal = next.grantPrincipal;
+      liveInput.authorizationProfile = next.authorizationProfile;
+      return { applied: true };
+    },
+    {
+      validator: (_next) => {
+        if (cancelled || pointOfNoReturnPassed)
+          throw ApplicationFailure.nonRetryable(
+            `authorization can't be changed now — the task is ${cancelled ? 'cancelled' : 'past the point of no return'}`,
+            'AuthorizationLocked',
+          );
+      },
+    },
+  );
   setHandler(
     changeWorkflowUpdate,
     async (workflow) => {
