@@ -89,5 +89,20 @@ ok(fileLinksEnabled() === false, 'the appearance preference disables world file 
 S.user = { id: 'user-2' };
 ok(fileLinksEnabled() === true, 'the appearance preference is scoped to the signed-in user');
 
+// Regression (Task 311): the workflow stamps agent/system replies with a per-array
+// sequence number while user messages carry real epoch-ms timestamps. A reply must
+// stay right after the message it answers, not be flung to the top of the timeline
+// by its tiny `ts`. Use a role with no activity events so ordering is what's tested.
+const ordered = conversationEntries({
+  role: 'merge',
+  messages: [
+    { id: 'm0', role: 'user', text: 'first request', ts: 1785089970324 },
+    { id: 'a1', role: 'agent', text: 'reply one', ts: 1 },
+    { id: 'u1', role: 'user', text: 'a follow-up', ts: 1785111313150 },
+    { id: 'a2', role: 'agent', text: 'reply two', ts: 3 },
+  ],
+}).map((entry) => entry.message.id);
+ok(ordered.join(',') === 'm0,a1,u1,a2', 'sequence-numbered replies sort after the message they answer, not at the top');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
