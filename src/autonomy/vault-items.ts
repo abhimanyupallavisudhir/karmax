@@ -65,9 +65,17 @@ export interface VaultItem {
   /** Which secret fields currently have stored values (never the values). */
   fields: VaultFieldName[];
   policy: VaultItemPolicy;
-  /** `source`: manual | connector:<name> | task:<id>. `externalId` lets a
-   *  connector re-sync onto the same item instead of duplicating it (§9). */
-  provenance: { source: string; taskId?: string; externalId?: string; at: number };
+  /** `source`: manual | connector:<name> | task:<id>. `externalId` identifies
+   *  an imported connector item (and remains the legacy single write-back
+   *  binding). `externalIds` records every connector an agent-created item was
+   *  pushed to, so later rotations update the right entries without guessing. */
+  provenance: {
+    source: string;
+    taskId?: string;
+    externalId?: string;
+    externalIds?: Record<string, string>;
+    at: number;
+  };
   updatedAt: number;
 }
 
@@ -284,12 +292,26 @@ export class VaultItems {
   }
 
   /** Bind an item to a connector's external id (write-back round-trips, §9).
+   *  The two-argument form preserves legacy callers/data; new write-back code
+   *  supplies `connector` so multiple enabled stores retain distinct bindings.
    *  Provenance is otherwise birth-data and never mutated by `save`. */
-  setExternalId(id: string, externalId: string): VaultItem {
+  setExternalId(id: string, externalId: string): VaultItem;
+  setExternalId(id: string, connector: string, externalId: string): VaultItem;
+  setExternalId(id: string, connectorOrExternalId: string, boundExternalId?: string): VaultItem {
     const all = this.list();
     const item = all.find((i) => i.id === id);
     if (!item) throw new Error(`no vault item ${id}`);
-    item.provenance = { ...item.provenance, externalId };
+    const connector = boundExternalId === undefined ? undefined : connectorOrExternalId;
+    const externalId = boundExternalId ?? connectorOrExternalId;
+    item.provenance = {
+      ...item.provenance,
+      // Keep the first legacy value stable for old readers. The connector map
+      // is authoritative for agent-created items written to multiple stores.
+      externalId: item.provenance.externalId ?? externalId,
+      ...(connector
+        ? { externalIds: { ...item.provenance.externalIds, [connector]: externalId } }
+        : {}),
+    };
     item.updatedAt = Date.now();
     this.store.kvSet(kvItems(this.organizationId), JSON.stringify(all));
     return item;

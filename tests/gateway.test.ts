@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { git } from '../src/world/git.js';
 
@@ -935,6 +937,80 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(reset.status).toBe('needs_approval');
     const reqs: any = await (await fetch(`${base}/api/vault/requests?status=pending`, { headers: auth() })).json();
     expect(reqs.find((r: any) => r.id === reset.requestId).kind).toBe('reset');
+  });
+
+  it('propagates an agent-created item rotation to its write-back entry without clobbering notes', async () => {
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fake-pass-'));
+    const fakePass = path.join(fakeHome, 'pass');
+    const entryFile = path.join(fakeHome, 'entry');
+    fs.writeFileSync(fakePass, `#!/bin/sh
+case "$1" in
+  show) cat "$KARMAX_TEST_PASS_ENTRY" ;;
+  insert) cat > "$KARMAX_TEST_PASS_ENTRY" ;;
+  *) exit 1 ;;
+esac
+`);
+    fs.chmodSync(fakePass, 0o755);
+    const previousPath = process.env.PATH;
+    const previousEntry = process.env.KARMAX_TEST_PASS_ENTRY;
+    process.env.PATH = `${fakeHome}${path.delimiter}${previousPath ?? ''}`;
+    process.env.KARMAX_TEST_PASS_ENTRY = entryFile;
+    try {
+      const configured = await fetch(`${base}/api/vault/connectors/pass/config`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({ writeBack: true }),
+      });
+      expect(configured.status).toBe(200);
+      const agent = h.tokens.mint({
+        taskId: 'task_agent_writeback_rotation',
+        profileId: 'do',
+        principal: 'user:test',
+        ceiling: ['credential:read', 'vault:store'],
+        grantorCaps: ['credential:read', 'vault:store'],
+      });
+      const agentAuth = { authorization: `Bearer ${agent.token}`, 'content-type': 'application/json' };
+      const created: any = await (await fetch(`${base}/api/vault/store`, {
+        method: 'POST',
+        headers: agentAuth,
+        body: JSON.stringify({
+          type: 'login',
+          label: 'Agent-created pass rotation',
+          domains: ['rotation.example.com'],
+          username: 'agent@example.com',
+          secrets: { password: 'initial' },
+        }),
+      })).json();
+      expect(created.writeBack).toEqual([
+        { connector: 'pass', externalId: 'karmax/Agent-created-pass-rotation' },
+      ]);
+      expect(fs.readFileSync(entryFile, 'utf8')).toBe('initial\n');
+
+      // Real pass entries often contain notes below line 1. Rotation must use
+      // updateSecret, not push, so those lines survive.
+      fs.writeFileSync(entryFile, 'initial\nusername: agent@example.com\nkeep this note\n');
+      const rotated: any = await (await fetch(`${base}/api/vault/store`, {
+        method: 'POST',
+        headers: agentAuth,
+        body: JSON.stringify({
+          id: created.id,
+          type: 'login',
+          label: 'Agent-created pass rotation',
+          secrets: { password: 'rotated' },
+        }),
+      })).json();
+      expect(rotated.propagated).toEqual({ connector: 'pass', fields: ['password'] });
+      expect(fs.readFileSync(entryFile, 'utf8')).toBe(
+        'rotated\nusername: agent@example.com\nkeep this note\n',
+      );
+    } finally {
+      await fetch(`${base}/api/vault/connectors/pass/config`, {
+        method: 'POST', headers: auth(), body: JSON.stringify({ writeBack: false }),
+      }).catch(() => {});
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousEntry === undefined) delete process.env.KARMAX_TEST_PASS_ENTRY;
+      else process.env.KARMAX_TEST_PASS_ENTRY = previousEntry;
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 
   it('lists the external-store connectors (describe, unauthenticated CLIs report not-ready)', async () => {

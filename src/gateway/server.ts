@@ -3179,10 +3179,11 @@ export class Gateway {
             secrets: b.secrets,
             provenance: { source: 'manual' },
           });
-          // A human rotating a mirrored item's secret propagates to the source
-          // store too (field-level, notes preserved) when write-back is on.
+          // A human rotating a secret propagates to its imported source or
+          // agent-created write-back targets (field-level, notes preserved)
+          // when the corresponding connector's write-back is on.
           let propagated;
-          if (b.id && b.secrets && Object.keys(b.secrets).length && saved.provenance.source.startsWith('connector:')) {
+          if (b.id && b.secrets && Object.keys(b.secrets).length) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
               propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
@@ -3238,10 +3239,11 @@ export class Gateway {
             store.appendAudit({ principalId: `task:${callerTaskId}`, action: 'vault.rotated',
               detail: { itemId: prior!.id, label: prior!.label, fields: secretFields } });
           }
-          // Best-effort propagation of rotated fields back to the item's source
-          // store (§9 updateSecret) — the vault is already correct either way.
+          // Best-effort propagation of rotated fields back to imported sources
+          // and agent-created write-back targets (§9 updateSecret) — the vault
+          // is already correct either way.
           let propagated;
-          if (prior && saved.provenance.source.startsWith('connector:') && b.secrets) {
+          if (prior && b.secrets) {
             try {
               const { defaultConnectors } = await import('../autonomy/connectors.js');
               propagated = await defaultConnectors(store, vault, this.deps.broker, organizationId)
