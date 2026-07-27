@@ -132,6 +132,17 @@ function projectBySlug(slug, organizationId) {
 // to a slug of the name for older records that predate it.
 function orgSlug(o) { return o ? (o.slug || slugify(o.name)) : ''; }
 function organizationById(id) { return (S.organizations || []).find((o) => o.id === id); }
+// Re-authorization is always offered once OAuth is configured. `userAuthorized`
+// only reports that a stored credential EXISTS, not that GitHub still accepts
+// it — so hiding this button whenever one exists left no escape hatch for a
+// token invalidated server-side (revocation, secret rotation, a single-use
+// refresh chain consumed by a concurrent instance). Re-authorizing a healthy
+// grant is idempotent, so there is no cost to keeping the affordance visible.
+function githubAuthorizeButton(githubApp, id) {
+  if (!githubApp?.oauthConfigured) return '';
+  const label = githubApp.userAuthorized ? 'Re-authorize GitHub' : 'Authorize repository creation';
+  return `<button class="btn sm" id="${id}">${label}</button>`;
+}
 function organizationBySlug(slug) {
   const s = slugify(slug);
   return (S.organizations || []).find((o) => orgSlug(o) === s) || (S.organizations || []).find((o) => o.id === slug);
@@ -8250,7 +8261,7 @@ async function hydrateProjectAccess(proj) {
       <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button></div>
       ${!githubApp.configured ? '<div class="inline-form"><button class="btn sm primary" id="project-setup-github">Connect GitHub</button></div>'
         : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
-        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="project-authorize-github">Authorize repository creation</button>' : ''}</div>
+        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>
           ${githubApp.userAuthorized ? `<details class="settings-disclosure compact"><summary><b>Create a new GitHub repository</b></summary><div class="inline-form"><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select><input id="project-new-repo-name" placeholder="new-repository"><input id="project-new-repo-description" placeholder="Description (optional)"><label class="switch"><input id="project-new-repo-private" type="checkbox" checked><span>Private</span></label><button class="btn sm primary" id="project-new-repo-create">Create and attach</button></div></details>` : ''}`}`;
     $('#project-member-add')?.addEventListener('click', async () => {
       const entered = $('#project-member-principal')?.value.trim().toLowerCase();
@@ -10234,7 +10245,7 @@ async function hydrateOrganizationView() {
     <div class="member-row"><span><b>${esc(githubApp.appSlug || 'GitHub App')}</b></span><span class="chip">App ready</span></div>
     ${gitConnections.map((connection) => `<div class="member-row"><span>${esc(connection.accountLogin)}</span><span class="chip">${esc(connection.accountType || 'account')}</span></div>`).join('') || '<p class="task-sub">The App is ready but not installed on a GitHub account yet.</p>'}
     <p class="task-sub">${githubApp.syncMode === 'webhook' ? 'Repository access stays current automatically through GitHub webhooks.' : 'This instance is not publicly reachable, so Karmax refreshes repository access when you ask instead of using webhooks.'}</p>
-    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubApp.oauthConfigured && !githubApp.userAuthorized ? '<button class="btn sm" id="authorize-github">Authorize repository creation</button>' : ''}</div>` : `
+    <div class="inline-form"><button class="btn sm primary" id="connect-github">${gitConnections.length ? 'Install on another account' : 'Install GitHub App'}</button>${gitConnections.length ? '<button class="btn sm" id="refresh-github">Refresh repositories</button>' : ''}${githubAuthorizeButton(githubApp, 'authorize-github')}</div>` : `
     <p class="task-sub">This creates a private GitHub App for this Karmax installation, then lets you choose exactly which repositories it may access. On localhost, setup works without a webhook and repository access is refreshed on demand.</p>
     <button class="btn sm primary" id="setup-github-app">Set up GitHub</button>
     <details style="margin-top:12px"><summary class="task-sub">Use an existing GitHub App</summary><div class="settings-grid" style="margin-top:8px"><label class="form-row">App ID<input id="github-app-id"></label><label class="form-row">App slug<input id="github-app-slug"></label><label class="form-row">Client ID<input id="github-client-id"></label><label class="form-row">Client secret<input id="github-client-secret" type="password"></label></div><label class="form-row">Private key (PEM)<textarea id="github-private-key" rows="4"></textarea></label><label class="form-row">Webhook secret<input id="github-webhook-secret" type="password"></label><button class="btn sm" id="save-github-app">Save App</button></details>`;
