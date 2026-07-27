@@ -1,0 +1,187 @@
+import crypto from 'node:crypto';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { BudgetService, PaymentRegistry, StripeIssuingProvider } from '../src/autonomy/payments.js';
+import { Store } from '../src/store/db.js';
+
+const json = (value: unknown, status = 200) =>
+  new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+
+describe('Stripe Issuing organization rail', () => {
+  let store: Store;
+  let fetcher: ReturnType<typeof vi.fn>;
+  let stripe: StripeIssuingProvider;
+  let organizationId: string;
+  let projectId: string;
+  const env = {
+    STRIPE_CLIENT_ID: 'ca_karmax',
+    STRIPE_SECRET_KEY: 'sk_test_platform',
+    STRIPE_WEBHOOK_SECRET: 'whsec_test',
+  };
+
+  beforeEach(() => {
+    store = new Store(':memory:');
+    organizationId = store.createOrganization({ name: 'Tenant A' }).id;
+    projectId = store.createProject('Payments', {}, organizationId).id;
+    fetcher = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === 'https://connect.stripe.com/oauth/token')
+        return json({ stripe_user_id: 'acct_tenant_a', livemode: false });
+      if (url === 'https://connect.stripe.com/oauth/deauthorize')
+        return json({ stripe_user_id: 'acct_tenant_a' });
+      if (url === 'https://api.stripe.com/v1/account')
+        return json({ country: 'US', capabilities: { card_issuing: 'active' },
+          business_profile: { name: 'Tenant A LLC' } });
+      if (url === 'https://api.stripe.com/v1/balance')
+        return json({ issuing: { available: [{ currency: 'usd', amount: 25_000 }] } });
+      if (url === 'https://api.stripe.com/v1/issuing/cardholders?limit=100')
+        return json({ data: [{ id: 'ich_tenant_a', name: 'Tenant A buyer', type: 'individual', status: 'active' }] });
+      if (url === 'https://api.stripe.com/v1/issuing/cardholders' && init?.method === 'POST')
+        return json({ id: 'ich_tenant_a', name: 'Tenant A buyer', type: 'individual', status: 'active' });
+      if (url === 'https://api.stripe.com/v1/issuing/cards' && init?.method === 'POST')
+        return json({ id: 'ic_tenant_a', status: 'active', last4: '4242' });
+      if (url === 'https://api.stripe.com/v1/issuing/cards/ic_tenant_a')
+        return json({ id: 'ic_tenant_a', status: 'active', last4: '4242' });
+      if (url === 'https://api.stripe.com/v1/issuing/cards/ic_tenant_a?expand[]=number&expand[]=cvc')
+        return json({ id: 'ic_tenant_a', number: '4242424242424242', cvc: '123', exp_month: 12, exp_year: 2030 });
+      throw new Error(`unexpected Stripe request ${init?.method ?? 'GET'} ${url}`);
+    });
+    stripe = new StripeIssuingProvider(store, fetcher as any, env);
+  });
+
+  async function connect() {
+    const started = await stripe.connect({
+      organizationId,
+      userId: 'user_a',
+      redirectUri: 'https://karmax.example/api/payments/stripe/callback',
+    });
+    expect(started.status).toBe('awaiting_oauth');
+    const state = new URL(started.url!).searchParams.get('state')!;
+    return stripe.completeOAuth(state, 'ac_test');
+  }
+
+  function signed(event: unknown) {
+    const raw = Buffer.from(JSON.stringify(event));
+    const timestamp = Math.floor(Date.now() / 1000);
+    const digest = crypto.createHmac('sha256', env.STRIPE_WEBHOOK_SECRET)
+      .update(`${timestamp}.${raw.toString('utf8')}`).digest('hex');
+    return { raw, signature: `t=${timestamp},v1=${digest}` };
+  }
+
+  it('stores a separate connected account and balance for the organization', async () => {
+    await connect();
+    expect(store.getPaymentConnection(organizationId, 'stripe')).toMatchObject({
+      accountId: 'acct_tenant_a',
+      status: 'ready',
+    });
+    expect(stripe.describe({ organizationId }).connected).toBe(true);
+    const other = store.createOrganization({ name: 'Tenant B' });
+    expect(stripe.describe({ organizationId: other.id }).connected).toBe(false);
+    expect(await stripe.balance(organizationId)).toMatchObject({ available: 25_000, currency: 'usd' });
+    expect(fetcher.mock.calls.find(([url]) => url === 'https://api.stripe.com/v1/balance')?.[1]?.headers)
+      .toMatchObject({ 'stripe-account': 'acct_tenant_a' });
+  });
+
+  it('creates a tenant cardholder and virtual card with a provider-side all-time cap', async () => {
+    await connect();
+    expect(await stripe.listCardholders(organizationId)).toHaveLength(1);
+    await stripe.createCardholder(organizationId, {
+      type: 'individual',
+      name: 'Tenant A buyer',
+      firstName: 'Tenant',
+      lastName: 'Buyer',
+      dob: { day: 1, month: 2, year: 1990 },
+      address: { line1: '1 Main', city: 'SF', state: 'CA', postalCode: '94105', country: 'US' },
+    });
+    const card = await stripe.provisionCard({
+      scope: 'project',
+      scopeId: projectId,
+      organizationId,
+      label: 'Agent card',
+      cap: 12_345,
+      cardholderId: 'ich_tenant_a',
+    });
+    expect(card).toMatchObject({ provider: 'stripe', externalId: 'ic_tenant_a', last4: '4242', available: 25_000 });
+    const create = fetcher.mock.calls.find(([url, init]) =>
+      url === 'https://api.stripe.com/v1/issuing/cards' && init?.method === 'POST')!;
+    const form = new URLSearchParams(String(create[1].body));
+    expect(form.get('spending_controls[spending_limits][0][amount]')).toBe('12345');
+    expect(form.get('spending_controls[spending_limits][0][interval]')).toBe('all_time');
+    expect((create[1].headers as any)['stripe-account']).toBe('acct_tenant_a');
+    expect(await stripe.retrieveCardDetails(card.id)).toEqual({
+      number: '4242424242424242', cvc: '123', expMonth: 12, expYear: 2030,
+    });
+    expect(JSON.stringify(store.getCard(card.id))).not.toContain('4242424242424242');
+    expect(JSON.stringify(store.exportOrganization(organizationId))).not.toContain('4242424242424242');
+  });
+
+  it('reserves a spend, approves only the matching real-time authorization, and reconciles capture', async () => {
+    await connect();
+    const card = await stripe.provisionCard({
+      scope: 'project', scopeId: projectId, organizationId, label: 'Agent card',
+      cap: 12_345, cardholderId: 'ich_tenant_a', merchantLock: ['shop.example'],
+    });
+    const registry = new PaymentRegistry(store);
+    registry.register(stripe);
+    const budget = new BudgetService(store, registry);
+    const spend = await budget.request(
+      { organizationId, projectId, taskId: 'task_a' },
+      { amount: 2_500, merchant: 'shop.example', why: 'test purchase', cardId: card.id },
+    );
+    expect(spend).toMatchObject({ status: 'granted', cardId: card.id });
+    expect(spend.requestId).toBeTruthy();
+
+    const authorization = signed({
+      id: 'evt_auth', account: 'acct_tenant_a', type: 'issuing_authorization.request',
+      data: { object: {
+        id: 'iauth_1', card: 'ic_tenant_a', pending_request: { amount: 2_500 },
+        currency: 'usd', merchant_data: { name: 'shop.example' }, created: 1_700_000_000,
+      } },
+    });
+    expect(stripe.handleWebhook(authorization.raw, authorization.signature)).toMatchObject({
+      status: 200, body: { approved: true },
+    });
+    expect(stripe.handleWebhook(authorization.raw, authorization.signature).body).toEqual({ approved: true });
+    expect(store.getPaymentSpendRequest(spend.requestId!).status).toBe('consumed');
+
+    const capture = signed({
+      id: 'evt_capture', account: 'acct_tenant_a', type: 'issuing_transaction.created',
+      data: { object: {
+        id: 'itxn_1', type: 'capture', card: 'ic_tenant_a', authorization: 'iauth_1',
+        amount: 2_500, currency: 'usd', merchant_data: { name: 'shop.example' }, created: 1_700_000_010,
+      } },
+    });
+    expect(stripe.handleWebhook(capture.raw, capture.signature).status).toBe(200);
+    expect(store.getPaymentSpendRequest(spend.requestId!).status).toBe('settled');
+    expect(store.listPaymentTransactions(organizationId).map((value) => value.kind).sort())
+      .toEqual(['authorization', 'transaction']);
+  });
+
+  it('rejects unsigned webhooks and authorizations without a matching reservation', async () => {
+    await connect();
+    await stripe.provisionCard({
+      scope: 'project', scopeId: projectId, organizationId, label: 'Agent card',
+      cap: 12_345, cardholderId: 'ich_tenant_a',
+    });
+    const event = signed({
+      id: 'evt_unreserved', account: 'acct_tenant_a', type: 'issuing_authorization.request',
+      data: { object: { id: 'iauth_none', card: 'ic_tenant_a', pending_request: { amount: 99 },
+        currency: 'usd', merchant_data: { name: 'shop.example' } } },
+    });
+    expect(stripe.handleWebhook(event.raw, 'bad').status).toBe(400);
+    expect(stripe.handleWebhook(event.raw, event.signature).body).toEqual({ approved: false });
+  });
+
+  it('revokes project cards before disconnecting the organization account', async () => {
+    await connect();
+    const card = await stripe.provisionCard({
+      scope: 'project', scopeId: projectId, organizationId, label: 'Project card',
+      cap: 12_345, cardholderId: 'ich_tenant_a',
+    });
+    await stripe.disconnect(organizationId);
+    expect(store.getCard(card.id)).toMatchObject({ status: 'canceled', available: 0 });
+    expect(store.getPaymentConnection(organizationId, 'stripe')).toBeUndefined();
+    expect(fetcher.mock.calls.some(([url, init]) =>
+      url === 'https://api.stripe.com/v1/issuing/cards/ic_tenant_a'
+      && init?.method === 'POST')).toBe(true);
+    expect(fetcher.mock.calls.some(([url]) => url === 'https://connect.stripe.com/oauth/deauthorize')).toBe(true);
+  });
+});

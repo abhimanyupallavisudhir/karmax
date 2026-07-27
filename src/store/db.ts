@@ -399,7 +399,40 @@ export class Store {
       CREATE TABLE IF NOT EXISTS cards (
         id TEXT PRIMARY KEY, provider TEXT NOT NULL, scope TEXT NOT NULL,
         scopeId TEXT, label TEXT NOT NULL, cap INTEGER NOT NULL,
-        available INTEGER NOT NULL, merchantLock TEXT, createdAt INTEGER NOT NULL
+        available INTEGER NOT NULL, merchantLock TEXT, createdAt INTEGER NOT NULL,
+        externalId TEXT, currency TEXT NOT NULL DEFAULT 'usd',
+        status TEXT NOT NULL DEFAULT 'active', cardholderId TEXT, last4 TEXT
+      );
+      CREATE TABLE IF NOT EXISTS payment_connections (
+        organizationId TEXT NOT NULL, provider TEXT NOT NULL, accountId TEXT NOT NULL,
+        status TEXT NOT NULL, livemode INTEGER NOT NULL, details TEXT NOT NULL,
+        createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (organizationId, provider), UNIQUE (provider, accountId)
+      );
+      CREATE TABLE IF NOT EXISTS payment_oauth_states (
+        stateHash TEXT PRIMARY KEY, organizationId TEXT NOT NULL, userId TEXT,
+        redirectUri TEXT NOT NULL, createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL,
+        usedAt INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS payment_spend_requests (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
+        taskId TEXT NOT NULL, cardId TEXT, amount INTEGER NOT NULL, currency TEXT NOT NULL,
+        merchant TEXT, why TEXT, status TEXT NOT NULL, reason TEXT, shortfall INTEGER,
+        providerAuthorizationId TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        expiresAt INTEGER NOT NULL, resolvedBy TEXT
+      );
+      CREATE TABLE IF NOT EXISTS payment_transactions (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT,
+        taskId TEXT, cardId TEXT, spendRequestId TEXT, provider TEXT NOT NULL,
+        providerId TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+        amount INTEGER NOT NULL, currency TEXT NOT NULL, merchant TEXT,
+        raw TEXT NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        UNIQUE (provider, providerId, kind)
+      );
+      CREATE TABLE IF NOT EXISTS payment_events (
+        provider TEXT NOT NULL, eventId TEXT NOT NULL, organizationId TEXT,
+        type TEXT NOT NULL, decision TEXT, createdAt INTEGER NOT NULL,
+        PRIMARY KEY (provider, eventId)
       );
       CREATE TABLE IF NOT EXISTS tags (
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
@@ -463,11 +496,21 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
       CREATE INDEX IF NOT EXISTS idx_saved_views_project ON saved_views(projectId);
+      CREATE INDEX IF NOT EXISTS idx_payment_requests_task_status ON payment_spend_requests(taskId, status, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_payment_requests_org_status ON payment_spend_requests(organizationId, status, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_payment_transactions_org_time ON payment_transactions(organizationId, createdAt DESC);
     `);
     // Free-form human notes, added after the initial schema. Guarded so existing
     // installs pick it up without a re-create.
     const cols = this.db.prepare('PRAGMA table_info(tasks)').all() as any[];
     const projectCols = this.db.prepare('PRAGMA table_info(projects)').all() as any[];
+    const cardCols = this.db.prepare('PRAGMA table_info(cards)').all() as { name: string }[];
+    if (!cardCols.some((c) => c.name === 'externalId')) this.db.exec('ALTER TABLE cards ADD COLUMN externalId TEXT');
+    if (!cardCols.some((c) => c.name === 'currency')) this.db.exec("ALTER TABLE cards ADD COLUMN currency TEXT NOT NULL DEFAULT 'usd'");
+    if (!cardCols.some((c) => c.name === 'status')) this.db.exec("ALTER TABLE cards ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+    if (!cardCols.some((c) => c.name === 'cardholderId')) this.db.exec('ALTER TABLE cards ADD COLUMN cardholderId TEXT');
+    if (!cardCols.some((c) => c.name === 'last4')) this.db.exec('ALTER TABLE cards ADD COLUMN last4 TEXT');
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_provider_external ON cards(provider, externalId) WHERE externalId IS NOT NULL');
     const invitationCols = this.db.prepare('PRAGMA table_info(organization_invitations)').all() as any[];
     if (!invitationCols.some((c) => c.name === 'profileId')) this.db.exec('ALTER TABLE organization_invitations ADD COLUMN profileId TEXT');
     const previewCols = this.db.prepare('PRAGMA table_info(preview_leases)').all() as any[];
@@ -865,7 +908,11 @@ export class Store {
       delivery_preferences: selectRows(this.db, 'delivery_preferences', 'organizationId=?', [organizationId]),
       delivery_outbox: rowsFor(this.db, 'delivery_outbox', 'inboxId', inboxIds),
       settings: rowsFor(this.db, 'settings', 'scopeKey', projectSettingKeys),
-      cards: rowsFor(this.db, 'cards', 'scopeId', projectIds),
+      cards: rowsFor(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]),
+      payment_connections: selectRows(this.db, 'payment_connections', 'organizationId=?', [organizationId]),
+      payment_spend_requests: selectRows(this.db, 'payment_spend_requests', 'organizationId=?', [organizationId]),
+      payment_transactions: selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId]),
+      payment_events: selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId]),
       authorization_profiles: rowsFor(this.db, 'authorization_profiles', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       principal_grants: rowsFor(this.db, 'principal_grants', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
       audit_log: rowsFor(this.db, 'audit_log', 'scopeKey', [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)]),
@@ -953,7 +1000,12 @@ export class Store {
       deleteRows(this.db, 'world_instances', 'worldId', taskIds);
       deleteRows(this.db, 'task_intents', 'id', intentIds);
       deleteRows(this.db, 'settings', 'scopeKey', projectSettingKeys);
-      deleteRows(this.db, 'cards', 'scopeId', projectIds);
+      deleteRows(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]);
+      this.db.prepare('DELETE FROM payment_events WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM payment_transactions WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM payment_spend_requests WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM payment_oauth_states WHERE organizationId=?').run(organizationId);
+      this.db.prepare('DELETE FROM payment_connections WHERE organizationId=?').run(organizationId);
       deleteRows(this.db, 'authorization_profiles', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'principal_grants', 'scopeKey', scopeKeys);
       deleteRows(this.db, 'audit_log', 'scopeKey', scopeKeys);
@@ -3420,10 +3472,15 @@ export class Store {
 
   // ─── Cards (payment resources; SPEC §7.6) ────────────────────────────────────
 
-  createCard(c: { id: string; provider: string; scope: 'project' | 'organization' | 'global'; scopeId?: string; label: string; cap: number; available: number; merchantLock?: string[]; createdAt: number }) {
+  createCard(c: { id: string; provider: string; scope: 'project' | 'organization' | 'global'; scopeId?: string;
+    label: string; cap: number; available: number; merchantLock?: string[]; createdAt: number;
+    externalId?: string; currency?: string; status?: string; cardholderId?: string; last4?: string }) {
     this.db
-      .prepare('INSERT INTO cards (id, provider, scope, scopeId, label, cap, available, merchantLock, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(c.id, c.provider, c.scope, c.scopeId ?? null, c.label, c.cap, c.available, c.merchantLock ? JSON.stringify(c.merchantLock) : null, c.createdAt);
+      .prepare(`INSERT INTO cards (id, provider, scope, scopeId, label, cap, available, merchantLock, createdAt,
+        externalId, currency, status, cardholderId, last4) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(c.id, c.provider, c.scope, c.scopeId ?? null, c.label, c.cap, c.available,
+        c.merchantLock ? JSON.stringify(c.merchantLock) : null, c.createdAt, c.externalId ?? null,
+        c.currency ?? 'usd', c.status ?? 'active', c.cardholderId ?? null, c.last4 ?? null);
   }
   getCard(id: string): any {
     const r = this.db.prepare('SELECT * FROM cards WHERE id = ?').get(id) as any;
@@ -3444,10 +3501,213 @@ export class Store {
       : (this.db.prepare(`SELECT * FROM cards WHERE (scope='organization' AND scopeId=?)${legacyGlobal} ORDER BY createdAt`).all(org) as any[]);
     return rows.map(cardRow);
   }
-  updateCard(id: string, patch: { available?: number; cap?: number }) {
+  /** Every card funded by an organization, including cards narrowed to one of
+   * its projects. Used for balance accounting and safe provider disconnect. */
+  listOrganizationCards(organizationId: string): any[] {
+    const legacyGlobal = organizationId === 'org_personal' ? " OR c.scope='global'" : '';
+    return (this.db.prepare(`SELECT c.* FROM cards c LEFT JOIN projects p
+      ON c.scope='project' AND c.scopeId=p.id
+      WHERE (c.scope='organization' AND c.scopeId=?)
+        OR (c.scope='project' AND p.organizationId=?)${legacyGlobal}
+      ORDER BY c.createdAt`).all(organizationId, organizationId) as any[]).map(cardRow);
+  }
+  getCardByExternalId(provider: string, externalId: string): any {
+    const row = this.db.prepare('SELECT * FROM cards WHERE provider=? AND externalId=?').get(provider, externalId) as any;
+    return row ? cardRow(row) : undefined;
+  }
+  updateCard(id: string, patch: { available?: number; cap?: number; status?: string; last4?: string }) {
     const c = this.getCard(id);
     if (!c) return;
-    this.db.prepare('UPDATE cards SET available = ?, cap = ? WHERE id = ?').run(patch.available ?? c.available, patch.cap ?? c.cap, id);
+    this.db.prepare('UPDATE cards SET available=?, cap=?, status=?, last4=? WHERE id=?')
+      .run(patch.available ?? c.available, patch.cap ?? c.cap, patch.status ?? c.status,
+        patch.last4 ?? c.last4 ?? null, id);
+  }
+
+  // ─── Organization payment connections + durable spend ledger ───────────────
+
+  upsertPaymentConnection(value: { organizationId: string; provider: string; accountId: string;
+    status?: string; livemode?: boolean; details?: Record<string, unknown> }): any {
+    const now = Date.now();
+    const existing = this.getPaymentConnection(value.organizationId, value.provider);
+    this.db.prepare(`INSERT INTO payment_connections
+      (organizationId, provider, accountId, status, livemode, details, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(organizationId, provider) DO UPDATE SET accountId=excluded.accountId,
+      status=excluded.status, livemode=excluded.livemode, details=excluded.details, updatedAt=excluded.updatedAt`)
+      .run(value.organizationId, value.provider, value.accountId, value.status ?? 'ready',
+        value.livemode ? 1 : 0, JSON.stringify(value.details ?? {}), existing?.createdAt ?? now, now);
+    return this.getPaymentConnection(value.organizationId, value.provider);
+  }
+  getPaymentConnection(organizationId: string, provider: string): any {
+    const row = this.db.prepare('SELECT * FROM payment_connections WHERE organizationId=? AND provider=?')
+      .get(organizationId, provider) as any;
+    return row ? { ...row, livemode: Boolean(row.livemode), details: JSON.parse(row.details || '{}') } : undefined;
+  }
+  getPaymentConnectionByAccount(provider: string, accountId: string): any {
+    const row = this.db.prepare('SELECT * FROM payment_connections WHERE provider=? AND accountId=?')
+      .get(provider, accountId) as any;
+    return row ? { ...row, livemode: Boolean(row.livemode), details: JSON.parse(row.details || '{}') } : undefined;
+  }
+  listPaymentConnections(organizationId: string): any[] {
+    return (this.db.prepare('SELECT * FROM payment_connections WHERE organizationId=? ORDER BY createdAt')
+      .all(organizationId) as any[]).map((row) => ({
+        ...row, livemode: Boolean(row.livemode), details: JSON.parse(row.details || '{}'),
+      }));
+  }
+  deletePaymentConnection(organizationId: string, provider: string): any {
+    const value = this.getPaymentConnection(organizationId, provider);
+    if (value) this.db.prepare('DELETE FROM payment_connections WHERE organizationId=? AND provider=?')
+      .run(organizationId, provider);
+    return value;
+  }
+
+  createPaymentOAuthState(input: { organizationId: string; userId?: string; redirectUri: string;
+    ttlMs?: number }): string {
+    const state = crypto.randomBytes(32).toString('base64url');
+    const now = Date.now();
+    this.db.prepare(`INSERT INTO payment_oauth_states
+      (stateHash, organizationId, userId, redirectUri, createdAt, expiresAt, usedAt)
+      VALUES (?, ?, ?, ?, ?, ?, NULL)`)
+      .run(sha256(state), input.organizationId, input.userId ?? null, input.redirectUri,
+        now, now + (input.ttlMs ?? 10 * 60_000));
+    return state;
+  }
+  consumePaymentOAuthState(state: string): any {
+    const hash = sha256(state);
+    const row = this.db.prepare('SELECT * FROM payment_oauth_states WHERE stateHash=?').get(hash) as any;
+    if (!row || row.usedAt || row.expiresAt <= Date.now()) return undefined;
+    const result = this.db.prepare('UPDATE payment_oauth_states SET usedAt=? WHERE stateHash=? AND usedAt IS NULL')
+      .run(Date.now(), hash);
+    return Number(result.changes) === 1 ? row : undefined;
+  }
+
+  createPaymentSpendRequest(input: { organizationId: string; projectId: string; taskId: string;
+    cardId?: string; amount: number; currency?: string; merchant?: string; why?: string;
+    status: string; reason?: string; shortfall?: number; expiresAt?: number }): any {
+    const now = Date.now();
+    const id = newId('spend');
+    this.db.prepare(`INSERT INTO payment_spend_requests
+      (id, organizationId, projectId, taskId, cardId, amount, currency, merchant, why,
+       status, reason, shortfall, providerAuthorizationId, createdAt, updatedAt, expiresAt, resolvedBy)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)`)
+      .run(id, input.organizationId, input.projectId, input.taskId, input.cardId ?? null, input.amount,
+        input.currency ?? 'usd', input.merchant ?? null, input.why ?? null, input.status,
+        input.reason ?? null, input.shortfall ?? null, now, now, input.expiresAt ?? now + 30 * 60_000);
+    if (input.status === 'authorized') this.kvSet(`spent:${input.taskId}`, String(this.paymentSpent(input.taskId)));
+    return this.getPaymentSpendRequest(id);
+  }
+  getPaymentSpendRequest(id: string): any {
+    return this.db.prepare('SELECT * FROM payment_spend_requests WHERE id=?').get(id) as any;
+  }
+  setPaymentSpendRequestCard(id: string, cardId: string): void {
+    this.db.prepare('UPDATE payment_spend_requests SET cardId=?, updatedAt=? WHERE id=?')
+      .run(cardId, Date.now(), id);
+  }
+  listPaymentSpendRequests(input: { organizationId?: string; taskId?: string; status?: string } = {}): any[] {
+    this.expirePaymentSpendRequests();
+    const clauses: string[] = [];
+    const values: any[] = [];
+    if (input.organizationId) { clauses.push('organizationId=?'); values.push(input.organizationId); }
+    if (input.taskId) { clauses.push('taskId=?'); values.push(input.taskId); }
+    if (input.status) { clauses.push('status=?'); values.push(input.status); }
+    return this.db.prepare(`SELECT * FROM payment_spend_requests${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''}
+      ORDER BY createdAt DESC`).all(...values) as any[];
+  }
+  updatePaymentSpendRequest(id: string, patch: { status?: string; reason?: string; shortfall?: number;
+    providerAuthorizationId?: string; resolvedBy?: string; expiresAt?: number }): any {
+    const current = this.getPaymentSpendRequest(id);
+    if (!current) return undefined;
+    this.db.prepare(`UPDATE payment_spend_requests SET status=?, reason=?, shortfall=?,
+      providerAuthorizationId=?, resolvedBy=?, expiresAt=?, updatedAt=? WHERE id=?`)
+      .run(patch.status ?? current.status, patch.reason ?? current.reason ?? null,
+        patch.shortfall ?? current.shortfall ?? null,
+        patch.providerAuthorizationId ?? current.providerAuthorizationId ?? null,
+        patch.resolvedBy ?? current.resolvedBy ?? null, patch.expiresAt ?? current.expiresAt,
+        Date.now(), id);
+    const updated = this.getPaymentSpendRequest(id);
+    this.kvSet(`spent:${current.taskId}`, String(this.paymentSpent(current.taskId)));
+    return updated;
+  }
+  paymentSpent(taskId: string): number {
+    this.expirePaymentSpendRequests();
+    const row = this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
+      WHERE taskId=? AND (status IN ('consumed','settled')
+        OR (status='authorized' AND expiresAt>?))`).get(taskId, Date.now()) as any;
+    return Number(row?.amount ?? 0);
+  }
+  cardPaymentSpent(cardId: string): number {
+    this.expirePaymentSpendRequests();
+    const row = this.db.prepare(`SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_spend_requests
+      WHERE cardId=? AND (status IN ('consumed','settled')
+        OR (status='authorized' AND expiresAt>?))`).get(cardId, Date.now()) as any;
+    return Number(row?.amount ?? 0);
+  }
+  findPaymentAuthorization(cardId: string, amount: number, merchant?: string): any {
+    this.expirePaymentSpendRequests();
+    const rows = this.db.prepare(`SELECT * FROM payment_spend_requests
+      WHERE cardId=? AND status='authorized' AND amount>=? AND expiresAt>?
+      ORDER BY CASE WHEN amount=? THEN 0 ELSE 1 END, createdAt`).all(cardId, amount, Date.now(), amount) as any[];
+    const normalized = normalizePaymentMerchant(merchant);
+    return rows.find((row) => {
+      const expected = normalizePaymentMerchant(row.merchant);
+      return !expected || !normalized || normalized.includes(expected) || expected.includes(normalized);
+    });
+  }
+  expirePaymentSpendRequests(now = Date.now()): number {
+    return Number(this.db.prepare(`UPDATE payment_spend_requests
+      SET status='expired', reason='request expired', updatedAt=?
+      WHERE expiresAt<=? AND status IN ('authorized','pending_approval','needs_funding')`)
+      .run(now, now).changes);
+  }
+  consumePaymentAuthorization(id: string, providerAuthorizationId: string): any {
+    const result = this.db.prepare(`UPDATE payment_spend_requests SET status='consumed',
+      providerAuthorizationId=?, updatedAt=? WHERE id=? AND status='authorized' AND expiresAt>?`)
+      .run(providerAuthorizationId, Date.now(), id, Date.now());
+    return Number(result.changes) === 1 ? this.getPaymentSpendRequest(id) : undefined;
+  }
+
+  upsertPaymentTransaction(value: { organizationId: string; projectId?: string; taskId?: string;
+    cardId?: string; spendRequestId?: string; provider: string; providerId: string; kind: string;
+    status: string; amount: number; currency?: string; merchant?: string; raw?: unknown;
+    createdAt?: number }): any {
+    const now = Date.now();
+    const id = newId('paytxn');
+    this.db.prepare(`INSERT INTO payment_transactions
+      (id, organizationId, projectId, taskId, cardId, spendRequestId, provider, providerId,
+       kind, status, amount, currency, merchant, raw, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(provider, providerId, kind) DO UPDATE SET status=excluded.status,
+      amount=excluded.amount, merchant=excluded.merchant, raw=excluded.raw, updatedAt=excluded.updatedAt`)
+      .run(id, value.organizationId, value.projectId ?? null, value.taskId ?? null, value.cardId ?? null,
+        value.spendRequestId ?? null, value.provider, value.providerId, value.kind, value.status,
+        value.amount, value.currency ?? 'usd', value.merchant ?? null, JSON.stringify(value.raw ?? {}),
+        value.createdAt ?? now, now);
+    const row = this.db.prepare('SELECT * FROM payment_transactions WHERE provider=? AND providerId=? AND kind=?')
+      .get(value.provider, value.providerId, value.kind) as any;
+    return row ? { ...row, raw: JSON.parse(row.raw || '{}') } : undefined;
+  }
+  listPaymentTransactions(organizationId: string, limit = 100): any[] {
+    return (this.db.prepare('SELECT * FROM payment_transactions WHERE organizationId=? ORDER BY createdAt DESC LIMIT ?')
+      .all(organizationId, Math.max(1, Math.min(500, limit))) as any[])
+      .map((row) => ({ ...row, raw: JSON.parse(row.raw || '{}') }));
+  }
+  getPaymentTransactionByProviderId(provider: string, providerId: string): any {
+    const row = this.db.prepare(`SELECT * FROM payment_transactions
+      WHERE provider=? AND providerId=? ORDER BY updatedAt DESC LIMIT 1`).get(provider, providerId) as any;
+    return row ? { ...row, raw: JSON.parse(row.raw || '{}') } : undefined;
+  }
+  getPaymentEvent(provider: string, eventId: string): any {
+    const row = this.db.prepare('SELECT * FROM payment_events WHERE provider=? AND eventId=?')
+      .get(provider, eventId) as any;
+    return row ? { ...row, decision: row.decision ? JSON.parse(row.decision) : undefined } : undefined;
+  }
+  recordPaymentEvent(value: { provider: string; eventId: string; organizationId?: string;
+    type: string; decision?: unknown }): any {
+    this.db.prepare(`INSERT OR IGNORE INTO payment_events
+      (provider, eventId, organizationId, type, decision, createdAt) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(value.provider, value.eventId, value.organizationId ?? null, value.type,
+        value.decision === undefined ? null : JSON.stringify(value.decision), Date.now());
+    return this.getPaymentEvent(value.provider, value.eventId);
   }
 
   // ─── KV (misc small state) ───────────────────────────────────────────────────
@@ -3521,8 +3781,17 @@ function cardRow(r: any) {
     cap: r.cap,
     available: r.available,
     merchantLock: r.merchantLock ? JSON.parse(r.merchantLock) : undefined,
+    externalId: r.externalId ?? undefined,
+    currency: r.currency ?? 'usd',
+    status: r.status ?? 'active',
+    cardholderId: r.cardholderId ?? undefined,
+    last4: r.last4 ?? undefined,
     createdAt: r.createdAt,
   };
+}
+
+function normalizePaymentMerchant(value: unknown): string {
+  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 function resourceAttachmentRow(row: any): ResourceAttachment {

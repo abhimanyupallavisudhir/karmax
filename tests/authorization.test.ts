@@ -71,6 +71,21 @@ describe('durable authorization policy', () => {
     ]);
   });
 
+  it('lets an organization operator manage tenant payments without host authority', () => {
+    const store = new Store(':memory:');
+    const authz = new AuthorizationService(store);
+    const organization = store.createOrganization({ name: 'Acme' });
+    const project = store.createProject('App', {}, organization.id);
+    authz.grant('root', {
+      principalId: 'user:operator',
+      scopeKey: `organization:${organization.id}`,
+      profileId: 'operator',
+    });
+    const capabilities = authz.capabilities('user:operator', project.id, organization.id);
+    expect(capabilities).toContain('payment:*');
+    expect(capabilities).not.toContain('process:*');
+  });
+
   it('applies team and @all project profiles dynamically', () => {
     const store = new Store(':memory:');
     const authz = new AuthorizationService(store);

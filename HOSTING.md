@@ -22,7 +22,8 @@ only migrate the ones that are actually per-tenant.
 | `KARMAX_CONTAINER_IMAGE`, `KARMAX_AGENT_PROVIDER`, `KARMAX_*_MODEL`, `KARMAX_*_BASE_URL` | operator default | ✅ fine as platform defaults; already overridable per-tenant via profiles |
 | `KARMAX_CLAUDE_LOGIN_ARGS`, `KARMAX_CODEX_LOGIN_ARGS` | operator/test | ✅ fine — how the login CLI is invoked |
 | `KARMAX_TOKEN`, `CLAUDE_CONFIG_DIR` | runtime | ✅ not user config — injected per agent spawn |
-| `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY` | **operator** | ✅ **correct as-is** — these are the *platform's* Stripe Connect app, set once. Each tenant connects **their own** Stripe account via OAuth; the connected-account id is stored per-tenant. (Messaging fixed to say so.) |
+| `STRIPE_CLIENT_ID`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | **operator** | ✅ these identify the deployment's Connect application and authenticate its webhook; they are never a funding source. Each organization connects a distinct Stripe account whose id, Issuing balance, cardholders, cards, requests, and ledger are stored under that organization. |
+| `STRIPE_API_VERSION` | operator | Optional Stripe API-version override. The default is the direct real-time authorization version used by the webhook response contract. |
 | `KARMAX_SAFE_MODE` | operator/global | ✅ fine (also a UI toggle); becomes per-workspace when workspaces exist |
 | `KARMAX_PASSWORD` | operator (single-tenant) | ⚠️ becomes **per-user auth** in hosted — replace with a real accounts/auth system |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` (+ the ambient `~/.claude` login) | **per-tenant** | ⚠️ **the real hazard** — see below |
@@ -58,8 +59,11 @@ single-user ambient-login setup).
    workspace.
 2. **Per-tenant credential isolation** — the fallback gate above; config homes and
    vault entries already key by account, so extend that to workspace.
-3. **Per-tenant Stripe** — already the model: platform Connect app (operator) +
-   per-tenant connected accounts (stored per workspace).
+3. **Per-tenant Stripe** — implemented as a platform Connect app (operator) plus
+   organization-owned connected accounts and Issuing balances. OAuth state,
+   account ids, cardholders, cards, reservations, authorization decisions, and
+   transaction/dispute reconciliation are tenant-scoped. The operator key is
+   used only to act as the Connect platform and is never treated as tenant money.
 4. **Resource isolation** — worktrees/containers, token/budget coordinators, and
    task queues partitioned or fair-shared per workspace.
 
@@ -67,3 +71,31 @@ None of these are env-var problems; they're the standard single-tenant → SaaS
 migration. The env audit above confirms only the **credential fallback** and
 **KARMAX_PASSWORD** are env-vars that block hosting — everything else is either
 correct operator config or already per-tenant in the DB/vault.
+
+## Stripe deployment setup
+
+Create one Stripe Connect application for the Karmax deployment and configure its
+OAuth redirect to:
+
+`https://<karmax-origin>/api/payments/stripe/callback`
+
+Create a Connect webhook endpoint at:
+
+`https://<karmax-origin>/api/payments/stripe/webhook`
+
+Subscribe it to Issuing authorization, card, transaction, and dispute events plus
+`account.application.deauthorized`. Direct real-time authorization requests must
+be delivered to that endpoint. Set its signing secret as
+`STRIPE_WEBHOOK_SECRET`; Karmax refuses to issue an active Stripe card without it.
+The public origin comes from `KARMAX_PUBLIC_URL` or trusted forwarded headers.
+
+Every organization then uses its own Connect button. Its connected account and
+Issuing balance remain separate; Local test funds remain the non-money-moving
+development rail.
+
+Karmax's agent checkout flow retrieves virtual-card PAN/CVC through Stripe's
+explicit `expand[]=number&expand[]=cvc` API and immediately types them into the
+origin-checked browser page without persisting or returning them. That makes the
+deployment part of the card-data path. Operators offering cards to customers
+must complete the applicable PCI-DSS service-provider work with Stripe; use
+Issuing Elements instead when the goal is only to display card details to a human.

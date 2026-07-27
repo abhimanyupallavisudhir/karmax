@@ -32,11 +32,16 @@ export interface CdpFillArgs {
 export async function fillViaCdp(args: CdpFillArgs): Promise<{ origin: string }> {
   const { session, origin } = await openPage(args.cdpUrl, { expectDomains: args.expectDomains, timeoutMs: args.timeoutMs });
   try {
-    const focus = await session.call('Runtime.evaluate', {
-      expression: `(() => { const el = document.querySelector(${JSON.stringify(args.selector)}); if (!el) return false; el.focus(); return true; })()`,
-      returnByValue: true,
-    });
-    if (focus?.result?.value !== true) throw new Error(`no element matches selector ${args.selector}`);
+    if (args.selector === '@tab') {
+      await session.call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab' });
+      await session.call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab' });
+    } else if (args.selector !== '@focused') {
+      const focus = await session.call('Runtime.evaluate', {
+        expression: `(() => { const el = document.querySelector(${JSON.stringify(args.selector)}); if (!el) return false; el.focus(); return true; })()`,
+        returnByValue: true,
+      });
+      if (focus?.result?.value !== true) throw new Error(`no element matches selector ${args.selector}`);
+    }
     const text = args.resolveText?.() ?? args.text;
     if (text === undefined) throw new Error('credential fill has no value resolver');
     await session.call('Input.insertText', { text });
