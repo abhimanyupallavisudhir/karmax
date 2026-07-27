@@ -48,7 +48,12 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
 
   it('resolves a browser + platform MCP baseline (SPEC §7.5)', () => {
     const servers = mcpServerMap({ browser: 'chrome-devtools', platform: { command: 'node', args: ['mcp.js'] } });
-    expect(servers['chrome-devtools']).toEqual({ command: 'npx', args: ['-y', 'chrome-devtools-mcp@1.6.0'] });
+    // chrome-devtools runs through karmax's launcher so its Chrome exposes a
+    // loopback DevTools port that host-side fill_credential can reach (§5B).
+    const chrome = servers['chrome-devtools']!;
+    expect(chrome.command).toBe(process.execPath);
+    expect(chrome.args[0]).toMatch(/chrome-cdp-launcher\.mjs$/);
+    expect(chrome.env).toMatchObject({ KARMAX_CDP_MCP_VERSION: '1.6.0' });
     expect(servers['karmax']).toEqual({ command: 'node', args: ['mcp.js'] });
     expect(mcpServerMap({ browser: 'none' })).toEqual({});
   });
@@ -100,7 +105,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(toml.match(/^\[mcp_servers\.karmax]$/gm)).toHaveLength(1);
     expect(toml.match(/^\[mcp_servers\.karmax\.env]$/gm)).toHaveLength(1);
     expect(toml).not.toContain('[mcp_servers.playwright]');
-    expect(toml).toContain('command = "npx"');
+    expect(toml).toContain('chrome-cdp-launcher.mjs'); // chrome-devtools runs through the CDP-port launcher
     expect(toml).toContain('model = "custom"');
     expect(toml).toContain('[mcp_servers.keep]');
     fs.rmSync(dir, { recursive: true, force: true });

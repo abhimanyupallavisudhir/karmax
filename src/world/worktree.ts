@@ -8,7 +8,7 @@ import { World, WorldHandle, WorldProvider, WorldSpec, WorldRepo, ExecOptions, E
 import { git, gitOrThrow, isGitRepo, ensureIdentity, isolatedGitEnvironment } from './git.js';
 import { paths } from '../config/paths.js';
 import { expandPath } from '../util/expand.js';
-import { openLocalPty, startLocalProcess } from './local-execution.js';
+import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execution.js';
 
 const pexec = promisify(execFile);
 const managedRepoClones = new Map<string, Promise<string>>();
@@ -307,12 +307,19 @@ class WorktreeWorld implements World {
   constructor(public handle: WorldHandle) {}
 
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
+    const cwd = opts.cwd ?? worldWorkingDirectory(this.handle);
+    const env = opts.env ? { ...process.env, ...opts.env } : process.env;
+    // STDIN (a secret fed to an in-world helper) needs a spawn-based path;
+    // execFile cannot pass input. Keep the fast pexec path for the common case.
+    if (opts.input !== undefined) {
+      return runLocalCommand(cmd, args, { cwd, env, timeoutMs: opts.timeoutMs, input: opts.input });
+    }
     try {
       const { stdout, stderr } = await pexec(cmd, args, {
-        cwd: opts.cwd ?? worldWorkingDirectory(this.handle),
+        cwd,
         timeout: opts.timeoutMs ?? 120_000,
         maxBuffer: 64 * 1024 * 1024,
-        env: opts.env ? { ...process.env, ...opts.env } : process.env,
+        env,
       });
       return { stdout, stderr, code: 0 };
     } catch (e: any) {

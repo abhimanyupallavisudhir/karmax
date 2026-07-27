@@ -40,6 +40,22 @@ describe('WorktreeProvider (real git)', () => {
     expect((await git(repo, ['rev-parse', '--verify', 'karmax/abc'])).code).toBe(0);
   });
 
+  it('feeds ExecOptions.input to a command over stdin (secret channel for in-world fill)', async () => {
+    const provider = new WorktreeProvider(home);
+    const world = await provider.create({ taskId: 'stdin', repo, base: 'main', target: 'main' });
+    try {
+      // `cat` echoes stdin; the payload must NOT appear in argv.
+      const res = await world.exec('cat', [], { input: 'sup3r-secret\n' });
+      expect(res.code).toBe(0);
+      expect(res.stdout).toBe('sup3r-secret\n');
+      // a reader that only sees argv (no stdin) gets nothing
+      const argvOnly = await world.exec('bash', ['-lc', 'echo "$@"', '--'], {});
+      expect(argvOnly.stdout).not.toContain('sup3r-secret');
+    } finally {
+      await world.destroy();
+    }
+  });
+
   it('attaches the project wiki as a branch-and-merge companion repository', async () => {
     const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-content-'));
     const store = new Store(':memory:');

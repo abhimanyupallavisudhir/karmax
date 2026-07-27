@@ -6,7 +6,9 @@ import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import type { Provider } from '../domain/types.js';
 import type { World, WorldPty } from '../world/types.js';
+import { fileURLToPath } from 'node:url';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION } from '../autonomy/config-homes.js';
+import { DEFAULT_CDP_PORT } from '../autonomy/cdp-endpoint.js';
 
 // CheckpointService already excludes this injection surface. Keep it under the
 // world root only because every remote provider exposes that portable write API.
@@ -556,10 +558,35 @@ async function ensureRemoteBrowser(world: World, browser: BrowserKind, runtimeBi
     await world.writeFile(marker, JSON.stringify({ chromium, playwright: PLAYWRIGHT_VERSION }));
   }
   const env = { PLAYWRIGHT_BROWSERS_PATH: resolvedCache, ...(pathEnv ? { PATH: pathEnv } : {}) };
-  return browser === 'playwright'
-    ? { playwright: { command: path.posix.join(resolvedBin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } }
-    : { 'chrome-devtools': { command: path.posix.join(resolvedBin, 'chrome-devtools-mcp'),
-        args: ['--headless', '--isolated', '--executablePath', chromium, '--chromeArg=--no-sandbox'], env } };
+  if (browser === 'playwright')
+    return { playwright: { command: path.posix.join(resolvedBin, 'playwright-mcp'), args: ['--headless', '--no-sandbox', '--isolated'], env } };
+  // Run chrome-devtools-mcp through karmax's launcher so the sandbox browser
+  // exposes a loopback DevTools port (PLAN-passwords.md §5B, cloud path): the
+  // launcher opens Chromium with --remote-debugging-port and attaches the baked
+  // chrome-devtools-mcp bin via --browserUrl. That in-world port is what the
+  // gateway's remote fill (world-fill.ts, over world.exec) types into. The
+  // launcher also sets vm.overcommit_memory=1 first (KARMAX_CDP_SET_OVERCOMMIT):
+  // the default ~512MB E2B sandbox ships overcommit=0, under which Chrome's V8
+  // renderer cannot reserve its virtual CodeRange and dies, hanging all
+  // page-level CDP (see findings/e2b-headless-chrome-overcommit.md). It
+  // self-falls-back to pipe mode if the browser can't open, so tools never
+  // regress. The dep-free launcher is shipped into the world here.
+  const launcherRel = `${REMOTE_ROOT}/chrome-cdp-launcher.mjs`;
+  const launcherSource = fs.readFileSync(fileURLToPath(new URL('../autonomy/chrome-cdp-launcher.mjs', import.meta.url)), 'utf8');
+  await world.writeFile(launcherRel, launcherSource);
+  return { 'chrome-devtools': {
+    command: nodeCommand,
+    args: [path.posix.join(world.handle.root, launcherRel)],
+    env: {
+      ...env,
+      KARMAX_CDP_MCP_BIN: path.posix.join(resolvedBin, 'chrome-devtools-mcp'),
+      KARMAX_CDP_MCP_VERSION: CHROME_DEVTOOLS_MCP_VERSION,
+      KARMAX_CDP_CHROME: chromium,
+      KARMAX_CDP_PORT: String(DEFAULT_CDP_PORT),
+      KARMAX_CDP_NO_SANDBOX: '1',
+      KARMAX_CDP_SET_OVERCOMMIT: '1',
+    },
+  } };
 }
 
 /** Bring stock provider images up to the minimum runtime required by the pinned

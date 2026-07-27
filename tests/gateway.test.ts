@@ -826,9 +826,13 @@ describe('gateway HTTP API (real server end-to-end)', () => {
 
     const first: any = await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id }) })).json();
     expect(first.status).toBe('needs_approval');
+    // The blocked reveal auto-raises the request — no separate request_credential
+    // call is needed for it to surface to the human.
+    expect(first.requestId).toBeTruthy();
+    // An explicit request_credential dedupes onto that same pending request.
     const req: any = await (await fetch(`${base}/api/vault/requests`, { method: 'POST', headers: agentAuth, body: JSON.stringify({ itemId: item.id, mode: 'reveal', why: 'need the key' }) })).json();
     expect(req.status).toBe('needs_approval');
-    expect(req.requestId).toBeTruthy();
+    expect(req.requestId).toBe(first.requestId);
     // the human resolves it for the whole task (durable grant extension)
     const resolved: any = await (await fetch(`${base}/api/vault/requests/${req.requestId}/resolve`, { method: 'POST', headers: auth(), body: JSON.stringify({ action: 'task' }) })).json();
     expect(resolved.status).toBe('granted');

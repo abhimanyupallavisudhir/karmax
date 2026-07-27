@@ -101,12 +101,24 @@ describe('remote subscription agents', () => {
     fs.writeFileSync(path.join(localHome, '.claude.json'), JSON.stringify({ mcpServers: {
       'chrome-devtools': { command: 'npx', args: ['-y', 'chrome-devtools-mcp'] },
     } }));
-    const seeded = await seedRemoteAgentHome(fakeWorld(false, true), 'claude', localHome);
+    const world = fakeWorld(false, true);
+    const seeded = await seedRemoteAgentHome(world, 'claude', localHome);
+    // chrome-devtools runs through karmax's launcher so the sandbox browser
+    // exposes a loopback CDP port the gateway's remote fill types into (§5B); the
+    // launcher sets vm.overcommit_memory=1 first so Chrome's V8 renderer can run
+    // in the memory-constrained sandbox (findings/e2b-headless-chrome-overcommit).
     expect(seeded.browserMcp?.['chrome-devtools']).toMatchObject({
-      command: '/opt/karmax/bin/chrome-devtools-mcp',
-      args: expect.arrayContaining(['--headless', '--isolated', '--chromeArg=--no-sandbox']),
-      env: { PLAYWRIGHT_BROWSERS_PATH: '/opt/karmax/browsers' },
+      command: 'node',
+      args: ['/workspace/.karmax-injection/agent/chrome-cdp-launcher.mjs'],
+      env: {
+        PLAYWRIGHT_BROWSERS_PATH: '/opt/karmax/browsers',
+        KARMAX_CDP_MCP_BIN: '/opt/karmax/bin/chrome-devtools-mcp',
+        KARMAX_CDP_CHROME: '/opt/karmax/browsers/chromium',
+        KARMAX_CDP_NO_SANDBOX: '1',
+        KARMAX_CDP_SET_OVERCOMMIT: '1',
+      },
     });
+    expect(world.files.get('.karmax-injection/agent/chrome-cdp-launcher.mjs')?.toString()).toContain('--remote-debugging-port');
   });
 
   it('copies only the requested native session between remote worlds', async () => {

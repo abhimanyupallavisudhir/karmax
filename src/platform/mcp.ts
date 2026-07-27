@@ -361,7 +361,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'fill_credential',
     {
       description:
-        'Type a vault credential into the page open in your browser WITHOUT the secret entering your context — karmax resolves and types it over CDP after verifying the page origin matches the credential\'s domains. Call once per field (username, password, then totp for a one-time code). The browser must expose DevTools (launch Chrome with --remote-debugging-port=9222).',
+        'Type a vault credential into the page open in your browser WITHOUT the secret entering your context — karmax resolves and types it over CDP after verifying the page origin matches the credential\'s domains. Call once per field (username, password, then totp for a one-time code). The karmax browser MCP already runs a Chrome that exposes this DevTools endpoint, so just drive the page normally — no manual Chrome launch needed. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.enum(['username', 'password', 'totp']).optional(), selector: z.string(), cdpUrl: z.string().optional() },
     },
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/fill', a)),
@@ -370,7 +370,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'get_credential',
     {
       description:
-        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents) — the audited last resort; prefer fill_credential for logins. Returns granted with the value, needs_approval/denied per the item\'s reveal policy, or not_in_vault.',
+        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents) — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.string().optional() },
     },
     async (a) => wrap(() => ops.platformRequest('POST', '/api/vault/resolve', a)),

@@ -1,7 +1,36 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
-import type { WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
+import type { WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec, ExecResult } from './types.js';
 import { worldRelativePath } from './types.js';
+
+/**
+ * A one-shot local command with optional STDIN — the async equivalent of
+ * `execFile` that also honors `input`. Used when a caller must feed a secret to
+ * a child (e.g. in-world credential fill) without it appearing in argv/env,
+ * which `promisify(execFile)` cannot do. Never rejects; returns the exit code.
+ */
+export function runLocalCommand(command: string, args: string[], opts: {
+  cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; input?: string; maxBuffer?: number;
+} = {}): Promise<ExecResult> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { cwd: opts.cwd, env: opts.env ?? process.env });
+    const cap = opts.maxBuffer ?? 64 * 1024 * 1024;
+    let out = '', err = '', outLen = 0, errLen = 0, done = false;
+    const finish = (code: number, extraErr?: string) => {
+      if (done) return; done = true;
+      clearTimeout(timer);
+      resolve({ stdout: out, stderr: err + (extraErr ?? ''), code });
+    };
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } finish(124, '\n[timed out]'); },
+      opts.timeoutMs ?? 120_000);
+    child.stdout?.on('data', (d) => { if (outLen < cap) { out += d; outLen += d.length; } });
+    child.stderr?.on('data', (d) => { if (errLen < cap) { err += d; errLen += d.length; } });
+    child.on('error', (e) => finish(1, String(e?.message ?? e)));
+    child.on('close', (code) => finish(code ?? 0));
+    if (opts.input !== undefined) { child.stdin?.on('error', () => { /* EPIPE if child exits early */ }); child.stdin?.end(opts.input); }
+    else child.stdin?.end();
+  });
+}
 
 /** Local implementation of the provider execution contract. Worktree and
  * memory worlds use it directly; container worlds use the same wrappers around
